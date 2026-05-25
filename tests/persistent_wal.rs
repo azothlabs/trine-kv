@@ -1,11 +1,13 @@
 use std::{
     fs,
+    fs::OpenOptions,
+    io::Write,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use trine_kv::{
-    Db, DbOptions, DurabilityMode, KeyRange, KeyspaceOptions, WriteBatch, WriteOptions,
+    Db, DbOptions, DurabilityMode, Error, KeyRange, KeyspaceOptions, WriteBatch, WriteOptions, wal,
 };
 
 fn temp_db_path(name: &str) -> PathBuf {
@@ -106,6 +108,64 @@ fn persistent_wal_replays_cross_keyspace_batch() {
             Some(b"hello".to_vec())
         );
     }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_wal_ignores_torn_final_record() {
+    let path = temp_db_path("torn-tail");
+    let options = DbOptions::persistent(&path);
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+        keyspace.insert(b"a", b"a1").expect("write a");
+        db.persist(DurabilityMode::Flush).expect("flush WAL");
+    }
+
+    OpenOptions::new()
+        .append(true)
+        .open(wal::wal_path(&path))
+        .expect("open WAL")
+        .write_all(&[0xaa, 0xbb, 0xcc])
+        .expect("append torn tail");
+
+    {
+        let db = Db::open(options).expect("torn final record is ignored");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace reopens");
+        assert_eq!(keyspace.get(b"a").expect("a replays"), Some(b"a1".to_vec()));
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_wal_checksum_corruption_fails_closed() {
+    let path = temp_db_path("checksum-corruption");
+    let options = DbOptions::persistent(&path);
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+        keyspace.insert(b"a", b"a1").expect("write a");
+        db.persist(DurabilityMode::Flush).expect("flush WAL");
+    }
+
+    let wal_path = wal::wal_path(&path);
+    let mut bytes = fs::read(&wal_path).expect("read WAL");
+    let last = bytes.last_mut().expect("WAL has payload bytes");
+    *last ^= 0xff;
+    fs::write(&wal_path, bytes).expect("write corrupted WAL");
+
+    let error = Db::open(options).expect_err("checksum corruption must fail closed");
+    assert!(matches!(error, Error::Corruption { .. }));
 
     fs::remove_dir_all(path).expect("cleanup test db");
 }

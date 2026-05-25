@@ -43,17 +43,17 @@ task004 [x] goal:in-memory range and prefix iteration return snapshot-consistent
 task005 [x] goal:in-memory range deletes affect point, range, and prefix reads with snapshot safety | scope:src/db.rs,src/write_batch.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 task006 [x] goal:optimistic transaction point/range read conflict validation works in memory | scope:src/transaction.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 task007 [x] goal:persistent mode writes committed batches to WAL and replays them on reopen | scope:src/db.rs,src/wal.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
-task008 [ ] goal:WAL recovery handles torn tail and fails closed on checksum corruption | scope:src/wal.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
+task008 [x] goal:WAL recovery handles torn tail and fails closed on checksum corruption | scope:src/wal.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
+task009 [ ] goal:manifest persists keyspace creation/options and WAL replay floor | scope:src/manifest.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 ```
 
 ## Known Blockers
 
-- WAL corruption tests, SSTable flush, manifest, recovery reports, compaction,
-  blob files, compression crates, and optimized search policies are not
-  implemented yet.
+- Manifest, SSTable flush, recovery reports, compaction, blob files,
+  compression crates, and optimized search policies are not implemented yet.
 
 ## Evidence To Record
 
 - Phase 2 scaffold gate results.
-- WAL corruption validation results.
-- Remaining blocker category after WAL corruption handling.
+- Manifest validation results.
+- Remaining blocker category after manifest.

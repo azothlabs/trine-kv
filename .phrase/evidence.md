@@ -347,3 +347,37 @@ Record only evidence that can change planning or durable decisions.
 
 - Add WAL corruption and torn-tail recovery tests, then tighten WAL parsing if
   those tests expose gaps.
+
+## 2026-05-25: WAL Torn Tail And Corruption Behavior Passed
+
+### Observation
+
+- A torn final WAL record is ignored during persistent reopen.
+- A complete WAL record with a corrupted payload checksum fails closed with
+  `Error::Corruption`.
+- The existing append/replay tests still pass after adding the bad-WAL tests.
+
+### Interpretation
+
+- Task008 is complete.
+- The next persistent-mode blocker is manifest state. WAL replay currently
+  recreates keyspaces with default options, so non-default keyspace options are
+  not durable yet.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Manifest creation/options and WAL replay floor are not implemented.
+- SSTable flush/read, recovery reports, compaction, compression crates,
+  optimized index policies, and blob files remain future blockers.
+
+### Recommended Next Action
+
+- Implement a small manifest that records keyspace creation/options and the WAL
+  replay floor, without adding SSTable flush yet.
