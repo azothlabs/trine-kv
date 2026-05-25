@@ -95,7 +95,9 @@ impl Db {
             .map(|(_, operation, _)| operation.clone())
             .collect::<Vec<_>>();
 
-        self.append_wal(sequence, &wal_operations, write_options.durability)?;
+        let durability =
+            effective_durability(self.inner.options.durability, write_options.durability);
+        self.append_wal(sequence, &wal_operations, durability)?;
 
         for (batch_index, operation, state) in indexed_operations {
             apply_memtable_operation(&state, operation, sequence, batch_index)?;
@@ -193,5 +195,42 @@ impl Db {
             .last_sequence
             .store(last_committed.get(), Ordering::Release);
         Ok(())
+    }
+}
+
+fn effective_durability(default: DurabilityMode, requested: DurabilityMode) -> DurabilityMode {
+    // The database option is a safety floor for all writes. Per-write options
+    // can ask for a stronger WAL sync, but cannot quietly weaken the database
+    // level selected at open time.
+    if durability_rank(requested) >= durability_rank(default) {
+        requested
+    } else {
+        default
+    }
+}
+
+const fn durability_rank(mode: DurabilityMode) -> u8 {
+    match mode {
+        DurabilityMode::Buffered => 0,
+        DurabilityMode::Flush => 1,
+        DurabilityMode::SyncData => 2,
+        DurabilityMode::SyncAll => 3,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DurabilityMode, effective_durability};
+
+    #[test]
+    fn database_durability_is_a_write_floor() {
+        assert_eq!(
+            effective_durability(DurabilityMode::Buffered, DurabilityMode::SyncData),
+            DurabilityMode::SyncData
+        );
+        assert_eq!(
+            effective_durability(DurabilityMode::SyncAll, DurabilityMode::Buffered),
+            DurabilityMode::SyncAll
+        );
     }
 }

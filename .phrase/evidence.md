@@ -1427,3 +1427,45 @@ Record only evidence that can change planning or durable decisions.
 - Write v1 durability documentation that clearly states each durability mode,
   recovery behavior, checksummed file boundaries, repair policy, and known
   non-goals before closing the v1 acceptance gate.
+
+## 2026-05-25: Durability Documentation Passed
+
+### Observation
+
+- `docs/durability.md` now describes v1 persistent and in-memory durability
+  scope, write durability modes, commit ordering, WAL replay, flush and
+  manifest publish behavior, SSTable/blob checks, compaction cleanup, repair
+  policy, process locking, read-only open behavior, and operator guidance.
+- The documentation states current limits directly, including that `SyncAll`
+  is strongest for WAL commits and that parent-directory sync coverage is not
+  claimed portably for every rename or create.
+- `DbOptions::durability` is now enforced as a database-level floor for every
+  commit. Per-write options can request a stronger mode but cannot weaken the
+  database-level mode selected at open time.
+- A unit test covers the durability-floor rule.
+
+### Interpretation
+
+- Task034 is complete for the v1 durability-doc acceptance requirement.
+- The durability configuration field now has a concrete effect on the write
+  path, which removes a documentation-discovered spec gap.
+
+### Verification
+
+- Manual document review against `.phrase/protocol/trine-kv-v1-spec.md`
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+- forbidden terminology scan over source, tests, phase notes, benchmark files,
+  and docs
+
+### Remaining Blockers
+
+- No implementation blockers are recorded after task034.
+- Final v1 acceptance audit still needs to decide whether Phase 3 can close.
+
+### Recommended Next Action
+
+- Run the final v1 acceptance audit against the protocol gate, then update
+  roadmap/current/evidence with the phase result.
