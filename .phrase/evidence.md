@@ -465,3 +465,38 @@ Record only evidence that can change planning or durable decisions.
 
 - Add table corruption and missing-table recovery tests, then tighten startup
   errors before moving into compaction.
+
+## 2026-05-25: SSTable Recovery Fail-Closed Coverage Passed
+
+### Observation
+
+- Startup now returns `Error::Corruption` if a manifest-referenced table file
+  cannot be opened or read.
+- A missing table file referenced by the manifest fails persistent reopen.
+- A table file with a corrupted payload checksum fails persistent reopen.
+- A table file whose valid payload properties differ from the manifest metadata
+  fails persistent reopen.
+
+### Interpretation
+
+- Task011 is complete for the current table-file format.
+- The first table recovery risks are now pinned by tests, so the next useful
+  engine slice is manual compaction over flushed tables.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Compaction is still unsupported.
+- SSTable block/index layout, recovery reports, blob files, compression crates,
+  and optimized search policies remain future blockers.
+
+### Recommended Next Action
+
+- Implement a small manual compaction path that rewrites flushed tables into a
+  replacement table while preserving MVCC visibility and manifest publish rules.

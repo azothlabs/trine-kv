@@ -20,6 +20,36 @@ fn temp_db_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("trine-kv-{name}-{}-{nonce}", std::process::id()))
 }
 
+fn flushed_default_table_path(path: &std::path::Path, options: &DbOptions) -> PathBuf {
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+        keyspace.insert(b"a", b"a1").expect("write a");
+        db.flush().expect("flush table");
+    }
+
+    let manifest_state =
+        manifest::read_manifest(&manifest::manifest_path(path)).expect("manifest reads");
+    let table_id = manifest_state
+        .tables()
+        .get("default")
+        .and_then(|tables| tables.first())
+        .expect("default table exists")
+        .id;
+    table::table_path(path, table_id)
+}
+
+fn checksum(bytes: &[u8]) -> u32 {
+    let mut hash = 0x811c_9dc5_u32;
+    for byte in bytes {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
 #[test]
 fn persistent_wal_replays_point_and_range_batches() {
     let path = temp_db_path("wal-replay");
@@ -294,6 +324,61 @@ fn persistent_flush_preserves_snapshot_versions() {
             Some(b"v2".to_vec())
         );
     }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_reopen_fails_when_manifest_table_file_is_missing() {
+    let path = temp_db_path("missing-table");
+    let options = DbOptions::persistent(&path);
+    let table_path = flushed_default_table_path(&path, &options);
+
+    fs::remove_file(table_path).expect("remove referenced table");
+
+    let error = Db::open(options).expect_err("missing referenced table fails closed");
+    assert!(matches!(error, Error::Corruption { .. }));
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_reopen_fails_when_table_checksum_is_corrupt() {
+    let path = temp_db_path("corrupt-table-checksum");
+    let options = DbOptions::persistent(&path);
+    let table_path = flushed_default_table_path(&path, &options);
+
+    let mut bytes = fs::read(&table_path).expect("read table");
+    let last = bytes.last_mut().expect("table has payload bytes");
+    *last ^= 0xff;
+    fs::write(&table_path, bytes).expect("write corrupted table");
+
+    let error = Db::open(options).expect_err("corrupt referenced table fails closed");
+    assert!(matches!(error, Error::Corruption { .. }));
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_reopen_fails_when_table_metadata_differs_from_manifest() {
+    let path = temp_db_path("table-metadata-mismatch");
+    let options = DbOptions::persistent(&path);
+    let table_path = flushed_default_table_path(&path, &options);
+
+    let mut bytes = fs::read(&table_path).expect("read table");
+    let payload_start = 14;
+    let mut table_id = [0_u8; 8];
+    table_id.copy_from_slice(&bytes[payload_start..payload_start + 8]);
+    let table_id = u64::from_le_bytes(table_id)
+        .checked_add(1)
+        .expect("test table id can increment");
+    bytes[payload_start..payload_start + 8].copy_from_slice(&table_id.to_le_bytes());
+    let checksum = checksum(&bytes[payload_start..]);
+    bytes[10..14].copy_from_slice(&checksum.to_le_bytes());
+    fs::write(&table_path, bytes).expect("write metadata-mismatched table");
+
+    let error = Db::open(options).expect_err("metadata mismatch fails closed");
+    assert!(matches!(error, Error::Corruption { .. }));
 
     fs::remove_dir_all(path).expect("cleanup test db");
 }

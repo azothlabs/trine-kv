@@ -165,7 +165,19 @@ pub(crate) fn write_table(
 
 pub(crate) fn read_table(path: &Path) -> Result<Table> {
     let mut bytes = Vec::new();
-    File::open(path)?.read_to_end(&mut bytes)?;
+    let mut file = File::open(path).map_err(|error| Error::Corruption {
+        message: format!(
+            "referenced table {} cannot be opened: {error}",
+            path.display()
+        ),
+    })?;
+    file.read_to_end(&mut bytes)
+        .map_err(|error| Error::Corruption {
+            message: format!(
+                "referenced table {} cannot be read: {error}",
+                path.display()
+            ),
+        })?;
     decode_table(&bytes)
 }
 
