@@ -66,13 +66,13 @@ task027 [x] goal:persistent open takes an exclusive database directory lock and 
 task028 [x] goal:table metadata records compaction levels and read ordering remains correct across levels | scope:src/manifest.rs,src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
 task029 [x] goal:compaction planning selects level-aware L0 inputs and overlapping lower-level tables | scope:src/compaction.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
 task030 [x] goal:flush path can trigger automatic compaction when L0 pressure exceeds configured limits | scope:src/db.rs,src/compaction.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
-task031 [ ] goal:database stats expose table, L0, blob, and compaction counters from live state | scope:src/stats.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
+task031 [x] goal:database stats expose table, L0, blob, and compaction counters from live state | scope:src/stats.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
+task032 [ ] goal:block cache records table block hits and misses without changing read results | scope:src/cache.rs,src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
 ```
 
 ## Known Blockers
 
-- Required metrics, cache behavior, benchmark output, and durability docs are
-  incomplete.
+- Cache behavior, benchmark output, and durability docs are incomplete.
 
 ## Evidence To Record
 
@@ -87,4 +87,5 @@ task031 [ ] goal:database stats expose table, L0, blob, and compaction counters 
 - Compaction-level metadata validation results.
 - Level-aware compaction planning validation results.
 - Automatic compaction trigger validation results.
-- Remaining blocker category after task030.
+- Live stats validation results.
+- Remaining blocker category after task031.

@@ -21,7 +21,7 @@ use crate::{
     options::{DbOptions, DurabilityMode, FailOnCorruptionPolicy, KeyspaceOptions, StorageMode},
     recovery,
     snapshot::{Snapshot, SnapshotTracker},
-    stats::DbStats,
+    stats::{DbStats, LevelStats},
     table::{self, Table, TableRangeTombstone},
     transaction::{Transaction, TransactionOptions},
     types::{KeyRange, KeyValue, Sequence},
@@ -47,6 +47,11 @@ pub(crate) struct DbInner {
     snapshots: Arc<SnapshotTracker>,
     manifest: Option<Mutex<ManifestStore>>,
     wal: Option<Mutex<WalWriter>>,
+    compaction_runs: AtomicU64,
+    compaction_input_tables: AtomicU64,
+    compaction_output_tables: AtomicU64,
+    compaction_input_bytes: AtomicU64,
+    compaction_output_bytes: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -141,6 +146,11 @@ impl Db {
                 snapshots: Arc::new(SnapshotTracker::default()),
                 manifest: None,
                 wal: None,
+                compaction_runs: AtomicU64::new(0),
+                compaction_input_tables: AtomicU64::new(0),
+                compaction_output_tables: AtomicU64::new(0),
+                compaction_input_bytes: AtomicU64::new(0),
+                compaction_output_bytes: AtomicU64::new(0),
             }),
         })
     }
@@ -205,6 +215,11 @@ impl Db {
                 snapshots: Arc::new(SnapshotTracker::default()),
                 manifest: Some(Mutex::new(manifest)),
                 wal,
+                compaction_runs: AtomicU64::new(0),
+                compaction_input_tables: AtomicU64::new(0),
+                compaction_output_tables: AtomicU64::new(0),
+                compaction_input_bytes: AtomicU64::new(0),
+                compaction_output_bytes: AtomicU64::new(0),
             }),
         };
         db.replay_wal_batches(batches, replay_floor)?;
@@ -401,6 +416,12 @@ impl Db {
         }
 
         self.install_compacted_tables(written_tables)?;
+        self.record_compaction_stats(
+            &db_path,
+            compaction_inputs.len(),
+            &obsolete_table_ids,
+            &written_table_ids,
+        );
         remove_table_files(&db_path, &obsolete_table_ids)?;
         self.remove_unreferenced_blob_files(&db_path)?;
 
@@ -421,17 +442,77 @@ impl Db {
 
     #[must_use]
     pub fn stats(&self) -> DbStats {
-        let live_keyspaces = self
-            .inner
-            .keyspaces
-            .read()
-            .map_or(0, |keyspaces| keyspaces.len());
-
-        DbStats {
-            live_keyspaces,
+        let mut stats = DbStats {
             active_snapshots: self.inner.snapshots.active_count(),
+            compaction_runs: self.inner.compaction_runs.load(Ordering::Acquire),
+            compaction_input_tables: self.inner.compaction_input_tables.load(Ordering::Acquire),
+            compaction_output_tables: self.inner.compaction_output_tables.load(Ordering::Acquire),
+            compaction_input_bytes: self.inner.compaction_input_bytes.load(Ordering::Acquire),
+            compaction_output_bytes: self.inner.compaction_output_bytes.load(Ordering::Acquire),
             ..DbStats::default()
+        };
+
+        let persistent_path = self.persistent_path();
+        let mut level_stats = BTreeMap::<u32, LevelStats>::new();
+        let mut live_blob_bytes_by_file = BTreeMap::<u64, u64>::new();
+
+        let Ok(keyspaces) = self.inner.keyspaces.read() else {
+            return stats;
+        };
+        stats.live_keyspaces = keyspaces.len();
+
+        for state in keyspaces.values() {
+            if let Ok(entries) = state.entries.read() {
+                stats.memtable_bytes = stats
+                    .memtable_bytes
+                    .saturating_add(memtable_entry_bytes(&entries));
+            }
+            if let Ok(tombstones) = state.range_tombstones.read() {
+                stats.memtable_bytes = stats
+                    .memtable_bytes
+                    .saturating_add(memtable_tombstone_bytes(&tombstones));
+            }
+            let Ok(tables) = state.tables.read() else {
+                continue;
+            };
+
+            for table in tables.iter() {
+                let properties = table.properties();
+                let level = properties.level.get();
+                let table_bytes =
+                    persistent_path.map_or(0, |db_path| table_file_bytes(db_path, properties.id));
+                stats.total_tables += 1;
+                stats.table_bytes = stats.table_bytes.saturating_add(table_bytes);
+                if properties.level == table::TableLevel::ZERO {
+                    stats.l0_tables += 1;
+                }
+                let level_entry = level_stats.entry(level).or_insert(LevelStats {
+                    level,
+                    tables: 0,
+                    bytes: 0,
+                });
+                level_entry.tables += 1;
+                level_entry.bytes = level_entry.bytes.saturating_add(table_bytes);
+
+                for record in table.point_records() {
+                    if let Some(ValueRef::Blob { file_id, len, .. }) = &record.value {
+                        live_blob_bytes_by_file
+                            .entry(*file_id)
+                            .and_modify(|bytes| *bytes = bytes.saturating_add(*len))
+                            .or_insert(*len);
+                    }
+                }
+            }
         }
+
+        stats.level_tables = level_stats.into_values().collect();
+        stats.live_blob_files = live_blob_bytes_by_file.len();
+        stats.live_blob_bytes = live_blob_bytes_by_file.values().copied().sum();
+        if let Some(db_path) = persistent_path {
+            add_obsolete_blob_stats(db_path, &live_blob_bytes_by_file, &mut stats);
+        }
+
+        stats
     }
 
     #[must_use]
@@ -879,6 +960,41 @@ impl Db {
 
         Ok(false)
     }
+
+    fn record_compaction_stats(
+        &self,
+        db_path: &Path,
+        runs: usize,
+        input_table_ids: &[table::TableId],
+        output_table_ids: &[table::TableId],
+    ) {
+        let input_bytes = input_table_ids
+            .iter()
+            .map(|table_id| table_file_bytes(db_path, *table_id))
+            .sum::<u64>();
+        let output_bytes = output_table_ids
+            .iter()
+            .map(|table_id| table_file_bytes(db_path, *table_id))
+            .sum::<u64>();
+
+        self.inner
+            .compaction_runs
+            .fetch_add(usize_to_u64_saturating(runs), Ordering::AcqRel);
+        self.inner.compaction_input_tables.fetch_add(
+            usize_to_u64_saturating(input_table_ids.len()),
+            Ordering::AcqRel,
+        );
+        self.inner.compaction_output_tables.fetch_add(
+            usize_to_u64_saturating(output_table_ids.len()),
+            Ordering::AcqRel,
+        );
+        self.inner
+            .compaction_input_bytes
+            .fetch_add(input_bytes, Ordering::AcqRel);
+        self.inner
+            .compaction_output_bytes
+            .fetch_add(output_bytes, Ordering::AcqRel);
+    }
 }
 
 fn validate_options(options: &DbOptions) -> Result<()> {
@@ -944,6 +1060,68 @@ fn validate_table_blob_refs(db_path: &Path, table: &Table) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn memtable_entry_bytes(entries: &BTreeMap<InternalKey, Option<ValueRef>>) -> u64 {
+    entries
+        .iter()
+        .map(|(internal_key, value)| {
+            let value_len = value.as_ref().map_or(0, ValueRef::len);
+            usize_to_u64_saturating(internal_key.user_key().len())
+                .saturating_add(value_len)
+                .saturating_add(16)
+        })
+        .sum()
+}
+
+fn memtable_tombstone_bytes(tombstones: &[RangeTombstone]) -> u64 {
+    tombstones
+        .iter()
+        .map(|tombstone| {
+            key_range_bytes(&tombstone.range)
+                .saturating_add(usize_to_u64_saturating(std::mem::size_of::<Sequence>()))
+                .saturating_add(usize_to_u64_saturating(std::mem::size_of::<u32>()))
+        })
+        .sum()
+}
+
+fn key_range_bytes(range: &KeyRange) -> u64 {
+    bound_bytes(&range.start).saturating_add(bound_bytes(&range.end))
+}
+
+fn bound_bytes(bound: &Bound<Vec<u8>>) -> u64 {
+    match bound {
+        Bound::Included(bytes) | Bound::Excluded(bytes) => usize_to_u64_saturating(bytes.len()),
+        Bound::Unbounded => 0,
+    }
+}
+
+fn table_file_bytes(db_path: &Path, table_id: table::TableId) -> u64 {
+    fs::metadata(table::table_path(db_path, table_id)).map_or(0, |metadata| metadata.len())
+}
+
+fn add_obsolete_blob_stats(
+    db_path: &Path,
+    live_blob_bytes_by_file: &BTreeMap<u64, u64>,
+    stats: &mut DbStats,
+) {
+    let Ok(blob_file_ids) = blob::list_blob_file_ids(db_path) else {
+        return;
+    };
+
+    for file_id in blob_file_ids {
+        if live_blob_bytes_by_file.contains_key(&file_id) {
+            continue;
+        }
+        stats.obsolete_blob_files += 1;
+        let bytes =
+            fs::metadata(blob::blob_path(db_path, file_id)).map_or(0, |metadata| metadata.len());
+        stats.obsolete_blob_bytes = stats.obsolete_blob_bytes.saturating_add(bytes);
+    }
+}
+
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn sort_tables_for_reads(tables: &mut [Arc<Table>]) {

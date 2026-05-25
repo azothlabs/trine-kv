@@ -89,6 +89,14 @@ fn default_table_levels(path: &std::path::Path) -> Vec<u32> {
     levels
 }
 
+fn level_table_count(stats: &trine_kv::DbStats, level: u32) -> usize {
+    stats
+        .level_tables
+        .iter()
+        .find(|level_stats| level_stats.level == level)
+        .map_or(0, |level_stats| level_stats.tables)
+}
+
 fn write_file(path: &std::path::Path, bytes: &[u8]) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).expect("create parent directory");
@@ -730,6 +738,71 @@ fn persistent_flush_auto_compacts_when_l0_pressure_exceeds_limit() {
             Some(b"a2".to_vec())
         );
         assert_eq!(keyspace.get(b"b").expect("b reopens"), Some(b"b1".to_vec()));
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_stats_report_tables_blobs_and_compactions() {
+    let path = temp_db_path("live-stats");
+    let mut options = DbOptions::persistent(&path);
+    options.max_l0_files = 1;
+    let keyspace_options = KeyspaceOptions {
+        blob_threshold_bytes: 4,
+        ..KeyspaceOptions::default()
+    };
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", keyspace_options)
+            .expect("keyspace opens");
+        assert_eq!(db.stats().live_keyspaces, 1);
+
+        let large_a = b"large-a".to_vec();
+        keyspace
+            .insert(b"a", large_a.clone())
+            .expect("write large a");
+        assert!(
+            db.stats().memtable_bytes > 0,
+            "unflushed writes should contribute to memtable stats"
+        );
+        db.flush().expect("first flush stays L0");
+        let stats = db.stats();
+        assert_eq!(stats.total_tables, 1);
+        assert_eq!(stats.l0_tables, 1);
+        assert_eq!(level_table_count(&stats, 0), 1);
+        assert!(stats.table_bytes > 0);
+        assert_eq!(stats.live_blob_files, 1);
+        assert_eq!(stats.live_blob_bytes, large_a.len() as u64);
+
+        let large_b = b"large-b".to_vec();
+        keyspace
+            .insert(b"b", large_b.clone())
+            .expect("write large b");
+        db.flush().expect("second flush triggers compaction");
+        let stats = db.stats();
+        assert_eq!(stats.total_tables, 1);
+        assert_eq!(stats.l0_tables, 0);
+        assert_eq!(level_table_count(&stats, 1), 1);
+        assert_eq!(stats.live_blob_files, 2);
+        assert_eq!(
+            stats.live_blob_bytes,
+            (large_a.len() + large_b.len()) as u64
+        );
+        assert_eq!(stats.compaction_runs, 1);
+        assert_eq!(stats.compaction_input_tables, 2);
+        assert_eq!(stats.compaction_output_tables, 1);
+        assert!(stats.compaction_input_bytes > 0);
+        assert!(stats.compaction_output_bytes > 0);
+
+        let obsolete_blob_path = blob::blob_path(&path, 999);
+        write_file(&obsolete_blob_path, b"obsolete");
+        let stats = db.stats();
+        assert_eq!(stats.obsolete_blob_files, 1);
+        assert_eq!(stats.obsolete_blob_bytes, b"obsolete".len() as u64);
+        fs::remove_file(obsolete_blob_path).expect("remove test obsolete blob");
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");

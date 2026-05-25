@@ -1306,3 +1306,45 @@ Record only evidence that can change planning or durable decisions.
 
 - Implement live database stats for tables, L0 pressure, blob files, and
   compaction counters before adding cache behavior.
+
+## 2026-05-25: Live Stats Passed
+
+### Observation
+
+- `DbStats` now reports total tables, L0 tables, per-level table counts and
+  bytes, total table bytes, live/obsolete blob file counts and bytes, and
+  compaction run/input/output counters.
+- `Db::stats` derives table, level, memtable, and blob stats from the current
+  keyspace state; persistent table and obsolete blob byte counts use filesystem
+  metadata best-effort.
+- Successful compaction publishes cumulative run, input table, output table,
+  input byte, and output byte counters.
+- Tests cover memtable bytes before flush, L0/table stats after flush, blob
+  stats, auto-compaction counters, per-level stats after L1 output, and obsolete
+  blob stats.
+
+### Interpretation
+
+- Task031 is complete for the live-state and compaction-counter stats required
+  before cache behavior.
+- Some deeper observability items remain naturally tied to their subsystems:
+  cache hit/miss stats belong with cache behavior, and benchmark/durability
+  reporting belongs with the documentation and benchmark slices.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Block cache behavior and cache hit/miss stats.
+- Required benchmark outputs.
+- Durability documentation.
+
+### Recommended Next Action
+
+- Implement block cache behavior for table reads and expose cache hit/miss
+  stats without changing visible read results.
