@@ -2,54 +2,51 @@
 
 ## Status
 
-Complete
+In progress
 
 ## Goal
 
-Polish the public v1 API so common usage paths need less caller-side boilerplate
-without changing storage behavior.
+Audit and harden production-facing operational behavior after API polish.
 
 ## Entry Condition
 
-- Phase 4 usage documentation is complete.
-- Quickstart example and v1 tests pass.
+- Phase 5 API polish is complete.
+- V1 tests, quickstart, docs, and benchmark baseline are present.
 
 ## Scope
 
-- Ergonomic constructors and helpers for public options.
-- Keyspace convenience methods that preserve batch/transaction semantics.
-- Documentation and examples updated only where the API becomes simpler.
+- Operational failure modes around recovery, file cleanup, locks, WAL replay,
+  flush/compaction publish, resource limits, and diagnostics.
+- Focused code changes only after an audit exposes a concrete risk.
+- Tests that reproduce the risk or prove the hardened path.
 
 ## Out Of Scope
 
-- Changing MVCC, WAL, SSTable, manifest, compaction, transaction,
-  prefix-filter, compression, or search-policy behavior.
-- Production-hardening audits; that is the next phase.
-- Publishing or packaging work.
+- Changing v1 storage contracts without an ADR or protocol update.
+- Packaging and release automation.
+- Performance tuning that is not tied to a hardening risk.
 
 ## Acceptance Gate
 
-- API examples compile and run.
+- At least one production-hardening audit result is recorded.
+- Any code change has a focused regression test.
 - `cargo fmt --check`, `cargo clippy`, `cargo test`, and `git diff --check`
   pass.
-- Usage docs remain accurate and avoid forbidden terminology.
 
 ## Active Task Slice
 
 ```text
-task037 [x] goal:common open and single-key write paths need less struct boilerplate | scope:src/db.rs,src/options.rs,src/keyspace.rs,README.md,docs/usage.md,examples/quickstart.rs,tests,.phrase/current.md,.phrase/evidence.md | verify:cargo run --example quickstart + cargo fmt --check + cargo clippy + cargo test + git diff --check
+task038 [x] goal:production hardening audit identifies the first concrete operational risk and fixes it if local | scope:src,recovery/table/blob/wal/db tests,.phrase/current.md,.phrase/evidence.md | verify:manual audit + focused test + cargo fmt --check + cargo clippy + cargo test + git diff --check
+task039 [ ] goal:continue hardening audit for startup cleanup and WAL/resource bounds | scope:src/recovery.rs,src/wal.rs,src/db.rs,tests,.phrase/current.md,.phrase/evidence.md | verify:manual audit + focused tests if local risk appears + cargo fmt --check + cargo clippy + cargo test + git diff --check
 ```
 
 ## Known Blockers
 
-- None recorded for Phase 5.
+- Manifest publish failure no longer advances in-memory manifest state.
+- Startup cleanup and WAL/resource-bound hardening still need follow-up audit.
 
 ## Evidence To Record
 
-- API helper validation.
-- Example and docs alignment.
-
-## Next Phase Recommendation
-
-Start production hardening from an audit slice. Do not assume the first
-hardening change before checking operational failure modes.
+- Audit result with risk category.
+- Fix and regression test if the risk is local.
+- Follow-up startup cleanup and WAL/resource-bound audit result.

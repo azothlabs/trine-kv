@@ -91,7 +91,7 @@ storage contract.
 
 ### Phase 6: Production Hardening
 
-**Status**: Planned
+**Status**: In progress
 
 **Goal**: Audit and harden operational behavior after API polish lands.
 
@@ -99,4 +99,5 @@ storage contract.
 
 **Acceptance Gate**:
 
-- To be defined from fresh hardening evidence at phase start.
+- Operational failure-mode audit records concrete risks and verification.
+- Hardening changes are backed by focused tests before the phase closes.

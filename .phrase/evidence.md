@@ -1607,3 +1607,47 @@ Record only evidence that can change planning or durable decisions.
 
 - Start production hardening with an audit slice that checks operational failure
   modes before choosing code changes.
+
+## 2026-05-25: Manifest Publish Failure Hardening Passed
+
+### Observation
+
+- Production-hardening audit checked recovery, table/blob write, manifest
+  publish, process-lock, and WAL replay boundaries.
+- The first local risk found was in `ManifestStore`: manifest edits changed
+  in-memory state before the manifest file publish succeeded.
+- A failed publish could leave the running process believing a keyspace, table,
+  compaction edit, or WAL replay floor had advanced even though the on-disk
+  manifest had not.
+- `ManifestStore` now builds the next manifest state separately, publishes it,
+  and installs it in memory only after publish succeeds.
+- A regression test forces manifest publish failure by removing the parent
+  directory and verifies the in-memory manifest state remains unchanged.
+
+### Interpretation
+
+- Task038 is complete for the first production-hardening audit slice.
+- Risk category: local durability/metadata cutover bug.
+- The fix does not change the manifest format or public storage contract; it
+  tightens the existing atomic publish boundary.
+
+### Verification
+
+- Manual audit of recovery/table/blob/WAL/db publish paths
+- `cargo test manifest_state_stays_put_when_publish_fails`
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+- forbidden terminology scan over source, tests, phase notes, benchmark files,
+  docs, README, and examples
+
+### Remaining Blockers
+
+- Continue production-hardening audit for startup cleanup and WAL/resource
+  bounds.
+
+### Recommended Next Action
+
+- Audit startup cleanup and WAL decode/resource limits, then fix any local risk
+  with a focused regression test.

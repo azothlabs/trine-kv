@@ -136,9 +136,10 @@ impl ManifestStore {
             ));
         }
 
-        self.state.keyspaces.insert(name.clone(), options);
-        self.state.tables.entry(name).or_default();
-        publish_manifest(&self.path, &self.state)
+        let mut next_state = self.state.clone();
+        next_state.keyspaces.insert(name.clone(), options);
+        next_state.tables.entry(name).or_default();
+        self.publish_next_state(next_state)
     }
 
     pub fn next_table_id(&self) -> Result<TableId> {
@@ -158,15 +159,16 @@ impl ManifestStore {
             }
         }
 
+        let mut next_state = self.state.clone();
         for (keyspace, properties) in tables {
-            self.state
+            next_state
                 .tables
                 .entry(keyspace)
                 .or_default()
                 .push(properties);
         }
-        self.state.wal_replay_floor = wal_replay_floor;
-        publish_manifest(&self.path, &self.state)
+        next_state.wal_replay_floor = wal_replay_floor;
+        self.publish_next_state(next_state)
     }
 
     pub fn replace_tables(
@@ -211,9 +213,9 @@ impl ManifestStore {
             }
         }
 
+        let mut next_state = self.state.clone();
         for (keyspace, removed_table_ids, replacement) in replacements {
-            let tables = self
-                .state
+            let tables = next_state
                 .tables
                 .get_mut(&keyspace)
                 .ok_or_else(|| Error::Corruption {
@@ -225,12 +227,23 @@ impl ManifestStore {
             }
         }
 
-        publish_manifest(&self.path, &self.state)
+        self.publish_next_state(next_state)
     }
 
     pub fn update_wal_replay_floor(&mut self, sequence: Sequence) -> Result<()> {
-        self.state.wal_replay_floor = sequence;
-        publish_manifest(&self.path, &self.state)
+        let mut next_state = self.state.clone();
+        next_state.wal_replay_floor = sequence;
+        self.publish_next_state(next_state)
+    }
+
+    fn publish_next_state(&mut self, next_state: ManifestState) -> Result<()> {
+        // Manifest publish is the durable cutover point. Keep the in-memory
+        // state unchanged until the file publish succeeds, so a failed create,
+        // flush, or compaction cannot make later operations believe an edit was
+        // committed when the on-disk manifest never advanced.
+        publish_manifest(&self.path, &next_state)?;
+        self.state = next_state;
+        Ok(())
     }
 }
 
@@ -706,5 +719,49 @@ impl<'payload> Cursor<'payload> {
 
     const fn is_finished(&self) -> bool {
         self.offset == self.payload.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::{ManifestStore, manifest_path};
+    use crate::options::KeyspaceOptions;
+
+    #[test]
+    fn manifest_state_stays_put_when_publish_fails() {
+        let dir = temp_manifest_dir("publish-fails");
+        fs::create_dir_all(&dir).expect("create manifest test dir");
+        let path = manifest_path(&dir);
+        let mut store = ManifestStore::open_or_create(path, true).expect("manifest opens");
+
+        fs::remove_dir_all(&dir).expect("remove manifest parent to force publish failure");
+        let error = store
+            .create_keyspace("users".to_owned(), KeyspaceOptions::default())
+            .expect_err("publish should fail");
+        assert!(
+            error.to_string().contains("io error"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !store.state().keyspaces().contains_key("users"),
+            "failed publish must not advance in-memory manifest state"
+        );
+    }
+
+    fn temp_manifest_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "trine-kv-manifest-{name}-{}-{nonce}",
+            std::process::id()
+        ))
     }
 }
