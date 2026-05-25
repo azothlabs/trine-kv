@@ -8,6 +8,7 @@ use std::{
 
 use crate::{
     blob::ValueRef,
+    cache::{BlockCache, BlockCacheKey},
     codec::{self, CodecId},
     error::{Error, Result},
     filter::{PointKeyFilter, PrefixFilter},
@@ -290,6 +291,20 @@ impl TableDataBlock {
                 .is_none_or(|filter| filter.may_contain_query_prefix(prefix, extractor))
     }
 
+    fn estimated_bytes(&self, point_records: &[TablePointRecord]) -> u64 {
+        point_records
+            .get(self.record_range.clone())
+            .into_iter()
+            .flatten()
+            .map(|record| {
+                usize_to_u64_saturating(record.internal_key.user_key().len())
+                    .saturating_add(record.value.as_ref().map_or(0, ValueRef::len))
+                    .saturating_add(16)
+            })
+            .sum::<u64>()
+            .max(1)
+    }
+
     fn prefix_bounds_may_overlap(&self, prefix: &[u8]) -> bool {
         self.largest_internal_key.user_key() >= prefix
             && (self.smallest_internal_key.user_key().starts_with(prefix)
@@ -372,58 +387,116 @@ impl Table {
             })
     }
 
+    #[cfg(test)]
     pub(crate) fn point_records_for_key(
         &self,
         key: &[u8],
         policy: IndexSearchPolicy,
     ) -> Vec<&TablePointRecord> {
+        self.point_records_for_key_with_cache(key, policy, None)
+    }
+
+    pub(crate) fn point_records_for_key_with_cache(
+        &self,
+        key: &[u8],
+        policy: IndexSearchPolicy,
+        block_cache: Option<&BlockCache>,
+    ) -> Vec<&TablePointRecord> {
         let Some(start) = self.first_block_for_key(key, policy) else {
             return Vec::new();
         };
 
-        self.data_blocks[start..]
-            .iter()
-            .take_while(|block| block.smallest_internal_key.user_key() <= key)
-            .filter(|block| block.may_contain_key(key))
-            .flat_map(|block| block.point_records_for_key(&self.point_records, key, policy))
-            .collect()
+        let mut records = Vec::new();
+        for (offset, block) in self.data_blocks[start..].iter().enumerate() {
+            if block.smallest_internal_key.user_key() > key {
+                break;
+            }
+            if !block.may_contain_key(key) {
+                continue;
+            }
+            self.record_block_cache_access(block_cache, start + offset);
+            records.extend(block.point_records_for_key(&self.point_records, key, policy));
+        }
+        records
     }
 
+    #[cfg(test)]
     pub(crate) fn point_records_in_range(
         &self,
         range: &KeyRange,
         policy: IndexSearchPolicy,
     ) -> Vec<&TablePointRecord> {
+        self.point_records_in_range_with_cache(range, policy, None)
+    }
+
+    pub(crate) fn point_records_in_range_with_cache(
+        &self,
+        range: &KeyRange,
+        policy: IndexSearchPolicy,
+        block_cache: Option<&BlockCache>,
+    ) -> Vec<&TablePointRecord> {
         let Some(start) = self.first_block_for_range(range, policy) else {
             return Vec::new();
         };
 
-        self.data_blocks[start..]
-            .iter()
-            .take_while(|block| {
-                !key_is_after_end(block.smallest_internal_key.user_key(), &range.end)
-            })
-            .filter(|block| block.overlaps_range(range))
-            .flat_map(|block| block.point_records_in_range(&self.point_records, range, policy))
-            .collect()
+        let mut records = Vec::new();
+        for (offset, block) in self.data_blocks[start..].iter().enumerate() {
+            if key_is_after_end(block.smallest_internal_key.user_key(), &range.end) {
+                break;
+            }
+            if !block.overlaps_range(range) {
+                continue;
+            }
+            self.record_block_cache_access(block_cache, start + offset);
+            records.extend(block.point_records_in_range(&self.point_records, range, policy));
+        }
+        records
     }
 
+    #[cfg(test)]
     pub(crate) fn point_records_with_prefix(
         &self,
         prefix: &[u8],
         extractor: &PrefixExtractor,
         policy: IndexSearchPolicy,
     ) -> Vec<&TablePointRecord> {
+        self.point_records_with_prefix_with_cache(prefix, extractor, policy, None)
+    }
+
+    pub(crate) fn point_records_with_prefix_with_cache(
+        &self,
+        prefix: &[u8],
+        extractor: &PrefixExtractor,
+        policy: IndexSearchPolicy,
+        block_cache: Option<&BlockCache>,
+    ) -> Vec<&TablePointRecord> {
         let Some(start) = self.first_block_for_prefix(prefix, policy) else {
             return Vec::new();
         };
 
-        self.data_blocks[start..]
-            .iter()
-            .take_while(|block| block.prefix_bounds_may_overlap(prefix))
-            .filter(|block| block.may_contain_prefix(prefix, extractor))
-            .flat_map(|block| block.point_records_with_prefix(&self.point_records, prefix, policy))
-            .collect()
+        let mut records = Vec::new();
+        for (offset, block) in self.data_blocks[start..].iter().enumerate() {
+            if !block.prefix_bounds_may_overlap(prefix) {
+                break;
+            }
+            if !block.may_contain_prefix(prefix, extractor) {
+                continue;
+            }
+            self.record_block_cache_access(block_cache, start + offset);
+            records.extend(block.point_records_with_prefix(&self.point_records, prefix, policy));
+        }
+        records
+    }
+
+    fn record_block_cache_access(&self, block_cache: Option<&BlockCache>, block_index: usize) {
+        if let Some(block_cache) = block_cache {
+            let estimated_bytes =
+                self.data_blocks[block_index].estimated_bytes(&self.point_records);
+            block_cache.record_access(
+                BlockCacheKey::new(self.properties.id, block_index),
+                estimated_bytes,
+            );
+        }
     }
 
     #[must_use]
@@ -1631,6 +1704,13 @@ fn usize_to_u32(value: usize, field: &'static str) -> Result<u32> {
 
 fn usize_to_u64(value: usize, field: &'static str) -> Result<u64> {
     u64::try_from(value).map_err(|_| Error::invalid_options(format!("{field} exceeds u64::MAX")))
+}
+
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    match u64::try_from(value) {
+        Ok(value) => value,
+        Err(_) => u64::MAX,
+    }
 }
 
 fn read_u16_at(bytes: &[u8], offset: usize) -> Result<u16> {

@@ -809,6 +809,54 @@ fn persistent_stats_report_tables_blobs_and_compactions() {
 }
 
 #[test]
+fn persistent_block_cache_records_hits_and_misses() {
+    let path = temp_db_path("block-cache-stats");
+    let options = DbOptions::persistent(&path);
+
+    {
+        let db = Db::open(options).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+        for index in 0..64 {
+            keyspace
+                .insert(
+                    format!("key-{index:03}").as_bytes(),
+                    format!("value-{index:03}").as_bytes(),
+                )
+                .expect("write row");
+        }
+        db.flush().expect("flush table");
+
+        let stats = db.stats();
+        assert_eq!(stats.block_cache_hits, 0);
+        assert_eq!(stats.block_cache_misses, 0);
+
+        assert_eq!(
+            keyspace.get(b"key-032").expect("first cached read"),
+            Some(b"value-032".to_vec())
+        );
+        let stats = db.stats();
+        assert_eq!(stats.block_cache_hits, 0);
+        assert!(
+            stats.block_cache_misses > 0,
+            "first table block read should miss cache"
+        );
+        let misses = stats.block_cache_misses;
+
+        assert_eq!(
+            keyspace.get(b"key-032").expect("second cached read"),
+            Some(b"value-032".to_vec())
+        );
+        let stats = db.stats();
+        assert!(stats.block_cache_hits > 0);
+        assert_eq!(stats.block_cache_misses, misses);
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_flush_preserves_snapshot_versions() {
     let path = temp_db_path("flush-snapshot");
     let options = DbOptions::persistent(&path);

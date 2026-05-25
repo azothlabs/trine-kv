@@ -1348,3 +1348,38 @@ Record only evidence that can change planning or durable decisions.
 
 - Implement block cache behavior for table reads and expose cache hit/miss
   stats without changing visible read results.
+
+## 2026-05-25: Block Cache Stats Passed
+
+### Observation
+
+- `src/cache.rs` now contains a capacity-bounded block cache keyed by table id
+  and data block index, with hit and miss counters.
+- Table point, range, and prefix reads record data-block cache access when
+  `Db` supplies its block cache.
+- `DbStats` now includes block cache hit and miss counters.
+- Tests verify that a first table-block read records a miss, a second read of
+  the same key records a hit, and read results remain unchanged.
+
+### Interpretation
+
+- Task032 is complete for cache behavior in the current loaded-table model.
+- The cache boundary is ready for a future on-demand block reader; this slice
+  deliberately does not change visible read semantics.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Required benchmark outputs.
+- Durability documentation.
+
+### Recommended Next Action
+
+- Add a reproducible benchmark harness and record v1 benchmark output before
+  writing final durability documentation.

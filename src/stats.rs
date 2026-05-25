@@ -18,6 +18,8 @@ pub struct DbStats {
     pub compaction_output_tables: u64,
     pub compaction_input_bytes: u64,
     pub compaction_output_bytes: u64,
+    pub block_cache_hits: u64,
+    pub block_cache_misses: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

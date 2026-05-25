@@ -67,12 +67,13 @@ task028 [x] goal:table metadata records compaction levels and read ordering rema
 task029 [x] goal:compaction planning selects level-aware L0 inputs and overlapping lower-level tables | scope:src/compaction.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
 task030 [x] goal:flush path can trigger automatic compaction when L0 pressure exceeds configured limits | scope:src/db.rs,src/compaction.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
 task031 [x] goal:database stats expose table, L0, blob, and compaction counters from live state | scope:src/stats.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
-task032 [ ] goal:block cache records table block hits and misses without changing read results | scope:src/cache.rs,src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
+task032 [x] goal:block cache records table block hits and misses without changing read results | scope:src/cache.rs,src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
+task033 [ ] goal:required benchmark harness records reproducible benchmark output for v1 gates | scope:benches,docs,.phrase/current.md | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check + benchmark command
 ```
 
 ## Known Blockers
 
-- Cache behavior, benchmark output, and durability docs are incomplete.
+- Benchmark output and durability docs are incomplete.
 
 ## Evidence To Record
 
@@ -88,4 +89,5 @@ task032 [ ] goal:block cache records table block hits and misses without changin
 - Level-aware compaction planning validation results.
 - Automatic compaction trigger validation results.
 - Live stats validation results.
-- Remaining blocker category after task031.
+- Block-cache validation results.
+- Remaining blocker category after task032.

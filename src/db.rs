@@ -12,7 +12,7 @@ use std::{
 
 use crate::{
     blob::{self, ValueRef},
-    compaction,
+    cache, compaction,
     error::{Error, Result},
     internal_key::{InternalKey, ValueKind},
     iterator::{Direction, Iter},
@@ -47,6 +47,7 @@ pub(crate) struct DbInner {
     snapshots: Arc<SnapshotTracker>,
     manifest: Option<Mutex<ManifestStore>>,
     wal: Option<Mutex<WalWriter>>,
+    block_cache: cache::BlockCache,
     compaction_runs: AtomicU64,
     compaction_input_tables: AtomicU64,
     compaction_output_tables: AtomicU64,
@@ -134,6 +135,7 @@ impl Db {
     pub fn memory(mut options: DbOptions) -> Result<Self> {
         options.storage_mode = StorageMode::InMemory;
         validate_options(&options)?;
+        let block_cache_bytes = options.block_cache_bytes;
 
         Ok(Self {
             inner: Arc::new(DbInner {
@@ -146,6 +148,7 @@ impl Db {
                 snapshots: Arc::new(SnapshotTracker::default()),
                 manifest: None,
                 wal: None,
+                block_cache: cache::BlockCache::new(block_cache_bytes),
                 compaction_runs: AtomicU64::new(0),
                 compaction_input_tables: AtomicU64::new(0),
                 compaction_output_tables: AtomicU64::new(0),
@@ -157,6 +160,7 @@ impl Db {
 
     fn open_persistent(options: DbOptions) -> Result<Self> {
         validate_options(&options)?;
+        let block_cache_bytes = options.block_cache_bytes;
         let StorageMode::Persistent { path } = &options.storage_mode else {
             return Err(Error::invalid_options("persistent open requires a path"));
         };
@@ -215,6 +219,7 @@ impl Db {
                 snapshots: Arc::new(SnapshotTracker::default()),
                 manifest: Some(Mutex::new(manifest)),
                 wal,
+                block_cache: cache::BlockCache::new(block_cache_bytes),
                 compaction_runs: AtomicU64::new(0),
                 compaction_input_tables: AtomicU64::new(0),
                 compaction_output_tables: AtomicU64::new(0),
@@ -451,6 +456,9 @@ impl Db {
             compaction_output_bytes: self.inner.compaction_output_bytes.load(Ordering::Acquire),
             ..DbStats::default()
         };
+        let cache_stats = self.inner.block_cache.stats();
+        stats.block_cache_hits = cache_stats.hits;
+        stats.block_cache_misses = cache_stats.misses;
 
         let persistent_path = self.persistent_path();
         let mut level_stats = BTreeMap::<u32, LevelStats>::new();
@@ -562,12 +570,16 @@ impl Db {
         let _read_pin = self.inner.snapshots.pinned_snapshot(read_sequence);
 
         let state = self.keyspace_state(keyspace)?;
-        Ok(
-            collect_visible_point(&state, key, read_sequence, self.persistent_path())?
-                .into_iter()
-                .next()
-                .map(|item| item.value),
-        )
+        Ok(collect_visible_point(
+            &state,
+            key,
+            read_sequence,
+            self.persistent_path(),
+            Some(&self.inner.block_cache),
+        )?
+        .into_iter()
+        .next()
+        .map(|item| item.value))
     }
 
     pub(crate) fn range_at(
@@ -581,7 +593,13 @@ impl Db {
         let _read_pin = self.inner.snapshots.pinned_snapshot(read_sequence);
 
         let state = self.keyspace_state(keyspace)?;
-        let items = collect_visible_range(&state, range, read_sequence, self.persistent_path())?;
+        let items = collect_visible_range(
+            &state,
+            range,
+            read_sequence,
+            self.persistent_path(),
+            Some(&self.inner.block_cache),
+        )?;
 
         Ok(Iter::from_items(items, direction))
     }
@@ -597,8 +615,13 @@ impl Db {
         let _read_pin = self.inner.snapshots.pinned_snapshot(read_sequence);
 
         let state = self.keyspace_state(keyspace)?;
-        let mut items =
-            collect_visible_prefix(&state, prefix, read_sequence, self.persistent_path())?;
+        let mut items = collect_visible_prefix(
+            &state,
+            prefix,
+            read_sequence,
+            self.persistent_path(),
+            Some(&self.inner.block_cache),
+        )?;
         items.retain(|item| item.key.starts_with(prefix));
 
         Ok(Iter::from_items(items, direction))
@@ -1121,7 +1144,10 @@ fn add_obsolete_blob_stats(
 }
 
 fn usize_to_u64_saturating(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
+    match u64::try_from(value) {
+        Ok(value) => value,
+        Err(_) => u64::MAX,
+    }
 }
 
 fn sort_tables_for_reads(tables: &mut [Arc<Table>]) {
@@ -1298,6 +1324,7 @@ fn validate_batch_len(len: usize) -> Result<()> {
 fn collect_point_key_records(
     state: &KeyspaceState,
     key: &[u8],
+    block_cache: Option<&cache::BlockCache>,
 ) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
     let entries = state
         .entries
@@ -1320,7 +1347,11 @@ fn collect_point_key_records(
         }
         records.extend(
             table
-                .point_records_for_key(key, state.options.index_search_policy)
+                .point_records_for_key_with_cache(
+                    key,
+                    state.options.index_search_policy,
+                    block_cache,
+                )
                 .into_iter()
                 .map(|record| (record.internal_key.clone(), record.value.clone())),
         );
@@ -1333,6 +1364,7 @@ fn collect_point_key_records(
 fn collect_range_point_records(
     state: &KeyspaceState,
     range: &KeyRange,
+    block_cache: Option<&cache::BlockCache>,
 ) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
     let entries = state
         .entries
@@ -1352,7 +1384,11 @@ fn collect_range_point_records(
     for table in tables.iter() {
         records.extend(
             table
-                .point_records_in_range(range, state.options.index_search_policy)
+                .point_records_in_range_with_cache(
+                    range,
+                    state.options.index_search_policy,
+                    block_cache,
+                )
                 .into_iter()
                 .map(|record| (record.internal_key.clone(), record.value.clone())),
         );
@@ -1365,6 +1401,7 @@ fn collect_range_point_records(
 fn collect_prefix_point_records(
     state: &KeyspaceState,
     prefix: &[u8],
+    block_cache: Option<&cache::BlockCache>,
 ) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
     let entries = state
         .entries
@@ -1387,10 +1424,11 @@ fn collect_prefix_point_records(
         }
         records.extend(
             table
-                .point_records_with_prefix(
+                .point_records_with_prefix_with_cache(
                     prefix,
                     &state.options.prefix_extractor,
                     state.options.index_search_policy,
+                    block_cache,
                 )
                 .into_iter()
                 .map(|record| (record.internal_key.clone(), record.value.clone())),
@@ -1436,7 +1474,7 @@ fn point_key_modified_after(
 ) -> Result<bool> {
     // A point read is invalidated by either a newer point record for that user
     // key or a newer range tombstone covering it.
-    for (internal_key, _) in collect_point_key_records(state, key)? {
+    for (internal_key, _) in collect_point_key_records(state, key, None)? {
         if internal_key.sequence() > read_sequence {
             return Ok(true);
         }
@@ -1452,7 +1490,7 @@ fn key_range_modified_after(
 ) -> Result<bool> {
     // A range read is invalidated by any newer point record inside the range or
     // any newer range tombstone whose bounds overlap the range read.
-    for (internal_key, _) in collect_range_point_records(state, range)? {
+    for (internal_key, _) in collect_range_point_records(state, range, None)? {
         if internal_key.sequence() > read_sequence {
             return Ok(true);
         }
@@ -1469,8 +1507,9 @@ fn collect_visible_range(
     range: &KeyRange,
     read_sequence: Sequence,
     db_path: Option<&Path>,
+    block_cache: Option<&cache::BlockCache>,
 ) -> Result<Vec<KeyValue>> {
-    let point_records = collect_range_point_records(state, range)?;
+    let point_records = collect_range_point_records(state, range, block_cache)?;
     let range_tombstones = collect_range_tombstones(state)?;
     collect_visible_records(
         &point_records,
@@ -1486,8 +1525,9 @@ fn collect_visible_point(
     key: &[u8],
     read_sequence: Sequence,
     db_path: Option<&Path>,
+    block_cache: Option<&cache::BlockCache>,
 ) -> Result<Vec<KeyValue>> {
-    let point_records = collect_point_key_records(state, key)?;
+    let point_records = collect_point_key_records(state, key, block_cache)?;
     let range_tombstones = collect_range_tombstones(state)?;
     let point_range = KeyRange {
         start: Bound::Included(key.to_vec()),
@@ -1507,8 +1547,9 @@ fn collect_visible_prefix(
     prefix: &[u8],
     read_sequence: Sequence,
     db_path: Option<&Path>,
+    block_cache: Option<&cache::BlockCache>,
 ) -> Result<Vec<KeyValue>> {
-    let point_records = collect_prefix_point_records(state, prefix)?;
+    let point_records = collect_prefix_point_records(state, prefix, block_cache)?;
     let range_tombstones = collect_range_tombstones(state)?;
     collect_visible_records(
         &point_records,
