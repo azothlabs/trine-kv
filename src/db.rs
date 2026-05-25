@@ -417,12 +417,8 @@ impl Db {
         self.ensure_open()?;
 
         let state = self.keyspace_state(keyspace)?;
-        let point_range = KeyRange {
-            start: Bound::Included(key.to_vec()),
-            end: Bound::Included(key.to_vec()),
-        };
         Ok(
-            collect_visible_range(&state, &point_range, read_sequence, self.persistent_path())?
+            collect_visible_point(&state, key, read_sequence, self.persistent_path())?
                 .into_iter()
                 .next()
                 .map(|item| item.value),
@@ -817,6 +813,7 @@ fn validate_keyspace_options(options: &KeyspaceOptions) -> Result<()> {
 fn table_write_options(options: &KeyspaceOptions) -> table::TableWriteOptions {
     table::TableWriteOptions {
         codec: options.compression.codec_id(),
+        filter_policy: options.filter_policy,
         prefix_extractor: options.prefix_extractor.clone(),
         prefix_filter_policy: options.prefix_filter_policy,
         blob_threshold_bytes: options.blob_threshold_bytes,
@@ -853,6 +850,42 @@ fn collect_point_records(state: &KeyspaceState) -> Result<Vec<(InternalKey, Opti
             table
                 .point_records()
                 .iter()
+                .map(|record| (record.internal_key.clone(), record.value.clone())),
+        );
+    }
+    records.sort_by(|left, right| left.0.cmp(&right.0));
+
+    Ok(records)
+}
+
+fn collect_point_key_records(
+    state: &KeyspaceState,
+    key: &[u8],
+) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
+    let entries = state
+        .entries
+        .read()
+        .map_err(|_| lock_poisoned("memtable entries"))?;
+    let mut records = entries
+        .iter()
+        .filter(|(internal_key, _)| internal_key.user_key() == key)
+        .map(|(internal_key, value)| (internal_key.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    drop(entries);
+
+    let tables = state
+        .tables
+        .read()
+        .map_err(|_| lock_poisoned("table list"))?;
+    for table in tables.iter() {
+        if !table.may_contain_key(key) {
+            continue;
+        }
+        records.extend(
+            table
+                .point_records()
+                .iter()
+                .filter(|record| record.internal_key.user_key() == key)
                 .map(|record| (record.internal_key.clone(), record.value.clone())),
         );
     }
@@ -985,6 +1018,27 @@ fn collect_visible_range(
         &point_records,
         &range_tombstones,
         range,
+        read_sequence,
+        db_path,
+    )
+}
+
+fn collect_visible_point(
+    state: &KeyspaceState,
+    key: &[u8],
+    read_sequence: Sequence,
+    db_path: Option<&Path>,
+) -> Result<Vec<KeyValue>> {
+    let point_records = collect_point_key_records(state, key)?;
+    let range_tombstones = collect_range_tombstones(state)?;
+    let point_range = KeyRange {
+        start: Bound::Included(key.to_vec()),
+        end: Bound::Included(key.to_vec()),
+    };
+    collect_visible_records(
+        &point_records,
+        &range_tombstones,
+        &point_range,
         read_sequence,
         db_path,
     )

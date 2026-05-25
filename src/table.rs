@@ -9,9 +9,9 @@ use crate::{
     blob::ValueRef,
     codec::{self, CodecId},
     error::{Error, Result},
-    filter::PrefixFilter,
+    filter::{PointKeyFilter, PrefixFilter},
     internal_key::{InternalKey, ValueKind},
-    options::PrefixFilterPolicy,
+    options::{FilterPolicy, PrefixFilterPolicy},
     prefix::PrefixExtractor,
     types::{KeyRange, Sequence},
 };
@@ -40,6 +40,9 @@ const BOUND_EXCLUDED: u8 = 2;
 
 const PREFIX_FILTER_ABSENT: u8 = 0;
 const PREFIX_FILTER_PRESENT: u8 = 1;
+
+const POINT_KEY_FILTER_ABSENT: u8 = 0;
+const POINT_KEY_FILTER_PRESENT: u8 = 1;
 
 const PREFIX_EXTRACTOR_DISABLED: u8 = 0;
 const PREFIX_EXTRACTOR_FIXED_LEN: u8 = 1;
@@ -87,6 +90,7 @@ pub struct TableProperties {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableWriteOptions {
     pub(crate) codec: CodecId,
+    pub(crate) filter_policy: FilterPolicy,
     pub(crate) prefix_extractor: PrefixExtractor,
     pub(crate) prefix_filter_policy: PrefixFilterPolicy,
     pub(crate) blob_threshold_bytes: usize,
@@ -147,6 +151,7 @@ pub(crate) struct Table {
     properties: TableProperties,
     point_records: Vec<TablePointRecord>,
     range_tombstones: Vec<TableRangeTombstone>,
+    point_key_filter: Option<PointKeyFilter>,
     prefix_filter: Option<PrefixFilter>,
 }
 
@@ -164,6 +169,13 @@ impl Table {
     #[must_use]
     pub(crate) fn range_tombstones(&self) -> &[TableRangeTombstone] {
         &self.range_tombstones
+    }
+
+    #[must_use]
+    pub(crate) fn may_contain_key(&self, key: &[u8]) -> bool {
+        self.point_key_filter
+            .as_ref()
+            .is_none_or(|filter| filter.may_contain_key(key))
     }
 
     #[must_use]
@@ -213,6 +225,7 @@ pub(crate) fn write_table(
 
     let table = Table {
         properties: table_properties(table_id, options.codec, &point_records, range_tombstones),
+        point_key_filter: build_point_key_filter(options, &point_records),
         prefix_filter: build_prefix_filter(options, &point_records),
         point_records,
         range_tombstones: range_tombstones.to_vec(),
@@ -312,6 +325,21 @@ fn build_prefix_filter(
     )
 }
 
+fn build_point_key_filter(
+    options: &TableWriteOptions,
+    point_records: &[TablePointRecord],
+) -> Option<PointKeyFilter> {
+    if matches!(options.filter_policy, FilterPolicy::Disabled) {
+        return None;
+    }
+
+    Some(PointKeyFilter::from_keys(
+        point_records
+            .iter()
+            .map(|record| record.internal_key.user_key()),
+    ))
+}
+
 fn encode_table(table: &Table) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let codec = table.properties.codec;
@@ -405,7 +433,7 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
     let range_tombstones = decode_range_tombstone_block(&tombstone_payload)?;
     let (filter_codec, filter_payload) = read_single_block_section(payload, footer.filters)?;
     validate_block_codec(filter_codec, properties.codec, TableSection::Filters)?;
-    let prefix_filter = decode_filter_block(&filter_payload)?;
+    let (point_key_filter, prefix_filter) = decode_filter_block(&filter_payload)?;
     if properties
         != table_properties(
             properties.id,
@@ -423,6 +451,7 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
         properties,
         point_records,
         range_tombstones,
+        point_key_filter,
         prefix_filter,
     })
 }
@@ -552,6 +581,20 @@ fn encode_range_tombstone_block(table: &Table) -> Result<Vec<u8>> {
 
 fn encode_filter_block(table: &Table) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
+    match &table.point_key_filter {
+        None => put_u8(&mut bytes, POINT_KEY_FILTER_ABSENT),
+        Some(filter) => {
+            put_u8(&mut bytes, POINT_KEY_FILTER_PRESENT);
+            put_u32(
+                &mut bytes,
+                usize_to_u32(filter.keys().len(), "point-key filter entry count")?,
+            );
+            for key in filter.keys() {
+                put_bytes(&mut bytes, key)?;
+            }
+        }
+    }
+
     match &table.prefix_filter {
         None => put_u8(&mut bytes, PREFIX_FILTER_ABSENT),
         Some(filter) => {
@@ -803,8 +846,24 @@ fn decode_range_tombstone_block(bytes: &[u8]) -> Result<Vec<TableRangeTombstone>
     Ok(range_tombstones)
 }
 
-fn decode_filter_block(bytes: &[u8]) -> Result<Option<PrefixFilter>> {
+fn decode_filter_block(bytes: &[u8]) -> Result<(Option<PointKeyFilter>, Option<PrefixFilter>)> {
     let mut cursor = Cursor::new(bytes);
+    let point_key_filter = match cursor.read_u8()? {
+        POINT_KEY_FILTER_ABSENT => None,
+        POINT_KEY_FILTER_PRESENT => {
+            let key_count = cursor.read_u32()? as usize;
+            let keys = (0..key_count)
+                .map(|_| cursor.read_bytes().map(<[u8]>::to_vec))
+                .collect::<Result<Vec<_>>>()?;
+            Some(PointKeyFilter::from_sorted_keys(keys)?)
+        }
+        tag => {
+            return Err(Error::InvalidFormat {
+                message: format!("unknown table point-key filter tag {tag}"),
+            });
+        }
+    };
+
     let prefix_filter = match cursor.read_u8()? {
         PREFIX_FILTER_ABSENT => None,
         PREFIX_FILTER_PRESENT => {
@@ -824,7 +883,7 @@ fn decode_filter_block(bytes: &[u8]) -> Result<Option<PrefixFilter>> {
     if !cursor.is_finished() {
         return Err(invalid_table("trailing filter block bytes"));
     }
-    Ok(prefix_filter)
+    Ok((point_key_filter, prefix_filter))
 }
 
 fn validate_restart_points(
@@ -1304,6 +1363,7 @@ impl<'payload> Cursor<'payload> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filter::PointKeyFilter;
 
     #[test]
     fn checked_block_index_round_trips_multiple_data_blocks() {
@@ -1333,6 +1393,22 @@ mod tests {
     }
 
     #[test]
+    fn point_key_filter_round_trips_and_rejects_missing_keys() {
+        let mut table = table_with_records(8, CodecId::None);
+        table.point_key_filter = Some(PointKeyFilter::from_keys(
+            table
+                .point_records()
+                .iter()
+                .map(|record| record.internal_key.user_key()),
+        ));
+        let payload = encode_table(&table).expect("table encodes");
+        let decoded = decode_table(&table_file_bytes(&payload)).expect("table decodes");
+
+        assert!(decoded.may_contain_key(b"key-003"));
+        assert!(!decoded.may_contain_key(b"missing"));
+    }
+
+    #[test]
     fn unknown_data_block_codec_fails_closed() {
         let table = table_with_records(4, CodecId::None);
         let mut payload = encode_table(&table).expect("table encodes");
@@ -1359,6 +1435,7 @@ mod tests {
             properties: table_properties(TableId(7), codec, &point_records, &[]),
             point_records,
             range_tombstones: Vec::new(),
+            point_key_filter: None,
             prefix_filter: None,
         }
     }

@@ -737,3 +737,43 @@ Record only evidence that can change planning or durable decisions.
 
 - Start the next phase selection from the remaining blockers instead of adding
   more behavior to the completed current task list.
+
+## 2026-05-25: Point-Key Filter Table Skip Passed
+
+### Observation
+
+- Table filter sections now store point-key filters separately from prefix
+  filters.
+- Point reads use compatible point-key filters to skip table point records that
+  cannot contain the requested key.
+- Range tombstones are still collected from all tables before MVCC visibility is
+  decided, so a skipped table's tombstones can still hide older point records.
+- Tests cover point-key filter round trip, missing-key rejection, point-read
+  correctness when an otherwise skipped table carries a range tombstone, and
+  reopen from filtered tables.
+
+### Interpretation
+
+- Task017 is complete for point-key table skipping.
+- SSTable filter coverage now includes point-key and prefix filters, but the
+  read path still does not use block indexes/restart offsets for block-level
+  seek.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Block-level index seek and restart seek are still not used by point/range
+  reads.
+- Partitioned filters/indexes, blob cleanup, version cleanup, recovery reports,
+  and optimized search policies remain future blockers.
+
+### Recommended Next Action
+
+- Implement a table read path that uses index entries and restart offsets for
+  point/range candidate selection before adding optimized search policies.

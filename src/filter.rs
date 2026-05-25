@@ -15,6 +15,37 @@ pub struct PrefixFilterDescriptor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PointKeyFilter {
+    keys: BTreeSet<Vec<u8>>,
+}
+
+impl PointKeyFilter {
+    #[must_use]
+    pub(crate) fn from_keys<'key>(keys: impl IntoIterator<Item = &'key [u8]>) -> Self {
+        Self {
+            keys: keys.into_iter().map(<[u8]>::to_vec).collect(),
+        }
+    }
+
+    pub(crate) fn from_sorted_keys(keys: Vec<Vec<u8>>) -> Result<Self> {
+        validate_sorted_unique("point-key filter entries", &keys)?;
+        Ok(Self {
+            keys: keys.into_iter().collect(),
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn keys(&self) -> &BTreeSet<Vec<u8>> {
+        &self.keys
+    }
+
+    #[must_use]
+    pub(crate) fn may_contain_key(&self, key: &[u8]) -> bool {
+        self.keys.contains(key)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PrefixFilter {
     extractor: PrefixExtractor,
     prefixes: BTreeSet<Vec<u8>>,
@@ -45,18 +76,7 @@ impl PrefixFilter {
         extractor: PrefixExtractor,
         prefixes: Vec<Vec<u8>>,
     ) -> Result<Self> {
-        let mut previous = None;
-        for prefix in &prefixes {
-            if previous
-                .as_ref()
-                .is_some_and(|previous: &Vec<u8>| previous >= prefix)
-            {
-                return Err(crate::Error::InvalidFormat {
-                    message: "prefix filter entries are not sorted and unique".to_owned(),
-                });
-            }
-            previous = Some(prefix.clone());
-        }
+        validate_sorted_unique("prefix filter entries", &prefixes)?;
 
         Ok(Self {
             extractor,
@@ -88,4 +108,21 @@ impl PrefixFilter {
             .query_filter_prefix(query_prefix)
             .is_none_or(|prefix| self.prefixes.contains(prefix))
     }
+}
+
+fn validate_sorted_unique(label: &'static str, entries: &[Vec<u8>]) -> Result<()> {
+    let mut previous = None;
+    for entry in entries {
+        if previous
+            .as_ref()
+            .is_some_and(|previous: &Vec<u8>| previous >= entry)
+        {
+            return Err(crate::Error::InvalidFormat {
+                message: format!("{label} are not sorted and unique"),
+            });
+        }
+        previous = Some(entry.clone());
+    }
+
+    Ok(())
 }

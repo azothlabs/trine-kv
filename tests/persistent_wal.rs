@@ -555,6 +555,51 @@ fn persistent_prefix_filter_keeps_range_tombstones_authoritative() {
 }
 
 #[test]
+fn persistent_point_filter_keeps_range_tombstones_authoritative() {
+    let path = temp_db_path("point-filter-tombstones");
+    let options = DbOptions::persistent(&path);
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+
+        keyspace.insert(b"user:1", b"old").expect("write old user");
+        db.flush().expect("flush user table");
+
+        keyspace.insert(b"post:1", b"post").expect("write post");
+        keyspace
+            .remove_range(KeyRange::half_open(b"user:1", b"user:2"))
+            .expect("range delete user");
+        db.flush().expect("flush post table with user tombstone");
+
+        assert_eq!(keyspace.get(b"user:1").expect("user is hidden"), None);
+        assert_eq!(
+            keyspace.get(b"post:1").expect("post survives"),
+            Some(b"post".to_vec())
+        );
+    }
+
+    fs::remove_file(wal::wal_path(&path)).expect("remove WAL after point-filter flush");
+
+    {
+        let db = Db::open(options).expect("persistent db reopens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace reopens");
+
+        assert_eq!(keyspace.get(b"user:1").expect("user remains hidden"), None);
+        assert_eq!(
+            keyspace.get(b"post:1").expect("post survives reopen"),
+            Some(b"post".to_vec())
+        );
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_blob_values_survive_flush_reopen_and_compaction() {
     let path = temp_db_path("blob-values");
     let options = DbOptions::persistent(&path);
