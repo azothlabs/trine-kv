@@ -190,3 +190,81 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Implement snapshot-consistent in-memory range and prefix iteration.
+
+## 2026-05-25: In-Memory Range And Prefix Iteration Passed
+
+### Observation
+
+- In-memory range scans now return one newest visible live value per user key in
+  lexicographic order.
+- Prefix scans return only keys that start with the requested byte prefix.
+- Reverse range and reverse prefix scans share the same visible key set and only
+  reverse output order.
+- Snapshot range and prefix scans keep seeing older point versions after later
+  writes and point deletes.
+- Existing keyspace handles now reject mismatched options instead of silently
+  ignoring the new options.
+- Write batch operation count is checked before memtable writes begin, so batch
+  index conversion cannot cause partial application.
+
+### Interpretation
+
+- Task004 is complete.
+- The next correctness blocker is range delete support, because point reads,
+  range scans, prefix scans, and future compaction must all honor range
+  tombstones under the same MVCC visibility rule.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+
+### Remaining Blockers
+
+- Range deletes are still rejected by write batches.
+- Persistent WAL, SSTable flush/read, manifest, recovery, compaction,
+  compression crates, optimized index policies, blob files, and optimistic
+  transaction validation remain future blockers.
+
+### Recommended Next Action
+
+- Implement in-memory range deletes for point reads, range scans, and prefix
+  scans while preserving snapshot reads.
+
+## 2026-05-25: In-Memory Range Deletes Passed
+
+### Observation
+
+- In-memory range tombstones now carry range bounds, commit sequence, and
+  batch index.
+- Point reads, range scans, and prefix scans check visible range tombstones
+  before returning point values.
+- Snapshot reads still see values that were live before a later range delete.
+- Same-batch order is preserved: a later insert survives an earlier range
+  delete, and a later range delete hides an earlier insert.
+
+### Interpretation
+
+- Task005 is complete for in-memory behavior.
+- The next memory-engine correctness blocker is optimistic transaction
+  validation, because point and range read tracking must conflict with writes
+  and range deletes committed after the transaction read sequence.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+
+### Remaining Blockers
+
+- Optimistic transaction validation still returns unsupported.
+- Persistent WAL, SSTable flush/read, manifest, recovery, compaction,
+  compression crates, optimized index policies, and blob files remain future
+  blockers.
+
+### Recommended Next Action
+
+- Implement in-memory optimistic transaction point/range read conflict
+  validation.

@@ -27,6 +27,9 @@ Evidence notes should separate:
 - Do not pre-split future roadmap phases into tasks.
 - Do not read archive material by default.
 - Do not maintain mechanical per-file changelogs when the git diff is enough.
+- Write comments for non-obvious Rust engine invariants, especially lock order,
+  MVCC visibility, batch atomicity, and storage-format assumptions.
+- Prefer concrete storage-engine language in explanations and comments.
 
 ## Trine KV V1 Source Of Truth
 
@@ -53,3 +56,4 @@ A phase can close only when:
 - Full-history loading as the default agent behavior.
 - Static spec/plan/task/change bookkeeping for every session.
 - Treating stale plans as current truth after fresh evidence contradicts them.
+- Abstract jargon when plain engine terminology is clearer.

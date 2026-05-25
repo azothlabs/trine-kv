@@ -1,6 +1,6 @@
 use crate::{
     db::Db,
-    error::{Error, Result},
+    error::Result,
     iterator::{Direction, Iter},
     options::{KeyspaceOptions, WriteOptions},
     snapshot::Snapshot,
@@ -79,20 +79,76 @@ impl Keyspace {
         self.db.write(batch, WriteOptions::default()).map(|_| ())
     }
 
-    pub fn range(&self, _range: KeyRange) -> Result<Iter> {
-        self.db.ensure_open()?;
-        Err(Error::unsupported("range iteration is not implemented yet"))
+    pub fn range(&self, range: &KeyRange) -> Result<Iter> {
+        self.range_at_sequence(range, self.db.last_committed_sequence(), Direction::Forward)
     }
 
-    pub fn prefix(&self, _prefix: impl Into<Vec<u8>>) -> Result<Iter> {
-        self.db.ensure_open()?;
-        Err(Error::unsupported(
-            "prefix iteration is not implemented yet",
-        ))
+    pub fn range_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<Iter> {
+        self.range_at_sequence(range, snapshot.read_sequence(), Direction::Forward)
+    }
+
+    pub fn range_reverse(&self, range: &KeyRange) -> Result<Iter> {
+        self.range_at_sequence(range, self.db.last_committed_sequence(), Direction::Reverse)
+    }
+
+    pub fn range_reverse_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<Iter> {
+        self.range_at_sequence(range, snapshot.read_sequence(), Direction::Reverse)
+    }
+
+    pub fn prefix(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
+        let prefix = prefix.into();
+        self.prefix_at_sequence(
+            &prefix,
+            self.db.last_committed_sequence(),
+            Direction::Forward,
+        )
+    }
+
+    pub fn prefix_at(&self, snapshot: &Snapshot, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
+        let prefix = prefix.into();
+        self.prefix_at_sequence(&prefix, snapshot.read_sequence(), Direction::Forward)
+    }
+
+    pub fn prefix_reverse(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
+        let prefix = prefix.into();
+        self.prefix_at_sequence(
+            &prefix,
+            self.db.last_committed_sequence(),
+            Direction::Reverse,
+        )
+    }
+
+    pub fn prefix_reverse_at(
+        &self,
+        snapshot: &Snapshot,
+        prefix: impl Into<Vec<u8>>,
+    ) -> Result<Iter> {
+        let prefix = prefix.into();
+        self.prefix_at_sequence(&prefix, snapshot.read_sequence(), Direction::Reverse)
     }
 
     #[must_use]
     pub fn empty_iter(direction: Direction) -> Iter {
         Iter::empty(direction)
+    }
+
+    fn range_at_sequence(
+        &self,
+        range: &KeyRange,
+        read_sequence: crate::types::Sequence,
+        direction: Direction,
+    ) -> Result<Iter> {
+        self.db
+            .range_at(self.name.as_str(), range, read_sequence, direction)
+    }
+
+    fn prefix_at_sequence(
+        &self,
+        prefix: &[u8],
+        read_sequence: crate::types::Sequence,
+        direction: Direction,
+    ) -> Result<Iter> {
+        self.db
+            .prefix_at(self.name.as_str(), prefix, read_sequence, direction)
     }
 }

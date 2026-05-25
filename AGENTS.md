@@ -1,5 +1,7 @@
 # 重要约束
+
 - 写rust需要使用rust skill, 去 `.rust-skills`看
+- 不得使用物化，投影等不合时宜的词。
 
 # SPEC-AGENTS v3：证据校准的 Agent 工作流
 

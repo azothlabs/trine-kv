@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    ops::Bound,
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -10,12 +11,13 @@ use crate::{
     blob::ValueRef,
     error::{Error, Result},
     internal_key::{InternalKey, ValueKind},
+    iterator::{Direction, Iter},
     keyspace::{Keyspace, KeyspaceName},
     options::{DbOptions, KeyspaceOptions, StorageMode, WriteOptions},
     snapshot::Snapshot,
     stats::DbStats,
     transaction::{Transaction, TransactionOptions},
-    types::{CommitInfo, KeyRange, Sequence},
+    types::{CommitInfo, KeyRange, KeyValue, Sequence},
     write_batch::{BatchOperation, WriteBatch},
 };
 
@@ -37,6 +39,7 @@ pub(crate) struct DbInner {
 pub(crate) struct KeyspaceState {
     options: KeyspaceOptions,
     entries: RwLock<BTreeMap<InternalKey, Option<ValueRef>>>,
+    range_tombstones: RwLock<Vec<RangeTombstone>>,
 }
 
 impl KeyspaceState {
@@ -44,7 +47,32 @@ impl KeyspaceState {
         Self {
             options,
             entries: RwLock::new(BTreeMap::new()),
+            range_tombstones: RwLock::new(Vec::new()),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RangeTombstone {
+    range: KeyRange,
+    sequence: Sequence,
+    batch_index: u32,
+}
+
+impl RangeTombstone {
+    fn covers_visible_point(
+        &self,
+        key: &[u8],
+        point_sequence: Sequence,
+        point_batch_index: u32,
+        read_sequence: Sequence,
+    ) -> bool {
+        if self.sequence > read_sequence || !key_is_in_range(key, &self.range) {
+            return false;
+        }
+
+        self.sequence > point_sequence
+            || (self.sequence == point_sequence && self.batch_index > point_batch_index)
     }
 }
 
@@ -95,7 +123,14 @@ impl Db {
                 .map_err(|_| lock_poisoned("keyspace registry"))?;
 
             if let Some(state) = keyspaces.get(name.as_str()) {
-                drop(options);
+                // Opening an existing keyspace with different options would
+                // hide a manifest-level decision behind a harmless-looking
+                // handle lookup. Keep that explicit from the start.
+                if state.options != options {
+                    return Err(Error::invalid_options(
+                        "existing keyspace options do not match requested options",
+                    ));
+                }
                 state.options.clone()
             } else {
                 if self.inner.options.read_only {
@@ -171,6 +206,13 @@ impl Db {
             return Err(Error::ReadOnly);
         }
 
+        // Check every batch-wide precondition before taking the writer lock or
+        // touching memtables, so a rejected batch cannot leave partial state.
+        validate_batch_len(operations.len())?;
+
+        // The writer lock serializes commit sequence assignment and memtable
+        // updates. Reads only take keyspace/table read locks and do not enter
+        // this coordinator.
         let _writer = self
             .inner
             .writer
@@ -184,12 +226,20 @@ impl Db {
             })?;
         let states = self.resolve_batch_keyspaces(&operations)?;
 
-        for (batch_index, (operation, state)) in operations.into_iter().zip(states).enumerate() {
-            let batch_index = u32::try_from(batch_index).map_err(|_| Error::InvalidOptions {
-                message: "write batch operation count exceeds u32::MAX".to_owned(),
-            })?;
+        let indexed_operations = operations
+            .into_iter()
+            .zip(states)
+            .enumerate()
+            .map(|(batch_index, (operation, state))| {
+                let batch_index = u32::try_from(batch_index).map_err(|_| {
+                    Error::invalid_options("write batch operation count exceeds u32::MAX")
+                })?;
+                Ok((batch_index, operation, state))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-            apply_point_operation(&state, operation, sequence, batch_index)?;
+        for (batch_index, operation, state) in indexed_operations {
+            apply_memtable_operation(&state, operation, sequence, batch_index)?;
         }
 
         self.inner
@@ -246,16 +296,56 @@ impl Db {
             }
 
             return match internal_key.kind() {
-                ValueKind::Put => match value.as_ref().and_then(ValueRef::inline_bytes) {
-                    Some(bytes) => Ok(Some(bytes.to_vec())),
-                    None => Err(Error::unsupported("blob values are not implemented yet")),
-                },
+                ValueKind::Put => {
+                    if range_tombstone_covers(
+                        &state,
+                        internal_key.user_key(),
+                        internal_key.sequence(),
+                        internal_key.batch_index(),
+                        read_sequence,
+                    )? {
+                        return Ok(None);
+                    }
+
+                    inline_value(value.as_ref()).map(|bytes| Some(bytes.to_vec()))
+                }
                 ValueKind::PointDelete => Ok(None),
                 ValueKind::RangeDelete => continue,
             };
         }
 
         Ok(None)
+    }
+
+    pub(crate) fn range_at(
+        &self,
+        keyspace: &str,
+        range: &KeyRange,
+        read_sequence: Sequence,
+        direction: Direction,
+    ) -> Result<Iter> {
+        self.ensure_open()?;
+
+        let state = self.keyspace_state(keyspace)?;
+        let items = collect_visible_range(&state, range, read_sequence)?;
+
+        Ok(Iter::from_items(items, direction))
+    }
+
+    pub(crate) fn prefix_at(
+        &self,
+        keyspace: &str,
+        prefix: &[u8],
+        read_sequence: Sequence,
+        direction: Direction,
+    ) -> Result<Iter> {
+        self.ensure_open()?;
+
+        let state = self.keyspace_state(keyspace)?;
+        let mut items = collect_visible_range(&state, &KeyRange::all(), read_sequence)?;
+        items.retain(|item| item.key.starts_with(prefix));
+
+        Ok(Iter::from_items(items, direction))
     }
 
     fn keyspace_state(&self, keyspace: &str) -> Result<Arc<KeyspaceState>> {
@@ -285,10 +375,6 @@ impl Db {
         let mut states = Vec::with_capacity(operations.len());
 
         for operation in operations {
-            if matches!(operation, BatchOperation::RemoveRange { .. }) {
-                return Err(Error::unsupported("range deletes are not implemented yet"));
-            }
-
             let state = keyspaces
                 .get(operation.keyspace())
                 .cloned()
@@ -335,7 +421,120 @@ fn validate_keyspace_options(options: &KeyspaceOptions) -> Result<()> {
     Ok(())
 }
 
-fn apply_point_operation(
+fn validate_batch_len(len: usize) -> Result<()> {
+    if len > u32::MAX as usize {
+        return Err(Error::InvalidOptions {
+            message: "write batch operation count exceeds u32::MAX".to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+// This scan is deliberately small-scope: it applies the same user-visible MVCC
+// rule that table readers and merge iterators must later share. The first
+// visible internal record for a user key decides whether that key is returned.
+fn collect_visible_range(
+    state: &KeyspaceState,
+    range: &KeyRange,
+    read_sequence: Sequence,
+) -> Result<Vec<KeyValue>> {
+    let entries = state
+        .entries
+        .read()
+        .map_err(|_| lock_poisoned("memtable entries"))?;
+    let mut items = Vec::new();
+    let mut decided_user_key: Option<Vec<u8>> = None;
+
+    for (internal_key, value) in entries.iter() {
+        let user_key = internal_key.user_key();
+
+        // Internal keys are sorted by user key ascending, then newest visible
+        // version first. Once a visible record decides a user key, older
+        // versions for that same key cannot change the scan result.
+        if decided_user_key.as_deref() == Some(user_key) {
+            continue;
+        }
+        if key_is_before_start(user_key, &range.start) {
+            continue;
+        }
+        if key_is_after_end(user_key, &range.end) {
+            break;
+        }
+        if internal_key.sequence() > read_sequence {
+            continue;
+        }
+
+        match internal_key.kind() {
+            ValueKind::Put => {
+                if !range_tombstone_covers(
+                    state,
+                    user_key,
+                    internal_key.sequence(),
+                    internal_key.batch_index(),
+                    read_sequence,
+                )? {
+                    items.push(KeyValue::new(
+                        user_key.to_vec(),
+                        inline_value(value.as_ref())?.to_vec(),
+                    ));
+                }
+                decided_user_key = Some(user_key.to_vec());
+            }
+            ValueKind::PointDelete => {
+                decided_user_key = Some(user_key.to_vec());
+            }
+            ValueKind::RangeDelete => {}
+        }
+    }
+
+    Ok(items)
+}
+
+fn inline_value(value: Option<&ValueRef>) -> Result<&[u8]> {
+    value
+        .and_then(ValueRef::inline_bytes)
+        .ok_or_else(|| Error::unsupported("blob values are not implemented yet"))
+}
+
+fn key_is_before_start(key: &[u8], start: &Bound<Vec<u8>>) -> bool {
+    match start {
+        Bound::Included(start) => key < start.as_slice(),
+        Bound::Excluded(start) => key <= start.as_slice(),
+        Bound::Unbounded => false,
+    }
+}
+
+fn key_is_after_end(key: &[u8], end: &Bound<Vec<u8>>) -> bool {
+    match end {
+        Bound::Included(end) => key > end.as_slice(),
+        Bound::Excluded(end) => key >= end.as_slice(),
+        Bound::Unbounded => false,
+    }
+}
+
+fn key_is_in_range(key: &[u8], range: &KeyRange) -> bool {
+    !key_is_before_start(key, &range.start) && !key_is_after_end(key, &range.end)
+}
+
+fn range_tombstone_covers(
+    state: &KeyspaceState,
+    key: &[u8],
+    point_sequence: Sequence,
+    point_batch_index: u32,
+    read_sequence: Sequence,
+) -> Result<bool> {
+    let range_tombstones = state
+        .range_tombstones
+        .read()
+        .map_err(|_| lock_poisoned("range tombstones"))?;
+
+    Ok(range_tombstones.iter().any(|tombstone| {
+        tombstone.covers_visible_point(key, point_sequence, point_batch_index, read_sequence)
+    }))
+}
+
+fn apply_memtable_operation(
     state: &KeyspaceState,
     operation: BatchOperation,
     sequence: Sequence,
@@ -359,8 +558,20 @@ fn apply_point_operation(
                 None,
             );
         }
-        BatchOperation::RemoveRange { .. } => {
-            return Err(Error::unsupported("range deletes are not implemented yet"));
+        BatchOperation::RemoveRange { range, .. } => {
+            // Range tombstones live beside point records for now. Drop the
+            // point-record lock before taking the tombstone lock so readers and
+            // writers keep one simple lock order.
+            drop(entries);
+            let mut range_tombstones = state
+                .range_tombstones
+                .write()
+                .map_err(|_| lock_poisoned("range tombstones"))?;
+            range_tombstones.push(RangeTombstone {
+                range,
+                sequence,
+                batch_index,
+            });
         }
     }
 
