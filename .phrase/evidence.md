@@ -421,3 +421,47 @@ Record only evidence that can change planning or durable decisions.
 
 - Implement a small SSTable writer/reader for flushed memtable contents, then
   publish table metadata and advance the WAL replay floor through the manifest.
+
+## 2026-05-25: First SSTable Flush And Read Passed
+
+### Observation
+
+- `Db::flush()` now writes per-keyspace table files for current point records
+  and range tombstones in persistent mode.
+- The manifest records table metadata and advances the WAL replay floor in the
+  same publish step after all table files are written.
+- Persistent open loads manifest table metadata, verifies table properties
+  against the referenced table file, and installs the table before WAL replay.
+- Point reads, range/prefix scans, transaction conflict checks, and snapshots
+  now read from both memtables and loaded table files.
+- Flush clears the memtable only after the table file is written, the manifest
+  is published, and the table is installed in the current process.
+- Tests remove the WAL after flush and confirm reopen still reads point
+  values, point deletes, and range deletes from the table file.
+- Snapshot tests confirm versions written before flush remain visible at older
+  read sequences.
+
+### Interpretation
+
+- Task010 is complete for the first table-file slice.
+- The next blocker is recovery hardening for table files, especially missing
+  files, checksum mismatch, and manifest/table metadata mismatch.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- The table format is still a simple checked file, not the full block/index
+  SSTable layout from the v1 protocol.
+- Table recovery hardening, recovery reports, compaction, blob files,
+  compression crates, and optimized search policies remain future blockers.
+
+### Recommended Next Action
+
+- Add table corruption and missing-table recovery tests, then tighten startup
+  errors before moving into compaction.

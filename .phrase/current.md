@@ -45,17 +45,18 @@ task006 [x] goal:optimistic transaction point/range read conflict validation wor
 task007 [x] goal:persistent mode writes committed batches to WAL and replays them on reopen | scope:src/db.rs,src/wal.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 task008 [x] goal:WAL recovery handles torn tail and fails closed on checksum corruption | scope:src/wal.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 task009 [x] goal:manifest persists keyspace creation/options and WAL replay floor | scope:src/manifest.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
-task010 [ ] goal:memtable flush writes readable SSTable files and advances manifest replay floor | scope:src/table.rs,src/db.rs,src/manifest.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
+task010 [x] goal:memtable flush writes readable SSTable files and advances manifest replay floor | scope:src/table.rs,src/db.rs,src/manifest.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
+task011 [ ] goal:SSTable recovery fails closed on missing/corrupt table files | scope:src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 ```
 
 ## Known Blockers
 
-- SSTable flush/read, table manifest edits, recovery reports, compaction, blob
-  files, compression crates, and optimized search policies are not implemented
-  yet.
+- SSTable block/index layout, table recovery hardening, recovery reports,
+  compaction, blob files, compression crates, and optimized search policies are
+  not implemented yet.
 
 ## Evidence To Record
 
 - Phase 2 scaffold gate results.
-- SSTable flush/read validation results.
-- Remaining blocker category after first table files.
+- Table recovery hardening validation results.
+- Remaining blocker category after table corruption coverage.

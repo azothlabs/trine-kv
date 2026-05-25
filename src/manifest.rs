@@ -6,12 +6,13 @@ use std::{
 };
 
 use crate::{
+    codec::CodecId,
     error::{Error, Result},
     options::{
         CompressionProfile, FilterPolicy, IndexSearchPolicy, KeyspaceOptions, PrefixFilterPolicy,
     },
     prefix::PrefixExtractor,
-    table::TableId,
+    table::{TableId, TableProperties},
     types::Sequence,
 };
 
@@ -32,7 +33,7 @@ pub enum ManifestEdit {
     },
     AddTable {
         keyspace: String,
-        table_id: TableId,
+        properties: TableProperties,
     },
     RemoveTable {
         keyspace: String,
@@ -47,6 +48,7 @@ pub enum ManifestEdit {
 pub struct ManifestState {
     wal_replay_floor: Sequence,
     keyspaces: BTreeMap<String, KeyspaceOptions>,
+    tables: BTreeMap<String, Vec<TableProperties>>,
 }
 
 impl ManifestState {
@@ -55,6 +57,7 @@ impl ManifestState {
         Self {
             wal_replay_floor: Sequence::ZERO,
             keyspaces: BTreeMap::new(),
+            tables: BTreeMap::new(),
         }
     }
 
@@ -66,6 +69,27 @@ impl ManifestState {
     #[must_use]
     pub fn keyspaces(&self) -> &BTreeMap<String, KeyspaceOptions> {
         &self.keyspaces
+    }
+
+    #[must_use]
+    pub fn tables(&self) -> &BTreeMap<String, Vec<TableProperties>> {
+        &self.tables
+    }
+
+    pub fn next_table_id(&self) -> Result<TableId> {
+        let highest = self
+            .tables
+            .values()
+            .flat_map(|tables| tables.iter().map(|properties| properties.id.get()))
+            .max()
+            .unwrap_or(0);
+
+        highest
+            .checked_add(1)
+            .map(TableId)
+            .ok_or_else(|| Error::Corruption {
+                message: "table id counter overflow".to_owned(),
+            })
     }
 }
 
@@ -112,7 +136,36 @@ impl ManifestStore {
             ));
         }
 
-        self.state.keyspaces.insert(name, options);
+        self.state.keyspaces.insert(name.clone(), options);
+        self.state.tables.entry(name).or_default();
+        publish_manifest(&self.path, &self.state)
+    }
+
+    pub fn next_table_id(&self) -> Result<TableId> {
+        self.state.next_table_id()
+    }
+
+    pub fn add_tables(
+        &mut self,
+        tables: Vec<(String, TableProperties)>,
+        wal_replay_floor: Sequence,
+    ) -> Result<()> {
+        for (keyspace, _) in &tables {
+            if !self.state.keyspaces.contains_key(keyspace) {
+                return Err(Error::Corruption {
+                    message: format!("table references missing keyspace: {keyspace}"),
+                });
+            }
+        }
+
+        for (keyspace, properties) in tables {
+            self.state
+                .tables
+                .entry(keyspace)
+                .or_default()
+                .push(properties);
+        }
+        self.state.wal_replay_floor = wal_replay_floor;
         publish_manifest(&self.path, &self.state)
     }
 
@@ -168,6 +221,7 @@ fn encode_state(state: &ManifestState) -> Result<Vec<u8>> {
         put_bytes(&mut bytes, name.as_bytes())?;
         put_keyspace_options(&mut bytes, options)?;
     }
+    put_tables(&mut bytes, &state.tables)?;
 
     Ok(bytes)
 }
@@ -221,6 +275,7 @@ fn decode_state(payload: &[u8]) -> Result<ManifestState> {
         let options = cursor.read_keyspace_options()?;
         keyspaces.insert(name, options);
     }
+    let tables = cursor.read_tables()?;
 
     if !cursor.is_finished() {
         return Err(invalid_manifest("trailing payload bytes"));
@@ -229,6 +284,7 @@ fn decode_state(payload: &[u8]) -> Result<ManifestState> {
     Ok(ManifestState {
         wal_replay_floor,
         keyspaces,
+        tables,
     })
 }
 
@@ -307,6 +363,45 @@ fn put_index_search_policy(bytes: &mut Vec<u8>, value: IndexSearchPolicy) {
             IndexSearchPolicy::Eytzinger => 2,
             IndexSearchPolicy::GallopingWithHint => 3,
             IndexSearchPolicy::Auto => 4,
+        },
+    );
+}
+
+fn put_tables(bytes: &mut Vec<u8>, tables: &BTreeMap<String, Vec<TableProperties>>) -> Result<()> {
+    let table_keyspace_count = u32::try_from(tables.len())
+        .map_err(|_| Error::invalid_options("too many table keyspaces for manifest"))?;
+    put_u32(bytes, table_keyspace_count);
+
+    for (keyspace, table_list) in tables {
+        put_bytes(bytes, keyspace.as_bytes())?;
+        let table_count = u32::try_from(table_list.len())
+            .map_err(|_| Error::invalid_options("too many tables for manifest keyspace"))?;
+        put_u32(bytes, table_count);
+        for properties in table_list {
+            put_table_properties(bytes, properties)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn put_table_properties(bytes: &mut Vec<u8>, properties: &TableProperties) -> Result<()> {
+    put_u64(bytes, properties.id.get());
+    put_bytes(bytes, &properties.smallest_user_key)?;
+    put_bytes(bytes, &properties.largest_user_key)?;
+    put_u64(bytes, properties.smallest_sequence.get());
+    put_u64(bytes, properties.largest_sequence.get());
+    put_codec(bytes, properties.codec);
+    Ok(())
+}
+
+fn put_codec(bytes: &mut Vec<u8>, codec: CodecId) {
+    put_u8(
+        bytes,
+        match codec {
+            CodecId::None => 0,
+            CodecId::FastLz4Block => 1,
+            CodecId::CompactZlib => 2,
         },
     );
 }
@@ -442,6 +537,38 @@ impl<'payload> Cursor<'payload> {
         })
     }
 
+    fn read_tables(&mut self) -> Result<BTreeMap<String, Vec<TableProperties>>> {
+        let table_keyspace_count = self.read_u32()? as usize;
+        let mut tables = BTreeMap::new();
+
+        for _ in 0..table_keyspace_count {
+            let keyspace = String::from_utf8(self.read_bytes()?.to_vec()).map_err(|_| {
+                Error::InvalidFormat {
+                    message: "manifest table keyspace is not valid UTF-8".to_owned(),
+                }
+            })?;
+            let table_count = self.read_u32()? as usize;
+            let mut table_list = Vec::with_capacity(table_count);
+            for _ in 0..table_count {
+                table_list.push(self.read_table_properties()?);
+            }
+            tables.insert(keyspace, table_list);
+        }
+
+        Ok(tables)
+    }
+
+    fn read_table_properties(&mut self) -> Result<TableProperties> {
+        Ok(TableProperties {
+            id: TableId(self.read_u64()?),
+            smallest_user_key: self.read_bytes()?.to_vec(),
+            largest_user_key: self.read_bytes()?.to_vec(),
+            smallest_sequence: Sequence::new(self.read_u64()?),
+            largest_sequence: Sequence::new(self.read_u64()?),
+            codec: self.read_codec()?,
+        })
+    }
+
     fn read_compression_profile(&mut self) -> Result<CompressionProfile> {
         match self.read_u8()? {
             0 => Ok(CompressionProfile::None),
@@ -505,6 +632,17 @@ impl<'payload> Cursor<'payload> {
             4 => Ok(IndexSearchPolicy::Auto),
             tag => Err(Error::InvalidFormat {
                 message: format!("unknown manifest index search policy {tag}"),
+            }),
+        }
+    }
+
+    fn read_codec(&mut self) -> Result<CodecId> {
+        match self.read_u8()? {
+            0 => Ok(CodecId::None),
+            1 => Ok(CodecId::FastLz4Block),
+            2 => Ok(CodecId::CompactZlib),
+            tag => Err(Error::UnsupportedFormat {
+                message: format!("unknown manifest table codec {tag}"),
             }),
         }
     }

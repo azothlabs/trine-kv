@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     ops::Bound,
+    path::Path,
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -17,6 +18,7 @@ use crate::{
     options::{DbOptions, DurabilityMode, KeyspaceOptions, StorageMode},
     snapshot::Snapshot,
     stats::DbStats,
+    table::{self, Table, TableRangeTombstone},
     transaction::{Transaction, TransactionOptions},
     types::{KeyRange, KeyValue, Sequence},
     wal::{self, WalWriter},
@@ -46,14 +48,16 @@ pub(crate) struct KeyspaceState {
     options: KeyspaceOptions,
     entries: RwLock<BTreeMap<InternalKey, Option<ValueRef>>>,
     range_tombstones: RwLock<Vec<RangeTombstone>>,
+    tables: RwLock<Vec<Arc<Table>>>,
 }
 
 impl KeyspaceState {
-    fn new(options: KeyspaceOptions) -> Self {
+    fn new(options: KeyspaceOptions, tables: Vec<Arc<Table>>) -> Self {
         Self {
             options,
             entries: RwLock::new(BTreeMap::new()),
             range_tombstones: RwLock::new(Vec::new()),
+            tables: RwLock::new(tables),
         }
     }
 }
@@ -80,6 +84,13 @@ impl RangeTombstone {
         self.sequence > point_sequence
             || (self.sequence == point_sequence && self.batch_index > point_batch_index)
     }
+}
+
+struct FlushInput {
+    keyspace: String,
+    table_id: table::TableId,
+    point_records: Vec<(InternalKey, Option<ValueRef>)>,
+    range_tombstones: Vec<TableRangeTombstone>,
 }
 
 impl Db {
@@ -129,7 +140,7 @@ impl Db {
             options.create_if_missing && !options.read_only,
         )?;
         let replay_floor = manifest.state().wal_replay_floor();
-        let keyspaces = keyspaces_from_manifest(manifest.state())?;
+        let keyspaces = keyspaces_from_manifest(path, manifest.state())?;
 
         let wal_path = wal::wal_path(path);
         let batches = wal::read_batches(&wal_path)?;
@@ -202,7 +213,7 @@ impl Db {
                 let keyspace_options = options.clone();
                 keyspaces.insert(
                     name.as_str().to_owned(),
-                    Arc::new(KeyspaceState::new(options)),
+                    Arc::new(KeyspaceState::new(options, Vec::new())),
                 );
                 keyspace_options
             }
@@ -229,7 +240,45 @@ impl Db {
 
     pub fn flush(&self) -> Result<()> {
         self.ensure_open()?;
-        Err(Error::unsupported("memtable flush is not implemented yet"))
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+
+        let StorageMode::Persistent { path } = &self.inner.options.storage_mode else {
+            return Ok(());
+        };
+        let db_path = path.clone();
+        let flush_sequence = self.last_committed_sequence();
+
+        // Flush holds the writer coordinator while it copies and clears
+        // memtables. That gives the manifest edit and the in-memory table list
+        // one clear cutover point relative to commits.
+        let _writer = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| lock_poisoned("writer coordinator"))?;
+        let flush_inputs = self.collect_flush_inputs()?;
+        if flush_inputs.is_empty() {
+            return Ok(());
+        }
+
+        let mut written_tables = Vec::with_capacity(flush_inputs.len());
+        for input in &flush_inputs {
+            let table_path = table::table_path(&db_path, input.table_id);
+            let table = table::write_table(
+                &table_path,
+                input.table_id,
+                &input.point_records,
+                &input.range_tombstones,
+            )?;
+            written_tables.push((input.keyspace.clone(), Arc::new(table)));
+        }
+
+        self.publish_flushed_tables(&written_tables, flush_sequence)?;
+        self.install_flushed_tables(&flush_inputs, written_tables)?;
+
+        Ok(())
     }
 
     pub fn compact_range(&self, _range: KeyRange) -> Result<()> {
@@ -292,42 +341,14 @@ impl Db {
         self.ensure_open()?;
 
         let state = self.keyspace_state(keyspace)?;
-        let entries = state
-            .entries
-            .read()
-            .map_err(|_| lock_poisoned("memtable entries"))?;
-
-        for (internal_key, value) in entries.iter() {
-            match internal_key.user_key().cmp(key) {
-                std::cmp::Ordering::Less => continue,
-                std::cmp::Ordering::Greater => break,
-                std::cmp::Ordering::Equal => {}
-            }
-
-            if internal_key.sequence() > read_sequence {
-                continue;
-            }
-
-            return match internal_key.kind() {
-                ValueKind::Put => {
-                    if range_tombstone_covers(
-                        &state,
-                        internal_key.user_key(),
-                        internal_key.sequence(),
-                        internal_key.batch_index(),
-                        read_sequence,
-                    )? {
-                        return Ok(None);
-                    }
-
-                    inline_value(value.as_ref()).map(|bytes| Some(bytes.to_vec()))
-                }
-                ValueKind::PointDelete => Ok(None),
-                ValueKind::RangeDelete => continue,
-            };
-        }
-
-        Ok(None)
+        let point_range = KeyRange {
+            start: Bound::Included(key.to_vec()),
+            end: Bound::Included(key.to_vec()),
+        };
+        Ok(collect_visible_range(&state, &point_range, read_sequence)?
+            .into_iter()
+            .next()
+            .map(|item| item.value))
     }
 
     pub(crate) fn range_at(
@@ -423,6 +444,119 @@ impl Db {
 
         Ok(states)
     }
+
+    fn collect_flush_inputs(&self) -> Result<Vec<FlushInput>> {
+        let mut next_table_id = self.next_table_id()?;
+        let keyspaces = self
+            .inner
+            .keyspaces
+            .read()
+            .map_err(|_| lock_poisoned("keyspace registry"))?;
+        let mut inputs = Vec::new();
+
+        for (name, state) in keyspaces.iter() {
+            let point_records = {
+                let entries = state
+                    .entries
+                    .read()
+                    .map_err(|_| lock_poisoned("memtable entries"))?;
+                entries
+                    .iter()
+                    .map(|(internal_key, value)| (internal_key.clone(), value.clone()))
+                    .collect::<Vec<_>>()
+            };
+            let range_tombstones = {
+                let tombstones = state
+                    .range_tombstones
+                    .read()
+                    .map_err(|_| lock_poisoned("range tombstones"))?;
+                tombstones
+                    .iter()
+                    .map(|tombstone| TableRangeTombstone {
+                        range: tombstone.range.clone(),
+                        sequence: tombstone.sequence,
+                        batch_index: tombstone.batch_index,
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            if point_records.is_empty() && range_tombstones.is_empty() {
+                continue;
+            }
+
+            inputs.push(FlushInput {
+                keyspace: name.clone(),
+                table_id: next_table_id,
+                point_records,
+                range_tombstones,
+            });
+            next_table_id = next_table_id.next().ok_or_else(|| Error::Corruption {
+                message: "table id counter overflow".to_owned(),
+            })?;
+        }
+
+        Ok(inputs)
+    }
+
+    fn next_table_id(&self) -> Result<table::TableId> {
+        self.inner
+            .manifest
+            .as_ref()
+            .ok_or_else(|| Error::Corruption {
+                message: "persistent database is missing manifest store".to_owned(),
+            })?
+            .lock()
+            .map_err(|_| lock_poisoned("manifest store"))?
+            .next_table_id()
+    }
+
+    fn publish_flushed_tables(
+        &self,
+        tables: &[(String, Arc<Table>)],
+        flush_sequence: Sequence,
+    ) -> Result<()> {
+        let edits = tables
+            .iter()
+            .map(|(keyspace, table)| (keyspace.clone(), table.properties().clone()))
+            .collect::<Vec<_>>();
+        self.inner
+            .manifest
+            .as_ref()
+            .ok_or_else(|| Error::Corruption {
+                message: "persistent database is missing manifest store".to_owned(),
+            })?
+            .lock()
+            .map_err(|_| lock_poisoned("manifest store"))?
+            .add_tables(edits, flush_sequence)
+    }
+
+    fn install_flushed_tables(
+        &self,
+        inputs: &[FlushInput],
+        tables: Vec<(String, Arc<Table>)>,
+    ) -> Result<()> {
+        for (input, (keyspace, table)) in inputs.iter().zip(tables) {
+            debug_assert_eq!(input.keyspace, keyspace);
+            let state = self.keyspace_state(&keyspace)?;
+            state
+                .tables
+                .write()
+                .map_err(|_| lock_poisoned("table list"))?
+                .push(table);
+            state
+                .entries
+                .write()
+                .map_err(|_| lock_poisoned("memtable entries"))?
+                .clear();
+            state
+                .range_tombstones
+                .write()
+                .map_err(|_| lock_poisoned("range tombstones"))?
+                .clear();
+        }
+
+        Ok(())
+    }
 }
 
 fn validate_options(options: &DbOptions) -> Result<()> {
@@ -448,13 +582,32 @@ fn validate_options(options: &DbOptions) -> Result<()> {
 }
 
 fn keyspaces_from_manifest(
+    db_path: &Path,
     manifest: &ManifestState,
 ) -> Result<BTreeMap<String, Arc<KeyspaceState>>> {
     let mut keyspaces = BTreeMap::new();
 
     for (name, options) in manifest.keyspaces() {
         validate_keyspace_options(options)?;
-        keyspaces.insert(name.clone(), Arc::new(KeyspaceState::new(options.clone())));
+        let mut tables = Vec::new();
+        for properties in manifest.tables().get(name).into_iter().flatten() {
+            let table_path = table::table_path(db_path, properties.id);
+            let table = table::read_table(&table_path)?;
+            if table.properties() != properties {
+                return Err(Error::Corruption {
+                    message: format!(
+                        "manifest properties do not match table {}",
+                        properties.id.get()
+                    ),
+                });
+            }
+            tables.push(Arc::new(table));
+        }
+
+        keyspaces.insert(
+            name.clone(),
+            Arc::new(KeyspaceState::new(options.clone(), tables)),
+        );
     }
 
     Ok(keyspaces)
@@ -481,6 +634,62 @@ fn validate_batch_len(len: usize) -> Result<()> {
     Ok(())
 }
 
+fn collect_point_records(state: &KeyspaceState) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
+    let entries = state
+        .entries
+        .read()
+        .map_err(|_| lock_poisoned("memtable entries"))?;
+    let mut records = entries
+        .iter()
+        .map(|(internal_key, value)| (internal_key.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    drop(entries);
+
+    let tables = state
+        .tables
+        .read()
+        .map_err(|_| lock_poisoned("table list"))?;
+    for table in tables.iter() {
+        records.extend(
+            table
+                .point_records()
+                .iter()
+                .map(|record| (record.internal_key.clone(), record.value.clone())),
+        );
+    }
+    records.sort_by(|left, right| left.0.cmp(&right.0));
+
+    Ok(records)
+}
+
+fn collect_range_tombstones(state: &KeyspaceState) -> Result<Vec<RangeTombstone>> {
+    let range_tombstones = state
+        .range_tombstones
+        .read()
+        .map_err(|_| lock_poisoned("range tombstones"))?;
+    let mut tombstones = range_tombstones.clone();
+    drop(range_tombstones);
+
+    let tables = state
+        .tables
+        .read()
+        .map_err(|_| lock_poisoned("table list"))?;
+    for table in tables.iter() {
+        tombstones.extend(
+            table
+                .range_tombstones()
+                .iter()
+                .map(|tombstone| RangeTombstone {
+                    range: tombstone.range.clone(),
+                    sequence: tombstone.sequence,
+                    batch_index: tombstone.batch_index,
+                }),
+        );
+    }
+
+    Ok(tombstones)
+}
+
 fn point_key_modified_after(
     state: &KeyspaceState,
     key: &[u8],
@@ -488,12 +697,7 @@ fn point_key_modified_after(
 ) -> Result<bool> {
     // A point read is invalidated by either a newer point record for that user
     // key or a newer range tombstone covering it.
-    let entries = state
-        .entries
-        .read()
-        .map_err(|_| lock_poisoned("memtable entries"))?;
-
-    for (internal_key, _) in entries.iter() {
+    for (internal_key, _) in collect_point_records(state)? {
         match internal_key.user_key().cmp(key) {
             std::cmp::Ordering::Less => {}
             std::cmp::Ordering::Greater => break,
@@ -504,7 +708,6 @@ fn point_key_modified_after(
             }
         }
     }
-    drop(entries);
 
     range_tombstone_modified_after_key(state, key, read_sequence)
 }
@@ -516,12 +719,7 @@ fn key_range_modified_after(
 ) -> Result<bool> {
     // A range read is invalidated by any newer point record inside the range or
     // any newer range tombstone whose bounds overlap the range read.
-    let entries = state
-        .entries
-        .read()
-        .map_err(|_| lock_poisoned("memtable entries"))?;
-
-    for (internal_key, _) in entries.iter() {
+    for (internal_key, _) in collect_point_records(state)? {
         let user_key = internal_key.user_key();
         if key_is_before_start(user_key, &range.start) {
             continue;
@@ -533,7 +731,6 @@ fn key_range_modified_after(
             return Ok(true);
         }
     }
-    drop(entries);
 
     range_tombstone_modified_after_range(state, range, read_sequence)
 }
@@ -546,14 +743,12 @@ fn collect_visible_range(
     range: &KeyRange,
     read_sequence: Sequence,
 ) -> Result<Vec<KeyValue>> {
-    let entries = state
-        .entries
-        .read()
-        .map_err(|_| lock_poisoned("memtable entries"))?;
+    let point_records = collect_point_records(state)?;
+    let range_tombstones = collect_range_tombstones(state)?;
     let mut items = Vec::new();
     let mut decided_user_key: Option<Vec<u8>> = None;
 
-    for (internal_key, value) in entries.iter() {
+    for (internal_key, value) in &point_records {
         let user_key = internal_key.user_key();
 
         // Internal keys are sorted by user key ascending, then newest visible
@@ -574,13 +769,13 @@ fn collect_visible_range(
 
         match internal_key.kind() {
             ValueKind::Put => {
-                if !range_tombstone_covers(
-                    state,
+                if !range_tombstones_cover(
+                    &range_tombstones,
                     user_key,
                     internal_key.sequence(),
                     internal_key.batch_index(),
                     read_sequence,
-                )? {
+                ) {
                     items.push(KeyValue::new(
                         user_key.to_vec(),
                         inline_value(value.as_ref())?.to_vec(),
@@ -624,21 +819,16 @@ fn key_is_in_range(key: &[u8], range: &KeyRange) -> bool {
     !key_is_before_start(key, &range.start) && !key_is_after_end(key, &range.end)
 }
 
-fn range_tombstone_covers(
-    state: &KeyspaceState,
+fn range_tombstones_cover(
+    range_tombstones: &[RangeTombstone],
     key: &[u8],
     point_sequence: Sequence,
     point_batch_index: u32,
     read_sequence: Sequence,
-) -> Result<bool> {
-    let range_tombstones = state
-        .range_tombstones
-        .read()
-        .map_err(|_| lock_poisoned("range tombstones"))?;
-
-    Ok(range_tombstones.iter().any(|tombstone| {
+) -> bool {
+    range_tombstones.iter().any(|tombstone| {
         tombstone.covers_visible_point(key, point_sequence, point_batch_index, read_sequence)
-    }))
+    })
 }
 
 fn range_tombstone_modified_after_key(
@@ -646,10 +836,7 @@ fn range_tombstone_modified_after_key(
     key: &[u8],
     read_sequence: Sequence,
 ) -> Result<bool> {
-    let range_tombstones = state
-        .range_tombstones
-        .read()
-        .map_err(|_| lock_poisoned("range tombstones"))?;
+    let range_tombstones = collect_range_tombstones(state)?;
 
     Ok(range_tombstones.iter().any(|tombstone| {
         tombstone.sequence > read_sequence && key_is_in_range(key, &tombstone.range)
@@ -661,10 +848,7 @@ fn range_tombstone_modified_after_range(
     range: &KeyRange,
     read_sequence: Sequence,
 ) -> Result<bool> {
-    let range_tombstones = state
-        .range_tombstones
-        .read()
-        .map_err(|_| lock_poisoned("range tombstones"))?;
+    let range_tombstones = collect_range_tombstones(state)?;
 
     Ok(range_tombstones.iter().any(|tombstone| {
         tombstone.sequence > read_sequence && ranges_overlap(range, &tombstone.range)
