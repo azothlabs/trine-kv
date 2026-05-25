@@ -33,6 +33,24 @@ fn point_writes_deletes_and_snapshot_reads_are_mvcc_visible() {
 }
 
 #[test]
+fn snapshots_pin_and_release_read_sequences() {
+    let db = Db::memory(DbOptions::memory()).expect("memory db opens");
+    assert_eq!(db.stats().active_snapshots, 0);
+
+    let snapshot = db.snapshot();
+    assert_eq!(db.stats().active_snapshots, 1);
+
+    let snapshot_clone = snapshot.clone();
+    assert_eq!(db.stats().active_snapshots, 2);
+
+    drop(snapshot_clone);
+    assert_eq!(db.stats().active_snapshots, 1);
+
+    drop(snapshot);
+    assert_eq!(db.stats().active_snapshots, 0);
+}
+
+#[test]
 fn write_batch_commits_multiple_keyspaces_at_one_sequence() {
     let db = Db::memory(DbOptions::memory()).expect("memory db opens");
     let users = db

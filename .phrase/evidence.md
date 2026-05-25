@@ -858,3 +858,44 @@ Record only evidence that can change planning or durable decisions.
 
 - Implement snapshot-safe version cleanup in compaction before blob cleanup, so
   blob files can later be removed only after no live table references them.
+
+## 2026-05-25: Snapshot-Safe Point-Version Cleanup Passed
+
+### Observation
+
+- `Snapshot` now pins its read sequence through a shared tracker owned by the
+  database; cloning a snapshot adds a pin, and dropping it releases the pin.
+- `Db::stats()` now reports active snapshot handles.
+- Manual compaction now computes the oldest active snapshot sequence and cleans
+  point records per user key: it keeps every version newer than that sequence
+  and the newest record at or below it.
+- If there is no active snapshot, compaction uses the latest committed sequence
+  as the cleanup floor and keeps only the newest point record per user key.
+- Tests cover snapshot pin clone/drop counts, active-snapshot floor cleanup,
+  no-old-snapshot cleanup, point tombstone preservation as the newest record,
+  and the existing persistent snapshot-through-compaction behavior.
+
+### Interpretation
+
+- Task020 is complete for snapshot-safe point-version cleanup.
+- Range tombstone and point tombstone cleanup rules are still separate because
+  they require checking whether older covered records remain in the relevant
+  compaction scope.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Tombstone cleanup, obsolete-file detection, blob cleanup, partitioned
+  filters/indexes, and optimized search policies remain future blockers.
+
+### Recommended Next Action
+
+- Implement tombstone cleanup under the same snapshot safety boundary, keeping
+  tombstones whenever older covered data may still exist in the compaction
+  scope.

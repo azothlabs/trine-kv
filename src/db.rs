@@ -18,7 +18,7 @@ use crate::{
     manifest::{self, ManifestState, ManifestStore},
     options::{DbOptions, DurabilityMode, FailOnCorruptionPolicy, KeyspaceOptions, StorageMode},
     recovery,
-    snapshot::Snapshot,
+    snapshot::{Snapshot, SnapshotTracker},
     stats::DbStats,
     table::{self, Table, TableRangeTombstone},
     transaction::{Transaction, TransactionOptions},
@@ -41,6 +41,7 @@ pub(crate) struct DbInner {
     closed: AtomicBool,
     writer: Mutex<()>,
     keyspaces: RwLock<BTreeMap<String, Arc<KeyspaceState>>>,
+    snapshots: Arc<SnapshotTracker>,
     manifest: Option<Mutex<ManifestStore>>,
     wal: Option<Mutex<WalWriter>>,
 }
@@ -130,6 +131,7 @@ impl Db {
                 closed: AtomicBool::new(false),
                 writer: Mutex::new(()),
                 keyspaces: RwLock::new(BTreeMap::new()),
+                snapshots: Arc::new(SnapshotTracker::default()),
                 manifest: None,
                 wal: None,
             }),
@@ -181,6 +183,7 @@ impl Db {
                 closed: AtomicBool::new(false),
                 writer: Mutex::new(()),
                 keyspaces: RwLock::new(keyspaces),
+                snapshots: Arc::new(SnapshotTracker::default()),
                 manifest: Some(Mutex::new(manifest)),
                 wal,
             }),
@@ -328,7 +331,8 @@ impl Db {
             .writer
             .lock()
             .map_err(|_| lock_poisoned("writer coordinator"))?;
-        let compaction_inputs = self.collect_compaction_inputs(&range)?;
+        let oldest_active_snapshot = self.oldest_active_snapshot_sequence();
+        let compaction_inputs = self.collect_compaction_inputs(&range, oldest_active_snapshot)?;
         if compaction_inputs.is_empty() {
             return Ok(());
         }
@@ -371,7 +375,9 @@ impl Db {
 
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
-        Snapshot::new(self.last_committed_sequence())
+        self.inner
+            .snapshots
+            .pinned_snapshot(self.last_committed_sequence())
     }
 
     #[must_use]
@@ -389,6 +395,7 @@ impl Db {
 
         DbStats {
             live_keyspaces,
+            active_snapshots: self.inner.snapshots.active_count(),
             ..DbStats::default()
         }
     }
@@ -401,6 +408,12 @@ impl Db {
     #[must_use]
     pub fn last_committed_sequence(&self) -> Sequence {
         Sequence::new(self.inner.last_sequence.load(Ordering::Acquire))
+    }
+
+    fn oldest_active_snapshot_sequence(&self) -> Sequence {
+        self.inner
+            .snapshots
+            .oldest_active_or(self.last_committed_sequence())
     }
 
     pub fn close(&self) {
@@ -588,7 +601,11 @@ impl Db {
         Ok(inputs)
     }
 
-    fn collect_compaction_inputs(&self, range: &KeyRange) -> Result<Vec<CompactionInput>> {
+    fn collect_compaction_inputs(
+        &self,
+        range: &KeyRange,
+        oldest_active_snapshot: Sequence,
+    ) -> Result<Vec<CompactionInput>> {
         let mut next_table_id = self.next_table_id()?;
         let keyspaces = self
             .inner
@@ -627,6 +644,7 @@ impl Db {
                 );
                 range_tombstones.extend(table.range_tombstones().iter().cloned());
             }
+            let point_records = compact_point_records(point_records, oldest_active_snapshot);
 
             inputs.push(CompactionInput {
                 keyspace: name.clone(),
@@ -825,6 +843,36 @@ fn table_write_options(options: &KeyspaceOptions) -> table::TableWriteOptions {
         prefix_filter_policy: options.prefix_filter_policy,
         blob_threshold_bytes: options.blob_threshold_bytes,
     }
+}
+
+fn compact_point_records(
+    mut point_records: Vec<(InternalKey, Option<ValueRef>)>,
+    oldest_active_snapshot: Sequence,
+) -> Vec<(InternalKey, Option<ValueRef>)> {
+    point_records.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut compacted = Vec::with_capacity(point_records.len());
+    let mut current_user_key: Option<Vec<u8>> = None;
+    let mut kept_floor_version = false;
+
+    for record in point_records {
+        if current_user_key.as_deref() != Some(record.0.user_key()) {
+            current_user_key = Some(record.0.user_key().to_vec());
+            kept_floor_version = false;
+        }
+
+        // Keep all versions newer than the oldest active snapshot, because a
+        // later reader may still need them. At or below the oldest active
+        // snapshot, only the newest record for that user key can be observed.
+        if record.0.sequence() > oldest_active_snapshot {
+            compacted.push(record);
+        } else if !kept_floor_version {
+            compacted.push(record);
+            kept_floor_version = true;
+        }
+    }
+
+    compacted
 }
 
 fn validate_batch_len(len: usize) -> Result<()> {
@@ -1285,4 +1333,72 @@ fn remove_table_files(db_path: &Path, table_ids: &[table::TableId]) -> Result<()
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InternalKey, ValueKind, ValueRef, compact_point_records};
+    use crate::types::Sequence;
+
+    #[test]
+    fn compaction_keeps_newer_versions_and_snapshot_floor() {
+        let compacted = compact_point_records(
+            vec![
+                record("a", 1),
+                record("a", 3),
+                record("a", 2),
+                record("b", 1),
+                record("b", 2),
+            ],
+            Sequence::new(2),
+        );
+
+        assert_eq!(
+            record_sequences(&compacted),
+            vec![("a", 3), ("a", 2), ("b", 2)]
+        );
+    }
+
+    #[test]
+    fn compaction_without_old_snapshot_keeps_only_newest_record_per_key() {
+        let compacted = compact_point_records(
+            vec![
+                record("a", 1),
+                record("a", 4),
+                record("a", 3),
+                tombstone("b", 2),
+                record("b", 1),
+            ],
+            Sequence::new(4),
+        );
+
+        assert_eq!(record_sequences(&compacted), vec![("a", 4), ("b", 2)]);
+        assert!(matches!(compacted[1].0.kind(), ValueKind::PointDelete));
+    }
+
+    fn record(key: &str, sequence: u64) -> (InternalKey, Option<ValueRef>) {
+        (
+            InternalKey::new(key, Sequence::new(sequence), ValueKind::Put, 0),
+            Some(ValueRef::Inline(format!("{key}-{sequence}").into_bytes())),
+        )
+    }
+
+    fn tombstone(key: &str, sequence: u64) -> (InternalKey, Option<ValueRef>) {
+        (
+            InternalKey::new(key, Sequence::new(sequence), ValueKind::PointDelete, 0),
+            None,
+        )
+    }
+
+    fn record_sequences(records: &[(InternalKey, Option<ValueRef>)]) -> Vec<(&str, u64)> {
+        records
+            .iter()
+            .map(|(internal_key, _)| {
+                (
+                    std::str::from_utf8(internal_key.user_key()).expect("test key is UTF-8"),
+                    internal_key.sequence().get(),
+                )
+            })
+            .collect()
+    }
 }
