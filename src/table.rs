@@ -307,6 +307,15 @@ impl Table {
         &self.range_tombstones
     }
 
+    pub(crate) fn blob_file_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.point_records
+            .iter()
+            .filter_map(|record| match record.value.as_ref() {
+                Some(ValueRef::Blob { file_id, .. }) => Some(*file_id),
+                Some(ValueRef::Inline(_)) | None => None,
+            })
+    }
+
     pub(crate) fn point_records_for_key(&self, key: &[u8]) -> Vec<&TablePointRecord> {
         self.data_blocks
             .iter()

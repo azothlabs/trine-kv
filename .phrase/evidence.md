@@ -939,3 +939,43 @@ Record only evidence that can change planning or durable decisions.
 
 - Implement blob cleanup by scanning live table references after compaction and
   removing unreferenced blob files only after manifest publish succeeds.
+
+## 2026-05-25: Blob Cleanup Passed
+
+### Observation
+
+- Manual compaction now scans live table blob references after manifest publish
+  and the in-memory table switch.
+- Blob files not referenced by the live table set are removed after obsolete
+  compacted table files are removed.
+- Blob removal is skipped while any snapshot or short read pin is active, so a
+  reader holding an older table handle cannot lose a referenced blob file.
+- Point, range, and prefix read paths now create short read pins around visible
+  record collection and blob reads.
+- Tests cover compaction removing the blob file for a dropped old version,
+  compaction removing the blob file after a delete-only cleanup, and reopen
+  after cleanup.
+
+### Interpretation
+
+- Task022 is complete for post-compaction blob cleanup in the current manual
+  compaction model.
+- Startup obsolete-file detection remains separate because recovery needs a
+  deterministic audit of unreferenced files before opening or repairing.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Obsolete-file detection, partitioned filters/indexes, and optimized search
+  policies remain future blockers.
+
+### Recommended Next Action
+
+- Implement obsolete-file detection during persistent startup, reporting
+  unreferenced table/blob files without weakening fail-closed recovery behavior.

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -48,6 +49,38 @@ impl ValueRef {
 #[must_use]
 pub fn blob_path(db_path: &Path, file_id: u64) -> PathBuf {
     db_path.join(format!("blob-{file_id:020}.{BLOB_FILE_EXTENSION}",))
+}
+
+pub(crate) fn list_blob_file_ids(db_path: &Path) -> Result<BTreeSet<u64>> {
+    let mut file_ids = BTreeSet::new();
+
+    for entry in fs::read_dir(db_path)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+
+        let path = entry.path();
+        let has_blob_extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case(BLOB_FILE_EXTENSION));
+        if !has_blob_extension {
+            continue;
+        }
+
+        let Some(file_id) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.strip_prefix("blob-"))
+            .and_then(|id| id.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        file_ids.insert(file_id);
+    }
+
+    Ok(file_ids)
 }
 
 pub(crate) fn write_large_values(

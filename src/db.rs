@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     ops::Bound,
     path::Path,
@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::{
-    blob::ValueRef,
+    blob::{self, ValueRef},
     error::{Error, Result},
     internal_key::{InternalKey, ValueKind},
     iterator::{Direction, Iter},
@@ -374,6 +374,7 @@ impl Db {
 
         self.install_compacted_tables(written_tables)?;
         remove_table_files(&db_path, &obsolete_table_ids)?;
+        self.remove_unreferenced_blob_files(&db_path)?;
 
         Ok(())
     }
@@ -440,6 +441,7 @@ impl Db {
         read_sequence: Sequence,
     ) -> Result<Option<Vec<u8>>> {
         self.ensure_open()?;
+        let _read_pin = self.inner.snapshots.pinned_snapshot(read_sequence);
 
         let state = self.keyspace_state(keyspace)?;
         Ok(
@@ -458,6 +460,7 @@ impl Db {
         direction: Direction,
     ) -> Result<Iter> {
         self.ensure_open()?;
+        let _read_pin = self.inner.snapshots.pinned_snapshot(read_sequence);
 
         let state = self.keyspace_state(keyspace)?;
         let items = collect_visible_range(&state, range, read_sequence, self.persistent_path())?;
@@ -473,6 +476,7 @@ impl Db {
         direction: Direction,
     ) -> Result<Iter> {
         self.ensure_open()?;
+        let _read_pin = self.inner.snapshots.pinned_snapshot(read_sequence);
 
         let state = self.keyspace_state(keyspace)?;
         let mut items =
@@ -765,6 +769,51 @@ impl Db {
             tables.retain(|table| !output.input_table_ids.contains(&table.properties().id));
             if let Some(table) = output.table {
                 tables.push(table);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn live_blob_file_ids(&self) -> Result<BTreeSet<u64>> {
+        let keyspaces = self
+            .inner
+            .keyspaces
+            .read()
+            .map_err(|_| lock_poisoned("keyspace registry"))?;
+        let mut file_ids = BTreeSet::new();
+
+        for state in keyspaces.values() {
+            let tables = state
+                .tables
+                .read()
+                .map_err(|_| lock_poisoned("table list"))?;
+            for table in tables.iter() {
+                file_ids.extend(table.blob_file_ids());
+            }
+        }
+
+        Ok(file_ids)
+    }
+
+    fn remove_unreferenced_blob_files(&self, db_path: &Path) -> Result<()> {
+        // This pass runs after manifest publish and the in-memory table switch.
+        // A snapshot or short read pin may still hold an older Arc<Table>, so
+        // skip deletion when any pin exists; a later compaction can retry.
+        if self.inner.snapshots.active_count() != 0 {
+            return Ok(());
+        }
+
+        let live_file_ids = self.live_blob_file_ids()?;
+        for file_id in blob::list_blob_file_ids(db_path)? {
+            if live_file_ids.contains(&file_id) {
+                continue;
+            }
+
+            match fs::remove_file(blob::blob_path(db_path, file_id)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(Error::Io(error)),
             }
         }
 

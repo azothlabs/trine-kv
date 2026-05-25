@@ -50,7 +50,7 @@ fn collect_rows(iter: trine_kv::Iter) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 fn blob_file_paths(path: &std::path::Path) -> Vec<PathBuf> {
-    fs::read_dir(path)
+    let mut paths = fs::read_dir(path)
         .expect("read test db directory")
         .map(|entry| entry.expect("read directory entry").path())
         .filter(|path| {
@@ -58,7 +58,9 @@ fn blob_file_paths(path: &std::path::Path) -> Vec<PathBuf> {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with("blob-"))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
 }
 
 fn table_file_paths(path: &std::path::Path) -> Vec<PathBuf> {
@@ -811,6 +813,112 @@ fn persistent_reopen_fails_when_blob_file_is_missing() {
 
     let error = Db::open(options).expect_err("missing blob file fails closed");
     assert!(matches!(error, Error::Corruption { .. }));
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_compaction_removes_blob_files_for_dropped_versions() {
+    let path = temp_db_path("compact-dropped-blob-versions");
+    let options = DbOptions::persistent(&path);
+    let keyspace_options = KeyspaceOptions {
+        blob_threshold_bytes: 8,
+        ..KeyspaceOptions::default()
+    };
+    let old_value = b"large-value-a-old-large-value-a-old".to_vec();
+    let new_value = b"large-value-a-new-large-value-a-new".to_vec();
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", keyspace_options.clone())
+            .expect("keyspace opens");
+
+        keyspace
+            .insert(b"a", old_value)
+            .expect("write old blob value");
+        db.flush().expect("flush old blob table");
+        keyspace
+            .insert(b"a", new_value.clone())
+            .expect("write new blob value");
+        db.flush().expect("flush new blob table");
+        assert_eq!(blob_file_paths(&path).len(), 2);
+
+        db.compact_range(KeyRange::all())
+            .expect("manual compaction removes dropped blob");
+
+        assert_eq!(
+            keyspace.get(b"a").expect("current blob reads"),
+            Some(new_value.clone())
+        );
+        assert_eq!(
+            blob_file_paths(&path).len(),
+            1,
+            "only the live blob file should remain"
+        );
+    }
+
+    fs::remove_file(wal::wal_path(&path)).expect("remove WAL after blob cleanup");
+
+    {
+        let db = Db::open(options).expect("persistent db reopens after blob cleanup");
+        let keyspace = db
+            .keyspace("default", keyspace_options)
+            .expect("keyspace reopens");
+        assert_eq!(keyspace.get(b"a").expect("blob reopens"), Some(new_value));
+        assert_eq!(blob_file_paths(&path).len(), 1);
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_compaction_removes_blob_files_after_delete_cleanup() {
+    let path = temp_db_path("compact-deleted-blob");
+    let options = DbOptions::persistent(&path);
+    let keyspace_options = KeyspaceOptions {
+        blob_threshold_bytes: 8,
+        ..KeyspaceOptions::default()
+    };
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", keyspace_options.clone())
+            .expect("keyspace opens");
+
+        keyspace
+            .insert(b"a", b"large-value-a-large-value-a".to_vec())
+            .expect("write blob value");
+        db.flush().expect("flush blob table");
+        keyspace.remove(b"a").expect("delete blob key");
+        db.flush().expect("flush delete table");
+        assert_eq!(blob_file_paths(&path).len(), 1);
+
+        db.compact_range(KeyRange::all())
+            .expect("manual compaction removes deleted blob");
+
+        assert_eq!(keyspace.get(b"a").expect("deleted key reads missing"), None);
+        assert!(
+            blob_file_paths(&path).is_empty(),
+            "deleted blob file should be removed"
+        );
+        assert!(
+            table_file_paths(&path).is_empty(),
+            "empty compaction output should leave no table files"
+        );
+    }
+
+    fs::remove_file(wal::wal_path(&path)).expect("remove WAL after deleted blob cleanup");
+
+    {
+        let db = Db::open(options).expect("persistent db reopens after deleted blob cleanup");
+        let keyspace = db
+            .keyspace("default", keyspace_options)
+            .expect("keyspace reopens");
+        assert_eq!(keyspace.get(b"a").expect("deleted key reopens"), None);
+        assert!(blob_file_paths(&path).is_empty());
+    }
 
     fs::remove_dir_all(path).expect("cleanup test db");
 }
