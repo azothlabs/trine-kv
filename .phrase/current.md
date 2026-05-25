@@ -51,16 +51,16 @@ task012 [x] goal:manual compaction rewrites flushed tables without changing MVCC
 task013 [x] goal:table block/index layout supports checked point/range reads with codec id none | scope:src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 task014 [x] goal:lz4_flex-backed fast block compression round-trips table blocks and fails closed on missing codec support | scope:Cargo.toml,src/codec.rs,src/table.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 task015 [x] goal:prefix filters skip incompatible table reads without changing MVCC/range-tombstone results | scope:src/filter.rs,src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
-task016 [ ] goal:separated blob values survive reopen, flush, and compaction | scope:src/blob.rs,src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
+task016 [x] goal:separated blob values survive reopen, flush, and compaction | scope:src/blob.rs,src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 ```
 
 ## Known Blockers
 
-- Recovery reports, version-cleaning compaction, blob files, and optimized
+- Recovery reports, blob cleanup/version-cleaning compaction, and optimized
   search policies are not implemented yet.
 
 ## Evidence To Record
 
 - Phase 2 scaffold gate results.
-- Blob-value validation results.
-- Remaining blocker category after first separated-blob slice.
+- Next phase selection from latest evidence.
+- Remaining blocker category after completing current task list.

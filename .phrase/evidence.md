@@ -696,3 +696,44 @@ Record only evidence that can change planning or durable decisions.
 
 - Implement blob file writing/reading for values above the keyspace threshold,
   then prove reopen, flush, and compaction keep those values readable.
+
+## 2026-05-25: Separated Blob Values Passed
+
+### Observation
+
+- Flush now writes values at or above the keyspace blob threshold into blob
+  files named by table id, and stores `Blob` references in the table records.
+- Blob references encode file id, offset, length, and checksum in checked table
+  blocks.
+- Reads resolve blob references through the persistent database path and verify
+  blob checksums before returning bytes.
+- Persistent open validates manifest-referenced tables and their blob
+  references, so missing blob files fail closed during recovery.
+- Compaction preserves existing blob references while rewriting table files.
+- Tests cover blob values after flush, reopen without WAL, compaction, inline
+  values in the same table, and missing blob-file recovery failure.
+
+### Interpretation
+
+- Task016 is complete for first-version separated blob values.
+- The current task list in `.phrase/current.md` is complete. Remaining work is
+  no longer the same slice; it should be selected from the latest evidence.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Blob cleanup is not implemented; old blob files remain if table references
+  move or become obsolete.
+- Recovery reports, version cleanup, and optimized search policies remain
+  future blockers.
+
+### Recommended Next Action
+
+- Start the next phase selection from the remaining blockers instead of adding
+  more behavior to the completed current task list.

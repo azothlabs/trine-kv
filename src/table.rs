@@ -32,6 +32,7 @@ const VALUE_KIND_RANGE_DELETE: u8 = 3;
 
 const VALUE_NONE: u8 = 0;
 const VALUE_INLINE: u8 = 1;
+const VALUE_BLOB: u8 = 2;
 
 const BOUND_UNBOUNDED: u8 = 0;
 const BOUND_INCLUDED: u8 = 1;
@@ -88,6 +89,7 @@ pub(crate) struct TableWriteOptions {
     pub(crate) codec: CodecId,
     pub(crate) prefix_extractor: PrefixExtractor,
     pub(crate) prefix_filter_policy: PrefixFilterPolicy,
+    pub(crate) blob_threshold_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,14 +193,23 @@ pub(crate) fn write_table(
         return Err(Error::invalid_options("cannot write an empty table"));
     }
 
-    let mut point_records = point_records
-        .iter()
-        .map(|(internal_key, value)| TablePointRecord {
-            internal_key: internal_key.clone(),
-            value: value.clone(),
-        })
-        .collect::<Vec<_>>();
-    point_records.sort_by(|left, right| left.internal_key.cmp(&right.internal_key));
+    let mut point_records = point_records.to_vec();
+    point_records.sort_by(|left, right| left.0.cmp(&right.0));
+    let db_path = path
+        .parent()
+        .ok_or_else(|| Error::invalid_options("table path has no parent"))?;
+    let point_records = crate::blob::write_large_values(
+        db_path,
+        table_id.get(),
+        options.blob_threshold_bytes,
+        &point_records,
+    )?
+    .into_iter()
+    .map(|(internal_key, value)| TablePointRecord {
+        internal_key,
+        value,
+    })
+    .collect::<Vec<_>>();
 
     let table = Table {
         properties: table_properties(table_id, options.codec, &point_records, range_tombstones),
@@ -429,7 +440,7 @@ fn append_data_blocks(
         let mut block_end = block_start;
         let mut estimated_len = 0_usize;
         while block_end < point_records.len() {
-            let next_len = point_record_encoded_len(&point_records[block_end])?;
+            let next_len = point_record_encoded_len(&point_records[block_end]);
             if block_end > block_start && estimated_len + next_len > DATA_BLOCK_TARGET_BYTES {
                 break;
             }
@@ -967,10 +978,17 @@ fn put_value_ref(bytes: &mut Vec<u8>, value: Option<&ValueRef>) -> Result<()> {
             put_u8(bytes, VALUE_INLINE);
             put_bytes(bytes, inline)?;
         }
-        Some(ValueRef::Blob { .. }) => {
-            return Err(Error::unsupported(
-                "blob table values are not implemented yet",
-            ));
+        Some(ValueRef::Blob {
+            file_id,
+            offset,
+            len,
+            checksum,
+        }) => {
+            put_u8(bytes, VALUE_BLOB);
+            put_u64(bytes, *file_id);
+            put_u64(bytes, *offset);
+            put_u64(bytes, *len);
+            put_u32(bytes, *checksum);
         }
     }
     Ok(())
@@ -1064,22 +1082,19 @@ fn put_section_handle(bytes: &mut Vec<u8>, handle: SectionHandle) {
     put_u64(bytes, handle.len);
 }
 
-fn point_record_encoded_len(record: &TablePointRecord) -> Result<usize> {
-    Ok(internal_key_encoded_len(&record.internal_key)
-        + value_ref_encoded_len(record.value.as_ref())?)
+fn point_record_encoded_len(record: &TablePointRecord) -> usize {
+    internal_key_encoded_len(&record.internal_key) + value_ref_encoded_len(record.value.as_ref())
 }
 
 fn internal_key_encoded_len(internal_key: &InternalKey) -> usize {
     4 + internal_key.user_key().len() + 8 + 1 + 4
 }
 
-fn value_ref_encoded_len(value: Option<&ValueRef>) -> Result<usize> {
+fn value_ref_encoded_len(value: Option<&ValueRef>) -> usize {
     match value {
-        None => Ok(1),
-        Some(ValueRef::Inline(bytes)) => Ok(1 + 4 + bytes.len()),
-        Some(ValueRef::Blob { .. }) => Err(Error::unsupported(
-            "blob table values are not implemented yet",
-        )),
+        None => 1,
+        Some(ValueRef::Inline(bytes)) => 1 + 4 + bytes.len(),
+        Some(ValueRef::Blob { .. }) => 1 + 8 + 8 + 8 + 4,
     }
 }
 
@@ -1223,6 +1238,12 @@ impl<'payload> Cursor<'payload> {
         match self.read_u8()? {
             VALUE_NONE => Ok(None),
             VALUE_INLINE => Ok(Some(ValueRef::Inline(self.read_bytes()?.to_vec()))),
+            VALUE_BLOB => Ok(Some(ValueRef::Blob {
+                file_id: self.read_u64()?,
+                offset: self.read_u64()?,
+                len: self.read_u64()?,
+                checksum: self.read_u32()?,
+            })),
             tag => Err(Error::InvalidFormat {
                 message: format!("unknown table value reference {tag}"),
             }),

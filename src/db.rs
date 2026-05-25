@@ -421,10 +421,12 @@ impl Db {
             start: Bound::Included(key.to_vec()),
             end: Bound::Included(key.to_vec()),
         };
-        Ok(collect_visible_range(&state, &point_range, read_sequence)?
-            .into_iter()
-            .next()
-            .map(|item| item.value))
+        Ok(
+            collect_visible_range(&state, &point_range, read_sequence, self.persistent_path())?
+                .into_iter()
+                .next()
+                .map(|item| item.value),
+        )
     }
 
     pub(crate) fn range_at(
@@ -437,7 +439,7 @@ impl Db {
         self.ensure_open()?;
 
         let state = self.keyspace_state(keyspace)?;
-        let items = collect_visible_range(&state, range, read_sequence)?;
+        let items = collect_visible_range(&state, range, read_sequence, self.persistent_path())?;
 
         Ok(Iter::from_items(items, direction))
     }
@@ -452,7 +454,8 @@ impl Db {
         self.ensure_open()?;
 
         let state = self.keyspace_state(keyspace)?;
-        let mut items = collect_visible_prefix(&state, prefix, read_sequence)?;
+        let mut items =
+            collect_visible_prefix(&state, prefix, read_sequence, self.persistent_path())?;
         items.retain(|item| item.key.starts_with(prefix));
 
         Ok(Iter::from_items(items, direction))
@@ -481,6 +484,13 @@ impl Db {
             .map_err(|_| lock_poisoned("keyspace registry"))?;
 
         Ok(keyspaces.get(keyspace).map(|state| state.options.clone()))
+    }
+
+    fn persistent_path(&self) -> Option<&Path> {
+        match &self.inner.options.storage_mode {
+            StorageMode::Persistent { path } => Some(path.as_path()),
+            StorageMode::InMemory => None,
+        }
     }
 
     fn persist_keyspace_creation(&self, name: &str, options: &KeyspaceOptions) -> Result<()> {
@@ -770,6 +780,7 @@ fn keyspaces_from_manifest(
                     ),
                 });
             }
+            validate_table_blob_refs(db_path, &table)?;
             tables.push(Arc::new(table));
         }
 
@@ -780,6 +791,16 @@ fn keyspaces_from_manifest(
     }
 
     Ok(keyspaces)
+}
+
+fn validate_table_blob_refs(db_path: &Path, table: &Table) -> Result<()> {
+    for record in table.point_records() {
+        if let Some(value @ ValueRef::Blob { .. }) = record.value.as_ref() {
+            crate::blob::read_value(db_path, value)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_keyspace_options(options: &KeyspaceOptions) -> Result<()> {
@@ -798,6 +819,7 @@ fn table_write_options(options: &KeyspaceOptions) -> table::TableWriteOptions {
         codec: options.compression.codec_id(),
         prefix_extractor: options.prefix_extractor.clone(),
         prefix_filter_policy: options.prefix_filter_policy,
+        blob_threshold_bytes: options.blob_threshold_bytes,
     }
 }
 
@@ -955,16 +977,24 @@ fn collect_visible_range(
     state: &KeyspaceState,
     range: &KeyRange,
     read_sequence: Sequence,
+    db_path: Option<&Path>,
 ) -> Result<Vec<KeyValue>> {
     let point_records = collect_point_records(state)?;
     let range_tombstones = collect_range_tombstones(state)?;
-    collect_visible_records(&point_records, &range_tombstones, range, read_sequence)
+    collect_visible_records(
+        &point_records,
+        &range_tombstones,
+        range,
+        read_sequence,
+        db_path,
+    )
 }
 
 fn collect_visible_prefix(
     state: &KeyspaceState,
     prefix: &[u8],
     read_sequence: Sequence,
+    db_path: Option<&Path>,
 ) -> Result<Vec<KeyValue>> {
     let point_records = collect_prefix_point_records(state, prefix)?;
     let range_tombstones = collect_range_tombstones(state)?;
@@ -973,6 +1003,7 @@ fn collect_visible_prefix(
         &range_tombstones,
         &KeyRange::all(),
         read_sequence,
+        db_path,
     )
 }
 
@@ -984,6 +1015,7 @@ fn collect_visible_records(
     range_tombstones: &[RangeTombstone],
     range: &KeyRange,
     read_sequence: Sequence,
+    db_path: Option<&Path>,
 ) -> Result<Vec<KeyValue>> {
     let mut items = Vec::new();
     let mut decided_user_key: Option<Vec<u8>> = None;
@@ -1018,7 +1050,7 @@ fn collect_visible_records(
                 ) {
                     items.push(KeyValue::new(
                         user_key.to_vec(),
-                        inline_value(value.as_ref())?.to_vec(),
+                        value_bytes(value.as_ref(), db_path)?,
                     ));
                 }
                 decided_user_key = Some(user_key.to_vec());
@@ -1033,10 +1065,20 @@ fn collect_visible_records(
     Ok(items)
 }
 
-fn inline_value(value: Option<&ValueRef>) -> Result<&[u8]> {
-    value
-        .and_then(ValueRef::inline_bytes)
-        .ok_or_else(|| Error::unsupported("blob values are not implemented yet"))
+fn value_bytes(value: Option<&ValueRef>, db_path: Option<&Path>) -> Result<Vec<u8>> {
+    let value = value.ok_or_else(|| Error::Corruption {
+        message: "put record is missing value bytes".to_owned(),
+    })?;
+
+    match value {
+        ValueRef::Inline(bytes) => Ok(bytes.clone()),
+        ValueRef::Blob { .. } => {
+            let db_path = db_path.ok_or_else(|| Error::Corruption {
+                message: "in-memory database cannot read blob value references".to_owned(),
+            })?;
+            crate::blob::read_value(db_path, value)
+        }
+    }
 }
 
 fn key_is_before_start(key: &[u8], start: &Bound<Vec<u8>>) -> bool {

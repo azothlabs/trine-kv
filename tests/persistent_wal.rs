@@ -49,6 +49,18 @@ fn collect_rows(iter: trine_kv::Iter) -> Vec<(Vec<u8>, Vec<u8>)> {
     .collect()
 }
 
+fn blob_file_paths(path: &std::path::Path) -> Vec<PathBuf> {
+    fs::read_dir(path)
+        .expect("read test db directory")
+        .map(|entry| entry.expect("read directory entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("blob-"))
+        })
+        .collect()
+}
+
 #[test]
 fn persistent_wal_replays_point_and_range_batches() {
     let path = temp_db_path("wal-replay");
@@ -538,6 +550,104 @@ fn persistent_prefix_filter_keeps_range_tombstones_authoritative() {
             vec![(b"user:2".to_vec(), b"live".to_vec())]
         );
     }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_blob_values_survive_flush_reopen_and_compaction() {
+    let path = temp_db_path("blob-values");
+    let options = DbOptions::persistent(&path);
+    let keyspace_options = KeyspaceOptions {
+        blob_threshold_bytes: 8,
+        ..KeyspaceOptions::default()
+    };
+    let large_a = b"large-value-a-large-value-a".to_vec();
+    let large_c = b"large-value-c-large-value-c".to_vec();
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", keyspace_options.clone())
+            .expect("keyspace opens");
+
+        keyspace
+            .insert(b"a", large_a.clone())
+            .expect("write blob a");
+        keyspace.insert(b"b", b"small").expect("write inline b");
+        db.flush().expect("flush first blob table");
+
+        keyspace
+            .insert(b"c", large_c.clone())
+            .expect("write blob c");
+        db.flush().expect("flush second blob table");
+        db.compact_range(KeyRange::all())
+            .expect("compact blob tables");
+
+        assert_eq!(
+            keyspace.get(b"a").expect("blob a reads"),
+            Some(large_a.clone())
+        );
+        assert_eq!(
+            keyspace.get(b"b").expect("inline b reads"),
+            Some(b"small".to_vec())
+        );
+        assert_eq!(
+            keyspace.get(b"c").expect("blob c reads"),
+            Some(large_c.clone())
+        );
+        assert!(
+            blob_file_paths(&path).len() >= 2,
+            "flushed blob values should create blob files"
+        );
+    }
+
+    fs::remove_file(wal::wal_path(&path)).expect("remove WAL after blob compaction");
+
+    {
+        let db = Db::open(options).expect("persistent db reopens with blob refs");
+        let keyspace = db
+            .keyspace("default", keyspace_options)
+            .expect("keyspace reopens");
+
+        assert_eq!(keyspace.get(b"a").expect("blob a reopens"), Some(large_a));
+        assert_eq!(
+            keyspace.get(b"b").expect("inline b reopens"),
+            Some(b"small".to_vec())
+        );
+        assert_eq!(keyspace.get(b"c").expect("blob c reopens"), Some(large_c));
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_reopen_fails_when_blob_file_is_missing() {
+    let path = temp_db_path("missing-blob");
+    let options = DbOptions::persistent(&path);
+    let keyspace_options = KeyspaceOptions {
+        blob_threshold_bytes: 8,
+        ..KeyspaceOptions::default()
+    };
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", keyspace_options)
+            .expect("keyspace opens");
+        keyspace
+            .insert(b"a", b"large-value-a-large-value-a".to_vec())
+            .expect("write blob a");
+        db.flush().expect("flush blob table");
+    }
+
+    let blob_path = blob_file_paths(&path)
+        .pop()
+        .expect("blob file exists after flush");
+    fs::remove_file(blob_path).expect("remove blob file");
+
+    let error = Db::open(options).expect_err("missing blob file fails closed");
+    assert!(matches!(error, Error::Corruption { .. }));
 
     fs::remove_dir_all(path).expect("cleanup test db");
 }
