@@ -308,3 +308,42 @@ Record only evidence that can change planning or durable decisions.
 
 - Implement persistent mode with a minimal WAL file for committed batches and
   deterministic replay on reopen.
+
+## 2026-05-25: Persistent WAL Append And Replay Passed
+
+### Observation
+
+- Persistent mode now opens a database directory, appends committed batches to
+  `trine.wal`, and replays WAL batches on reopen.
+- WAL frames include magic, format version, payload length, header checksum,
+  payload checksum, and a binary payload for inserts, point deletes, and range
+  deletes.
+- WAL append happens after sequence assignment and before memtable update.
+- Reopen restores point values, point deletes, range deletes, cross-keyspace
+  batches, and the last committed sequence.
+
+### Interpretation
+
+- Task007 is complete for the minimal persistent WAL loop.
+- The next useful WAL slice is recovery behavior under bad WAL bytes: torn
+  final record should be ignored, but checksum corruption in a complete record
+  should fail closed.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- WAL corruption/torn-tail behavior needs explicit tests.
+- Keyspace options are not durable without a manifest.
+- SSTable flush/read, manifest, recovery reports, compaction, compression
+  crates, optimized index policies, and blob files remain future blockers.
+
+### Recommended Next Action
+
+- Add WAL corruption and torn-tail recovery tests, then tighten WAL parsing if
+  those tests expose gaps.

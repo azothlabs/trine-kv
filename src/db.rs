@@ -13,11 +13,12 @@ use crate::{
     internal_key::{InternalKey, ValueKind},
     iterator::{Direction, Iter},
     keyspace::{Keyspace, KeyspaceName},
-    options::{DbOptions, KeyspaceOptions, StorageMode, WriteOptions},
+    options::{DbOptions, DurabilityMode, KeyspaceOptions, StorageMode, WriteOptions},
     snapshot::Snapshot,
     stats::DbStats,
     transaction::{Transaction, TransactionOptions, TransactionReadSet},
     types::{CommitInfo, KeyRange, KeyValue, Sequence},
+    wal::{self, WalBatch, WalWriter},
     write_batch::{BatchOperation, WriteBatch},
 };
 
@@ -33,6 +34,7 @@ pub(crate) struct DbInner {
     closed: AtomicBool,
     writer: Mutex<()>,
     keyspaces: RwLock<BTreeMap<String, Arc<KeyspaceState>>>,
+    wal: Option<Mutex<WalWriter>>,
 }
 
 #[derive(Debug)]
@@ -80,9 +82,7 @@ impl Db {
     pub fn open(options: DbOptions) -> Result<Self> {
         match options.storage_mode {
             StorageMode::InMemory => Self::memory(options),
-            StorageMode::Persistent { .. } => {
-                Err(Error::unsupported("persistent open is not implemented yet"))
-            }
+            StorageMode::Persistent { .. } => Self::open_persistent(options),
         }
     }
 
@@ -97,8 +97,48 @@ impl Db {
                 closed: AtomicBool::new(false),
                 writer: Mutex::new(()),
                 keyspaces: RwLock::new(BTreeMap::new()),
+                wal: None,
             }),
         })
+    }
+
+    fn open_persistent(options: DbOptions) -> Result<Self> {
+        validate_options(&options)?;
+        let StorageMode::Persistent { path } = &options.storage_mode else {
+            return Err(Error::invalid_options("persistent open requires a path"));
+        };
+
+        if path.exists() {
+            if !path.is_dir() {
+                return Err(Error::invalid_options("database path is not a directory"));
+            }
+        } else if options.create_if_missing && !options.read_only {
+            wal::ensure_parent_dir(path)?;
+        } else {
+            return Err(Error::invalid_options("database path does not exist"));
+        }
+
+        let wal_path = wal::wal_path(path);
+        let batches = wal::read_batches(&wal_path)?;
+        let wal = if options.read_only {
+            None
+        } else {
+            Some(Mutex::new(WalWriter::open_append(&wal_path)?))
+        };
+
+        let db = Self {
+            inner: Arc::new(DbInner {
+                options,
+                last_sequence: AtomicU64::new(Sequence::ZERO.get()),
+                closed: AtomicBool::new(false),
+                writer: Mutex::new(()),
+                keyspaces: RwLock::new(BTreeMap::new()),
+                wal,
+            }),
+        };
+        db.replay_wal_batches(batches)?;
+
+        Ok(db)
     }
 
     pub fn keyspace(
@@ -149,14 +189,19 @@ impl Db {
         Ok(Keyspace::new(self.clone(), name, keyspace_options))
     }
 
-    pub fn persist(&self, _mode: crate::options::DurabilityMode) -> Result<()> {
+    pub fn persist(&self, mode: DurabilityMode) -> Result<()> {
         self.ensure_open()?;
 
         match self.inner.options.storage_mode {
             StorageMode::InMemory => Ok(()),
-            StorageMode::Persistent { .. } => Err(Error::unsupported(
-                "persistent durability is not implemented yet",
-            )),
+            StorageMode::Persistent { .. } => {
+                if let Some(wal) = &self.inner.wal {
+                    wal.lock()
+                        .map_err(|_| lock_poisoned("WAL writer"))?
+                        .persist(mode)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -194,8 +239,8 @@ impl Db {
         }
     }
 
-    pub fn write(&self, batch: WriteBatch, _options: WriteOptions) -> Result<CommitInfo> {
-        self.commit_operations(batch.into_operations(), None)
+    pub fn write(&self, batch: WriteBatch, options: WriteOptions) -> Result<CommitInfo> {
+        self.commit_operations(batch.into_operations(), options, None)
     }
 
     pub(crate) fn commit_transaction(
@@ -203,14 +248,19 @@ impl Db {
         read_sequence: Sequence,
         read_set: TransactionReadSet,
         batch: WriteBatch,
-        _options: WriteOptions,
+        write_options: WriteOptions,
     ) -> Result<CommitInfo> {
-        self.commit_operations(batch.into_operations(), Some((read_sequence, read_set)))
+        self.commit_operations(
+            batch.into_operations(),
+            write_options,
+            Some((read_sequence, read_set)),
+        )
     }
 
     fn commit_operations(
         &self,
         operations: Vec<BatchOperation>,
+        write_options: WriteOptions,
         transaction_reads: Option<(Sequence, TransactionReadSet)>,
     ) -> Result<CommitInfo> {
         self.ensure_open()?;
@@ -264,6 +314,12 @@ impl Db {
                 Ok((batch_index, operation, state))
             })
             .collect::<Result<Vec<_>>>()?;
+        let wal_operations = indexed_operations
+            .iter()
+            .map(|(_, operation, _)| operation.clone())
+            .collect::<Vec<_>>();
+
+        self.append_wal(sequence, &wal_operations, write_options.durability)?;
 
         for (batch_index, operation, state) in indexed_operations {
             apply_memtable_operation(&state, operation, sequence, batch_index)?;
@@ -296,6 +352,48 @@ impl Db {
                     message: format!("range read conflict in keyspace {}", read.keyspace),
                 });
             }
+        }
+
+        Ok(())
+    }
+
+    fn append_wal(
+        &self,
+        sequence: Sequence,
+        operations: &[BatchOperation],
+        durability: DurabilityMode,
+    ) -> Result<()> {
+        if let Some(wal) = &self.inner.wal {
+            wal.lock()
+                .map_err(|_| lock_poisoned("WAL writer"))?
+                .append_batch(sequence, operations, durability)?;
+        }
+
+        Ok(())
+    }
+
+    fn replay_wal_batches(&self, batches: Vec<WalBatch>) -> Result<()> {
+        let mut last_sequence = Sequence::ZERO;
+
+        for batch in batches {
+            if batch.sequence <= last_sequence {
+                return Err(Error::Corruption {
+                    message: "WAL sequence did not increase".to_owned(),
+                });
+            }
+            validate_batch_len(batch.operations.len())?;
+
+            for (batch_index, operation) in batch.operations.into_iter().enumerate() {
+                let batch_index = u32::try_from(batch_index)
+                    .map_err(|_| Error::invalid_options("WAL operation count exceeds u32::MAX"))?;
+                let state = self.keyspace_state_or_create_default(operation.keyspace())?;
+                apply_memtable_operation(&state, operation, batch.sequence, batch_index)?;
+            }
+
+            self.inner
+                .last_sequence
+                .store(batch.sequence.get(), Ordering::Release);
+            last_sequence = batch.sequence;
         }
 
         Ok(())
@@ -414,6 +512,19 @@ impl Db {
             .ok_or_else(|| Error::KeyspaceMissing {
                 name: keyspace.to_owned(),
             })
+    }
+
+    fn keyspace_state_or_create_default(&self, keyspace: &str) -> Result<Arc<KeyspaceState>> {
+        let mut keyspaces = self
+            .inner
+            .keyspaces
+            .write()
+            .map_err(|_| lock_poisoned("keyspace registry"))?;
+
+        Ok(keyspaces
+            .entry(keyspace.to_owned())
+            .or_insert_with(|| Arc::new(KeyspaceState::new(KeyspaceOptions::default())))
+            .clone())
     }
 
     fn resolve_batch_keyspaces(
