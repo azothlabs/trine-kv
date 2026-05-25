@@ -37,16 +37,21 @@ Audit and harden production-facing operational behavior after API polish.
 
 ```text
 task038 [x] goal:production hardening audit identifies the first concrete operational risk and fixes it if local | scope:src,recovery/table/blob/wal/db tests,.phrase/current.md,.phrase/evidence.md | verify:manual audit + focused test + cargo fmt --check + cargo clippy + cargo test + git diff --check
-task039 [ ] goal:continue hardening audit for startup cleanup and WAL/resource bounds | scope:src/recovery.rs,src/wal.rs,src/db.rs,tests,.phrase/current.md,.phrase/evidence.md | verify:manual audit + focused tests if local risk appears + cargo fmt --check + cargo clippy + cargo test + git diff --check
+task039 [x] goal:WAL decode rejects impossible operation counts before allocation | scope:src/wal.rs,.phrase/current.md,.phrase/evidence.md | verify:manual audit + focused test + cargo fmt --check + cargo clippy + cargo test + git diff --check
+task040 [ ] goal:continue hardening audit for startup cleanup and manifest/table decode resource bounds | scope:src/recovery.rs,src/manifest.rs,src/table.rs,tests,.phrase/current.md,.phrase/evidence.md | verify:manual audit + focused tests if local risk appears + cargo fmt --check + cargo clippy + cargo test + git diff --check
 ```
 
 ## Known Blockers
 
 - Manifest publish failure no longer advances in-memory manifest state.
-- Startup cleanup and WAL/resource-bound hardening still need follow-up audit.
+- WAL decode now rejects impossible operation counts before allocation.
+- Startup cleanup and manifest/table decode resource-bound hardening still need
+  follow-up audit.
 
 ## Evidence To Record
 
 - Audit result with risk category.
 - Fix and regression test if the risk is local.
-- Follow-up startup cleanup and WAL/resource-bound audit result.
+- WAL resource-bound audit result.
+- Follow-up startup cleanup and manifest/table decode resource-bound audit
+  result.

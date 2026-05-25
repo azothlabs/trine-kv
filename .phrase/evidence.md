@@ -1651,3 +1651,38 @@ Record only evidence that can change planning or durable decisions.
 
 - Audit startup cleanup and WAL decode/resource limits, then fix any local risk
   with a focused regression test.
+
+## 2026-05-25: WAL Decode Resource Bound Passed
+
+### Observation
+
+- The hardening audit found that a corrupt-but-checksummed WAL payload could
+  declare a very large operation count before the decoder allocated the
+  operation vector.
+- WAL decode now checks the declared operation count against the remaining
+  payload bytes before allocation. The check uses the smallest possible encoded
+  operation size, so valid payloads still decode normally.
+- A regression test feeds a payload with `u32::MAX` operations and no operation
+  bytes, and verifies the decoder rejects it without large allocation.
+
+### Interpretation
+
+- Task039 is complete for the WAL operation-count resource bound.
+- Risk category: local recovery resource exhaustion.
+
+### Verification
+
+- Manual audit of WAL decode count allocation
+- `cargo test wal_decode_rejects_operation_count_before_large_allocation`
+- `cargo fmt --check`
+- `cargo clippy`
+
+### Remaining Blockers
+
+- Continue hardening audit for startup cleanup and manifest/table decode
+  resource bounds.
+
+### Recommended Next Action
+
+- Audit startup cleanup plus manifest/table decode count allocation, then fix
+  any local risk with a focused regression test.

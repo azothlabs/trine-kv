@@ -23,6 +23,7 @@ const OP_REMOVE_RANGE: u8 = 3;
 const BOUND_UNBOUNDED: u8 = 0;
 const BOUND_INCLUDED: u8 = 1;
 const BOUND_EXCLUDED: u8 = 2;
+const MIN_WAL_OPERATION_BYTES: usize = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalRecordHeader {
@@ -202,6 +203,11 @@ fn decode_payload(payload: &[u8]) -> Result<WalBatch> {
     let mut cursor = Cursor::new(payload);
     let sequence = Sequence::new(cursor.read_u64()?);
     let op_count = cursor.read_u32()? as usize;
+    if op_count > cursor.remaining_len() / MIN_WAL_OPERATION_BYTES {
+        return Err(Error::InvalidFormat {
+            message: "WAL operation count exceeds payload bytes".to_owned(),
+        });
+    }
     let mut operations = Vec::with_capacity(op_count);
 
     for _ in 0..op_count {
@@ -387,5 +393,29 @@ impl<'payload> Cursor<'payload> {
 
     const fn is_finished(&self) -> bool {
         self.offset == self.payload.len()
+    }
+
+    const fn remaining_len(&self) -> usize {
+        self.payload.len() - self.offset
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_payload;
+
+    #[test]
+    fn wal_decode_rejects_operation_count_before_large_allocation() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1_u64.to_le_bytes());
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let error = decode_payload(&payload).expect_err("oversized operation count fails");
+        assert!(
+            error
+                .to_string()
+                .contains("operation count exceeds payload bytes"),
+            "unexpected error: {error}"
+        );
     }
 }
