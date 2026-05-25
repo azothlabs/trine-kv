@@ -47,7 +47,7 @@ task008 [x] goal:WAL recovery handles torn tail and fails closed on checksum cor
 task009 [x] goal:manifest persists keyspace creation/options and WAL replay floor | scope:src/manifest.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 task010 [x] goal:memtable flush writes readable SSTable files and advances manifest replay floor | scope:src/table.rs,src/db.rs,src/manifest.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 task011 [x] goal:SSTable recovery fails closed on missing/corrupt table files | scope:src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
-task012 [ ] goal:manual compaction rewrites flushed tables without changing MVCC visibility | scope:src/db.rs,src/table.rs,src/manifest.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
+task012 [x] goal:manual compaction rewrites flushed tables without changing MVCC visibility | scope:src/db.rs,src/table.rs,src/manifest.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 task013 [ ] goal:table block/index layout supports checked point/range reads with codec id none | scope:src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 task014 [ ] goal:lz4_flex-backed fast block compression round-trips table blocks and fails closed on missing codec support | scope:Cargo.toml,src/codec.rs,src/table.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 task015 [ ] goal:prefix filters skip incompatible table reads without changing MVCC/range-tombstone results | scope:src/filter.rs,src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
@@ -56,12 +56,12 @@ task016 [ ] goal:separated blob values survive reopen, flush, and compaction | s
 
 ## Known Blockers
 
-- SSTable block/index layout, recovery reports, compaction, blob files,
-  lz4_flex block compression, and optimized search policies are not implemented
-  yet.
+- SSTable block/index layout, recovery reports, version-cleaning compaction,
+  blob files, lz4_flex block compression, and optimized search policies are not
+  implemented yet.
 
 ## Evidence To Record
 
 - Phase 2 scaffold gate results.
-- Compaction validation results.
-- Remaining blocker category after first compaction slice.
+- Table block/index validation results.
+- Remaining blocker category after first checked block/index slice.

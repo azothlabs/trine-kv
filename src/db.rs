@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    fs,
     ops::Bound,
     path::Path,
     sync::{
@@ -91,6 +92,20 @@ struct FlushInput {
     table_id: table::TableId,
     point_records: Vec<(InternalKey, Option<ValueRef>)>,
     range_tombstones: Vec<TableRangeTombstone>,
+}
+
+struct CompactionInput {
+    keyspace: String,
+    table_id: table::TableId,
+    input_table_ids: Vec<table::TableId>,
+    point_records: Vec<(InternalKey, Option<ValueRef>)>,
+    range_tombstones: Vec<TableRangeTombstone>,
+}
+
+struct CompactionOutput {
+    keyspace: String,
+    input_table_ids: Vec<table::TableId>,
+    table: Arc<Table>,
 }
 
 impl Db {
@@ -281,9 +296,66 @@ impl Db {
         Ok(())
     }
 
-    pub fn compact_range(&self, _range: KeyRange) -> Result<()> {
+    // Keep the public shape aligned with the accepted v1 protocol:
+    // `Db::compact_range(range) -> Result<()>`.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn compact_range(&self, range: KeyRange) -> Result<()> {
         self.ensure_open()?;
-        Err(Error::unsupported("compaction is not implemented yet"))
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+
+        let StorageMode::Persistent { path } = &self.inner.options.storage_mode else {
+            return Ok(());
+        };
+        let db_path = path.clone();
+
+        // The first compaction slice preserves every internal version and
+        // tombstone. That keeps old snapshots valid while replacing several
+        // flushed table files with one new file per keyspace.
+        let _writer = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| lock_poisoned("writer coordinator"))?;
+        let compaction_inputs = self.collect_compaction_inputs(&range)?;
+        if compaction_inputs.is_empty() {
+            return Ok(());
+        }
+
+        let obsolete_table_ids = compaction_inputs
+            .iter()
+            .flat_map(|input| input.input_table_ids.iter().copied())
+            .collect::<Vec<_>>();
+        let mut written_tables = Vec::with_capacity(compaction_inputs.len());
+        for input in &compaction_inputs {
+            let table_path = table::table_path(&db_path, input.table_id);
+            let table = table::write_table(
+                &table_path,
+                input.table_id,
+                &input.point_records,
+                &input.range_tombstones,
+            )?;
+            written_tables.push(CompactionOutput {
+                keyspace: input.keyspace.clone(),
+                input_table_ids: input.input_table_ids.clone(),
+                table: Arc::new(table),
+            });
+        }
+
+        let written_table_ids = written_tables
+            .iter()
+            .map(|output| output.table.properties().id)
+            .collect::<Vec<_>>();
+        if let Err(error) = self.publish_compacted_tables(&written_tables) {
+            let _ = remove_table_files(&db_path, &written_table_ids);
+            return Err(error);
+        }
+
+        self.install_compacted_tables(written_tables)?;
+        remove_table_files(&db_path, &obsolete_table_ids)?;
+
+        Ok(())
     }
 
     #[must_use]
@@ -498,6 +570,61 @@ impl Db {
         Ok(inputs)
     }
 
+    fn collect_compaction_inputs(&self, range: &KeyRange) -> Result<Vec<CompactionInput>> {
+        let mut next_table_id = self.next_table_id()?;
+        let keyspaces = self
+            .inner
+            .keyspaces
+            .read()
+            .map_err(|_| lock_poisoned("keyspace registry"))?;
+        let mut inputs = Vec::new();
+
+        for (name, state) in keyspaces.iter() {
+            let candidate_tables = {
+                let tables = state
+                    .tables
+                    .read()
+                    .map_err(|_| lock_poisoned("table list"))?;
+                tables
+                    .iter()
+                    .filter(|table| table_overlaps_range(table, range))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+
+            if candidate_tables.len() < 2 {
+                continue;
+            }
+
+            let mut input_table_ids = Vec::with_capacity(candidate_tables.len());
+            let mut point_records = Vec::new();
+            let mut range_tombstones = Vec::new();
+            for table in &candidate_tables {
+                input_table_ids.push(table.properties().id);
+                point_records.extend(
+                    table
+                        .point_records()
+                        .iter()
+                        .map(|record| (record.internal_key.clone(), record.value.clone())),
+                );
+                range_tombstones.extend(table.range_tombstones().iter().cloned());
+            }
+
+            inputs.push(CompactionInput {
+                keyspace: name.clone(),
+                table_id: next_table_id,
+                input_table_ids,
+                point_records,
+                range_tombstones,
+            });
+            next_table_id = next_table_id.next().ok_or_else(|| Error::Corruption {
+                message: "table id counter overflow".to_owned(),
+            })?;
+        }
+
+        Ok(inputs)
+    }
+
     fn next_table_id(&self) -> Result<table::TableId> {
         self.inner
             .manifest
@@ -530,6 +657,28 @@ impl Db {
             .add_tables(edits, flush_sequence)
     }
 
+    fn publish_compacted_tables(&self, outputs: &[CompactionOutput]) -> Result<()> {
+        let edits = outputs
+            .iter()
+            .map(|output| {
+                (
+                    output.keyspace.clone(),
+                    output.input_table_ids.clone(),
+                    output.table.properties().clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.inner
+            .manifest
+            .as_ref()
+            .ok_or_else(|| Error::Corruption {
+                message: "persistent database is missing manifest store".to_owned(),
+            })?
+            .lock()
+            .map_err(|_| lock_poisoned("manifest store"))?
+            .replace_tables_batch(edits)
+    }
+
     fn install_flushed_tables(
         &self,
         inputs: &[FlushInput],
@@ -553,6 +702,20 @@ impl Db {
                 .write()
                 .map_err(|_| lock_poisoned("range tombstones"))?
                 .clear();
+        }
+
+        Ok(())
+    }
+
+    fn install_compacted_tables(&self, outputs: Vec<CompactionOutput>) -> Result<()> {
+        for output in outputs {
+            let state = self.keyspace_state(&output.keyspace)?;
+            let mut tables = state
+                .tables
+                .write()
+                .map_err(|_| lock_poisoned("table list"))?;
+            tables.retain(|table| !output.input_table_ids.contains(&table.properties().id));
+            tables.push(output.table);
         }
 
         Ok(())
@@ -819,6 +982,28 @@ fn key_is_in_range(key: &[u8], range: &KeyRange) -> bool {
     !key_is_before_start(key, &range.start) && !key_is_after_end(key, &range.end)
 }
 
+fn table_overlaps_range(table: &Table, range: &KeyRange) -> bool {
+    if range_is_all(range) {
+        return true;
+    }
+
+    table
+        .point_records()
+        .iter()
+        .any(|record| key_is_in_range(record.internal_key.user_key(), range))
+        || table
+            .range_tombstones()
+            .iter()
+            .any(|tombstone| ranges_overlap(&tombstone.range, range))
+}
+
+fn range_is_all(range: &KeyRange) -> bool {
+    matches!(
+        (&range.start, &range.end),
+        (Bound::Unbounded, Bound::Unbounded)
+    )
+}
+
 fn range_tombstones_cover(
     range_tombstones: &[RangeTombstone],
     key: &[u8],
@@ -919,4 +1104,16 @@ fn lock_poisoned(lock_name: &'static str) -> Error {
     Error::Corruption {
         message: format!("{lock_name} lock poisoned"),
     }
+}
+
+fn remove_table_files(db_path: &Path, table_ids: &[table::TableId]) -> Result<()> {
+    for table_id in table_ids {
+        match fs::remove_file(table::table_path(db_path, *table_id)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Error::Io(error)),
+        }
+    }
+
+    Ok(())
 }

@@ -169,6 +169,63 @@ impl ManifestStore {
         publish_manifest(&self.path, &self.state)
     }
 
+    pub fn replace_tables(
+        &mut self,
+        keyspace: &str,
+        removed_table_ids: &[TableId],
+        replacement: TableProperties,
+    ) -> Result<()> {
+        self.replace_tables_batch(vec![(
+            keyspace.to_owned(),
+            removed_table_ids.to_vec(),
+            replacement,
+        )])
+    }
+
+    pub fn replace_tables_batch(
+        &mut self,
+        replacements: Vec<(String, Vec<TableId>, TableProperties)>,
+    ) -> Result<()> {
+        // Validate the whole batch before changing in-memory manifest state.
+        // That keeps multi-keyspace compaction from publishing a partial edit.
+        for (keyspace, removed_table_ids, _) in &replacements {
+            if !self.state.keyspaces.contains_key(keyspace) {
+                return Err(Error::Corruption {
+                    message: format!("compaction references missing keyspace: {keyspace}"),
+                });
+            }
+
+            let tables = self
+                .state
+                .tables
+                .get(keyspace)
+                .ok_or_else(|| Error::Corruption {
+                    message: format!("manifest is missing table list for keyspace: {keyspace}"),
+                })?;
+            for table_id in removed_table_ids {
+                if !tables.iter().any(|properties| properties.id == *table_id) {
+                    return Err(Error::Corruption {
+                        message: format!("compaction input table is missing: {}", table_id.get()),
+                    });
+                }
+            }
+        }
+
+        for (keyspace, removed_table_ids, replacement) in replacements {
+            let tables = self
+                .state
+                .tables
+                .get_mut(&keyspace)
+                .ok_or_else(|| Error::Corruption {
+                    message: format!("manifest is missing table list for keyspace: {keyspace}"),
+                })?;
+            tables.retain(|properties| !removed_table_ids.contains(&properties.id));
+            tables.push(replacement);
+        }
+
+        publish_manifest(&self.path, &self.state)
+    }
+
     pub fn update_wal_replay_floor(&mut self, sequence: Sequence) -> Result<()> {
         self.state.wal_replay_floor = sequence;
         publish_manifest(&self.path, &self.state)

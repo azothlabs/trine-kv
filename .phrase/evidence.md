@@ -530,3 +530,47 @@ Record only evidence that can change planning or durable decisions.
 
 - Keep compaction as the next implementation slice, then add `lz4_flex` once
   the block/index table layout exists.
+
+## 2026-05-25: Manual Compaction Slice Passed
+
+### Observation
+
+- `Db::compact_range` now rewrites overlapping flushed tables into one
+  replacement table per keyspace in persistent mode.
+- The first compaction slice keeps all internal versions and range tombstones,
+  so older snapshots keep their expected read results.
+- Manifest replacement validates every keyspace and input table before
+  publishing one batch edit, which avoids partial multi-keyspace manifest
+  updates.
+- After manifest publish and in-process table-list switch, obsolete table files
+  are removed from disk.
+- Tests cover snapshot visibility across compaction, range tombstone results,
+  reopen without WAL after compaction, obsolete table cleanup, and keyspace
+  separation.
+
+### Interpretation
+
+- Task012 is complete for manual table rewrite and manifest cutover.
+- The remaining compaction work is cleanup policy, scheduling, and leveled input
+  selection; this slice intentionally does not drop older versions yet.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- SSTable files still use the simple checked payload format rather than the v1
+  block/index layout.
+- Version cleanup needs an active-snapshot boundary before it can safely drop
+  older versions or tombstones.
+- Blob files, lz4_flex block compression, prefix filters, recovery reports, and
+  optimized search policies remain future blockers.
+
+### Recommended Next Action
+
+- Implement the checked table block/index layout with codec id `none`, then
+  retest point/range reads, recovery, and compaction against the new layout.
