@@ -91,7 +91,7 @@ storage contract.
 
 ### Phase 6: Production Hardening
 
-**Status**: In progress
+**Status**: Complete
 
 **Goal**: Audit and harden operational behavior after API polish lands.
 

@@ -1738,3 +1738,53 @@ Record only evidence that can change planning or durable decisions.
 
 - Audit flush/compaction cleanup and diagnostics next, then fix any local risk
   with a focused regression test.
+
+## 2026-05-26: Flush And Compaction Publish-Failure Cleanup Passed
+
+### Observation
+
+- Flush wrote table/blob files before publishing the manifest edit. If manifest
+  publish failed after those files were written, the operation returned an error
+  without removing the unpublished formal files.
+- Compaction already removed unpublished table files on manifest publish
+  failure, but large-value compaction output can also create a blob file with
+  the same id as the output table.
+- A shared cleanup helper now removes unpublished table files and matching blob
+  files together after table-write failure or manifest-publish failure in flush
+  and compaction.
+- Regression tests force manifest publish failure by blocking the manifest temp
+  path after database open. The flush test verifies unpublished table/blob
+  files are removed and the memtable value remains readable. The compaction
+  test verifies pre-existing table/blob files remain while unpublished
+  replacement table/blob files are removed.
+
+### Interpretation
+
+- Task041 is complete.
+- Risk category: local file cleanup after durable metadata publish failure.
+- Phase 6 satisfies its acceptance gate: concrete operational risks were
+  audited, local fixes have focused regression tests, and the full verification
+  gate passed.
+
+### Verification
+
+- Manual audit of flush table/blob write, compaction table/blob write, manifest
+  publish, and startup unreferenced-file behavior.
+- `cargo test persistent_flush_publish_failure_removes_unpublished_table_and_blob_files`
+- `cargo test persistent_compaction_publish_failure_removes_unpublished_table_and_blob_files`
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+- forbidden terminology scan over source, tests, phase notes, benchmark files,
+  docs, README, and examples
+
+### Remaining Blockers
+
+- None recorded for Phase 6.
+
+### Recommended Next Action
+
+- Choose the next phase from release packaging, CI/release verification,
+  integration examples, or another targeted hardening audit based on fresh
+  user priority.

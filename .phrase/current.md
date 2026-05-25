@@ -2,7 +2,7 @@
 
 ## Status
 
-In progress
+Complete
 
 ## Goal
 
@@ -39,17 +39,17 @@ Audit and harden production-facing operational behavior after API polish.
 task038 [x] goal:production hardening audit identifies the first concrete operational risk and fixes it if local | scope:src,recovery/table/blob/wal/db tests,.phrase/current.md,.phrase/evidence.md | verify:manual audit + focused test + cargo fmt --check + cargo clippy + cargo test + git diff --check
 task039 [x] goal:WAL decode rejects impossible operation counts before allocation | scope:src/wal.rs,.phrase/current.md,.phrase/evidence.md | verify:manual audit + focused test + cargo fmt --check + cargo clippy + cargo test + git diff --check
 task040 [x] goal:continue hardening audit for startup cleanup and manifest/table decode resource bounds | scope:src/recovery.rs,src/manifest.rs,src/table.rs,tests,.phrase/current.md,.phrase/evidence.md | verify:manual audit + focused tests if local risk appears + cargo fmt --check + cargo clippy + cargo test + git diff --check
-task041 [ ] goal:audit flush/compaction cleanup and diagnostics after partial file writes or publish failures | scope:src/db.rs,src/table.rs,src/blob.rs,src/manifest.rs,tests,.phrase/current.md,.phrase/evidence.md | verify:manual audit + focused tests if local risk appears + cargo fmt --check + cargo clippy + cargo test + git diff --check
+task041 [x] goal:audit flush/compaction cleanup and diagnostics after partial file writes or publish failures | scope:src/db.rs,src/table.rs,src/blob.rs,src/manifest.rs,tests,.phrase/current.md,.phrase/evidence.md | verify:manual audit + focused tests if local risk appears + cargo fmt --check + cargo clippy + cargo test + git diff --check
 ```
 
 ## Known Blockers
 
+- None recorded for Phase 6.
 - Manifest publish failure no longer advances in-memory manifest state.
-- WAL decode now rejects impossible operation counts before allocation.
-- Startup cleanup fail-closed behavior is covered by existing tests.
-- Manifest and table decoders now reject impossible count fields before large
+- WAL, manifest, and table decoders reject impossible count fields before large
   allocation.
-- Flush/compaction cleanup and diagnostics need the next hardening audit.
+- Startup cleanup fail-closed behavior is covered by existing tests.
+- Failed flush/compaction publish removes unpublished table/blob output files.
 
 ## Evidence To Record
 
@@ -59,3 +59,9 @@ task041 [ ] goal:audit flush/compaction cleanup and diagnostics after partial fi
 - Follow-up startup cleanup and manifest/table decode resource-bound audit
   result.
 - Flush/compaction cleanup and diagnostics audit result.
+
+## Next Recommendation
+
+- Choose the next phase from release packaging, CI/release verification,
+  integration examples, or another targeted hardening audit based on fresh
+  user priority.

@@ -343,20 +343,31 @@ impl Db {
             }
 
             let mut written_tables = Vec::with_capacity(flush_inputs.len());
+            let mut written_table_ids = Vec::with_capacity(flush_inputs.len());
             for input in &flush_inputs {
                 let table_path = table::table_path(&db_path, input.table_id);
-                let table = table::write_table(
+                written_table_ids.push(input.table_id);
+                let table = match table::write_table(
                     &table_path,
                     input.table_id,
                     input.table_level,
                     &input.table_options,
                     &input.point_records,
                     &input.range_tombstones,
-                )?;
+                ) {
+                    Ok(table) => table,
+                    Err(error) => {
+                        let _ = remove_storage_files(&db_path, &written_table_ids);
+                        return Err(error);
+                    }
+                };
                 written_tables.push((input.keyspace.clone(), Arc::new(table)));
             }
 
-            self.publish_flushed_tables(&written_tables, flush_sequence)?;
+            if let Err(error) = self.publish_flushed_tables(&written_tables, flush_sequence) {
+                let _ = remove_storage_files(&db_path, &written_table_ids);
+                return Err(error);
+            }
             self.install_flushed_tables(&flush_inputs, written_tables)?;
             self.l0_pressure_exceeded()?
         };
@@ -402,19 +413,28 @@ impl Db {
             .flat_map(|input| input.input_table_ids.iter().copied())
             .collect::<Vec<_>>();
         let mut written_tables = Vec::with_capacity(compaction_inputs.len());
+        let mut written_table_ids = Vec::with_capacity(compaction_inputs.len());
         for input in &compaction_inputs {
             let table = if input.point_records.is_empty() && input.range_tombstones.is_empty() {
                 None
             } else {
                 let table_path = table::table_path(&db_path, input.table_id);
-                Some(Arc::new(table::write_table(
+                written_table_ids.push(input.table_id);
+                let table = match table::write_table(
                     &table_path,
                     input.table_id,
                     input.table_level,
                     &input.table_options,
                     &input.point_records,
                     &input.range_tombstones,
-                )?))
+                ) {
+                    Ok(table) => table,
+                    Err(error) => {
+                        let _ = remove_storage_files(&db_path, &written_table_ids);
+                        return Err(error);
+                    }
+                };
+                Some(Arc::new(table))
             };
             written_tables.push(CompactionOutput {
                 keyspace: input.keyspace.clone(),
@@ -423,12 +443,8 @@ impl Db {
             });
         }
 
-        let written_table_ids = written_tables
-            .iter()
-            .filter_map(|output| output.table.as_ref().map(|table| table.properties().id))
-            .collect::<Vec<_>>();
         if let Err(error) = self.publish_compacted_tables(&written_tables) {
-            let _ = remove_table_files(&db_path, &written_table_ids);
+            let _ = remove_storage_files(&db_path, &written_table_ids);
             return Err(error);
         }
 
@@ -1785,6 +1801,26 @@ fn remove_table_files(db_path: &Path, table_ids: &[table::TableId]) -> Result<()
     }
 
     Ok(())
+}
+
+fn remove_blob_files(db_path: &Path, table_ids: &[table::TableId]) -> Result<()> {
+    for table_id in table_ids {
+        match fs::remove_file(blob::blob_path(db_path, table_id.get())) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Error::Io(error)),
+        }
+    }
+
+    Ok(())
+}
+
+fn remove_storage_files(db_path: &Path, table_ids: &[table::TableId]) -> Result<()> {
+    // A table write uses the table id as the blob file id for large values.
+    // Before manifest publish succeeds, both files are unpublished output and
+    // can be removed together after a failed flush or compaction attempt.
+    remove_table_files(db_path, table_ids)?;
+    remove_blob_files(db_path, table_ids)
 }
 
 #[cfg(test)]

@@ -677,6 +677,51 @@ fn persistent_flush_writes_table_and_reopen_can_skip_wal() {
 }
 
 #[test]
+fn persistent_flush_publish_failure_removes_unpublished_table_and_blob_files() {
+    let path = temp_db_path("flush-publish-cleanup");
+    let options = DbOptions::persistent(&path);
+    let keyspace_options = KeyspaceOptions {
+        blob_threshold_bytes: 8,
+        ..KeyspaceOptions::default()
+    };
+    let value = b"large-value-a-large-value-a".to_vec();
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", keyspace_options)
+            .expect("keyspace opens");
+        keyspace
+            .insert(b"a", value.clone())
+            .expect("write blob value");
+
+        let manifest_tmp_dir = manifest::manifest_path(&path).with_extension("tmp");
+        fs::create_dir(&manifest_tmp_dir).expect("block manifest tmp path");
+
+        let error = db.flush().expect_err("manifest publish should fail");
+        assert!(matches!(error, Error::Io(_)));
+        assert!(
+            table_file_paths(&path).is_empty(),
+            "failed flush should remove unpublished table files"
+        );
+        assert!(
+            blob_file_paths(&path).is_empty(),
+            "failed flush should remove unpublished blob files"
+        );
+        assert_eq!(
+            keyspace
+                .get(b"a")
+                .expect("memtable row survives failed flush"),
+            Some(value)
+        );
+
+        fs::remove_dir(&manifest_tmp_dir).expect("remove manifest tmp blocker");
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_compaction_levels_preserve_newer_l0_reads() {
     let path = temp_db_path("compaction-levels");
     let options = DbOptions::persistent(&path);
@@ -1467,6 +1512,70 @@ fn persistent_compaction_removes_blob_files_for_dropped_versions() {
             .expect("keyspace reopens");
         assert_eq!(keyspace.get(b"a").expect("blob reopens"), Some(new_value));
         assert_eq!(blob_file_paths(&path).len(), 1);
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_compaction_publish_failure_removes_unpublished_table_and_blob_files() {
+    let path = temp_db_path("compact-publish-cleanup");
+    let options = DbOptions::persistent(&path);
+    let keyspace_options = KeyspaceOptions {
+        blob_threshold_bytes: 8,
+        ..KeyspaceOptions::default()
+    };
+    let old_value = b"large-value-a-old-large-value-a-old".to_vec();
+    let new_value = b"large-value-a-new-large-value-a-new".to_vec();
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", keyspace_options)
+            .expect("keyspace opens");
+
+        keyspace
+            .insert(b"a", old_value)
+            .expect("write old blob value");
+        db.flush().expect("flush old blob table");
+        keyspace
+            .insert(b"a", new_value.clone())
+            .expect("write new blob value");
+        db.flush().expect("flush new blob table");
+
+        let mut before_tables = table_file_paths(&path);
+        before_tables.sort();
+        let before_blobs = blob_file_paths(&path);
+        assert_eq!(before_tables.len(), 2);
+        assert_eq!(before_blobs.len(), 2);
+
+        let manifest_tmp_dir = manifest::manifest_path(&path).with_extension("tmp");
+        fs::create_dir(&manifest_tmp_dir).expect("block manifest tmp path");
+
+        let error = db
+            .compact_range(KeyRange::all())
+            .expect_err("manifest publish should fail");
+        assert!(matches!(error, Error::Io(_)));
+
+        let mut after_tables = table_file_paths(&path);
+        after_tables.sort();
+        assert_eq!(
+            after_tables, before_tables,
+            "failed compaction should keep only pre-existing table files"
+        );
+        assert_eq!(
+            blob_file_paths(&path),
+            before_blobs,
+            "failed compaction should remove unpublished blob files"
+        );
+        assert_eq!(
+            keyspace
+                .get(b"a")
+                .expect("old tables survive failed compaction"),
+            Some(new_value)
+        );
+
+        fs::remove_dir(&manifest_tmp_dir).expect("remove manifest tmp blocker");
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");
