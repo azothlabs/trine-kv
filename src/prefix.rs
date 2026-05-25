@@ -24,4 +24,24 @@ impl PrefixExtractor {
     pub fn is_enabled(&self) -> bool {
         !matches!(self, Self::Disabled)
     }
+
+    #[must_use]
+    pub(crate) fn supports_prefix_filter(&self) -> bool {
+        matches!(self, Self::FixedLen(_) | Self::Separator(_))
+    }
+
+    #[must_use]
+    pub(crate) fn query_filter_prefix<'prefix>(
+        &self,
+        query_prefix: &'prefix [u8],
+    ) -> Option<&'prefix [u8]> {
+        match self {
+            Self::FixedLen(len) => query_prefix.get(..*len),
+            Self::Separator(separator) => query_prefix
+                .iter()
+                .position(|byte| byte == separator)
+                .map(|index| &query_prefix[..=index]),
+            Self::Custom(_) | Self::Disabled => None,
+        }
+    }
 }

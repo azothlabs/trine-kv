@@ -41,6 +41,14 @@ fn flushed_default_table_path(path: &std::path::Path, options: &DbOptions) -> Pa
     table::table_path(path, table_id)
 }
 
+fn collect_rows(iter: trine_kv::Iter) -> Vec<(Vec<u8>, Vec<u8>)> {
+    iter.map(|item| {
+        let item = item.expect("iterator item reads");
+        (item.key, item.value)
+    })
+    .collect()
+}
+
 #[test]
 fn persistent_wal_replays_point_and_range_batches() {
     let path = temp_db_path("wal-replay");
@@ -466,6 +474,68 @@ fn persistent_table_compression_profiles_round_trip() {
         assert_eq!(
             plain.get(b"key-042").expect("plain row reads after reopen"),
             Some(b"value-042-aaaaaaaaaaaaaaaaaaaaaaaa".to_vec())
+        );
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_prefix_filter_keeps_range_tombstones_authoritative() {
+    let path = temp_db_path("prefix-filter-tombstones");
+    let options = DbOptions::persistent(&path);
+    let keyspace_options = KeyspaceOptions {
+        prefix_extractor: PrefixExtractor::Separator(b':'),
+        ..KeyspaceOptions::default()
+    };
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", keyspace_options.clone())
+            .expect("keyspace opens");
+
+        keyspace.insert(b"user:1", b"old").expect("write old user");
+        keyspace
+            .insert(b"user:2", b"live")
+            .expect("write live user");
+        db.flush().expect("flush user table");
+
+        keyspace.insert(b"post:1", b"post").expect("write post");
+        keyspace
+            .remove_range(KeyRange::half_open(b"user:1", b"user:2"))
+            .expect("range delete one user");
+        db.flush().expect("flush post table with user tombstone");
+
+        assert_eq!(
+            collect_rows(keyspace.prefix(b"user:").expect("prefix reads users")),
+            vec![(b"user:2".to_vec(), b"live".to_vec())]
+        );
+        assert_eq!(
+            collect_rows(keyspace.prefix(b"us").expect("short prefix falls back")),
+            vec![(b"user:2".to_vec(), b"live".to_vec())]
+        );
+    }
+
+    fs::remove_file(wal::wal_path(&path)).expect("remove WAL after prefix-filter flush");
+
+    {
+        let db = Db::open(options).expect("persistent db reopens");
+        let keyspace = db
+            .keyspace("default", keyspace_options)
+            .expect("keyspace reopens");
+
+        assert_eq!(
+            collect_rows(
+                keyspace
+                    .prefix(b"user:")
+                    .expect("prefix reads after reopen")
+            ),
+            vec![(b"user:2".to_vec(), b"live".to_vec())]
+        );
+        assert_eq!(
+            collect_rows(keyspace.prefix(b"us").expect("short prefix after reopen")),
+            vec![(b"user:2".to_vec(), b"live".to_vec())]
         );
     }
 

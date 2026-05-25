@@ -9,7 +9,10 @@ use crate::{
     blob::ValueRef,
     codec::{self, CodecId},
     error::{Error, Result},
+    filter::PrefixFilter,
     internal_key::{InternalKey, ValueKind},
+    options::PrefixFilterPolicy,
+    prefix::PrefixExtractor,
     types::{KeyRange, Sequence},
 };
 
@@ -18,7 +21,7 @@ const TABLE_MAGIC: u32 = 0x5452_5442;
 const TABLE_VERSION: u16 = 1;
 const HEADER_LEN: usize = 14;
 const FOOTER_MAGIC: u32 = 0x5452_5446;
-const FOOTER_LEN: usize = 74;
+const FOOTER_LEN: usize = 90;
 const BLOCK_HEADER_LEN: usize = 13;
 const DATA_BLOCK_TARGET_BYTES: usize = 1024;
 const DATA_BLOCK_RESTART_INTERVAL: usize = 16;
@@ -33,6 +36,14 @@ const VALUE_INLINE: u8 = 1;
 const BOUND_UNBOUNDED: u8 = 0;
 const BOUND_INCLUDED: u8 = 1;
 const BOUND_EXCLUDED: u8 = 2;
+
+const PREFIX_FILTER_ABSENT: u8 = 0;
+const PREFIX_FILTER_PRESENT: u8 = 1;
+
+const PREFIX_EXTRACTOR_DISABLED: u8 = 0;
+const PREFIX_EXTRACTOR_FIXED_LEN: u8 = 1;
+const PREFIX_EXTRACTOR_SEPARATOR: u8 = 2;
+const PREFIX_EXTRACTOR_CUSTOM: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TableId(pub u64);
@@ -73,6 +84,13 @@ pub struct TableProperties {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableWriteOptions {
+    pub(crate) codec: CodecId,
+    pub(crate) prefix_extractor: PrefixExtractor,
+    pub(crate) prefix_filter_policy: PrefixFilterPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TablePointRecord {
     pub(crate) internal_key: InternalKey,
     pub(crate) value: Option<ValueRef>,
@@ -103,6 +121,7 @@ struct BlockHandle {
 struct TableFooter {
     data_blocks: SectionHandle,
     range_tombstones: SectionHandle,
+    filters: SectionHandle,
     indexes: SectionHandle,
     properties: SectionHandle,
 }
@@ -126,6 +145,7 @@ pub(crate) struct Table {
     properties: TableProperties,
     point_records: Vec<TablePointRecord>,
     range_tombstones: Vec<TableRangeTombstone>,
+    prefix_filter: Option<PrefixFilter>,
 }
 
 impl Table {
@@ -143,6 +163,13 @@ impl Table {
     pub(crate) fn range_tombstones(&self) -> &[TableRangeTombstone] {
         &self.range_tombstones
     }
+
+    #[must_use]
+    pub(crate) fn may_contain_prefix(&self, prefix: &[u8], extractor: &PrefixExtractor) -> bool {
+        self.prefix_filter
+            .as_ref()
+            .is_none_or(|filter| filter.may_contain_query_prefix(prefix, extractor))
+    }
 }
 
 #[must_use]
@@ -156,7 +183,7 @@ pub fn table_path(db_path: &Path, table_id: TableId) -> PathBuf {
 pub(crate) fn write_table(
     path: &Path,
     table_id: TableId,
-    codec: CodecId,
+    options: &TableWriteOptions,
     point_records: &[(InternalKey, Option<ValueRef>)],
     range_tombstones: &[TableRangeTombstone],
 ) -> Result<Table> {
@@ -174,7 +201,8 @@ pub(crate) fn write_table(
     point_records.sort_by(|left, right| left.internal_key.cmp(&right.internal_key));
 
     let table = Table {
-        properties: table_properties(table_id, codec, &point_records, range_tombstones),
+        properties: table_properties(table_id, options.codec, &point_records, range_tombstones),
+        prefix_filter: build_prefix_filter(options, &point_records),
         point_records,
         range_tombstones: range_tombstones.to_vec(),
     };
@@ -257,12 +285,29 @@ fn table_properties(
     }
 }
 
+fn build_prefix_filter(
+    options: &TableWriteOptions,
+    point_records: &[TablePointRecord],
+) -> Option<PrefixFilter> {
+    if matches!(options.prefix_filter_policy, PrefixFilterPolicy::Disabled) {
+        return None;
+    }
+
+    PrefixFilter::from_keys(
+        options.prefix_extractor.clone(),
+        point_records
+            .iter()
+            .map(|record| record.internal_key.user_key()),
+    )
+}
+
 fn encode_table(table: &Table) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let codec = table.properties.codec;
     let (data_blocks, index_entries) = append_data_blocks(&mut bytes, codec, &table.point_records)?;
     let range_tombstones =
         append_single_block_section(&mut bytes, codec, &encode_range_tombstone_block(table)?)?;
+    let filters = append_single_block_section(&mut bytes, codec, &encode_filter_block(table)?)?;
     let indexes =
         append_single_block_section(&mut bytes, codec, &encode_index_block(&index_entries)?)?;
     let properties = append_single_block_section(
@@ -275,6 +320,7 @@ fn encode_table(table: &Table) -> Result<Vec<u8>> {
         &TableFooter {
             data_blocks,
             range_tombstones,
+            filters,
             indexes,
             properties,
         },
@@ -346,6 +392,9 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
         TableSection::RangeTombstones,
     )?;
     let range_tombstones = decode_range_tombstone_block(&tombstone_payload)?;
+    let (filter_codec, filter_payload) = read_single_block_section(payload, footer.filters)?;
+    validate_block_codec(filter_codec, properties.codec, TableSection::Filters)?;
+    let prefix_filter = decode_filter_block(&filter_payload)?;
     if properties
         != table_properties(
             properties.id,
@@ -363,6 +412,7 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
         properties,
         point_records,
         range_tombstones,
+        prefix_filter,
     })
 }
 
@@ -489,6 +539,25 @@ fn encode_range_tombstone_block(table: &Table) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn encode_filter_block(table: &Table) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    match &table.prefix_filter {
+        None => put_u8(&mut bytes, PREFIX_FILTER_ABSENT),
+        Some(filter) => {
+            put_u8(&mut bytes, PREFIX_FILTER_PRESENT);
+            put_prefix_extractor(&mut bytes, filter.extractor())?;
+            put_u32(
+                &mut bytes,
+                usize_to_u32(filter.prefixes().len(), "prefix filter entry count")?,
+            );
+            for prefix in filter.prefixes() {
+                put_bytes(&mut bytes, prefix)?;
+            }
+        }
+    }
+    Ok(bytes)
+}
+
 fn encode_index_block(index_entries: &[DataBlockIndexEntry]) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     put_u32(
@@ -540,6 +609,7 @@ fn read_footer(payload: &[u8]) -> Result<TableFooter> {
     let footer = TableFooter {
         data_blocks: cursor.read_section_handle()?,
         range_tombstones: cursor.read_section_handle()?,
+        filters: cursor.read_section_handle()?,
         indexes: cursor.read_section_handle()?,
         properties: cursor.read_section_handle()?,
     };
@@ -557,6 +627,7 @@ fn put_footer(bytes: &mut Vec<u8>, footer: &TableFooter) {
     put_u16(&mut footer_bytes, TABLE_VERSION);
     put_section_handle(&mut footer_bytes, footer.data_blocks);
     put_section_handle(&mut footer_bytes, footer.range_tombstones);
+    put_section_handle(&mut footer_bytes, footer.filters);
     put_section_handle(&mut footer_bytes, footer.indexes);
     put_section_handle(&mut footer_bytes, footer.properties);
     let footer_checksum = checksum(&footer_bytes);
@@ -571,6 +642,7 @@ fn validate_footer_sections(payload: &[u8], footer: &TableFooter) -> Result<()> 
     for section in [
         footer.data_blocks,
         footer.range_tombstones,
+        footer.filters,
         footer.indexes,
         footer.properties,
     ] {
@@ -718,6 +790,30 @@ fn decode_range_tombstone_block(bytes: &[u8]) -> Result<Vec<TableRangeTombstone>
         return Err(invalid_table("trailing range tombstone block bytes"));
     }
     Ok(range_tombstones)
+}
+
+fn decode_filter_block(bytes: &[u8]) -> Result<Option<PrefixFilter>> {
+    let mut cursor = Cursor::new(bytes);
+    let prefix_filter = match cursor.read_u8()? {
+        PREFIX_FILTER_ABSENT => None,
+        PREFIX_FILTER_PRESENT => {
+            let extractor = cursor.read_prefix_extractor()?;
+            let prefix_count = cursor.read_u32()? as usize;
+            let prefixes = (0..prefix_count)
+                .map(|_| cursor.read_bytes().map(<[u8]>::to_vec))
+                .collect::<Result<Vec<_>>>()?;
+            Some(PrefixFilter::from_sorted_prefixes(extractor, prefixes)?)
+        }
+        tag => {
+            return Err(Error::InvalidFormat {
+                message: format!("unknown table prefix filter tag {tag}"),
+            });
+        }
+    };
+    if !cursor.is_finished() {
+        return Err(invalid_table("trailing filter block bytes"));
+    }
+    Ok(prefix_filter)
 }
 
 fn validate_restart_points(
@@ -910,6 +1006,30 @@ fn put_bound(bytes: &mut Vec<u8>, bound: &Bound<Vec<u8>>) -> Result<()> {
         Bound::Excluded(value) => {
             put_u8(bytes, BOUND_EXCLUDED);
             put_bytes(bytes, value)?;
+        }
+    }
+    Ok(())
+}
+
+fn put_prefix_extractor(bytes: &mut Vec<u8>, extractor: &PrefixExtractor) -> Result<()> {
+    match extractor {
+        PrefixExtractor::Disabled => put_u8(bytes, PREFIX_EXTRACTOR_DISABLED),
+        PrefixExtractor::FixedLen(len) => {
+            put_u8(bytes, PREFIX_EXTRACTOR_FIXED_LEN);
+            put_u64(
+                bytes,
+                u64::try_from(*len).map_err(|_| {
+                    Error::invalid_options("prefix extractor length exceeds u64::MAX")
+                })?,
+            );
+        }
+        PrefixExtractor::Separator(separator) => {
+            put_u8(bytes, PREFIX_EXTRACTOR_SEPARATOR);
+            put_u8(bytes, *separator);
+        }
+        PrefixExtractor::Custom(name) => {
+            put_u8(bytes, PREFIX_EXTRACTOR_CUSTOM);
+            put_bytes(bytes, name.as_bytes())?;
         }
     }
     Ok(())
@@ -1120,6 +1240,30 @@ impl<'payload> Cursor<'payload> {
         })
     }
 
+    fn read_prefix_extractor(&mut self) -> Result<PrefixExtractor> {
+        match self.read_u8()? {
+            PREFIX_EXTRACTOR_DISABLED => Ok(PrefixExtractor::Disabled),
+            PREFIX_EXTRACTOR_FIXED_LEN => {
+                let len = usize::try_from(self.read_u64()?).map_err(|_| Error::InvalidFormat {
+                    message: "prefix extractor length exceeds usize".to_owned(),
+                })?;
+                Ok(PrefixExtractor::FixedLen(len))
+            }
+            PREFIX_EXTRACTOR_SEPARATOR => Ok(PrefixExtractor::Separator(self.read_u8()?)),
+            PREFIX_EXTRACTOR_CUSTOM => {
+                let name = String::from_utf8(self.read_bytes()?.to_vec()).map_err(|_| {
+                    Error::InvalidFormat {
+                        message: "prefix extractor custom name is not utf-8".to_owned(),
+                    }
+                })?;
+                Ok(PrefixExtractor::Custom(name))
+            }
+            tag => Err(Error::InvalidFormat {
+                message: format!("unknown table prefix extractor tag {tag}"),
+            }),
+        }
+    }
+
     fn read_bound(&mut self) -> Result<Bound<Vec<u8>>> {
         match self.read_u8()? {
             BOUND_UNBOUNDED => Ok(Bound::Unbounded),
@@ -1194,6 +1338,7 @@ mod tests {
             properties: table_properties(TableId(7), codec, &point_records, &[]),
             point_records,
             range_tombstones: Vec::new(),
+            prefix_filter: None,
         }
     }
 

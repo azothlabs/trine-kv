@@ -90,7 +90,7 @@ impl RangeTombstone {
 struct FlushInput {
     keyspace: String,
     table_id: table::TableId,
-    codec: crate::codec::CodecId,
+    table_options: table::TableWriteOptions,
     point_records: Vec<(InternalKey, Option<ValueRef>)>,
     range_tombstones: Vec<TableRangeTombstone>,
 }
@@ -98,7 +98,7 @@ struct FlushInput {
 struct CompactionInput {
     keyspace: String,
     table_id: table::TableId,
-    codec: crate::codec::CodecId,
+    table_options: table::TableWriteOptions,
     input_table_ids: Vec<table::TableId>,
     point_records: Vec<(InternalKey, Option<ValueRef>)>,
     range_tombstones: Vec<TableRangeTombstone>,
@@ -286,7 +286,7 @@ impl Db {
             let table = table::write_table(
                 &table_path,
                 input.table_id,
-                input.codec,
+                &input.table_options,
                 &input.point_records,
                 &input.range_tombstones,
             )?;
@@ -336,7 +336,7 @@ impl Db {
             let table = table::write_table(
                 &table_path,
                 input.table_id,
-                input.codec,
+                &input.table_options,
                 &input.point_records,
                 &input.range_tombstones,
             )?;
@@ -452,7 +452,7 @@ impl Db {
         self.ensure_open()?;
 
         let state = self.keyspace_state(keyspace)?;
-        let mut items = collect_visible_range(&state, &KeyRange::all(), read_sequence)?;
+        let mut items = collect_visible_prefix(&state, prefix, read_sequence)?;
         items.retain(|item| item.key.starts_with(prefix));
 
         Ok(Iter::from_items(items, direction))
@@ -563,7 +563,7 @@ impl Db {
             inputs.push(FlushInput {
                 keyspace: name.clone(),
                 table_id: next_table_id,
-                codec: state.options.compression.codec_id(),
+                table_options: table_write_options(&state.options),
                 point_records,
                 range_tombstones,
             });
@@ -618,7 +618,7 @@ impl Db {
             inputs.push(CompactionInput {
                 keyspace: name.clone(),
                 table_id: next_table_id,
-                codec: state.options.compression.codec_id(),
+                table_options: table_write_options(&state.options),
                 input_table_ids,
                 point_records,
                 range_tombstones,
@@ -793,6 +793,14 @@ fn validate_keyspace_options(options: &KeyspaceOptions) -> Result<()> {
     Ok(())
 }
 
+fn table_write_options(options: &KeyspaceOptions) -> table::TableWriteOptions {
+    table::TableWriteOptions {
+        codec: options.compression.codec_id(),
+        prefix_extractor: options.prefix_extractor.clone(),
+        prefix_filter_policy: options.prefix_filter_policy,
+    }
+}
+
 fn validate_batch_len(len: usize) -> Result<()> {
     if len > u32::MAX as usize {
         return Err(Error::InvalidOptions {
@@ -823,6 +831,42 @@ fn collect_point_records(state: &KeyspaceState) -> Result<Vec<(InternalKey, Opti
             table
                 .point_records()
                 .iter()
+                .map(|record| (record.internal_key.clone(), record.value.clone())),
+        );
+    }
+    records.sort_by(|left, right| left.0.cmp(&right.0));
+
+    Ok(records)
+}
+
+fn collect_prefix_point_records(
+    state: &KeyspaceState,
+    prefix: &[u8],
+) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
+    let entries = state
+        .entries
+        .read()
+        .map_err(|_| lock_poisoned("memtable entries"))?;
+    let mut records = entries
+        .iter()
+        .filter(|(internal_key, _)| internal_key.user_key().starts_with(prefix))
+        .map(|(internal_key, value)| (internal_key.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    drop(entries);
+
+    let tables = state
+        .tables
+        .read()
+        .map_err(|_| lock_poisoned("table list"))?;
+    for table in tables.iter() {
+        if !table.may_contain_prefix(prefix, &state.options.prefix_extractor) {
+            continue;
+        }
+        records.extend(
+            table
+                .point_records()
+                .iter()
+                .filter(|record| record.internal_key.user_key().starts_with(prefix))
                 .map(|record| (record.internal_key.clone(), record.value.clone())),
         );
     }
@@ -914,10 +958,37 @@ fn collect_visible_range(
 ) -> Result<Vec<KeyValue>> {
     let point_records = collect_point_records(state)?;
     let range_tombstones = collect_range_tombstones(state)?;
+    collect_visible_records(&point_records, &range_tombstones, range, read_sequence)
+}
+
+fn collect_visible_prefix(
+    state: &KeyspaceState,
+    prefix: &[u8],
+    read_sequence: Sequence,
+) -> Result<Vec<KeyValue>> {
+    let point_records = collect_prefix_point_records(state, prefix)?;
+    let range_tombstones = collect_range_tombstones(state)?;
+    collect_visible_records(
+        &point_records,
+        &range_tombstones,
+        &KeyRange::all(),
+        read_sequence,
+    )
+}
+
+// Prefix filters may remove table point records from the input set, but they
+// never remove range tombstones. This helper is the single MVCC visibility path
+// for normal range scans and prefix scans after table selection is finished.
+fn collect_visible_records(
+    point_records: &[(InternalKey, Option<ValueRef>)],
+    range_tombstones: &[RangeTombstone],
+    range: &KeyRange,
+    read_sequence: Sequence,
+) -> Result<Vec<KeyValue>> {
     let mut items = Vec::new();
     let mut decided_user_key: Option<Vec<u8>> = None;
 
-    for (internal_key, value) in &point_records {
+    for (internal_key, value) in point_records {
         let user_key = internal_key.user_key();
 
         // Internal keys are sorted by user key ascending, then newest visible
@@ -939,7 +1010,7 @@ fn collect_visible_range(
         match internal_key.kind() {
             ValueKind::Put => {
                 if !range_tombstones_cover(
-                    &range_tombstones,
+                    range_tombstones,
                     user_key,
                     internal_key.sequence(),
                     internal_key.batch_index(),

@@ -656,3 +656,43 @@ Record only evidence that can change planning or durable decisions.
 
 - Implement prefix filters as an advisory table-skip path, while keeping MVCC
   and range tombstone checks authoritative after any filter hit.
+
+## 2026-05-25: Prefix Filter Table Skip Passed
+
+### Observation
+
+- Table files now include a checked filter section.
+- Newly written tables can store an exact prefix set for `FixedLen` or
+  `Separator` extractors when prefix filters are enabled for the keyspace.
+- Prefix scans consult compatible table prefix filters to skip point records
+  that cannot match the requested prefix.
+- Range tombstones are still collected from all tables, including tables whose
+  point records are skipped by a prefix filter.
+- Queries that are shorter than the configured extractor prefix fall back to
+  reading candidate tables instead of trusting an incompatible filter lookup.
+- Tests cover prefix-filter table skipping, short-prefix fallback, range
+  tombstone correctness, and reopen from filtered tables.
+
+### Interpretation
+
+- Task015 is complete for the first advisory prefix-filter path.
+- The next blocker is separated blob values, because table blocks can now carry
+  checked metadata, compression, and advisory filters for inline values.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Blob references still return unsupported errors on the read path.
+- Recovery reports, version cleanup, and optimized search policies remain
+  future blockers.
+
+### Recommended Next Action
+
+- Implement blob file writing/reading for values above the keyspace threshold,
+  then prove reopen, flush, and compaction keep those values readable.
