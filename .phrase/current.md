@@ -56,15 +56,16 @@ task017 [x] goal:point-key filters skip incompatible point-record reads without 
 task018 [x] goal:SSTable point/range/prefix reads use block index and restart points for candidate selection | scope:src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 task019 [x] goal:persistent recovery fails closed on safe temporary files by default and writes a repair report when repair is explicitly enabled | scope:src/recovery.rs,src/db.rs,src/lib.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 task020 [x] goal:manual compaction drops obsolete point versions only when active snapshot pins allow it | scope:src/snapshot.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
+task021 [x] goal:manual compaction drops point/range tombstones only when the compaction scope proves they no longer hide retained values | scope:src/db.rs,src/manifest.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 ```
 
 ## Known Blockers
 
-- Tombstone cleanup, obsolete-file detection, blob cleanup, partitioned
-  filters/indexes, and optimized search policies are not implemented yet.
+- Obsolete-file detection, blob cleanup, partitioned filters/indexes, and
+  optimized search policies are not implemented yet.
 
 ## Evidence To Record
 
 - Phase 2 scaffold gate results.
-- Snapshot-safe point-version cleanup validation results.
-- Remaining blocker category after task020.
+- Tombstone cleanup validation results.
+- Remaining blocker category after task021.

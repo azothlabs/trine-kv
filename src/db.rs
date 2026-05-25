@@ -109,7 +109,7 @@ struct CompactionInput {
 struct CompactionOutput {
     keyspace: String,
     input_table_ids: Vec<table::TableId>,
-    table: Arc<Table>,
+    table: Option<Arc<Table>>,
 }
 
 impl Db {
@@ -323,9 +323,10 @@ impl Db {
         };
         let db_path = path.clone();
 
-        // The first compaction slice preserves every internal version and
-        // tombstone. That keeps old snapshots valid while replacing several
-        // flushed table files with one new file per keyspace.
+        // Compaction holds the writer coordinator while it chooses inputs,
+        // writes replacement tables, and publishes the manifest edit. Readers
+        // keep using the old Arc<Table> handles until the in-memory list is
+        // swapped after publish.
         let _writer = self
             .inner
             .writer
@@ -343,24 +344,28 @@ impl Db {
             .collect::<Vec<_>>();
         let mut written_tables = Vec::with_capacity(compaction_inputs.len());
         for input in &compaction_inputs {
-            let table_path = table::table_path(&db_path, input.table_id);
-            let table = table::write_table(
-                &table_path,
-                input.table_id,
-                &input.table_options,
-                &input.point_records,
-                &input.range_tombstones,
-            )?;
+            let table = if input.point_records.is_empty() && input.range_tombstones.is_empty() {
+                None
+            } else {
+                let table_path = table::table_path(&db_path, input.table_id);
+                Some(Arc::new(table::write_table(
+                    &table_path,
+                    input.table_id,
+                    &input.table_options,
+                    &input.point_records,
+                    &input.range_tombstones,
+                )?))
+            };
             written_tables.push(CompactionOutput {
                 keyspace: input.keyspace.clone(),
                 input_table_ids: input.input_table_ids.clone(),
-                table: Arc::new(table),
+                table,
             });
         }
 
         let written_table_ids = written_tables
             .iter()
-            .map(|output| output.table.properties().id)
+            .filter_map(|output| output.table.as_ref().map(|table| table.properties().id))
             .collect::<Vec<_>>();
         if let Err(error) = self.publish_compacted_tables(&written_tables) {
             let _ = remove_table_files(&db_path, &written_table_ids);
@@ -645,6 +650,9 @@ impl Db {
                 range_tombstones.extend(table.range_tombstones().iter().cloned());
             }
             let point_records = compact_point_records(point_records, oldest_active_snapshot);
+            let point_records = cleanup_point_tombstones(&point_records);
+            let range_tombstones =
+                cleanup_range_tombstones(range_tombstones, &point_records, range_is_all(range));
 
             inputs.push(CompactionInput {
                 keyspace: name.clone(),
@@ -701,7 +709,10 @@ impl Db {
                 (
                     output.keyspace.clone(),
                     output.input_table_ids.clone(),
-                    output.table.properties().clone(),
+                    output
+                        .table
+                        .as_ref()
+                        .map(|table| table.properties().clone()),
                 )
             })
             .collect::<Vec<_>>();
@@ -752,7 +763,9 @@ impl Db {
                 .write()
                 .map_err(|_| lock_poisoned("table list"))?;
             tables.retain(|table| !output.input_table_ids.contains(&table.properties().id));
-            tables.push(output.table);
+            if let Some(table) = output.table {
+                tables.push(table);
+            }
         }
 
         Ok(())
@@ -873,6 +886,74 @@ fn compact_point_records(
     }
 
     compacted
+}
+
+fn cleanup_point_tombstones(
+    point_records: &[(InternalKey, Option<ValueRef>)],
+) -> Vec<(InternalKey, Option<ValueRef>)> {
+    let mut compacted = Vec::with_capacity(point_records.len());
+    let mut index = 0;
+
+    while index < point_records.len() {
+        let user_key = point_records[index].0.user_key();
+        let group_end = point_records[index..]
+            .partition_point(|(internal_key, _)| internal_key.user_key() == user_key)
+            + index;
+
+        for record_index in index..group_end {
+            let (internal_key, _) = &point_records[record_index];
+            if matches!(internal_key.kind(), ValueKind::PointDelete)
+                && !has_older_point_record(point_records, record_index, group_end)
+            {
+                continue;
+            }
+            compacted.push(point_records[record_index].clone());
+        }
+
+        index = group_end;
+    }
+
+    compacted
+}
+
+fn has_older_point_record(
+    point_records: &[(InternalKey, Option<ValueRef>)],
+    tombstone_index: usize,
+    group_end: usize,
+) -> bool {
+    let tombstone_sequence = point_records[tombstone_index].0.sequence();
+    point_records[tombstone_index + 1..group_end]
+        .iter()
+        .any(|(internal_key, _)| internal_key.sequence() <= tombstone_sequence)
+}
+
+fn cleanup_range_tombstones(
+    range_tombstones: Vec<TableRangeTombstone>,
+    point_records: &[(InternalKey, Option<ValueRef>)],
+    full_keyspace_compaction: bool,
+) -> Vec<TableRangeTombstone> {
+    // Partial compaction cannot prove there is no older covered data just
+    // outside its input tables. Keep range tombstones there and only clean them
+    // when the whole keyspace participates in this compaction pass.
+    if !full_keyspace_compaction {
+        return range_tombstones;
+    }
+
+    range_tombstones
+        .into_iter()
+        .filter(|tombstone| range_tombstone_covers_remaining_put(tombstone, point_records))
+        .collect()
+}
+
+fn range_tombstone_covers_remaining_put(
+    tombstone: &TableRangeTombstone,
+    point_records: &[(InternalKey, Option<ValueRef>)],
+) -> bool {
+    point_records.iter().any(|(internal_key, _)| {
+        matches!(internal_key.kind(), ValueKind::Put)
+            && internal_key.sequence() <= tombstone.sequence
+            && key_is_in_range(internal_key.user_key(), &tombstone.range)
+    })
 }
 
 fn validate_batch_len(len: usize) -> Result<()> {
@@ -1337,8 +1418,11 @@ fn remove_table_files(db_path: &Path, table_ids: &[table::TableId]) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::{InternalKey, ValueKind, ValueRef, compact_point_records};
-    use crate::types::Sequence;
+    use super::{
+        InternalKey, TableRangeTombstone, ValueKind, ValueRef, cleanup_point_tombstones,
+        cleanup_range_tombstones, compact_point_records,
+    };
+    use crate::types::{KeyRange, Sequence};
 
     #[test]
     fn compaction_keeps_newer_versions_and_snapshot_floor() {
@@ -1376,6 +1460,51 @@ mod tests {
         assert!(matches!(compacted[1].0.kind(), ValueKind::PointDelete));
     }
 
+    #[test]
+    fn point_tombstone_cleanup_drops_delete_after_older_records_are_removed() {
+        let compacted =
+            compact_point_records(vec![tombstone("a", 2), record("a", 1)], Sequence::new(2));
+
+        assert!(cleanup_point_tombstones(&compacted).is_empty());
+    }
+
+    #[test]
+    fn point_tombstone_cleanup_keeps_delete_while_older_record_remains() {
+        let compacted =
+            compact_point_records(vec![tombstone("a", 3), record("a", 1)], Sequence::new(1));
+
+        assert_eq!(
+            record_sequences(&cleanup_point_tombstones(&compacted)),
+            vec![("a", 3), ("a", 1)]
+        );
+    }
+
+    #[test]
+    fn range_tombstone_cleanup_keeps_tombstone_covering_remaining_put() {
+        let tombstones =
+            cleanup_range_tombstones(vec![range_tombstone("a", "c", 2)], &[record("b", 1)], true);
+
+        assert_eq!(tombstones.len(), 1);
+    }
+
+    #[test]
+    fn range_tombstone_cleanup_drops_tombstone_without_remaining_put() {
+        let tombstones = cleanup_range_tombstones(
+            vec![range_tombstone("a", "c", 2)],
+            &[record("b", 3), record("z", 1)],
+            true,
+        );
+
+        assert!(tombstones.is_empty());
+    }
+
+    #[test]
+    fn range_tombstone_cleanup_keeps_tombstone_for_partial_compaction() {
+        let tombstones = cleanup_range_tombstones(vec![range_tombstone("a", "c", 2)], &[], false);
+
+        assert_eq!(tombstones.len(), 1);
+    }
+
     fn record(key: &str, sequence: u64) -> (InternalKey, Option<ValueRef>) {
         (
             InternalKey::new(key, Sequence::new(sequence), ValueKind::Put, 0),
@@ -1388,6 +1517,14 @@ mod tests {
             InternalKey::new(key, Sequence::new(sequence), ValueKind::PointDelete, 0),
             None,
         )
+    }
+
+    fn range_tombstone(start: &str, end: &str, sequence: u64) -> TableRangeTombstone {
+        TableRangeTombstone {
+            range: KeyRange::half_open(start.as_bytes(), end.as_bytes()),
+            sequence: Sequence::new(sequence),
+            batch_index: 0,
+        }
     }
 
     fn record_sequences(records: &[(InternalKey, Option<ValueRef>)]) -> Vec<(&str, u64)> {

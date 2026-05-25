@@ -61,6 +61,18 @@ fn blob_file_paths(path: &std::path::Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn table_file_paths(path: &std::path::Path) -> Vec<PathBuf> {
+    fs::read_dir(path)
+        .expect("read test db directory")
+        .map(|entry| entry.expect("read directory entry").path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension == table::TABLE_FILE_EXTENSION)
+        })
+        .collect()
+}
+
 fn write_file(path: &std::path::Path, bytes: &[u8]) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).expect("create parent directory");
@@ -885,6 +897,55 @@ fn persistent_compaction_rewrites_tables_and_preserves_reads() {
         );
         assert_eq!(keyspace.get(b"b").expect("b delete survives reopen"), None);
         assert_eq!(keyspace.get(b"c").expect("c delete survives reopen"), None);
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_compaction_removes_obsolete_point_delete_without_replacement() {
+    let path = temp_db_path("compact-empty-output");
+    let options = DbOptions::persistent(&path);
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+
+        keyspace.insert(b"a", b"v1").expect("write a");
+        db.flush().expect("flush value table");
+        keyspace.remove(b"a").expect("delete a");
+        db.flush().expect("flush delete table");
+        assert_eq!(table_file_paths(&path).len(), 2);
+
+        db.compact_range(KeyRange::all())
+            .expect("manual compaction removes obsolete delete");
+        assert_eq!(keyspace.get(b"a").expect("deleted key reads missing"), None);
+        assert!(
+            table_file_paths(&path).is_empty(),
+            "empty compaction output should remove old tables without writing a replacement"
+        );
+
+        let manifest_state =
+            manifest::read_manifest(&manifest::manifest_path(&path)).expect("manifest reads");
+        assert!(
+            manifest_state
+                .tables()
+                .get("default")
+                .expect("default table list exists")
+                .is_empty()
+        );
+    }
+
+    fs::remove_file(wal::wal_path(&path)).expect("remove WAL after empty compaction");
+
+    {
+        let db = Db::open(options).expect("persistent db reopens after empty compaction");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace reopens");
+        assert_eq!(keyspace.get(b"a").expect("deleted key reopens"), None);
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");

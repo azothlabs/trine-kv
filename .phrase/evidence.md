@@ -899,3 +899,43 @@ Record only evidence that can change planning or durable decisions.
 - Implement tombstone cleanup under the same snapshot safety boundary, keeping
   tombstones whenever older covered data may still exist in the compaction
   scope.
+
+## 2026-05-25: Tombstone Cleanup Passed
+
+### Observation
+
+- Manual compaction now removes point deletes when the compacted point-record
+  group has no older record left for that user key.
+- Full-keyspace compaction now removes range deletes that no longer cover any
+  retained older `Put` record.
+- Partial compaction retains range deletes, because it cannot prove there is no
+  older covered data just outside the input tables.
+- Manifest replacement now supports compaction outputs that remove input tables
+  without writing a replacement table when cleanup produces no records.
+- Tests cover point-delete cleanup, point-delete retention while older records
+  remain, range-delete cleanup and partial-compaction retention, and persistent
+  compaction that removes a delete-only output without leaving an empty table.
+
+### Interpretation
+
+- Task021 is complete for conservative tombstone cleanup inside the current
+  manual compaction model.
+- Blob cleanup can now rely on compaction removing obsolete point records and
+  tombstones before deciding whether old blob files are still referenced.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Obsolete-file detection, blob cleanup, partitioned filters/indexes, and
+  optimized search policies remain future blockers.
+
+### Recommended Next Action
+
+- Implement blob cleanup by scanning live table references after compaction and
+  removing unreferenced blob files only after manifest publish succeeds.
