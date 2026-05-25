@@ -1268,3 +1268,41 @@ Record only evidence that can change planning or durable decisions.
 
 - Add an automatic compaction trigger after flush when L0 table count exceeds
   the configured threshold, using the level-aware planner.
+
+## 2026-05-25: Flush L0 Pressure Trigger Passed
+
+### Observation
+
+- `Db::flush` now checks live L0 table counts after publishing flushed tables.
+- If any keyspace exceeds `max_l0_files`, flush releases the writer
+  coordinator and invokes `compact_range(KeyRange::all())`.
+- The compaction call reuses the level-aware planner and existing manifest
+  publish/cleanup path.
+- Tests verify that a second flush with `max_l0_files = 1` automatically moves
+  L0 data into L1, keeps reads correct, leaves one new L0 table below the
+  pressure limit, and survives reopen.
+
+### Interpretation
+
+- Task030 is complete for the v1 automatic compaction trigger.
+- Compaction is now enabled without manual calls once L0 pressure exceeds the
+  configured threshold. The remaining v1 blockers have moved to observability,
+  cache behavior, benchmark output, and durability docs.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Required metrics and cache behavior.
+- Required benchmark outputs.
+- Durability documentation.
+
+### Recommended Next Action
+
+- Implement live database stats for tables, L0 pressure, blob files, and
+  compaction counters before adding cache behavior.

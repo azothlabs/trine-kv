@@ -65,13 +65,12 @@ task026 [x] goal:v1 protocol acceptance audit identifies remaining gaps and the 
 task027 [x] goal:persistent open takes an exclusive database directory lock and releases it safely | scope:src/db.rs,src/recovery.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
 task028 [x] goal:table metadata records compaction levels and read ordering remains correct across levels | scope:src/manifest.rs,src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
 task029 [x] goal:compaction planning selects level-aware L0 inputs and overlapping lower-level tables | scope:src/compaction.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
-task030 [ ] goal:flush path can trigger automatic compaction when L0 pressure exceeds configured limits | scope:src/db.rs,src/compaction.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
+task030 [x] goal:flush path can trigger automatic compaction when L0 pressure exceeds configured limits | scope:src/db.rs,src/compaction.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
+task031 [ ] goal:database stats expose table, L0, blob, and compaction counters from live state | scope:src/stats.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
 ```
 
 ## Known Blockers
 
-- Leveled compaction input picking exists, but background scheduling is not
-  complete yet.
 - Required metrics, cache behavior, benchmark output, and durability docs are
   incomplete.
 
@@ -87,4 +86,5 @@ task030 [ ] goal:flush path can trigger automatic compaction when L0 pressure ex
 - Process-lock validation results.
 - Compaction-level metadata validation results.
 - Level-aware compaction planning validation results.
-- Remaining blocker category after task029.
+- Automatic compaction trigger validation results.
+- Remaining blocker category after task030.

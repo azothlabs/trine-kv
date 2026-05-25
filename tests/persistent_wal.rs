@@ -683,6 +683,59 @@ fn persistent_compaction_levels_preserve_newer_l0_reads() {
 }
 
 #[test]
+fn persistent_flush_auto_compacts_when_l0_pressure_exceeds_limit() {
+    let path = temp_db_path("auto-compact-l0");
+    let mut options = DbOptions::persistent(&path);
+    options.max_l0_files = 1;
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+
+        keyspace.insert(b"a", b"a1").expect("write a");
+        db.flush().expect("first flush stays L0");
+        assert_eq!(default_table_levels(&path), vec![0]);
+
+        keyspace.insert(b"b", b"b1").expect("write b");
+        db.flush().expect("second flush triggers compaction");
+        assert_eq!(default_table_levels(&path), vec![1]);
+        assert_eq!(
+            keyspace.get(b"a").expect("a reads after auto compaction"),
+            Some(b"a1".to_vec())
+        );
+        assert_eq!(
+            keyspace.get(b"b").expect("b reads after auto compaction"),
+            Some(b"b1".to_vec())
+        );
+
+        keyspace.insert(b"a", b"a2").expect("write newer a");
+        db.flush().expect("new L0 below pressure limit");
+        assert_eq!(default_table_levels(&path), vec![0, 1]);
+        assert_eq!(
+            keyspace.get(b"a").expect("newer a reads over L1"),
+            Some(b"a2".to_vec())
+        );
+    }
+
+    {
+        let db = Db::open(options).expect("persistent db reopens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace reopens");
+        assert_eq!(default_table_levels(&path), vec![0, 1]);
+        assert_eq!(
+            keyspace.get(b"a").expect("newer a reopens"),
+            Some(b"a2".to_vec())
+        );
+        assert_eq!(keyspace.get(b"b").expect("b reopens"), Some(b"b1".to_vec()));
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_flush_preserves_snapshot_versions() {
     let path = temp_db_path("flush-snapshot");
     let options = DbOptions::persistent(&path);

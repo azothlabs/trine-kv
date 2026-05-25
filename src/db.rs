@@ -296,35 +296,42 @@ impl Db {
         let db_path = path.clone();
         let flush_sequence = self.last_committed_sequence();
 
-        // Flush holds the writer coordinator while it copies and clears
-        // memtables. That gives the manifest edit and the in-memory table list
-        // one clear cutover point relative to commits.
-        let _writer = self
-            .inner
-            .writer
-            .lock()
-            .map_err(|_| lock_poisoned("writer coordinator"))?;
-        let flush_inputs = self.collect_flush_inputs()?;
-        if flush_inputs.is_empty() {
-            return Ok(());
-        }
+        let should_compact = {
+            // Flush holds the writer coordinator while it copies and clears
+            // memtables. That gives the manifest edit and the in-memory table
+            // list one clear cutover point relative to commits.
+            let _writer = self
+                .inner
+                .writer
+                .lock()
+                .map_err(|_| lock_poisoned("writer coordinator"))?;
+            let flush_inputs = self.collect_flush_inputs()?;
+            if flush_inputs.is_empty() {
+                return Ok(());
+            }
 
-        let mut written_tables = Vec::with_capacity(flush_inputs.len());
-        for input in &flush_inputs {
-            let table_path = table::table_path(&db_path, input.table_id);
-            let table = table::write_table(
-                &table_path,
-                input.table_id,
-                input.table_level,
-                &input.table_options,
-                &input.point_records,
-                &input.range_tombstones,
-            )?;
-            written_tables.push((input.keyspace.clone(), Arc::new(table)));
-        }
+            let mut written_tables = Vec::with_capacity(flush_inputs.len());
+            for input in &flush_inputs {
+                let table_path = table::table_path(&db_path, input.table_id);
+                let table = table::write_table(
+                    &table_path,
+                    input.table_id,
+                    input.table_level,
+                    &input.table_options,
+                    &input.point_records,
+                    &input.range_tombstones,
+                )?;
+                written_tables.push((input.keyspace.clone(), Arc::new(table)));
+            }
 
-        self.publish_flushed_tables(&written_tables, flush_sequence)?;
-        self.install_flushed_tables(&flush_inputs, written_tables)?;
+            self.publish_flushed_tables(&written_tables, flush_sequence)?;
+            self.install_flushed_tables(&flush_inputs, written_tables)?;
+            self.l0_pressure_exceeded()?
+        };
+
+        if should_compact {
+            self.compact_range(KeyRange::all())?;
+        }
 
         Ok(())
     }
@@ -847,6 +854,30 @@ impl Db {
         }
 
         Ok(())
+    }
+
+    fn l0_pressure_exceeded(&self) -> Result<bool> {
+        let keyspaces = self
+            .inner
+            .keyspaces
+            .read()
+            .map_err(|_| lock_poisoned("keyspace registry"))?;
+
+        for state in keyspaces.values() {
+            let tables = state
+                .tables
+                .read()
+                .map_err(|_| lock_poisoned("table list"))?;
+            let l0_count = tables
+                .iter()
+                .filter(|table| table.properties().level == table::TableLevel::ZERO)
+                .count();
+            if l0_count > self.inner.options.max_l0_files {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 }
 
