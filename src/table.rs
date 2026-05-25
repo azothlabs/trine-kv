@@ -17,6 +17,11 @@ pub const TABLE_FILE_EXTENSION: &str = "trinet";
 const TABLE_MAGIC: u32 = 0x5452_5442;
 const TABLE_VERSION: u16 = 1;
 const HEADER_LEN: usize = 14;
+const FOOTER_MAGIC: u32 = 0x5452_5446;
+const FOOTER_LEN: usize = 74;
+const BLOCK_HEADER_LEN: usize = 13;
+const DATA_BLOCK_TARGET_BYTES: usize = 1024;
+const DATA_BLOCK_RESTART_INTERVAL: usize = 16;
 
 const VALUE_KIND_PUT: u8 = 1;
 const VALUE_KIND_POINT_DELETE: u8 = 2;
@@ -71,6 +76,42 @@ pub struct TableProperties {
 pub(crate) struct TablePointRecord {
     pub(crate) internal_key: InternalKey,
     pub(crate) value: Option<ValueRef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SectionHandle {
+    offset: u64,
+    len: u64,
+}
+
+impl SectionHandle {
+    fn from_span(start: usize, end: usize) -> Result<Self> {
+        Ok(Self {
+            offset: usize_to_u64(start, "section offset")?,
+            len: usize_to_u64(end.saturating_sub(start), "section length")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockHandle {
+    offset: u64,
+    len: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TableFooter {
+    data_blocks: SectionHandle,
+    range_tombstones: SectionHandle,
+    indexes: SectionHandle,
+    properties: SectionHandle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DataBlockIndexEntry {
+    smallest_internal_key: InternalKey,
+    largest_internal_key: InternalKey,
+    block: BlockHandle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,28 +257,21 @@ fn table_properties(
 
 fn encode_table(table: &Table) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    put_properties(&mut bytes, &table.properties)?;
-    put_u32(
+    let (data_blocks, index_entries) = append_data_blocks(&mut bytes, &table.point_records)?;
+    let range_tombstones =
+        append_single_block_section(&mut bytes, &encode_range_tombstone_block(table)?)?;
+    let indexes = append_single_block_section(&mut bytes, &encode_index_block(&index_entries)?)?;
+    let properties =
+        append_single_block_section(&mut bytes, &encode_properties_block(&table.properties)?)?;
+    put_footer(
         &mut bytes,
-        u32::try_from(table.point_records.len())
-            .map_err(|_| Error::invalid_options("too many point records for table"))?,
+        &TableFooter {
+            data_blocks,
+            range_tombstones,
+            indexes,
+            properties,
+        },
     );
-    for record in &table.point_records {
-        put_internal_key(&mut bytes, &record.internal_key)?;
-        put_value_ref(&mut bytes, record.value.as_ref())?;
-    }
-
-    put_u32(
-        &mut bytes,
-        u32::try_from(table.range_tombstones.len())
-            .map_err(|_| Error::invalid_options("too many range tombstones for table"))?,
-    );
-    for tombstone in &table.range_tombstones {
-        put_bound(&mut bytes, &tombstone.range.start)?;
-        put_bound(&mut bytes, &tombstone.range.end)?;
-        put_u64(&mut bytes, tombstone.sequence.get());
-        put_u32(&mut bytes, tombstone.batch_index);
-    }
 
     Ok(bytes)
 }
@@ -274,17 +308,373 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
         });
     }
 
-    let mut cursor = Cursor::new(payload);
+    let footer = read_footer(payload)?;
+    validate_footer_sections(payload, &footer)?;
+
+    let properties_payload = read_single_block_section(payload, footer.properties)?;
+    let properties = decode_properties_block(&properties_payload)?;
+
+    let index_payload = read_single_block_section(payload, footer.indexes)?;
+    let index_entries = decode_index_block(&index_payload)?;
+    validate_data_index_covers_section(&index_entries, footer.data_blocks)?;
+
+    let mut point_records = Vec::new();
+    for entry in &index_entries {
+        let block_payload = read_checked_block(payload, entry.block)?;
+        let block_records = decode_data_block(&block_payload)?;
+        validate_data_block_entry(entry, &block_records)?;
+        point_records.extend(block_records);
+    }
+    validate_sorted_point_records(&point_records)?;
+
+    let tombstone_payload = read_single_block_section(payload, footer.range_tombstones)?;
+    let range_tombstones = decode_range_tombstone_block(&tombstone_payload)?;
+    if properties != table_properties(properties.id, &point_records, &range_tombstones) {
+        return Err(Error::Corruption {
+            message: "table properties do not match encoded records".to_owned(),
+        });
+    }
+
+    Ok(Table {
+        properties,
+        point_records,
+        range_tombstones,
+    })
+}
+
+fn append_data_blocks(
+    bytes: &mut Vec<u8>,
+    point_records: &[TablePointRecord],
+) -> Result<(SectionHandle, Vec<DataBlockIndexEntry>)> {
+    let section_start = bytes.len();
+    let mut index_entries = Vec::new();
+    let mut block_start = 0;
+
+    while block_start < point_records.len() {
+        let mut block_end = block_start;
+        let mut estimated_len = 0_usize;
+        while block_end < point_records.len() {
+            let next_len = point_record_encoded_len(&point_records[block_end])?;
+            if block_end > block_start && estimated_len + next_len > DATA_BLOCK_TARGET_BYTES {
+                break;
+            }
+            estimated_len += next_len;
+            block_end += 1;
+        }
+
+        let records = &point_records[block_start..block_end];
+        let block_payload = encode_data_block(records)?;
+        let block = append_checked_block(bytes, CodecId::None, &block_payload)?;
+        index_entries.push(DataBlockIndexEntry {
+            smallest_internal_key: records
+                .first()
+                .expect("data block has at least one record")
+                .internal_key
+                .clone(),
+            largest_internal_key: records
+                .last()
+                .expect("data block has at least one record")
+                .internal_key
+                .clone(),
+            block,
+        });
+        block_start = block_end;
+    }
+
+    Ok((
+        SectionHandle::from_span(section_start, bytes.len())?,
+        index_entries,
+    ))
+}
+
+fn append_single_block_section(bytes: &mut Vec<u8>, block_payload: &[u8]) -> Result<SectionHandle> {
+    let section_start = bytes.len();
+    append_checked_block(bytes, CodecId::None, block_payload)?;
+    SectionHandle::from_span(section_start, bytes.len())
+}
+
+fn append_checked_block(
+    bytes: &mut Vec<u8>,
+    codec: CodecId,
+    block_payload: &[u8],
+) -> Result<BlockHandle> {
+    if codec != CodecId::None {
+        return Err(Error::CodecUnavailable {
+            codec: codec.as_str().to_owned(),
+        });
+    }
+
+    let section_start = bytes.len();
+    put_codec(bytes, codec);
+    put_u32(
+        bytes,
+        usize_to_u32(block_payload.len(), "block payload length")?,
+    );
+    put_u32(
+        bytes,
+        usize_to_u32(block_payload.len(), "encoded block length")?,
+    );
+    put_u32(bytes, checksum(block_payload));
+    bytes.extend_from_slice(block_payload);
+
+    Ok(BlockHandle {
+        offset: usize_to_u64(section_start, "block offset")?,
+        len: usize_to_u64(bytes.len() - section_start, "block length")?,
+    })
+}
+
+fn encode_data_block(records: &[TablePointRecord]) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut restart_offsets = Vec::new();
+    put_u32(
+        &mut bytes,
+        usize_to_u32(records.len(), "data block record count")?,
+    );
+
+    for (index, record) in records.iter().enumerate() {
+        if index % DATA_BLOCK_RESTART_INTERVAL == 0 {
+            restart_offsets.push(usize_to_u32(bytes.len(), "data block restart offset")?);
+        }
+        put_internal_key(&mut bytes, &record.internal_key)?;
+        put_value_ref(&mut bytes, record.value.as_ref())?;
+    }
+
+    put_u32(
+        &mut bytes,
+        usize_to_u32(restart_offsets.len(), "data block restart count")?,
+    );
+    for restart_offset in restart_offsets {
+        put_u32(&mut bytes, restart_offset);
+    }
+
+    Ok(bytes)
+}
+
+fn encode_range_tombstone_block(table: &Table) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    put_u32(
+        &mut bytes,
+        usize_to_u32(
+            table.range_tombstones.len(),
+            "range tombstone block record count",
+        )?,
+    );
+    for tombstone in &table.range_tombstones {
+        put_bound(&mut bytes, &tombstone.range.start)?;
+        put_bound(&mut bytes, &tombstone.range.end)?;
+        put_u64(&mut bytes, tombstone.sequence.get());
+        put_u32(&mut bytes, tombstone.batch_index);
+    }
+    Ok(bytes)
+}
+
+fn encode_index_block(index_entries: &[DataBlockIndexEntry]) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    put_u32(
+        &mut bytes,
+        usize_to_u32(index_entries.len(), "data block index entry count")?,
+    );
+    for entry in index_entries {
+        put_internal_key(&mut bytes, &entry.smallest_internal_key)?;
+        put_internal_key(&mut bytes, &entry.largest_internal_key)?;
+        put_u64(&mut bytes, entry.block.offset);
+        put_u64(&mut bytes, entry.block.len);
+    }
+    Ok(bytes)
+}
+
+fn encode_properties_block(properties: &TableProperties) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    put_properties(&mut bytes, properties)?;
+    Ok(bytes)
+}
+
+fn read_footer(payload: &[u8]) -> Result<TableFooter> {
+    if payload.len() < FOOTER_LEN {
+        return Err(invalid_table("short footer"));
+    }
+    let footer_start = payload.len() - FOOTER_LEN;
+    let footer = &payload[footer_start..];
+    let stored_checksum = read_u32_at(footer, FOOTER_LEN - 4)?;
+    if checksum(&footer[..FOOTER_LEN - 4]) != stored_checksum {
+        return Err(Error::Corruption {
+            message: "table footer checksum mismatch".to_owned(),
+        });
+    }
+
+    let mut cursor = Cursor::new(footer);
+    let magic = cursor.read_u32()?;
+    let version = cursor.read_u16()?;
+    if magic != FOOTER_MAGIC {
+        return Err(Error::Corruption {
+            message: "table footer magic mismatch".to_owned(),
+        });
+    }
+    if version != TABLE_VERSION {
+        return Err(Error::UnsupportedFormat {
+            message: format!("unsupported table footer version {version}"),
+        });
+    }
+
+    let footer = TableFooter {
+        data_blocks: cursor.read_section_handle()?,
+        range_tombstones: cursor.read_section_handle()?,
+        indexes: cursor.read_section_handle()?,
+        properties: cursor.read_section_handle()?,
+    };
+    let _footer_checksum = cursor.read_u32()?;
+    if !cursor.is_finished() {
+        return Err(invalid_table("trailing footer bytes"));
+    }
+
+    Ok(footer)
+}
+
+fn put_footer(bytes: &mut Vec<u8>, footer: &TableFooter) {
+    let mut footer_bytes = Vec::with_capacity(FOOTER_LEN);
+    put_u32(&mut footer_bytes, FOOTER_MAGIC);
+    put_u16(&mut footer_bytes, TABLE_VERSION);
+    put_section_handle(&mut footer_bytes, footer.data_blocks);
+    put_section_handle(&mut footer_bytes, footer.range_tombstones);
+    put_section_handle(&mut footer_bytes, footer.indexes);
+    put_section_handle(&mut footer_bytes, footer.properties);
+    let footer_checksum = checksum(&footer_bytes);
+    put_u32(&mut footer_bytes, footer_checksum);
+    debug_assert_eq!(footer_bytes.len(), FOOTER_LEN);
+    bytes.extend_from_slice(&footer_bytes);
+}
+
+fn validate_footer_sections(payload: &[u8], footer: &TableFooter) -> Result<()> {
+    let footer_start = payload.len() - FOOTER_LEN;
+    let mut expected_start = 0_usize;
+    for section in [
+        footer.data_blocks,
+        footer.range_tombstones,
+        footer.indexes,
+        footer.properties,
+    ] {
+        let (section_start, section_end) = section_bounds(section)?;
+        if section_start != expected_start || section_end > footer_start {
+            return Err(Error::Corruption {
+                message: "table section layout is inconsistent".to_owned(),
+            });
+        }
+        expected_start = section_end;
+    }
+    if expected_start != footer_start {
+        return Err(Error::Corruption {
+            message: "table footer does not cover all section bytes".to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+fn read_single_block_section(payload: &[u8], section: SectionHandle) -> Result<Vec<u8>> {
+    let (_, section_end) = section_bounds(section)?;
+    if section.len == 0 {
+        return Err(invalid_table("empty single-block section"));
+    }
+    let block = BlockHandle {
+        offset: section.offset,
+        len: section.len,
+    };
+    let (_, block_end) = block_bounds(block)?;
+    if block_end != section_end {
+        return Err(Error::Corruption {
+            message: "section block length mismatch".to_owned(),
+        });
+    }
+    read_checked_block(payload, block)
+}
+
+fn read_checked_block(payload: &[u8], block: BlockHandle) -> Result<Vec<u8>> {
+    let (start, end) = block_bounds(block)?;
+    let block_bytes = payload
+        .get(start..end)
+        .ok_or_else(|| invalid_table("block outside table payload"))?;
+    if block_bytes.len() < BLOCK_HEADER_LEN {
+        return Err(invalid_table("short block header"));
+    }
+
+    let codec = codec_from_tag(block_bytes[0])?;
+    let uncompressed_len = read_u32_at(block_bytes, 1)? as usize;
+    let encoded_len = read_u32_at(block_bytes, 5)? as usize;
+    let expected_checksum = read_u32_at(block_bytes, 9)?;
+    if block_bytes.len() != BLOCK_HEADER_LEN + encoded_len {
+        return Err(Error::Corruption {
+            message: "block length mismatch".to_owned(),
+        });
+    }
+
+    let encoded = &block_bytes[BLOCK_HEADER_LEN..];
+    if checksum(encoded) != expected_checksum {
+        return Err(Error::Corruption {
+            message: "block checksum mismatch".to_owned(),
+        });
+    }
+
+    match codec {
+        CodecId::None => {
+            if encoded.len() != uncompressed_len {
+                return Err(invalid_table("uncompressed block length mismatch"));
+            }
+            Ok(encoded.to_vec())
+        }
+        CodecId::FastLz4Block => Err(Error::CodecUnavailable {
+            codec: codec.as_str().to_owned(),
+        }),
+    }
+}
+
+fn decode_properties_block(bytes: &[u8]) -> Result<TableProperties> {
+    let mut cursor = Cursor::new(bytes);
     let properties = cursor.read_properties()?;
-    let point_count = cursor.read_u32()? as usize;
-    let mut point_records = Vec::with_capacity(point_count);
-    for _ in 0..point_count {
-        point_records.push(TablePointRecord {
+    if !cursor.is_finished() {
+        return Err(invalid_table("trailing properties block bytes"));
+    }
+    Ok(properties)
+}
+
+fn decode_index_block(bytes: &[u8]) -> Result<Vec<DataBlockIndexEntry>> {
+    let mut cursor = Cursor::new(bytes);
+    let entry_count = cursor.read_u32()? as usize;
+    let mut entries = Vec::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        entries.push(DataBlockIndexEntry {
+            smallest_internal_key: cursor.read_internal_key()?,
+            largest_internal_key: cursor.read_internal_key()?,
+            block: BlockHandle {
+                offset: cursor.read_u64()?,
+                len: cursor.read_u64()?,
+            },
+        });
+    }
+    if !cursor.is_finished() {
+        return Err(invalid_table("trailing index block bytes"));
+    }
+    Ok(entries)
+}
+
+fn decode_data_block(bytes: &[u8]) -> Result<Vec<TablePointRecord>> {
+    let mut cursor = Cursor::new(bytes);
+    let record_count = cursor.read_u32()? as usize;
+    let mut records = Vec::with_capacity(record_count);
+    for _ in 0..record_count {
+        records.push(TablePointRecord {
             internal_key: cursor.read_internal_key()?,
             value: cursor.read_value_ref()?,
         });
     }
+    validate_restart_points(bytes, &mut cursor, record_count)?;
+    if !cursor.is_finished() {
+        return Err(invalid_table("trailing data block bytes"));
+    }
+    Ok(records)
+}
 
+fn decode_range_tombstone_block(bytes: &[u8]) -> Result<Vec<TableRangeTombstone>> {
+    let mut cursor = Cursor::new(bytes);
     let tombstone_count = cursor.read_u32()? as usize;
     let mut range_tombstones = Vec::with_capacity(tombstone_count);
     for _ in 0..tombstone_count {
@@ -296,16 +686,125 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
             batch_index: cursor.read_u32()?,
         });
     }
-
     if !cursor.is_finished() {
-        return Err(invalid_table("trailing payload bytes"));
+        return Err(invalid_table("trailing range tombstone block bytes"));
+    }
+    Ok(range_tombstones)
+}
+
+fn validate_restart_points(
+    block_payload: &[u8],
+    cursor: &mut Cursor<'_>,
+    record_count: usize,
+) -> Result<()> {
+    let restart_count = cursor.read_u32()? as usize;
+    if record_count == 0 {
+        if restart_count == 0 {
+            return Ok(());
+        }
+        return Err(invalid_table("empty data block has restart points"));
+    }
+    if restart_count == 0 {
+        return Err(invalid_table("data block is missing restart points"));
     }
 
-    Ok(Table {
-        properties,
-        point_records,
-        range_tombstones,
-    })
+    let mut previous_restart = None;
+    for _ in 0..restart_count {
+        let restart = cursor.read_u32()? as usize;
+        if restart >= block_payload.len() {
+            return Err(invalid_table("data block restart outside block"));
+        }
+        if previous_restart.is_some_and(|previous| restart <= previous) {
+            return Err(invalid_table("data block restart points are not sorted"));
+        }
+        previous_restart = Some(restart);
+    }
+
+    Ok(())
+}
+
+fn validate_data_index_covers_section(
+    index_entries: &[DataBlockIndexEntry],
+    data_blocks: SectionHandle,
+) -> Result<()> {
+    let (section_start, section_end) = section_bounds(data_blocks)?;
+    if index_entries.is_empty() {
+        if section_start == section_end {
+            return Ok(());
+        }
+        return Err(Error::Corruption {
+            message: "data block section is not indexed".to_owned(),
+        });
+    }
+
+    let mut expected_start = section_start;
+    let mut previous_largest = None;
+    for entry in index_entries {
+        let (block_start, block_end) = block_bounds(entry.block)?;
+        if block_start != expected_start || block_end > section_end {
+            return Err(Error::Corruption {
+                message: "data block index does not cover section bytes".to_owned(),
+            });
+        }
+        if entry.smallest_internal_key > entry.largest_internal_key {
+            return Err(Error::Corruption {
+                message: "data block index key bounds are inverted".to_owned(),
+            });
+        }
+        if previous_largest
+            .as_ref()
+            .is_some_and(|previous| previous >= &entry.smallest_internal_key)
+        {
+            return Err(Error::Corruption {
+                message: "data block index entries are not sorted".to_owned(),
+            });
+        }
+        expected_start = block_end;
+        previous_largest = Some(entry.largest_internal_key.clone());
+    }
+
+    if expected_start != section_end {
+        return Err(Error::Corruption {
+            message: "data block index leaves section bytes unread".to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_data_block_entry(
+    entry: &DataBlockIndexEntry,
+    records: &[TablePointRecord],
+) -> Result<()> {
+    let Some(first) = records.first() else {
+        return Err(Error::Corruption {
+            message: "data block index points to an empty block".to_owned(),
+        });
+    };
+    let last = records
+        .last()
+        .expect("non-empty data block has last record");
+    if first.internal_key != entry.smallest_internal_key
+        || last.internal_key != entry.largest_internal_key
+    {
+        return Err(Error::Corruption {
+            message: "data block index key bounds do not match block records".to_owned(),
+        });
+    }
+
+    validate_sorted_point_records(records)
+}
+
+fn validate_sorted_point_records(point_records: &[TablePointRecord]) -> Result<()> {
+    for pair in point_records.windows(2) {
+        if pair[0].internal_key >= pair[1].internal_key {
+            return Err(Error::Corruption {
+                message: "table point records are not sorted by internal key".to_owned(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn put_properties(bytes: &mut Vec<u8>, properties: &TableProperties) -> Result<()> {
@@ -363,6 +862,16 @@ fn put_codec(bytes: &mut Vec<u8>, codec: CodecId) {
     );
 }
 
+fn codec_from_tag(tag: u8) -> Result<CodecId> {
+    match tag {
+        0 => Ok(CodecId::None),
+        1 => Ok(CodecId::FastLz4Block),
+        tag => Err(Error::UnsupportedFormat {
+            message: format!("unknown table codec {tag}"),
+        }),
+    }
+}
+
 fn put_bound(bytes: &mut Vec<u8>, bound: &Bound<Vec<u8>>) -> Result<()> {
     match bound {
         Bound::Unbounded => put_u8(bytes, BOUND_UNBOUNDED),
@@ -382,6 +891,10 @@ fn put_u8(bytes: &mut Vec<u8>, value: u8) {
     bytes.push(value);
 }
 
+fn put_u16(bytes: &mut Vec<u8>, value: u16) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
 fn put_u32(bytes: &mut Vec<u8>, value: u32) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }
@@ -396,6 +909,55 @@ fn put_bytes(bytes: &mut Vec<u8>, value: &[u8]) -> Result<()> {
     put_u32(bytes, len);
     bytes.extend_from_slice(value);
     Ok(())
+}
+
+fn put_section_handle(bytes: &mut Vec<u8>, handle: SectionHandle) {
+    put_u64(bytes, handle.offset);
+    put_u64(bytes, handle.len);
+}
+
+fn point_record_encoded_len(record: &TablePointRecord) -> Result<usize> {
+    Ok(internal_key_encoded_len(&record.internal_key)
+        + value_ref_encoded_len(record.value.as_ref())?)
+}
+
+fn internal_key_encoded_len(internal_key: &InternalKey) -> usize {
+    4 + internal_key.user_key().len() + 8 + 1 + 4
+}
+
+fn value_ref_encoded_len(value: Option<&ValueRef>) -> Result<usize> {
+    match value {
+        None => Ok(1),
+        Some(ValueRef::Inline(bytes)) => Ok(1 + 4 + bytes.len()),
+        Some(ValueRef::Blob { .. }) => Err(Error::unsupported(
+            "blob table values are not implemented yet",
+        )),
+    }
+}
+
+fn section_bounds(handle: SectionHandle) -> Result<(usize, usize)> {
+    bounds(handle.offset, handle.len)
+}
+
+fn block_bounds(handle: BlockHandle) -> Result<(usize, usize)> {
+    bounds(handle.offset, handle.len)
+}
+
+fn bounds(offset: u64, len: u64) -> Result<(usize, usize)> {
+    let start = usize::try_from(offset).map_err(|_| invalid_table("offset exceeds usize"))?;
+    let len = usize::try_from(len).map_err(|_| invalid_table("length exceeds usize"))?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| invalid_table("offset plus length overflows usize"))?;
+    Ok((start, end))
+}
+
+fn usize_to_u32(value: usize, field: &'static str) -> Result<u32> {
+    u32::try_from(value).map_err(|_| Error::invalid_options(format!("{field} exceeds u32::MAX")))
+}
+
+fn usize_to_u64(value: usize, field: &'static str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| Error::invalid_options(format!("{field} exceeds u64::MAX")))
 }
 
 fn read_u16_at(bytes: &[u8], offset: usize) -> Result<u16> {
@@ -443,6 +1005,12 @@ impl<'payload> Cursor<'payload> {
             .get(self.offset)
             .ok_or_else(|| invalid_table("short u8"))?;
         self.offset += 1;
+        Ok(value)
+    }
+
+    fn read_u16(&mut self) -> Result<u16> {
+        let value = read_u16_at(self.payload, self.offset)?;
+        self.offset += 2;
         Ok(value)
     }
 
@@ -514,13 +1082,14 @@ impl<'payload> Cursor<'payload> {
     }
 
     fn read_codec(&mut self) -> Result<CodecId> {
-        match self.read_u8()? {
-            0 => Ok(CodecId::None),
-            1 => Ok(CodecId::FastLz4Block),
-            tag => Err(Error::UnsupportedFormat {
-                message: format!("unknown table codec {tag}"),
-            }),
-        }
+        codec_from_tag(self.read_u8()?)
+    }
+
+    fn read_section_handle(&mut self) -> Result<SectionHandle> {
+        Ok(SectionHandle {
+            offset: self.read_u64()?,
+            len: self.read_u64()?,
+        })
     }
 
     fn read_bound(&mut self) -> Result<Bound<Vec<u8>>> {
@@ -536,5 +1105,70 @@ impl<'payload> Cursor<'payload> {
 
     const fn is_finished(&self) -> bool {
         self.offset == self.payload.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_block_index_round_trips_multiple_data_blocks() {
+        let table = table_with_records(160);
+        let payload = encode_table(&table).expect("table encodes");
+        let footer = read_footer(&payload).expect("footer reads");
+        let index_payload =
+            read_single_block_section(&payload, footer.indexes).expect("index block reads");
+        let index_entries = decode_index_block(&index_payload).expect("index decodes");
+        assert!(
+            index_entries.len() > 1,
+            "test table should span multiple data blocks"
+        );
+
+        let decoded = decode_table(&table_file_bytes(&payload)).expect("table decodes");
+        assert_eq!(decoded.properties(), table.properties());
+        assert_eq!(decoded.point_records(), table.point_records());
+    }
+
+    #[test]
+    fn unsupported_data_block_codec_fails_closed() {
+        let table = table_with_records(4);
+        let mut payload = encode_table(&table).expect("table encodes");
+        payload[0] = 1;
+
+        let error =
+            decode_table(&table_file_bytes(&payload)).expect_err("unsupported block codec fails");
+        assert!(matches!(error, Error::CodecUnavailable { .. }));
+    }
+
+    fn table_with_records(count: usize) -> Table {
+        let point_records = (0..count)
+            .map(|index| TablePointRecord {
+                internal_key: InternalKey::new(
+                    format!("key-{index:03}").into_bytes(),
+                    Sequence::new(u64::try_from(index + 1).expect("test sequence fits u64")),
+                    ValueKind::Put,
+                    0,
+                ),
+                value: Some(ValueRef::Inline(format!("value-{index:03}").into_bytes())),
+            })
+            .collect::<Vec<_>>();
+        Table {
+            properties: table_properties(TableId(7), &point_records, &[]),
+            point_records,
+            range_tombstones: Vec::new(),
+        }
+    }
+
+    fn table_file_bytes(payload: &[u8]) -> Vec<u8> {
+        let payload_len = u32::try_from(payload.len()).expect("test payload fits u32");
+        let payload_checksum = checksum(payload);
+        let mut bytes = Vec::with_capacity(HEADER_LEN + payload.len());
+        bytes.extend_from_slice(&TABLE_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&TABLE_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&payload_len.to_le_bytes());
+        bytes.extend_from_slice(&payload_checksum.to_le_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
     }
 }

@@ -41,15 +41,6 @@ fn flushed_default_table_path(path: &std::path::Path, options: &DbOptions) -> Pa
     table::table_path(path, table_id)
 }
 
-fn checksum(bytes: &[u8]) -> u32 {
-    let mut hash = 0x811c_9dc5_u32;
-    for byte in bytes {
-        hash ^= u32::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    hash
-}
-
 #[test]
 fn persistent_wal_replays_point_and_range_batches() {
     let path = temp_db_path("wal-replay");
@@ -329,6 +320,84 @@ fn persistent_flush_preserves_snapshot_versions() {
 }
 
 #[test]
+fn persistent_table_block_index_reads_points_and_ranges() {
+    let path = temp_db_path("table-block-index");
+    let options = DbOptions::persistent(&path);
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+
+        for index in 0..160 {
+            keyspace
+                .insert(
+                    format!("key-{index:03}").into_bytes(),
+                    format!("value-{index:03}").into_bytes(),
+                )
+                .expect("write indexed row");
+        }
+        db.flush().expect("flush indexed table");
+
+        assert_eq!(
+            keyspace.get(b"key-042").expect("point reads indexed table"),
+            Some(b"value-042".to_vec())
+        );
+        let rows = keyspace
+            .range(&KeyRange::half_open(b"key-020", b"key-030"))
+            .expect("range reads indexed table")
+            .map(|item| {
+                let item = item.expect("range item reads");
+                (item.key, item.value)
+            })
+            .collect::<Vec<_>>();
+        let expected = (20..30)
+            .map(|index| {
+                (
+                    format!("key-{index:03}").into_bytes(),
+                    format!("value-{index:03}").into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows, expected);
+    }
+
+    fs::remove_file(wal::wal_path(&path)).expect("remove WAL after block-index flush");
+
+    {
+        let db = Db::open(options).expect("persistent db reopens from indexed table");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace reopens");
+
+        assert_eq!(
+            keyspace.get(b"key-127").expect("point reads after reopen"),
+            Some(b"value-127".to_vec())
+        );
+        let rows = keyspace
+            .range(&KeyRange::half_open(b"key-150", b"key-160"))
+            .expect("range reads after reopen")
+            .map(|item| {
+                let item = item.expect("range item reads after reopen");
+                (item.key, item.value)
+            })
+            .collect::<Vec<_>>();
+        let expected = (150..160)
+            .map(|index| {
+                (
+                    format!("key-{index:03}").into_bytes(),
+                    format!("value-{index:03}").into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows, expected);
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_compaction_rewrites_tables_and_preserves_reads() {
     let path = temp_db_path("compact-default");
     let options = DbOptions::persistent(&path);
@@ -535,19 +604,26 @@ fn persistent_reopen_fails_when_table_checksum_is_corrupt() {
 fn persistent_reopen_fails_when_table_metadata_differs_from_manifest() {
     let path = temp_db_path("table-metadata-mismatch");
     let options = DbOptions::persistent(&path);
-    let table_path = flushed_default_table_path(&path, &options);
+    let _table_path = flushed_default_table_path(&path, &options);
 
-    let mut bytes = fs::read(&table_path).expect("read table");
-    let payload_start = 14;
-    let mut table_id = [0_u8; 8];
-    table_id.copy_from_slice(&bytes[payload_start..payload_start + 8]);
-    let table_id = u64::from_le_bytes(table_id)
-        .checked_add(1)
-        .expect("test table id can increment");
-    bytes[payload_start..payload_start + 8].copy_from_slice(&table_id.to_le_bytes());
-    let checksum = checksum(&bytes[payload_start..]);
-    bytes[10..14].copy_from_slice(&checksum.to_le_bytes());
-    fs::write(&table_path, bytes).expect("write metadata-mismatched table");
+    let manifest_path = manifest::manifest_path(&path);
+    let mut store =
+        manifest::ManifestStore::open_or_create(manifest_path, false).expect("manifest opens");
+    let original = store
+        .state()
+        .tables()
+        .get("default")
+        .and_then(|tables| tables.first())
+        .expect("default table metadata exists")
+        .clone();
+    let mut mismatched = original.clone();
+    mismatched.largest_sequence = mismatched
+        .largest_sequence
+        .next()
+        .expect("test sequence can increment");
+    store
+        .replace_tables("default", &[original.id], mismatched)
+        .expect("manifest metadata is replaced");
 
     let error = Db::open(options).expect_err("metadata mismatch fails closed");
     assert!(matches!(error, Error::Corruption { .. }));

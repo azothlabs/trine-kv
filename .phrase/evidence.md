@@ -574,3 +574,45 @@ Record only evidence that can change planning or durable decisions.
 
 - Implement the checked table block/index layout with codec id `none`, then
   retest point/range reads, recovery, and compaction against the new layout.
+
+## 2026-05-25: Checked Table Block/Index Layout Passed
+
+### Observation
+
+- Table files now encode checked sections for data blocks, range tombstones,
+  indexes, properties, and a footer with section offsets.
+- Data blocks store sorted internal-key records, restart offsets, codec id,
+  uncompressed length, encoded length, and block checksum.
+- Index blocks map internal-key bounds to data block handles and are validated
+  for sorted, contiguous coverage before table records are trusted.
+- Properties are stored in a checked properties block and must match the decoded
+  records before startup accepts the table.
+- The current writer only emits codec id `none`; reading a data block marked as
+  `fast-lz4-block` fails closed until task014 wires the codec.
+- Tests cover multi-block table round trip, unsupported block codec failure,
+  point/range reads from the new layout before and after reopen, and manifest
+  metadata mismatch without depending on byte offsets inside the table file.
+
+### Interpretation
+
+- Task013 is complete for checked `none`-codec table layout.
+- The next blocker is real `lz4_flex` block compression; the format can already
+  name the fast codec, but the implementation intentionally refuses it today.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- `lz4_flex` is not connected to checked block encode/decode yet.
+- Prefix filters, blob files, recovery reports, version cleanup, and optimized
+  search policies remain future blockers.
+
+### Recommended Next Action
+
+- Add `lz4_flex`, route `CompressionProfile::Fast` to codec id
+  `fast-lz4-block`, and keep `none` as the mandatory fallback.
