@@ -1019,3 +1019,42 @@ Record only evidence that can change planning or durable decisions.
 
 - Implement partitioned filters/indexes so point, range, and prefix reads can
   skip incompatible table sections without changing visible results.
+
+## 2026-05-25: Partitioned Filter/Index Read Path Passed
+
+### Observation
+
+- Data block index entries now carry per-block point-key and prefix filters in
+  addition to key bounds and block handles.
+- Table reads use block-local point filters for point-key candidates and
+  block-local prefix filters for prefix candidates while retaining ordered scan
+  and MVCC checks.
+- Table decode validates that block-local filters do not miss keys or prefixes
+  actually present in the indexed block.
+- Tests cover index-entry filter round-trip, prefix reads through decoded
+  partitioned filters, and fail-closed validation for a block filter false
+  negative.
+
+### Interpretation
+
+- Task024 is complete for the current in-memory-loaded SSTable model: filters
+  now skip table partitions, and the data block index remains the ordered
+  source for block selection.
+- The next remaining v1 blocker is wiring the search-policy module into table
+  and block candidate lookup without changing read results.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Optimized search policies remain future work.
+
+### Recommended Next Action
+
+- Implement search-policy dispatch for table/block candidate lookup, keeping
+  canonical sorted index order as the validation and traversal source.

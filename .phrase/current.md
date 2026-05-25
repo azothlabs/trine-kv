@@ -59,12 +59,12 @@ task020 [x] goal:manual compaction drops obsolete point versions only when activ
 task021 [x] goal:manual compaction drops point/range tombstones only when the compaction scope proves they no longer hide retained values | scope:src/db.rs,src/manifest.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 task022 [x] goal:compaction removes blob files no longer referenced by live tables or active snapshots | scope:src/blob.rs,src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 task023 [x] goal:persistent startup detects unreferenced table/blob files and handles them conservatively | scope:src/recovery.rs,src/db.rs,src/blob.rs,src/table.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
+task024 [x] goal:SSTable reads use partitioned filters/indexes so point/range/prefix reads avoid unnecessary whole-table scans | scope:src/filter.rs,src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
 ```
 
 ## Known Blockers
 
-- Partitioned filters/indexes and optimized search policies are not
-  implemented yet.
+- Optimized search policies are not implemented yet.
 
 ## Evidence To Record
 
@@ -72,4 +72,5 @@ task023 [x] goal:persistent startup detects unreferenced table/blob files and ha
 - Tombstone cleanup validation results.
 - Blob cleanup validation results.
 - Obsolete-file detection validation results.
-- Remaining blocker category after task023.
+- Partitioned filter/index validation results.
+- Remaining blocker category after task024.

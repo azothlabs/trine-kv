@@ -138,6 +138,8 @@ struct DataBlockIndexEntry {
     smallest_internal_key: InternalKey,
     largest_internal_key: InternalKey,
     block: BlockHandle,
+    point_key_filter: Option<PointKeyFilter>,
+    prefix_filter: Option<PrefixFilter>,
 }
 
 #[derive(Debug)]
@@ -155,6 +157,8 @@ struct TableDataBlock {
     largest_internal_key: InternalKey,
     record_range: Range<usize>,
     restart_indices: Vec<usize>,
+    point_key_filter: Option<PointKeyFilter>,
+    prefix_filter: Option<PrefixFilter>,
 }
 
 impl TableDataBlock {
@@ -162,6 +166,8 @@ impl TableDataBlock {
         point_records: &[TablePointRecord],
         record_range: Range<usize>,
         restart_indices: Vec<usize>,
+        point_key_filter: Option<PointKeyFilter>,
+        prefix_filter: Option<PrefixFilter>,
     ) -> Result<Self> {
         let records = point_records
             .get(record_range.clone())
@@ -191,6 +197,8 @@ impl TableDataBlock {
             largest_internal_key: last.internal_key.clone(),
             record_range,
             restart_indices,
+            point_key_filter,
+            prefix_filter,
         })
     }
 
@@ -236,7 +244,12 @@ impl TableDataBlock {
     }
 
     fn may_contain_key(&self, key: &[u8]) -> bool {
-        self.smallest_internal_key.user_key() <= key && key <= self.largest_internal_key.user_key()
+        self.smallest_internal_key.user_key() <= key
+            && key <= self.largest_internal_key.user_key()
+            && self
+                .point_key_filter
+                .as_ref()
+                .is_none_or(|filter| filter.may_contain_key(key))
     }
 
     fn overlaps_range(&self, range: &KeyRange) -> bool {
@@ -244,10 +257,14 @@ impl TableDataBlock {
             && !key_is_before_start(self.largest_internal_key.user_key(), &range.start)
     }
 
-    fn may_contain_prefix(&self, prefix: &[u8]) -> bool {
+    fn may_contain_prefix(&self, prefix: &[u8], extractor: &PrefixExtractor) -> bool {
         self.largest_internal_key.user_key() >= prefix
             && (self.smallest_internal_key.user_key().starts_with(prefix)
                 || self.smallest_internal_key.user_key() <= prefix)
+            && self
+                .prefix_filter
+                .as_ref()
+                .is_none_or(|filter| filter.may_contain_query_prefix(prefix, extractor))
     }
 
     fn restart_index_for_bound(
@@ -333,10 +350,14 @@ impl Table {
             .collect()
     }
 
-    pub(crate) fn point_records_with_prefix(&self, prefix: &[u8]) -> Vec<&TablePointRecord> {
+    pub(crate) fn point_records_with_prefix(
+        &self,
+        prefix: &[u8],
+        extractor: &PrefixExtractor,
+    ) -> Vec<&TablePointRecord> {
         self.data_blocks
             .iter()
-            .filter(|block| block.may_contain_prefix(prefix))
+            .filter(|block| block.may_contain_prefix(prefix, extractor))
             .flat_map(|block| block.point_records_with_prefix(&self.point_records, prefix))
             .collect()
     }
@@ -428,7 +449,7 @@ pub(crate) fn write_table(
         value,
     })
     .collect::<Vec<_>>();
-    let data_blocks = build_data_blocks(&point_records)?;
+    let data_blocks = build_data_blocks(&point_records, options)?;
 
     let table = Table {
         properties: table_properties(table_id, options.codec, &point_records, range_tombstones),
@@ -548,7 +569,10 @@ fn build_point_key_filter(
     ))
 }
 
-fn build_data_blocks(point_records: &[TablePointRecord]) -> Result<Vec<TableDataBlock>> {
+fn build_data_blocks(
+    point_records: &[TablePointRecord],
+    options: &TableWriteOptions,
+) -> Result<Vec<TableDataBlock>> {
     let mut data_blocks = Vec::new();
     let mut block_start = 0;
 
@@ -567,10 +591,13 @@ fn build_data_blocks(point_records: &[TablePointRecord]) -> Result<Vec<TableData
         let restart_indices = (block_start..block_end)
             .step_by(DATA_BLOCK_RESTART_INTERVAL)
             .collect::<Vec<_>>();
+        let records = &point_records[block_start..block_end];
         data_blocks.push(TableDataBlock::from_record_range(
             point_records,
             block_start..block_end,
             restart_indices,
+            build_point_key_filter(options, records),
+            build_prefix_filter(options, records),
         )?);
         block_start = block_end;
     }
@@ -659,6 +686,7 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
         validate_block_codec(block_codec, properties.codec, TableSection::DataBlocks)?;
         let decoded_block = decode_data_block(&block_payload)?;
         validate_data_block_entry(entry, &decoded_block.records)?;
+        validate_data_block_filters(entry, &decoded_block.records)?;
         let record_start = point_records.len();
         point_records.extend(decoded_block.records);
         let record_end = point_records.len();
@@ -670,6 +698,8 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
                 .into_iter()
                 .map(|index| record_start + index)
                 .collect(),
+            entry.point_key_filter.clone(),
+            entry.prefix_filter.clone(),
         )?);
     }
     validate_sorted_point_records(&point_records)?;
@@ -727,6 +757,8 @@ fn append_data_blocks(
             smallest_internal_key: data_block.smallest_internal_key.clone(),
             largest_internal_key: data_block.largest_internal_key.clone(),
             block,
+            point_key_filter: data_block.point_key_filter.clone(),
+            prefix_filter: data_block.prefix_filter.clone(),
         });
     }
 
@@ -815,34 +847,8 @@ fn encode_range_tombstone_block(table: &Table) -> Result<Vec<u8>> {
 
 fn encode_filter_block(table: &Table) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    match &table.point_key_filter {
-        None => put_u8(&mut bytes, POINT_KEY_FILTER_ABSENT),
-        Some(filter) => {
-            put_u8(&mut bytes, POINT_KEY_FILTER_PRESENT);
-            put_u32(
-                &mut bytes,
-                usize_to_u32(filter.keys().len(), "point-key filter entry count")?,
-            );
-            for key in filter.keys() {
-                put_bytes(&mut bytes, key)?;
-            }
-        }
-    }
-
-    match &table.prefix_filter {
-        None => put_u8(&mut bytes, PREFIX_FILTER_ABSENT),
-        Some(filter) => {
-            put_u8(&mut bytes, PREFIX_FILTER_PRESENT);
-            put_prefix_extractor(&mut bytes, filter.extractor())?;
-            put_u32(
-                &mut bytes,
-                usize_to_u32(filter.prefixes().len(), "prefix filter entry count")?,
-            );
-            for prefix in filter.prefixes() {
-                put_bytes(&mut bytes, prefix)?;
-            }
-        }
-    }
+    put_point_key_filter(&mut bytes, table.point_key_filter.as_ref())?;
+    put_prefix_filter(&mut bytes, table.prefix_filter.as_ref())?;
     Ok(bytes)
 }
 
@@ -857,8 +863,47 @@ fn encode_index_block(index_entries: &[DataBlockIndexEntry]) -> Result<Vec<u8>> 
         put_internal_key(&mut bytes, &entry.largest_internal_key)?;
         put_u64(&mut bytes, entry.block.offset);
         put_u64(&mut bytes, entry.block.len);
+        put_point_key_filter(&mut bytes, entry.point_key_filter.as_ref())?;
+        put_prefix_filter(&mut bytes, entry.prefix_filter.as_ref())?;
     }
     Ok(bytes)
+}
+
+fn put_point_key_filter(bytes: &mut Vec<u8>, filter: Option<&PointKeyFilter>) -> Result<()> {
+    match filter {
+        None => put_u8(bytes, POINT_KEY_FILTER_ABSENT),
+        Some(filter) => {
+            put_u8(bytes, POINT_KEY_FILTER_PRESENT);
+            put_u32(
+                bytes,
+                usize_to_u32(filter.keys().len(), "point-key filter entry count")?,
+            );
+            for key in filter.keys() {
+                put_bytes(bytes, key)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn put_prefix_filter(bytes: &mut Vec<u8>, filter: Option<&PrefixFilter>) -> Result<()> {
+    match filter {
+        None => put_u8(bytes, PREFIX_FILTER_ABSENT),
+        Some(filter) => {
+            put_u8(bytes, PREFIX_FILTER_PRESENT);
+            put_prefix_extractor(bytes, filter.extractor())?;
+            put_u32(
+                bytes,
+                usize_to_u32(filter.prefixes().len(), "prefix filter entry count")?,
+            );
+            for prefix in filter.prefixes() {
+                put_bytes(bytes, prefix)?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn encode_properties_block(properties: &TableProperties) -> Result<Vec<u8>> {
@@ -1036,6 +1081,8 @@ fn decode_index_block(bytes: &[u8]) -> Result<Vec<DataBlockIndexEntry>> {
                 offset: cursor.read_u64()?,
                 len: cursor.read_u64()?,
             },
+            point_key_filter: read_point_key_filter(&mut cursor)?,
+            prefix_filter: read_prefix_filter(&mut cursor)?,
         });
     }
     if !cursor.is_finished() {
@@ -1087,42 +1134,47 @@ fn decode_range_tombstone_block(bytes: &[u8]) -> Result<Vec<TableRangeTombstone>
 
 fn decode_filter_block(bytes: &[u8]) -> Result<(Option<PointKeyFilter>, Option<PrefixFilter>)> {
     let mut cursor = Cursor::new(bytes);
-    let point_key_filter = match cursor.read_u8()? {
-        POINT_KEY_FILTER_ABSENT => None,
+    let point_key_filter = read_point_key_filter(&mut cursor)?;
+    let prefix_filter = read_prefix_filter(&mut cursor)?;
+    if !cursor.is_finished() {
+        return Err(invalid_table("trailing filter block bytes"));
+    }
+    Ok((point_key_filter, prefix_filter))
+}
+
+fn read_point_key_filter(cursor: &mut Cursor<'_>) -> Result<Option<PointKeyFilter>> {
+    match cursor.read_u8()? {
+        POINT_KEY_FILTER_ABSENT => Ok(None),
         POINT_KEY_FILTER_PRESENT => {
             let key_count = cursor.read_u32()? as usize;
             let keys = (0..key_count)
                 .map(|_| cursor.read_bytes().map(<[u8]>::to_vec))
                 .collect::<Result<Vec<_>>>()?;
-            Some(PointKeyFilter::from_sorted_keys(keys)?)
+            Ok(Some(PointKeyFilter::from_sorted_keys(keys)?))
         }
-        tag => {
-            return Err(Error::InvalidFormat {
-                message: format!("unknown table point-key filter tag {tag}"),
-            });
-        }
-    };
+        tag => Err(Error::InvalidFormat {
+            message: format!("unknown table point-key filter tag {tag}"),
+        }),
+    }
+}
 
-    let prefix_filter = match cursor.read_u8()? {
-        PREFIX_FILTER_ABSENT => None,
+fn read_prefix_filter(cursor: &mut Cursor<'_>) -> Result<Option<PrefixFilter>> {
+    match cursor.read_u8()? {
+        PREFIX_FILTER_ABSENT => Ok(None),
         PREFIX_FILTER_PRESENT => {
             let extractor = cursor.read_prefix_extractor()?;
             let prefix_count = cursor.read_u32()? as usize;
             let prefixes = (0..prefix_count)
                 .map(|_| cursor.read_bytes().map(<[u8]>::to_vec))
                 .collect::<Result<Vec<_>>>()?;
-            Some(PrefixFilter::from_sorted_prefixes(extractor, prefixes)?)
+            Ok(Some(PrefixFilter::from_sorted_prefixes(
+                extractor, prefixes,
+            )?))
         }
-        tag => {
-            return Err(Error::InvalidFormat {
-                message: format!("unknown table prefix filter tag {tag}"),
-            });
-        }
-    };
-    if !cursor.is_finished() {
-        return Err(invalid_table("trailing filter block bytes"));
+        tag => Err(Error::InvalidFormat {
+            message: format!("unknown table prefix filter tag {tag}"),
+        }),
     }
-    Ok((point_key_filter, prefix_filter))
 }
 
 fn decode_restart_points(cursor: &mut Cursor<'_>, record_offsets: &[usize]) -> Result<Vec<usize>> {
@@ -1236,6 +1288,41 @@ fn validate_data_block_entry(
     }
 
     validate_sorted_point_records(records)
+}
+
+fn validate_data_block_filters(
+    entry: &DataBlockIndexEntry,
+    records: &[TablePointRecord],
+) -> Result<()> {
+    // Index-level filters can only remove data-block candidates if every key in
+    // the block remains represented. Rejecting false negatives keeps filters
+    // advisory instead of letting them decide MVCC visibility.
+    for record in records {
+        let user_key = record.internal_key.user_key();
+        if entry
+            .point_key_filter
+            .as_ref()
+            .is_some_and(|filter| !filter.may_contain_key(user_key))
+        {
+            return Err(Error::Corruption {
+                message: "data block point-key filter misses a block key".to_owned(),
+            });
+        }
+
+        if let Some(filter) = &entry.prefix_filter {
+            if filter
+                .extractor()
+                .extract(user_key)
+                .is_some_and(|prefix| !filter.prefixes().contains(prefix))
+            {
+                return Err(Error::Corruption {
+                    message: "data block prefix filter misses a block prefix".to_owned(),
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_sorted_point_records(point_records: &[TablePointRecord]) -> Result<()> {
@@ -1629,6 +1716,7 @@ impl<'payload> Cursor<'payload> {
 mod tests {
     use super::*;
     use crate::filter::PointKeyFilter;
+    use crate::options::KeyspaceOptions;
 
     #[test]
     fn checked_block_index_round_trips_multiple_data_blocks() {
@@ -1684,7 +1772,7 @@ mod tests {
         assert_eq!(range_keys, expected_range);
 
         let prefix_keys = table
-            .point_records_with_prefix(b"key-12")
+            .point_records_with_prefix(b"key-12", &PrefixExtractor::Disabled)
             .into_iter()
             .map(|record| record.internal_key.user_key().to_vec())
             .collect::<Vec<_>>();
@@ -1692,6 +1780,67 @@ mod tests {
             .map(|index| format!("key-{index:03}").into_bytes())
             .collect::<Vec<_>>();
         assert_eq!(prefix_keys, expected_prefix);
+    }
+
+    #[test]
+    fn partitioned_filters_round_trip_through_index_entries() {
+        let table = table_with_filters(160, CodecId::None);
+        let payload = encode_table(&table).expect("table encodes");
+        let footer = read_footer(&payload).expect("footer reads");
+        let (_, index_payload) =
+            read_single_block_section(&payload, footer.indexes).expect("index block reads");
+        let index_entries = decode_index_block(&index_payload).expect("index decodes");
+        assert!(
+            index_entries.len() > 1,
+            "test table should span multiple data blocks"
+        );
+        assert!(
+            index_entries
+                .iter()
+                .all(|entry| entry.point_key_filter.is_some())
+        );
+        assert!(
+            index_entries
+                .iter()
+                .all(|entry| entry.prefix_filter.is_some())
+        );
+
+        let first_entry = index_entries.first().expect("index has first entry");
+        let point_filter = first_entry
+            .point_key_filter
+            .as_ref()
+            .expect("point filter exists");
+        assert!(point_filter.may_contain_key(first_entry.smallest_internal_key.user_key()));
+        assert!(!point_filter.may_contain_key(b"not-present"));
+
+        let decoded = decode_table(&table_file_bytes(&payload)).expect("table decodes");
+        let prefix_keys = decoded
+            .point_records_with_prefix(b"key-12", &PrefixExtractor::FixedLen(6))
+            .into_iter()
+            .map(|record| record.internal_key.user_key().to_vec())
+            .collect::<Vec<_>>();
+        let expected_prefix = (120..130)
+            .map(|index| format!("key-{index:03}").into_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(prefix_keys, expected_prefix);
+    }
+
+    #[test]
+    fn data_block_filter_false_negative_fails_closed() {
+        let table = table_with_filters(32, CodecId::None);
+        let block = table.data_blocks.first().expect("test table has a block");
+        let records = &table.point_records[block.record_range.clone()];
+        let entry = DataBlockIndexEntry {
+            smallest_internal_key: block.smallest_internal_key.clone(),
+            largest_internal_key: block.largest_internal_key.clone(),
+            block: BlockHandle { offset: 0, len: 0 },
+            point_key_filter: Some(PointKeyFilter::from_keys(std::iter::empty::<&[u8]>())),
+            prefix_filter: None,
+        };
+
+        let error = validate_data_block_filters(&entry, records)
+            .expect_err("missing block key should fail");
+        assert!(matches!(error, Error::Corruption { .. }));
     }
 
     #[test]
@@ -1722,6 +1871,14 @@ mod tests {
     }
 
     fn table_with_records(count: usize, codec: CodecId) -> Table {
+        table_with_options(count, test_table_options(codec, false))
+    }
+
+    fn table_with_filters(count: usize, codec: CodecId) -> Table {
+        table_with_options(count, test_table_options(codec, true))
+    }
+
+    fn table_with_options(count: usize, options: TableWriteOptions) -> Table {
         let point_records = (0..count)
             .map(|index| TablePointRecord {
                 internal_key: InternalKey::new(
@@ -1733,14 +1890,38 @@ mod tests {
                 value: Some(ValueRef::Inline(format!("value-{index:03}").into_bytes())),
             })
             .collect::<Vec<_>>();
-        let data_blocks = build_data_blocks(&point_records).expect("test blocks build");
+        let data_blocks = build_data_blocks(&point_records, &options).expect("test blocks build");
         Table {
-            properties: table_properties(TableId(7), codec, &point_records, &[]),
+            properties: table_properties(TableId(7), options.codec, &point_records, &[]),
+            point_key_filter: build_point_key_filter(&options, &point_records),
+            prefix_filter: build_prefix_filter(&options, &point_records),
             point_records,
             data_blocks,
             range_tombstones: Vec::new(),
-            point_key_filter: None,
-            prefix_filter: None,
+        }
+    }
+
+    const fn test_table_options(codec: CodecId, filters_enabled: bool) -> TableWriteOptions {
+        TableWriteOptions {
+            codec,
+            filter_policy: if filters_enabled {
+                FilterPolicy::Bloom { bits_per_key: 10 }
+            } else {
+                FilterPolicy::Disabled
+            },
+            prefix_extractor: if filters_enabled {
+                PrefixExtractor::FixedLen(6)
+            } else {
+                PrefixExtractor::Disabled
+            },
+            prefix_filter_policy: if filters_enabled {
+                PrefixFilterPolicy::Bloom {
+                    bits_per_prefix: 10,
+                }
+            } else {
+                PrefixFilterPolicy::Disabled
+            },
+            blob_threshold_bytes: KeyspaceOptions::DEFAULT_BLOB_THRESHOLD_BYTES,
         }
     }
 

@@ -1126,7 +1126,7 @@ fn collect_prefix_point_records(
         }
         records.extend(
             table
-                .point_records_with_prefix(prefix)
+                .point_records_with_prefix(prefix, &state.options.prefix_extractor)
                 .into_iter()
                 .map(|record| (record.internal_key.clone(), record.value.clone())),
         );
