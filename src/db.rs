@@ -12,6 +12,7 @@ use std::{
 
 use crate::{
     blob::{self, ValueRef},
+    compaction,
     error::{Error, Result},
     internal_key::{InternalKey, ValueKind},
     iterator::{Direction, Iter},
@@ -654,21 +655,28 @@ impl Db {
         let mut inputs = Vec::new();
 
         for (name, state) in keyspaces.iter() {
-            let candidate_tables = {
+            let (candidate_tables, table_level) = {
                 let tables = state
                     .tables
                     .read()
                     .map_err(|_| lock_poisoned("table list"))?;
-                tables
+                let plan_tables = tables
                     .iter()
-                    .filter(|table| table_overlaps_range(table, range))
+                    .map(|table| compaction::CompactionTable::from_properties(table.properties()))
+                    .collect::<Vec<_>>();
+                let Some(plan) =
+                    compaction::plan_compaction(name, &plan_tables, range, oldest_active_snapshot)?
+                else {
+                    continue;
+                };
+                let input_table_ids = plan.input_tables.iter().copied().collect::<BTreeSet<_>>();
+                let candidate_tables = tables
+                    .iter()
+                    .filter(|table| input_table_ids.contains(&table.properties().id))
                     .cloned()
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                (candidate_tables, plan.output_level)
             };
-
-            if candidate_tables.len() < 2 {
-                continue;
-            }
 
             let mut input_table_ids = Vec::with_capacity(candidate_tables.len());
             let mut point_records = Vec::new();
@@ -683,7 +691,6 @@ impl Db {
                 );
                 range_tombstones.extend(table.range_tombstones().iter().cloned());
             }
-            let table_level = compaction_output_level(&candidate_tables)?;
             let point_records = compact_point_records(point_records, oldest_active_snapshot);
             let point_records = cleanup_point_tombstones(&point_records);
             let range_tombstones =
@@ -922,23 +929,6 @@ fn compare_tables_for_reads(left: &Arc<Table>, right: &Arc<Table>) -> CmpOrderin
         .cmp(&right.level)
         .then_with(|| right.largest_sequence.cmp(&left.largest_sequence))
         .then_with(|| right.id.cmp(&left.id))
-}
-
-fn compaction_output_level(tables: &[Arc<Table>]) -> Result<table::TableLevel> {
-    let highest_level = tables
-        .iter()
-        .map(|table| table.properties().level)
-        .max()
-        .unwrap_or(table::TableLevel::ZERO);
-    // A pure L0 merge moves down to L1. Once a lower level participates, the
-    // replacement stays at that deepest input level and absorbs newer overlap.
-    if highest_level == table::TableLevel::ZERO {
-        highest_level.next().ok_or_else(|| Error::Corruption {
-            message: "table level counter overflow".to_owned(),
-        })
-    } else {
-        Ok(highest_level)
-    }
 }
 
 fn referenced_table_file_ids(manifest: &ManifestState) -> BTreeSet<table::TableId> {
@@ -1412,21 +1402,6 @@ fn key_is_after_end(key: &[u8], end: &Bound<Vec<u8>>) -> bool {
 
 fn key_is_in_range(key: &[u8], range: &KeyRange) -> bool {
     !key_is_before_start(key, &range.start) && !key_is_after_end(key, &range.end)
-}
-
-fn table_overlaps_range(table: &Table, range: &KeyRange) -> bool {
-    if range_is_all(range) {
-        return true;
-    }
-
-    table
-        .point_records()
-        .iter()
-        .any(|record| key_is_in_range(record.internal_key.user_key(), range))
-        || table
-            .range_tombstones()
-            .iter()
-            .any(|tombstone| ranges_overlap(&tombstone.range, range))
 }
 
 fn range_is_all(range: &KeyRange) -> bool {

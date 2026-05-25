@@ -1227,3 +1227,44 @@ Record only evidence that can change planning or durable decisions.
 
 - Implement compaction planning that chooses L0 inputs and overlapping
   lower-level tables explicitly before wiring automatic scheduling.
+
+## 2026-05-25: Level-Aware Compaction Planning Passed
+
+### Observation
+
+- Compaction planning now lives in `src/compaction.rs` instead of being an
+  ad hoc table-list filter inside `Db`.
+- The planner selects L0 tables that overlap the requested range, expands that
+  set to include overlapping L0 neighbors, and includes lower-level tables that
+  overlap the selected L0 key span.
+- A single L0 table can now compact with an overlapping lower-level table;
+  a single L0 table without lower-level overlap is skipped.
+- When no L0 table is selected, manual compaction keeps a same-level fallback
+  for the shallowest overlapping level.
+- `Db::compact_range` now uses the planner's input table ids and output level
+  before reusing the existing rewrite, manifest publish, and cleanup path.
+
+### Interpretation
+
+- Task029 is complete for explicit compaction input picking.
+- The remaining compaction blocker is automatic scheduling after flush/L0
+  pressure; the rewrite and publish path can already consume planner output.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Background compaction scheduling.
+- Required metrics and cache behavior.
+- Required benchmark outputs.
+- Durability documentation.
+
+### Recommended Next Action
+
+- Add an automatic compaction trigger after flush when L0 table count exceeds
+  the configured threshold, using the level-aware planner.

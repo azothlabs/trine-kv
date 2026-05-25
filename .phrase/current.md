@@ -64,13 +64,14 @@ task025 [x] goal:search-policy code is wired into table/block candidate lookup w
 task026 [x] goal:v1 protocol acceptance audit identifies remaining gaps and the next measured slice | scope:.phrase/protocol,trine source,tests | verify:manual audit + cargo fmt --check + cargo clippy + cargo test + git diff --check
 task027 [x] goal:persistent open takes an exclusive database directory lock and releases it safely | scope:src/db.rs,src/recovery.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
 task028 [x] goal:table metadata records compaction levels and read ordering remains correct across levels | scope:src/manifest.rs,src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
-task029 [ ] goal:compaction planning selects level-aware L0 inputs and overlapping lower-level tables | scope:src/compaction.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
+task029 [x] goal:compaction planning selects level-aware L0 inputs and overlapping lower-level tables | scope:src/compaction.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
+task030 [ ] goal:flush path can trigger automatic compaction when L0 pressure exceeds configured limits | scope:src/db.rs,src/compaction.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
 ```
 
 ## Known Blockers
 
-- Leveled compaction metadata exists, but input picking and background
-  scheduling are not complete yet.
+- Leveled compaction input picking exists, but background scheduling is not
+  complete yet.
 - Required metrics, cache behavior, benchmark output, and durability docs are
   incomplete.
 
@@ -85,4 +86,5 @@ task029 [ ] goal:compaction planning selects level-aware L0 inputs and overlappi
 - V1 acceptance audit results.
 - Process-lock validation results.
 - Compaction-level metadata validation results.
-- Remaining blocker category after task028.
+- Level-aware compaction planning validation results.
+- Remaining blocker category after task029.
