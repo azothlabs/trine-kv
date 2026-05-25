@@ -28,6 +28,16 @@ Evidence notes should separate:
 - Do not read archive material by default.
 - Do not maintain mechanical per-file changelogs when the git diff is enough.
 
+## Trine KV V1 Source Of Truth
+
+- V1 engine decision: `.phrase/adr/0001-v1-lsm-mvcc-engine.md`.
+- V1 protocol and storage contract: `.phrase/protocol/trine-kv-v1-spec.md`.
+- Trine specs, ADRs, tests, and local design notes are the source of truth.
+- Do not implement Trine by depending on another storage engine.
+- Do not change MVCC, WAL, SSTable, manifest, compaction, transaction,
+  prefix-filter, compression, or search-policy behavior without updating the
+  protocol spec or adding a follow-up ADR.
+
 ## Phase Gate Rules
 
 A phase can close only when:

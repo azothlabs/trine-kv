@@ -13,16 +13,46 @@ and major out-of-scope boundaries. Detailed implementation tasks belong only in
 
 ## Phases
 
-### Phase 1: Establish Current Context
+### Phase 1: Freeze V1 Database Spec
 
-**Status**: Planned
+**Status**: In progress
 
-**Goal**: Convert the active work into a minimal current phase brief.
+**Goal**: Define Trine KV v1 as a complete embedded LSM MVCC database before
+implementation.
 
 **Entry Condition**: `.phrase/decision.md` exists.
 
 **Acceptance Gate**:
 
-- `.phrase/current.md` describes the active phase.
-- Any relevant existing evidence is summarized in `.phrase/evidence.md`.
-- Stale historical context is moved or linked from `.phrase/archive/`.
+- ADR records the LSM MVCC engine decision.
+- Protocol spec covers API, MVCC, WAL, SSTable, manifest, compaction, recovery,
+  transactions, in-memory mode, tests, and benchmarks.
+- User accepts the spec as the implementation source of truth.
+
+### Phase 2: Scaffold Rust Crate
+
+**Status**: Pending
+
+**Goal**: Create the Rust crate and module skeleton that matches the accepted
+spec.
+
+**Entry Condition**: Phase 1 accepted.
+
+**Acceptance Gate**:
+
+- `Cargo.toml` follows local Rust guidance.
+- Module skeleton matches the spec boundaries.
+- `cargo fmt --check`, `cargo clippy`, and empty scaffold tests pass.
+
+### Phase 3: Build V1 Engine By Spec
+
+**Status**: Pending
+
+**Goal**: Implement the complete v1 engine in slices without changing the
+accepted contracts silently.
+
+**Entry Condition**: Phase 2 complete.
+
+**Acceptance Gate**:
+
+- The v1 acceptance gate in `.phrase/protocol/trine-kv-v1-spec.md` passes.
