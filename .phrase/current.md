@@ -6,56 +6,50 @@ Complete
 
 ## Goal
 
-Prepare Trine KV for a clean first crate package using Semantic Versioning.
+Add runnable integration examples that show Trine KV behind realistic
+application boundaries.
 
 ## Entry Condition
 
-- Phase 6 production hardening is complete.
-- User chose release packaging before integration examples.
+- Phase 7 release packaging is complete.
+- User chose integration examples after release packaging.
 
 ## Scope
 
-- Cargo package metadata for the first `0.1.0` SemVer release candidate.
-- Crate package contents, license files, changelog, and release checklist.
-- README and usage docs that explain released dependency syntax.
-- Package verification using Cargo and the existing test/example gate.
+- Runnable examples under `examples/` using only public Trine KV APIs.
+- Documentation links from README or usage docs.
+- Verification that examples compile and run.
 
 ## Out Of Scope
 
-- Publishing to crates.io.
-- Creating GitHub releases or CI pipelines.
-- Adding integration examples; that is the next planned phase.
-- Changing v1 storage contracts.
+- New storage-engine behavior.
+- New public API helpers unless examples expose a concrete API blocker.
+- Heavy external dependencies.
 
 ## Acceptance Gate
 
-- `cargo package --list` excludes local workflow files such as `.phrase/`,
-  `.rust-skills/`, and `.claude/`.
-- `cargo package` verifies the package.
-- `cargo fmt --check`, `cargo clippy`, `cargo test`,
-  `cargo run --example quickstart`, and `git diff --check` pass.
-- Release docs record the SemVer rule and package checklist.
+- Integration examples run with `cargo run --example`.
+- README or usage docs points users to the examples.
+- `cargo fmt --check`, `cargo clippy`, `cargo test`, and `git diff --check`
+  pass.
 
 ## Active Task Slice
 
 ```text
-task042 [x] goal:package metadata, package contents, release docs, and SemVer rule are ready for 0.1.0 | scope:Cargo.toml,README.md,docs,CHANGELOG.md,LICENSE*,.phrase | verify:cargo package --list + cargo package + cargo fmt --check + cargo clippy + cargo test + cargo run --example quickstart + git diff --check
+task043 [x] goal:repository-pattern and event-index integration examples are runnable and documented | scope:examples,README.md,docs,.phrase | verify:cargo run --example user_store + cargo run --example event_index + cargo fmt --check + cargo clippy + cargo test + git diff --check
 ```
 
 ## Known Blockers
 
-- None recorded for Phase 7.
-- Initial `cargo package --list` included local workflow and skill files; the
-  package include list now excludes them.
-- `cargo package` required network access to refresh the crates.io index in
-  this environment.
+- None recorded for Phase 8.
+- The examples did not expose a public API blocker.
 
 ## Evidence To Record
 
-- Package list result.
-- Package verification result.
-- Full release gate result.
+- Example run results.
+- Any API friction discovered while writing examples.
 
 ## Next Recommendation
 
-- Start Phase 8 integration examples.
+- Choose the next phase from CI/release verification, publishing workflow,
+  more targeted hardening, or user-requested API changes.

@@ -1834,3 +1834,47 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Start Phase 8 integration examples.
+
+## 2026-05-26: Integration Examples Gate Passed
+
+### Observation
+
+- Added `examples/user_store.rs`, a repository-style wrapper around `Db` and a
+  `users` keyspace. It demonstrates persistent open, keyspace options,
+  length-prefixed record encoding, prefix listing, transaction-backed
+  conditional update, flush, reopen, and cleanup.
+- Added `examples/event_index.rs`, a two-keyspace event log. It stores event
+  payloads and an account lookup key in one write batch, then resolves account
+  queries through the index keyspace.
+- README, usage docs, and release checklist now list the integration examples.
+- `cargo clippy --examples` found one minor string assignment issue in
+  `user_store`; it was fixed with `clone_into`.
+
+### Interpretation
+
+- Task043 is complete.
+- Phase 8 satisfies its acceptance gate.
+- The examples did not reveal a public API blocker; the existing `Db`,
+  `Keyspace`, transaction, prefix scan, and batch APIs were enough.
+
+### Verification
+
+- `cargo run --example user_store`
+- `cargo run --example event_index`
+- `cargo clippy --examples`
+- `cargo package --allow-dirty --list`
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+- forbidden terminology scan over source, tests, phase notes, Cargo metadata,
+  benches, docs, README, examples, and changelog
+
+### Remaining Blockers
+
+- None recorded for Phase 8.
+
+### Recommended Next Action
+
+- Choose the next phase from CI/release verification, publishing workflow,
+  more targeted hardening, or user-requested API changes.

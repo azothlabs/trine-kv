@@ -45,6 +45,8 @@ cargo fmt --check
 cargo clippy
 cargo test
 cargo run --example quickstart
+cargo run --example user_store
+cargo run --example event_index
 cargo package --list
 cargo package
 git diff --check

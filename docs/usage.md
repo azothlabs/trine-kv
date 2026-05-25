@@ -9,6 +9,18 @@ Run the checked quickstart first:
 cargo run --example quickstart
 ```
 
+Then look at the integration examples when you want to embed the database
+behind an application boundary:
+
+```text
+cargo run --example user_store
+cargo run --example event_index
+```
+
+`user_store` wraps Trine KV behind a small repository-style API. `event_index`
+uses two keyspaces and one write batch to keep event payloads and an account
+index in sync.
+
 ## Add The Crate
 
 Published releases use Semantic Versioning. For the `0.1` release line:
@@ -317,6 +329,8 @@ Use these commands before trusting a change to documentation or examples:
 
 ```text
 cargo run --example quickstart
+cargo run --example user_store
+cargo run --example event_index
 cargo fmt --check
 cargo clippy
 cargo test

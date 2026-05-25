@@ -55,8 +55,18 @@ cargo fmt --check
 cargo clippy
 cargo test
 cargo run --example quickstart
+cargo run --example user_store
+cargo run --example event_index
 cargo bench --bench v1_bench
 ```
+
+## Examples
+
+- `quickstart`: first pass through persistent open, keyspaces, scans,
+  transactions, flush, reopen, and stats.
+- `user_store`: wraps Trine KV behind a small repository-style API.
+- `event_index`: stores event payloads and a secondary account index with one
+  atomic write batch.
 
 ## Documentation
 

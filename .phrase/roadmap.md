@@ -123,7 +123,7 @@ Versioning.
 
 ### Phase 8: Integration Examples
 
-**Status**: Planned
+**Status**: Complete
 
 **Goal**: Add runnable examples that show Trine KV embedded behind realistic
 application boundaries.
