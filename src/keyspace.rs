@@ -79,6 +79,12 @@ impl Keyspace {
         self.db.write(batch, WriteOptions::default()).map(|_| ())
     }
 
+    pub fn remove_range(&self, range: KeyRange) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.remove_range(self.name.as_str(), range);
+        self.db.write(batch, WriteOptions::default()).map(|_| ())
+    }
+
     pub fn range(&self, range: &KeyRange) -> Result<Iter> {
         self.range_at_sequence(range, self.db.last_committed_sequence(), Direction::Forward)
     }

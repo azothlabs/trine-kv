@@ -1,6 +1,6 @@
 use crate::{
     db::Db,
-    error::{Error, Result},
+    error::Result,
     options::WriteOptions,
     types::{CommitInfo, KeyRange, Sequence, Value},
     write_batch::WriteBatch,
@@ -17,6 +17,26 @@ pub struct Transaction {
     read_sequence: Sequence,
     options: TransactionOptions,
     writes: WriteBatch,
+    point_reads: Vec<ReadKey>,
+    range_reads: Vec<ReadRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadKey {
+    pub(crate) keyspace: String,
+    pub(crate) key: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadRange {
+    pub(crate) keyspace: String,
+    pub(crate) range: KeyRange,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TransactionReadSet {
+    pub(crate) point_reads: Vec<ReadKey>,
+    pub(crate) range_reads: Vec<ReadRange>,
 }
 
 impl Transaction {
@@ -27,6 +47,8 @@ impl Transaction {
             read_sequence,
             options,
             writes: WriteBatch::new(),
+            point_reads: Vec::new(),
+            range_reads: Vec::new(),
         }
     }
 
@@ -40,18 +62,34 @@ impl Transaction {
         self.options
     }
 
-    pub fn get(&mut self, _keyspace: impl Into<String>, _key: &[u8]) -> Result<Option<Value>> {
-        self.db.ensure_open()?;
-        Err(Error::unsupported(
-            "transaction reads are not implemented yet",
-        ))
+    pub fn get(&mut self, keyspace: impl Into<String>, key: &[u8]) -> Result<Option<Value>> {
+        let keyspace = keyspace.into();
+        let value = self.db.get_at(&keyspace, key, self.read_sequence)?;
+        // Record the exact user key read at the transaction's read sequence.
+        // Commit validation rejects the transaction if a later committed point
+        // write, point delete, or covering range delete touched it.
+        self.point_reads.push(ReadKey {
+            keyspace,
+            key: key.to_vec(),
+        });
+
+        Ok(value)
     }
 
-    pub fn read_range(&mut self, _keyspace: impl Into<String>, _range: KeyRange) -> Result<()> {
+    pub fn read_range(&mut self, keyspace: impl Into<String>, range: KeyRange) -> Result<()> {
         self.db.ensure_open()?;
-        Err(Error::unsupported(
-            "transaction range tracking is not implemented yet",
-        ))
+        let keyspace = keyspace.into();
+        self.db.range_at(
+            &keyspace,
+            &range,
+            self.read_sequence,
+            crate::Direction::Forward,
+        )?;
+        // Range reads conflict with any later committed point mutation inside
+        // the range, plus any later range tombstone that overlaps it.
+        self.range_reads.push(ReadRange { keyspace, range });
+
+        Ok(())
     }
 
     pub fn insert(
@@ -67,10 +105,21 @@ impl Transaction {
         self.writes.remove(keyspace, key);
     }
 
+    pub fn remove_range(&mut self, keyspace: impl Into<String>, range: KeyRange) {
+        self.writes.remove_range(keyspace, range);
+    }
+
     pub fn commit(self) -> Result<CommitInfo> {
-        self.db.ensure_open()?;
-        Err(Error::unsupported(
-            "optimistic transaction commit is not implemented yet",
-        ))
+        let read_set = TransactionReadSet {
+            point_reads: self.point_reads,
+            range_reads: self.range_reads,
+        };
+
+        self.db.commit_transaction(
+            self.read_sequence,
+            read_set,
+            self.writes,
+            self.options.write_options,
+        )
     }
 }

@@ -268,3 +268,43 @@ Record only evidence that can change planning or durable decisions.
 
 - Implement in-memory optimistic transaction point/range read conflict
   validation.
+
+## 2026-05-25: In-Memory Optimistic Transaction Validation Passed
+
+### Observation
+
+- Transactions now record point keys and key ranges read at the transaction
+  read sequence.
+- Commit validation runs while holding the writer coordinator lock.
+- Point reads conflict with later point writes, point deletes, and covering
+  range deletes.
+- Range reads conflict with later point mutations inside the range and later
+  overlapping range deletes.
+- Writes outside a tracked read range do not conflict.
+- Transactions can commit staged writes through the same batch commit path as
+  direct writes.
+
+### Interpretation
+
+- Task006 is complete for in-memory behavior.
+- The next blocker should be persistence, starting with a small WAL append and
+  replay loop for committed batches before SSTable or manifest work.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Persistent mode still returns unsupported.
+- WAL framing/checksums, manifest, SSTable flush/read, recovery reports,
+  compaction, compression crates, optimized index policies, and blob files
+  remain future blockers.
+
+### Recommended Next Action
+
+- Implement persistent mode with a minimal WAL file for committed batches and
+  deterministic replay on reopen.

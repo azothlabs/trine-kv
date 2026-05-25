@@ -16,7 +16,7 @@ use crate::{
     options::{DbOptions, KeyspaceOptions, StorageMode, WriteOptions},
     snapshot::Snapshot,
     stats::DbStats,
-    transaction::{Transaction, TransactionOptions},
+    transaction::{Transaction, TransactionOptions, TransactionReadSet},
     types::{CommitInfo, KeyRange, KeyValue, Sequence},
     write_batch::{BatchOperation, WriteBatch},
 };
@@ -195,14 +195,31 @@ impl Db {
     }
 
     pub fn write(&self, batch: WriteBatch, _options: WriteOptions) -> Result<CommitInfo> {
+        self.commit_operations(batch.into_operations(), None)
+    }
+
+    pub(crate) fn commit_transaction(
+        &self,
+        read_sequence: Sequence,
+        read_set: TransactionReadSet,
+        batch: WriteBatch,
+        _options: WriteOptions,
+    ) -> Result<CommitInfo> {
+        self.commit_operations(batch.into_operations(), Some((read_sequence, read_set)))
+    }
+
+    fn commit_operations(
+        &self,
+        operations: Vec<BatchOperation>,
+        transaction_reads: Option<(Sequence, TransactionReadSet)>,
+    ) -> Result<CommitInfo> {
         self.ensure_open()?;
 
-        let operations = batch.into_operations();
-        if operations.is_empty() {
+        if operations.is_empty() && transaction_reads.is_none() {
             return Ok(CommitInfo::new(self.last_committed_sequence()));
         }
 
-        if self.inner.options.read_only {
+        if self.inner.options.read_only && !operations.is_empty() {
             return Err(Error::ReadOnly);
         }
 
@@ -218,6 +235,16 @@ impl Db {
             .writer
             .lock()
             .map_err(|_| lock_poisoned("writer coordinator"))?;
+        // Validate transaction reads while holding the writer lock. That keeps
+        // the successful validation and the following writes in one serial
+        // commit slot.
+        if let Some((read_sequence, read_set)) = transaction_reads {
+            self.validate_transaction_reads(read_sequence, &read_set)?;
+        }
+        if operations.is_empty() {
+            return Ok(CommitInfo::new(self.last_committed_sequence()));
+        }
+
         let sequence = self
             .last_committed_sequence()
             .next()
@@ -246,6 +273,32 @@ impl Db {
             .last_sequence
             .store(sequence.get(), Ordering::Release);
         Ok(CommitInfo::new(sequence))
+    }
+
+    fn validate_transaction_reads(
+        &self,
+        read_sequence: Sequence,
+        read_set: &TransactionReadSet,
+    ) -> Result<()> {
+        for read in &read_set.point_reads {
+            let state = self.keyspace_state(&read.keyspace)?;
+            if point_key_modified_after(&state, &read.key, read_sequence)? {
+                return Err(Error::Conflict {
+                    message: format!("point read conflict in keyspace {}", read.keyspace),
+                });
+            }
+        }
+
+        for read in &read_set.range_reads {
+            let state = self.keyspace_state(&read.keyspace)?;
+            if key_range_modified_after(&state, &read.range, read_sequence)? {
+                return Err(Error::Conflict {
+                    message: format!("range read conflict in keyspace {}", read.keyspace),
+                });
+            }
+        }
+
+        Ok(())
     }
 
     #[must_use]
@@ -431,6 +484,63 @@ fn validate_batch_len(len: usize) -> Result<()> {
     Ok(())
 }
 
+fn point_key_modified_after(
+    state: &KeyspaceState,
+    key: &[u8],
+    read_sequence: Sequence,
+) -> Result<bool> {
+    // A point read is invalidated by either a newer point record for that user
+    // key or a newer range tombstone covering it.
+    let entries = state
+        .entries
+        .read()
+        .map_err(|_| lock_poisoned("memtable entries"))?;
+
+    for (internal_key, _) in entries.iter() {
+        match internal_key.user_key().cmp(key) {
+            std::cmp::Ordering::Less => {}
+            std::cmp::Ordering::Greater => break,
+            std::cmp::Ordering::Equal => {
+                if internal_key.sequence() > read_sequence {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    drop(entries);
+
+    range_tombstone_modified_after_key(state, key, read_sequence)
+}
+
+fn key_range_modified_after(
+    state: &KeyspaceState,
+    range: &KeyRange,
+    read_sequence: Sequence,
+) -> Result<bool> {
+    // A range read is invalidated by any newer point record inside the range or
+    // any newer range tombstone whose bounds overlap the range read.
+    let entries = state
+        .entries
+        .read()
+        .map_err(|_| lock_poisoned("memtable entries"))?;
+
+    for (internal_key, _) in entries.iter() {
+        let user_key = internal_key.user_key();
+        if key_is_before_start(user_key, &range.start) {
+            continue;
+        }
+        if key_is_after_end(user_key, &range.end) {
+            break;
+        }
+        if internal_key.sequence() > read_sequence {
+            return Ok(true);
+        }
+    }
+    drop(entries);
+
+    range_tombstone_modified_after_range(state, range, read_sequence)
+}
+
 // This scan is deliberately small-scope: it applies the same user-visible MVCC
 // rule that table readers and merge iterators must later share. The first
 // visible internal record for a user key decides whether that key is returned.
@@ -532,6 +642,52 @@ fn range_tombstone_covers(
     Ok(range_tombstones.iter().any(|tombstone| {
         tombstone.covers_visible_point(key, point_sequence, point_batch_index, read_sequence)
     }))
+}
+
+fn range_tombstone_modified_after_key(
+    state: &KeyspaceState,
+    key: &[u8],
+    read_sequence: Sequence,
+) -> Result<bool> {
+    let range_tombstones = state
+        .range_tombstones
+        .read()
+        .map_err(|_| lock_poisoned("range tombstones"))?;
+
+    Ok(range_tombstones.iter().any(|tombstone| {
+        tombstone.sequence > read_sequence && key_is_in_range(key, &tombstone.range)
+    }))
+}
+
+fn range_tombstone_modified_after_range(
+    state: &KeyspaceState,
+    range: &KeyRange,
+    read_sequence: Sequence,
+) -> Result<bool> {
+    let range_tombstones = state
+        .range_tombstones
+        .read()
+        .map_err(|_| lock_poisoned("range tombstones"))?;
+
+    Ok(range_tombstones.iter().any(|tombstone| {
+        tombstone.sequence > read_sequence && ranges_overlap(range, &tombstone.range)
+    }))
+}
+
+fn ranges_overlap(left: &KeyRange, right: &KeyRange) -> bool {
+    !range_ends_before_start(&left.end, &right.start)
+        && !range_ends_before_start(&right.end, &left.start)
+}
+
+fn range_ends_before_start(end: &Bound<Vec<u8>>, start: &Bound<Vec<u8>>) -> bool {
+    match (end, start) {
+        (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
+        (Bound::Excluded(end), Bound::Included(start) | Bound::Excluded(start)) => {
+            end.as_slice() <= start.as_slice()
+        }
+        (Bound::Included(end), Bound::Included(start)) => end.as_slice() < start.as_slice(),
+        (Bound::Included(end), Bound::Excluded(start)) => end.as_slice() <= start.as_slice(),
+    }
 }
 
 fn apply_memtable_operation(
