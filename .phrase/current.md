@@ -2,7 +2,7 @@
 
 ## Status
 
-In progress
+Complete
 
 ## Goal
 
@@ -70,13 +70,13 @@ task031 [x] goal:database stats expose table, L0, blob, and compaction counters 
 task032 [x] goal:block cache records table block hits and misses without changing read results | scope:src/cache.rs,src/table.rs,src/db.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check
 task033 [x] goal:required benchmark harness records reproducible benchmark output for v1 gates | scope:benches,docs,.phrase/current.md | verify:cargo fmt --check + cargo clippy + cargo test + git diff --check + benchmark command
 task034 [x] goal:durability documentation describes honest guarantees and tradeoffs for v1 | scope:docs,src/db/commit.rs,.phrase/current.md | verify:doc review + cargo fmt --check + cargo clippy + cargo test + git diff --check
-task035 [ ] goal:final v1 acceptance audit confirms Phase 3 can close or records remaining gaps | scope:.phrase/protocol,.phrase/current.md,.phrase/roadmap.md,.phrase/evidence.md | verify:manual acceptance audit + cargo fmt --check + cargo clippy + cargo test + cargo bench --bench v1_bench + git diff --check
+task035 [x] goal:final v1 acceptance audit confirms Phase 3 can close or records remaining gaps | scope:.phrase/protocol,.phrase/current.md,.phrase/roadmap.md,.phrase/evidence.md | verify:manual acceptance audit + cargo fmt --check + cargo clippy + cargo test + cargo bench --bench v1_bench + git diff --check
 ```
 
 ## Known Blockers
 
-- No implementation blockers are recorded after task034.
-- Final acceptance audit remains before closing Phase 3.
+- No implementation blockers remain recorded for Phase 3.
+- Phase 3 is complete by the v1 acceptance gate.
 
 ## Evidence To Record
 
@@ -96,3 +96,9 @@ task035 [ ] goal:final v1 acceptance audit confirms Phase 3 can close or records
 - Benchmark harness validation results.
 - Durability documentation validation results.
 - Final acceptance gate result after task034.
+
+## Next Phase Recommendation
+
+Do not pre-split a new implementation phase from this file. Start the next
+phase from fresh evidence: release readiness, API polish, external integration,
+or production hardening should each begin with its own current phase brief.

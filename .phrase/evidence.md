@@ -1469,3 +1469,54 @@ Record only evidence that can change planning or durable decisions.
 
 - Run the final v1 acceptance audit against the protocol gate, then update
   roadmap/current/evidence with the phase result.
+
+## 2026-05-25: Phase 3 V1 Acceptance Gate Passed
+
+### Observation
+
+- The final audit checked `.phrase/protocol/trine-kv-v1-spec.md` section 31.
+- Public API concepts in the spec are represented in crate modules and public
+  exports for database open modes, keyspaces, write batches, snapshots,
+  transactions, range/prefix iteration, WAL, SSTables, compaction, filters,
+  compression, search policy, stats, and recovery.
+- Persistent crash/recovery coverage includes WAL replay, torn WAL tail,
+  checksum corruption, missing/corrupt tables and blobs, manifest/keyspace
+  recovery, lock behavior, repair reports, and unreferenced storage-file
+  rejection.
+- In-memory logical coverage includes point writes/deletes, batch atomicity,
+  snapshots, range scans, reverse scans, prefix scans, range deletes, and
+  optimistic transaction conflicts.
+- Persistent SSTable coverage includes flush/reopen, compaction, snapshot-safe
+  cleanup, blob survival/cleanup, prefix filters, point-key filters, table block
+  indexes, compression profiles, index search policies, stats, block cache
+  hits/misses, and automatic L0 compaction.
+- Benchmark output is recorded in `docs/benchmarks/v1-baseline.md`, and the
+  final audit reran `cargo bench --bench v1_bench` successfully.
+- Durability tradeoffs are documented in `docs/durability.md`.
+
+### Interpretation
+
+- Phase 3 satisfies the v1 acceptance gate.
+- No implementation blocker remains recorded in the current phase brief.
+- The next phase should not be inferred from the old task list; it should start
+  from new evidence and a new current phase brief.
+
+### Verification
+
+- Manual acceptance audit against `.phrase/protocol/trine-kv-v1-spec.md`
+  section 31
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `cargo bench --bench v1_bench`
+- `git diff --check`
+
+### Remaining Blockers
+
+- None recorded for Phase 3.
+
+### Recommended Next Action
+
+- Treat Phase 3 as complete. Start the next phase only after choosing a fresh
+  phase goal from release readiness, API polish, external integration, or
+  production-hardening evidence.

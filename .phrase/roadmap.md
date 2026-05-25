@@ -46,7 +46,7 @@ spec.
 
 ### Phase 3: Build V1 Engine By Spec
 
-**Status**: In progress
+**Status**: Complete
 
 **Goal**: Implement the complete v1 engine in slices without changing the
 accepted contracts silently.
