@@ -92,3 +92,101 @@ Record only evidence that can change planning or durable decisions.
 
 - During crate scaffolding, add codec and prefix-filter modules as first-class
   boundaries instead of burying them inside SSTable reader code.
+
+## 2026-05-25: V1 Spec Accepted For Scaffolding
+
+### Observation
+
+- User stated the spec, protocol, and related docs are detailed enough and asked
+  to begin implementation.
+- Phase 1 acceptance files already exist:
+  `.phrase/adr/0001-v1-lsm-mvcc-engine.md` and
+  `.phrase/protocol/trine-kv-v1-spec.md`.
+
+### Interpretation
+
+- Phase 1 can be treated as accepted for implementation planning.
+- The next measured slice is Phase 2 crate scaffolding, not engine behavior.
+
+### Verification
+
+- Manual review of roadmap, current phase, ADR, protocol spec, and evidence.
+
+### Remaining Blockers
+
+- No Rust crate exists yet.
+
+### Recommended Next Action
+
+- Create the crate skeleton and run the Phase 2 formatting, lint, and test gate.
+
+## 2026-05-25: Phase 2 Scaffold Gate Passed
+
+### Observation
+
+- Rust crate scaffold was added with modules matching the v1 protocol boundary:
+  API handles, typed errors, MVCC, WAL, memtable, SSTable, manifest,
+  VersionSet, compaction, transaction, prefix/filter, codec, search, cache,
+  blob, stats, and write batches.
+- `cargo fmt --check`, `cargo clippy`, and `cargo test` passed.
+
+### Interpretation
+
+- Phase 2 is complete.
+- The next useful implementation slice is in-memory MVCC point semantics,
+  because it exercises sequence assignment, write batches, snapshots, typed
+  errors, and keyspace boundaries without pulling in WAL/SSTable complexity.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+
+### Remaining Blockers
+
+- No point write/read behavior exists yet.
+- Persistent WAL, SSTable, manifest, recovery, compaction, range deletes,
+  range/prefix iteration, and optimistic transaction validation remain future
+  blockers.
+
+### Recommended Next Action
+
+- Implement in-memory MVCC point writes, point deletes, and snapshot reads.
+
+## 2026-05-25: In-Memory MVCC Point Slice Passed
+
+### Observation
+
+- In-memory keyspaces now store point versions in an ordered
+  `BTreeMap<InternalKey, ValueRef>`.
+- Write batches assign one commit sequence and apply point inserts/deletes
+  atomically after validating keyspaces and unsupported operations.
+- Snapshot reads use the snapshot sequence and continue seeing older point
+  versions after later writes and deletes.
+- Duplicate keys inside one batch use later batch operations first through the
+  internal-key batch index tie-breaker.
+
+### Interpretation
+
+- The first Phase 3 behavior slice is complete.
+- The next blocker is not persistence yet; it is ordered in-memory iteration,
+  because range/prefix scans should reuse the same MVCC visibility rules before
+  SSTable and compaction work exists.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+
+### Remaining Blockers
+
+- Range iteration and prefix iteration are still unsupported.
+- Range deletes, WAL, SSTable flush/read, manifest, recovery, compaction,
+  compression crates, optimized index policies, blob files, and optimistic
+  transaction validation remain future blockers.
+
+### Recommended Next Action
+
+- Implement snapshot-consistent in-memory range and prefix iteration.

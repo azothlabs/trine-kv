@@ -6,52 +6,50 @@ In progress
 
 ## Goal
 
-Freeze the Trine KV v1 database specification before implementation.
+Build the v1 engine in measured slices without silently changing the accepted
+protocol.
 
 ## Entry Condition
 
-- The project is a clean repository skeleton.
-- The user wants a serious embedded LSM KV, independent from previous projects.
-- Trine specs and tests are the source of truth.
+- Phase 2 crate scaffold is complete.
+- `cargo fmt --check`, `cargo clippy`, and scaffold tests passed.
+- The v1 protocol remains the implementation source of truth.
 
 ## Scope
 
-- Define v1 database capabilities.
-- Define MVCC, transactions, LSM layout, WAL, SSTable, manifest, compaction,
-  recovery, in-memory mode, prefix filters, compression, search policy, and
-  public API shape.
-- Record the project independence boundary as a durable decision.
+- Implement one behavior slice at a time.
+- Keep each slice aligned with MVCC, write batch, snapshot, WAL, SSTable,
+  manifest, compaction, transaction, prefix-filter, compression, and
+  search-policy contracts.
+- Add tests before claiming a slice works.
 
 ## Out Of Scope
 
-- Writing Rust implementation code.
-- Benchmarking before the engine exists.
-- Depending on another storage engine.
-- Choosing a specific compression codec name as part of the core contract.
+- Implementing multiple adjacent engine subsystems in one unverified jump.
+- Changing public protocol behavior without updating the spec or an ADR.
+- Adding external codec crates before codec behavior and fixtures are ready.
+- Persistent crash recovery before in-memory MVCC point semantics exist.
 
 ## Acceptance Gate
 
-- `.phrase/adr/0001-v1-lsm-mvcc-engine.md` records the durable design decision.
-- `.phrase/protocol/trine-kv-v1-spec.md` defines the v1 protocol and storage
-  contract.
-- The spec includes in-memory mode and persistent mode.
-- The spec includes prefix extractor and prefix filter rules.
-- The spec chooses a fast default compression codec and compact zlib option.
-- The spec includes search-policy rules for immutable indexes and iterators.
-- The spec includes required tests and benchmarks.
+- The v1 acceptance gate in `.phrase/protocol/trine-kv-v1-spec.md` passes.
+- Each slice records its verification evidence and remaining blockers.
 
 ## Active Task Slice
 
 ```text
-task001 [x] goal:v1 spec exists | scope:.phrase/adr,.phrase/protocol | verify:manual review + diff check
+task003 [x] goal:in-memory MVCC point writes, deletes, and snapshot reads work | scope:src/db.rs,src/keyspace.rs,src/write_batch.rs,src/blob.rs,src/snapshot.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
+task004 [ ] goal:in-memory range and prefix iteration return snapshot-consistent ordered live keys | scope:src/db.rs,src/keyspace.rs,src/iterator.rs,tests | verify:cargo fmt --check + cargo clippy + cargo test
 ```
 
 ## Known Blockers
 
-- No Cargo project exists yet; implementation starts after spec review.
+- Range iteration, prefix iteration, range deletes, persistent WAL, SSTable
+  flush, manifest, recovery, compaction, and optimistic transaction validation
+  are not implemented yet.
 
 ## Evidence To Record
 
-- Spec files created.
-- User review outcome.
-- Any capability that should be cut or strengthened before coding.
+- Phase 2 scaffold gate results.
+- Range/prefix iterator validation results.
+- Remaining blocker category after the iterator slice.

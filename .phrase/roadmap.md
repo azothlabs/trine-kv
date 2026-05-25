@@ -15,7 +15,7 @@ and major out-of-scope boundaries. Detailed implementation tasks belong only in
 
 ### Phase 1: Freeze V1 Database Spec
 
-**Status**: In progress
+**Status**: Accepted
 
 **Goal**: Define Trine KV v1 as a complete embedded LSM MVCC database before
 implementation.
@@ -31,7 +31,7 @@ implementation.
 
 ### Phase 2: Scaffold Rust Crate
 
-**Status**: Pending
+**Status**: Complete
 
 **Goal**: Create the Rust crate and module skeleton that matches the accepted
 spec.
@@ -46,7 +46,7 @@ spec.
 
 ### Phase 3: Build V1 Engine By Spec
 
-**Status**: Pending
+**Status**: In progress
 
 **Goal**: Implement the complete v1 engine in slices without changing the
 accepted contracts silently.
