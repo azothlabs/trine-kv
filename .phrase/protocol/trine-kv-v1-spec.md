@@ -505,7 +505,6 @@ V1 codec policy:
 
 - default codec profile: `Fast`;
 - `Fast` is implemented with `lz4_flex` block compression;
-- `Compact` is implemented with `flate2` zlib/DEFLATE compression;
 - `None` stores uncompressed blocks;
 - table metadata records the concrete codec id used for every compressed block.
 
@@ -514,17 +513,16 @@ Design judgment:
 - `lz4_flex` is the default because SSTable block decompression is on the read
   path and LSM point/range reads benefit more from low CPU cost than maximum
   compression ratio.
-- `flate2` zlib is useful when space reduction matters more than read/write CPU,
-  such as cold keyspaces or compact archival workloads.
-- zlib must not be the default for hot LSM levels unless benchmarks show the
-  ratio gain outweighs read and compaction CPU on the target workload.
+- V1 deliberately does not include a zlib/DEFLATE codec. If a future version
+  needs another codec, it must get a new stable Trine codec id and explicit
+  fixtures before implementation.
 - codec choice must be benchmarked with Trine blocks, not generic text files.
 
 Crate binding rule:
 
-The public format uses Trine codec ids such as `none`, `fast-lz4-block`, and
-`compact-zlib`. The implementation may use `lz4_flex` and `flate2`, but crate
-names do not become on-disk compatibility names.
+The public format uses Trine codec ids such as `none` and `fast-lz4-block`.
+The implementation uses `lz4_flex`, but crate names do not become on-disk
+compatibility names.
 
 ## 18. Large Values
 
@@ -819,7 +817,7 @@ Benchmarks must cover persistent and in-memory modes where relevant:
 - cold table read.
 - index seek policy comparison over small, medium, and large index arrays;
 - iterator `advance_to` with near, far, and random targets.
-- codec comparison for `none`, fast block compression, and compact zlib over
+- codec comparison for `none` and fast block compression over
   Trine data blocks, index blocks, and range tombstone blocks.
 
 ## 31. V1 Acceptance Gate
@@ -834,8 +832,7 @@ Trine KV v1 is complete when:
 - prefix filters are implemented and prefix scans remain correct under MVCC and
   range tombstones;
 - compaction is enabled and snapshot-safe;
-- block compression interface works with `none`, the fast default codec, and the
-  compact zlib codec;
+- block compression interface works with `none` and the fast default codec;
 - optimized index search policies match canonical sorted search behavior;
 - checksums guard WAL, blocks, and table footers;
 - benchmark output exists for the required benchmark set;

@@ -37,6 +37,8 @@ Evidence notes should separate:
 - V1 protocol and storage contract: `.phrase/protocol/trine-kv-v1-spec.md`.
 - Trine specs, ADRs, tests, and local design notes are the source of truth.
 - Do not implement Trine by depending on another storage engine.
+- V1 compression uses only `none` and `lz4_flex`-backed fast block compression;
+  do not add zlib/DEFLATE or `flate2` for v1.
 - Do not change MVCC, WAL, SSTable, manifest, compaction, transaction,
   prefix-filter, compression, or search-policy behavior without updating the
   protocol spec or adding a follow-up ADR.

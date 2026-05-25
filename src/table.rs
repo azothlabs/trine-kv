@@ -359,7 +359,6 @@ fn put_codec(bytes: &mut Vec<u8>, codec: CodecId) {
         match codec {
             CodecId::None => 0,
             CodecId::FastLz4Block => 1,
-            CodecId::CompactZlib => 2,
         },
     );
 }
@@ -518,7 +517,6 @@ impl<'payload> Cursor<'payload> {
         match self.read_u8()? {
             0 => Ok(CodecId::None),
             1 => Ok(CodecId::FastLz4Block),
-            2 => Ok(CodecId::CompactZlib),
             tag => Err(Error::UnsupportedFormat {
                 message: format!("unknown table codec {tag}"),
             }),

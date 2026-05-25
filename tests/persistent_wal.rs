@@ -150,7 +150,7 @@ fn persistent_manifest_keeps_keyspace_options_across_reopen() {
     let options = DbOptions::persistent(&path);
     let keyspace_options = KeyspaceOptions {
         allow_empty_keys: false,
-        compression: CompressionProfile::Compact,
+        compression: CompressionProfile::Fast,
         block_bytes: 4096,
         filter_policy: FilterPolicy::Bloom { bits_per_key: 12 },
         prefix_extractor: PrefixExtractor::Separator(b':'),

@@ -77,15 +77,14 @@ Record only evidence that can change planning or durable decisions.
   range construction.
 - SSTable block decompression sits on the read path. Fast decompression is more
   important for hot blocks than maximum compression ratio.
-- A compact zlib-style codec is still useful for workloads that value space over
-  CPU.
+- A compact second codec was considered earlier, but this is superseded by the
+  later V1 compression narrowing below.
 
 ### Interpretation
 
 - Prefix extractor and prefix filter support must be part of v1 table format,
   keyspace options, tests, and metrics.
-- Trine should default to a fast block codec implemented with `lz4_flex`, while
-  also supporting a compact zlib/DEFLATE codec implemented with `flate2`.
+- Trine should default to a fast block codec implemented with `lz4_flex`.
 - On-disk codec ids should be Trine names, not Rust crate names.
 
 ### Recommended Next Action
@@ -500,3 +499,34 @@ Record only evidence that can change planning or durable decisions.
 
 - Implement a small manual compaction path that rewrites flushed tables into a
   replacement table while preserving MVCC visibility and manifest publish rules.
+
+## 2026-05-25: V1 Compression Narrowed To LZ4
+
+### Observation
+
+- User explicitly decided V1 compression should use only `lz4_flex`, not
+  `flate2`.
+- The protocol previously named a compact zlib/DEFLATE codec, which conflicted
+  with the new V1 boundary.
+
+### Interpretation
+
+- V1 should expose only `none` and `fast-lz4-block` codec ids.
+- `CompressionProfile` should only distinguish uncompressed blocks from the
+  fast default codec.
+- Any future second codec needs a new protocol decision and fixtures.
+
+### Verification
+
+- Protocol, decision framework, current task brief, codec ids, compression
+  profiles, manifest codec encoding, table codec encoding, and tests were
+  scanned and updated for the narrowed V1 rule.
+
+### Remaining Blockers
+
+- `lz4_flex` is not wired into table blocks yet.
+
+### Recommended Next Action
+
+- Keep compaction as the next implementation slice, then add `lz4_flex` once
+  the block/index table layout exists.

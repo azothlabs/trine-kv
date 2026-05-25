@@ -4,7 +4,6 @@ use crate::{Error, error::Result};
 pub enum CodecId {
     None,
     FastLz4Block,
-    CompactZlib,
 }
 
 impl CodecId {
@@ -13,7 +12,6 @@ impl CodecId {
         match self {
             Self::None => "none",
             Self::FastLz4Block => "fast-lz4-block",
-            Self::CompactZlib => "compact-zlib",
         }
     }
 }

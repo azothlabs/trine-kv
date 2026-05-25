@@ -28,7 +28,6 @@ pub enum CompressionProfile {
     None,
     #[default]
     Fast,
-    Compact,
 }
 
 impl CompressionProfile {
@@ -37,7 +36,6 @@ impl CompressionProfile {
         match self {
             Self::None => CodecId::None,
             Self::Fast => CodecId::FastLz4Block,
-            Self::Compact => CodecId::CompactZlib,
         }
     }
 }

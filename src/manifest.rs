@@ -310,7 +310,6 @@ fn put_compression_profile(bytes: &mut Vec<u8>, value: CompressionProfile) {
         match value {
             CompressionProfile::None => 0,
             CompressionProfile::Fast => 1,
-            CompressionProfile::Compact => 2,
         },
     );
 }
@@ -401,7 +400,6 @@ fn put_codec(bytes: &mut Vec<u8>, codec: CodecId) {
         match codec {
             CodecId::None => 0,
             CodecId::FastLz4Block => 1,
-            CodecId::CompactZlib => 2,
         },
     );
 }
@@ -573,7 +571,6 @@ impl<'payload> Cursor<'payload> {
         match self.read_u8()? {
             0 => Ok(CompressionProfile::None),
             1 => Ok(CompressionProfile::Fast),
-            2 => Ok(CompressionProfile::Compact),
             tag => Err(Error::InvalidFormat {
                 message: format!("unknown manifest compression profile {tag}"),
             }),
@@ -640,7 +637,6 @@ impl<'payload> Cursor<'payload> {
         match self.read_u8()? {
             0 => Ok(CodecId::None),
             1 => Ok(CodecId::FastLz4Block),
-            2 => Ok(CodecId::CompactZlib),
             tag => Err(Error::UnsupportedFormat {
                 message: format!("unknown manifest table codec {tag}"),
             }),
