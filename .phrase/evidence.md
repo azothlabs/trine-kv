@@ -381,3 +381,43 @@ Record only evidence that can change planning or durable decisions.
 
 - Implement a small manifest that records keyspace creation/options and the WAL
   replay floor, without adding SSTable flush yet.
+
+## 2026-05-25: Manifest Keyspace State Passed
+
+### Observation
+
+- Persistent DB startup now opens `MANIFEST`, restores declared keyspaces and
+  their options before WAL replay, and stores the manifest behind a mutex for
+  later edits.
+- Creating a persistent keyspace publishes its options to `MANIFEST` before the
+  in-memory registry is updated.
+- WAL replay now skips records at or below the manifest replay floor and fails
+  closed if a newer WAL record references a keyspace missing from the manifest.
+- A regression test removes `MANIFEST` after writing WAL data and confirms
+  reopen fails instead of recreating the keyspace with default options.
+- The direct commit and WAL replay methods were moved from `src/db.rs` into
+  `src/db/commit.rs` to keep the DB API, read path, and commit path separated.
+
+### Interpretation
+
+- Task009 is complete for keyspace creation/options and replay-floor handling.
+- The next blocker is the first SSTable flush/read slice, because advancing the
+  replay floor is only useful once flushed table files exist.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy`
+- `cargo test`
+- `git diff --check`
+
+### Remaining Blockers
+
+- SSTable flush/read and table manifest edits are not implemented.
+- Recovery reports, compaction, blob files, compression crates, and optimized
+  search policies remain future blockers.
+
+### Recommended Next Action
+
+- Implement a small SSTable writer/reader for flushed memtable contents, then
+  publish table metadata and advance the WAL replay floor through the manifest.

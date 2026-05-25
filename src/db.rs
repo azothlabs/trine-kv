@@ -13,14 +13,17 @@ use crate::{
     internal_key::{InternalKey, ValueKind},
     iterator::{Direction, Iter},
     keyspace::{Keyspace, KeyspaceName},
-    options::{DbOptions, DurabilityMode, KeyspaceOptions, StorageMode, WriteOptions},
+    manifest::{self, ManifestState, ManifestStore},
+    options::{DbOptions, DurabilityMode, KeyspaceOptions, StorageMode},
     snapshot::Snapshot,
     stats::DbStats,
-    transaction::{Transaction, TransactionOptions, TransactionReadSet},
-    types::{CommitInfo, KeyRange, KeyValue, Sequence},
-    wal::{self, WalBatch, WalWriter},
-    write_batch::{BatchOperation, WriteBatch},
+    transaction::{Transaction, TransactionOptions},
+    types::{KeyRange, KeyValue, Sequence},
+    wal::{self, WalWriter},
+    write_batch::BatchOperation,
 };
+
+mod commit;
 
 #[derive(Debug, Clone)]
 pub struct Db {
@@ -34,6 +37,7 @@ pub(crate) struct DbInner {
     closed: AtomicBool,
     writer: Mutex<()>,
     keyspaces: RwLock<BTreeMap<String, Arc<KeyspaceState>>>,
+    manifest: Option<Mutex<ManifestStore>>,
     wal: Option<Mutex<WalWriter>>,
 }
 
@@ -97,6 +101,7 @@ impl Db {
                 closed: AtomicBool::new(false),
                 writer: Mutex::new(()),
                 keyspaces: RwLock::new(BTreeMap::new()),
+                manifest: None,
                 wal: None,
             }),
         })
@@ -118,6 +123,14 @@ impl Db {
             return Err(Error::invalid_options("database path does not exist"));
         }
 
+        let manifest_path = manifest::manifest_path(path);
+        let manifest = ManifestStore::open_or_create(
+            manifest_path,
+            options.create_if_missing && !options.read_only,
+        )?;
+        let replay_floor = manifest.state().wal_replay_floor();
+        let keyspaces = keyspaces_from_manifest(manifest.state())?;
+
         let wal_path = wal::wal_path(path);
         let batches = wal::read_batches(&wal_path)?;
         let wal = if options.read_only {
@@ -132,11 +145,12 @@ impl Db {
                 last_sequence: AtomicU64::new(Sequence::ZERO.get()),
                 closed: AtomicBool::new(false),
                 writer: Mutex::new(()),
-                keyspaces: RwLock::new(BTreeMap::new()),
+                keyspaces: RwLock::new(keyspaces),
+                manifest: Some(Mutex::new(manifest)),
                 wal,
             }),
         };
-        db.replay_wal_batches(batches)?;
+        db.replay_wal_batches(batches, replay_floor)?;
 
         Ok(db)
     }
@@ -155,6 +169,21 @@ impl Db {
 
         validate_keyspace_options(&options)?;
 
+        if let Some(existing_options) = self.existing_keyspace_options(name.as_str())? {
+            if existing_options != options {
+                return Err(Error::invalid_options(
+                    "existing keyspace options do not match requested options",
+                ));
+            }
+            return Ok(Keyspace::new(self.clone(), name, existing_options));
+        }
+
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+
+        self.persist_keyspace_creation(name.as_str(), &options)?;
+
         let keyspace_options = {
             let mut keyspaces = self
                 .inner
@@ -163,9 +192,6 @@ impl Db {
                 .map_err(|_| lock_poisoned("keyspace registry"))?;
 
             if let Some(state) = keyspaces.get(name.as_str()) {
-                // Opening an existing keyspace with different options would
-                // hide a manifest-level decision behind a harmless-looking
-                // handle lookup. Keep that explicit from the start.
                 if state.options != options {
                     return Err(Error::invalid_options(
                         "existing keyspace options do not match requested options",
@@ -173,10 +199,6 @@ impl Db {
                 }
                 state.options.clone()
             } else {
-                if self.inner.options.read_only {
-                    return Err(Error::ReadOnly);
-                }
-
                 let keyspace_options = options.clone();
                 keyspaces.insert(
                     name.as_str().to_owned(),
@@ -237,166 +259,6 @@ impl Db {
             live_keyspaces,
             ..DbStats::default()
         }
-    }
-
-    pub fn write(&self, batch: WriteBatch, options: WriteOptions) -> Result<CommitInfo> {
-        self.commit_operations(batch.into_operations(), options, None)
-    }
-
-    pub(crate) fn commit_transaction(
-        &self,
-        read_sequence: Sequence,
-        read_set: TransactionReadSet,
-        batch: WriteBatch,
-        write_options: WriteOptions,
-    ) -> Result<CommitInfo> {
-        self.commit_operations(
-            batch.into_operations(),
-            write_options,
-            Some((read_sequence, read_set)),
-        )
-    }
-
-    fn commit_operations(
-        &self,
-        operations: Vec<BatchOperation>,
-        write_options: WriteOptions,
-        transaction_reads: Option<(Sequence, TransactionReadSet)>,
-    ) -> Result<CommitInfo> {
-        self.ensure_open()?;
-
-        if operations.is_empty() && transaction_reads.is_none() {
-            return Ok(CommitInfo::new(self.last_committed_sequence()));
-        }
-
-        if self.inner.options.read_only && !operations.is_empty() {
-            return Err(Error::ReadOnly);
-        }
-
-        // Check every batch-wide precondition before taking the writer lock or
-        // touching memtables, so a rejected batch cannot leave partial state.
-        validate_batch_len(operations.len())?;
-
-        // The writer lock serializes commit sequence assignment and memtable
-        // updates. Reads only take keyspace/table read locks and do not enter
-        // this coordinator.
-        let _writer = self
-            .inner
-            .writer
-            .lock()
-            .map_err(|_| lock_poisoned("writer coordinator"))?;
-        // Validate transaction reads while holding the writer lock. That keeps
-        // the successful validation and the following writes in one serial
-        // commit slot.
-        if let Some((read_sequence, read_set)) = transaction_reads {
-            self.validate_transaction_reads(read_sequence, &read_set)?;
-        }
-        if operations.is_empty() {
-            return Ok(CommitInfo::new(self.last_committed_sequence()));
-        }
-
-        let sequence = self
-            .last_committed_sequence()
-            .next()
-            .ok_or_else(|| Error::Corruption {
-                message: "sequence counter overflow".to_owned(),
-            })?;
-        let states = self.resolve_batch_keyspaces(&operations)?;
-
-        let indexed_operations = operations
-            .into_iter()
-            .zip(states)
-            .enumerate()
-            .map(|(batch_index, (operation, state))| {
-                let batch_index = u32::try_from(batch_index).map_err(|_| {
-                    Error::invalid_options("write batch operation count exceeds u32::MAX")
-                })?;
-                Ok((batch_index, operation, state))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let wal_operations = indexed_operations
-            .iter()
-            .map(|(_, operation, _)| operation.clone())
-            .collect::<Vec<_>>();
-
-        self.append_wal(sequence, &wal_operations, write_options.durability)?;
-
-        for (batch_index, operation, state) in indexed_operations {
-            apply_memtable_operation(&state, operation, sequence, batch_index)?;
-        }
-
-        self.inner
-            .last_sequence
-            .store(sequence.get(), Ordering::Release);
-        Ok(CommitInfo::new(sequence))
-    }
-
-    fn validate_transaction_reads(
-        &self,
-        read_sequence: Sequence,
-        read_set: &TransactionReadSet,
-    ) -> Result<()> {
-        for read in &read_set.point_reads {
-            let state = self.keyspace_state(&read.keyspace)?;
-            if point_key_modified_after(&state, &read.key, read_sequence)? {
-                return Err(Error::Conflict {
-                    message: format!("point read conflict in keyspace {}", read.keyspace),
-                });
-            }
-        }
-
-        for read in &read_set.range_reads {
-            let state = self.keyspace_state(&read.keyspace)?;
-            if key_range_modified_after(&state, &read.range, read_sequence)? {
-                return Err(Error::Conflict {
-                    message: format!("range read conflict in keyspace {}", read.keyspace),
-                });
-            }
-        }
-
-        Ok(())
-    }
-
-    fn append_wal(
-        &self,
-        sequence: Sequence,
-        operations: &[BatchOperation],
-        durability: DurabilityMode,
-    ) -> Result<()> {
-        if let Some(wal) = &self.inner.wal {
-            wal.lock()
-                .map_err(|_| lock_poisoned("WAL writer"))?
-                .append_batch(sequence, operations, durability)?;
-        }
-
-        Ok(())
-    }
-
-    fn replay_wal_batches(&self, batches: Vec<WalBatch>) -> Result<()> {
-        let mut last_sequence = Sequence::ZERO;
-
-        for batch in batches {
-            if batch.sequence <= last_sequence {
-                return Err(Error::Corruption {
-                    message: "WAL sequence did not increase".to_owned(),
-                });
-            }
-            validate_batch_len(batch.operations.len())?;
-
-            for (batch_index, operation) in batch.operations.into_iter().enumerate() {
-                let batch_index = u32::try_from(batch_index)
-                    .map_err(|_| Error::invalid_options("WAL operation count exceeds u32::MAX"))?;
-                let state = self.keyspace_state_or_create_default(operation.keyspace())?;
-                apply_memtable_operation(&state, operation, batch.sequence, batch_index)?;
-            }
-
-            self.inner
-                .last_sequence
-                .store(batch.sequence.get(), Ordering::Release);
-            last_sequence = batch.sequence;
-        }
-
-        Ok(())
     }
 
     #[must_use]
@@ -514,17 +376,28 @@ impl Db {
             })
     }
 
-    fn keyspace_state_or_create_default(&self, keyspace: &str) -> Result<Arc<KeyspaceState>> {
-        let mut keyspaces = self
+    fn existing_keyspace_options(&self, keyspace: &str) -> Result<Option<KeyspaceOptions>> {
+        let keyspaces = self
             .inner
             .keyspaces
-            .write()
+            .read()
             .map_err(|_| lock_poisoned("keyspace registry"))?;
 
-        Ok(keyspaces
-            .entry(keyspace.to_owned())
-            .or_insert_with(|| Arc::new(KeyspaceState::new(KeyspaceOptions::default())))
-            .clone())
+        Ok(keyspaces.get(keyspace).map(|state| state.options.clone()))
+    }
+
+    fn persist_keyspace_creation(&self, name: &str, options: &KeyspaceOptions) -> Result<()> {
+        if let Some(manifest) = &self.inner.manifest {
+            // Manifest I/O happens outside the keyspace registry lock. Two
+            // racing creators are serialized by the manifest lock, and the
+            // second identical request becomes a no-op.
+            manifest
+                .lock()
+                .map_err(|_| lock_poisoned("manifest store"))?
+                .create_keyspace(name.to_owned(), options.clone())?;
+        }
+
+        Ok(())
     }
 
     fn resolve_batch_keyspaces(
@@ -572,6 +445,19 @@ fn validate_options(options: &DbOptions) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn keyspaces_from_manifest(
+    manifest: &ManifestState,
+) -> Result<BTreeMap<String, Arc<KeyspaceState>>> {
+    let mut keyspaces = BTreeMap::new();
+
+    for (name, options) in manifest.keyspaces() {
+        validate_keyspace_options(options)?;
+        keyspaces.insert(name.clone(), Arc::new(KeyspaceState::new(options.clone())));
+    }
+
+    Ok(keyspaces)
 }
 
 fn validate_keyspace_options(options: &KeyspaceOptions) -> Result<()> {

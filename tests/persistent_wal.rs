@@ -7,7 +7,9 @@ use std::{
 };
 
 use trine_kv::{
-    Db, DbOptions, DurabilityMode, Error, KeyRange, KeyspaceOptions, WriteBatch, WriteOptions, wal,
+    CompressionProfile, Db, DbOptions, DurabilityMode, Error, FilterPolicy, IndexSearchPolicy,
+    KeyRange, KeyspaceOptions, PrefixExtractor, PrefixFilterPolicy, Sequence, WriteBatch,
+    WriteOptions, manifest, wal,
 };
 
 fn temp_db_path(name: &str) -> PathBuf {
@@ -108,6 +110,82 @@ fn persistent_wal_replays_cross_keyspace_batch() {
             Some(b"hello".to_vec())
         );
     }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_manifest_keeps_keyspace_options_across_reopen() {
+    let path = temp_db_path("manifest-keyspace-options");
+    let options = DbOptions::persistent(&path);
+    let keyspace_options = KeyspaceOptions {
+        allow_empty_keys: false,
+        compression: CompressionProfile::Compact,
+        block_bytes: 4096,
+        filter_policy: FilterPolicy::Bloom { bits_per_key: 12 },
+        prefix_extractor: PrefixExtractor::Separator(b':'),
+        prefix_filter_policy: PrefixFilterPolicy::Bloom { bits_per_prefix: 8 },
+        index_search_policy: IndexSearchPolicy::Binary,
+        blob_threshold_bytes: 128 * 1024,
+    };
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("users", keyspace_options.clone())
+            .expect("keyspace opens");
+
+        keyspace.insert(b"user:1", b"ada").expect("write user row");
+        db.persist(DurabilityMode::Flush).expect("flush WAL");
+    }
+
+    let manifest_state =
+        manifest::read_manifest(&manifest::manifest_path(&path)).expect("manifest reads");
+    assert_eq!(manifest_state.wal_replay_floor(), Sequence::ZERO);
+    assert_eq!(
+        manifest_state.keyspaces().get("users"),
+        Some(&keyspace_options)
+    );
+
+    {
+        let db = Db::open(options).expect("persistent db reopens");
+        assert_eq!(db.stats().live_keyspaces, 1);
+
+        let keyspace = db
+            .keyspace("users", keyspace_options)
+            .expect("keyspace reopens with manifest options");
+        assert_eq!(
+            keyspace.get(b"user:1").expect("user row replays"),
+            Some(b"ada".to_vec())
+        );
+
+        let error = db
+            .keyspace("users", KeyspaceOptions::default())
+            .expect_err("wrong keyspace options are rejected");
+        assert!(matches!(error, Error::InvalidOptions { .. }));
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_wal_rejects_keyspace_missing_from_manifest() {
+    let path = temp_db_path("wal-missing-manifest-keyspace");
+    let options = DbOptions::persistent(&path);
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+        keyspace.insert(b"a", b"a1").expect("write a");
+        db.persist(DurabilityMode::Flush).expect("flush WAL");
+    }
+
+    fs::remove_file(manifest::manifest_path(&path)).expect("remove manifest");
+
+    let error = Db::open(options).expect_err("WAL cannot recreate a missing manifest keyspace");
+    assert!(matches!(error, Error::Corruption { .. }));
 
     fs::remove_dir_all(path).expect("cleanup test db");
 }
