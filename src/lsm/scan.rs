@@ -8,7 +8,10 @@ use crate::{
     types::KeyRange,
 };
 
-use super::tree::{LsmTree, RangeTombstone, lock_poisoned};
+use super::{
+    LsmVersion,
+    tree::{LsmTree, RangeTombstone, lock_poisoned},
+};
 
 #[derive(Debug)]
 pub(crate) struct LsmScan {
@@ -23,14 +26,16 @@ impl LsmTree {
         direction: Direction,
         block_cache: Option<&Arc<cache::BlockCache>>,
     ) -> Result<LsmScan> {
+        let version = self.current_version()?;
         Ok(LsmScan {
-            range_tombstones: self.scan_range_tombstones(selector)?,
-            sources: self.scan_sources(selector, direction, block_cache)?,
+            range_tombstones: self.scan_range_tombstones(&version, selector)?,
+            sources: self.scan_sources(&version, selector, direction, block_cache)?,
         })
     }
 
     fn scan_sources(
         &self,
+        version: &LsmVersion,
         selector: &ScanSelector,
         direction: Direction,
         block_cache: Option<&Arc<cache::BlockCache>>,
@@ -55,18 +60,14 @@ impl LsmTree {
             RecordSource::memtable(immutable.memtable, selector.clone(), direction)
         }));
 
-        let tables = self
-            .tables
-            .read()
-            .map_err(|_| lock_poisoned("table list"))?;
-        for table in tables.iter() {
+        for table in version.table_handles() {
             if let Some(prefix) = selector.prefix() {
                 if !table.may_contain_prefix(prefix, &self.options.prefix_extractor) {
                     continue;
                 }
             }
 
-            let cursor = Arc::clone(table).point_cursor(
+            let cursor = table.point_cursor(
                 selector.clone(),
                 self.options.prefix_extractor.clone(),
                 direction,
@@ -79,7 +80,11 @@ impl LsmTree {
         Ok(sources)
     }
 
-    fn scan_range_tombstones(&self, selector: &ScanSelector) -> Result<Vec<ScanRangeTombstone>> {
+    fn scan_range_tombstones(
+        &self,
+        version: &LsmVersion,
+        selector: &ScanSelector,
+    ) -> Result<Vec<ScanRangeTombstone>> {
         let range = selector_query_range(selector);
         let memtable_tombstones = self.memtable_range_tombstones()?;
         let mut tombstones = memtable_tombstones
@@ -87,11 +92,7 @@ impl LsmTree {
             .cloned()
             .collect::<Vec<_>>();
 
-        let tables = self
-            .tables
-            .read()
-            .map_err(|_| lock_poisoned("table list"))?;
-        for table in tables.iter() {
+        for table in version.table_handles() {
             tombstones.extend(
                 table
                     .range_tombstones_overlapping_range(&range)?

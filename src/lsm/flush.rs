@@ -77,18 +77,13 @@ impl LsmTree {
     }
 
     pub(crate) fn install_flush(&self, input: &FlushInput, table: Arc<Table>) -> Result<()> {
-        {
-            let mut tables = self
-                .tables
-                .write()
-                .map_err(|_| lock_poisoned("table list"))?;
-            tables.push(table);
-            Self::sort_tables_for_reads(&mut tables);
-        }
+        let version = self.current_version()?;
+        let version = version.with_added_l0_table(table)?;
+        self.install_version(version)?;
 
-        // Publish/install adds the new table before removing the immutable
-        // memtable. If a reader starts between those locks it may see both
-        // copies, but it cannot miss the committed data.
+        // Publish the L0 table before removing the immutable memtable. A
+        // reader that starts between the two swaps may see both copies, but it
+        // cannot miss committed data.
         let mut immutable_memtables = self
             .immutable_memtables
             .write()

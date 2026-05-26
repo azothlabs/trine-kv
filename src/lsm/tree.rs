@@ -1,7 +1,4 @@
-use std::{
-    cmp::Ordering as CmpOrdering,
-    sync::{Arc, RwLock},
-};
+use std::sync::{Arc, RwLock};
 
 use crate::{
     error::{Error, Result},
@@ -12,50 +9,50 @@ use crate::{
     types::{KeyRange, Sequence},
 };
 
+use super::LsmVersion;
+
 #[derive(Debug)]
 pub(crate) struct LsmTree {
     pub(crate) options: KeyspaceOptions,
     pub(crate) active_memtable: RwLock<Arc<Memtable>>,
     pub(crate) range_tombstones: RwLock<Vec<RangeTombstone>>,
     pub(crate) immutable_memtables: RwLock<Vec<ImmutableMemtable>>,
-    pub(crate) tables: RwLock<Vec<Arc<Table>>>,
+    pub(crate) current_version: RwLock<Arc<LsmVersion>>,
 }
 
 impl LsmTree {
-    pub(crate) fn new(options: KeyspaceOptions, mut tables: Vec<Arc<Table>>) -> Self {
-        Self::sort_tables_for_reads(&mut tables);
-        Self {
+    pub(crate) fn new(options: KeyspaceOptions, tables: Vec<Arc<Table>>) -> Result<Self> {
+        let current_version = Arc::new(LsmVersion::new(tables)?);
+        Ok(Self {
             options,
             active_memtable: RwLock::new(Arc::new(Memtable::default())),
             range_tombstones: RwLock::new(Vec::new()),
             immutable_memtables: RwLock::new(Vec::new()),
-            tables: RwLock::new(tables),
-        }
+            current_version: RwLock::new(current_version),
+        })
     }
 
-    pub(crate) fn sort_tables_for_reads(tables: &mut [Arc<Table>]) {
-        // Keep table handles in level order. Reads still merge candidate
-        // records defensively, but this invariant gives optimized point reads
-        // and compaction picking one stable rule to share.
-        tables.sort_by(compare_tables_for_reads);
+    pub(crate) fn current_version(&self) -> Result<Arc<LsmVersion>> {
+        self.current_version
+            .read()
+            .map_err(|_| lock_poisoned("LSM version"))
+            .map(|version| Arc::clone(&version))
+    }
+
+    pub(crate) fn install_version(&self, version: LsmVersion) -> Result<()> {
+        *self
+            .current_version
+            .write()
+            .map_err(|_| lock_poisoned("LSM version"))? = Arc::new(version);
+        Ok(())
     }
 
     pub(crate) fn tables_snapshot(&self) -> Result<Vec<Arc<Table>>> {
-        self.tables
-            .read()
-            .map_err(|_| lock_poisoned("table list"))
-            .map(|tables| tables.clone())
+        Ok(self.current_version()?.table_handles())
     }
 
     pub(crate) fn l0_table_count(&self) -> Result<usize> {
-        let tables = self
-            .tables
-            .read()
-            .map_err(|_| lock_poisoned("table list"))?;
-        Ok(tables
-            .iter()
-            .filter(|table| table.properties().level == crate::table::TableLevel::ZERO)
-            .count())
+        Ok(self.current_version()?.l0_table_count())
     }
 }
 
@@ -96,15 +93,6 @@ pub(crate) struct ImmutableMemtable {
     pub(crate) memtable: Arc<Memtable>,
     pub(crate) range_tombstones: Arc<Vec<RangeTombstone>>,
     pub(crate) freeze_sequence: Sequence,
-}
-
-fn compare_tables_for_reads(left: &Arc<Table>, right: &Arc<Table>) -> CmpOrdering {
-    let left = left.properties();
-    let right = right.properties();
-    left.level
-        .cmp(&right.level)
-        .then_with(|| right.largest_sequence.cmp(&left.largest_sequence))
-        .then_with(|| right.id.cmp(&left.id))
 }
 
 pub(super) fn lock_poisoned(lock_name: &'static str) -> Error {

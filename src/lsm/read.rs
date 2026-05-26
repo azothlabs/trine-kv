@@ -32,15 +32,9 @@ impl LsmTree {
         // user key, then a tombstone coverage check for that candidate.
         let mut candidate = self.newest_visible_memtable_point_candidate(key, read_sequence)?;
         let memtable_range_tombstones = self.memtable_range_tombstones()?;
-        let tables = self
-            .tables
-            .read()
-            .map_err(|_| lock_poisoned("table list"))?;
+        let version = self.current_version()?;
 
-        for table in tables.iter() {
-            if !table.may_contain_key(key) {
-                continue;
-            }
+        for table in version.point_lookup_tables(key) {
             if let Some(record) = table.newest_visible_point_record_for_key_with_cache(
                 key,
                 read_sequence,
@@ -70,7 +64,7 @@ impl LsmTree {
                 );
                 let mut covered_by_table_tombstone = false;
                 if !covered_by_memtable_tombstone {
-                    for table in tables.iter() {
+                    for table in version.table_handles() {
                         covered_by_table_tombstone = table.range_tombstone_covers_visible_point(
                             key,
                             candidate.internal_key.sequence(),
@@ -85,7 +79,6 @@ impl LsmTree {
                 if covered_by_memtable_tombstone || covered_by_table_tombstone {
                     Ok(None)
                 } else {
-                    drop(tables);
                     value_bytes(candidate.value.as_ref(), db_path).map(Some)
                 }
             }

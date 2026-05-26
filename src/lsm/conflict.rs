@@ -8,7 +8,10 @@ use crate::{
     types::{KeyRange, Sequence},
 };
 
-use super::tree::{LsmTree, lock_poisoned};
+use super::{
+    LsmVersion,
+    tree::{LsmTree, lock_poisoned},
+};
 
 impl LsmTree {
     pub(crate) fn point_key_modified_after(
@@ -18,13 +21,14 @@ impl LsmTree {
     ) -> Result<bool> {
         // A point read is invalidated by either a newer point record for that
         // user key or a newer range tombstone covering it.
-        for (internal_key, _) in self.collect_point_key_records(key)? {
+        let version = self.current_version()?;
+        for (internal_key, _) in self.collect_point_key_records(&version, key)? {
             if internal_key.sequence() > read_sequence {
                 return Ok(true);
             }
         }
 
-        self.range_tombstone_modified_after_key(key, read_sequence)
+        self.range_tombstone_modified_after_key(&version, key, read_sequence)
     }
 
     pub(crate) fn key_range_modified_after(
@@ -34,17 +38,19 @@ impl LsmTree {
     ) -> Result<bool> {
         // A range read is invalidated by any newer point record inside the
         // range or any newer range tombstone whose bounds overlap the read.
-        for (internal_key, _) in self.collect_range_point_records(range)? {
+        let version = self.current_version()?;
+        for (internal_key, _) in self.collect_range_point_records(&version, range)? {
             if internal_key.sequence() > read_sequence {
                 return Ok(true);
             }
         }
 
-        self.range_tombstone_modified_after_range(range, read_sequence)
+        self.range_tombstone_modified_after_range(&version, range, read_sequence)
     }
 
     fn collect_point_key_records(
         &self,
+        version: &LsmVersion,
         key: &[u8],
     ) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
         let active_memtable = self
@@ -63,14 +69,7 @@ impl LsmTree {
             records.extend(collect_memtable_point_records(&immutable.memtable, key)?);
         }
 
-        let tables = self
-            .tables
-            .read()
-            .map_err(|_| lock_poisoned("table list"))?;
-        for table in tables.iter() {
-            if !table.may_contain_key(key) {
-                continue;
-            }
+        for table in version.point_lookup_tables(key) {
             records.extend(
                 table
                     .point_records_for_key_with_cache(key, self.options.index_search_policy, None)?
@@ -85,6 +84,7 @@ impl LsmTree {
 
     fn collect_range_point_records(
         &self,
+        version: &LsmVersion,
         range: &KeyRange,
     ) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
         let active_memtable = self
@@ -103,11 +103,7 @@ impl LsmTree {
             records.extend(collect_memtable_range_records(&immutable.memtable, range)?);
         }
 
-        let tables = self
-            .tables
-            .read()
-            .map_err(|_| lock_poisoned("table list"))?;
-        for table in tables.iter() {
+        for table in version.table_handles() {
             records.extend(
                 table
                     .point_records_in_range_with_cache(
@@ -126,6 +122,7 @@ impl LsmTree {
 
     fn range_tombstone_modified_after_key(
         &self,
+        version: &LsmVersion,
         key: &[u8],
         read_sequence: Sequence,
     ) -> Result<bool> {
@@ -137,11 +134,7 @@ impl LsmTree {
             return Ok(true);
         }
 
-        let tables = self
-            .tables
-            .read()
-            .map_err(|_| lock_poisoned("table list"))?;
-        for table in tables.iter() {
+        for table in version.table_handles() {
             let tombstones = table.range_tombstones()?;
             if tombstones
                 .covering_key(key)
@@ -156,6 +149,7 @@ impl LsmTree {
 
     fn range_tombstone_modified_after_range(
         &self,
+        version: &LsmVersion,
         range: &KeyRange,
         read_sequence: Sequence,
     ) -> Result<bool> {
@@ -167,11 +161,7 @@ impl LsmTree {
             return Ok(true);
         }
 
-        let tables = self
-            .tables
-            .read()
-            .map_err(|_| lock_poisoned("table list"))?;
-        for table in tables.iter() {
+        for table in version.table_handles() {
             if table
                 .range_tombstones_overlapping_range(range)?
                 .into_iter()

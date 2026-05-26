@@ -50,6 +50,7 @@ pub(crate) struct DbInner {
     process_lock: Mutex<Option<recovery::ProcessLock>>,
     keyspaces: RwLock<BTreeMap<String, Arc<LsmTree>>>,
     snapshots: Arc<SnapshotTracker>,
+    pending_obsolete_table_ids: Mutex<BTreeSet<table::TableId>>,
     manifest: Option<Mutex<ManifestStore>>,
     wal: Option<Mutex<WalWriter>>,
     block_cache: Arc<cache::BlockCache>,
@@ -153,6 +154,11 @@ impl Drop for DbInner {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::Release);
         self.maintenance.shutdown();
+        let _ = cleanup_pending_obsolete_table_files(
+            persistent_path_from_options(&self.options),
+            &self.snapshots,
+            &self.pending_obsolete_table_ids,
+        );
     }
 }
 
@@ -190,6 +196,7 @@ impl Db {
                 process_lock: Mutex::new(None),
                 keyspaces: RwLock::new(BTreeMap::new()),
                 snapshots: Arc::new(SnapshotTracker::default()),
+                pending_obsolete_table_ids: Mutex::new(BTreeSet::new()),
                 manifest: None,
                 wal: None,
                 block_cache: Arc::new(cache::BlockCache::new(block_cache_bytes)),
@@ -262,6 +269,7 @@ impl Db {
                 process_lock: Mutex::new(process_lock),
                 keyspaces: RwLock::new(keyspaces),
                 snapshots: Arc::new(SnapshotTracker::default()),
+                pending_obsolete_table_ids: Mutex::new(BTreeSet::new()),
                 manifest: Some(Mutex::new(manifest)),
                 wal,
                 block_cache: Arc::new(cache::BlockCache::new(block_cache_bytes)),
@@ -326,7 +334,7 @@ impl Db {
                 let keyspace_options = options.clone();
                 keyspaces.insert(
                     name.as_str().to_owned(),
-                    Arc::new(LsmTree::new(options, Vec::new())),
+                    Arc::new(LsmTree::new(options, Vec::new())?),
                 );
                 keyspace_options
             }
@@ -380,6 +388,7 @@ impl Db {
         if should_compact {
             self.compact_range(KeyRange::all())?;
         }
+        self.cleanup_pending_obsolete_table_files(&db_path)?;
 
         Ok(())
     }
@@ -485,7 +494,7 @@ impl Db {
             &obsolete_table_ids,
             &written_table_ids,
         );
-        remove_table_files(&db_path, &obsolete_table_ids)?;
+        self.retire_obsolete_table_files(&db_path, &obsolete_table_ids)?;
         self.remove_unreferenced_blob_files(&db_path)?;
 
         Ok(())
@@ -536,35 +545,37 @@ impl Db {
                     .immutable_memtables
                     .saturating_add(immutable_memtables);
             }
-            let Ok(tables) = state.tables_snapshot() else {
+            let Ok(version) = state.current_version() else {
                 continue;
             };
 
-            for table in &tables {
-                let properties = table.properties();
-                let level = properties.level.get();
-                let table_bytes =
-                    persistent_path.map_or(0, |db_path| table_file_bytes(db_path, properties.id));
-                stats.total_tables += 1;
-                stats.table_bytes = stats.table_bytes.saturating_add(table_bytes);
-                if properties.level == table::TableLevel::ZERO {
-                    stats.l0_tables += 1;
-                }
+            for (level_state, tables) in version.level_table_handles() {
+                let level = level_state.get();
                 let level_entry = level_stats.entry(level).or_insert(LevelStats {
                     level,
                     tables: 0,
                     bytes: 0,
                 });
-                level_entry.tables += 1;
-                level_entry.bytes = level_entry.bytes.saturating_add(table_bytes);
+                for table in tables {
+                    let properties = table.properties();
+                    let table_bytes = persistent_path
+                        .map_or(0, |db_path| table_file_bytes(db_path, properties.id));
+                    stats.total_tables += 1;
+                    stats.table_bytes = stats.table_bytes.saturating_add(table_bytes);
+                    if properties.level == table::TableLevel::ZERO {
+                        stats.l0_tables += 1;
+                    }
+                    level_entry.tables += 1;
+                    level_entry.bytes = level_entry.bytes.saturating_add(table_bytes);
 
-                if let Ok(records) = table.point_records() {
-                    for record in records {
-                        if let Some(ValueRef::Blob { file_id, len, .. }) = record.value {
-                            live_blob_bytes_by_file
-                                .entry(file_id)
-                                .and_modify(|bytes| *bytes = bytes.saturating_add(len))
-                                .or_insert(len);
+                    if let Ok(records) = table.point_records() {
+                        for record in records {
+                            if let Some(ValueRef::Blob { file_id, len, .. }) = record.value {
+                                live_blob_bytes_by_file
+                                    .entry(file_id)
+                                    .and_modify(|bytes| *bytes = bytes.saturating_add(len))
+                                    .or_insert(len);
+                            }
                         }
                     }
                 }
@@ -606,6 +617,9 @@ impl Db {
         let Ok(_writer) = self.inner.writer.lock() else {
             return;
         };
+        if let Some(db_path) = self.persistent_path().map(Path::to_path_buf) {
+            let _ = self.cleanup_pending_obsolete_table_files(&db_path);
+        }
         if let Ok(mut process_lock) = self.inner.process_lock.lock() {
             process_lock.take();
         }
@@ -1167,6 +1181,31 @@ impl Db {
         Ok(())
     }
 
+    fn retire_obsolete_table_files(
+        &self,
+        db_path: &Path,
+        table_ids: &[table::TableId],
+    ) -> Result<()> {
+        {
+            let mut pending = self
+                .inner
+                .pending_obsolete_table_ids
+                .lock()
+                .map_err(|_| lock_poisoned("obsolete table cleanup queue"))?;
+            pending.extend(table_ids.iter().copied());
+        }
+
+        self.cleanup_pending_obsolete_table_files(db_path)
+    }
+
+    fn cleanup_pending_obsolete_table_files(&self, db_path: &Path) -> Result<()> {
+        cleanup_pending_obsolete_table_files(
+            Some(db_path),
+            &self.inner.snapshots,
+            &self.inner.pending_obsolete_table_ids,
+        )
+    }
+
     fn l0_pressure_exceeded(&self) -> Result<bool> {
         let keyspaces = self
             .inner
@@ -1284,7 +1323,7 @@ fn keyspaces_from_manifest(
 
         keyspaces.insert(
             name.clone(),
-            Arc::new(LsmTree::new(options.clone(), tables)),
+            Arc::new(LsmTree::new(options.clone(), tables)?),
         );
     }
 
@@ -1403,6 +1442,47 @@ fn lock_poisoned(lock_name: &'static str) -> Error {
     Error::Corruption {
         message: format!("{lock_name} lock poisoned"),
     }
+}
+
+fn persistent_path_from_options(options: &DbOptions) -> Option<&Path> {
+    match &options.storage_mode {
+        StorageMode::Persistent { path } => Some(path.as_path()),
+        StorageMode::InMemory => None,
+    }
+}
+
+fn cleanup_pending_obsolete_table_files(
+    db_path: Option<&Path>,
+    snapshots: &SnapshotTracker,
+    pending_table_ids: &Mutex<BTreeSet<table::TableId>>,
+) -> Result<()> {
+    let Some(db_path) = db_path else {
+        return Ok(());
+    };
+    if snapshots.active_count() != 0 {
+        return Ok(());
+    }
+
+    let table_ids = {
+        let pending = pending_table_ids
+            .lock()
+            .map_err(|_| lock_poisoned("obsolete table cleanup queue"))?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        pending.iter().copied().collect::<Vec<_>>()
+    };
+
+    remove_table_files(db_path, &table_ids)?;
+
+    let mut pending = pending_table_ids
+        .lock()
+        .map_err(|_| lock_poisoned("obsolete table cleanup queue"))?;
+    for table_id in table_ids {
+        pending.remove(&table_id);
+    }
+
+    Ok(())
 }
 
 fn remove_table_files(db_path: &Path, table_ids: &[table::TableId]) -> Result<()> {

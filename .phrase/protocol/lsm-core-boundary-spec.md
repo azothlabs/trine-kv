@@ -210,7 +210,52 @@ The database layer supplies:
 The database layer must not inspect internal key sequences to decide read
 visibility after the extraction is complete.
 
-## 9. Read Path Contract
+## 9. Version And Level Layout Invariants
+
+The LSM core publishes one current tree version per keyspace.
+
+`LsmVersion` owns the immutable table layout for one tree version. Readers clone
+one version handle at read setup and then use that handle for the rest of the
+point read, range scan setup, prefix scan setup, transaction conflict check, or
+stats pass.
+
+This gives the read path one table-layout lock access per setup instead of
+repeated table-list lock access during one operation.
+
+Required invariants:
+
+- L0 may contain overlapping tables.
+- L0 tables are kept in newest-first read order by largest sequence and table
+  id, so newer overlapping runs win.
+- L1 and deeper levels must not overlap inside the same level.
+- L1 and deeper tables are sorted by key range.
+- Flush output always enters L0.
+- Compaction output is installed at the level chosen by the compaction plan.
+- Flush and compaction construct a complete replacement `LsmVersion` before
+  installing it.
+- Flush and compaction install a new version only after the database layer has
+  successfully published the corresponding durable edit.
+- Failed table writes or failed manifest publishes must leave the current
+  version unchanged.
+- Old versions are kept alive by `Arc` references held by active reads,
+  iterators, snapshots, stats, or conflict checks.
+- File cleanup must not delete table or blob files that can still be referenced
+  by an old version held by an active read or snapshot.
+- Recovery and in-memory initialization must build the same `LsmVersion`
+  structure; they must not use a special flat table path.
+- New read-path or compaction optimizations require focused tests before being
+  enabled by default.
+
+`LevelState` represents one level:
+
+- L0 `LevelState` is an ordered run list and permits overlap.
+- L1+ `LevelState` is a non-overlapping sorted table list.
+
+The LSM core validates these invariants when constructing and installing a
+version. Corruption is returned rather than silently accepting an impossible
+layout.
+
+## 10. Read Path Contract
 
 The LSM core exposes tree-local read operations:
 
@@ -236,7 +281,7 @@ Contract:
 `Db` and `Keyspace` may convert the returned value representation to public
 owned values. They must not redo MVCC visibility.
 
-## 10. Write Path Contract
+## 11. Write Path Contract
 
 The database layer assigns one commit sequence after WAL append succeeds. It
 then passes per-tree operations into each affected `LsmTree`.
@@ -255,7 +300,7 @@ The database layer:
 - keeps WAL and manifest ordering correct;
 - surfaces write errors through public APIs.
 
-## 11. Freeze And Flush Contract
+## 12. Freeze And Flush Contract
 
 Freezing is a tree-local data-structure operation.
 
@@ -276,13 +321,15 @@ Rules:
 
 - active memtable and active range tombstones freeze as one unit;
 - immutable memtables flush in sequence order;
+- flush output enters L0;
+- flush builds a replacement tree version before install;
 - a failed table write does not change the live tree version;
 - a failed manifest publish does not install flush output;
 - WAL replay floor advances only after publish succeeds;
 - in-memory mode follows the same logical tree transition without filesystem
   durability.
 
-## 12. Compaction Contract
+## 13. Compaction Contract
 
 Compaction selection and merge are tree-local rules.
 
@@ -304,6 +351,7 @@ Rules:
 - L0 compaction groups overlapping L0 tables and overlapping L1 tables;
 - L1 and deeper compaction uses level-size pressure;
 - deeper levels remain non-overlapping within one tree;
+- compaction builds a replacement tree version before install;
 - merge reads table cursors by user key;
 - output SSTables split at user-key boundaries by `target_table_bytes`;
 - compaction keeps versions needed by active snapshots;
@@ -312,7 +360,7 @@ Rules:
   covered data outside the output span is gone;
 - partial compaction retains original range tombstone bounds when needed.
 
-## 13. Transaction Conflict Contract
+## 14. Transaction Conflict Contract
 
 Transaction validation asks each touched `LsmTree` whether a key or range was
 modified after the transaction read sequence.
@@ -331,7 +379,7 @@ The database layer owns:
 - cross-keyspace validation order;
 - final commit sequencing.
 
-## 14. Caching Boundary
+## 15. Caching Boundary
 
 Caches are shared services, not correctness dependencies.
 
@@ -347,7 +395,7 @@ Rules:
 - clearing a cache cannot change read results;
 - value guards may keep cached blocks alive while public values are read.
 
-## 15. Concurrency And Lock Ordering
+## 16. Concurrency And Lock Ordering
 
 `LsmTree` must be `Send + Sync` through its owned state and shared references.
 
@@ -355,6 +403,8 @@ Reads:
 
 - do not acquire the database writer coordinator;
 - may take tree read locks briefly to clone `Arc` handles;
+- clone the current version handle once at read setup when table layout is
+  needed;
 - must not hold tree metadata locks while doing slow table block I/O when a
   cloned handle is enough.
 
@@ -378,7 +428,7 @@ database writer coordinator
 Code comments must document any function that intentionally relies on this
 order.
 
-## 16. Stats Boundary
+## 17. Stats Boundary
 
 `LsmTree` reports tree-local stats:
 
@@ -399,7 +449,7 @@ The database layer aggregates:
 - cross-tree totals;
 - background maintenance error state.
 
-## 17. Phased Migration Plan
+## 18. Phased Migration Plan
 
 The extraction must be incremental and testable.
 
@@ -449,7 +499,24 @@ The extraction must be incremental and testable.
 - transaction validation calls tree-local modified-after APIs;
 - DB layer keeps transaction lifecycle and cross-keyspace ordering.
 
-## 18. Acceptance Gate
+### Step 8: Introduce Versioned Level Layout
+
+- introduce `LsmVersion` and `LevelState`;
+- replace flat table list storage with one current-version handle;
+- make reads, conflict checks, scan setup, and stats clone one version handle;
+- make flush and compaction publish replacement versions after durable publish;
+- validate L0 overlap allowance and L1+ non-overlap on version construction.
+
+Acceptance:
+
+- `LsmVersion` and `LevelState` exist and are covered by focused tests;
+- read setup takes one current-version handle instead of repeatedly reading the
+  table list lock;
+- flush and compaction install validated replacement versions;
+- recovery and in-memory setup build the same version layout;
+- full verification passes.
+
+## 19. Acceptance Gate
 
 The LSM core separation is complete when:
 
@@ -469,7 +536,7 @@ The LSM core separation is complete when:
 - persistent recovery tests pass unchanged;
 - full local Rust verification passes.
 
-## 19. Refactoring Safety Rules
+## 20. Refactoring Safety Rules
 
 - Do not change storage formats during the extraction.
 - Do not change public API during the extraction.
@@ -480,4 +547,3 @@ The LSM core separation is complete when:
 - Every step must keep tests passing before the next step starts.
 - Add comments where lock order, install-after-publish, or MVCC retention is
   non-obvious.
-

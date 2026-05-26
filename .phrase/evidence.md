@@ -2782,3 +2782,150 @@ Record only evidence that can change planning or durable decisions.
 
 - Run remote CI. Choose the next phase from fresh CI, benchmark, or review
   evidence rather than old coupling notes.
+
+## 2026-05-26: LSM Tree Improvement Suggestions Classified
+
+### Observation
+
+- User review supplied P0-P10 as improvement suggestions for the LSM tree, not
+  as a request to report whether the previous phase had completed all of them.
+- User review identified that the next useful LSM core improvement is explicit
+  invariants, version handles, and real level layout.
+- Current `LsmTree` still stores tables as a flat `RwLock<Vec<Arc<Table>>>`.
+- Current flush and compaction install mutate the table list after
+  database-layer publish, instead of constructing and swapping a validated tree
+  version.
+- Current read paths do not hold a named version handle for the whole read.
+- A version handle should reduce table-layout lock access from repeated lock
+  reads during one operation to one current-version handle acquisition at read
+  setup.
+- The next review list also identifies later risks in memtable accounting,
+  SSTable lookup details, filters, compaction picking, MVCC delete semantics,
+  read-path level optimization, blob GC, and randomized verification.
+
+### Interpretation
+
+- Phase 21 should remain closed as the boundary extraction slice, but it is not
+  the same as a mature versioned LSM design.
+- The next phase should focus narrowly on `LsmVersion`, `LevelState`, and
+  version publish semantics before table-block, filter, blob, or benchmark
+  work.
+- A RocksDB-style SuperVersion target should be interpreted as a stable
+  read-held bundle of active memtable, immutable memtables, and current table
+  version. Trine can start with `Arc<LsmVersion>` plus existing memtable handles
+  before adding deeper lifetime accounting.
+- The immediate performance target is not only cleaner ownership; it is also to
+  make point reads and scan setup take one version handle and then run without
+  repeated table-layout lock access.
+
+### Verification
+
+- Manual code audit of `src/lsm/tree.rs`, `src/lsm/flush.rs`,
+  `src/lsm/compact.rs`, `src/db.rs`, and
+  `.phrase/protocol/lsm-core-boundary-spec.md`.
+
+### Remaining Blockers
+
+- No `LsmVersion` or `LevelState` type exists yet.
+- Level-overlap validation is not enforced at install time.
+- Read path still starts from table snapshots rather than one named version
+  handle.
+- Later P3-P10 suggestions remain valid follow-up candidates after the version
+  boundary is in place.
+
+### Recommended Next Action
+
+- Start Phase 22 with a spec addendum for version and level invariants, then
+  implement `LsmVersion` and move read/install paths onto version handles.
+
+## 2026-05-26: Versioned Level Layout First Slice
+
+### Observation
+
+- `.phrase/protocol/lsm-core-boundary-spec.md` now records the version and
+  level-layout invariants: L0 overlap, L1+ non-overlap, flush into L0,
+  version-swap install, and one read-held version handle.
+- `src/lsm/version.rs` adds `LsmVersion` and `LevelState`.
+- `LsmTree` now stores `current_version: RwLock<Arc<LsmVersion>>` instead of
+  `RwLock<Vec<Arc<Table>>>`.
+- Flush and compaction install build a replacement `LsmVersion` and swap the
+  current handle after database-layer publish succeeds.
+- Point reads, scan setup, transaction conflict checks, compaction planning,
+  stats, recovery, and in-memory setup now use version handles.
+- Point read, scan setup, and transaction conflict checks acquire the current
+  version once per operation setup and reuse that handle underneath.
+- Version construction validates L0 newest-first ordering and L1+ non-overlap.
+- `Table::has_key_bounds()` now distinguishes empty-key tables from
+  tombstone-only tables without point-key bounds.
+
+### Interpretation
+
+- Phase 22 has completed the version-handle and level-layout foundation, but
+  should stay open.
+- The next correctness blocker is old file lifetime: `Arc<LsmVersion>` keeps
+  old table objects alive, but compaction still removes obsolete table files
+  immediately after install. Lazy readers can hold old handles that have not
+  loaded their data blocks yet.
+- P3-P10 should remain later work until the old-version file lifetime rule is
+  closed.
+
+### Verification
+
+- `cargo fmt`
+- `cargo clippy --all-targets`
+- `cargo test`
+
+### Remaining Blockers
+
+- Remote CI cannot be executed locally; it must run after push.
+- Add a long lazy iterator plus compaction regression before changing old table
+  file cleanup.
+
+### Recommended Next Action
+
+- Implement task079: protect old version file lifetimes after compaction, then
+  rerun full local Rust verification.
+
+## 2026-05-26: Phase 22 Versioned Level Layout Completed
+
+### Observation
+
+- Compaction now queues obsolete table ids and deletes their files only when no
+  snapshot/read pin is active.
+- `Db::flush()`, `Db::close()`, and `DbInner::drop()` attempt pending obsolete
+  table cleanup when it is safe.
+- `persistent_compaction_keeps_lazy_iterator_table_files_until_pin_released`
+  proves a lazy range iterator can be created before compaction, read an old
+  table block after compaction publishes, and then allow cleanup after its pin
+  is released.
+- `persistent_compaction_rewrites_tables_and_preserves_reads` now checks that
+  snapshot-pinned old tables stay on disk until the snapshot is dropped.
+- `lsm::version::tests::old_version_handle_keeps_previous_tables_after_replacement`
+  proves version replacement does not mutate an old held version handle.
+
+### Interpretation
+
+- Phase 22 acceptance is met locally: tree versions, level layout, read-held
+  version handles, publish-time validation, recovery/in-memory parity, and old
+  compacted-table file lifetime protection are in place.
+- The next phase should move to P3: memtable accounting and flush scheduling.
+
+### Verification
+
+- `cargo fmt`
+- `cargo fmt --check`
+- `cargo check --all-targets --all-features`
+- `cargo clippy --all-targets --all-features`
+- `cargo test persistent_compaction --test persistent_wal`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- forbidden-term scan over `.phrase`, `src`, and `tests`
+
+### Remaining Blockers
+
+- Remote CI cannot be executed locally; it must run after push.
+
+### Recommended Next Action
+
+- Start Phase 23 with task080: audit memtable byte accounting, keyspace-local
+  freeze behavior, and immutable queue pressure before code changes.

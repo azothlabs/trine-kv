@@ -415,6 +415,13 @@ impl Table {
         usize_to_u64_saturating(HEADER_LEN.saturating_add(self.payload_len))
     }
 
+    #[must_use]
+    pub(crate) fn has_key_bounds(&self) -> bool {
+        !(self.data_blocks.is_empty()
+            && self.properties.smallest_user_key.is_empty()
+            && self.properties.largest_user_key.is_empty())
+    }
+
     #[cfg(test)]
     pub(crate) fn point_records_for_key(
         &self,
@@ -548,7 +555,8 @@ impl Table {
 
     #[must_use]
     pub(crate) fn may_contain_key(&self, key: &[u8]) -> bool {
-        self.properties.smallest_user_key.as_slice() <= key
+        self.has_key_bounds()
+            && self.properties.smallest_user_key.as_slice() <= key
             && key <= self.properties.largest_user_key.as_slice()
             && self
                 .point_key_filter

@@ -400,3 +400,46 @@ the next maintainability and correctness risk.
 - In-memory mode continues to use the same LSM core.
 - Public API and storage formats remain unchanged.
 - Full local Rust verification passes after each extraction slice.
+
+### Phase 22: Versioned LSM Level Layout
+
+**Status**: Complete
+
+**Goal**: Replace the flat locked table list with a versioned level layout so
+readers hold a stable tree version and flush/compaction publish new versions
+atomically.
+
+**Entry Condition**: Phase 21 complete and user review identifies the missing
+Tree Version boundary as the next core LSM risk.
+
+**Acceptance Gate**:
+
+- LSM boundary spec records version and level-layout invariants.
+- `LsmVersion` and `LevelState` model L0 overlap and L1+ non-overlap.
+- `LsmTree` exposes read-safe version handles instead of requiring long table
+  list lock use.
+- Flush and compaction build and validate new versions before install.
+- Recovery and in-memory setup build the same version structure.
+- Old table/blob file cleanup respects old version handles held by lazy readers
+  and snapshots.
+- Existing public API and storage formats remain unchanged.
+- Full local Rust verification passes.
+
+### Phase 23: Memtable And Flush Scheduling Hardening
+
+**Status**: In Progress
+
+**Goal**: Harden memtable accounting, keyspace-local freeze behavior, and
+immutable queue pressure before deeper table and compaction optimizations.
+
+**Entry Condition**: Phase 22 complete and user review identifies P3 as the
+next LSM tree improvement after versioned level layout.
+
+**Acceptance Gate**:
+
+- Memtable byte accounting no longer needs whole-map scans on normal writes.
+- Freeze/flush pressure is tree-local and does not move unrelated keyspaces.
+- Immutable memtable queue pressure and write backpressure are tested.
+- In-memory mode follows the same logical LSM path.
+- Existing public API and storage formats remain unchanged.
+- Full local Rust verification passes.

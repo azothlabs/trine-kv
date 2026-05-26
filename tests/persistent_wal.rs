@@ -2115,6 +2115,81 @@ fn persistent_compaction_removes_blob_files_after_delete_cleanup() {
 }
 
 #[test]
+fn persistent_compaction_keeps_lazy_iterator_table_files_until_pin_released() {
+    let path = temp_db_path("compaction-lazy-iterator-file-lifetime");
+    let options = DbOptions::persistent(&path);
+
+    {
+        let db = Db::open(options).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+        for index in 0..64 {
+            keyspace
+                .insert(
+                    format!("key-{index:03}").as_bytes(),
+                    format!("value-{index:03}").as_bytes(),
+                )
+                .expect("write row");
+        }
+        db.flush().expect("flush base table");
+
+        let mut iter = keyspace
+            .range(&KeyRange::all())
+            .expect("range cursor is created");
+        assert_eq!(
+            db.stats().block_cache_misses,
+            0,
+            "constructing a range cursor should not touch table blocks"
+        );
+
+        let before_manifest =
+            manifest::read_manifest(&manifest::manifest_path(&path)).expect("manifest reads");
+        let before_table_paths = before_manifest
+            .tables()
+            .get("default")
+            .expect("default table list")
+            .iter()
+            .map(|properties| table::table_path(&path, properties.id))
+            .collect::<Vec<_>>();
+
+        keyspace
+            .insert(b"key-032", b"value-032-new")
+            .expect("write overlapping update");
+        db.flush().expect("flush overlapping table");
+        db.compact_range(KeyRange::all())
+            .expect("manual compaction succeeds");
+
+        for old_path in &before_table_paths {
+            assert!(
+                old_path.exists(),
+                "old table file stays available for a lazy iterator at {}",
+                old_path.display()
+            );
+        }
+
+        let first = iter
+            .next()
+            .expect("first row exists")
+            .expect("first row reads after compaction");
+        assert_eq!(first.key, b"key-000".to_vec());
+        assert_eq!(first.value, b"value-000".to_vec());
+
+        drop(iter);
+        db.flush().expect("cleanup pending obsolete tables");
+        for old_path in before_table_paths {
+            assert!(
+                !old_path.exists(),
+                "old table file is removed after read pin release at {}",
+                old_path.display()
+            );
+        }
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_compaction_rewrites_tables_and_preserves_reads() {
     let path = temp_db_path("compact-default");
     let options = DbOptions::persistent(&path);
@@ -2173,6 +2248,16 @@ fn persistent_compaction_rewrites_tables_and_preserves_reads() {
             .expect("default compacted table list");
         assert_eq!(after_tables.len(), 1);
         assert!(table::table_path(&path, after_tables[0].id).exists());
+        for old_path in &before_table_paths {
+            assert!(
+                old_path.exists(),
+                "obsolete compacted table is kept while snapshot is pinned at {}",
+                old_path.display()
+            );
+        }
+
+        drop(snapshot);
+        db.flush().expect("cleanup pending obsolete tables");
         for old_path in before_table_paths {
             assert!(
                 !old_path.exists(),

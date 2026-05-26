@@ -12,7 +12,7 @@ use crate::{
     types::{KeyRange, Sequence},
 };
 
-use super::tree::{LsmTree, lock_poisoned};
+use super::tree::LsmTree;
 
 #[derive(Debug)]
 pub(crate) struct CompactionInput {
@@ -48,10 +48,8 @@ impl LsmTree {
         oldest_active_snapshot: Sequence,
         options: compaction::CompactionOptions,
     ) -> Result<Option<CompactionInput>> {
-        let tables = self
-            .tables
-            .read()
-            .map_err(|_| lock_poisoned("table list"))?;
+        let version = self.current_version()?;
+        let tables = version.table_handles();
         let plan_tables = tables
             .iter()
             .map(|table| {
@@ -164,13 +162,9 @@ impl LsmTree {
     }
 
     pub(crate) fn install_compaction(&self, output: CompactionOutput) -> Result<()> {
-        let mut tables = self
-            .tables
-            .write()
-            .map_err(|_| lock_poisoned("table list"))?;
-        tables.retain(|table| !output.input_table_ids.contains(&table.properties().id));
-        tables.extend(output.tables);
-        Self::sort_tables_for_reads(&mut tables);
+        let version = self.current_version()?;
+        let version = version.with_replaced_tables(&output.input_table_ids, output.tables)?;
+        self.install_version(version)?;
         Ok(())
     }
 }
