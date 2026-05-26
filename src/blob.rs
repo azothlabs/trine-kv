@@ -419,23 +419,19 @@ fn read_indexed_value(
     index: &BlobIndex,
     expected_internal_key: Option<&InternalKey>,
 ) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    File::open(blob_path(db_path, index.file_id))
-        .map_err(|error| Error::Corruption {
+    let mut file =
+        File::open(blob_path(db_path, index.file_id)).map_err(|error| Error::Corruption {
             message: format!("referenced blob file cannot be opened: {error}"),
-        })?
-        .read_to_end(&mut bytes)
+        })?;
+    let file_len = file
+        .metadata()
         .map_err(|error| Error::Corruption {
-            message: format!("referenced blob file cannot be read: {error}"),
-        })?;
-    let blob_file = decode_blob_file(&bytes)?;
-    let record = blob_file
-        .records
-        .into_iter()
-        .find(|record| record.index.offset == index.offset)
-        .ok_or_else(|| Error::Corruption {
-            message: "blob index offset is not present in blob file".to_owned(),
-        })?;
+            message: format!("referenced blob file metadata cannot be read: {error}"),
+        })?
+        .len();
+    validate_indexed_blob_header(&mut file, index.file_id)?;
+    let record = read_indexed_blob_record(&mut file, file_len, index)?;
+
     if record.index != *index {
         return Err(Error::Corruption {
             message: "blob index metadata mismatch".to_owned(),
@@ -447,6 +443,70 @@ fn read_indexed_value(
         });
     }
     Ok(record.record.value)
+}
+
+fn validate_indexed_blob_header(file: &mut File, expected_file_id: u64) -> Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut header_bytes = [0_u8; BLOB_HEADER_LEN];
+    file.read_exact(&mut header_bytes)
+        .map_err(|error| Error::Corruption {
+            message: format!("referenced blob header cannot be read: {error}"),
+        })?;
+    let header = decode_header(&header_bytes)?;
+    if header.file_id != expected_file_id {
+        return Err(Error::Corruption {
+            message: format!(
+                "blob file id mismatch: path has {expected_file_id}, header has {}",
+                header.file_id
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn read_indexed_blob_record(
+    file: &mut File,
+    file_len: u64,
+    index: &BlobIndex,
+) -> Result<BlobFileRecord> {
+    if index.offset < BLOB_HEADER_LEN as u64 {
+        return Err(invalid_blob("blob index offset points before records"));
+    }
+
+    let frame_end = checked_blob_offset_add(
+        index.offset,
+        MIN_BLOB_RECORD_FRAME_BYTES as u64,
+        "blob record frame bounds",
+    )?;
+    if frame_end > file_len {
+        return Err(invalid_blob("blob index frame is outside the blob file"));
+    }
+
+    file.seek(SeekFrom::Start(index.offset))?;
+    let mut frame = [0_u8; MIN_BLOB_RECORD_FRAME_BYTES];
+    file.read_exact(&mut frame)
+        .map_err(|error| Error::Corruption {
+            message: format!("referenced blob record frame cannot be read: {error}"),
+        })?;
+    let body_len = read_u64_at(&frame, 0)?;
+    let record_checksum = read_u32_at(&frame, 8)?;
+    let body_end = checked_blob_offset_add(frame_end, body_len, "blob record body bounds")?;
+    if body_end > file_len {
+        return Err(invalid_blob("blob index body is outside the blob file"));
+    }
+
+    let mut body = vec![0_u8; u64_to_usize(body_len, "blob record length")?];
+    file.read_exact(&mut body)
+        .map_err(|error| Error::Corruption {
+            message: format!("referenced blob record body cannot be read: {error}"),
+        })?;
+    if checksum(&body) != record_checksum {
+        return Err(Error::Corruption {
+            message: "blob record checksum mismatch".to_owned(),
+        });
+    }
+
+    decode_record_body(index.file_id, index.offset, record_checksum, &body)
 }
 
 fn validate_blob_record_order(records: &[BlobRecord]) -> Result<()> {
@@ -783,6 +843,12 @@ fn read_u64_at(bytes: &[u8], offset: usize) -> Result<u64> {
     ]))
 }
 
+fn checked_blob_offset_add(left: u64, right: u64, field: &'static str) -> Result<u64> {
+    left.checked_add(right).ok_or_else(|| Error::Corruption {
+        message: format!("{field} overflow"),
+    })
+}
+
 fn usize_to_u64(value: usize, field: &'static str) -> Result<u64> {
     u64::try_from(value).map_err(|_| Error::invalid_options(format!("{field} exceeds u64::MAX")))
 }
@@ -1031,12 +1097,7 @@ mod tests {
 
     #[test]
     fn indexed_read_validates_exact_blob_index() {
-        let temp =
-            std::env::temp_dir().join(format!("trine-kv-blob-format-test-{}", std::process::id()));
-        if temp.exists() {
-            std::fs::remove_dir_all(&temp).expect("cleanup old temp dir");
-        }
-        std::fs::create_dir_all(&temp).expect("temp dir creates");
+        let temp = temp_blob_dir("indexed-read-validates");
 
         let header = BlobFileHeader::new(12, Sequence::new(1), 8, CodecId::None);
         let record = blob_record("key", 1, 0, b"value".to_vec(), CodecId::None);
@@ -1050,6 +1111,33 @@ mod tests {
         bad_index.value_len += 1;
         let error = read_indexed_value(&temp, &bad_index, None).expect_err("bad index fails");
         assert!(error.to_string().contains("metadata mismatch"));
+
+        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn indexed_read_uses_only_target_record() {
+        let temp = temp_blob_dir("indexed-read-target-record");
+
+        let header = BlobFileHeader::new(13, Sequence::new(1), 8, CodecId::None);
+        let records = vec![
+            blob_record("key-a", 1, 0, b"value-a".to_vec(), CodecId::None),
+            blob_record("key-b", 1, 0, b"value-b".to_vec(), CodecId::None),
+        ];
+        let (mut bytes, indexes) = encode_blob_file(header, &records).expect("blob encodes");
+        let corrupt_second_body = usize::try_from(indexes[1].offset)
+            .expect("offset fits usize")
+            .saturating_add(super::MIN_BLOB_RECORD_FRAME_BYTES);
+        bytes[corrupt_second_body] ^= 0xff;
+        assert!(
+            decode_blob_file(&bytes).is_err(),
+            "full blob decode should notice the unrelated corrupt record"
+        );
+        std::fs::write(super::blob_path(&temp, 13), bytes).expect("blob writes");
+
+        let value = read_indexed_value(&temp, &indexes[0], None)
+            .expect("targeted indexed read skips unrelated corrupt record");
+        assert_eq!(value, b"value-a");
 
         std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
@@ -1086,5 +1174,18 @@ mod tests {
         .expect("record length fits usize");
         let checksum = super::checksum(&bytes[body_start..body_start + body_len]);
         bytes[checksum_offset..checksum_offset + 4].copy_from_slice(&checksum.to_le_bytes());
+    }
+
+    fn temp_blob_dir(name: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "trine-kv-blob-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir creates");
+        dir
     }
 }

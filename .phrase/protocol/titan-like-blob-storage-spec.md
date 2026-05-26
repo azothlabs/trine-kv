@@ -331,6 +331,10 @@ Blob reads must validate:
 - that the record's internal key matches the LSM `BlobIndex` owner when the
   caller has enough context to check it.
 
+Point reads should use `BlobIndex.offset` to read the indexed record directly.
+Full blob-file decode is still required for recovery validation and GC scans,
+but not for a single visible value.
+
 ## 13. Blob GC
 
 GC has two parts: estimate stale bytes and rewrite live blob records.

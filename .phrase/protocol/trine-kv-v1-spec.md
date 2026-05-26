@@ -623,6 +623,7 @@ Rules:
 - blob GC is snapshot-safe and recoverable;
 - manifest edits can mark obsolete blob files as pending deletion, and startup
   can resume cleanup from that metadata;
+- point reads use `BlobIndex.offset` to read the indexed blob record directly;
 - cleanup cannot remove a blob file referenced by any live table, active
   snapshot, read pin, or pending old tree version.
 

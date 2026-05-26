@@ -727,3 +727,22 @@ large-value work.
 - `DbOptions` exposes blob GC threshold/ratio controls and `DbStats` exposes GC
   counters.
 - Full local Rust verification passes.
+
+### Phase 37: Large-Value Benchmark And Direct Blob Read
+
+**Status**: Complete
+
+**Goal**: Add benchmark coverage for the large-value path and remove the
+measured whole-blob decode from point reads.
+
+**Entry Condition**: Phase 36 complete and blob GC throughput has no dedicated
+benchmark baseline.
+
+**Acceptance Gate**:
+
+- Benchmark harness reports large-value point read, range scan, and GC rewrite
+  rows.
+- Evidence records pre/post benchmark numbers for the selected tuning change.
+- `BlobIndex` point reads seek to the indexed blob record and verify only that
+  record.
+- Full local Rust verification passes.

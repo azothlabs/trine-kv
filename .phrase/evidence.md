@@ -3674,3 +3674,54 @@ Record only evidence that can change planning or durable decisions.
 
 - Commit Phase 36, then start a dedicated benchmark phase for large-value write,
   read, range scan, and GC rewrite throughput before tuning policy or layout.
+
+## 2026-05-26: Phase 37 Large-Value Direct Read Completed
+
+### Observation
+
+- The benchmark harness now reports dedicated large-value rows:
+  `blob point read`, `blob range scan`, and `blob GC rewrite`.
+- Pre-tuning `cargo bench --bench v1_bench` after adding those rows showed:
+  - `blob point read`: 1140632 us for 256 reads.
+  - `blob range scan`: 1128654 us for 32 scans.
+  - `blob GC rewrite`: 148488 us.
+- `BlobIndex` reads previously decoded the full blob file and searched by
+  offset.
+- `BlobIndex` reads now validate the blob header, seek to the indexed record
+  frame, verify the record checksum, decode that one record, and compare the
+  resulting index/internal key with the expected owner.
+- Post-tuning `cargo bench --bench v1_bench` showed:
+  - `blob point read`: 13976 us for 256 reads.
+  - `blob range scan`: 13719 us for 32 scans.
+  - `blob GC rewrite`: 153518 us.
+- Full blob-file decoding remains in recovery validation and GC scanning.
+
+### Interpretation
+
+- The largest measured large-value read-path cost was fixed without changing
+  public API or visible MVCC behavior.
+- Blob GC rewrite did not improve because this phase intentionally targeted
+  value reads. That workload is now measured and can guide a future GC-specific
+  phase if needed.
+
+### Verification
+
+- `cargo test blob::tests --all-features`
+- `cargo bench --bench v1_bench` before and after tuning
+- `cargo test --all-targets --all-features`
+- `cargo clippy --all-targets --all-features`
+- `cargo fmt --all --check`
+- `git diff --check`
+- forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, and `README.md`
+
+### Remaining Blockers
+
+- Remote CI cannot be executed locally; it must run after push.
+- Titan Level Merge, value-lazy iterators, and GC-specific throughput tuning
+  remain future phases, not correctness gaps in this read-path phase.
+
+### Recommended Next Action
+
+- Commit Phase 37. If more performance work is desired, start a focused
+  GC-throughput or value-lazy-iterator phase with fresh benchmark evidence.

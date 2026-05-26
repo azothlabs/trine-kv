@@ -6,14 +6,17 @@ use std::{
 };
 
 use trine_kv::{
-    BucketOptions, Db, DbOptions, FilterPolicy, IndexSearchPolicy, KeyRange, PrefixExtractor,
-    PrefixFilterPolicy, TransactionOptions, WriteBatch, WriteOptions,
+    BlobGcRatio, BucketOptions, Db, DbOptions, FilterPolicy, IndexSearchPolicy, KeyRange,
+    PrefixExtractor, PrefixFilterPolicy, TransactionOptions, WriteBatch, WriteOptions,
     codec::{BlockCodec, FastLz4BlockCodec, NoneCodec},
     search,
 };
 
 const ROWS: usize = 1_024;
 const OPS: usize = 2_048;
+const LARGE_ROWS: usize = 128;
+const LARGE_OPS: usize = 256;
+const LARGE_VALUE_BYTES: usize = 16 * 1024;
 
 fn main() {
     println!("trine-kv v1 benchmark");
@@ -37,6 +40,9 @@ fn main() {
     results.push(bench_compaction_throughput());
     results.push(bench_large_inline_values());
     results.push(bench_separated_blob_values());
+    results.push(bench_blob_point_read());
+    results.push(bench_blob_range_scan());
+    results.push(bench_blob_gc_rewrite());
     results.push(bench_block_cache_warm_read());
     results.push(bench_cold_table_read());
     results.extend(bench_index_seek_policies());
@@ -374,6 +380,82 @@ fn bench_separated_blob_values() -> BenchResult {
     })
 }
 
+fn bench_blob_point_read() -> BenchResult {
+    let (dir, db, bucket) = large_blob_db("blob-point-read", LARGE_ROWS);
+    let result = measure("blob point read", LARGE_OPS, || {
+        let mut checksum = 0;
+        let mut seed = 0x6b1d_f00d_u64;
+        for _ in 0..LARGE_OPS {
+            seed = xorshift(seed);
+            let index = seed_index(seed, LARGE_ROWS);
+            checksum += bucket
+                .get(&key(index))
+                .expect("blob point get succeeds")
+                .map_or(0, |value| value.len() as u64);
+        }
+        checksum
+    });
+    drop(db);
+    cleanup_dir(&dir);
+    result
+}
+
+fn bench_blob_range_scan() -> BenchResult {
+    let (dir, db, bucket) = large_blob_db("blob-range-scan", LARGE_ROWS);
+    let result = measure("blob range scan", 32, || {
+        let mut checksum = 0;
+        for start in 0..32 {
+            let first = (start * 3) % (LARGE_ROWS - 8);
+            let iter = bucket
+                .range(&KeyRange::half_open(key(first), key(first + 8)))
+                .expect("blob range succeeds");
+            checksum += iter
+                .map(|item| item.expect("blob range item").value.len() as u64)
+                .sum::<u64>();
+        }
+        checksum
+    });
+    drop(db);
+    cleanup_dir(&dir);
+    result
+}
+
+fn bench_blob_gc_rewrite() -> BenchResult {
+    measure("blob GC rewrite", LARGE_ROWS, || {
+        let dir = temp_dir("blob-gc");
+        let mut options = DbOptions::persistent(&dir);
+        options.blob_gc_min_file_bytes = 1;
+        options.blob_gc_discardable_ratio = BlobGcRatio::from_millionths(300_000);
+        options.default_bucket_options = large_blob_options();
+        let db = Db::open(options).expect("persistent db opens");
+        let bucket = db.default_bucket().expect("bucket opens");
+
+        for index in 0..LARGE_ROWS {
+            bucket
+                .put(key(index), large_value(index))
+                .expect("initial large put succeeds");
+        }
+        db.flush().expect("initial blob flush succeeds");
+        for index in (0..LARGE_ROWS).step_by(2) {
+            bucket
+                .put(key(index), large_value(index + LARGE_ROWS))
+                .expect("overwrite large put succeeds");
+        }
+        db.flush().expect("overwrite blob flush succeeds");
+        db.compact_range(KeyRange::all())
+            .expect("blob GC compaction succeeds");
+
+        let stats = db.stats();
+        let checksum = stats
+            .blob_gc_input_bytes
+            .saturating_add(stats.blob_gc_output_bytes)
+            .saturating_add(stats.blob_gc_discarded_bytes);
+        drop(db);
+        cleanup_dir(&dir);
+        checksum
+    })
+}
+
 fn bench_block_cache_warm_read() -> BenchResult {
     let (dir, db, bucket) = flushed_persistent_db("warm-read", ROWS, BucketOptions::default());
     bucket.get(&key(ROWS / 2)).expect("warmup get succeeds");
@@ -589,6 +671,28 @@ fn flushed_persistent_db(
     (dir, db, bucket)
 }
 
+fn large_blob_db(name: &str, rows: usize) -> (PathBuf, Db, trine_kv::Bucket) {
+    let dir = temp_dir(name);
+    let mut options = DbOptions::persistent(&dir);
+    options.default_bucket_options = large_blob_options();
+    let db = Db::open(options).expect("persistent db opens");
+    let bucket = db.default_bucket().expect("bucket opens");
+    for index in 0..rows {
+        bucket
+            .put(key(index), large_value(index))
+            .expect("large put succeeds");
+    }
+    db.flush().expect("large flush succeeds");
+    (dir, db, bucket)
+}
+
+fn large_blob_options() -> BucketOptions {
+    BucketOptions {
+        blob_threshold_bytes: 4 * 1024,
+        ..BucketOptions::default()
+    }
+}
+
 fn prefix_options(filters: bool) -> BucketOptions {
     BucketOptions {
         prefix_extractor: PrefixExtractor::Separator(b':'),
@@ -616,6 +720,19 @@ fn prefix_key(index: usize) -> Vec<u8> {
 
 fn value(index: usize) -> Vec<u8> {
     format!("value-{index:08}-{}", index.wrapping_mul(31)).into_bytes()
+}
+
+fn large_value(index: usize) -> Vec<u8> {
+    let mut seed = (index as u64)
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(0x1234_5678_9abc_def0);
+    let mut bytes = Vec::with_capacity(LARGE_VALUE_BYTES);
+    while bytes.len() < LARGE_VALUE_BYTES {
+        seed = xorshift(seed);
+        bytes.extend_from_slice(&seed.to_le_bytes());
+    }
+    bytes.truncate(LARGE_VALUE_BYTES);
+    bytes
 }
 
 fn repeated_bytes(prefix: &[u8], len: usize) -> Vec<u8> {

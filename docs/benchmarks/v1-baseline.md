@@ -1,6 +1,6 @@
 # Trine KV V1 Benchmark Baseline
 
-Date: 2026-05-25
+Date: 2026-05-25; large-value read rows extended on 2026-05-26
 
 Command:
 
@@ -37,6 +37,9 @@ accidental no-op rewrites of the harness.
 | compaction throughput | 1024 | 51923 | 19721 | 29972 |
 | large inline values | 256 | 537 | 476463 | 4194304 |
 | separated blob values | 256 | 38302 | 6683 | 4194304 |
+| blob point read | 256 | 13976 | 18316 | 4194304 |
+| blob range scan | 32 | 13719 | 2332 | 4194304 |
+| blob GC rewrite | 128 | 153518 | 833 | 4194304 |
 | block cache warm read | 2048 | 1443 | 1418322 | 40960 |
 | cold table read | 32 | 156116 | 204 | 640 |
 | index seek policy linear small | 2048 | 1334 | 1535040 | 37696 |

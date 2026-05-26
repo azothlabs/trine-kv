@@ -133,6 +133,7 @@ cargo bench --bench v1_bench
 - [Durability notes](docs/durability.md)
 - [Release packaging](docs/release.md)
 - [V1 benchmark baseline](docs/benchmarks/v1-baseline.md)
+- [Large-value direct read tuning](docs/benchmarks/v1-large-value-direct-read.md)
 
 ## Current Boundaries
 
