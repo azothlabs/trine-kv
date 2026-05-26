@@ -135,3 +135,21 @@ application boundaries.
 - Integration examples are runnable with `cargo run --example`.
 - README or usage docs point users to the examples.
 - Examples use public APIs without changing the v1 storage contract.
+
+### Phase 9: CI And Publishing Workflow
+
+**Status**: Complete
+
+**Goal**: Automate release verification and provide a guarded manual crates.io
+publishing workflow.
+
+**Entry Condition**: Phase 8 complete.
+
+**Acceptance Gate**:
+
+- CI workflow runs formatting, clippy, tests, examples, package content guard,
+  and package verification.
+- Publishing workflow is manual, checks the requested SemVer version, runs the
+  full verification gate, defaults to dry-run behavior, and publishes only when
+  explicitly requested.
+- Release docs explain the CI and publishing workflow.

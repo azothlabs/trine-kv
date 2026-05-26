@@ -1,0 +1,90 @@
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: SemVer version to publish. Must match Cargo.toml and CHANGELOG.md.
+        required: true
+        type: string
+      mode:
+        description: Run a dry-run or publish to crates.io.
+        required: true
+        default: dry-run
+        type: choice
+        options:
+          - dry-run
+          - publish
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    environment: crates-io
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Verify requested version
+        run: |
+          cargo_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+
+          if [ "$cargo_version" != "${{ inputs.version }}" ]; then
+            echo "workflow version ${{ inputs.version }} does not match Cargo.toml $cargo_version" >&2
+            exit 1
+          fi
+
+          if ! grep -F "## ${{ inputs.version }}" CHANGELOG.md; then
+            echo "CHANGELOG.md is missing an entry for ${{ inputs.version }}" >&2
+            exit 1
+          fi
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets --all-features
+
+      - name: Run examples
+        run: |
+          cargo run --example quickstart
+          cargo run --example user_store
+          cargo run --example event_index
+
+      - name: Check package contents
+        run: |
+          cargo package --list > package-files.txt
+          cat package-files.txt
+          if grep -E '(^|/)(\.github|\.phrase|\.rust-skills|\.claude)/' package-files.txt; then
+            echo "crate package contains local workflow files" >&2
+            exit 1
+          fi
+
+      - name: Verify package
+        run: cargo package --locked
+
+      - name: Dry-run publish
+        run: cargo publish --dry-run --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish to crates.io
+        if: ${{ inputs.mode == 'publish' }}
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

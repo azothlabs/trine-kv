@@ -1,4 +1,4 @@
-use trine_kv::{Db, DbOptions, Error, KeyspaceOptions, WriteBatch};
+use trine_kv::{Db, DbOptions, Error, KeyspaceOptions, WriteBatch, WriteOptions};
 
 #[test]
 fn point_writes_deletes_and_snapshot_reads_are_mvcc_visible() {
@@ -64,7 +64,9 @@ fn write_batch_commits_multiple_keyspaces_at_one_sequence() {
     batch.insert("users", b"1", b"ada");
     batch.insert("posts", b"1", b"hello");
 
-    let info = db.write(batch, Default::default()).expect("batch commits");
+    let info = db
+        .write(batch, WriteOptions::default())
+        .expect("batch commits");
     assert_eq!(info.sequence().get(), 1);
     assert_eq!(users.get(b"1").expect("users read"), Some(b"ada".to_vec()));
     assert_eq!(
@@ -85,7 +87,7 @@ fn failed_batch_does_not_partially_apply() {
     batch.insert("missing", b"b", b"nope");
 
     let error = db
-        .write(batch, Default::default())
+        .write(batch, WriteOptions::default())
         .expect_err("missing keyspace rejects whole batch");
     assert!(matches!(error, Error::KeyspaceMissing { .. }));
     assert_eq!(keyspace.get(b"a").expect("no partial write"), None);
@@ -101,14 +103,14 @@ fn duplicate_keys_in_one_batch_use_later_operation() {
     let mut insert_then_delete = WriteBatch::new();
     insert_then_delete.insert("default", b"a", b"v1");
     insert_then_delete.remove("default", b"a");
-    db.write(insert_then_delete, Default::default())
+    db.write(insert_then_delete, WriteOptions::default())
         .expect("batch commits");
     assert_eq!(keyspace.get(b"a").expect("later delete wins"), None);
 
     let mut delete_then_insert = WriteBatch::new();
     delete_then_insert.remove("default", b"a");
     delete_then_insert.insert("default", b"a", b"v2");
-    db.write(delete_then_insert, Default::default())
+    db.write(delete_then_insert, WriteOptions::default())
         .expect("batch commits");
     assert_eq!(
         keyspace.get(b"a").expect("later insert wins"),

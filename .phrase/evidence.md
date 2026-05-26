@@ -1878,3 +1878,60 @@ Record only evidence that can change planning or durable decisions.
 
 - Choose the next phase from CI/release verification, publishing workflow,
   more targeted hardening, or user-requested API changes.
+
+## 2026-05-26: CI And Publishing Workflow Gate Passed
+
+### Observation
+
+- Added `.github/workflows/ci.yml` for pull requests, pushes to `main`, and
+  manual dispatch. It runs formatting, strict clippy, all-target tests, the
+  three examples, package-content guard, and package verification.
+- Added `.github/workflows/publish.yml` as a manual workflow with `version` and
+  `mode` inputs. It checks the requested SemVer version against `Cargo.toml`
+  and `CHANGELOG.md`, runs the full gate, always runs `cargo publish --dry-run
+  --locked`, and only runs `cargo publish --locked` when `mode=publish`.
+- Release docs now explain CI verification, manual publish inputs, the
+  `CARGO_REGISTRY_TOKEN` secret, the optional protected `crates-io`
+  environment, and the recommended dry-run-first flow.
+- Strict all-target clippy exposed old test style issues. Tests now use
+  concrete option types instead of ambiguous `Default::default()` calls, and
+  SSTable test helpers borrow table-write options instead of moving them.
+
+### Interpretation
+
+- Task044 is complete.
+- Phase 9 satisfies its acceptance gate.
+- The repository has a repeatable local release gate plus guarded GitHub
+  workflows for CI and crates.io publishing.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo run --example quickstart`
+- `cargo run --example user_store`
+- `cargo run --example event_index`
+- YAML syntax parse for `.github/workflows/ci.yml` and
+  `.github/workflows/publish.yml`
+- `cargo package --allow-dirty --list`
+- `cargo package --allow-dirty --locked`
+- `cargo publish --dry-run --allow-dirty --locked`
+- `git diff --check`
+- forbidden terminology scan over workflows, source, tests, phase notes, Cargo
+  metadata, benches, docs, README, examples, and changelog
+
+### Remaining Blockers
+
+- GitHub Actions was not executed locally; the remote workflow must run after
+  push.
+- Real publish remains intentionally manual and requires `CARGO_REGISTRY_TOKEN`
+  plus `mode=publish`.
+- The first sandboxed `cargo package --allow-dirty --locked` attempt could not
+  reach the crates.io index; the same command passed with approved network
+  access.
+
+### Recommended Next Action
+
+- Configure the publish secret/environment, then use the `Publish` workflow with
+  `mode=dry-run` before any release publish.

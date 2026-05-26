@@ -79,8 +79,10 @@ fn bounded_range_and_reverse_iteration_obey_key_order() {
 #[test]
 fn prefix_iteration_uses_snapshot_visibility() {
     let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-    let mut options = KeyspaceOptions::default();
-    options.prefix_extractor = PrefixExtractor::Separator(b':');
+    let options = KeyspaceOptions {
+        prefix_extractor: PrefixExtractor::Separator(b':'),
+        ..KeyspaceOptions::default()
+    };
     let keyspace = db.keyspace("default", options).expect("keyspace opens");
 
     keyspace.insert(b"user:1", b"old").expect("write old");

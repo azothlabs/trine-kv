@@ -6,50 +6,63 @@ Complete
 
 ## Goal
 
-Add runnable integration examples that show Trine KV behind realistic
-application boundaries.
+Automate release verification and add a guarded manual crates.io publishing
+workflow.
 
 ## Entry Condition
 
-- Phase 7 release packaging is complete.
-- User chose integration examples after release packaging.
+- Phase 8 integration examples is complete.
+- User asked to finish CI/release verification and publishing workflow.
 
 ## Scope
 
-- Runnable examples under `examples/` using only public Trine KV APIs.
-- Documentation links from README or usage docs.
-- Verification that examples compile and run.
+- GitHub Actions workflow for regular CI verification.
+- GitHub Actions workflow for manual dry-run/publish to crates.io.
+- Release docs that explain required secrets, version checks, and workflow
+  order.
+- Local validation of the Cargo commands that can run outside GitHub Actions.
 
 ## Out Of Scope
 
-- New storage-engine behavior.
-- New public API helpers unless examples expose a concrete API blocker.
-- Heavy external dependencies.
+- Actually publishing the crate.
+- Creating release tags.
+- Adding non-Rust package targets.
+- Changing v1 storage contracts or public APIs.
 
 ## Acceptance Gate
 
-- Integration examples run with `cargo run --example`.
-- README or usage docs points users to the examples.
-- `cargo fmt --check`, `cargo clippy`, `cargo test`, and `git diff --check`
-  pass.
+- CI workflow contains formatting, clippy, tests, examples, package content
+  guard, and package verification.
+- Publish workflow is manual, verifies the requested SemVer version against
+  `Cargo.toml` and `CHANGELOG.md`, runs a dry run first, and only publishes
+  when `mode=publish`.
+- Release docs describe CI and publish workflow usage.
+- Local verification passes for `cargo fmt --check`,
+  `cargo clippy --all-targets --all-features -- -D warnings`,
+  `cargo test --all-targets --all-features`, examples, package list, package
+  verification, publish dry-run, and `git diff --check`.
 
 ## Active Task Slice
 
 ```text
-task043 [x] goal:repository-pattern and event-index integration examples are runnable and documented | scope:examples,README.md,docs,.phrase | verify:cargo run --example user_store + cargo run --example event_index + cargo fmt --check + cargo clippy + cargo test + git diff --check
+task044 [x] goal:CI/release verification and guarded publishing workflow are defined and documented | scope:.github/workflows,docs/release.md,.phrase | verify:local release gate + workflow YAML syntax parse
 ```
 
 ## Known Blockers
 
-- None recorded for Phase 8.
-- The examples did not expose a public API blocker.
+- GitHub Actions cannot be executed locally in this environment; remote CI must
+  run after push.
+- Real `cargo publish` needs a configured `CARGO_REGISTRY_TOKEN` secret and an
+  explicit manual workflow run with `mode=publish`.
 
 ## Evidence To Record
 
-- Example run results.
-- Any API friction discovered while writing examples.
+- Local command verification.
+- Workflow syntax sanity check.
+- Publishing workflow safety boundaries.
 
 ## Next Recommendation
 
-- Choose the next phase from CI/release verification, publishing workflow,
-  more targeted hardening, or user-requested API changes.
+- When ready to ship, configure the `crates-io` environment and
+  `CARGO_REGISTRY_TOKEN`, then run the `Publish` workflow first with
+  `mode=dry-run`.

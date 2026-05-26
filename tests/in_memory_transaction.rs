@@ -1,4 +1,6 @@
-use trine_kv::{Db, DbOptions, Error, KeyRange, KeyspaceOptions};
+use trine_kv::{
+    Db, DbOptions, Error, KeyRange, KeyspaceOptions, TransactionOptions, WriteBatch, WriteOptions,
+};
 
 #[test]
 fn transaction_commits_staged_writes_without_reads() {
@@ -6,7 +8,7 @@ fn transaction_commits_staged_writes_without_reads() {
     let keyspace = db
         .keyspace("default", KeyspaceOptions::default())
         .expect("keyspace opens");
-    let mut txn = db.transaction(Default::default());
+    let mut txn = db.transaction(TransactionOptions::default());
 
     txn.insert("default", b"a", b"txn");
     let info = txn.commit().expect("transaction commits");
@@ -26,7 +28,7 @@ fn transaction_point_read_conflicts_with_later_point_write() {
         .expect("keyspace opens");
     keyspace.insert(b"a", b"v1").expect("seed value");
 
-    let mut txn = db.transaction(Default::default());
+    let mut txn = db.transaction(TransactionOptions::default());
     assert_eq!(
         txn.get("default", b"a").expect("txn read"),
         Some(b"v1".to_vec())
@@ -45,7 +47,7 @@ fn transaction_point_read_conflicts_with_later_range_delete() {
         .expect("keyspace opens");
     keyspace.insert(b"m", b"value").expect("seed value");
 
-    let mut txn = db.transaction(Default::default());
+    let mut txn = db.transaction(TransactionOptions::default());
     assert_eq!(
         txn.get("default", b"m").expect("txn read"),
         Some(b"value".to_vec())
@@ -64,7 +66,7 @@ fn transaction_range_read_conflicts_with_later_point_write_inside_range() {
     let keyspace = db
         .keyspace("default", KeyspaceOptions::default())
         .expect("keyspace opens");
-    let mut txn = db.transaction(Default::default());
+    let mut txn = db.transaction(TransactionOptions::default());
 
     txn.read_range("default", KeyRange::half_open(b"a", b"m"))
         .expect("track range read");
@@ -79,13 +81,13 @@ fn transaction_range_read_conflicts_with_later_overlapping_range_delete() {
     let db = Db::memory(DbOptions::memory()).expect("memory db opens");
     db.keyspace("default", KeyspaceOptions::default())
         .expect("keyspace opens");
-    let mut txn = db.transaction(Default::default());
+    let mut txn = db.transaction(TransactionOptions::default());
 
     txn.read_range("default", KeyRange::half_open(b"c", b"g"))
         .expect("track range read");
-    let mut delete = trine_kv::WriteBatch::new();
+    let mut delete = WriteBatch::new();
     delete.remove_range("default", KeyRange::half_open(b"f", b"z"));
-    db.write(delete, Default::default())
+    db.write(delete, WriteOptions::default())
         .expect("concurrent range delete");
 
     let error = txn
@@ -100,7 +102,7 @@ fn transaction_range_read_allows_later_write_outside_range() {
     let keyspace = db
         .keyspace("default", KeyspaceOptions::default())
         .expect("keyspace opens");
-    let mut txn = db.transaction(Default::default());
+    let mut txn = db.transaction(TransactionOptions::default());
 
     txn.read_range("default", KeyRange::half_open(b"a", b"m"))
         .expect("track range read");

@@ -1,4 +1,6 @@
-use trine_kv::{Db, DbOptions, Iter, KeyRange, KeyValue, KeyspaceOptions, WriteBatch};
+use trine_kv::{
+    Db, DbOptions, Iter, KeyRange, KeyValue, KeyspaceOptions, WriteBatch, WriteOptions,
+};
 
 fn collect(iter: Iter) -> Vec<(Vec<u8>, Vec<u8>)> {
     iter.map(|item| {
@@ -22,7 +24,7 @@ fn range_delete_hides_point_reads_and_scans_without_breaking_snapshots() {
 
     let mut delete = WriteBatch::new();
     delete.remove_range("default", KeyRange::half_open(b"b", b"d"));
-    db.write(delete, Default::default())
+    db.write(delete, WriteOptions::default())
         .expect("range delete commits");
 
     assert_eq!(
@@ -70,7 +72,7 @@ fn range_delete_participates_in_prefix_scans() {
 
     let mut delete = WriteBatch::new();
     delete.remove_range("default", KeyRange::half_open(b"user:1", b"user:3"));
-    db.write(delete, Default::default())
+    db.write(delete, WriteOptions::default())
         .expect("range delete commits");
 
     assert_eq!(
@@ -93,7 +95,7 @@ fn same_batch_order_decides_range_delete_conflicts() {
     let mut delete_then_insert = WriteBatch::new();
     delete_then_insert.remove_range("default", KeyRange::half_open(b"a", b"z"));
     delete_then_insert.insert("default", b"m", b"visible");
-    db.write(delete_then_insert, Default::default())
+    db.write(delete_then_insert, WriteOptions::default())
         .expect("first batch commits");
     assert_eq!(
         keyspace.get(b"m").expect("later insert survives"),
@@ -103,7 +105,7 @@ fn same_batch_order_decides_range_delete_conflicts() {
     let mut insert_then_delete = WriteBatch::new();
     insert_then_delete.insert("default", b"n", b"hidden");
     insert_then_delete.remove_range("default", KeyRange::half_open(b"a", b"z"));
-    db.write(insert_then_delete, Default::default())
+    db.write(insert_then_delete, WriteOptions::default())
         .expect("second batch commits");
     assert_eq!(keyspace.get(b"n").expect("later range delete wins"), None);
 }

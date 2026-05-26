@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets --all-features
+
+      - name: Run examples
+        run: |
+          cargo run --example quickstart
+          cargo run --example user_store
+          cargo run --example event_index
+
+      - name: Check package contents
+        run: |
+          cargo package --list > package-files.txt
+          cat package-files.txt
+          if grep -E '(^|/)(\.github|\.phrase|\.rust-skills|\.claude)/' package-files.txt; then
+            echo "crate package contains local workflow files" >&2
+            exit 1
+          fi
+
+      - name: Verify package
+        run: cargo package --locked

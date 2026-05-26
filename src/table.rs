@@ -2175,14 +2175,14 @@ mod tests {
     fn table_decode_rejects_index_entry_count_before_large_allocation() {
         let error = decode_index_block(&count_block(u32::MAX))
             .expect_err("impossible index count should fail");
-        assert_invalid_table_message(error, "index entry count exceeds block bytes");
+        assert_invalid_table_message(&error, "index entry count exceeds block bytes");
     }
 
     #[test]
     fn table_decode_rejects_data_record_count_before_large_allocation() {
         let error = decode_data_block(&count_block(u32::MAX))
             .expect_err("impossible data record count should fail");
-        assert_invalid_table_message(error, "data record count exceeds block bytes");
+        assert_invalid_table_message(&error, "data record count exceeds block bytes");
     }
 
     #[test]
@@ -2198,14 +2198,14 @@ mod tests {
         put_u32(&mut bytes, u32::MAX);
 
         let error = decode_data_block(&bytes).expect_err("impossible restart count should fail");
-        assert_invalid_table_message(error, "data block restart count exceeds block bytes");
+        assert_invalid_table_message(&error, "data block restart count exceeds block bytes");
     }
 
     #[test]
     fn table_decode_rejects_range_tombstone_count_before_large_allocation() {
         let error = decode_range_tombstone_block(&count_block(u32::MAX))
             .expect_err("impossible tombstone count should fail");
-        assert_invalid_table_message(error, "range tombstone count exceeds block bytes");
+        assert_invalid_table_message(&error, "range tombstone count exceeds block bytes");
     }
 
     #[test]
@@ -2215,7 +2215,7 @@ mod tests {
         put_u32(&mut point_bytes, u32::MAX);
         let error = decode_filter_block(&point_bytes)
             .expect_err("impossible point-key filter count should fail");
-        assert_invalid_table_message(error, "point-key filter count exceeds block bytes");
+        assert_invalid_table_message(&error, "point-key filter count exceeds block bytes");
 
         let mut prefix_bytes = Vec::new();
         put_u8(&mut prefix_bytes, POINT_KEY_FILTER_ABSENT);
@@ -2224,18 +2224,20 @@ mod tests {
         put_u32(&mut prefix_bytes, u32::MAX);
         let error = decode_filter_block(&prefix_bytes)
             .expect_err("impossible prefix filter count should fail");
-        assert_invalid_table_message(error, "prefix filter count exceeds block bytes");
+        assert_invalid_table_message(&error, "prefix filter count exceeds block bytes");
     }
 
     fn table_with_records(count: usize, codec: CodecId) -> Table {
-        table_with_options(count, test_table_options(codec, false))
+        let options = test_table_options(codec, false);
+        table_with_options(count, &options)
     }
 
     fn table_with_filters(count: usize, codec: CodecId) -> Table {
-        table_with_options(count, test_table_options(codec, true))
+        let options = test_table_options(codec, true);
+        table_with_options(count, &options)
     }
 
-    fn table_with_options(count: usize, options: TableWriteOptions) -> Table {
+    fn table_with_options(count: usize, options: &TableWriteOptions) -> Table {
         let point_records = (0..count)
             .map(|index| TablePointRecord {
                 internal_key: InternalKey::new(
@@ -2247,7 +2249,7 @@ mod tests {
                 value: Some(ValueRef::Inline(format!("value-{index:03}").into_bytes())),
             })
             .collect::<Vec<_>>();
-        let data_blocks = build_data_blocks(&point_records, &options).expect("test blocks build");
+        let data_blocks = build_data_blocks(&point_records, options).expect("test blocks build");
         Table {
             properties: table_properties(
                 TableId(7),
@@ -2256,8 +2258,8 @@ mod tests {
                 &point_records,
                 &[],
             ),
-            point_key_filter: build_point_key_filter(&options, &point_records),
-            prefix_filter: build_prefix_filter(&options, &point_records),
+            point_key_filter: build_point_key_filter(options, &point_records),
+            prefix_filter: build_prefix_filter(options, &point_records),
             point_records,
             data_blocks,
             range_tombstones: Vec::new(),
@@ -2306,7 +2308,7 @@ mod tests {
         bytes
     }
 
-    fn assert_invalid_table_message(error: Error, expected: &str) {
+    fn assert_invalid_table_message(error: &Error, expected: &str) {
         assert!(
             error.to_string().contains(expected),
             "unexpected error: {error}"
