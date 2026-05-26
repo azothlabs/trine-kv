@@ -7,6 +7,7 @@ use std::{
 
 use crate::{
     codec::CodecId,
+    durability::sync_parent_dir_after_rename,
     error::{Error, Result},
     options::{
         CompressionProfile, FilterPolicy, IndexSearchPolicy, KeyspaceOptions, PrefixFilterPolicy,
@@ -281,6 +282,7 @@ fn publish_manifest(path: &Path, state: &ManifestState) -> Result<()> {
         file.sync_all()?;
     }
     fs::rename(tmp_path, path)?;
+    sync_parent_dir_after_rename(path)?;
 
     Ok(())
 }

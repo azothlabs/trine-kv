@@ -1935,3 +1935,57 @@ Record only evidence that can change planning or durable decisions.
 
 - Configure the publish secret/environment, then use the `Publish` workflow with
   `mode=dry-run` before any release publish.
+
+## 2026-05-26: Targeted Pre-Publish Directory Sync Hardening Passed
+
+### Observation
+
+- The publish paths for manifest, SSTable, blob, and recovery-report files
+  already wrote a temporary file, synced the file contents, and renamed the
+  temporary file into place.
+- Those paths did not sync the parent directory after rename. On Unix
+  filesystems, the rename changes the directory entry, and a crash can lose
+  that directory entry unless the parent directory is synced.
+- Added a shared `durability::sync_parent_dir_after_rename` helper. On Unix it
+  opens and syncs the parent directory after the rename; on non-Unix it keeps
+  the previous best-effort path because Rust `std` has no portable directory
+  sync.
+- Manifest, table, blob, and recovery-report publish paths now call the helper
+  after successful rename.
+- `docs/durability.md` now describes the Unix parent-directory sync behavior
+  and the non-Unix boundary.
+
+### Interpretation
+
+- Task045 is complete.
+- Phase 10 satisfies its acceptance gate.
+- Risk category: local crash durability for newly published storage-file names.
+- The change does not alter public API or any v1 file format.
+
+### Verification
+
+- `cargo test sync_parent_dir_after_rename_accepts_published_file`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo run --example quickstart`
+- `cargo run --example user_store`
+- `cargo run --example event_index`
+- `cargo package --allow-dirty --list`
+- `cargo package --allow-dirty --locked`
+- `cargo publish --dry-run --allow-dirty --locked`
+- `git diff --check`
+- forbidden terminology scan over workflows, source, tests, phase notes, Cargo
+  metadata, benches, docs, README, examples, and changelog
+
+### Remaining Blockers
+
+- GitHub Actions was not executed locally; the remote workflow must run after
+  push.
+- Real publish still requires `CARGO_REGISTRY_TOKEN` plus an explicit
+  `mode=publish` manual workflow dispatch.
+
+### Recommended Next Action
+
+- Configure the publish secret/environment, run the `Publish` workflow with
+  `mode=dry-run`, review CI, then decide whether to publish.

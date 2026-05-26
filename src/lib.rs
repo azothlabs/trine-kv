@@ -11,6 +11,7 @@ pub mod cache;
 pub mod codec;
 pub mod compaction;
 pub mod db;
+mod durability;
 pub mod error;
 pub mod filter;
 pub mod internal_key;

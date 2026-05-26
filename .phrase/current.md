@@ -6,37 +6,34 @@ Complete
 
 ## Goal
 
-Automate release verification and add a guarded manual crates.io publishing
-workflow.
+Harden one concrete pre-publish durability risk without changing public API or
+the v1 storage contract.
 
 ## Entry Condition
 
-- Phase 8 integration examples is complete.
-- User asked to finish CI/release verification and publishing workflow.
+- Phase 9 CI and publishing workflow is complete.
+- User asked for targeted hardening before publishing.
 
 ## Scope
 
-- GitHub Actions workflow for regular CI verification.
-- GitHub Actions workflow for manual dry-run/publish to crates.io.
-- Release docs that explain required secrets, version checks, and workflow
-  order.
-- Local validation of the Cargo commands that can run outside GitHub Actions.
+- Atomic file publish paths for manifest, table, blob, and recovery report
+  writes.
+- Focused tests for the new durability helper.
+- Local release gate after the hardening change.
 
 ## Out Of Scope
 
-- Actually publishing the crate.
-- Creating release tags.
-- Adding non-Rust package targets.
-- Changing v1 storage contracts or public APIs.
+- Changing the table, manifest, WAL, blob, or recovery file formats.
+- Adding new public API.
+- Publishing the crate.
+- Broad performance tuning.
 
 ## Acceptance Gate
 
-- CI workflow contains formatting, clippy, tests, examples, package content
-  guard, and package verification.
-- Publish workflow is manual, verifies the requested SemVer version against
-  `Cargo.toml` and `CHANGELOG.md`, runs a dry run first, and only publishes
-  when `mode=publish`.
-- Release docs describe CI and publish workflow usage.
+- Atomic publish paths sync the new file contents before rename and sync the
+  parent directory after rename on Unix platforms.
+- Existing persistent behavior remains unchanged.
+- Focused helper coverage passes.
 - Local verification passes for `cargo fmt --check`,
   `cargo clippy --all-targets --all-features -- -D warnings`,
   `cargo test --all-targets --all-features`, examples, package list, package
@@ -45,24 +42,24 @@ workflow.
 ## Active Task Slice
 
 ```text
-task044 [x] goal:CI/release verification and guarded publishing workflow are defined and documented | scope:.github/workflows,docs/release.md,.phrase | verify:local release gate + workflow YAML syntax parse
+task045 [x] goal:atomic file publish paths sync parent directory after rename | scope:src/{durability,manifest,table,blob,recovery}.rs,docs/durability.md,.phrase | verify:focused helper test + full release gate
 ```
 
 ## Known Blockers
 
 - GitHub Actions cannot be executed locally in this environment; remote CI must
   run after push.
-- Real `cargo publish` needs a configured `CARGO_REGISTRY_TOKEN` secret and an
-  explicit manual workflow run with `mode=publish`.
+- Parent-directory fsync is Unix-specific here; non-Unix builds keep the
+  previous behavior because portable directory syncing is not available through
+  `std`.
 
 ## Evidence To Record
 
-- Local command verification.
-- Workflow syntax sanity check.
-- Publishing workflow safety boundaries.
+- Audit result for atomic publish paths.
+- Focused helper test result.
+- Full local release gate result.
 
 ## Next Recommendation
 
-- When ready to ship, configure the `crates-io` environment and
-  `CARGO_REGISTRY_TOKEN`, then run the `Publish` workflow first with
-  `mode=dry-run`.
+- If this gate passes, configure the publish secret/environment and run the
+  `Publish` workflow with `mode=dry-run` before any real publish.

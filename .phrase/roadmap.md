@@ -153,3 +153,20 @@ publishing workflow.
   full verification gate, defaults to dry-run behavior, and publishes only when
   explicitly requested.
 - Release docs explain the CI and publishing workflow.
+
+### Phase 10: Targeted Pre-Publish Hardening
+
+**Status**: Complete
+
+**Goal**: Reduce one concrete publish-blocking durability risk before the first
+crate publish.
+
+**Entry Condition**: Phase 9 complete and user requests targeted hardening
+before publishing.
+
+**Acceptance Gate**:
+
+- The selected risk is classified and fixed without changing public API or v1
+  storage formats.
+- Focused regression coverage exists for the hardening mechanism.
+- The full local release gate still passes.

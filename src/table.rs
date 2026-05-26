@@ -10,6 +10,7 @@ use crate::{
     blob::ValueRef,
     cache::{BlockCache, BlockCacheKey},
     codec::{self, CodecId},
+    durability::sync_parent_dir_after_rename,
     error::{Error, Result},
     filter::{PointKeyFilter, PrefixFilter},
     internal_key::{InternalKey, ValueKind},
@@ -661,6 +662,7 @@ pub(crate) fn write_table(
         file.sync_all()?;
     }
     fs::rename(tmp_path, path)?;
+    sync_parent_dir_after_rename(path)?;
 
     Ok(table)
 }

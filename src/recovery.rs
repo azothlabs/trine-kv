@@ -8,6 +8,7 @@ use std::{
 
 use crate::{
     blob,
+    durability::sync_parent_dir_after_rename,
     error::{Error, Result},
     options::FailOnCorruptionPolicy,
     table::{self, TableId},
@@ -248,7 +249,8 @@ fn write_recovery_report(db_path: &Path, report: &RecoveryReport) -> Result<()> 
     file.write_all(encode_report(report).as_bytes())?;
     file.sync_all()?;
     drop(file);
-    fs::rename(tmp_path, path)?;
+    fs::rename(tmp_path, &path)?;
+    sync_parent_dir_after_rename(&path)?;
 
     Ok(())
 }
