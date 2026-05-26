@@ -221,3 +221,22 @@ newer local toolchains accepted.
 - Runtime public API behavior and storage formats remain unchanged.
 - Local verification passes for formatting, clippy, tests, examples, package
   checks, and dry-run publishing.
+
+### Phase 14: Lazy Range Iterator
+
+**Status**: Complete
+
+**Goal**: Replace eager range/prefix result building with a lazy seek cursor
+that merges memtable and SSTable records under MVCC visibility.
+
+**Entry Condition**: User review identifies eager range iteration as an
+incorrect engine shape for v1.
+
+**Acceptance Gate**:
+
+- Range and prefix scans create a cursor instead of prebuilding all visible
+  `KeyValue` rows.
+- The cursor merges memtable and SSTable user-key groups lazily and applies
+  MVCC point/range-delete rules per returned row.
+- Existing scan, snapshot, range-delete, table, and persistent tests pass.
+- A focused test proves table blocks are not touched until `Iterator::next`.

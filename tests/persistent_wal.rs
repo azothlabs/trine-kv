@@ -951,6 +951,53 @@ fn persistent_block_cache_records_hits_and_misses() {
 }
 
 #[test]
+fn persistent_range_iterator_defers_table_block_reads_until_next() {
+    let path = temp_db_path("range-iterator-lazy-block-read");
+    let options = DbOptions::persistent(&path);
+
+    {
+        let db = Db::open(options).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+        for index in 0..64 {
+            keyspace
+                .insert(
+                    format!("key-{index:03}").as_bytes(),
+                    format!("value-{index:03}").as_bytes(),
+                )
+                .expect("write row");
+        }
+        db.flush().expect("flush table");
+
+        let mut iter = keyspace
+            .range(&KeyRange::all())
+            .expect("range cursor is created");
+        let stats = db.stats();
+        assert_eq!(stats.block_cache_hits, 0);
+        assert_eq!(
+            stats.block_cache_misses, 0,
+            "constructing a range cursor should not touch table blocks"
+        );
+
+        let first = iter
+            .next()
+            .expect("first row exists")
+            .expect("first row reads");
+        assert_eq!(first.key, b"key-000".to_vec());
+        assert_eq!(first.value, b"value-000".to_vec());
+
+        let stats = db.stats();
+        assert!(
+            stats.block_cache_misses > 0,
+            "first iterator advance should touch the table block"
+        );
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_flush_preserves_snapshot_versions() {
     let path = temp_db_path("flush-snapshot");
     let options = DbOptions::persistent(&path);

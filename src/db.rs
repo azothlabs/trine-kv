@@ -15,7 +15,7 @@ use crate::{
     cache, compaction, durability,
     error::{Error, Result},
     internal_key::{InternalKey, ValueKind},
-    iterator::{Direction, Iter},
+    iterator::{Direction, Iter, RecordSource, ScanRangeTombstone, ScanSelector, prefix_successor},
     keyspace::{Keyspace, KeyspaceName},
     manifest::{self, ManifestState, ManifestStore},
     options::{DbOptions, DurabilityMode, FailOnCorruptionPolicy, KeyspaceOptions, StorageMode},
@@ -47,7 +47,7 @@ pub(crate) struct DbInner {
     snapshots: Arc<SnapshotTracker>,
     manifest: Option<Mutex<ManifestStore>>,
     wal: Option<Mutex<WalWriter>>,
-    block_cache: cache::BlockCache,
+    block_cache: Arc<cache::BlockCache>,
     compaction_runs: AtomicU64,
     compaction_input_tables: AtomicU64,
     compaction_output_tables: AtomicU64,
@@ -160,7 +160,7 @@ impl Db {
                 snapshots: Arc::new(SnapshotTracker::default()),
                 manifest: None,
                 wal: None,
-                block_cache: cache::BlockCache::new(block_cache_bytes),
+                block_cache: Arc::new(cache::BlockCache::new(block_cache_bytes)),
                 compaction_runs: AtomicU64::new(0),
                 compaction_input_tables: AtomicU64::new(0),
                 compaction_output_tables: AtomicU64::new(0),
@@ -231,7 +231,7 @@ impl Db {
                 snapshots: Arc::new(SnapshotTracker::default()),
                 manifest: Some(Mutex::new(manifest)),
                 wal,
-                block_cache: cache::BlockCache::new(block_cache_bytes),
+                block_cache: Arc::new(cache::BlockCache::new(block_cache_bytes)),
                 compaction_runs: AtomicU64::new(0),
                 compaction_input_tables: AtomicU64::new(0),
                 compaction_output_tables: AtomicU64::new(0),
@@ -615,7 +615,7 @@ impl Db {
             key,
             read_sequence,
             self.persistent_path(),
-            Some(&self.inner.block_cache),
+            Some(self.inner.block_cache.as_ref()),
         )?
         .into_iter()
         .next()
@@ -630,18 +630,22 @@ impl Db {
         direction: Direction,
     ) -> Result<Iter> {
         self.ensure_open()?;
-        let _read_pin = self.inner.snapshots.pinned_snapshot(read_sequence);
+        let read_pin = self.inner.snapshots.pinned_snapshot(read_sequence);
 
         let state = self.keyspace_state(keyspace)?;
-        let items = collect_visible_range(
-            &state,
-            range,
-            read_sequence,
-            self.persistent_path(),
-            Some(&self.inner.block_cache),
-        )?;
+        let selector = ScanSelector::Range(range.clone());
+        let sources = scan_sources(&state, &selector, direction, Some(&self.inner.block_cache))?;
+        let range_tombstones = scan_range_tombstones(&state)?;
+        let db_path = self.persistent_path().map(Path::to_path_buf);
 
-        Ok(Iter::from_items(items, direction))
+        Ok(Iter::from_sources(
+            direction,
+            read_sequence,
+            read_pin,
+            db_path,
+            range_tombstones,
+            sources,
+        ))
     }
 
     pub(crate) fn prefix_at(
@@ -652,19 +656,22 @@ impl Db {
         direction: Direction,
     ) -> Result<Iter> {
         self.ensure_open()?;
-        let _read_pin = self.inner.snapshots.pinned_snapshot(read_sequence);
+        let read_pin = self.inner.snapshots.pinned_snapshot(read_sequence);
 
         let state = self.keyspace_state(keyspace)?;
-        let mut items = collect_visible_prefix(
-            &state,
-            prefix,
-            read_sequence,
-            self.persistent_path(),
-            Some(&self.inner.block_cache),
-        )?;
-        items.retain(|item| item.key.starts_with(prefix));
+        let selector = ScanSelector::Prefix(prefix.to_vec());
+        let sources = scan_sources(&state, &selector, direction, Some(&self.inner.block_cache))?;
+        let range_tombstones = scan_range_tombstones(&state)?;
+        let db_path = self.persistent_path().map(Path::to_path_buf);
 
-        Ok(Iter::from_items(items, direction))
+        Ok(Iter::from_sources(
+            direction,
+            read_sequence,
+            read_pin,
+            db_path,
+            range_tombstones,
+            sources,
+        ))
     }
 
     fn keyspace_state(&self, keyspace: &str) -> Result<Arc<KeyspaceState>> {
@@ -1361,6 +1368,106 @@ fn validate_batch_len(len: usize) -> Result<()> {
     Ok(())
 }
 
+fn scan_sources(
+    state: &KeyspaceState,
+    selector: &ScanSelector,
+    direction: Direction,
+    block_cache: Option<&Arc<cache::BlockCache>>,
+) -> Result<Vec<RecordSource>> {
+    let entries = state
+        .entries
+        .read()
+        .map_err(|_| lock_poisoned("memtable entries"))?;
+    let memtable_records = collect_memtable_scan_records(&entries, selector);
+    drop(entries);
+
+    let mut sources = vec![RecordSource::memtable(
+        memtable_records,
+        selector.clone(),
+        direction,
+    )];
+
+    let tables = state
+        .tables
+        .read()
+        .map_err(|_| lock_poisoned("table list"))?;
+    for table in tables.iter() {
+        if let Some(prefix) = selector.prefix() {
+            if !table.may_contain_prefix(prefix, &state.options.prefix_extractor) {
+                continue;
+            }
+        }
+
+        let cursor = Arc::clone(table).point_cursor(
+            selector.clone(),
+            state.options.prefix_extractor.clone(),
+            direction,
+            state.options.index_search_policy,
+            block_cache.cloned(),
+        );
+        sources.push(RecordSource::table(cursor));
+    }
+
+    Ok(sources)
+}
+
+fn collect_memtable_scan_records(
+    entries: &BTreeMap<InternalKey, Option<ValueRef>>,
+    selector: &ScanSelector,
+) -> Vec<(InternalKey, Option<ValueRef>)> {
+    let (start, end) = memtable_scan_bounds(selector);
+    entries
+        .range((start, end))
+        .filter(|(internal_key, _)| selector.contains_key(internal_key.user_key()))
+        .map(|(internal_key, value)| (internal_key.clone(), value.clone()))
+        .collect()
+}
+
+fn memtable_scan_bounds(selector: &ScanSelector) -> (Bound<InternalKey>, Bound<InternalKey>) {
+    match selector {
+        ScanSelector::Range(range) => (
+            memtable_start_bound(&range.start),
+            memtable_end_bound(&range.end),
+        ),
+        ScanSelector::Prefix(prefix) => {
+            let start = Bound::Included(first_internal_key_for_user(prefix));
+            let end = prefix_successor(prefix).map_or(Bound::Unbounded, |end| {
+                Bound::Excluded(first_internal_key_for_user(&end))
+            });
+            (start, end)
+        }
+    }
+}
+
+fn memtable_start_bound(start: &Bound<Vec<u8>>) -> Bound<InternalKey> {
+    match start {
+        Bound::Included(key) => Bound::Included(first_internal_key_for_user(key)),
+        Bound::Excluded(key) => Bound::Excluded(last_internal_key_for_user(key)),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
+fn memtable_end_bound(end: &Bound<Vec<u8>>) -> Bound<InternalKey> {
+    match end {
+        Bound::Included(key) => Bound::Included(last_internal_key_for_user(key)),
+        Bound::Excluded(key) => Bound::Excluded(first_internal_key_for_user(key)),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
+fn first_internal_key_for_user(user_key: &[u8]) -> InternalKey {
+    InternalKey::new(
+        user_key.to_vec(),
+        Sequence::new(u64::MAX),
+        ValueKind::Put,
+        u32::MAX,
+    )
+}
+
+fn last_internal_key_for_user(user_key: &[u8]) -> InternalKey {
+    InternalKey::new(user_key.to_vec(), Sequence::ZERO, ValueKind::RangeDelete, 0)
+}
+
 fn collect_point_key_records(
     state: &KeyspaceState,
     key: &[u8],
@@ -1438,47 +1545,6 @@ fn collect_range_point_records(
     Ok(records)
 }
 
-fn collect_prefix_point_records(
-    state: &KeyspaceState,
-    prefix: &[u8],
-    block_cache: Option<&cache::BlockCache>,
-) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
-    let entries = state
-        .entries
-        .read()
-        .map_err(|_| lock_poisoned("memtable entries"))?;
-    let mut records = entries
-        .iter()
-        .filter(|(internal_key, _)| internal_key.user_key().starts_with(prefix))
-        .map(|(internal_key, value)| (internal_key.clone(), value.clone()))
-        .collect::<Vec<_>>();
-    drop(entries);
-
-    let tables = state
-        .tables
-        .read()
-        .map_err(|_| lock_poisoned("table list"))?;
-    for table in tables.iter() {
-        if !table.may_contain_prefix(prefix, &state.options.prefix_extractor) {
-            continue;
-        }
-        records.extend(
-            table
-                .point_records_with_prefix_with_cache(
-                    prefix,
-                    &state.options.prefix_extractor,
-                    state.options.index_search_policy,
-                    block_cache,
-                )
-                .into_iter()
-                .map(|record| (record.internal_key.clone(), record.value.clone())),
-        );
-    }
-    records.sort_by(|left, right| left.0.cmp(&right.0));
-
-    Ok(records)
-}
-
 fn collect_range_tombstones(state: &KeyspaceState) -> Result<Vec<RangeTombstone>> {
     let range_tombstones = state
         .range_tombstones
@@ -1505,6 +1571,15 @@ fn collect_range_tombstones(state: &KeyspaceState) -> Result<Vec<RangeTombstone>
     }
 
     Ok(tombstones)
+}
+
+fn scan_range_tombstones(state: &KeyspaceState) -> Result<Vec<ScanRangeTombstone>> {
+    Ok(collect_range_tombstones(state)?
+        .into_iter()
+        .map(|tombstone| {
+            ScanRangeTombstone::new(tombstone.range, tombstone.sequence, tombstone.batch_index)
+        })
+        .collect())
 }
 
 fn point_key_modified_after(
@@ -1539,27 +1614,6 @@ fn key_range_modified_after(
     range_tombstone_modified_after_range(state, range, read_sequence)
 }
 
-// This scan is deliberately small-scope: it applies the same user-visible MVCC
-// rule that table readers and merge iterators must later share. The first
-// visible internal record for a user key decides whether that key is returned.
-fn collect_visible_range(
-    state: &KeyspaceState,
-    range: &KeyRange,
-    read_sequence: Sequence,
-    db_path: Option<&Path>,
-    block_cache: Option<&cache::BlockCache>,
-) -> Result<Vec<KeyValue>> {
-    let point_records = collect_range_point_records(state, range, block_cache)?;
-    let range_tombstones = collect_range_tombstones(state)?;
-    collect_visible_records(
-        &point_records,
-        &range_tombstones,
-        range,
-        read_sequence,
-        db_path,
-    )
-}
-
 fn collect_visible_point(
     state: &KeyspaceState,
     key: &[u8],
@@ -1582,27 +1636,8 @@ fn collect_visible_point(
     )
 }
 
-fn collect_visible_prefix(
-    state: &KeyspaceState,
-    prefix: &[u8],
-    read_sequence: Sequence,
-    db_path: Option<&Path>,
-    block_cache: Option<&cache::BlockCache>,
-) -> Result<Vec<KeyValue>> {
-    let point_records = collect_prefix_point_records(state, prefix, block_cache)?;
-    let range_tombstones = collect_range_tombstones(state)?;
-    collect_visible_records(
-        &point_records,
-        &range_tombstones,
-        &KeyRange::all(),
-        read_sequence,
-        db_path,
-    )
-}
-
-// Prefix filters may remove table point records from the input set, but they
-// never remove range tombstones. This helper is the single MVCC visibility path
-// for normal range scans and prefix scans after table selection is finished.
+// Point reads and lazy scans share the same MVCC rule: for a user key, the
+// newest visible point record decides whether a value is returned.
 fn collect_visible_records(
     point_records: &[(InternalKey, Option<ValueRef>)],
     range_tombstones: &[RangeTombstone],

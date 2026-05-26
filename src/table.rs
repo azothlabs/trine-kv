@@ -4,6 +4,7 @@ use std::{
     io::{Read, Write},
     ops::{Bound, Range},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use crate::{
@@ -13,6 +14,10 @@ use crate::{
     error::{Error, Result},
     filter::{PointKeyFilter, PrefixFilter},
     internal_key::{InternalKey, ValueKind},
+    iterator::{
+        Direction, ForwardKeyState, RecordGroup, ReverseKeyState, ScanRecord, ScanSelector,
+        prefix_successor, sort_group_records,
+    },
     options::{FilterPolicy, IndexSearchPolicy, PrefixFilterPolicy},
     prefix::PrefixExtractor,
     search,
@@ -266,6 +271,7 @@ impl TableDataBlock {
             .collect()
     }
 
+    #[cfg(test)]
     fn point_records_with_prefix<'records>(
         &self,
         point_records: &'records [TablePointRecord],
@@ -474,6 +480,7 @@ impl Table {
         self.point_records_with_prefix_with_cache(prefix, extractor, policy, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn point_records_with_prefix_with_cache(
         &self,
         prefix: &[u8],
@@ -546,6 +553,336 @@ impl Table {
             self.data_blocks[index].largest_internal_key.user_key() < prefix
         });
         (index < self.data_blocks.len()).then_some(index)
+    }
+
+    pub(crate) fn point_cursor(
+        self: Arc<Self>,
+        selector: ScanSelector,
+        prefix_extractor: PrefixExtractor,
+        direction: Direction,
+        policy: IndexSearchPolicy,
+        block_cache: Option<Arc<BlockCache>>,
+    ) -> TablePointCursor {
+        TablePointCursor::new(
+            self,
+            selector,
+            prefix_extractor,
+            direction,
+            policy,
+            block_cache,
+        )
+    }
+
+    fn last_block_for_range(&self, range: &KeyRange, policy: IndexSearchPolicy) -> Option<usize> {
+        let upper = search::partition_point_by(self.data_blocks.len(), policy, |index| {
+            !key_is_after_end(
+                self.data_blocks[index].smallest_internal_key.user_key(),
+                &range.end,
+            )
+        });
+        upper.checked_sub(1)
+    }
+
+    fn last_block_for_prefix(&self, prefix: &[u8], policy: IndexSearchPolicy) -> Option<usize> {
+        let end = prefix_successor(prefix).map_or(Bound::Unbounded, Bound::Excluded);
+        let range = KeyRange {
+            start: Bound::Included(prefix.to_vec()),
+            end,
+        };
+        self.last_block_for_range(&range, policy)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TablePointCursor {
+    table: Arc<Table>,
+    selector: ScanSelector,
+    prefix_extractor: PrefixExtractor,
+    direction: Direction,
+    block_cache: Option<Arc<BlockCache>>,
+    block_index: Option<usize>,
+    record_index: usize,
+    pending: Option<ScanRecord>,
+    recorded_block_index: Option<usize>,
+    exhausted: bool,
+}
+
+impl TablePointCursor {
+    fn new(
+        table: Arc<Table>,
+        selector: ScanSelector,
+        prefix_extractor: PrefixExtractor,
+        direction: Direction,
+        policy: IndexSearchPolicy,
+        block_cache: Option<Arc<BlockCache>>,
+    ) -> Self {
+        let block_index = match direction {
+            Direction::Forward => first_block_for_selector(&table, &selector, policy),
+            Direction::Reverse => last_block_for_selector(&table, &selector, policy),
+        };
+        let record_index = block_index.map_or(0, |index| match direction {
+            Direction::Forward => first_record_index_for_block(&table, &selector, index, policy),
+            Direction::Reverse => table.data_blocks[index].record_range.end,
+        });
+
+        Self {
+            table,
+            selector,
+            prefix_extractor,
+            direction,
+            block_cache,
+            block_index,
+            record_index,
+            pending: None,
+            recorded_block_index: None,
+            exhausted: false,
+        }
+    }
+
+    pub(crate) fn next_group(&mut self) -> Option<RecordGroup> {
+        let first = self.pending.take().or_else(|| self.next_record())?;
+        let user_key = first.0.user_key().to_vec();
+        let mut rest = Vec::new();
+
+        while let Some(record) = self.next_record() {
+            if record.0.user_key() == user_key.as_slice() {
+                rest.push(record);
+            } else {
+                self.pending = Some(record);
+                break;
+            }
+        }
+        let (first, rest) = sort_group_records(first, rest);
+
+        Some(RecordGroup {
+            user_key,
+            first,
+            rest,
+        })
+    }
+
+    fn next_record(&mut self) -> Option<ScanRecord> {
+        match self.direction {
+            Direction::Forward => self.next_record_forward(),
+            Direction::Reverse => self.next_record_reverse(),
+        }
+    }
+
+    fn next_record_forward(&mut self) -> Option<ScanRecord> {
+        while !self.exhausted {
+            let block_index = self.block_index?;
+            match self.forward_block_state(block_index) {
+                CursorBlockState::Scan => {}
+                CursorBlockState::Skip => {
+                    self.move_to_next_block();
+                    continue;
+                }
+                CursorBlockState::Done => {
+                    self.exhausted = true;
+                    return None;
+                }
+            }
+
+            self.record_block_cache_access(block_index);
+            let block_end = self.table.data_blocks[block_index].record_range.end;
+            while self.record_index < block_end {
+                let record = &self.table.point_records[self.record_index];
+                self.record_index += 1;
+
+                match self
+                    .selector
+                    .forward_key_state(record.internal_key.user_key())
+                {
+                    ForwardKeyState::Before => {}
+                    ForwardKeyState::Match => {
+                        return Some((record.internal_key.clone(), record.value.clone()));
+                    }
+                    ForwardKeyState::After => {
+                        self.exhausted = true;
+                        return None;
+                    }
+                }
+            }
+
+            self.move_to_next_block();
+        }
+
+        None
+    }
+
+    fn next_record_reverse(&mut self) -> Option<ScanRecord> {
+        while !self.exhausted {
+            let block_index = self.block_index?;
+            match self.reverse_block_state(block_index) {
+                CursorBlockState::Scan => {}
+                CursorBlockState::Skip => {
+                    self.move_to_previous_block();
+                    continue;
+                }
+                CursorBlockState::Done => {
+                    self.exhausted = true;
+                    return None;
+                }
+            }
+
+            self.record_block_cache_access(block_index);
+            let block_start = self.table.data_blocks[block_index].record_range.start;
+            while self.record_index > block_start {
+                self.record_index -= 1;
+                let record = &self.table.point_records[self.record_index];
+
+                match self
+                    .selector
+                    .reverse_key_state(record.internal_key.user_key())
+                {
+                    ReverseKeyState::Above => {}
+                    ReverseKeyState::Match => {
+                        return Some((record.internal_key.clone(), record.value.clone()));
+                    }
+                    ReverseKeyState::Below => {
+                        self.exhausted = true;
+                        return None;
+                    }
+                }
+            }
+
+            self.move_to_previous_block();
+        }
+
+        None
+    }
+
+    fn forward_block_state(&self, block_index: usize) -> CursorBlockState {
+        let block = &self.table.data_blocks[block_index];
+        match &self.selector {
+            ScanSelector::Range(range) => {
+                if key_is_after_end(block.smallest_internal_key.user_key(), &range.end) {
+                    CursorBlockState::Done
+                } else if block.overlaps_range(range) {
+                    CursorBlockState::Scan
+                } else {
+                    CursorBlockState::Skip
+                }
+            }
+            ScanSelector::Prefix(prefix) => {
+                if !block.prefix_bounds_may_overlap(prefix) {
+                    if block.largest_internal_key.user_key() < prefix.as_slice() {
+                        CursorBlockState::Skip
+                    } else {
+                        CursorBlockState::Done
+                    }
+                } else if block.may_contain_prefix(prefix, &self.prefix_extractor) {
+                    CursorBlockState::Scan
+                } else {
+                    CursorBlockState::Skip
+                }
+            }
+        }
+    }
+
+    fn reverse_block_state(&self, block_index: usize) -> CursorBlockState {
+        let block = &self.table.data_blocks[block_index];
+        match &self.selector {
+            ScanSelector::Range(range) => {
+                if key_is_before_start(block.largest_internal_key.user_key(), &range.start) {
+                    CursorBlockState::Done
+                } else if block.overlaps_range(range) {
+                    CursorBlockState::Scan
+                } else {
+                    CursorBlockState::Skip
+                }
+            }
+            ScanSelector::Prefix(prefix) => {
+                if block.largest_internal_key.user_key() < prefix.as_slice() {
+                    CursorBlockState::Done
+                } else if block.may_contain_prefix(prefix, &self.prefix_extractor) {
+                    CursorBlockState::Scan
+                } else {
+                    CursorBlockState::Skip
+                }
+            }
+        }
+    }
+
+    fn move_to_next_block(&mut self) {
+        let Some(block_index) = self.block_index else {
+            self.exhausted = true;
+            return;
+        };
+        let next = block_index + 1;
+        self.block_index = (next < self.table.data_blocks.len()).then_some(next);
+        self.record_index = self
+            .block_index
+            .map_or(0, |index| self.table.data_blocks[index].record_range.start);
+    }
+
+    fn move_to_previous_block(&mut self) {
+        let Some(block_index) = self.block_index else {
+            self.exhausted = true;
+            return;
+        };
+        self.block_index = block_index.checked_sub(1);
+        self.record_index = self
+            .block_index
+            .map_or(0, |index| self.table.data_blocks[index].record_range.end);
+    }
+
+    fn record_block_cache_access(&mut self, block_index: usize) {
+        if self.recorded_block_index == Some(block_index) {
+            return;
+        }
+        self.recorded_block_index = Some(block_index);
+
+        if let Some(block_cache) = &self.block_cache {
+            self.table
+                .record_block_cache_access(Some(block_cache.as_ref()), block_index);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorBlockState {
+    Scan,
+    Skip,
+    Done,
+}
+
+fn first_block_for_selector(
+    table: &Table,
+    selector: &ScanSelector,
+    policy: IndexSearchPolicy,
+) -> Option<usize> {
+    match selector {
+        ScanSelector::Range(range) => table.first_block_for_range(range, policy),
+        ScanSelector::Prefix(prefix) => table.first_block_for_prefix(prefix, policy),
+    }
+}
+
+fn last_block_for_selector(
+    table: &Table,
+    selector: &ScanSelector,
+    policy: IndexSearchPolicy,
+) -> Option<usize> {
+    match selector {
+        ScanSelector::Range(range) => table.last_block_for_range(range, policy),
+        ScanSelector::Prefix(prefix) => table.last_block_for_prefix(prefix, policy),
+    }
+}
+
+fn first_record_index_for_block(
+    table: &Table,
+    selector: &ScanSelector,
+    block_index: usize,
+    policy: IndexSearchPolicy,
+) -> usize {
+    let block = &table.data_blocks[block_index];
+    match selector {
+        ScanSelector::Range(range) => {
+            block.restart_index_for_bound(&table.point_records, &range.start, policy)
+        }
+        ScanSelector::Prefix(prefix) => {
+            block.restart_index_for_key(&table.point_records, prefix, policy)
+        }
     }
 }
 

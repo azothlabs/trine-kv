@@ -2162,3 +2162,71 @@ Record only evidence that can change planning or durable decisions.
 - Push and let CI run. If the MSRV job passes, consider adding a second
   `stable` CI job for newer-toolchain coverage without weakening the Rust 1.85
   gate.
+
+## 2026-05-26: Lazy Range Iterator Passed
+
+### Observation
+
+- User review identified eager range iteration as the wrong engine shape:
+  range/prefix scans should advance with source cursors instead of prebuilding
+  all visible rows.
+- `Iter` now supports a lazy scan path that owns a snapshot pin, database path,
+  range tombstones, and one source cursor per memtable/table source.
+- Memtable scan setup uses user-key bounds against the `BTreeMap`, so it seeks
+  into the requested key span before cloning the small source slice needed by
+  the cursor.
+- SSTable scans use `TablePointCursor`, which seeks to the first or last
+  candidate block and advances by user-key groups. Block-cache access is
+  recorded only when a table cursor advances into a block.
+- The lazy merge chooses the next user key across sources, combines records for
+  that key, sorts only that key's internal records, and applies MVCC point and
+  range-delete visibility before returning the row.
+- `persistent_range_iterator_defers_table_block_reads_until_next` confirms that
+  constructing a range cursor leaves block-cache misses at zero, and the first
+  `next()` touches the table block.
+- Release benchmark spot-check after memtable seek optimization: bounded range
+  scan 1529 us, prefix scan 2781 us, prefix table matching scan 2445 us in this
+  local run.
+
+### Interpretation
+
+- Task049 is complete.
+- Phase 14 satisfies its acceptance gate.
+- The implementation fixes the range iterator shape without changing public
+  scan semantics or storage formats.
+- Prefix scan is slightly slower than the old eager baseline on this local
+  microbenchmark, but bounded range scan is back within the previous baseline
+  range after replacing whole-memtable cloning with bounded memtable seek.
+
+### Verification
+
+- `cargo test --test in_memory_iteration`
+- `cargo test --test in_memory_range_delete`
+- `cargo test persistent_range_iterator_defers_table_block_reads_until_next --test persistent_wal`
+- `cargo test persistent_table_block_index_reads_points_and_ranges --test persistent_wal`
+- `cargo test persistent_index_search_policies_preserve_table_reads --test persistent_wal`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo check --target x86_64-pc-windows-gnu`
+- `cargo run --example quickstart`
+- `cargo run --example user_store`
+- `cargo run --example event_index`
+- `cargo bench --bench v1_bench`
+- `git diff --check`
+- forbidden terminology scan over workflows, source, tests, phase notes, Cargo
+  metadata, benches, docs, README, examples, and changelog
+- targeted scan for the removed eager range/prefix builders
+
+### Remaining Blockers
+
+- GitHub Actions was not executed locally; the remote workflow must run after
+  push to confirm the exact Rust 1.85 environment.
+- Tables are still loaded into memory as complete table objects. This phase
+  makes scan advancement and blob value reads lazy over those loaded tables; it
+  does not introduce an on-demand file-block decoder.
+
+### Recommended Next Action
+
+- Push and let CI run. If CI passes, consider a follow-up prefix-scan tuning
+  slice only if release benchmarks keep showing the small local slowdown.
