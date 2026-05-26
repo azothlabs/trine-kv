@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use trine_kv::{
-    Db, DbOptions, DurabilityMode, Error, Keyspace, KeyspaceOptions, PrefixExtractor, Result,
+    Bucket, BucketOptions, Db, DbOptions, DurabilityMode, Error, PrefixExtractor, Result,
     TransactionOptions,
 };
 
@@ -40,21 +40,21 @@ fn main() -> Result<()> {
 
 struct UserStore {
     db: Db,
-    users: Keyspace,
+    users: Bucket,
 }
 
 impl UserStore {
     fn open(path: &Path) -> Result<Self> {
         let db = Db::open(DbOptions::persistent(path).with_durability(DurabilityMode::Flush))?;
-        let users = db.keyspace(
+        let users = db.open_bucket_with_options(
             "users",
-            KeyspaceOptions::default().with_prefix_extractor(PrefixExtractor::Separator(b':')),
+            BucketOptions::default().with_prefix_extractor(PrefixExtractor::Separator(b':')),
         )?;
         Ok(Self { db, users })
     }
 
     fn put_user(&self, user: &User) -> Result<()> {
-        self.users.insert(user_key(&user.id), user.encode()?)
+        self.users.put(user_key(&user.id), user.encode()?)
     }
 
     fn get_user(&self, id: &str) -> Result<Option<User>> {
@@ -88,7 +88,7 @@ impl UserStore {
         }
 
         new_name.clone_into(&mut user.display_name);
-        transaction.insert("users", key, user.encode()?);
+        transaction.put("users", key, user.encode()?);
         transaction.commit()?;
         Ok(true)
     }

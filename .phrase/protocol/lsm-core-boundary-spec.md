@@ -11,7 +11,7 @@ the LSM core.
 The goal is to make one LSM tree a clear data structure with its own read,
 flush, compaction, tombstone, and MVCC rules. The database layer should
 coordinate database-wide concerns such as public handles, WAL, manifest publish,
-process locking, recovery, background worker lifecycle, and cross-keyspace
+process locking, recovery, background worker lifecycle, and cross-bucket
 atomicity.
 
 This is an internal refactoring contract. It must not change:
@@ -22,7 +22,7 @@ This is an internal refactoring contract. It must not change:
 - manifest format;
 - SSTable format;
 - MVCC visibility rules;
-- keyspace semantics;
+- bucket semantics;
 - in-memory mode behavior.
 
 ## 2. Problem Statement
@@ -31,7 +31,7 @@ The current implementation has grown the LSM tree inside the database module.
 That makes `db.rs` responsible for unrelated layers at the same time:
 
 - public database API;
-- keyspace registration;
+- bucket registration;
 - WAL and manifest coordination;
 - active and immutable memtables;
 - table lists and level decisions;
@@ -52,11 +52,11 @@ The LSM core boundary exists to make one rule live in one place.
 
 The database layer owns a set of named trees.
 
-Each LSM tree owns the data-structure rules for exactly one keyspace:
+Each LSM tree owns the data-structure rules for exactly one bucket:
 
 ```text
 Db
-  -> keyspace map
+  -> bucket map
     -> LsmTree
 ```
 
@@ -68,13 +68,13 @@ data.
 
 The database layer remains responsible for:
 
-- public `Db`, `Keyspace`, `Snapshot`, and `Transaction` handles;
+- public `Db`, `Bucket`, `Snapshot`, and `Transaction` handles;
 - storage mode selection;
 - process lock acquisition and release;
 - durable WAL append, flush, sync, replay, and rewrite;
 - manifest loading and atomic publish;
-- keyspace name and option registration;
-- cross-keyspace write batch sequencing;
+- bucket name and option registration;
+- cross-bucket write batch sequencing;
 - assigning commit sequences;
 - snapshot tracker ownership;
 - oldest active snapshot sequence discovery;
@@ -98,7 +98,7 @@ The database layer must not decide:
 
 One `LsmTree` owns:
 
-- `KeyspaceOptions`;
+- `BucketOptions`;
 - active memtable;
 - immutable memtable queue;
 - table readers for the current tree version;
@@ -131,7 +131,7 @@ The LSM core must not:
 - acquire or release process locks;
 - spawn background worker threads;
 - assign global commit sequences;
-- make cross-keyspace atomicity decisions;
+- make cross-bucket atomicity decisions;
 - expose public crate API types unless they are already part of the v1 API.
 
 ## 6. Target Module Shape
@@ -212,7 +212,7 @@ visibility after the extraction is complete.
 
 ## 9. Version And Level Layout Invariants
 
-The LSM core publishes one current tree version per keyspace.
+The LSM core publishes one current tree version per bucket.
 
 `LsmVersion` owns the immutable table layout for one tree version. Readers clone
 one version handle at read setup and then use that handle for the rest of the
@@ -278,7 +278,7 @@ Contract:
 - block reads remain on demand and verified before decoded records affect a
   result.
 
-`Db` and `Keyspace` may convert the returned value representation to public
+`Db` and `Bucket` may convert the returned value representation to public
 owned values. They must not redo MVCC visibility.
 
 ## 11. Write Path Contract
@@ -296,7 +296,7 @@ The LSM core:
 
 The database layer:
 
-- keeps cross-keyspace batch commit serialized;
+- keeps cross-bucket batch commit serialized;
 - keeps WAL and manifest ordering correct;
 - surfaces write errors through public APIs.
 
@@ -376,7 +376,7 @@ The database layer owns:
 
 - transaction lifecycle;
 - read-set and write-set storage;
-- cross-keyspace validation order;
+- cross-bucket validation order;
 - final commit sequencing.
 
 ## 15. Caching Boundary
@@ -442,7 +442,7 @@ order.
 
 The database layer aggregates:
 
-- keyspace count;
+- bucket count;
 - active snapshot count;
 - WAL bytes;
 - recovery stats;
@@ -462,10 +462,10 @@ The extraction must be incremental and testable.
 ### Step 2: Create LSM Module And Move Tree State
 
 - introduce `src/lsm/`;
-- move `KeyspaceState`, immutable memtable state, and tree-local stats behind
+- move `BucketState`, immutable memtable state, and tree-local stats behind
   `LsmTree`;
 - keep behavior unchanged;
-- keep `Db` as the owner of the keyspace map.
+- keep `Db` as the owner of the bucket map.
 
 ### Step 3: Move Point Read Into LSM Core
 
@@ -497,7 +497,7 @@ The extraction must be incremental and testable.
 ### Step 7: Move Transaction Conflict Checks Into LSM Core
 
 - transaction validation calls tree-local modified-after APIs;
-- DB layer keeps transaction lifecycle and cross-keyspace ordering.
+- DB layer keeps transaction lifecycle and cross-bucket ordering.
 
 ### Step 8: Introduce Versioned Level Layout
 
@@ -526,7 +526,7 @@ The LSM core separation is complete when:
 - `Db` no longer builds range or prefix scan sources directly;
 - `Db` no longer owns compaction retention helpers for point or range
   tombstones;
-- `LsmTree` owns active and immutable memtables for one keyspace;
+- `LsmTree` owns active and immutable memtables for one bucket;
 - `LsmTree` owns tree table layout and level version logic;
 - `LsmTree` owns point read, range scan, prefix scan, and conflict checks;
 - `LsmTree` owns flush planning and compaction planning;

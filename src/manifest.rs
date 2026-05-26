@@ -10,7 +10,7 @@ use crate::{
     durability::sync_parent_dir_after_rename,
     error::{Error, Result},
     options::{
-        CompressionProfile, FilterPolicy, IndexSearchPolicy, KeyspaceOptions, PrefixFilterPolicy,
+        BucketOptions, CompressionProfile, FilterPolicy, IndexSearchPolicy, PrefixFilterPolicy,
     },
     prefix::PrefixExtractor,
     table::{TableId, TableLevel, TableProperties},
@@ -27,20 +27,20 @@ const MIN_TABLE_PROPERTY_BYTES: usize = 41;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestEdit {
-    CreateKeyspace {
+    CreateBucket {
         name: String,
-        options: KeyspaceOptions,
+        options: BucketOptions,
     },
-    UpdateKeyspaceOptions {
+    UpdateBucketOptions {
         name: String,
-        options: KeyspaceOptions,
+        options: BucketOptions,
     },
     AddTable {
-        keyspace: String,
+        bucket: String,
         properties: TableProperties,
     },
     RemoveTable {
-        keyspace: String,
+        bucket: String,
         table_id: TableId,
     },
     UpdateWalReplayFloor {
@@ -51,7 +51,7 @@ pub enum ManifestEdit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestState {
     wal_replay_floor: Sequence,
-    keyspaces: BTreeMap<String, KeyspaceOptions>,
+    buckets: BTreeMap<String, BucketOptions>,
     tables: BTreeMap<String, Vec<TableProperties>>,
 }
 
@@ -60,7 +60,7 @@ impl ManifestState {
     pub const fn empty() -> Self {
         Self {
             wal_replay_floor: Sequence::ZERO,
-            keyspaces: BTreeMap::new(),
+            buckets: BTreeMap::new(),
             tables: BTreeMap::new(),
         }
     }
@@ -71,8 +71,8 @@ impl ManifestState {
     }
 
     #[must_use]
-    pub fn keyspaces(&self) -> &BTreeMap<String, KeyspaceOptions> {
-        &self.keyspaces
+    pub fn buckets(&self) -> &BTreeMap<String, BucketOptions> {
+        &self.buckets
     }
 
     #[must_use]
@@ -130,19 +130,34 @@ impl ManifestStore {
         &self.state
     }
 
-    pub fn create_keyspace(&mut self, name: String, options: KeyspaceOptions) -> Result<()> {
-        if let Some(existing) = self.state.keyspaces.get(&name) {
+    pub fn create_bucket(&mut self, name: String, options: BucketOptions) -> Result<()> {
+        if let Some(existing) = self.state.buckets.get(&name) {
             if existing == &options {
                 return Ok(());
             }
             return Err(Error::invalid_options(
-                "existing keyspace options do not match requested options",
+                "existing bucket options do not match requested options",
             ));
         }
 
         let mut next_state = self.state.clone();
-        next_state.keyspaces.insert(name.clone(), options);
+        next_state.buckets.insert(name.clone(), options);
         next_state.tables.entry(name).or_default();
+        self.publish_next_state(next_state)
+    }
+
+    pub fn update_bucket_options(&mut self, name: &str, options: BucketOptions) -> Result<()> {
+        let Some(existing) = self.state.buckets.get(name) else {
+            return Err(Error::Corruption {
+                message: format!("bucket options update references missing bucket: {name}"),
+            });
+        };
+        if existing == &options {
+            return Ok(());
+        }
+
+        let mut next_state = self.state.clone();
+        next_state.buckets.insert(name.to_owned(), options);
         self.publish_next_state(next_state)
     }
 
@@ -155,19 +170,19 @@ impl ManifestStore {
         tables: Vec<(String, TableProperties)>,
         wal_replay_floor: Sequence,
     ) -> Result<()> {
-        for (keyspace, _) in &tables {
-            if !self.state.keyspaces.contains_key(keyspace) {
+        for (bucket, _) in &tables {
+            if !self.state.buckets.contains_key(bucket) {
                 return Err(Error::Corruption {
-                    message: format!("table references missing keyspace: {keyspace}"),
+                    message: format!("table references missing bucket: {bucket}"),
                 });
             }
         }
 
         let mut next_state = self.state.clone();
-        for (keyspace, properties) in tables {
+        for (bucket, properties) in tables {
             next_state
                 .tables
-                .entry(keyspace)
+                .entry(bucket)
                 .or_default()
                 .push(properties);
         }
@@ -177,12 +192,12 @@ impl ManifestStore {
 
     pub fn replace_tables(
         &mut self,
-        keyspace: &str,
+        bucket: &str,
         removed_table_ids: &[TableId],
         replacement: TableProperties,
     ) -> Result<()> {
         self.replace_tables_batch(vec![(
-            keyspace.to_owned(),
+            bucket.to_owned(),
             removed_table_ids.to_vec(),
             vec![replacement],
         )])
@@ -193,20 +208,20 @@ impl ManifestStore {
         replacements: Vec<(String, Vec<TableId>, Vec<TableProperties>)>,
     ) -> Result<()> {
         // Validate the whole batch before changing in-memory manifest state.
-        // That keeps multi-keyspace compaction from publishing a partial edit.
-        for (keyspace, removed_table_ids, _) in &replacements {
-            if !self.state.keyspaces.contains_key(keyspace) {
+        // That keeps multi-bucket compaction from publishing a partial edit.
+        for (bucket, removed_table_ids, _) in &replacements {
+            if !self.state.buckets.contains_key(bucket) {
                 return Err(Error::Corruption {
-                    message: format!("compaction references missing keyspace: {keyspace}"),
+                    message: format!("compaction references missing bucket: {bucket}"),
                 });
             }
 
             let tables = self
                 .state
                 .tables
-                .get(keyspace)
+                .get(bucket)
                 .ok_or_else(|| Error::Corruption {
-                    message: format!("manifest is missing table list for keyspace: {keyspace}"),
+                    message: format!("manifest is missing table list for bucket: {bucket}"),
                 })?;
             for table_id in removed_table_ids {
                 if !tables.iter().any(|properties| properties.id == *table_id) {
@@ -218,12 +233,12 @@ impl ManifestStore {
         }
 
         let mut next_state = self.state.clone();
-        for (keyspace, removed_table_ids, replacements) in replacements {
+        for (bucket, removed_table_ids, replacements) in replacements {
             let tables = next_state
                 .tables
-                .get_mut(&keyspace)
+                .get_mut(&bucket)
                 .ok_or_else(|| Error::Corruption {
-                    message: format!("manifest is missing table list for keyspace: {keyspace}"),
+                    message: format!("manifest is missing table list for bucket: {bucket}"),
                 })?;
             tables.retain(|properties| !removed_table_ids.contains(&properties.id));
             for replacement in replacements {
@@ -289,14 +304,14 @@ fn publish_manifest(path: &Path, state: &ManifestState) -> Result<()> {
 
 fn encode_state(state: &ManifestState) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let keyspace_count = u32::try_from(state.keyspaces.len())
-        .map_err(|_| Error::invalid_options("too many keyspaces for manifest"))?;
+    let bucket_count = u32::try_from(state.buckets.len())
+        .map_err(|_| Error::invalid_options("too many buckets for manifest"))?;
 
     put_u64(&mut bytes, state.wal_replay_floor.get());
-    put_u32(&mut bytes, keyspace_count);
-    for (name, options) in &state.keyspaces {
+    put_u32(&mut bytes, bucket_count);
+    for (name, options) in &state.buckets {
         put_bytes(&mut bytes, name.as_bytes())?;
-        put_keyspace_options(&mut bytes, options)?;
+        put_bucket_options(&mut bytes, options)?;
     }
     put_tables(&mut bytes, &state.tables)?;
 
@@ -341,16 +356,16 @@ fn decode_manifest(bytes: &[u8]) -> Result<ManifestState> {
 fn decode_state(payload: &[u8]) -> Result<ManifestState> {
     let mut cursor = Cursor::new(payload);
     let wal_replay_floor = Sequence::new(cursor.read_u64()?);
-    let keyspace_count = cursor.read_u32()? as usize;
-    let mut keyspaces = BTreeMap::new();
+    let bucket_count = cursor.read_u32()? as usize;
+    let mut buckets = BTreeMap::new();
 
-    for _ in 0..keyspace_count {
+    for _ in 0..bucket_count {
         let name =
             String::from_utf8(cursor.read_bytes()?.to_vec()).map_err(|_| Error::InvalidFormat {
-                message: "manifest keyspace name is not valid UTF-8".to_owned(),
+                message: "manifest bucket name is not valid UTF-8".to_owned(),
             })?;
-        let options = cursor.read_keyspace_options()?;
-        keyspaces.insert(name, options);
+        let options = cursor.read_bucket_options()?;
+        buckets.insert(name, options);
     }
     let tables = cursor.read_tables()?;
 
@@ -360,12 +375,12 @@ fn decode_state(payload: &[u8]) -> Result<ManifestState> {
 
     Ok(ManifestState {
         wal_replay_floor,
-        keyspaces,
+        buckets,
         tables,
     })
 }
 
-fn put_keyspace_options(bytes: &mut Vec<u8>, options: &KeyspaceOptions) -> Result<()> {
+fn put_bucket_options(bytes: &mut Vec<u8>, options: &BucketOptions) -> Result<()> {
     put_bool(bytes, options.allow_empty_keys);
     put_compression_profile(bytes, options.compression);
     put_usize(bytes, options.block_bytes)?;
@@ -444,14 +459,14 @@ fn put_index_search_policy(bytes: &mut Vec<u8>, value: IndexSearchPolicy) {
 }
 
 fn put_tables(bytes: &mut Vec<u8>, tables: &BTreeMap<String, Vec<TableProperties>>) -> Result<()> {
-    let table_keyspace_count = u32::try_from(tables.len())
-        .map_err(|_| Error::invalid_options("too many table keyspaces for manifest"))?;
-    put_u32(bytes, table_keyspace_count);
+    let table_bucket_count = u32::try_from(tables.len())
+        .map_err(|_| Error::invalid_options("too many table buckets for manifest"))?;
+    put_u32(bytes, table_bucket_count);
 
-    for (keyspace, table_list) in tables {
-        put_bytes(bytes, keyspace.as_bytes())?;
+    for (bucket, table_list) in tables {
+        put_bytes(bytes, bucket.as_bytes())?;
         let table_count = u32::try_from(table_list.len())
-            .map_err(|_| Error::invalid_options("too many tables for manifest keyspace"))?;
+            .map_err(|_| Error::invalid_options("too many tables for manifest bucket"))?;
         put_u32(bytes, table_count);
         for properties in table_list {
             put_table_properties(bytes, properties)?;
@@ -608,8 +623,8 @@ impl<'payload> Cursor<'payload> {
         Ok(value)
     }
 
-    fn read_keyspace_options(&mut self) -> Result<KeyspaceOptions> {
-        Ok(KeyspaceOptions {
+    fn read_bucket_options(&mut self) -> Result<BucketOptions> {
+        Ok(BucketOptions {
             allow_empty_keys: self.read_bool()?,
             compression: self.read_compression_profile()?,
             block_bytes: self.read_usize()?,
@@ -622,13 +637,13 @@ impl<'payload> Cursor<'payload> {
     }
 
     fn read_tables(&mut self) -> Result<BTreeMap<String, Vec<TableProperties>>> {
-        let table_keyspace_count = self.read_u32()? as usize;
+        let table_bucket_count = self.read_u32()? as usize;
         let mut tables = BTreeMap::new();
 
-        for _ in 0..table_keyspace_count {
-            let keyspace = String::from_utf8(self.read_bytes()?.to_vec()).map_err(|_| {
+        for _ in 0..table_bucket_count {
+            let bucket = String::from_utf8(self.read_bytes()?.to_vec()).map_err(|_| {
                 Error::InvalidFormat {
-                    message: "manifest table keyspace is not valid UTF-8".to_owned(),
+                    message: "manifest table bucket is not valid UTF-8".to_owned(),
                 }
             })?;
             let table_count = self.read_u32()? as usize;
@@ -639,7 +654,7 @@ impl<'payload> Cursor<'payload> {
             for _ in 0..table_count {
                 table_list.push(self.read_table_properties()?);
             }
-            tables.insert(keyspace, table_list);
+            tables.insert(bucket, table_list);
         }
 
         Ok(tables)
@@ -770,7 +785,7 @@ mod tests {
     };
 
     use super::{ManifestStore, decode_state, manifest_path};
-    use crate::options::KeyspaceOptions;
+    use crate::options::BucketOptions;
 
     #[test]
     fn manifest_decode_rejects_table_count_before_large_allocation() {
@@ -799,14 +814,14 @@ mod tests {
 
         fs::remove_dir_all(&dir).expect("remove manifest parent to force publish failure");
         let error = store
-            .create_keyspace("users".to_owned(), KeyspaceOptions::default())
+            .create_bucket("users".to_owned(), BucketOptions::default())
             .expect_err("publish should fail");
         assert!(
             error.to_string().contains("io error"),
             "unexpected error: {error}"
         );
         assert!(
-            !store.state().keyspaces().contains_key("users"),
+            !store.state().buckets().contains_key("users"),
             "failed publish must not advance in-memory manifest state"
         );
     }

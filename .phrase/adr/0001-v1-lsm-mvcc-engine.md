@@ -26,7 +26,7 @@ Trine KV v1 is a complete embedded LSM MVCC database target:
 - Repeatable snapshots.
 - Atomic write batches.
 - Serializable optimistic transactions.
-- Keyspaces with cross-keyspace atomic write batches.
+- Buckets with cross-bucket atomic write batches.
 - Persistent local-file mode.
 - In-memory mode with the same logical engine and volatile storage.
 - Range and prefix iteration.

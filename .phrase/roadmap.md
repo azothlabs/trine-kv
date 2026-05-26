@@ -69,7 +69,7 @@ v1 API safely.
 **Acceptance Gate**:
 
 - README explains what Trine KV is, how to run verification, and where to start.
-- Usage docs cover in-memory and persistent open, keyspaces, reads/writes,
+- Usage docs cover in-memory and persistent open, buckets, reads/writes,
   batches, snapshots, transactions, range/prefix scans, durability, maintenance,
   stats, and recovery boundaries.
 - At least one example program compiles and runs with `cargo run --example`.
@@ -303,7 +303,7 @@ loading as the highest P0 production-readiness risk.
   without decoding data blocks.
 - Point and range reads load only candidate data blocks and verify checksum,
   codec, and block/index consistency at read time.
-- `KeyspaceOptions::block_bytes` controls data block sizing.
+- `BucketOptions::block_bytes` controls data block sizing.
 - Block cache stores real decoded data blocks and reports misses/hits
   around actual block reads.
 - Startup validates formal blob files using table/manifest metadata, including
@@ -382,7 +382,7 @@ risks.
 
 **Status**: Complete
 
-**Goal**: Separate one-keyspace LSM tree rules from database-wide coordination
+**Goal**: Separate one-bucket LSM tree rules from database-wide coordination
 without changing public API behavior or storage formats.
 
 **Entry Condition**: Phase 20 complete and user identifies DB/LSM coupling as
@@ -392,11 +392,11 @@ the next maintainability and correctness risk.
 
 - The LSM core boundary spec is written and linked from the v1 protocol.
 - `Db` remains responsible for WAL, manifest publish, process lock, recovery,
-  background worker lifecycle, snapshots, transactions, and cross-keyspace
+  background worker lifecycle, snapshots, transactions, and cross-bucket
   atomicity.
 - `LsmTree` owns active and immutable memtables, table layout, tree-local reads,
   range tombstones, flush planning, compaction planning, and MVCC retention for
-  one keyspace as the extraction progresses.
+  one bucket as the extraction progresses.
 - In-memory mode continues to use the same LSM core.
 - Public API and storage formats remain unchanged.
 - Full local Rust verification passes after each extraction slice.
@@ -429,7 +429,7 @@ Tree Version boundary as the next core LSM risk.
 
 **Status**: Complete
 
-**Goal**: Harden memtable accounting, keyspace-local freeze behavior, and
+**Goal**: Harden memtable accounting, bucket-local freeze behavior, and
 immutable queue pressure before deeper table and compaction optimizations.
 
 **Entry Condition**: Phase 22 complete and user review identifies P3 as the
@@ -438,7 +438,7 @@ next LSM tree improvement after versioned level layout.
 **Acceptance Gate**:
 
 - Memtable byte accounting no longer needs whole-map scans on normal writes.
-- Freeze/flush pressure is tree-local and does not move unrelated keyspaces.
+- Freeze/flush pressure is tree-local and does not move unrelated buckets.
 - Immutable memtable queue pressure and write backpressure are tested.
 - In-memory mode follows the same logical LSM path.
 - Existing public API and storage formats remain unchanged.
@@ -593,4 +593,25 @@ open.
   model.
 - Existing crash/reopen, corruption, long scan, and benchmark gates remain in
   the verification list.
+- Full local Rust verification passes.
+
+### Phase 31: Default Bucket API Polish
+
+**Status**: Complete
+
+**Goal**: Make the common public API operate directly on a built-in default
+bucket and rename optional named namespaces to buckets.
+
+**Entry Condition**: Phase 30 complete and user requests the default-bucket API
+shape before release.
+
+**Acceptance Gate**:
+
+- `Db::put/get/range/prefix` operate on the default bucket without an explicit
+  bucket open.
+- `Db::open_bucket` and `Db::open_bucket_with_options` support optional named
+  buckets.
+- `BucketOptions` replaces the public options type for bucket configuration.
+- The default bucket exists in memory and persistent modes after open.
+- Protocol, usage docs, examples, tests, and benches use bucket terminology.
 - Full local Rust verification passes.

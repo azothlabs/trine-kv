@@ -46,7 +46,9 @@ Rules:
 - **Internal key**: encoded key used inside memtables and SSTables.
 - **Sequence**: monotonic commit number assigned by Trine.
 - **Snapshot sequence**: read boundary for repeatable reads.
-- **Keyspace**: named ordered KV namespace, similar to a column family.
+- **Default bucket**: built-in ordered KV namespace addressed directly through
+  `Db`.
+- **Bucket**: optional named ordered KV namespace with independent options.
 - **Memtable**: mutable in-memory ordered table for recent writes.
 - **Immutable memtable**: frozen memtable waiting for flush.
 - **SSTable**: immutable sorted table file or in-memory table object.
@@ -98,7 +100,12 @@ The exact Rust names may evolve, but the v1 API must expose these concepts:
 ```rust
 Db::open(options) -> Result<Db>
 Db::memory(options) -> Result<Db>
-Db::keyspace(name, options) -> Result<Keyspace>
+Db::put(key, value) -> Result<()>
+Db::get(key) -> Result<Option<Value>>
+Db::range(range) -> Result<Iter>
+Db::prefix(prefix) -> Result<Iter>
+Db::open_bucket(name) -> Result<Bucket>
+Db::open_bucket_with_options(name, options) -> Result<Bucket>
 Db::persist(mode) -> Result<()>
 Db::flush() -> Result<()>
 Db::compact_range(range) -> Result<()>
@@ -106,24 +113,28 @@ Db::snapshot() -> Snapshot
 Db::transaction(options) -> Transaction
 Db::stats() -> DbStats
 
-Keyspace::get(key) -> Result<Option<Value>>
-Keyspace::insert(key, value) -> Result<()>
-Keyspace::remove(key) -> Result<()>
-Keyspace::range(range) -> Result<Iter>
-Keyspace::prefix(prefix) -> Result<Iter>
+Bucket::get(key) -> Result<Option<Value>>
+Bucket::put(key, value) -> Result<()>
+Bucket::delete(key) -> Result<()>
+Bucket::range(range) -> Result<Iter>
+Bucket::prefix(prefix) -> Result<Iter>
 
-WriteBatch::insert(keyspace, key, value)
-WriteBatch::remove(keyspace, key)
-WriteBatch::remove_range(keyspace, range)
+WriteBatch::put(bucket, key, value)
+WriteBatch::delete(bucket, key)
+WriteBatch::delete_range(bucket, range)
 Db::write(batch, write_options) -> Result<CommitInfo>
 ```
 
 API rules:
 
-- `Db`, `Keyspace`, and `Snapshot` handles are cloneable and thread-safe.
+- `Db`, `Bucket`, and `Snapshot` handles are cloneable and thread-safe.
+- the default bucket always exists and is the target for direct `Db` reads and
+  writes;
+- named buckets are optional and used for logical isolation or different
+  per-bucket options;
 - Iterators keep the read VersionSet alive.
 - Iterators are snapshot-consistent.
-- `WriteBatch` is atomic across keyspaces.
+- `WriteBatch` is atomic across buckets.
 - values returned by reads may borrow shared immutable buffers through an owned
   guard type; callers can copy to `Vec<u8>` when they need independent storage.
 - errors are explicit typed errors, not strings as the primary contract.
@@ -134,7 +145,7 @@ API rules:
 - ordering is lexicographic over user key bytes;
 - callers storing integers should encode them big-endian when numeric ordering
   matters;
-- empty keys are allowed unless a keyspace option forbids them;
+- empty keys are allowed unless a bucket option forbids them;
 - v1 supports values up to at least `u32::MAX` bytes in the format, though
   practical limits may be lower by configuration;
 - large value handling uses the same visible semantics as inline values.
@@ -206,7 +217,7 @@ sequence or none do.
 
 Rules:
 
-- a batch may touch multiple keyspaces;
+- a batch may touch multiple buckets;
 - a batch commit appends one WAL batch record;
 - a batch commit publishes one sequence;
 - batch commit is serialized through the writer coordinator.
@@ -223,14 +234,14 @@ It records:
 
 - point keys read;
 - key ranges read;
-- keyspace names read or written;
+- bucket names read or written;
 - writes staged by the transaction.
 
 Commit validation:
 
 - fail if any read key was modified after `txn.read_seq`;
 - fail if any read range overlaps a write committed after `txn.read_seq`;
-- fail if a keyspace required by the transaction was dropped or recreated after
+- fail if a bucket required by the transaction was dropped or recreated after
   `txn.read_seq`;
 - otherwise assign one new commit sequence and commit the staged write batch.
 
@@ -313,7 +324,7 @@ payload
 Payload includes:
 
 - database id;
-- keyspace id mapping version;
+- bucket id mapping version;
 - commit sequence;
 - batch operation count;
 - operation records;
@@ -383,7 +394,7 @@ Index rules:
 Filter rules:
 
 - each table may have point-key Bloom filters;
-- each table may have prefix filters when a keyspace prefix extractor is
+- each table may have prefix filters when a bucket prefix extractor is
   configured;
 - filters are partitionable by table key range for large tables;
 - filters are advisory only; false positives are allowed, false negatives are
@@ -409,10 +420,10 @@ Persistent read rule:
 ## 15. Prefix Extractors And Filters
 
 Prefix scan is a first-class operation. Prefix filtering must be designed into
-the table format and keyspace options instead of treated as a caller-side range
+the table format and bucket options instead of treated as a caller-side range
 hack.
 
-Keyspace prefix extractor:
+Bucket prefix extractor:
 
 ```text
 PrefixExtractor::FixedLen(n)
@@ -423,7 +434,7 @@ PrefixExtractor::Disabled
 
 Rules:
 
-- a keyspace declares at most one prefix extractor at a time;
+- a bucket declares at most one prefix extractor at a time;
 - prefix extractor changes are manifest edits and affect newly written tables;
 - existing tables retain the extractor id used when they were written;
 - prefix filters are stored per table or per partition;
@@ -523,7 +534,7 @@ Required behavior:
 - compressed blocks store codec id and uncompressed length;
 - checksum is checked before trusting decoded records;
 - a database must refuse to open if it needs a codec that is not available;
-- compression can be configured per keyspace; option changes affect newly
+- compression can be configured per bucket; option changes affect newly
   written tables and do not rewrite existing tables by themselves.
 
 V1 codec policy:
@@ -560,7 +571,7 @@ Blob { file_id, offset, len, checksum }
 
 The v1 complete target supports both inline values and separated blob values.
 Small values may stay inline. Large value threshold is configurable per
-keyspace.
+bucket.
 
 Rules:
 
@@ -575,8 +586,8 @@ The manifest stores a sequence of version edits.
 
 Version edit operations:
 
-- create keyspace;
-- update keyspace options;
+- create bucket;
+- update bucket options;
 - add table;
 - remove table;
 - add blob file;
@@ -602,7 +613,7 @@ Publish rules:
 Trine v1 uses leveled compaction:
 
 - L0 may contain overlapping flush outputs;
-- L1 and deeper levels are non-overlapping within a keyspace;
+- L1 and deeper levels are non-overlapping within a bucket;
 - reads check newer levels before older levels;
 - compaction picks input tables, merges sorted streams, writes new tables, and
   publishes a manifest edit.
@@ -625,11 +636,11 @@ Compaction must preserve:
 - versions needed by active snapshots;
 - point tombstones needed to hide lower-level records;
 - range tombstones needed to hide covered lower-level records;
-- keyspace boundaries.
+- bucket boundaries.
 - range tombstones may be clipped to output table key spans only when the
   compaction scope proves older covered data outside the span has been removed;
   a request over all user keys is still partial when the picker did not include
-  every live table in the keyspace;
+  every live table in the bucket;
   partial compaction must retain the original tombstone bounds.
 - point tombstones may be dropped only when the compaction input proves no
   older value for that user key can survive in another live table; partial
@@ -642,7 +653,7 @@ Version cleanup rules for a user key:
 - keep the newest version with `sequence <= oldest_active_snapshot_seq`;
 - drop older versions only when no active snapshot can read them;
 - drop point tombstones only when all older covered versions are removed from
-  the live keyspace, not merely from the selected input tables;
+  the live bucket, not merely from the selected input tables;
 - drop range tombstones only when all covered older versions are removed from
   the relevant compaction scope.
 
@@ -693,19 +704,23 @@ Iterator rules:
 - use `advance_to` rather than restarting from the beginning when a merge or
   range cursor can provide a position hint.
 
-## 23. Keyspaces
+## 23. Buckets
 
-A database may contain multiple keyspaces. A keyspace is an ordered KV namespace
-with independent LSM tables and options.
+A database always contains a default bucket. A database may also contain named
+buckets. Each bucket is an ordered KV namespace with independent LSM tables and
+options.
 
 Rules:
 
-- keyspace names map to stable numeric ids;
-- keyspace ids appear in WAL and manifest records;
-- cross-keyspace write batches are atomic;
-- keyspace creation and option changes are manifest edits;
-- dropping keyspaces requires snapshot-safe cleanup;
-- compaction does not merge tables across keyspaces.
+- direct `Db` read/write helpers target the default bucket;
+- the default bucket is built in and callers do not open it by name for common
+  usage;
+- bucket names map to stable numeric ids;
+- bucket ids appear in WAL and manifest records;
+- cross-bucket write batches are atomic;
+- bucket creation and option changes are manifest edits;
+- dropping buckets requires snapshot-safe cleanup;
+- compaction does not merge tables across buckets.
 
 ## 24. Caching
 
@@ -748,6 +763,7 @@ V1 options include:
 - storage mode;
 - create-if-missing;
 - read-only;
+- default bucket options;
 - durability default;
 - write buffer size;
 - max immutable memtables;
@@ -781,7 +797,7 @@ Errors are typed:
 - `Conflict`
 - `ReadOnly`
 - `Closed`
-- `KeyspaceMissing`
+- `BucketMissing`
 - `InvalidOptions`
 
 Library code must not panic for expected runtime errors. Panics are only
@@ -791,7 +807,7 @@ acceptable for internal invariant violations in tests or debug assertions.
 
 V1 exposes structured stats:
 
-- live keyspaces;
+- live buckets;
 - active snapshots;
 - memtable bytes;
 - immutable memtable count;
@@ -815,7 +831,7 @@ Correctness tests:
 
 - put/get/delete round trip;
 - atomic write batch success and failure;
-- cross-keyspace batch atomicity;
+- cross-bucket batch atomicity;
 - snapshot repeatable read;
 - snapshot survives compaction;
 - optimistic transaction conflict on point read;

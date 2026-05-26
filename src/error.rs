@@ -13,7 +13,7 @@ pub enum Error {
     Conflict { message: String },
     ReadOnly,
     Closed,
-    KeyspaceMissing { name: String },
+    BucketMissing { name: String },
     InvalidOptions { message: String },
     Unsupported { feature: &'static str },
 }
@@ -45,7 +45,7 @@ impl fmt::Display for Error {
             Self::Conflict { message } => write!(formatter, "transaction conflict: {message}"),
             Self::ReadOnly => formatter.write_str("database is read-only"),
             Self::Closed => formatter.write_str("database is closed"),
-            Self::KeyspaceMissing { name } => write!(formatter, "keyspace is missing: {name}"),
+            Self::BucketMissing { name } => write!(formatter, "bucket is missing: {name}"),
             Self::InvalidOptions { message } => write!(formatter, "invalid options: {message}"),
             Self::Unsupported { feature } => write!(formatter, "unsupported feature: {feature}"),
         }

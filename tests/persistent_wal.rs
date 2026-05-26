@@ -8,10 +8,10 @@ use std::{
 };
 
 use trine_kv::{
-    CompressionProfile, Db, DbOptions, DurabilityMode, Error, FailOnCorruptionPolicy, FilterPolicy,
-    IndexSearchPolicy, KeyRange, KeyspaceOptions, PrefixExtractor, PrefixFilterPolicy, Sequence,
-    TransactionOptions, WriteBatch, WriteOptions, blob, codec::CodecId, manifest, recovery, table,
-    wal,
+    BucketOptions, CompressionProfile, Db, DbOptions, DurabilityMode, Error,
+    FailOnCorruptionPolicy, FilterPolicy, IndexSearchPolicy, KeyRange, PrefixExtractor,
+    PrefixFilterPolicy, Sequence, TransactionOptions, WriteBatch, WriteOptions, blob,
+    codec::CodecId, manifest, recovery, table, wal,
 };
 
 fn temp_db_path(name: &str) -> PathBuf {
@@ -25,10 +25,10 @@ fn temp_db_path(name: &str) -> PathBuf {
 fn flushed_default_table_path(path: &std::path::Path, options: &DbOptions) -> PathBuf {
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
-        keyspace.insert(b"a", b"a1").expect("write a");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
+        bucket.put(b"a", b"a1").expect("write a");
         db.flush().expect("flush table");
     }
 
@@ -154,31 +154,31 @@ fn corruption_message(error: Error) -> String {
 }
 
 #[test]
-fn persistent_api_helpers_cover_open_options_and_keyspace_writes() {
+fn persistent_api_helpers_cover_open_options_and_bucket_writes() {
     let path = temp_db_path("api-helpers");
     let options = DbOptions::persistent(&path).with_durability(DurabilityMode::Flush);
-    let keyspace_options =
-        KeyspaceOptions::default().with_prefix_extractor(PrefixExtractor::Separator(b':'));
+    let bucket_options =
+        BucketOptions::default().with_prefix_extractor(PrefixExtractor::Separator(b':'));
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", keyspace_options.clone())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", bucket_options.clone())
+            .expect("bucket opens");
 
-        let insert_info = keyspace
-            .insert_with_options(b"user:001", b"Ada", WriteOptions::sync_all())
-            .expect("insert with options commits");
-        assert_eq!(insert_info.sequence(), Sequence::new(1));
+        let put_info = bucket
+            .put_with_options(b"user:001", b"Ada", WriteOptions::sync_all())
+            .expect("put with options commits");
+        assert_eq!(put_info.sequence(), Sequence::new(1));
 
-        keyspace
-            .insert_with_options(b"user:002", b"Lin", WriteOptions::flush())
-            .expect("second insert commits");
-        keyspace
-            .remove_with_options(b"user:002", WriteOptions::sync_data())
-            .expect("remove with options commits");
-        keyspace
-            .remove_range_with_options(
+        bucket
+            .put_with_options(b"user:002", b"Lin", WriteOptions::flush())
+            .expect("second put commits");
+        bucket
+            .delete_with_options(b"user:002", WriteOptions::sync_data())
+            .expect("delete with options commits");
+        bucket
+            .delete_range_with_options(
                 KeyRange::half_open(b"unused:000", b"unused:999"),
                 WriteOptions::buffered(),
             )
@@ -189,14 +189,14 @@ fn persistent_api_helpers_cover_open_options_and_keyspace_writes() {
 
     {
         let db = Db::open_read_only(&path).expect("read-only db opens");
-        let keyspace = db
-            .keyspace("default", keyspace_options.clone())
-            .expect("read-only keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", bucket_options.clone())
+            .expect("read-only bucket opens");
         assert_eq!(
-            keyspace.get(b"user:001").expect("user reads"),
+            bucket.get(b"user:001").expect("user reads"),
             Some(b"Ada".to_vec())
         );
-        assert_eq!(keyspace.get(b"user:002").expect("deleted user reads"), None);
+        assert_eq!(bucket.get(b"user:002").expect("deleted user reads"), None);
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");
@@ -209,33 +209,33 @@ fn persistent_wal_replays_point_and_range_batches() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
 
-        keyspace.insert(b"a", b"a1").expect("write a");
-        keyspace.insert(b"b", b"b1").expect("write b");
-        keyspace.insert(b"c", b"c1").expect("write c");
-        keyspace.remove(b"b").expect("delete b");
-        keyspace
-            .remove_range(KeyRange::half_open(b"c", b"d"))
+        bucket.put(b"a", b"a1").expect("write a");
+        bucket.put(b"b", b"b1").expect("write b");
+        bucket.put(b"c", b"c1").expect("write c");
+        bucket.delete(b"b").expect("delete b");
+        bucket
+            .delete_range(KeyRange::half_open(b"c", b"d"))
             .expect("range delete c");
         db.persist(DurabilityMode::Flush).expect("flush WAL");
     }
 
     {
         let db = Db::open(options).expect("persistent db reopens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace reopens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket reopens");
 
-        assert_eq!(db.stats().live_keyspaces, 1);
-        assert_eq!(keyspace.get(b"a").expect("a replays"), Some(b"a1".to_vec()));
-        assert_eq!(keyspace.get(b"b").expect("b delete replays"), None);
-        assert_eq!(keyspace.get(b"c").expect("range delete replays"), None);
+        assert_eq!(db.stats().live_buckets, 1);
+        assert_eq!(bucket.get(b"a").expect("a replays"), Some(b"a1".to_vec()));
+        assert_eq!(bucket.get(b"b").expect("b delete replays"), None);
+        assert_eq!(bucket.get(b"c").expect("range delete replays"), None);
 
         let mut batch = WriteBatch::new();
-        batch.insert("default", b"d", b"d1");
+        batch.put("default", b"d", b"d1");
         let info = db
             .write(
                 batch,
@@ -251,37 +251,37 @@ fn persistent_wal_replays_point_and_range_batches() {
 }
 
 #[test]
-fn persistent_wal_replays_cross_keyspace_batch() {
-    let path = temp_db_path("cross-keyspace");
+fn persistent_wal_replays_cross_bucket_batch() {
+    let path = temp_db_path("cross-bucket");
     let options = DbOptions::persistent(&path);
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        db.keyspace("users", KeyspaceOptions::default())
-            .expect("users keyspace opens");
-        db.keyspace("posts", KeyspaceOptions::default())
-            .expect("posts keyspace opens");
+        db.open_bucket_with_options("users", BucketOptions::default())
+            .expect("users bucket opens");
+        db.open_bucket_with_options("posts", BucketOptions::default())
+            .expect("posts bucket opens");
 
         let mut batch = WriteBatch::new();
-        batch.insert("users", b"1", b"ada");
-        batch.insert("posts", b"1", b"hello");
+        batch.put("users", b"1", b"ada");
+        batch.put("posts", b"1", b"hello");
         db.write(
             batch,
             WriteOptions {
                 durability: DurabilityMode::Flush,
             },
         )
-        .expect("cross-keyspace batch commits");
+        .expect("cross-bucket batch commits");
     }
 
     {
         let db = Db::open(options).expect("persistent db reopens");
         let users = db
-            .keyspace("users", KeyspaceOptions::default())
-            .expect("users keyspace reopens");
+            .open_bucket_with_options("users", BucketOptions::default())
+            .expect("users bucket reopens");
         let posts = db
-            .keyspace("posts", KeyspaceOptions::default())
-            .expect("posts keyspace reopens");
+            .open_bucket_with_options("posts", BucketOptions::default())
+            .expect("posts bucket reopens");
 
         assert_eq!(
             users.get(b"1").expect("users replay"),
@@ -297,10 +297,10 @@ fn persistent_wal_replays_cross_keyspace_batch() {
 }
 
 #[test]
-fn persistent_manifest_keeps_keyspace_options_across_reopen() {
-    let path = temp_db_path("manifest-keyspace-options");
+fn persistent_manifest_keeps_bucket_options_across_reopen() {
+    let path = temp_db_path("manifest-bucket-options");
     let options = DbOptions::persistent(&path);
-    let keyspace_options = KeyspaceOptions {
+    let bucket_options = BucketOptions {
         allow_empty_keys: false,
         compression: CompressionProfile::Fast,
         block_bytes: 4096,
@@ -313,37 +313,34 @@ fn persistent_manifest_keeps_keyspace_options_across_reopen() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("users", keyspace_options.clone())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("users", bucket_options.clone())
+            .expect("bucket opens");
 
-        keyspace.insert(b"user:1", b"ada").expect("write user row");
+        bucket.put(b"user:1", b"ada").expect("write user row");
         db.persist(DurabilityMode::Flush).expect("flush WAL");
     }
 
     let manifest_state =
         manifest::read_manifest(&manifest::manifest_path(&path)).expect("manifest reads");
     assert_eq!(manifest_state.wal_replay_floor(), Sequence::ZERO);
-    assert_eq!(
-        manifest_state.keyspaces().get("users"),
-        Some(&keyspace_options)
-    );
+    assert_eq!(manifest_state.buckets().get("users"), Some(&bucket_options));
 
     {
         let db = Db::open(options).expect("persistent db reopens");
-        assert_eq!(db.stats().live_keyspaces, 1);
+        assert_eq!(db.stats().live_buckets, 2);
 
-        let keyspace = db
-            .keyspace("users", keyspace_options)
-            .expect("keyspace reopens with manifest options");
+        let bucket = db
+            .open_bucket_with_options("users", bucket_options)
+            .expect("bucket reopens with manifest options");
         assert_eq!(
-            keyspace.get(b"user:1").expect("user row replays"),
+            bucket.get(b"user:1").expect("user row replays"),
             Some(b"ada".to_vec())
         );
 
         let error = db
-            .keyspace("users", KeyspaceOptions::default())
-            .expect_err("wrong keyspace options are rejected");
+            .open_bucket_with_options("users", BucketOptions::default())
+            .expect_err("wrong bucket options are rejected");
         assert!(matches!(error, Error::InvalidOptions { .. }));
     }
 
@@ -410,10 +407,7 @@ fn persistent_read_only_open_does_not_take_writer_lock() {
 
     {
         let db = Db::open(options.clone()).expect("writer opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
-        keyspace.insert(b"a", b"a1").expect("write row");
+        db.put(b"a", b"a1").expect("write row");
         db.persist(DurabilityMode::Flush).expect("flush WAL");
     }
 
@@ -429,11 +423,8 @@ fn persistent_read_only_open_does_not_take_writer_lock() {
     let writer = Db::open(options).expect("writer opens while read-only handle exists");
     assert!(lock_path.exists());
 
-    let keyspace = read_only_db
-        .keyspace("default", KeyspaceOptions::default())
-        .expect("read-only keyspace opens");
     assert_eq!(
-        keyspace.get(b"a").expect("read-only row reads"),
+        read_only_db.get(b"a").expect("read-only row reads"),
         Some(b"a1".to_vec())
     );
 
@@ -467,10 +458,10 @@ fn persistent_recovery_repairs_safe_temporary_files_and_writes_report() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
-        keyspace.insert(b"a", b"a1").expect("write row");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
+        bucket.put(b"a", b"a1").expect("write row");
         db.flush().expect("flush table");
     }
 
@@ -486,11 +477,11 @@ fn persistent_recovery_repairs_safe_temporary_files_and_writes_report() {
     options.fail_on_corruption = FailOnCorruptionPolicy::RepairSafeTemporaryFiles;
     {
         let db = Db::open(options).expect("repair recovery opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace reopens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket reopens");
         assert_eq!(
-            keyspace.get(b"a").expect("row survives repair"),
+            bucket.get(b"a").expect("row survives repair"),
             Some(b"a1".to_vec())
         );
     }
@@ -521,10 +512,10 @@ fn persistent_recovery_fails_closed_on_unreferenced_table_file() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
-        keyspace.insert(b"a", b"a1").expect("write row");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
+        bucket.put(b"a", b"a1").expect("write row");
         db.flush().expect("flush table");
 
         let manifest_state =
@@ -557,18 +548,18 @@ fn persistent_recovery_fails_closed_on_unreferenced_table_file() {
 fn persistent_recovery_fails_closed_on_unreferenced_blob_file_even_with_temp_repair_policy() {
     let path = temp_db_path("recovery-unreferenced-blob");
     let mut options = DbOptions::persistent(&path);
-    let keyspace_options = KeyspaceOptions {
+    let bucket_options = BucketOptions {
         blob_threshold_bytes: 8,
-        ..KeyspaceOptions::default()
+        ..BucketOptions::default()
     };
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", keyspace_options.clone())
-            .expect("keyspace opens");
-        keyspace
-            .insert(b"a", b"large-value-a-large-value-a".to_vec())
+        let bucket = db
+            .open_bucket_with_options("default", bucket_options.clone())
+            .expect("bucket opens");
+        bucket
+            .put(b"a", b"large-value-a-large-value-a".to_vec())
             .expect("write blob value");
         db.flush().expect("flush blob table");
     }
@@ -598,8 +589,8 @@ fn persistent_recovery_fails_closed_on_malformed_formal_storage_file_name() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        db.keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
+        db.open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
     }
 
     write_file(&malformed_table_path, b"not a valid table file");
@@ -616,22 +607,20 @@ fn persistent_recovery_fails_closed_on_malformed_formal_storage_file_name() {
 }
 
 #[test]
-fn persistent_wal_rejects_keyspace_missing_from_manifest() {
-    let path = temp_db_path("wal-missing-manifest-keyspace");
+fn persistent_wal_rejects_bucket_missing_from_manifest() {
+    let path = temp_db_path("wal-missing-manifest-bucket");
     let options = DbOptions::persistent(&path);
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
-        keyspace.insert(b"a", b"a1").expect("write a");
+        let bucket = db.open_bucket("users").expect("bucket opens");
+        bucket.put(b"a", b"a1").expect("write a");
         db.persist(DurabilityMode::Flush).expect("flush WAL");
     }
 
     fs::remove_file(manifest::manifest_path(&path)).expect("remove manifest");
 
-    let error = Db::open(options).expect_err("WAL cannot recreate a missing manifest keyspace");
+    let error = Db::open(options).expect_err("WAL cannot recreate a missing manifest bucket");
     assert!(matches!(error, Error::Corruption { .. }));
 
     fs::remove_dir_all(path).expect("cleanup test db");
@@ -644,26 +633,26 @@ fn persistent_flush_writes_table_and_reopen_can_skip_wal() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
 
-        keyspace.insert(b"a", b"a1").expect("write a");
-        keyspace.insert(b"b", b"b1").expect("write b");
-        keyspace.insert(b"c", b"c1").expect("write c");
-        keyspace.remove(b"b").expect("delete b");
-        keyspace
-            .remove_range(KeyRange::half_open(b"c", b"d"))
+        bucket.put(b"a", b"a1").expect("write a");
+        bucket.put(b"b", b"b1").expect("write b");
+        bucket.put(b"c", b"c1").expect("write c");
+        bucket.delete(b"b").expect("delete b");
+        bucket
+            .delete_range(KeyRange::half_open(b"c", b"d"))
             .expect("range delete c");
 
         db.flush().expect("flush memtable to table");
         assert_eq!(
-            keyspace.get(b"a").expect("a reads from table"),
+            bucket.get(b"a").expect("a reads from table"),
             Some(b"a1".to_vec())
         );
-        assert_eq!(keyspace.get(b"b").expect("b delete reads from table"), None);
+        assert_eq!(bucket.get(b"b").expect("b delete reads from table"), None);
         assert_eq!(
-            keyspace.get(b"c").expect("range delete reads from table"),
+            bucket.get(b"c").expect("range delete reads from table"),
             None
         );
     }
@@ -689,25 +678,22 @@ fn persistent_flush_writes_table_and_reopen_can_skip_wal() {
 
     {
         let db = Db::open(options).expect("persistent db reopens from table");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace reopens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket reopens");
 
         assert_eq!(
-            keyspace.get(b"a").expect("a reads after reopen"),
+            bucket.get(b"a").expect("a reads after reopen"),
             Some(b"a1".to_vec())
         );
+        assert_eq!(bucket.get(b"b").expect("b delete reads after reopen"), None);
         assert_eq!(
-            keyspace.get(b"b").expect("b delete reads after reopen"),
-            None
-        );
-        assert_eq!(
-            keyspace.get(b"c").expect("range delete reads after reopen"),
+            bucket.get(b"c").expect("range delete reads after reopen"),
             None
         );
 
         let mut batch = WriteBatch::new();
-        batch.insert("default", b"d", b"d1");
+        batch.put("default", b"d", b"d1");
         let info = db
             .write(
                 batch,
@@ -731,25 +717,25 @@ fn persistent_write_buffer_freezes_active_memtable_and_reads_immutable() {
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
 
-        keyspace.insert(b"user:1", b"ada").expect("write user");
+        bucket.put(b"user:1", b"ada").expect("write user");
 
         let stats = db.stats();
         assert_eq!(stats.immutable_memtables, 1);
         assert_eq!(stats.total_tables, 0);
         assert_eq!(
-            keyspace.get(b"user:1").expect("point read sees immutable"),
+            bucket.get(b"user:1").expect("point read sees immutable"),
             Some(b"ada".to_vec())
         );
         assert_eq!(
-            collect_rows(keyspace.range(&KeyRange::all()).expect("range reads")),
+            collect_rows(bucket.range(&KeyRange::all()).expect("range reads")),
             vec![(b"user:1".to_vec(), b"ada".to_vec())]
         );
         assert_eq!(
-            collect_rows(keyspace.prefix(b"user:").expect("prefix reads")),
+            collect_rows(bucket.prefix(b"user:").expect("prefix reads")),
             vec![(b"user:1".to_vec(), b"ada".to_vec())]
         );
     }
@@ -758,8 +744,8 @@ fn persistent_write_buffer_freezes_active_memtable_and_reads_immutable() {
 }
 
 #[test]
-fn persistent_write_buffer_freezes_only_large_keyspace() {
-    let path = temp_db_path("write-buffer-keyspace-local-freeze");
+fn persistent_write_buffer_freezes_only_large_bucket() {
+    let path = temp_db_path("write-buffer-bucket-local-freeze");
     let mut options = DbOptions::persistent(&path);
     options.write_buffer_bytes = 40;
     options.max_immutable_memtables = 4;
@@ -767,17 +753,17 @@ fn persistent_write_buffer_freezes_only_large_keyspace() {
     {
         let db = Db::open(options).expect("persistent db opens");
         let cold = db
-            .keyspace("cold", KeyspaceOptions::default())
-            .expect("cold keyspace opens");
+            .open_bucket_with_options("cold", BucketOptions::default())
+            .expect("cold bucket opens");
         let hot = db
-            .keyspace("hot", KeyspaceOptions::default())
-            .expect("hot keyspace opens");
+            .open_bucket_with_options("hot", BucketOptions::default())
+            .expect("hot bucket opens");
 
-        cold.insert(b"c", b"v").expect("cold write stays active");
+        cold.put(b"c", b"v").expect("cold write stays active");
         assert_eq!(db.stats().immutable_memtables, 0);
 
-        hot.insert(b"h", vec![b'x'; 80])
-            .expect("hot write freezes hot keyspace");
+        hot.put(b"h", vec![b'x'; 80])
+            .expect("hot write freezes hot bucket");
         let stats = db.stats();
         assert_eq!(stats.immutable_memtables, 1);
         assert_eq!(stats.total_tables, 0);
@@ -795,8 +781,8 @@ fn persistent_write_buffer_freezes_only_large_keyspace() {
 }
 
 #[test]
-fn persistent_immutable_pressure_flushes_only_pressure_keyspaces() {
-    let path = temp_db_path("immutable-pressure-keyspace-local-flush");
+fn persistent_immutable_pressure_flushes_only_pressure_buckets() {
+    let path = temp_db_path("immutable-pressure-bucket-local-flush");
     let mut options = DbOptions::persistent(&path);
     options.write_buffer_bytes = 1;
     options.max_immutable_memtables = 2;
@@ -804,22 +790,21 @@ fn persistent_immutable_pressure_flushes_only_pressure_keyspaces() {
     {
         let db = Db::open(options).expect("persistent db opens");
         let cold = db
-            .keyspace("cold", KeyspaceOptions::default())
-            .expect("cold keyspace opens");
+            .open_bucket_with_options("cold", BucketOptions::default())
+            .expect("cold bucket opens");
         let hot = db
-            .keyspace("hot", KeyspaceOptions::default())
-            .expect("hot keyspace opens");
+            .open_bucket_with_options("hot", BucketOptions::default())
+            .expect("hot bucket opens");
 
-        cold.insert(b"cold", b"c1")
-            .expect("cold write freezes once");
-        hot.insert(b"h1", b"v1").expect("hot write freezes once");
-        hot.insert(b"h2", b"v2")
+        cold.put(b"cold", b"c1").expect("cold write freezes once");
+        hot.put(b"h1", b"v1").expect("hot write freezes once");
+        hot.put(b"h2", b"v2")
             .expect("hot reaches immutable pressure");
         assert_eq!(db.stats().immutable_memtables, 3);
         assert_eq!(db.stats().total_tables, 0);
 
-        hot.insert(b"h3", b"v3")
-            .expect("hot pressure flushes hot keyspace first");
+        hot.put(b"h3", b"v3")
+            .expect("hot pressure flushes hot bucket first");
         let stats = db.stats();
         assert_eq!(
             stats.total_tables, 2,
@@ -855,22 +840,22 @@ fn persistent_immutable_range_tombstone_hides_point_records() {
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
 
-        keyspace.insert(b"k1", b"v1").expect("write k1");
-        keyspace
-            .remove_range(KeyRange::half_open(b"k", b"l"))
+        bucket.put(b"k1", b"v1").expect("write k1");
+        bucket
+            .delete_range(KeyRange::half_open(b"k", b"l"))
             .expect("range delete freezes");
 
         assert_eq!(
-            keyspace
+            bucket
                 .get(b"k1")
                 .expect("point read checks immutable tombstone"),
             None
         );
-        assert!(collect_rows(keyspace.range(&KeyRange::all()).expect("range reads")).is_empty());
+        assert!(collect_rows(bucket.range(&KeyRange::all()).expect("range reads")).is_empty());
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");
@@ -885,19 +870,19 @@ fn persistent_immutable_pressure_flushes_before_next_write_and_keeps_new_wal_bat
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
 
-        let first = keyspace
-            .insert_with_options(b"a", b"a1", WriteOptions::sync_all())
+        let first = bucket
+            .put_with_options(b"a", b"a1", WriteOptions::sync_all())
             .expect("first write freezes");
         assert_eq!(first.sequence(), Sequence::new(1));
         assert_eq!(db.stats().immutable_memtables, 1);
         assert_eq!(db.stats().total_tables, 0);
 
-        let second = keyspace
-            .insert_with_options(b"b", b"b1", WriteOptions::sync_all())
+        let second = bucket
+            .put_with_options(b"b", b"b1", WriteOptions::sync_all())
             .expect("second write flushes pressure first");
         assert_eq!(second.sequence(), Sequence::new(2));
 
@@ -905,11 +890,11 @@ fn persistent_immutable_pressure_flushes_before_next_write_and_keeps_new_wal_bat
         assert_eq!(stats.total_tables, 1);
         assert_eq!(stats.immutable_memtables, 1);
         assert_eq!(
-            keyspace.get(b"a").expect("flushed row reads"),
+            bucket.get(b"a").expect("flushed row reads"),
             Some(b"a1".to_vec())
         );
         assert_eq!(
-            keyspace.get(b"b").expect("new immutable row reads"),
+            bucket.get(b"b").expect("new immutable row reads"),
             Some(b"b1".to_vec())
         );
 
@@ -928,15 +913,15 @@ fn persistent_immutable_pressure_flushes_before_next_write_and_keeps_new_wal_bat
 
     {
         let db = Db::open(options).expect("persistent db reopens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace reopens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket reopens");
         assert_eq!(
-            keyspace.get(b"a").expect("flushed row survives reopen"),
+            bucket.get(b"a").expect("flushed row survives reopen"),
             Some(b"a1".to_vec())
         );
         assert_eq!(
-            keyspace.get(b"b").expect("WAL row survives reopen"),
+            bucket.get(b"b").expect("WAL row survives reopen"),
             Some(b"b1".to_vec())
         );
     }
@@ -953,10 +938,10 @@ fn persistent_transaction_conflict_checks_immutable_memtables() {
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
-        keyspace.insert(b"a", b"a1").expect("write first value");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
+        bucket.put(b"a", b"a1").expect("write first value");
 
         let mut txn = db.transaction(TransactionOptions::default());
         assert_eq!(
@@ -964,10 +949,8 @@ fn persistent_transaction_conflict_checks_immutable_memtables() {
             Some(b"a1".to_vec())
         );
 
-        keyspace
-            .insert(b"a", b"a2")
-            .expect("write conflicting value");
-        txn.insert("default", b"b", b"b1");
+        bucket.put(b"a", b"a2").expect("write conflicting value");
+        txn.put("default", b"b", b"b1");
         let error = txn
             .commit()
             .expect_err("immutable memtable update should conflict");
@@ -981,20 +964,18 @@ fn persistent_transaction_conflict_checks_immutable_memtables() {
 fn persistent_flush_publish_failure_removes_unpublished_table_and_blob_files() {
     let path = temp_db_path("flush-publish-cleanup");
     let options = DbOptions::persistent(&path);
-    let keyspace_options = KeyspaceOptions {
+    let bucket_options = BucketOptions {
         blob_threshold_bytes: 8,
-        ..KeyspaceOptions::default()
+        ..BucketOptions::default()
     };
     let value = b"large-value-a-large-value-a".to_vec();
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", keyspace_options.clone())
-            .expect("keyspace opens");
-        keyspace
-            .insert(b"a", value.clone())
-            .expect("write blob value");
+        let bucket = db
+            .open_bucket_with_options("default", bucket_options.clone())
+            .expect("bucket opens");
+        bucket.put(b"a", value.clone()).expect("write blob value");
 
         let manifest_tmp_dir = manifest::manifest_path(&path).with_extension("tmp");
         fs::create_dir(&manifest_tmp_dir).expect("block manifest tmp path");
@@ -1010,7 +991,7 @@ fn persistent_flush_publish_failure_removes_unpublished_table_and_blob_files() {
             "failed flush should remove unpublished blob files"
         );
         assert_eq!(
-            keyspace
+            bucket
                 .get(b"a")
                 .expect("memtable row survives failed flush"),
             Some(value)
@@ -1029,13 +1010,13 @@ fn persistent_compaction_levels_preserve_newer_l0_reads() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
 
-        keyspace.insert(b"a", b"old-a").expect("write old a");
+        bucket.put(b"a", b"old-a").expect("write old a");
         db.flush().expect("flush first L0 table");
-        keyspace.insert(b"b", b"old-b").expect("write b");
+        bucket.put(b"b", b"old-b").expect("write b");
         db.flush().expect("flush second L0 table");
         assert_eq!(default_table_levels(&path), vec![0, 0]);
 
@@ -1043,15 +1024,15 @@ fn persistent_compaction_levels_preserve_newer_l0_reads() {
             .expect("compact L0 tables");
         assert_eq!(default_table_levels(&path), vec![1]);
         assert_eq!(
-            keyspace.get(b"a").expect("compacted a reads"),
+            bucket.get(b"a").expect("compacted a reads"),
             Some(b"old-a".to_vec())
         );
 
-        keyspace.insert(b"a", b"new-a").expect("write newer L0 a");
+        bucket.put(b"a", b"new-a").expect("write newer L0 a");
         db.flush().expect("flush newer L0 table");
         assert_eq!(default_table_levels(&path), vec![0, 1]);
         assert_eq!(
-            keyspace.get(b"a").expect("newer L0 a reads"),
+            bucket.get(b"a").expect("newer L0 a reads"),
             Some(b"new-a".to_vec())
         );
 
@@ -1059,7 +1040,7 @@ fn persistent_compaction_levels_preserve_newer_l0_reads() {
             .expect("compact L0 into L1");
         assert_eq!(default_table_levels(&path), vec![1]);
         assert_eq!(
-            keyspace
+            bucket
                 .get(b"a")
                 .expect("newer a survives second compaction"),
             Some(b"new-a".to_vec())
@@ -1068,16 +1049,16 @@ fn persistent_compaction_levels_preserve_newer_l0_reads() {
 
     {
         let db = Db::open(options).expect("persistent db reopens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace reopens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket reopens");
         assert_eq!(default_table_levels(&path), vec![1]);
         assert_eq!(
-            keyspace.get(b"a").expect("newer L0 a reopens"),
+            bucket.get(b"a").expect("newer L0 a reopens"),
             Some(b"new-a".to_vec())
         );
         assert_eq!(
-            keyspace.get(b"b").expect("compacted b reopens"),
+            bucket.get(b"b").expect("compacted b reopens"),
             Some(b"old-b".to_vec())
         );
     }
@@ -1093,11 +1074,11 @@ fn persistent_single_l0_compaction_moves_table_without_rewrite() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
 
-        keyspace.insert(b"a", b"a1").expect("write a");
+        bucket.put(b"a", b"a1").expect("write a");
         db.flush().expect("flush L0 table");
         before_table_ids = default_table_ids(&path);
         assert_eq!(default_table_levels(&path), vec![0]);
@@ -1109,7 +1090,7 @@ fn persistent_single_l0_compaction_moves_table_without_rewrite() {
         assert_eq!(default_table_levels(&path), vec![1]);
         assert_eq!(table_file_paths(&path).len(), 1);
         assert_eq!(
-            keyspace.get(b"a").expect("moved table reads"),
+            bucket.get(b"a").expect("moved table reads"),
             Some(b"a1".to_vec())
         );
         let stats = db.stats();
@@ -1122,13 +1103,13 @@ fn persistent_single_l0_compaction_moves_table_without_rewrite() {
 
     {
         let db = Db::open(options).expect("persistent db reopens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace reopens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket reopens");
         assert_eq!(default_table_ids(&path), before_table_ids);
         assert_eq!(default_table_levels(&path), vec![1]);
         assert_eq!(
-            keyspace.get(b"a").expect("moved table reopens"),
+            bucket.get(b"a").expect("moved table reopens"),
             Some(b"a1".to_vec())
         );
     }
@@ -1144,46 +1125,46 @@ fn persistent_flush_auto_compacts_when_l0_pressure_exceeds_limit() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
 
-        keyspace.insert(b"a", b"a1").expect("write a");
+        bucket.put(b"a", b"a1").expect("write a");
         db.flush().expect("first flush stays L0");
         assert_eq!(default_table_levels(&path), vec![0]);
 
-        keyspace.insert(b"b", b"b1").expect("write b");
+        bucket.put(b"b", b"b1").expect("write b");
         db.flush().expect("second flush triggers compaction");
         assert_eq!(default_table_levels(&path), vec![1]);
         assert_eq!(
-            keyspace.get(b"a").expect("a reads after auto compaction"),
+            bucket.get(b"a").expect("a reads after auto compaction"),
             Some(b"a1".to_vec())
         );
         assert_eq!(
-            keyspace.get(b"b").expect("b reads after auto compaction"),
+            bucket.get(b"b").expect("b reads after auto compaction"),
             Some(b"b1".to_vec())
         );
 
-        keyspace.insert(b"a", b"a2").expect("write newer a");
+        bucket.put(b"a", b"a2").expect("write newer a");
         db.flush().expect("new L0 below pressure limit");
         assert_eq!(default_table_levels(&path), vec![0, 1]);
         assert_eq!(
-            keyspace.get(b"a").expect("newer a reads over L1"),
+            bucket.get(b"a").expect("newer a reads over L1"),
             Some(b"a2".to_vec())
         );
     }
 
     {
         let db = Db::open(options).expect("persistent db reopens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace reopens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket reopens");
         assert_eq!(default_table_levels(&path), vec![0, 1]);
         assert_eq!(
-            keyspace.get(b"a").expect("newer a reopens"),
+            bucket.get(b"a").expect("newer a reopens"),
             Some(b"a2".to_vec())
         );
-        assert_eq!(keyspace.get(b"b").expect("b reopens"), Some(b"b1".to_vec()));
+        assert_eq!(bucket.get(b"b").expect("b reopens"), Some(b"b1".to_vec()));
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");
@@ -1200,27 +1181,27 @@ fn persistent_background_workers_flush_and_compact_pressure() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
 
-        keyspace.insert(b"a", b"a1").expect("write a");
+        bucket.put(b"a", b"a1").expect("write a");
         wait_until("background flush of first immutable memtable", || {
             let stats = db.stats();
             stats.total_tables == 1 && stats.immutable_memtables == 0
         });
 
-        keyspace.insert(b"b", b"b1").expect("write b");
+        bucket.put(b"b", b"b1").expect("write b");
         wait_until("background compaction after L0 pressure", || {
             default_table_levels(&path) == vec![1]
         });
 
         assert_eq!(
-            keyspace.get(b"a").expect("a reads after background work"),
+            bucket.get(b"a").expect("a reads after background work"),
             Some(b"a1".to_vec())
         );
         assert_eq!(
-            keyspace.get(b"b").expect("b reads after background work"),
+            bucket.get(b"b").expect("b reads after background work"),
             Some(b"b1".to_vec())
         );
         db.close();
@@ -1228,12 +1209,12 @@ fn persistent_background_workers_flush_and_compact_pressure() {
 
     {
         let db = Db::open(options).expect("persistent db reopens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace reopens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket reopens");
         assert_eq!(default_table_levels(&path), vec![1]);
-        assert_eq!(keyspace.get(b"a").expect("a reopens"), Some(b"a1".to_vec()));
-        assert_eq!(keyspace.get(b"b").expect("b reopens"), Some(b"b1".to_vec()));
+        assert_eq!(bucket.get(b"a").expect("a reopens"), Some(b"a1".to_vec()));
+        assert_eq!(bucket.get(b"b").expect("b reopens"), Some(b"b1".to_vec()));
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");
@@ -1249,19 +1230,19 @@ fn persistent_background_maintenance_error_surfaces_to_later_write() {
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
 
         let manifest_tmp_dir = manifest::manifest_path(&path).with_extension("tmp");
         fs::create_dir(&manifest_tmp_dir).expect("block manifest tmp path");
-        keyspace.insert(b"a", b"a1").expect("write schedules flush");
+        bucket.put(b"a", b"a1").expect("write schedules flush");
 
         let mut surfaced = false;
         for index in 0..100 {
             thread::sleep(std::time::Duration::from_millis(20));
             let key = format!("probe-{index:03}").into_bytes();
-            match keyspace.insert(key, b"value") {
+            match bucket.put(key, b"value") {
                 Err(Error::Corruption { message })
                     if message.contains("background maintenance failed") =>
                 {
@@ -1290,28 +1271,28 @@ fn persistent_compaction_splits_outputs_and_moves_overfull_l1_down() {
     let mut options = DbOptions::persistent(&path);
     options.target_table_bytes = 240;
     options.level_size_multiplier = 2;
-    let keyspace_options = KeyspaceOptions {
+    let bucket_options = BucketOptions {
         compression: CompressionProfile::None,
         block_bytes: 256,
-        ..KeyspaceOptions::default()
+        ..BucketOptions::default()
     };
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", keyspace_options.clone())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", bucket_options.clone())
+            .expect("bucket opens");
 
         for index in 0..30 {
             let key = format!("key-{index:03}").into_bytes();
             let value = format!("value-{index:03}-{}", "x".repeat(48)).into_bytes();
-            keyspace.insert(key, value).expect("write first batch");
+            bucket.put(key, value).expect("write first batch");
         }
         db.flush().expect("flush first L0 table");
         for index in 30..60 {
             let key = format!("key-{index:03}").into_bytes();
             let value = format!("value-{index:03}-{}", "y".repeat(48)).into_bytes();
-            keyspace.insert(key, value).expect("write second batch");
+            bucket.put(key, value).expect("write second batch");
         }
         db.flush().expect("flush second L0 table");
 
@@ -1333,24 +1314,21 @@ fn persistent_compaction_splits_outputs_and_moves_overfull_l1_down() {
         for index in [0, 17, 30, 59] {
             let key = format!("key-{index:03}").into_bytes();
             let expected_prefix = format!("value-{index:03}-").into_bytes();
-            let value = keyspace
-                .get(&key)
-                .expect("value reads")
-                .expect("key exists");
+            let value = bucket.get(&key).expect("value reads").expect("key exists");
             assert!(value.starts_with(&expected_prefix));
         }
     }
 
     {
         let db = Db::open(options).expect("persistent db reopens");
-        let keyspace = db
-            .keyspace("default", keyspace_options)
-            .expect("keyspace reopens");
+        let bucket = db
+            .open_bucket_with_options("default", bucket_options)
+            .expect("bucket reopens");
         let levels = default_table_levels(&path);
         assert!(levels.contains(&1));
         assert!(levels.contains(&2));
         assert_eq!(
-            keyspace.get(b"key-059").expect("latest key reopens"),
+            bucket.get(b"key-059").expect("latest key reopens"),
             Some(format!("value-059-{}", "y".repeat(48)).into_bytes())
         );
     }
@@ -1363,22 +1341,20 @@ fn persistent_stats_report_tables_blobs_and_compactions() {
     let path = temp_db_path("live-stats");
     let mut options = DbOptions::persistent(&path);
     options.max_l0_files = 1;
-    let keyspace_options = KeyspaceOptions {
+    let bucket_options = BucketOptions {
         blob_threshold_bytes: 4,
-        ..KeyspaceOptions::default()
+        ..BucketOptions::default()
     };
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", keyspace_options)
-            .expect("keyspace opens");
-        assert_eq!(db.stats().live_keyspaces, 1);
+        let bucket = db
+            .open_bucket_with_options("default", bucket_options)
+            .expect("bucket opens");
+        assert_eq!(db.stats().live_buckets, 1);
 
         let large_a = b"large-a".to_vec();
-        keyspace
-            .insert(b"a", large_a.clone())
-            .expect("write large a");
+        bucket.put(b"a", large_a.clone()).expect("write large a");
         assert!(
             db.stats().memtable_bytes > 0,
             "unflushed writes should contribute to memtable stats"
@@ -1393,9 +1369,7 @@ fn persistent_stats_report_tables_blobs_and_compactions() {
         assert_eq!(stats.live_blob_bytes, large_a.len() as u64);
 
         let large_b = b"large-b".to_vec();
-        keyspace
-            .insert(b"b", large_b.clone())
-            .expect("write large b");
+        bucket.put(b"b", large_b.clone()).expect("write large b");
         db.flush().expect("second flush triggers compaction");
         let stats = db.stats();
         assert_eq!(stats.total_tables, 1);
@@ -1432,12 +1406,12 @@ fn persistent_block_cache_records_hits_and_misses() {
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
         for index in 0..64 {
-            keyspace
-                .insert(
+            bucket
+                .put(
                     format!("key-{index:03}").as_bytes(),
                     format!("value-{index:03}").as_bytes(),
                 )
@@ -1450,7 +1424,7 @@ fn persistent_block_cache_records_hits_and_misses() {
         assert_eq!(stats.block_cache_misses, 0);
 
         assert_eq!(
-            keyspace.get(b"key-032").expect("first cached read"),
+            bucket.get(b"key-032").expect("first cached read"),
             Some(b"value-032".to_vec())
         );
         let stats = db.stats();
@@ -1462,7 +1436,7 @@ fn persistent_block_cache_records_hits_and_misses() {
         let misses = stats.block_cache_misses;
 
         assert_eq!(
-            keyspace.get(b"key-032").expect("second cached read"),
+            bucket.get(b"key-032").expect("second cached read"),
             Some(b"value-032".to_vec())
         );
         let stats = db.stats();
@@ -1480,12 +1454,12 @@ fn persistent_range_iterator_defers_table_block_reads_until_next() {
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
         for index in 0..64 {
-            keyspace
-                .insert(
+            bucket
+                .put(
                     format!("key-{index:03}").as_bytes(),
                     format!("value-{index:03}").as_bytes(),
                 )
@@ -1493,7 +1467,7 @@ fn persistent_range_iterator_defers_table_block_reads_until_next() {
         }
         db.flush().expect("flush table");
 
-        let mut iter = keyspace
+        let mut iter = bucket
             .range(&KeyRange::all())
             .expect("range cursor is created");
         let stats = db.stats();
@@ -1527,19 +1501,17 @@ fn persistent_range_iterator_keeps_active_memtable_after_flush() {
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
-        keyspace.insert(b"key-010", b"before-a").expect("write row");
-        keyspace.insert(b"key-020", b"before-b").expect("write row");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
+        bucket.put(b"key-010", b"before-a").expect("write row");
+        bucket.put(b"key-020", b"before-b").expect("write row");
 
-        let iter = keyspace
+        let iter = bucket
             .range(&KeyRange::all())
             .expect("range cursor is created");
         db.flush().expect("flush active memtable");
-        keyspace
-            .insert(b"key-000", b"after")
-            .expect("write later row");
+        bucket.put(b"key-000", b"after").expect("write later row");
 
         assert_eq!(
             collect_rows(iter),
@@ -1560,12 +1532,12 @@ fn persistent_transaction_read_range_consumes_scan_before_tracking() {
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
         for index in 0..64 {
-            keyspace
-                .insert(
+            bucket
+                .put(
                     format!("key-{index:03}").as_bytes(),
                     format!("value-{index:03}").as_bytes(),
                 )
@@ -1594,22 +1566,22 @@ fn persistent_flush_preserves_snapshot_versions() {
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
 
-        keyspace.insert(b"a", b"v1").expect("write v1");
+        bucket.put(b"a", b"v1").expect("write v1");
         let snapshot = db.snapshot();
-        keyspace.insert(b"a", b"v2").expect("write v2");
+        bucket.put(b"a", b"v2").expect("write v2");
 
         db.flush().expect("flush table");
 
         assert_eq!(
-            snapshot.get(&keyspace, b"a").expect("snapshot reads table"),
+            snapshot.get(&bucket, b"a").expect("snapshot reads table"),
             Some(b"v1".to_vec())
         );
         assert_eq!(
-            keyspace.get(b"a").expect("current reads table"),
+            bucket.get(b"a").expect("current reads table"),
             Some(b"v2".to_vec())
         );
     }
@@ -1624,13 +1596,13 @@ fn persistent_table_block_index_reads_points_and_ranges() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
 
         for index in 0..160 {
-            keyspace
-                .insert(
+            bucket
+                .put(
                     format!("key-{index:03}").into_bytes(),
                     format!("value-{index:03}").into_bytes(),
                 )
@@ -1639,10 +1611,10 @@ fn persistent_table_block_index_reads_points_and_ranges() {
         db.flush().expect("flush indexed table");
 
         assert_eq!(
-            keyspace.get(b"key-042").expect("point reads indexed table"),
+            bucket.get(b"key-042").expect("point reads indexed table"),
             Some(b"value-042".to_vec())
         );
-        let rows = keyspace
+        let rows = bucket
             .range(&KeyRange::half_open(b"key-020", b"key-030"))
             .expect("range reads indexed table")
             .map(|item| {
@@ -1660,7 +1632,7 @@ fn persistent_table_block_index_reads_points_and_ranges() {
             .collect::<Vec<_>>();
         assert_eq!(rows, expected);
 
-        let prefix_rows = collect_rows(keyspace.prefix(b"key-12").expect("prefix reads table"));
+        let prefix_rows = collect_rows(bucket.prefix(b"key-12").expect("prefix reads table"));
         let expected_prefix = (120..130)
             .map(|index| {
                 (
@@ -1676,15 +1648,15 @@ fn persistent_table_block_index_reads_points_and_ranges() {
 
     {
         let db = Db::open(options).expect("persistent db reopens from indexed table");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace reopens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket reopens");
 
         assert_eq!(
-            keyspace.get(b"key-127").expect("point reads after reopen"),
+            bucket.get(b"key-127").expect("point reads after reopen"),
             Some(b"value-127".to_vec())
         );
-        let rows = keyspace
+        let rows = bucket
             .range(&KeyRange::half_open(b"key-150", b"key-160"))
             .expect("range reads after reopen")
             .map(|item| {
@@ -1702,11 +1674,8 @@ fn persistent_table_block_index_reads_points_and_ranges() {
             .collect::<Vec<_>>();
         assert_eq!(rows, expected);
 
-        let prefix_rows = collect_rows(
-            keyspace
-                .prefix(b"key-12")
-                .expect("prefix reads after reopen"),
-        );
+        let prefix_rows =
+            collect_rows(bucket.prefix(b"key-12").expect("prefix reads after reopen"));
         let expected_prefix = (120..130)
             .map(|index| {
                 (
@@ -1736,17 +1705,17 @@ fn persistent_index_search_policies_preserve_table_reads() {
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
         for (name, policy) in policies {
-            let keyspace_options = KeyspaceOptions {
+            let bucket_options = BucketOptions {
                 index_search_policy: policy,
                 prefix_extractor: PrefixExtractor::FixedLen(6),
-                ..KeyspaceOptions::default()
+                ..BucketOptions::default()
             };
-            let keyspace = db
-                .keyspace(name, keyspace_options)
-                .expect("policy keyspace opens");
+            let bucket = db
+                .open_bucket_with_options(name, bucket_options)
+                .expect("policy bucket opens");
             for index in 0..80 {
-                keyspace
-                    .insert(
+                bucket
+                    .put(
                         format!("key-{index:03}").into_bytes(),
                         format!("value-{index:03}").into_bytes(),
                     )
@@ -1756,21 +1725,21 @@ fn persistent_index_search_policies_preserve_table_reads() {
         db.flush().expect("flush policy tables");
 
         for (name, policy) in policies {
-            let keyspace_options = KeyspaceOptions {
+            let bucket_options = BucketOptions {
                 index_search_policy: policy,
                 prefix_extractor: PrefixExtractor::FixedLen(6),
-                ..KeyspaceOptions::default()
+                ..BucketOptions::default()
             };
-            let keyspace = db
-                .keyspace(name, keyspace_options)
-                .expect("policy keyspace reuses options");
+            let bucket = db
+                .open_bucket_with_options(name, bucket_options)
+                .expect("policy bucket reuses options");
             assert_eq!(
-                keyspace.get(b"key-042").expect("policy point reads"),
+                bucket.get(b"key-042").expect("policy point reads"),
                 Some(b"value-042".to_vec())
             );
             assert_eq!(
                 collect_rows(
-                    keyspace
+                    bucket
                         .range(&KeyRange::half_open(b"key-020", b"key-023"))
                         .expect("policy range reads")
                 ),
@@ -1782,7 +1751,7 @@ fn persistent_index_search_policies_preserve_table_reads() {
                 "policy {policy:?} range changed"
             );
             assert_eq!(
-                collect_rows(keyspace.prefix(b"key-04").expect("policy prefix reads")),
+                collect_rows(bucket.prefix(b"key-04").expect("policy prefix reads")),
                 (40..50)
                     .map(|index| {
                         (
@@ -1801,16 +1770,16 @@ fn persistent_index_search_policies_preserve_table_reads() {
     {
         let db = Db::open(options).expect("persistent db reopens");
         for (name, policy) in policies {
-            let keyspace_options = KeyspaceOptions {
+            let bucket_options = BucketOptions {
                 index_search_policy: policy,
                 prefix_extractor: PrefixExtractor::FixedLen(6),
-                ..KeyspaceOptions::default()
+                ..BucketOptions::default()
             };
-            let keyspace = db
-                .keyspace(name, keyspace_options)
-                .expect("policy keyspace reopens");
+            let bucket = db
+                .open_bucket_with_options(name, bucket_options)
+                .expect("policy bucket reopens");
             assert_eq!(
-                keyspace.get(b"key-042").expect("policy point reopens"),
+                bucket.get(b"key-042").expect("policy point reopens"),
                 Some(b"value-042".to_vec())
             );
         }
@@ -1823,27 +1792,27 @@ fn persistent_index_search_policies_preserve_table_reads() {
 fn persistent_table_compression_profiles_round_trip() {
     let path = temp_db_path("table-compression");
     let options = DbOptions::persistent(&path);
-    let fast_options = KeyspaceOptions::default();
-    let plain_options = KeyspaceOptions {
+    let fast_options = BucketOptions::default();
+    let plain_options = BucketOptions {
         compression: CompressionProfile::None,
-        ..KeyspaceOptions::default()
+        ..BucketOptions::default()
     };
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
         let fast = db
-            .keyspace("fast", fast_options.clone())
-            .expect("fast keyspace opens");
+            .open_bucket_with_options("fast", fast_options.clone())
+            .expect("fast bucket opens");
         let plain = db
-            .keyspace("plain", plain_options.clone())
-            .expect("plain keyspace opens");
+            .open_bucket_with_options("plain", plain_options.clone())
+            .expect("plain bucket opens");
 
         for index in 0..64 {
             let value = format!("value-{index:03}-aaaaaaaaaaaaaaaaaaaaaaaa").into_bytes();
-            fast.insert(format!("key-{index:03}").into_bytes(), value.clone())
+            fast.put(format!("key-{index:03}").into_bytes(), value.clone())
                 .expect("write fast row");
             plain
-                .insert(format!("key-{index:03}").into_bytes(), value)
+                .put(format!("key-{index:03}").into_bytes(), value)
                 .expect("write plain row");
         }
         db.flush().expect("flush compressed tables");
@@ -1875,11 +1844,11 @@ fn persistent_table_compression_profiles_round_trip() {
     {
         let db = Db::open(options).expect("persistent db reopens from compressed tables");
         let fast = db
-            .keyspace("fast", fast_options)
-            .expect("fast keyspace reopens");
+            .open_bucket_with_options("fast", fast_options)
+            .expect("fast bucket reopens");
         let plain = db
-            .keyspace("plain", plain_options)
-            .expect("plain keyspace reopens");
+            .open_bucket_with_options("plain", plain_options)
+            .expect("plain bucket reopens");
 
         assert_eq!(
             fast.get(b"key-042").expect("fast row reads after reopen"),
@@ -1898,38 +1867,36 @@ fn persistent_table_compression_profiles_round_trip() {
 fn persistent_prefix_filter_keeps_range_tombstones_authoritative() {
     let path = temp_db_path("prefix-filter-tombstones");
     let options = DbOptions::persistent(&path);
-    let keyspace_options = KeyspaceOptions {
+    let bucket_options = BucketOptions {
         prefix_extractor: PrefixExtractor::Separator(b':'),
         prefix_filter_policy: PrefixFilterPolicy::Bloom {
             bits_per_prefix: 32,
         },
-        ..KeyspaceOptions::default()
+        ..BucketOptions::default()
     };
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", keyspace_options.clone())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", bucket_options.clone())
+            .expect("bucket opens");
 
-        keyspace.insert(b"user:1", b"old").expect("write old user");
-        keyspace
-            .insert(b"user:2", b"live")
-            .expect("write live user");
+        bucket.put(b"user:1", b"old").expect("write old user");
+        bucket.put(b"user:2", b"live").expect("write live user");
         db.flush().expect("flush user table");
 
-        keyspace.insert(b"post:1", b"post").expect("write post");
-        keyspace
-            .remove_range(KeyRange::half_open(b"user:1", b"user:2"))
+        bucket.put(b"post:1", b"post").expect("write post");
+        bucket
+            .delete_range(KeyRange::half_open(b"user:1", b"user:2"))
             .expect("range delete one user");
         db.flush().expect("flush post table with user tombstone");
 
         assert_eq!(
-            collect_rows(keyspace.prefix(b"user:").expect("prefix reads users")),
+            collect_rows(bucket.prefix(b"user:").expect("prefix reads users")),
             vec![(b"user:2".to_vec(), b"live".to_vec())]
         );
         assert_eq!(
-            collect_rows(keyspace.prefix(b"us").expect("short prefix falls back")),
+            collect_rows(bucket.prefix(b"us").expect("short prefix falls back")),
             vec![(b"user:2".to_vec(), b"live".to_vec())]
         );
     }
@@ -1938,20 +1905,16 @@ fn persistent_prefix_filter_keeps_range_tombstones_authoritative() {
 
     {
         let db = Db::open(options).expect("persistent db reopens");
-        let keyspace = db
-            .keyspace("default", keyspace_options)
-            .expect("keyspace reopens");
+        let bucket = db
+            .open_bucket_with_options("default", bucket_options)
+            .expect("bucket reopens");
 
         assert_eq!(
-            collect_rows(
-                keyspace
-                    .prefix(b"user:")
-                    .expect("prefix reads after reopen")
-            ),
+            collect_rows(bucket.prefix(b"user:").expect("prefix reads after reopen")),
             vec![(b"user:2".to_vec(), b"live".to_vec())]
         );
         assert_eq!(
-            collect_rows(keyspace.prefix(b"us").expect("short prefix after reopen")),
+            collect_rows(bucket.prefix(b"us").expect("short prefix after reopen")),
             vec![(b"user:2".to_vec(), b"live".to_vec())]
         );
     }
@@ -1966,22 +1929,22 @@ fn persistent_point_filter_keeps_range_tombstones_authoritative() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
 
-        keyspace.insert(b"user:1", b"old").expect("write old user");
+        bucket.put(b"user:1", b"old").expect("write old user");
         db.flush().expect("flush user table");
 
-        keyspace.insert(b"post:1", b"post").expect("write post");
-        keyspace
-            .remove_range(KeyRange::half_open(b"user:1", b"user:2"))
+        bucket.put(b"post:1", b"post").expect("write post");
+        bucket
+            .delete_range(KeyRange::half_open(b"user:1", b"user:2"))
             .expect("range delete user");
         db.flush().expect("flush post table with user tombstone");
 
-        assert_eq!(keyspace.get(b"user:1").expect("user is hidden"), None);
+        assert_eq!(bucket.get(b"user:1").expect("user is hidden"), None);
         assert_eq!(
-            keyspace.get(b"post:1").expect("post survives"),
+            bucket.get(b"post:1").expect("post survives"),
             Some(b"post".to_vec())
         );
     }
@@ -1990,13 +1953,13 @@ fn persistent_point_filter_keeps_range_tombstones_authoritative() {
 
     {
         let db = Db::open(options).expect("persistent db reopens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace reopens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket reopens");
 
-        assert_eq!(keyspace.get(b"user:1").expect("user remains hidden"), None);
+        assert_eq!(bucket.get(b"user:1").expect("user remains hidden"), None);
         assert_eq!(
-            keyspace.get(b"post:1").expect("post survives reopen"),
+            bucket.get(b"post:1").expect("post survives reopen"),
             Some(b"post".to_vec())
         );
     }
@@ -2008,42 +1971,38 @@ fn persistent_point_filter_keeps_range_tombstones_authoritative() {
 fn persistent_blob_values_survive_flush_reopen_and_compaction() {
     let path = temp_db_path("blob-values");
     let options = DbOptions::persistent(&path);
-    let keyspace_options = KeyspaceOptions {
+    let bucket_options = BucketOptions {
         blob_threshold_bytes: 8,
-        ..KeyspaceOptions::default()
+        ..BucketOptions::default()
     };
     let large_a = b"large-value-a-large-value-a".to_vec();
     let large_c = b"large-value-c-large-value-c".to_vec();
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", keyspace_options.clone())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", bucket_options.clone())
+            .expect("bucket opens");
 
-        keyspace
-            .insert(b"a", large_a.clone())
-            .expect("write blob a");
-        keyspace.insert(b"b", b"small").expect("write inline b");
+        bucket.put(b"a", large_a.clone()).expect("write blob a");
+        bucket.put(b"b", b"small").expect("write inline b");
         db.flush().expect("flush first blob table");
 
-        keyspace
-            .insert(b"c", large_c.clone())
-            .expect("write blob c");
+        bucket.put(b"c", large_c.clone()).expect("write blob c");
         db.flush().expect("flush second blob table");
         db.compact_range(KeyRange::all())
             .expect("compact blob tables");
 
         assert_eq!(
-            keyspace.get(b"a").expect("blob a reads"),
+            bucket.get(b"a").expect("blob a reads"),
             Some(large_a.clone())
         );
         assert_eq!(
-            keyspace.get(b"b").expect("inline b reads"),
+            bucket.get(b"b").expect("inline b reads"),
             Some(b"small".to_vec())
         );
         assert_eq!(
-            keyspace.get(b"c").expect("blob c reads"),
+            bucket.get(b"c").expect("blob c reads"),
             Some(large_c.clone())
         );
         assert!(
@@ -2056,16 +2015,16 @@ fn persistent_blob_values_survive_flush_reopen_and_compaction() {
 
     {
         let db = Db::open(options).expect("persistent db reopens with blob refs");
-        let keyspace = db
-            .keyspace("default", keyspace_options)
-            .expect("keyspace reopens");
+        let bucket = db
+            .open_bucket_with_options("default", bucket_options)
+            .expect("bucket reopens");
 
-        assert_eq!(keyspace.get(b"a").expect("blob a reopens"), Some(large_a));
+        assert_eq!(bucket.get(b"a").expect("blob a reopens"), Some(large_a));
         assert_eq!(
-            keyspace.get(b"b").expect("inline b reopens"),
+            bucket.get(b"b").expect("inline b reopens"),
             Some(b"small".to_vec())
         );
-        assert_eq!(keyspace.get(b"c").expect("blob c reopens"), Some(large_c));
+        assert_eq!(bucket.get(b"c").expect("blob c reopens"), Some(large_c));
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");
@@ -2075,18 +2034,18 @@ fn persistent_blob_values_survive_flush_reopen_and_compaction() {
 fn persistent_reopen_fails_when_referenced_blob_file_is_missing() {
     let path = temp_db_path("missing-blob");
     let options = DbOptions::persistent(&path);
-    let keyspace_options = KeyspaceOptions {
+    let bucket_options = BucketOptions {
         blob_threshold_bytes: 8,
-        ..KeyspaceOptions::default()
+        ..BucketOptions::default()
     };
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", keyspace_options.clone())
-            .expect("keyspace opens");
-        keyspace
-            .insert(b"a", b"large-value-a-large-value-a".to_vec())
+        let bucket = db
+            .open_bucket_with_options("default", bucket_options.clone())
+            .expect("bucket opens");
+        bucket
+            .put(b"a", b"large-value-a-large-value-a".to_vec())
             .expect("write blob a");
         db.flush().expect("flush blob table");
     }
@@ -2111,25 +2070,23 @@ fn persistent_reopen_fails_when_referenced_blob_file_is_missing() {
 fn persistent_compaction_removes_blob_files_for_dropped_versions() {
     let path = temp_db_path("compact-dropped-blob-versions");
     let options = DbOptions::persistent(&path);
-    let keyspace_options = KeyspaceOptions {
+    let bucket_options = BucketOptions {
         blob_threshold_bytes: 8,
-        ..KeyspaceOptions::default()
+        ..BucketOptions::default()
     };
     let old_value = b"large-value-a-old-large-value-a-old".to_vec();
     let new_value = b"large-value-a-new-large-value-a-new".to_vec();
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", keyspace_options.clone())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", bucket_options.clone())
+            .expect("bucket opens");
 
-        keyspace
-            .insert(b"a", old_value)
-            .expect("write old blob value");
+        bucket.put(b"a", old_value).expect("write old blob value");
         db.flush().expect("flush old blob table");
-        keyspace
-            .insert(b"a", new_value.clone())
+        bucket
+            .put(b"a", new_value.clone())
             .expect("write new blob value");
         db.flush().expect("flush new blob table");
         assert_eq!(blob_file_paths(&path).len(), 2);
@@ -2138,7 +2095,7 @@ fn persistent_compaction_removes_blob_files_for_dropped_versions() {
             .expect("manual compaction removes dropped blob");
 
         assert_eq!(
-            keyspace.get(b"a").expect("current blob reads"),
+            bucket.get(b"a").expect("current blob reads"),
             Some(new_value.clone())
         );
         assert_eq!(
@@ -2152,10 +2109,10 @@ fn persistent_compaction_removes_blob_files_for_dropped_versions() {
 
     {
         let db = Db::open(options).expect("persistent db reopens after blob cleanup");
-        let keyspace = db
-            .keyspace("default", keyspace_options)
-            .expect("keyspace reopens");
-        assert_eq!(keyspace.get(b"a").expect("blob reopens"), Some(new_value));
+        let bucket = db
+            .open_bucket_with_options("default", bucket_options)
+            .expect("bucket reopens");
+        assert_eq!(bucket.get(b"a").expect("blob reopens"), Some(new_value));
         assert_eq!(blob_file_paths(&path).len(), 1);
     }
 
@@ -2166,25 +2123,23 @@ fn persistent_compaction_removes_blob_files_for_dropped_versions() {
 fn persistent_compaction_publish_failure_removes_unpublished_table_and_blob_files() {
     let path = temp_db_path("compact-publish-cleanup");
     let options = DbOptions::persistent(&path);
-    let keyspace_options = KeyspaceOptions {
+    let bucket_options = BucketOptions {
         blob_threshold_bytes: 8,
-        ..KeyspaceOptions::default()
+        ..BucketOptions::default()
     };
     let old_value = b"large-value-a-old-large-value-a-old".to_vec();
     let new_value = b"large-value-a-new-large-value-a-new".to_vec();
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", keyspace_options)
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", bucket_options)
+            .expect("bucket opens");
 
-        keyspace
-            .insert(b"a", old_value)
-            .expect("write old blob value");
+        bucket.put(b"a", old_value).expect("write old blob value");
         db.flush().expect("flush old blob table");
-        keyspace
-            .insert(b"a", new_value.clone())
+        bucket
+            .put(b"a", new_value.clone())
             .expect("write new blob value");
         db.flush().expect("flush new blob table");
 
@@ -2214,7 +2169,7 @@ fn persistent_compaction_publish_failure_removes_unpublished_table_and_blob_file
             "failed compaction should remove unpublished blob files"
         );
         assert_eq!(
-            keyspace
+            bucket
                 .get(b"a")
                 .expect("old tables survive failed compaction"),
             Some(new_value)
@@ -2230,29 +2185,29 @@ fn persistent_compaction_publish_failure_removes_unpublished_table_and_blob_file
 fn persistent_compaction_removes_blob_files_after_delete_cleanup() {
     let path = temp_db_path("compact-deleted-blob");
     let options = DbOptions::persistent(&path);
-    let keyspace_options = KeyspaceOptions {
+    let bucket_options = BucketOptions {
         blob_threshold_bytes: 8,
-        ..KeyspaceOptions::default()
+        ..BucketOptions::default()
     };
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", keyspace_options.clone())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", bucket_options.clone())
+            .expect("bucket opens");
 
-        keyspace
-            .insert(b"a", b"large-value-a-large-value-a".to_vec())
+        bucket
+            .put(b"a", b"large-value-a-large-value-a".to_vec())
             .expect("write blob value");
         db.flush().expect("flush blob table");
-        keyspace.remove(b"a").expect("delete blob key");
+        bucket.delete(b"a").expect("delete blob key");
         db.flush().expect("flush delete table");
         assert_eq!(blob_file_paths(&path).len(), 1);
 
         db.compact_range(KeyRange::all())
             .expect("manual compaction removes deleted blob");
 
-        assert_eq!(keyspace.get(b"a").expect("deleted key reads missing"), None);
+        assert_eq!(bucket.get(b"a").expect("deleted key reads missing"), None);
         assert!(
             blob_file_paths(&path).is_empty(),
             "deleted blob file should be removed"
@@ -2267,10 +2222,10 @@ fn persistent_compaction_removes_blob_files_after_delete_cleanup() {
 
     {
         let db = Db::open(options).expect("persistent db reopens after deleted blob cleanup");
-        let keyspace = db
-            .keyspace("default", keyspace_options)
-            .expect("keyspace reopens");
-        assert_eq!(keyspace.get(b"a").expect("deleted key reopens"), None);
+        let bucket = db
+            .open_bucket_with_options("default", bucket_options)
+            .expect("bucket reopens");
+        assert_eq!(bucket.get(b"a").expect("deleted key reopens"), None);
         assert!(blob_file_paths(&path).is_empty());
     }
 
@@ -2284,12 +2239,12 @@ fn persistent_compaction_keeps_lazy_iterator_table_files_until_pin_released() {
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
         for index in 0..64 {
-            keyspace
-                .insert(
+            bucket
+                .put(
                     format!("key-{index:03}").as_bytes(),
                     format!("value-{index:03}").as_bytes(),
                 )
@@ -2297,7 +2252,7 @@ fn persistent_compaction_keeps_lazy_iterator_table_files_until_pin_released() {
         }
         db.flush().expect("flush base table");
 
-        let mut iter = keyspace
+        let mut iter = bucket
             .range(&KeyRange::all())
             .expect("range cursor is created");
         assert_eq!(
@@ -2316,8 +2271,8 @@ fn persistent_compaction_keeps_lazy_iterator_table_files_until_pin_released() {
             .map(|properties| table::table_path(&path, properties.id))
             .collect::<Vec<_>>();
 
-        keyspace
-            .insert(b"key-032", b"value-032-new")
+        bucket
+            .put(b"key-032", b"value-032-new")
             .expect("write overlapping update");
         db.flush().expect("flush overlapping table");
         db.compact_range(KeyRange::all())
@@ -2359,21 +2314,21 @@ fn persistent_compaction_rewrites_tables_and_preserves_reads() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
 
-        keyspace.insert(b"a", b"v1").expect("write a v1");
+        bucket.put(b"a", b"v1").expect("write a v1");
         db.flush().expect("flush first table");
         let snapshot = db.snapshot();
 
-        keyspace.insert(b"a", b"v2").expect("write a v2");
-        keyspace.insert(b"b", b"b1").expect("write b");
-        keyspace.insert(b"c", b"c1").expect("write c");
+        bucket.put(b"a", b"v2").expect("write a v2");
+        bucket.put(b"b", b"b1").expect("write b");
+        bucket.put(b"c", b"c1").expect("write c");
         db.flush().expect("flush second table");
 
-        keyspace
-            .remove_range(KeyRange::half_open(b"b", b"d"))
+        bucket
+            .delete_range(KeyRange::half_open(b"b", b"d"))
             .expect("range delete b and c");
         db.flush().expect("flush tombstone table");
 
@@ -2393,15 +2348,15 @@ fn persistent_compaction_rewrites_tables_and_preserves_reads() {
             .expect("manual compaction succeeds");
 
         assert_eq!(
-            snapshot.get(&keyspace, b"a").expect("snapshot reads old a"),
+            snapshot.get(&bucket, b"a").expect("snapshot reads old a"),
             Some(b"v1".to_vec())
         );
         assert_eq!(
-            keyspace.get(b"a").expect("current reads new a"),
+            bucket.get(b"a").expect("current reads new a"),
             Some(b"v2".to_vec())
         );
-        assert_eq!(keyspace.get(b"b").expect("b is range-deleted"), None);
-        assert_eq!(keyspace.get(b"c").expect("c is range-deleted"), None);
+        assert_eq!(bucket.get(b"b").expect("b is range-deleted"), None);
+        assert_eq!(bucket.get(b"c").expect("c is range-deleted"), None);
 
         let after_manifest =
             manifest::read_manifest(&manifest::manifest_path(&path)).expect("manifest rereads");
@@ -2434,16 +2389,16 @@ fn persistent_compaction_rewrites_tables_and_preserves_reads() {
 
     {
         let db = Db::open(options).expect("persistent db reopens after compaction");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace reopens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket reopens");
 
         assert_eq!(
-            keyspace.get(b"a").expect("a reads after reopen"),
+            bucket.get(b"a").expect("a reads after reopen"),
             Some(b"v2".to_vec())
         );
-        assert_eq!(keyspace.get(b"b").expect("b delete survives reopen"), None);
-        assert_eq!(keyspace.get(b"c").expect("c delete survives reopen"), None);
+        assert_eq!(bucket.get(b"b").expect("b delete survives reopen"), None);
+        assert_eq!(bucket.get(b"c").expect("c delete survives reopen"), None);
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");
@@ -2456,19 +2411,19 @@ fn persistent_compaction_removes_obsolete_point_delete_without_replacement() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
 
-        keyspace.insert(b"a", b"v1").expect("write a");
+        bucket.put(b"a", b"v1").expect("write a");
         db.flush().expect("flush value table");
-        keyspace.remove(b"a").expect("delete a");
+        bucket.delete(b"a").expect("delete a");
         db.flush().expect("flush delete table");
         assert_eq!(table_file_paths(&path).len(), 2);
 
         db.compact_range(KeyRange::all())
             .expect("manual compaction removes obsolete delete");
-        assert_eq!(keyspace.get(b"a").expect("deleted key reads missing"), None);
+        assert_eq!(bucket.get(b"a").expect("deleted key reads missing"), None);
         assert!(
             table_file_paths(&path).is_empty(),
             "empty compaction output should remove old tables without writing a replacement"
@@ -2489,35 +2444,35 @@ fn persistent_compaction_removes_obsolete_point_delete_without_replacement() {
 
     {
         let db = Db::open(options).expect("persistent db reopens after empty compaction");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace reopens");
-        assert_eq!(keyspace.get(b"a").expect("deleted key reopens"), None);
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket reopens");
+        assert_eq!(bucket.get(b"a").expect("deleted key reopens"), None);
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");
 }
 
 #[test]
-fn persistent_compaction_keeps_keyspaces_separate() {
-    let path = temp_db_path("compact-keyspaces");
+fn persistent_compaction_keeps_buckets_separate() {
+    let path = temp_db_path("compact-buckets");
     let options = DbOptions::persistent(&path);
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
         let users = db
-            .keyspace("users", KeyspaceOptions::default())
-            .expect("users keyspace opens");
+            .open_bucket_with_options("users", BucketOptions::default())
+            .expect("users bucket opens");
         let posts = db
-            .keyspace("posts", KeyspaceOptions::default())
-            .expect("posts keyspace opens");
+            .open_bucket_with_options("posts", BucketOptions::default())
+            .expect("posts bucket opens");
 
-        users.insert(b"1", b"ada").expect("write first user");
-        posts.insert(b"1", b"hello").expect("write first post");
+        users.put(b"1", b"ada").expect("write first user");
+        posts.put(b"1", b"hello").expect("write first post");
         db.flush().expect("flush first tables");
 
-        users.insert(b"1", b"grace").expect("write second user");
-        posts.insert(b"2", b"reply").expect("write second post");
+        users.put(b"1", b"grace").expect("write second user");
+        posts.put(b"2", b"reply").expect("write second post");
         db.flush().expect("flush second tables");
 
         db.compact_range(KeyRange::all())
@@ -2560,11 +2515,11 @@ fn persistent_compaction_keeps_keyspaces_separate() {
     {
         let db = Db::open(options).expect("persistent db reopens after compaction");
         let users = db
-            .keyspace("users", KeyspaceOptions::default())
-            .expect("users keyspace reopens");
+            .open_bucket_with_options("users", BucketOptions::default())
+            .expect("users bucket reopens");
         let posts = db
-            .keyspace("posts", KeyspaceOptions::default())
-            .expect("posts keyspace reopens");
+            .open_bucket_with_options("posts", BucketOptions::default())
+            .expect("posts bucket reopens");
 
         assert_eq!(
             users.get(b"1").expect("user survives reopen"),
@@ -2623,10 +2578,10 @@ fn persistent_reopen_defers_data_block_checksum_until_read() {
     corrupt_first_data_block_payload(&table_path);
 
     let db = Db::open(options).expect("metadata-only table open succeeds");
-    let keyspace = db
-        .keyspace("default", KeyspaceOptions::default())
-        .expect("keyspace reopens");
-    let error = keyspace
+    let bucket = db
+        .open_bucket_with_options("default", BucketOptions::default())
+        .expect("bucket reopens");
+    let error = bucket
         .get(b"a")
         .expect_err("corrupt data block fails when read");
     assert!(matches!(error, Error::Corruption { .. }));
@@ -2642,11 +2597,11 @@ fn persistent_filter_miss_does_not_read_corrupt_data_block() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
-        keyspace.insert(b"a", b"a1").expect("write a");
-        keyspace.insert(b"c", b"c1").expect("write c");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
+        bucket.put(b"a", b"a1").expect("write a");
+        bucket.put(b"c", b"c1").expect("write c");
         db.flush().expect("flush table");
 
         let manifest_state =
@@ -2663,11 +2618,11 @@ fn persistent_filter_miss_does_not_read_corrupt_data_block() {
     corrupt_first_data_block_payload(&table_path);
 
     let db = Db::open(options).expect("metadata-only table open succeeds");
-    let keyspace = db
-        .keyspace("default", KeyspaceOptions::default())
-        .expect("keyspace reopens");
+    let bucket = db
+        .open_bucket_with_options("default", BucketOptions::default())
+        .expect("bucket reopens");
     assert_eq!(
-        keyspace
+        bucket
             .get(b"b")
             .expect("filter miss should not read data block"),
         None
@@ -2690,18 +2645,18 @@ fn persistent_filter_miss_does_not_read_corrupt_data_block() {
 fn persistent_prefix_filter_stats_skip_nonmatching_tables() {
     let path = temp_db_path("prefix-filter-stats-skip");
     let options = DbOptions::persistent(&path);
-    let keyspace_options = KeyspaceOptions {
+    let bucket_options = BucketOptions {
         prefix_extractor: PrefixExtractor::Separator(b':'),
-        ..KeyspaceOptions::default()
+        ..BucketOptions::default()
     };
 
     {
         let db = Db::open(options).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", keyspace_options)
-            .expect("keyspace opens");
-        keyspace.insert(b"user:1", b"ada").expect("write user");
-        keyspace.insert(b"post:1", b"hello").expect("write post");
+        let bucket = db
+            .open_bucket_with_options("default", bucket_options)
+            .expect("bucket opens");
+        bucket.put(b"user:1", b"ada").expect("write user");
+        bucket.put(b"post:1", b"hello").expect("write post");
         db.flush().expect("flush table");
         assert_eq!(db.stats().block_cache_misses, 0);
 
@@ -2716,7 +2671,7 @@ fn persistent_prefix_filter_stats_skip_nonmatching_tables() {
         ] {
             let before = db.stats();
             assert!(
-                collect_rows(keyspace.prefix(prefix).expect("nonmatching prefix scans")).is_empty()
+                collect_rows(bucket.prefix(prefix).expect("nonmatching prefix scans")).is_empty()
             );
             let after = db.stats();
             let before_misses =
@@ -2780,10 +2735,10 @@ fn persistent_wal_ignores_torn_final_record() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
-        keyspace.insert(b"a", b"a1").expect("write a");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
+        bucket.put(b"a", b"a1").expect("write a");
         db.persist(DurabilityMode::Flush).expect("flush WAL");
     }
 
@@ -2796,10 +2751,10 @@ fn persistent_wal_ignores_torn_final_record() {
 
     {
         let db = Db::open(options).expect("torn final record is ignored");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace reopens");
-        assert_eq!(keyspace.get(b"a").expect("a replays"), Some(b"a1".to_vec()));
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket reopens");
+        assert_eq!(bucket.get(b"a").expect("a replays"), Some(b"a1".to_vec()));
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");
@@ -2812,10 +2767,10 @@ fn persistent_wal_checksum_corruption_fails_closed() {
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
-        let keyspace = db
-            .keyspace("default", KeyspaceOptions::default())
-            .expect("keyspace opens");
-        keyspace.insert(b"a", b"a1").expect("write a");
+        let bucket = db
+            .open_bucket_with_options("default", BucketOptions::default())
+            .expect("bucket opens");
+        bucket.put(b"a", b"a1").expect("write a");
         db.persist(DurabilityMode::Flush).expect("flush WAL");
     }
 

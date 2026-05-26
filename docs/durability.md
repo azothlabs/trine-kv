@@ -77,8 +77,8 @@ Startup behavior:
 - a WAL record is not visible unless it replays successfully after manifest
   load.
 
-If a WAL record references a keyspace that is missing from the manifest, startup
-fails closed. This prevents a partially published keyspace change from silently
+If a WAL record references a bucket that is missing from the manifest, startup
+fails closed. This prevents a partially published bucket change from silently
 turning into a different database state.
 
 ## Flush And Manifest Publish
@@ -90,7 +90,7 @@ syncs it, and renames it into place.
 
 The manifest stores:
 
-- keyspace definitions and options;
+- bucket definitions and options;
 - live SSTable ids and compaction levels;
 - live blob file ids;
 - the WAL replay floor.

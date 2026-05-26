@@ -35,14 +35,13 @@ trine-kv = { path = "../trine-kv" }
 ## Minimal Example
 
 ```rust
-use trine_kv::{Db, KeyspaceOptions};
+use trine_kv::Db;
 
 fn main() -> trine_kv::Result<()> {
     let db = Db::open_memory()?;
-    let users = db.keyspace("users", KeyspaceOptions::default())?;
 
-    users.insert(b"user:001", b"Ada")?;
-    assert_eq!(users.get(b"user:001")?, Some(b"Ada".to_vec()));
+    db.put(b"user:001", b"Ada")?;
+    assert_eq!(db.get(b"user:001")?, Some(b"Ada".to_vec()));
 
     Ok(())
 }
@@ -62,7 +61,7 @@ cargo bench --bench v1_bench
 
 ## Examples
 
-- `quickstart`: first pass through persistent open, keyspaces, scans,
+- `quickstart`: first pass through persistent open, buckets, scans,
   transactions, flush, reopen, and stats.
 - `user_store`: wraps Trine KV behind a small repository-style API.
 - `event_index`: stores event payloads and a secondary account index with one

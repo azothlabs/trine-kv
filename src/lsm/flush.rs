@@ -4,7 +4,7 @@ use crate::{
     blob::ValueRef,
     error::{Error, Result},
     internal_key::InternalKey,
-    options::KeyspaceOptions,
+    options::BucketOptions,
     table::{self, Table, TableRangeTombstone},
     types::Sequence,
 };
@@ -102,7 +102,7 @@ impl LsmTree {
     }
 }
 
-fn table_write_options(options: &KeyspaceOptions) -> table::TableWriteOptions {
+fn table_write_options(options: &BucketOptions) -> table::TableWriteOptions {
     table::TableWriteOptions {
         codec: options.compression.codec_id(),
         block_bytes: options.block_bytes,

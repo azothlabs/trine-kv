@@ -6,41 +6,43 @@ Complete
 
 ## Goal
 
-Close the remaining verification gap with deterministic randomized model
-testing.
+Polish the public API around buckets and make the default bucket the direct
+`Db` read/write target.
 
 ## Entry Condition
 
-- Phase 29 completed blob lifecycle hardening with full local verification.
-- P10 verification expansion was open.
+- Phase 30 completed local P0-P10 LSM hardening verification.
+- User requested renaming the public key namespace concept to bucket and
+  making common operations work without explicitly opening a bucket.
 
 ## Scope
 
-- Add a random operation model test against a simple MVCC reference.
-- Cover point writes, point deletes, range deletes, point reads, range scans,
-  snapshots, flush, compaction, and reopen.
-- Keep the test deterministic and small enough for normal `cargo test`.
+- Public API rename from the prior namespace naming to bucket naming.
+- Add built-in default bucket direct helpers on `Db`.
+- Keep named buckets available for logical isolation and custom options.
+- Update examples, usage docs, protocol, tests, benches, and stats naming.
 
 ## Out Of Scope
 
-- New public API.
-- Storage format changes.
+- LSM core behavior changes beyond namespace naming and default-bucket routing.
 - Large benchmark policy decisions.
 - External test services.
 
 ## Acceptance Gate
 
-- Random operation testing compares Trine against a simple MVCC reference
-  model.
-- Existing crash/reopen, corruption, long scan, and benchmark gates remain in
-  the verification list.
+- `Db::put/get/range/prefix` operate on the default bucket.
+- `Db::open_bucket` and `Db::open_bucket_with_options` open named buckets.
+- `BucketOptions` replaces the public options type for named buckets.
+- Default bucket exists after open in memory and persistent modes.
+- Usage docs and examples show the default path first.
 - Full local Rust verification passes.
 
 ## Active Task Slice
 
 ```text
-task101 [x] goal:add deterministic MVCC model test | scope:tests | verify:focused model test
-task102 [x] goal:update verification evidence and close remaining roadmap | scope:.phrase | verify:full Rust gate plus evidence
+task103 [x] goal:rename public namespace API to bucket | scope:src,tests,examples,docs | verify:cargo check
+task104 [x] goal:add default bucket direct Db helpers | scope:src/db.rs,tests | verify:focused default bucket tests
+task105 [x] goal:update evidence and close phase | scope:.phrase | verify:full Rust gate
 ```
 
 ## Known Blockers
@@ -49,16 +51,18 @@ task102 [x] goal:update verification evidence and close remaining roadmap | scop
 
 ## Evidence
 
-- Phase 30 added deterministic randomized comparison against a simple MVCC
-  reference model.
-- The model test exposed a partial-compaction point-delete retention bug:
-  deleting a key in an upper level could be cleaned too early while an older
-  value still lived in a lower level.
-- Partial compaction now keeps point deletes unless the whole live keyspace
-  participates in the rewrite.
-- Full local Rust verification passed.
+- Phase 30 full local verification passed.
+- The prior public API required users to open a named handle before basic
+  reads/writes, which made the simple path heavier than needed.
+- The new API remains pre-1.0 and can make a breaking public rename under the
+  existing Semantic Versioning rule.
+- `Db::put/get/range/prefix` now route to the built-in default bucket, and
+  named buckets are opened through `Db::open_bucket`.
+- Persistent and in-memory opens create the default bucket before user data is
+  read or written.
+- Full local Rust verification passed for this phase.
 
 ## Next Recommendation
 
-- Push to remote CI when ready. No local P0-P10 LSM hardening item remains open
-  in the current roadmap.
+- Commit the Phase 31 API polish when ready, then push to CI for remote
+  verification.

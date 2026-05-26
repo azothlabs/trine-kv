@@ -163,24 +163,20 @@ fn encode_payload(sequence: Sequence, operations: &[BatchOperation]) -> Result<V
     put_u32(&mut bytes, op_count);
     for operation in operations {
         match operation {
-            BatchOperation::Insert {
-                keyspace,
-                key,
-                value,
-            } => {
+            BatchOperation::Put { bucket, key, value } => {
                 put_u8(&mut bytes, OP_INSERT);
-                put_bytes(&mut bytes, keyspace.as_bytes())?;
+                put_bytes(&mut bytes, bucket.as_bytes())?;
                 put_bytes(&mut bytes, key)?;
                 put_bytes(&mut bytes, value)?;
             }
-            BatchOperation::Remove { keyspace, key } => {
+            BatchOperation::Delete { bucket, key } => {
                 put_u8(&mut bytes, OP_REMOVE);
-                put_bytes(&mut bytes, keyspace.as_bytes())?;
+                put_bytes(&mut bytes, bucket.as_bytes())?;
                 put_bytes(&mut bytes, key)?;
             }
-            BatchOperation::RemoveRange { keyspace, range } => {
+            BatchOperation::DeleteRange { bucket, range } => {
                 put_u8(&mut bytes, OP_REMOVE_RANGE);
-                put_bytes(&mut bytes, keyspace.as_bytes())?;
+                put_bytes(&mut bytes, bucket.as_bytes())?;
                 put_bound(&mut bytes, &range.start)?;
                 put_bound(&mut bytes, &range.end)?;
             }
@@ -262,30 +258,26 @@ fn decode_payload(payload: &[u8]) -> Result<WalBatch> {
 
     for _ in 0..op_count {
         let tag = cursor.read_u8()?;
-        let keyspace =
+        let bucket =
             String::from_utf8(cursor.read_bytes()?.to_vec()).map_err(|_| Error::InvalidFormat {
-                message: "WAL keyspace name is not valid UTF-8".to_owned(),
+                message: "WAL bucket name is not valid UTF-8".to_owned(),
             })?;
 
         let operation = match tag {
             OP_INSERT => {
                 let key = cursor.read_bytes()?.to_vec();
                 let value = cursor.read_bytes()?.to_vec();
-                BatchOperation::Insert {
-                    keyspace,
-                    key,
-                    value,
-                }
+                BatchOperation::Put { bucket, key, value }
             }
             OP_REMOVE => {
                 let key = cursor.read_bytes()?.to_vec();
-                BatchOperation::Remove { keyspace, key }
+                BatchOperation::Delete { bucket, key }
             }
             OP_REMOVE_RANGE => {
                 let start = cursor.read_bound()?;
                 let end = cursor.read_bound()?;
-                BatchOperation::RemoveRange {
-                    keyspace,
+                BatchOperation::DeleteRange {
+                    bucket,
                     range: KeyRange { start, end },
                 }
             }
@@ -483,8 +475,8 @@ mod tests {
 
         let new_payload = super::encode_payload(
             Sequence::new(2),
-            &[BatchOperation::Insert {
-                keyspace: "default".to_owned(),
+            &[BatchOperation::Put {
+                bucket: "default".to_owned(),
                 key: b"a".to_vec(),
                 value: b"a1".to_vec(),
             }],

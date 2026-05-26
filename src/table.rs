@@ -3174,7 +3174,7 @@ impl<'payload> Cursor<'payload> {
 mod tests {
     use super::*;
     use crate::filter::PointKeyFilter;
-    use crate::options::KeyspaceOptions;
+    use crate::options::BucketOptions;
 
     #[test]
     fn checked_block_index_round_trips_multiple_data_blocks() {
@@ -3649,7 +3649,7 @@ mod tests {
             } else {
                 PrefixFilterPolicy::Disabled
             },
-            blob_threshold_bytes: KeyspaceOptions::DEFAULT_BLOB_THRESHOLD_BYTES,
+            blob_threshold_bytes: BucketOptions::DEFAULT_BLOB_THRESHOLD_BYTES,
         }
     }
 

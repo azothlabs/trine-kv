@@ -11,30 +11,32 @@ use std::{
 
 use crate::{
     blob::{self, ValueRef},
+    bucket::{Bucket, BucketName},
     cache, compaction, durability,
     error::{Error, Result},
     iterator::{Direction, Iter, ScanSelector},
-    keyspace::{Keyspace, KeyspaceName},
     lsm::{
         CompactionInput as LsmCompactionInput, CompactionOutput as LsmCompactionOutput,
         FlushInput as LsmFlushInput, LsmTree,
     },
     manifest::{self, ManifestState, ManifestStore},
     options::{
-        DbOptions, DurabilityMode, FailOnCorruptionPolicy, FilterPolicy, KeyspaceOptions,
-        PrefixFilterPolicy, StorageMode,
+        BucketOptions, DbOptions, DurabilityMode, FailOnCorruptionPolicy, FilterPolicy,
+        PrefixFilterPolicy, StorageMode, WriteOptions,
     },
     recovery,
     snapshot::{Snapshot, SnapshotTracker},
     stats::{DbStats, LevelStats},
     table::{self, Table},
     transaction::{Transaction, TransactionOptions},
-    types::{KeyRange, Sequence},
+    types::{CommitInfo, KeyRange, Sequence, Value},
     wal::{self, WalWriter},
     write_batch::BatchOperation,
 };
 
 mod commit;
+
+pub(crate) const DEFAULT_BUCKET_NAME: &str = "default";
 
 #[derive(Debug, Clone)]
 pub struct Db {
@@ -48,7 +50,7 @@ pub(crate) struct DbInner {
     closed: AtomicBool,
     writer: Mutex<()>,
     process_lock: Mutex<Option<recovery::ProcessLock>>,
-    keyspaces: RwLock<BTreeMap<String, Arc<LsmTree>>>,
+    buckets: RwLock<BTreeMap<String, Arc<LsmTree>>>,
     snapshots: Arc<SnapshotTracker>,
     pending_obsolete_table_ids: Mutex<BTreeSet<table::TableId>>,
     manifest: Option<Mutex<ManifestStore>>,
@@ -63,19 +65,19 @@ pub(crate) struct DbInner {
 }
 
 struct NamedFlushInput {
-    keyspace: String,
+    bucket: String,
     tree: Arc<LsmTree>,
     input: LsmFlushInput,
 }
 
 struct NamedCompactionInput {
-    keyspace: String,
+    bucket: String,
     tree: Arc<LsmTree>,
     input: LsmCompactionInput,
 }
 
 struct NamedCompactionOutput {
-    keyspace: String,
+    bucket: String,
     output: LsmCompactionOutput,
 }
 
@@ -191,6 +193,12 @@ impl Db {
         options.storage_mode = StorageMode::InMemory;
         validate_options(&options)?;
         let block_cache_bytes = options.block_cache_bytes;
+        let default_bucket = Arc::new(LsmTree::new(
+            options.default_bucket_options.clone(),
+            Vec::new(),
+        )?);
+        let mut buckets = BTreeMap::new();
+        buckets.insert(DEFAULT_BUCKET_NAME.to_owned(), default_bucket);
 
         Ok(Self {
             inner: Arc::new(DbInner {
@@ -199,7 +207,7 @@ impl Db {
                 closed: AtomicBool::new(false),
                 writer: Mutex::new(()),
                 process_lock: Mutex::new(None),
-                keyspaces: RwLock::new(BTreeMap::new()),
+                buckets: RwLock::new(buckets),
                 snapshots: Arc::new(SnapshotTracker::default()),
                 pending_obsolete_table_ids: Mutex::new(BTreeSet::new()),
                 manifest: None,
@@ -245,13 +253,15 @@ impl Db {
         }
 
         let manifest_path = manifest::manifest_path(path);
-        let manifest = ManifestStore::open_or_create(
+        let mut manifest = ManifestStore::open_or_create(
             manifest_path,
             options.create_if_missing && !options.read_only,
         )?;
+        ensure_default_bucket_in_manifest(&mut manifest, &options)?;
         let replay_floor = manifest.state().wal_replay_floor();
         let referenced_blob_ids = referenced_blob_file_ids_from_manifest(manifest.state());
-        let keyspaces = keyspaces_from_manifest(path, manifest.state())?;
+        let mut buckets = buckets_from_manifest(path, manifest.state())?;
+        ensure_default_bucket_loaded(&mut buckets, &options)?;
         recovery::fail_on_missing_referenced_blob_files(path, &referenced_blob_ids)?;
         recovery::fail_on_unreferenced_storage_files(
             path,
@@ -274,7 +284,7 @@ impl Db {
                 closed: AtomicBool::new(false),
                 writer: Mutex::new(()),
                 process_lock: Mutex::new(process_lock),
-                keyspaces: RwLock::new(keyspaces),
+                buckets: RwLock::new(buckets),
                 snapshots: Arc::new(SnapshotTracker::default()),
                 pending_obsolete_table_ids: Mutex::new(BTreeSet::new()),
                 manifest: Some(Mutex::new(manifest)),
@@ -294,60 +304,318 @@ impl Db {
         Ok(db)
     }
 
-    pub fn keyspace(
+    /// Returns a handle for the built-in default bucket.
+    ///
+    /// Direct helpers such as `Db::put` and `Db::get` use this bucket without
+    /// requiring callers to open it explicitly.
+    pub fn default_bucket(&self) -> Result<Bucket> {
+        let options = self
+            .existing_bucket_options(DEFAULT_BUCKET_NAME)?
+            .ok_or_else(|| Error::BucketMissing {
+                name: DEFAULT_BUCKET_NAME.to_owned(),
+            })?;
+        Ok(Bucket::new(
+            self.clone(),
+            BucketName::new(DEFAULT_BUCKET_NAME),
+            options,
+        ))
+    }
+
+    /// Opens an existing named bucket or creates it with default bucket
+    /// options.
+    pub fn open_bucket(&self, name: impl Into<BucketName>) -> Result<Bucket> {
+        self.open_bucket_with_options(name, BucketOptions::default())
+    }
+
+    /// Opens an existing named bucket or creates it with explicit options.
+    ///
+    /// Bucket options are fixed after creation. Reopening an existing named
+    /// bucket with different options returns an error.
+    pub fn open_bucket_with_options(
         &self,
-        name: impl Into<KeyspaceName>,
-        options: KeyspaceOptions,
-    ) -> Result<Keyspace> {
+        name: impl Into<BucketName>,
+        options: BucketOptions,
+    ) -> Result<Bucket> {
         self.ensure_open()?;
 
         let name = name.into();
         if name.as_str().is_empty() {
-            return Err(Error::invalid_options("keyspace name cannot be empty"));
+            return Err(Error::invalid_options("bucket name cannot be empty"));
         }
 
-        validate_keyspace_options(&options)?;
+        validate_bucket_options(&options)?;
 
-        if let Some(existing_options) = self.existing_keyspace_options(name.as_str())? {
+        if let Some(existing_options) = self.existing_bucket_options(name.as_str())? {
             if existing_options != options {
+                if name.as_str() == DEFAULT_BUCKET_NAME {
+                    return self.reconfigure_empty_default_bucket(options);
+                }
                 return Err(Error::invalid_options(
-                    "existing keyspace options do not match requested options",
+                    "existing bucket options do not match requested options",
                 ));
             }
-            return Ok(Keyspace::new(self.clone(), name, existing_options));
+            return Ok(Bucket::new(self.clone(), name, existing_options));
         }
 
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
 
-        self.persist_keyspace_creation(name.as_str(), &options)?;
+        self.persist_bucket_creation(name.as_str(), &options)?;
 
-        let keyspace_options = {
-            let mut keyspaces = self
+        let bucket_options = {
+            let mut buckets = self
                 .inner
-                .keyspaces
+                .buckets
                 .write()
-                .map_err(|_| lock_poisoned("keyspace registry"))?;
+                .map_err(|_| lock_poisoned("bucket registry"))?;
 
-            if let Some(state) = keyspaces.get(name.as_str()) {
+            if let Some(state) = buckets.get(name.as_str()) {
                 if state.options != options {
                     return Err(Error::invalid_options(
-                        "existing keyspace options do not match requested options",
+                        "existing bucket options do not match requested options",
                     ));
                 }
                 state.options.clone()
             } else {
-                let keyspace_options = options.clone();
-                keyspaces.insert(
+                let bucket_options = options.clone();
+                buckets.insert(
                     name.as_str().to_owned(),
                     Arc::new(LsmTree::new(options, Vec::new())?),
                 );
-                keyspace_options
+                bucket_options
             }
         };
 
-        Ok(Keyspace::new(self.clone(), name, keyspace_options))
+        Ok(Bucket::new(self.clone(), name, bucket_options))
+    }
+
+    fn reconfigure_empty_default_bucket(&self, options: BucketOptions) -> Result<Bucket> {
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+        validate_bucket_options(&options)?;
+
+        let _writer = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| lock_poisoned("writer coordinator"))?;
+        {
+            let buckets = self
+                .inner
+                .buckets
+                .read()
+                .map_err(|_| lock_poisoned("bucket registry"))?;
+            let state = buckets
+                .get(DEFAULT_BUCKET_NAME)
+                .ok_or_else(|| Error::BucketMissing {
+                    name: DEFAULT_BUCKET_NAME.to_owned(),
+                })?;
+            if !state.is_empty()? {
+                return Err(Error::invalid_options(
+                    "default bucket options cannot change after writes",
+                ));
+            }
+        }
+
+        if let Some(manifest) = &self.inner.manifest {
+            manifest
+                .lock()
+                .map_err(|_| lock_poisoned("manifest store"))?
+                .update_bucket_options(DEFAULT_BUCKET_NAME, options.clone())?;
+        }
+
+        {
+            let mut buckets = self
+                .inner
+                .buckets
+                .write()
+                .map_err(|_| lock_poisoned("bucket registry"))?;
+            let state = buckets
+                .get(DEFAULT_BUCKET_NAME)
+                .ok_or_else(|| Error::BucketMissing {
+                    name: DEFAULT_BUCKET_NAME.to_owned(),
+                })?;
+            if !state.is_empty()? {
+                return Err(Error::invalid_options(
+                    "default bucket options cannot change after writes",
+                ));
+            }
+            buckets.insert(
+                DEFAULT_BUCKET_NAME.to_owned(),
+                Arc::new(LsmTree::new(options.clone(), Vec::new())?),
+            );
+        }
+
+        Ok(Bucket::new(
+            self.clone(),
+            BucketName::new(DEFAULT_BUCKET_NAME),
+            options,
+        ))
+    }
+
+    /// Reads the newest committed value for `key` from the default bucket.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Value>> {
+        self.get_at_sequence(DEFAULT_BUCKET_NAME, key, self.last_committed_sequence())
+    }
+
+    /// Reads `key` from the default bucket at the sequence pinned by
+    /// `snapshot`.
+    pub fn get_at(&self, snapshot: &Snapshot, key: &[u8]) -> Result<Option<Value>> {
+        self.get_at_with_pin_state(
+            DEFAULT_BUCKET_NAME,
+            key,
+            snapshot.read_sequence(),
+            snapshot.is_pinned(),
+        )
+    }
+
+    /// Writes one key/value pair to the default bucket using default write
+    /// options.
+    pub fn put(&self, key: impl Into<Vec<u8>>, value: impl Into<Value>) -> Result<()> {
+        self.put_with_options(key, value, WriteOptions::default())
+            .map(|_| ())
+    }
+
+    /// Writes one key/value pair to the default bucket and returns commit
+    /// information.
+    pub fn put_with_options(
+        &self,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Value>,
+        options: WriteOptions,
+    ) -> Result<CommitInfo> {
+        let mut batch = crate::WriteBatch::new();
+        batch.put(DEFAULT_BUCKET_NAME, key, value);
+        self.write(batch, options)
+    }
+
+    /// Adds a point delete for one default-bucket key using default write
+    /// options.
+    pub fn delete(&self, key: impl Into<Vec<u8>>) -> Result<()> {
+        self.delete_with_options(key, WriteOptions::default())
+            .map(|_| ())
+    }
+
+    /// Adds a point delete for one default-bucket key and returns commit
+    /// information.
+    pub fn delete_with_options(
+        &self,
+        key: impl Into<Vec<u8>>,
+        options: WriteOptions,
+    ) -> Result<CommitInfo> {
+        let mut batch = crate::WriteBatch::new();
+        batch.delete(DEFAULT_BUCKET_NAME, key);
+        self.write(batch, options)
+    }
+
+    /// Adds a range delete to the default bucket using default write options.
+    pub fn delete_range(&self, range: KeyRange) -> Result<()> {
+        self.delete_range_with_options(range, WriteOptions::default())
+            .map(|_| ())
+    }
+
+    /// Adds a range delete to the default bucket and returns commit
+    /// information.
+    pub fn delete_range_with_options(
+        &self,
+        range: KeyRange,
+        options: WriteOptions,
+    ) -> Result<CommitInfo> {
+        let mut batch = crate::WriteBatch::new();
+        batch.delete_range(DEFAULT_BUCKET_NAME, range);
+        self.write(batch, options)
+    }
+
+    /// Returns a forward iterator over default-bucket rows in `range`.
+    pub fn range(&self, range: &KeyRange) -> Result<Iter> {
+        self.range_at_sequence(
+            DEFAULT_BUCKET_NAME,
+            range,
+            self.last_committed_sequence(),
+            Direction::Forward,
+        )
+    }
+
+    /// Returns a forward default-bucket iterator over `range` at `snapshot`.
+    pub fn range_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<Iter> {
+        self.range_at_sequence(
+            DEFAULT_BUCKET_NAME,
+            range,
+            snapshot.read_sequence(),
+            Direction::Forward,
+        )
+    }
+
+    /// Returns a reverse iterator over default-bucket rows in `range`.
+    pub fn range_reverse(&self, range: &KeyRange) -> Result<Iter> {
+        self.range_at_sequence(
+            DEFAULT_BUCKET_NAME,
+            range,
+            self.last_committed_sequence(),
+            Direction::Reverse,
+        )
+    }
+
+    /// Returns a reverse default-bucket iterator over `range` at `snapshot`.
+    pub fn range_reverse_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<Iter> {
+        self.range_at_sequence(
+            DEFAULT_BUCKET_NAME,
+            range,
+            snapshot.read_sequence(),
+            Direction::Reverse,
+        )
+    }
+
+    /// Returns a forward iterator over default-bucket rows whose keys begin
+    /// with `prefix`.
+    pub fn prefix(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
+        let prefix = prefix.into();
+        self.prefix_at_sequence(
+            DEFAULT_BUCKET_NAME,
+            &prefix,
+            self.last_committed_sequence(),
+            Direction::Forward,
+        )
+    }
+
+    /// Returns a forward default-bucket prefix iterator at `snapshot`.
+    pub fn prefix_at(&self, snapshot: &Snapshot, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
+        let prefix = prefix.into();
+        self.prefix_at_sequence(
+            DEFAULT_BUCKET_NAME,
+            &prefix,
+            snapshot.read_sequence(),
+            Direction::Forward,
+        )
+    }
+
+    /// Returns a reverse iterator over default-bucket rows whose keys begin
+    /// with `prefix`.
+    pub fn prefix_reverse(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
+        let prefix = prefix.into();
+        self.prefix_at_sequence(
+            DEFAULT_BUCKET_NAME,
+            &prefix,
+            self.last_committed_sequence(),
+            Direction::Reverse,
+        )
+    }
+
+    /// Returns a reverse default-bucket prefix iterator at `snapshot`.
+    pub fn prefix_reverse_at(
+        &self,
+        snapshot: &Snapshot,
+        prefix: impl Into<Vec<u8>>,
+    ) -> Result<Iter> {
+        let prefix = prefix.into();
+        self.prefix_at_sequence(
+            DEFAULT_BUCKET_NAME,
+            &prefix,
+            snapshot.read_sequence(),
+            Direction::Reverse,
+        )
     }
 
     pub fn persist(&self, mode: DurabilityMode) -> Result<()> {
@@ -532,12 +800,12 @@ impl Db {
         let mut level_stats = BTreeMap::<u32, LevelStats>::new();
         let mut live_blob_bytes_by_file = BTreeMap::<u64, u64>::new();
 
-        let Ok(keyspaces) = self.inner.keyspaces.read() else {
+        let Ok(buckets) = self.inner.buckets.read() else {
             return stats;
         };
-        stats.live_keyspaces = keyspaces.len();
+        stats.live_buckets = buckets.len();
 
-        for state in keyspaces.values() {
+        for state in buckets.values() {
             if let Ok(memtable_bytes) = state.memtable_bytes() {
                 stats.memtable_bytes = stats.memtable_bytes.saturating_add(memtable_bytes);
             }
@@ -709,18 +977,18 @@ impl Db {
         Ok(())
     }
 
-    pub(crate) fn get_at(
+    pub(crate) fn get_at_sequence(
         &self,
-        keyspace: &str,
+        bucket: &str,
         key: &[u8],
         read_sequence: Sequence,
     ) -> Result<Option<Vec<u8>>> {
-        self.get_at_with_pin_state(keyspace, key, read_sequence, false)
+        self.get_at_with_pin_state(bucket, key, read_sequence, false)
     }
 
     pub(crate) fn get_at_with_pin_state(
         &self,
-        keyspace: &str,
+        bucket: &str,
         key: &[u8],
         read_sequence: Sequence,
         read_pin_held: bool,
@@ -732,7 +1000,7 @@ impl Db {
             Some(self.inner.snapshots.pinned_snapshot(read_sequence))
         };
 
-        let state = self.keyspace_state(keyspace)?;
+        let state = self.bucket_state(bucket)?;
         state.read_visible_point(
             key,
             read_sequence,
@@ -741,9 +1009,9 @@ impl Db {
         )
     }
 
-    pub(crate) fn range_at(
+    pub(crate) fn range_at_sequence(
         &self,
-        keyspace: &str,
+        bucket: &str,
         range: &KeyRange,
         read_sequence: Sequence,
         direction: Direction,
@@ -751,7 +1019,7 @@ impl Db {
         self.ensure_open()?;
         let read_pin = self.inner.snapshots.pinned_snapshot(read_sequence);
 
-        let state = self.keyspace_state(keyspace)?;
+        let state = self.bucket_state(bucket)?;
         let selector = ScanSelector::Range(range.clone());
         let scan = state.scan(&selector, direction, Some(&self.inner.block_cache))?;
         let db_path = self.persistent_path().map(Path::to_path_buf);
@@ -766,9 +1034,9 @@ impl Db {
         ))
     }
 
-    pub(crate) fn prefix_at(
+    pub(crate) fn prefix_at_sequence(
         &self,
-        keyspace: &str,
+        bucket: &str,
         prefix: &[u8],
         read_sequence: Sequence,
         direction: Direction,
@@ -776,7 +1044,7 @@ impl Db {
         self.ensure_open()?;
         let read_pin = self.inner.snapshots.pinned_snapshot(read_sequence);
 
-        let state = self.keyspace_state(keyspace)?;
+        let state = self.bucket_state(bucket)?;
         let selector = ScanSelector::Prefix(prefix.to_vec());
         let scan = state.scan(&selector, direction, Some(&self.inner.block_cache))?;
         let db_path = self.persistent_path().map(Path::to_path_buf);
@@ -791,29 +1059,29 @@ impl Db {
         ))
     }
 
-    fn keyspace_state(&self, keyspace: &str) -> Result<Arc<LsmTree>> {
-        let keyspaces = self
+    fn bucket_state(&self, bucket: &str) -> Result<Arc<LsmTree>> {
+        let buckets = self
             .inner
-            .keyspaces
+            .buckets
             .read()
-            .map_err(|_| lock_poisoned("keyspace registry"))?;
+            .map_err(|_| lock_poisoned("bucket registry"))?;
 
-        keyspaces
-            .get(keyspace)
+        buckets
+            .get(bucket)
             .cloned()
-            .ok_or_else(|| Error::KeyspaceMissing {
-                name: keyspace.to_owned(),
+            .ok_or_else(|| Error::BucketMissing {
+                name: bucket.to_owned(),
             })
     }
 
-    fn existing_keyspace_options(&self, keyspace: &str) -> Result<Option<KeyspaceOptions>> {
-        let keyspaces = self
+    fn existing_bucket_options(&self, bucket: &str) -> Result<Option<BucketOptions>> {
+        let buckets = self
             .inner
-            .keyspaces
+            .buckets
             .read()
-            .map_err(|_| lock_poisoned("keyspace registry"))?;
+            .map_err(|_| lock_poisoned("bucket registry"))?;
 
-        Ok(keyspaces.get(keyspace).map(|state| state.options.clone()))
+        Ok(buckets.get(bucket).map(|state| state.options.clone()))
     }
 
     fn persistent_path(&self) -> Option<&Path> {
@@ -823,35 +1091,36 @@ impl Db {
         }
     }
 
-    fn persist_keyspace_creation(&self, name: &str, options: &KeyspaceOptions) -> Result<()> {
+    fn persist_bucket_creation(&self, name: &str, options: &BucketOptions) -> Result<()> {
         if let Some(manifest) = &self.inner.manifest {
-            // Manifest I/O happens outside the keyspace registry lock. Two
+            // Manifest I/O happens outside the bucket registry lock. Two
             // racing creators are serialized by the manifest lock, and the
             // second identical request becomes a no-op.
             manifest
                 .lock()
                 .map_err(|_| lock_poisoned("manifest store"))?
-                .create_keyspace(name.to_owned(), options.clone())?;
+                .create_bucket(name.to_owned(), options.clone())?;
         }
 
         Ok(())
     }
 
-    fn resolve_batch_keyspaces(&self, operations: &[BatchOperation]) -> Result<Vec<Arc<LsmTree>>> {
-        let keyspaces = self
+    fn resolve_batch_buckets(&self, operations: &[BatchOperation]) -> Result<Vec<Arc<LsmTree>>> {
+        let buckets = self
             .inner
-            .keyspaces
+            .buckets
             .read()
-            .map_err(|_| lock_poisoned("keyspace registry"))?;
+            .map_err(|_| lock_poisoned("bucket registry"))?;
         let mut states = Vec::with_capacity(operations.len());
 
         for operation in operations {
-            let state = keyspaces
-                .get(operation.keyspace())
-                .cloned()
-                .ok_or_else(|| Error::KeyspaceMissing {
-                    name: operation.keyspace().to_owned(),
-                })?;
+            let state =
+                buckets
+                    .get(operation.bucket())
+                    .cloned()
+                    .ok_or_else(|| Error::BucketMissing {
+                        name: operation.bucket().to_owned(),
+                    })?;
             states.push(state);
         }
 
@@ -887,13 +1156,13 @@ impl Db {
     }
 
     fn has_immutable_memtables(&self) -> Result<bool> {
-        let keyspaces = self
+        let buckets = self
             .inner
-            .keyspaces
+            .buckets
             .read()
-            .map_err(|_| lock_poisoned("keyspace registry"))?;
+            .map_err(|_| lock_poisoned("bucket registry"))?;
 
-        for state in keyspaces.values() {
+        for state in buckets.values() {
             if state.has_immutable_memtables()? {
                 return Ok(true);
             }
@@ -903,14 +1172,14 @@ impl Db {
     }
 
     fn freeze_all_active_memtables(&self, freeze_sequence: Sequence) -> Result<usize> {
-        let keyspaces = self
+        let buckets = self
             .inner
-            .keyspaces
+            .buckets
             .read()
-            .map_err(|_| lock_poisoned("keyspace registry"))?;
+            .map_err(|_| lock_poisoned("bucket registry"))?;
         let mut frozen_count = 0;
 
-        for state in keyspaces.values() {
+        for state in buckets.values() {
             if state.freeze_active_memtable(freeze_sequence)? {
                 frozen_count += 1;
             }
@@ -961,7 +1230,7 @@ impl Db {
                     return Err(error);
                 }
             };
-            written_tables.push((input.keyspace.clone(), Arc::new(table)));
+            written_tables.push((input.bucket.clone(), Arc::new(table)));
         }
 
         if let Err(error) = durability::sync_dir_after_renames(db_path) {
@@ -981,20 +1250,20 @@ impl Db {
     fn collect_pressure_flush_inputs(&self) -> Result<Vec<NamedFlushInput>> {
         let max_immutable_memtables = self.inner.options.max_immutable_memtables;
         let mut next_table_id = self.next_table_id()?;
-        let keyspaces = self
+        let buckets = self
             .inner
-            .keyspaces
+            .buckets
             .read()
-            .map_err(|_| lock_poisoned("keyspace registry"))?;
+            .map_err(|_| lock_poisoned("bucket registry"))?;
         let mut inputs = Vec::new();
 
-        for (name, state) in keyspaces.iter() {
+        for (name, state) in buckets.iter() {
             if state.immutable_memtable_count()? < max_immutable_memtables {
                 continue;
             }
             for input in state.prepare_flush_inputs(&mut next_table_id)? {
                 inputs.push(NamedFlushInput {
-                    keyspace: name.clone(),
+                    bucket: name.clone(),
                     tree: Arc::clone(state),
                     input,
                 });
@@ -1006,17 +1275,17 @@ impl Db {
 
     fn collect_flush_inputs(&self) -> Result<Vec<NamedFlushInput>> {
         let mut next_table_id = self.next_table_id()?;
-        let keyspaces = self
+        let buckets = self
             .inner
-            .keyspaces
+            .buckets
             .read()
-            .map_err(|_| lock_poisoned("keyspace registry"))?;
+            .map_err(|_| lock_poisoned("bucket registry"))?;
         let mut inputs = Vec::new();
 
-        for (name, state) in keyspaces.iter() {
+        for (name, state) in buckets.iter() {
             for input in state.prepare_flush_inputs(&mut next_table_id)? {
                 inputs.push(NamedFlushInput {
-                    keyspace: name.clone(),
+                    bucket: name.clone(),
                     tree: Arc::clone(state),
                     input,
                 });
@@ -1031,22 +1300,22 @@ impl Db {
         range: &KeyRange,
         oldest_active_snapshot: Sequence,
     ) -> Result<Vec<NamedCompactionInput>> {
-        let keyspaces = self
+        let buckets = self
             .inner
-            .keyspaces
+            .buckets
             .read()
-            .map_err(|_| lock_poisoned("keyspace registry"))?;
+            .map_err(|_| lock_poisoned("bucket registry"))?;
         let mut inputs = Vec::new();
         let compaction_options = compaction_options(&self.inner.options);
 
-        for (name, state) in keyspaces.iter() {
+        for (name, state) in buckets.iter() {
             let Some(input) =
                 state.plan_compaction(name, range, oldest_active_snapshot, compaction_options)?
             else {
                 continue;
             };
             inputs.push(NamedCompactionInput {
-                keyspace: name.clone(),
+                bucket: name.clone(),
                 tree: Arc::clone(state),
                 input,
             });
@@ -1069,7 +1338,7 @@ impl Db {
         for input in compaction_inputs {
             if input.input.trivial_move {
                 outputs.push(NamedCompactionOutput {
-                    keyspace: input.keyspace.clone(),
+                    bucket: input.bucket.clone(),
                     output: LsmCompactionOutput {
                         input_table_ids: input.input.input_table_ids.clone(),
                         tables: vec![input.input.moved_table()?],
@@ -1121,7 +1390,7 @@ impl Db {
                 output_tables.push(Arc::new(table));
             }
             outputs.push(NamedCompactionOutput {
-                keyspace: input.keyspace.clone(),
+                bucket: input.bucket.clone(),
                 output: LsmCompactionOutput {
                     input_table_ids: input.input.input_table_ids.clone(),
                     tables: output_tables,
@@ -1154,7 +1423,7 @@ impl Db {
     ) -> Result<()> {
         let edits = tables
             .iter()
-            .map(|(keyspace, table)| (keyspace.clone(), table.properties().clone()))
+            .map(|(bucket, table)| (bucket.clone(), table.properties().clone()))
             .collect::<Vec<_>>();
         self.inner
             .manifest
@@ -1172,7 +1441,7 @@ impl Db {
             .iter()
             .map(|output| {
                 (
-                    output.keyspace.clone(),
+                    output.bucket.clone(),
                     output.output.input_table_ids.clone(),
                     output
                         .output
@@ -1210,8 +1479,8 @@ impl Db {
         inputs: &[NamedFlushInput],
         tables: Vec<(String, Arc<Table>)>,
     ) -> Result<()> {
-        for (input, (keyspace, table)) in inputs.iter().zip(tables) {
-            debug_assert_eq!(input.keyspace, keyspace);
+        for (input, (bucket, table)) in inputs.iter().zip(tables) {
+            debug_assert_eq!(input.bucket, bucket);
             input.tree.install_flush(&input.input, table)?;
         }
 
@@ -1220,7 +1489,7 @@ impl Db {
 
     fn install_compacted_tables(&self, outputs: Vec<NamedCompactionOutput>) -> Result<()> {
         for output in outputs {
-            let state = self.keyspace_state(&output.keyspace)?;
+            let state = self.bucket_state(&output.bucket)?;
             state.install_compaction(output.output)?;
         }
 
@@ -1229,7 +1498,7 @@ impl Db {
 
     fn validate_compacted_tables(&self, outputs: &[NamedCompactionOutput]) -> Result<()> {
         for output in outputs {
-            let state = self.keyspace_state(&output.keyspace)?;
+            let state = self.bucket_state(&output.bucket)?;
             state.validate_compaction(&output.output)?;
         }
 
@@ -1237,12 +1506,12 @@ impl Db {
     }
 
     fn live_blob_file_ids(&self) -> Result<BTreeSet<u64>> {
-        let keyspaces = self
+        let buckets = self
             .inner
-            .keyspaces
+            .buckets
             .read()
-            .map_err(|_| lock_poisoned("keyspace registry"))?;
-        referenced_blob_file_ids(&keyspaces)
+            .map_err(|_| lock_poisoned("bucket registry"))?;
+        referenced_blob_file_ids(&buckets)
     }
 
     fn remove_unreferenced_blob_files(&self, db_path: &Path) -> Result<()> {
@@ -1295,13 +1564,13 @@ impl Db {
     }
 
     fn l0_pressure_exceeded(&self) -> Result<bool> {
-        let keyspaces = self
+        let buckets = self
             .inner
-            .keyspaces
+            .buckets
             .read()
-            .map_err(|_| lock_poisoned("keyspace registry"))?;
+            .map_err(|_| lock_poisoned("bucket registry"))?;
 
-        for state in keyspaces.values() {
+        for state in buckets.values() {
             if state.l0_table_count()? > self.inner.options.max_l0_files {
                 return Ok(true);
             }
@@ -1347,6 +1616,7 @@ impl Db {
 }
 
 fn validate_options(options: &DbOptions) -> Result<()> {
+    validate_bucket_options(&options.default_bucket_options)?;
     if options.write_buffer_bytes == 0 {
         return Err(Error::invalid_options("write buffer must be non-zero"));
     }
@@ -1386,14 +1656,14 @@ fn background_worker_loop(inner: &Weak<DbInner>, maintenance: &MaintenanceCoordi
     }
 }
 
-fn keyspaces_from_manifest(
+fn buckets_from_manifest(
     db_path: &Path,
     manifest: &ManifestState,
 ) -> Result<BTreeMap<String, Arc<LsmTree>>> {
-    let mut keyspaces = BTreeMap::new();
+    let mut buckets = BTreeMap::new();
 
-    for (name, options) in manifest.keyspaces() {
-        validate_keyspace_options(options)?;
+    for (name, options) in manifest.buckets() {
+        validate_bucket_options(options)?;
         let mut tables = Vec::new();
         for properties in manifest.tables().get(name).into_iter().flatten() {
             let table_path = table::table_path(db_path, properties.id);
@@ -1401,13 +1671,47 @@ fn keyspaces_from_manifest(
             tables.push(Arc::new(table));
         }
 
-        keyspaces.insert(
+        buckets.insert(
             name.clone(),
             Arc::new(LsmTree::new(options.clone(), tables)?),
         );
     }
 
-    Ok(keyspaces)
+    Ok(buckets)
+}
+
+fn ensure_default_bucket_in_manifest(
+    manifest: &mut ManifestStore,
+    options: &DbOptions,
+) -> Result<()> {
+    if manifest.state().buckets().contains_key(DEFAULT_BUCKET_NAME) || options.read_only {
+        return Ok(());
+    }
+
+    manifest.create_bucket(
+        DEFAULT_BUCKET_NAME.to_owned(),
+        options.default_bucket_options.clone(),
+    )
+}
+
+fn ensure_default_bucket_loaded(
+    buckets: &mut BTreeMap<String, Arc<LsmTree>>,
+    options: &DbOptions,
+) -> Result<()> {
+    if buckets.contains_key(DEFAULT_BUCKET_NAME) {
+        return Ok(());
+    }
+
+    // Read-only opens cannot publish a missing manifest entry, but the public
+    // API still treats the default bucket as always present.
+    buckets.insert(
+        DEFAULT_BUCKET_NAME.to_owned(),
+        Arc::new(LsmTree::new(
+            options.default_bucket_options.clone(),
+            Vec::new(),
+        )?),
+    );
+    Ok(())
 }
 
 fn table_file_bytes(db_path: &Path, table_id: table::TableId) -> u64 {
@@ -1463,10 +1767,10 @@ fn referenced_blob_file_ids_from_manifest(manifest: &ManifestState) -> BTreeSet<
         .collect()
 }
 
-fn referenced_blob_file_ids(keyspaces: &BTreeMap<String, Arc<LsmTree>>) -> Result<BTreeSet<u64>> {
+fn referenced_blob_file_ids(buckets: &BTreeMap<String, Arc<LsmTree>>) -> Result<BTreeSet<u64>> {
     let mut file_ids = BTreeSet::new();
 
-    for state in keyspaces.values() {
+    for state in buckets.values() {
         for table in state.tables_snapshot()? {
             file_ids.extend(table.blob_file_ids());
         }
@@ -1475,7 +1779,7 @@ fn referenced_blob_file_ids(keyspaces: &BTreeMap<String, Arc<LsmTree>>) -> Resul
     Ok(file_ids)
 }
 
-fn validate_keyspace_options(options: &KeyspaceOptions) -> Result<()> {
+fn validate_bucket_options(options: &BucketOptions) -> Result<()> {
     if options.block_bytes == 0 {
         return Err(Error::invalid_options("block size must be non-zero"));
     }

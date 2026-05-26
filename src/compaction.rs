@@ -8,7 +8,7 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionPlan {
-    pub keyspace: String,
+    pub bucket: String,
     pub input_tables: Vec<TableId>,
     pub output_level: TableLevel,
     pub oldest_active_snapshot: Sequence,
@@ -69,7 +69,7 @@ struct KeySpan {
 }
 
 pub(crate) fn plan_compaction(
-    keyspace: &str,
+    bucket: &str,
     tables: &[CompactionTable],
     range: &KeyRange,
     oldest_active_snapshot: Sequence,
@@ -77,7 +77,7 @@ pub(crate) fn plan_compaction(
 ) -> Result<Option<CompactionPlan>> {
     if let Some(input_tables) = l0_compaction_inputs(tables, range) {
         return Ok(Some(CompactionPlan {
-            keyspace: keyspace.to_owned(),
+            bucket: bucket.to_owned(),
             input_tables,
             output_level: TableLevel(1),
             oldest_active_snapshot,
@@ -89,7 +89,7 @@ pub(crate) fn plan_compaction(
         let input_tables = narrow_leveled_inputs(tables, range, level, output_level);
         if !input_tables.is_empty() {
             return Ok(Some(CompactionPlan {
-                keyspace: keyspace.to_owned(),
+                bucket: bucket.to_owned(),
                 input_tables,
                 output_level,
                 oldest_active_snapshot,
@@ -107,7 +107,7 @@ pub(crate) fn plan_compaction(
     }
 
     Ok(Some(CompactionPlan {
-        keyspace: keyspace.to_owned(),
+        bucket: bucket.to_owned(),
         input_tables,
         output_level,
         oldest_active_snapshot,

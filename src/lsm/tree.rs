@@ -6,7 +6,7 @@ use std::{
 use crate::{
     error::{Error, Result},
     memtable::Memtable,
-    options::KeyspaceOptions,
+    options::BucketOptions,
     range_tombstone::RangeTombstoneLike,
     table::Table,
     types::{KeyRange, Sequence},
@@ -16,7 +16,7 @@ use super::LsmVersion;
 
 #[derive(Debug)]
 pub(crate) struct LsmTree {
-    pub(crate) options: KeyspaceOptions,
+    pub(crate) options: BucketOptions,
     pub(crate) active_memtable: RwLock<Arc<Memtable>>,
     pub(crate) range_tombstones: RwLock<Vec<RangeTombstone>>,
     pub(crate) range_tombstone_bytes: AtomicU64,
@@ -25,7 +25,7 @@ pub(crate) struct LsmTree {
 }
 
 impl LsmTree {
-    pub(crate) fn new(options: KeyspaceOptions, tables: Vec<Arc<Table>>) -> Result<Self> {
+    pub(crate) fn new(options: BucketOptions, tables: Vec<Arc<Table>>) -> Result<Self> {
         let current_version = Arc::new(LsmVersion::new(tables)?);
         Ok(Self {
             options,
@@ -58,6 +58,28 @@ impl LsmTree {
 
     pub(crate) fn l0_table_count(&self) -> Result<usize> {
         Ok(self.current_version()?.l0_table_count())
+    }
+
+    pub(crate) fn is_empty(&self) -> Result<bool> {
+        let active_empty = self
+            .active_memtable
+            .read()
+            .map_err(|_| lock_poisoned("active memtable"))?
+            .is_empty()
+            .map_err(|()| lock_poisoned("memtable entries"))?;
+        let tombstones_empty = self
+            .range_tombstones
+            .read()
+            .map_err(|_| lock_poisoned("range tombstones"))?
+            .is_empty();
+        let immutable_empty = self
+            .immutable_memtables
+            .read()
+            .map_err(|_| lock_poisoned("immutable memtable queue"))?
+            .is_empty();
+        let tables_empty = self.current_version()?.table_handles().is_empty();
+
+        Ok(active_empty && tombstones_empty && immutable_empty && tables_empty)
     }
 }
 

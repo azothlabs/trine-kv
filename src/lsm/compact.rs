@@ -6,7 +6,7 @@ use crate::{
     error::Result,
     internal_key::{InternalKey, ValueKind},
     iterator::{Direction, RecordGroup, ScanSelector},
-    options::KeyspaceOptions,
+    options::BucketOptions,
     range_tombstone,
     table::{self, Table, TablePointCursor, TableRangeTombstone},
     types::{KeyRange, Sequence},
@@ -20,7 +20,7 @@ pub(crate) struct CompactionInput {
     pub(crate) table_options: table::TableWriteOptions,
     pub(crate) input_table_ids: Vec<table::TableId>,
     pub(crate) trivial_move: bool,
-    full_keyspace_compaction: bool,
+    full_bucket_compaction: bool,
     input_tables: Vec<Arc<Table>>,
 }
 
@@ -45,7 +45,7 @@ struct CompactionChunk {
 impl LsmTree {
     pub(crate) fn plan_compaction(
         &self,
-        keyspace: &str,
+        bucket: &str,
         range: &KeyRange,
         oldest_active_snapshot: Sequence,
         options: compaction::CompactionOptions,
@@ -62,7 +62,7 @@ impl LsmTree {
             })
             .collect::<Vec<_>>();
         let Some(plan) = compaction::plan_compaction(
-            keyspace,
+            bucket,
             &plan_tables,
             range,
             oldest_active_snapshot,
@@ -72,7 +72,7 @@ impl LsmTree {
             return Ok(None);
         };
         let input_table_ids = plan.input_tables.iter().copied().collect::<BTreeSet<_>>();
-        let full_keyspace_compaction = range_is_all(range)
+        let full_bucket_compaction = range_is_all(range)
             && tables
                 .iter()
                 .all(|table| input_table_ids.contains(&table.properties().id));
@@ -92,7 +92,7 @@ impl LsmTree {
             table_options: table_write_options(&self.options),
             input_table_ids,
             trivial_move,
-            full_keyspace_compaction,
+            full_bucket_compaction,
             input_tables,
         }))
     }
@@ -149,7 +149,7 @@ impl LsmTree {
             let records = compact_point_record_group(
                 records,
                 oldest_active_snapshot,
-                input.full_keyspace_compaction,
+                input.full_bucket_compaction,
             );
             if records.is_empty() {
                 continue;
@@ -174,12 +174,12 @@ impl LsmTree {
         let range_tombstones = cleanup_range_tombstones_by_coverage(
             range_tombstones,
             tombstone_has_remaining_put,
-            input.full_keyspace_compaction,
+            input.full_bucket_compaction,
         );
         Ok(compaction_payloads_from_chunks(
             chunks,
             &range_tombstones,
-            input.full_keyspace_compaction,
+            input.full_bucket_compaction,
             target_table_bytes,
         ))
     }
@@ -283,10 +283,10 @@ fn next_compaction_user_key(sources: &mut [CompactionSource]) -> Result<Option<V
 fn compact_point_record_group(
     records: Vec<(InternalKey, Option<ValueRef>)>,
     oldest_active_snapshot: Sequence,
-    full_keyspace_compaction: bool,
+    full_bucket_compaction: bool,
 ) -> Vec<(InternalKey, Option<ValueRef>)> {
     let compacted = compact_point_records(records, oldest_active_snapshot);
-    if full_keyspace_compaction {
+    if full_bucket_compaction {
         cleanup_point_tombstones(&compacted)
     } else {
         // A partial compaction sees only selected input tables. Keep point
@@ -335,9 +335,9 @@ fn mark_tombstones_covering_records(
 fn cleanup_range_tombstones_by_coverage(
     range_tombstones: Vec<TableRangeTombstone>,
     tombstone_has_remaining_put: Vec<bool>,
-    full_keyspace_compaction: bool,
+    full_bucket_compaction: bool,
 ) -> Vec<TableRangeTombstone> {
-    if !full_keyspace_compaction {
+    if !full_bucket_compaction {
         return range_tombstones;
     }
 
@@ -351,7 +351,7 @@ fn cleanup_range_tombstones_by_coverage(
 fn compaction_payloads_from_chunks(
     chunks: Vec<CompactionChunk>,
     range_tombstones: &[TableRangeTombstone],
-    full_keyspace_compaction: bool,
+    full_bucket_compaction: bool,
     target_table_bytes: u64,
 ) -> Vec<CompactionTablePayload> {
     let mut payloads = Vec::with_capacity(chunks.len());
@@ -364,7 +364,7 @@ fn compaction_payloads_from_chunks(
         let mut chunk_tombstones = Vec::new();
         for (index, tombstone) in range_tombstones.iter().enumerate() {
             if let Some(tombstone) =
-                tombstone_for_output_span(tombstone, &span, full_keyspace_compaction)
+                tombstone_for_output_span(tombstone, &span, full_bucket_compaction)
             {
                 assigned_tombstones[index] = true;
                 chunk_tombstones.push(tombstone);
@@ -409,9 +409,9 @@ fn compaction_payloads_from_chunks(
 fn tombstone_for_output_span(
     tombstone: &TableRangeTombstone,
     span: &KeyRange,
-    full_keyspace_compaction: bool,
+    full_bucket_compaction: bool,
 ) -> Option<TableRangeTombstone> {
-    if full_keyspace_compaction {
+    if full_bucket_compaction {
         range_tombstone::range_intersection(&tombstone.range, span).map(|range| {
             TableRangeTombstone {
                 range,
@@ -533,7 +533,7 @@ fn range_is_all(range: &KeyRange) -> bool {
     )
 }
 
-fn table_write_options(options: &KeyspaceOptions) -> table::TableWriteOptions {
+fn table_write_options(options: &BucketOptions) -> table::TableWriteOptions {
     table::TableWriteOptions {
         codec: options.compression.codec_id(),
         block_bytes: options.block_bytes,
@@ -555,12 +555,12 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
 fn cleanup_range_tombstones(
     range_tombstones: Vec<TableRangeTombstone>,
     point_records: &[(InternalKey, Option<ValueRef>)],
-    full_keyspace_compaction: bool,
+    full_bucket_compaction: bool,
 ) -> Vec<TableRangeTombstone> {
     // Partial compaction cannot prove there is no older covered data just
     // outside its input tables. Keep range tombstones there and only clean them
-    // when the whole keyspace participates in this compaction pass.
-    if !full_keyspace_compaction {
+    // when the whole bucket participates in this compaction pass.
+    if !full_bucket_compaction {
         return range_tombstones;
     }
 
@@ -598,7 +598,7 @@ mod tests {
     use crate::{
         compaction::CompactionOptions,
         lsm::LsmTree,
-        options::KeyspaceOptions,
+        options::BucketOptions,
         table::{self, TableId, TableLevel},
         types::{KeyRange, Sequence},
     };
@@ -742,7 +742,7 @@ mod tests {
     fn range_all_compaction_is_not_full_when_picker_chooses_narrow_input() {
         let table_dir = temp_table_dir("narrow-compaction");
         let tree = LsmTree::new(
-            KeyspaceOptions::default(),
+            BucketOptions::default(),
             vec![
                 test_table(&table_dir, 1, 1, "a"),
                 test_table(&table_dir, 2, 1, "c"),
@@ -766,7 +766,7 @@ mod tests {
             .expect("plan exists");
 
         assert_eq!(input.input_tables.len(), 1);
-        assert!(!input.full_keyspace_compaction);
+        assert!(!input.full_bucket_compaction);
         fs::remove_dir_all(table_dir).expect("cleanup table dir");
     }
 
@@ -774,7 +774,7 @@ mod tests {
     fn range_all_compaction_is_full_when_all_tables_are_inputs() {
         let table_dir = temp_table_dir("full-compaction");
         let tree = LsmTree::new(
-            KeyspaceOptions::default(),
+            BucketOptions::default(),
             vec![
                 test_table(&table_dir, 1, 0, "a"),
                 test_table(&table_dir, 2, 0, "b"),
@@ -797,7 +797,7 @@ mod tests {
             .expect("plan exists");
 
         assert_eq!(input.input_tables.len(), 2);
-        assert!(input.full_keyspace_compaction);
+        assert!(input.full_bucket_compaction);
         fs::remove_dir_all(table_dir).expect("cleanup table dir");
     }
 
@@ -847,7 +847,7 @@ mod tests {
             &table::table_path(table_dir, table_id),
             table_id,
             TableLevel(level),
-            &table_write_options(&KeyspaceOptions::default()),
+            &table_write_options(&BucketOptions::default()),
             &[record(key, 1)],
             &[],
         )

@@ -1,39 +1,42 @@
 use crate::types::{KeyRange, Value};
 
+/// One operation inside an atomic write batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatchOperation {
-    Insert {
-        keyspace: String,
+    Put {
+        bucket: String,
         key: Vec<u8>,
         value: Value,
     },
-    Remove {
-        keyspace: String,
+    Delete {
+        bucket: String,
         key: Vec<u8>,
     },
-    RemoveRange {
-        keyspace: String,
+    DeleteRange {
+        bucket: String,
         range: KeyRange,
     },
 }
 
 impl BatchOperation {
     #[must_use]
-    pub fn keyspace(&self) -> &str {
+    pub fn bucket(&self) -> &str {
         match self {
-            Self::Insert { keyspace, .. }
-            | Self::Remove { keyspace, .. }
-            | Self::RemoveRange { keyspace, .. } => keyspace,
+            Self::Put { bucket, .. }
+            | Self::Delete { bucket, .. }
+            | Self::DeleteRange { bucket, .. } => bucket,
         }
     }
 }
 
+/// Atomic group of writes that may span multiple buckets.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WriteBatch {
     operations: Vec<BatchOperation>,
 }
 
 impl WriteBatch {
+    /// Creates an empty batch.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -41,29 +44,32 @@ impl WriteBatch {
         }
     }
 
-    pub fn insert(
+    /// Adds a key/value write for `bucket`.
+    pub fn put(
         &mut self,
-        keyspace: impl Into<String>,
+        bucket: impl Into<String>,
         key: impl Into<Vec<u8>>,
         value: impl Into<Value>,
     ) {
-        self.operations.push(BatchOperation::Insert {
-            keyspace: keyspace.into(),
+        self.operations.push(BatchOperation::Put {
+            bucket: bucket.into(),
             key: key.into(),
             value: value.into(),
         });
     }
 
-    pub fn remove(&mut self, keyspace: impl Into<String>, key: impl Into<Vec<u8>>) {
-        self.operations.push(BatchOperation::Remove {
-            keyspace: keyspace.into(),
+    /// Adds a point delete for `bucket`.
+    pub fn delete(&mut self, bucket: impl Into<String>, key: impl Into<Vec<u8>>) {
+        self.operations.push(BatchOperation::Delete {
+            bucket: bucket.into(),
             key: key.into(),
         });
     }
 
-    pub fn remove_range(&mut self, keyspace: impl Into<String>, range: KeyRange) {
-        self.operations.push(BatchOperation::RemoveRange {
-            keyspace: keyspace.into(),
+    /// Adds a range delete for `bucket`.
+    pub fn delete_range(&mut self, bucket: impl Into<String>, range: KeyRange) {
+        self.operations.push(BatchOperation::DeleteRange {
+            bucket: bucket.into(),
             range,
         });
     }

@@ -3310,3 +3310,53 @@ Record only evidence that can change planning or durable decisions.
 
 - Push to CI when ready, then treat any remote failure as fresh evidence for
   the next phase.
+
+## 2026-05-26: Phase 31 Default Bucket API Polish Completed
+
+### Observation
+
+- The public API now exposes `Bucket`, `BucketName`, and `BucketOptions` for
+  named buckets, with `Db::open_bucket` and `Db::open_bucket_with_options` as
+  the named-bucket entry points.
+- `Db::put`, `Db::get`, `Db::range`, `Db::prefix`, and their snapshot/reverse
+  variants now operate on the built-in default bucket.
+- Memory and persistent open paths both create or load the default bucket
+  before reads and writes run.
+- `WriteBatch` and `Transaction` now expose `put`, `delete`, and
+  `delete_range` helpers; public batch operations use `Put`, `Delete`, and
+  `DeleteRange` variants.
+- Usage docs, examples, public protocol docs, durable boundary docs, tests,
+  benches, and stats naming now use bucket terminology.
+
+### Interpretation
+
+- Phase 31 acceptance is met locally: simple users can call direct `Db`
+  helpers, while advanced users can still create named buckets for isolation or
+  different options.
+- The change is a pre-1.0 public API break and remains within the existing
+  Semantic Versioning rule for the crate.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo check --all-targets --all-features`
+- `cargo clippy --all-targets --all-features`
+- `cargo test --test persistent_wal`
+- `cargo test --test scaffold`
+- `cargo test --all-targets --all-features`
+- `cargo run --example quickstart`
+- `cargo run --example user_store`
+- `cargo run --example event_index`
+- `git diff --check`
+- public old-name scan over current `.phrase` docs, `src`, `tests`,
+  `examples`, `docs`, `README.md`, and `benches`
+- forbidden-term scan over `.phrase`, `src`, `tests`, `examples`, `docs`,
+  `README.md`, and `benches`
+
+### Remaining Blockers
+
+- Remote CI cannot be executed locally; it must run after push.
+
+### Recommended Next Action
+
+- Commit the Phase 31 API polish, then push to CI when ready.

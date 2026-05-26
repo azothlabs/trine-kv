@@ -4,9 +4,9 @@ use std::{
 };
 
 use crate::{
+    bucket::Bucket,
     error::Result,
     iterator::Iter,
-    keyspace::Keyspace,
     types::{KeyRange, Sequence, Value},
 };
 
@@ -96,24 +96,24 @@ impl Snapshot {
         self.pin.is_some()
     }
 
-    pub fn get(&self, keyspace: &Keyspace, key: &[u8]) -> Result<Option<Value>> {
-        keyspace.get_at(self, key)
+    pub fn get(&self, bucket: &Bucket, key: &[u8]) -> Result<Option<Value>> {
+        bucket.get_at(self, key)
     }
 
-    pub fn range(&self, keyspace: &Keyspace, range: &KeyRange) -> Result<Iter> {
-        keyspace.range_at(self, range)
+    pub fn range(&self, bucket: &Bucket, range: &KeyRange) -> Result<Iter> {
+        bucket.range_at(self, range)
     }
 
-    pub fn range_reverse(&self, keyspace: &Keyspace, range: &KeyRange) -> Result<Iter> {
-        keyspace.range_reverse_at(self, range)
+    pub fn range_reverse(&self, bucket: &Bucket, range: &KeyRange) -> Result<Iter> {
+        bucket.range_reverse_at(self, range)
     }
 
-    pub fn prefix(&self, keyspace: &Keyspace, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
-        keyspace.prefix_at(self, prefix)
+    pub fn prefix(&self, bucket: &Bucket, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
+        bucket.prefix_at(self, prefix)
     }
 
-    pub fn prefix_reverse(&self, keyspace: &Keyspace, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
-        keyspace.prefix_reverse_at(self, prefix)
+    pub fn prefix_reverse(&self, bucket: &Bucket, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
+        bucket.prefix_reverse_at(self, prefix)
     }
 }
 

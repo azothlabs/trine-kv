@@ -88,6 +88,8 @@ pub struct DbOptions {
     pub storage_mode: StorageMode,
     pub create_if_missing: bool,
     pub read_only: bool,
+    /// Options used when the built-in default bucket is first created.
+    pub default_bucket_options: BucketOptions,
     pub durability: DurabilityMode,
     pub write_buffer_bytes: usize,
     pub max_immutable_memtables: usize,
@@ -142,6 +144,7 @@ impl Default for DbOptions {
             storage_mode: StorageMode::InMemory,
             create_if_missing: true,
             read_only: false,
+            default_bucket_options: BucketOptions::default(),
             durability: DurabilityMode::Buffered,
             write_buffer_bytes: Self::DEFAULT_WRITE_BUFFER_BYTES,
             max_immutable_memtables: 4,
@@ -156,7 +159,7 @@ impl Default for DbOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeyspaceOptions {
+pub struct BucketOptions {
     pub allow_empty_keys: bool,
     pub compression: CompressionProfile,
     pub block_bytes: usize,
@@ -167,7 +170,7 @@ pub struct KeyspaceOptions {
     pub blob_threshold_bytes: usize,
 }
 
-impl KeyspaceOptions {
+impl BucketOptions {
     pub const DEFAULT_BLOCK_BYTES: usize = 16 * 1024;
     pub const DEFAULT_BLOB_THRESHOLD_BYTES: usize = 1024 * 1024;
 
@@ -184,7 +187,7 @@ impl KeyspaceOptions {
     }
 }
 
-impl Default for KeyspaceOptions {
+impl Default for BucketOptions {
     fn default() -> Self {
         Self {
             allow_empty_keys: true,

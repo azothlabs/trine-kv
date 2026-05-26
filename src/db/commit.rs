@@ -53,7 +53,7 @@ impl Db {
         validate_batch_len(operations.len())?;
 
         // The writer lock serializes commit sequence assignment and memtable
-        // updates. Reads only take keyspace/table read locks and do not enter
+        // updates. Reads only take bucket/table read locks and do not enter
         // this coordinator.
         let _writer = self
             .inner
@@ -79,7 +79,7 @@ impl Db {
             .ok_or_else(|| Error::Corruption {
                 message: "sequence counter overflow".to_owned(),
             })?;
-        let states = self.resolve_batch_keyspaces(&operations)?;
+        let states = self.resolve_batch_buckets(&operations)?;
 
         let indexed_operations = operations
             .into_iter()
@@ -125,19 +125,19 @@ impl Db {
         read_set: &TransactionReadSet,
     ) -> Result<()> {
         for read in &read_set.point_reads {
-            let state = self.keyspace_state(&read.keyspace)?;
+            let state = self.bucket_state(&read.bucket)?;
             if state.point_key_modified_after(&read.key, read_sequence)? {
                 return Err(Error::Conflict {
-                    message: format!("point read conflict in keyspace {}", read.keyspace),
+                    message: format!("point read conflict in bucket {}", read.bucket),
                 });
             }
         }
 
         for read in &read_set.range_reads {
-            let state = self.keyspace_state(&read.keyspace)?;
+            let state = self.bucket_state(&read.bucket)?;
             if state.key_range_modified_after(&read.range, read_sequence)? {
                 return Err(Error::Conflict {
-                    message: format!("range read conflict in keyspace {}", read.keyspace),
+                    message: format!("range read conflict in bucket {}", read.bucket),
                 });
             }
         }
@@ -184,12 +184,10 @@ impl Db {
             for (batch_index, operation) in batch.operations.into_iter().enumerate() {
                 let batch_index = u32::try_from(batch_index)
                     .map_err(|_| Error::invalid_options("WAL operation count exceeds u32::MAX"))?;
-                let state = self.keyspace_state(operation.keyspace()).map_err(|error| {
-                    if let Error::KeyspaceMissing { name } = error {
+                let state = self.bucket_state(operation.bucket()).map_err(|error| {
+                    if let Error::BucketMissing { name } = error {
                         Error::Corruption {
-                            message: format!(
-                                "WAL references keyspace missing from manifest: {name}"
-                            ),
+                            message: format!("WAL references bucket missing from manifest: {name}"),
                         }
                     } else {
                         error

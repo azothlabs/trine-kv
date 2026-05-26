@@ -18,7 +18,7 @@ cargo run --example event_index
 ```
 
 `user_store` wraps Trine KV behind a small repository-style API. `event_index`
-uses two keyspaces and one write batch to keep event payloads and an account
+uses two buckets and one write batch to keep event payloads and an account
 index in sync.
 
 ## Add The Crate
@@ -72,55 +72,67 @@ let db = Db::open(
 )?;
 ```
 
-`Db`, `Keyspace`, and `Snapshot` are cheap handles. A `Keyspace` keeps its
-database open, so release keyspace handles before reopening the same directory
-in the same process.
+`Db`, `Bucket`, and `Snapshot` are cheap handles. `Db` writes to the built-in
+default bucket. A named `Bucket` keeps its database open, so release bucket
+handles before reopening the same directory in the same process.
 
-## Create A Keyspace
+## Use The Default Bucket
 
-A keyspace is a named collection of keys with fixed options. Reopening an
-existing keyspace with different options returns an error, because the options
+The default bucket is created automatically and is the right path for simple
+embedded storage:
+
+```rust
+db.put(b"user:001", b"Ada")?;
+assert_eq!(db.get(b"user:001")?, Some(b"Ada".to_vec()));
+
+let rows = db.range(&trine_kv::KeyRange::all())?;
+```
+
+## Create A Bucket
+
+A bucket is a named collection of keys with fixed options. Reopening an
+existing bucket with different options returns an error, because the options
 are part of the on-disk contract.
 
 ```rust
-use trine_kv::{KeyspaceOptions, PrefixExtractor};
+use trine_kv::{BucketOptions, PrefixExtractor};
 
-let users = db.keyspace(
+let users = db.open_bucket_with_options(
     "users",
-    KeyspaceOptions::default().with_prefix_extractor(PrefixExtractor::Separator(b':')),
+    BucketOptions::default().with_prefix_extractor(PrefixExtractor::Separator(b':')),
 )?;
 ```
 
-Use `KeyspaceOptions::default()` when you do not need prefix filters or custom
+Use `BucketOptions::default()` when you do not need prefix filters or custom
 storage tuning.
 
 ## Write And Read Keys
 
-The keyspace helpers are the simplest way to write one key at a time:
+The bucket helpers write one key at a time when you need a named bucket:
 
 ```rust
-users.insert(b"user:001", b"Ada")?;
-users.insert(b"user:002", b"Lin")?;
+users.put(b"user:001", b"Ada")?;
+users.put(b"user:002", b"Lin")?;
 
 assert_eq!(users.get(b"user:001")?, Some(b"Ada".to_vec()));
 ```
 
-Use `insert_with_options` when a single-key helper needs explicit durability:
+Use `put_with_options` when a single-key helper needs explicit durability:
 
 ```rust
 use trine_kv::WriteOptions;
 
-users.insert_with_options(b"user:003", b"Grace", WriteOptions::sync_all())?;
+users.put_with_options(b"user:003", b"Grace", WriteOptions::sync_all())?;
 ```
 
-Deletes use the same keyspace handle:
+Deletes use the same bucket handle:
 
 ```rust
-users.remove(b"user:002")?;
+users.delete(b"user:002")?;
 assert_eq!(users.get(b"user:002")?, None);
 ```
 
-The matching `remove_with_options` and `remove_range_with_options` helpers are
+The matching `delete_with_options` and `delete_range_with_options` helpers are
 available when deletes need explicit write options.
 
 Keys and values are byte vectors. String keys are fine, but the database does
@@ -134,8 +146,8 @@ Use `WriteBatch` when several changes must commit at the same sequence:
 use trine_kv::{WriteBatch, WriteOptions};
 
 let mut batch = WriteBatch::new();
-batch.insert("users", b"user:003", b"Grace");
-batch.remove("users", b"user:001");
+batch.put("users", b"user:003", b"Grace");
+batch.delete("users", b"user:001");
 
 let commit = db.write(
     batch,
@@ -145,7 +157,7 @@ let commit = db.write(
 println!("committed sequence {}", commit.sequence().get());
 ```
 
-Batch writes can span keyspaces. If validation fails, the batch is rejected
+Batch writes can span buckets. If validation fails, the batch is rejected
 before it changes memtables.
 
 ## Range And Prefix Scans
@@ -171,7 +183,7 @@ for item in users.range_reverse(&range)? {
 }
 ```
 
-Prefix scans are most useful when the keyspace has a prefix extractor:
+Prefix scans are most useful when the bucket has a prefix extractor:
 
 ```rust
 for item in users.prefix(b"user:")? {
@@ -191,7 +203,7 @@ the snapshot was created:
 ```rust
 let snapshot = db.snapshot();
 
-users.insert(b"user:004", b"Barbara")?;
+users.put(b"user:004", b"Barbara")?;
 
 assert_eq!(snapshot.get(&users, b"user:004")?, None);
 assert_eq!(users.get(b"user:004")?, Some(b"Barbara".to_vec()));
@@ -218,7 +230,7 @@ use trine_kv::{Error, TransactionOptions};
 
 let mut txn = db.transaction(TransactionOptions::default());
 let previous = txn.get("users", b"user:001")?;
-txn.insert("users", b"user:005", b"Margaret");
+txn.put("users", b"user:005", b"Margaret");
 
 match txn.commit() {
     Ok(info) => println!("committed sequence {}", info.sequence().get()),
@@ -240,7 +252,7 @@ visible in memtables. Choose a durability mode per write:
 use trine_kv::{WriteBatch, WriteOptions};
 
 let mut batch = WriteBatch::new();
-batch.insert("users", b"user:006", b"Edsger");
+batch.put("users", b"user:006", b"Edsger");
 
 db.write(
     batch,
@@ -285,8 +297,8 @@ Inspect live state with `Db::stats`:
 ```rust
 let stats = db.stats();
 println!(
-    "keyspaces={} tables={} cache_hits={}",
-    stats.live_keyspaces, stats.total_tables, stats.block_cache_hits
+    "buckets={} tables={} cache_hits={}",
+    stats.live_buckets, stats.total_tables, stats.block_cache_hits
 );
 ```
 

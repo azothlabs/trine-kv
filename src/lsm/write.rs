@@ -29,7 +29,7 @@ impl LsmTree {
             .clone();
 
         match operation {
-            BatchOperation::Insert { key, value, .. } => {
+            BatchOperation::Put { key, value, .. } => {
                 active_memtable
                     .insert(
                         InternalKey::new(key, sequence, ValueKind::Put, batch_index),
@@ -37,7 +37,7 @@ impl LsmTree {
                     )
                     .map_err(|()| lock_poisoned("memtable entries"))?;
             }
-            BatchOperation::Remove { key, .. } => {
+            BatchOperation::Delete { key, .. } => {
                 active_memtable
                     .insert(
                         InternalKey::new(key, sequence, ValueKind::PointDelete, batch_index),
@@ -45,7 +45,7 @@ impl LsmTree {
                     )
                     .map_err(|()| lock_poisoned("memtable entries"))?;
             }
-            BatchOperation::RemoveRange { range, .. } => {
+            BatchOperation::DeleteRange { range, .. } => {
                 // Range tombstones share the same commit sequence and batch
                 // order as point records. Keep the tombstone byte counter in
                 // the same step so write-buffer checks stay O(1).

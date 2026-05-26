@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use trine_kv::{Db, Error, Keyspace, KeyspaceOptions, Result, WriteBatch, WriteOptions};
+use trine_kv::{Bucket, Db, Error, Result, WriteBatch, WriteOptions};
 
 fn main() -> Result<()> {
     let path = temp_path("trine-kv-event-index");
@@ -38,15 +38,15 @@ fn main() -> Result<()> {
 
 struct EventLog {
     db: Db,
-    events: Keyspace,
-    by_account: Keyspace,
+    events: Bucket,
+    by_account: Bucket,
 }
 
 impl EventLog {
     fn open(path: &Path) -> Result<Self> {
         let db = Db::open_persistent(path)?;
-        let events = db.keyspace("events", KeyspaceOptions::default())?;
-        let by_account = db.keyspace("events_by_account", KeyspaceOptions::default())?;
+        let events = db.open_bucket("events")?;
+        let by_account = db.open_bucket("events_by_account")?;
         Ok(Self {
             db,
             events,
@@ -56,8 +56,8 @@ impl EventLog {
 
     fn append(&self, event: &Event) -> Result<()> {
         let mut batch = WriteBatch::new();
-        batch.insert("events", event_key(&event.id), event.encode()?);
-        batch.insert(
+        batch.put("events", event_key(&event.id), event.encode()?);
+        batch.put(
             "events_by_account",
             account_event_key(&event.account_id, &event.id),
             event.id.as_bytes(),

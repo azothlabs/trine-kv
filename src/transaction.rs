@@ -11,6 +11,7 @@ pub struct TransactionOptions {
     pub write_options: WriteOptions,
 }
 
+/// Optimistic transaction over one read snapshot and a staged write batch.
 #[derive(Debug, Clone)]
 pub struct Transaction {
     db: Db,
@@ -23,13 +24,13 @@ pub struct Transaction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReadKey {
-    pub(crate) keyspace: String,
+    pub(crate) bucket: String,
     pub(crate) key: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReadRange {
-    pub(crate) keyspace: String,
+    pub(crate) bucket: String,
     pub(crate) range: KeyRange,
 }
 
@@ -62,25 +63,27 @@ impl Transaction {
         self.options
     }
 
-    pub fn get(&mut self, keyspace: impl Into<String>, key: &[u8]) -> Result<Option<Value>> {
-        let keyspace = keyspace.into();
-        let value = self.db.get_at(&keyspace, key, self.read_sequence)?;
+    /// Reads a key from `bucket` and tracks it for commit conflict checks.
+    pub fn get(&mut self, bucket: impl Into<String>, key: &[u8]) -> Result<Option<Value>> {
+        let bucket = bucket.into();
+        let value = self.db.get_at_sequence(&bucket, key, self.read_sequence)?;
         // Record the exact user key read at the transaction's read sequence.
         // Commit validation rejects the transaction if a later committed point
         // write, point delete, or covering range delete touched it.
         self.point_reads.push(ReadKey {
-            keyspace,
+            bucket,
             key: key.to_vec(),
         });
 
         Ok(value)
     }
 
-    pub fn read_range(&mut self, keyspace: impl Into<String>, range: KeyRange) -> Result<()> {
+    /// Reads a range from `bucket` and tracks it for commit conflict checks.
+    pub fn read_range(&mut self, bucket: impl Into<String>, range: KeyRange) -> Result<()> {
         self.db.ensure_open()?;
-        let keyspace = keyspace.into();
-        let iter = self.db.range_at(
-            &keyspace,
+        let bucket = bucket.into();
+        let iter = self.db.range_at_sequence(
+            &bucket,
             &range,
             self.read_sequence,
             crate::Direction::Forward,
@@ -93,26 +96,29 @@ impl Transaction {
         }
         // Range reads conflict with any later committed point mutation inside
         // the range, plus any later range tombstone that overlaps it.
-        self.range_reads.push(ReadRange { keyspace, range });
+        self.range_reads.push(ReadRange { bucket, range });
 
         Ok(())
     }
 
-    pub fn insert(
+    /// Stages one key/value write for `bucket`.
+    pub fn put(
         &mut self,
-        keyspace: impl Into<String>,
+        bucket: impl Into<String>,
         key: impl Into<Vec<u8>>,
         value: impl Into<Value>,
     ) {
-        self.writes.insert(keyspace, key, value);
+        self.writes.put(bucket, key, value);
     }
 
-    pub fn remove(&mut self, keyspace: impl Into<String>, key: impl Into<Vec<u8>>) {
-        self.writes.remove(keyspace, key);
+    /// Stages a point delete for `bucket`.
+    pub fn delete(&mut self, bucket: impl Into<String>, key: impl Into<Vec<u8>>) {
+        self.writes.delete(bucket, key);
     }
 
-    pub fn remove_range(&mut self, keyspace: impl Into<String>, range: KeyRange) {
-        self.writes.remove_range(keyspace, range);
+    /// Stages a range delete for `bucket`.
+    pub fn delete_range(&mut self, bucket: impl Into<String>, range: KeyRange) {
+        self.writes.delete_range(bucket, range);
     }
 
     pub fn commit(self) -> Result<CommitInfo> {
