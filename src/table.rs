@@ -509,44 +509,42 @@ struct TableFilterStats {
 
 #[derive(Debug, Default)]
 struct TableReadPathStats {
-    point_table_probes: AtomicU64,
-    point_index_partition_probes: AtomicU64,
-    point_block_metadata_probes: AtomicU64,
-    point_data_block_reads: AtomicU64,
-    point_filter_misses: AtomicU64,
+    table_probes: AtomicU64,
+    index_partition_probes: AtomicU64,
+    block_metadata_probes: AtomicU64,
+    data_block_reads: AtomicU64,
+    filter_misses: AtomicU64,
 }
 
 impl TableReadPathStats {
     fn snapshot(&self) -> ReadPathStats {
         ReadPathStats {
-            point_table_probes: self.point_table_probes.load(Ordering::Acquire),
-            point_index_partition_probes: self.point_index_partition_probes.load(Ordering::Acquire),
-            point_block_metadata_probes: self.point_block_metadata_probes.load(Ordering::Acquire),
-            point_data_block_reads: self.point_data_block_reads.load(Ordering::Acquire),
-            point_filter_misses: self.point_filter_misses.load(Ordering::Acquire),
+            point_table_probes: self.table_probes.load(Ordering::Acquire),
+            point_index_partition_probes: self.index_partition_probes.load(Ordering::Acquire),
+            point_block_metadata_probes: self.block_metadata_probes.load(Ordering::Acquire),
+            point_data_block_reads: self.data_block_reads.load(Ordering::Acquire),
+            point_filter_misses: self.filter_misses.load(Ordering::Acquire),
         }
     }
 
     fn record_point_table_probe(&self) {
-        self.point_table_probes.fetch_add(1, Ordering::AcqRel);
+        self.table_probes.fetch_add(1, Ordering::AcqRel);
     }
 
     fn record_point_index_partition_probe(&self) {
-        self.point_index_partition_probes
-            .fetch_add(1, Ordering::AcqRel);
+        self.index_partition_probes.fetch_add(1, Ordering::AcqRel);
     }
 
     fn record_point_block_metadata_probe(&self) {
-        self.point_block_metadata_probes
-            .fetch_add(1, Ordering::AcqRel);
+        self.block_metadata_probes.fetch_add(1, Ordering::AcqRel);
     }
 
     fn record_point_data_block_read(&self) {
-        self.point_data_block_reads.fetch_add(1, Ordering::AcqRel);
+        self.data_block_reads.fetch_add(1, Ordering::AcqRel);
     }
 
     fn record_point_filter_miss(&self) {
-        self.point_filter_misses.fetch_add(1, Ordering::AcqRel);
+        self.filter_misses.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -1313,7 +1311,7 @@ impl Table {
                 records
                     .get(block.record_range.clone())
                     .ok_or_else(|| invalid_table("data block record range outside table"))
-                    .map(|records| records.to_vec())
+                    .map(<[_]>::to_vec)
             })?;
             return DecodedDataBlock::from_records(&records).map(Arc::new);
         }

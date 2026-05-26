@@ -51,6 +51,9 @@ impl Db {
         // Check every batch-wide precondition before taking the writer lock or
         // touching memtables, so a rejected batch cannot leave partial state.
         validate_batch_len(operations.len())?;
+        if !operations.is_empty() {
+            self.apply_write_backpressure()?;
+        }
 
         // The writer lock serializes commit sequence assignment and memtable
         // updates. Reads only take bucket/table read locks and do not enter
@@ -60,9 +63,6 @@ impl Db {
             .writer
             .lock()
             .map_err(|_| lock_poisoned("writer coordinator"))?;
-        if let crate::options::StorageMode::Persistent { path } = &self.inner.options.storage_mode {
-            self.flush_immutable_memtables_for_write_locked(path)?;
-        }
 
         // Read validation and writes share one commit slot. Once validation
         // succeeds, no other writer can sneak in before this batch lands.
@@ -114,7 +114,7 @@ impl Db {
             .last_sequence
             .store(sequence.get(), Ordering::Release);
         if self.freeze_large_active_memtables_after_commit_locked(sequence, &touched_states)? {
-            self.request_background_maintenance();
+            self.request_background_flush();
         }
         Ok(CommitInfo::new(sequence))
     }

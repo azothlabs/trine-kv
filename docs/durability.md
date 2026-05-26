@@ -154,9 +154,19 @@ Compaction must preserve:
 - range tombstones needed to hide covered records;
 - blob references still reachable from live tables or snapshots.
 
+Persistent writable databases start one background maintenance worker by
+default. `DbOptions::background_worker_count = 0` keeps maintenance fully
+manual, and read-only or in-memory opens do not start workers.
+
 Automatic compaction may run after flush when L0 file pressure exceeds
-`DbOptions::max_l0_files`. The same recovery and manifest-publish rules apply to
-manual and automatic compaction.
+`DbOptions::max_l0_files`. Automatic L0 compaction can choose a local
+overlapping key span and leave unrelated L0 files for later passes. The same
+recovery and manifest-publish rules apply to manual and automatic compaction.
+
+When immutable memtables or L0 files exceed configured limits, writes apply
+pressure handling before taking the writer coordinator. They may wait for the
+background worker or help with one maintenance pass, while table building and
+compaction output construction stay outside the short publish lock.
 
 ## Recovery And Repair Policy
 

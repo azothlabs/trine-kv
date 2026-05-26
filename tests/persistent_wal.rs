@@ -969,6 +969,7 @@ fn persistent_write_buffer_freezes_active_memtable_and_reads_immutable() {
     let mut options = DbOptions::persistent(&path);
     options.write_buffer_bytes = 1;
     options.max_immutable_memtables = 4;
+    options.background_worker_count = 0;
 
     {
         let db = Db::open(options).expect("persistent db opens");
@@ -1002,6 +1003,7 @@ fn persistent_write_buffer_freezes_only_large_bucket() {
     let mut options = DbOptions::persistent(&path);
     options.write_buffer_bytes = 40;
     options.max_immutable_memtables = 4;
+    options.background_worker_count = 0;
 
     {
         let db = Db::open(options).expect("persistent db opens");
@@ -1035,6 +1037,7 @@ fn persistent_immutable_pressure_flushes_only_pressure_buckets() {
     let mut options = DbOptions::persistent(&path);
     options.write_buffer_bytes = 1;
     options.max_immutable_memtables = 2;
+    options.background_worker_count = 0;
 
     {
         let db = Db::open(options).expect("persistent db opens");
@@ -1082,6 +1085,7 @@ fn persistent_immutable_range_tombstone_hides_point_records() {
     let mut options = DbOptions::persistent(&path);
     options.write_buffer_bytes = 1;
     options.max_immutable_memtables = 4;
+    options.background_worker_count = 0;
 
     {
         let db = Db::open(options).expect("persistent db opens");
@@ -1110,6 +1114,7 @@ fn persistent_immutable_pressure_flushes_before_next_write_and_keeps_new_wal_bat
     let mut options = DbOptions::persistent(&path);
     options.write_buffer_bytes = 1;
     options.max_immutable_memtables = 1;
+    options.background_worker_count = 0;
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
@@ -1174,6 +1179,7 @@ fn persistent_transaction_conflict_checks_immutable_memtables() {
     let mut options = DbOptions::persistent(&path);
     options.write_buffer_bytes = 1;
     options.max_immutable_memtables = 4;
+    options.background_worker_count = 0;
 
     {
         let db = Db::open(options).expect("persistent db opens");
@@ -1361,7 +1367,7 @@ fn persistent_flush_auto_compacts_when_l0_pressure_exceeds_limit() {
 
         bucket.put(b"b", b"b1").expect("write b");
         db.flush().expect("second flush triggers compaction");
-        assert_eq!(default_table_levels(&path), vec![1]);
+        assert_eq!(default_table_levels(&path), vec![0, 1]);
         assert_eq!(
             bucket.get(b"a").expect("a reads after auto compaction"),
             Some(b"a1".to_vec())
@@ -1373,7 +1379,7 @@ fn persistent_flush_auto_compacts_when_l0_pressure_exceeds_limit() {
 
         bucket.put(b"a", b"a2").expect("write newer a");
         db.flush().expect("new L0 below pressure limit");
-        assert_eq!(default_table_levels(&path), vec![0, 1]);
+        assert_eq!(default_table_levels(&path), vec![0, 1, 1]);
         assert_eq!(
             bucket.get(b"a").expect("newer a reads over L1"),
             Some(b"a2".to_vec())
@@ -1383,7 +1389,7 @@ fn persistent_flush_auto_compacts_when_l0_pressure_exceeds_limit() {
     {
         let db = Db::open(options).expect("persistent db reopens");
         let bucket = db.default_bucket().expect("bucket reopens");
-        assert_eq!(default_table_levels(&path), vec![0, 1]);
+        assert_eq!(default_table_levels(&path), vec![0, 1, 1]);
         assert_eq!(
             bucket.get(b"a").expect("newer a reopens"),
             Some(b"a2".to_vec())
@@ -1401,7 +1407,6 @@ fn persistent_background_workers_flush_and_compact_pressure() {
     options.write_buffer_bytes = 1;
     options.max_immutable_memtables = 4;
     options.max_l0_files = 1;
-    options.background_worker_count = 1;
 
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
@@ -1415,7 +1420,8 @@ fn persistent_background_workers_flush_and_compact_pressure() {
 
         bucket.put(b"b", b"b1").expect("write b");
         wait_until("background compaction after L0 pressure", || {
-            default_table_levels(&path) == vec![1]
+            let stats = db.stats();
+            stats.l0_tables <= 1 && level_table_count(&stats, 1) >= 1
         });
 
         assert_eq!(
@@ -1432,7 +1438,9 @@ fn persistent_background_workers_flush_and_compact_pressure() {
     {
         let db = Db::open(options).expect("persistent db reopens");
         let bucket = db.default_bucket().expect("bucket reopens");
-        assert_eq!(default_table_levels(&path), vec![1]);
+        let stats = db.stats();
+        assert!(stats.l0_tables <= 1);
+        assert!(level_table_count(&stats, 1) >= 1);
         assert_eq!(bucket.get(b"a").expect("a reopens"), Some(b"a1".to_vec()));
         assert_eq!(bucket.get(b"b").expect("b reopens"), Some(b"b1".to_vec()));
     }
@@ -1586,16 +1594,16 @@ fn persistent_stats_report_tables_blobs_and_compactions() {
         bucket.put(b"b", large_b.clone()).expect("write large b");
         db.flush().expect("second flush triggers compaction");
         let stats = db.stats();
-        assert_eq!(stats.total_tables, 1);
-        assert_eq!(stats.l0_tables, 0);
+        assert_eq!(stats.total_tables, 2);
+        assert_eq!(stats.l0_tables, 1);
         assert_eq!(level_table_count(&stats, 1), 1);
-        assert_eq!(stats.live_blob_files, 1);
+        assert_eq!(stats.live_blob_files, 2);
         assert_eq!(
             stats.live_blob_bytes,
             (large_a.len() + large_b.len()) as u64
         );
         assert_eq!(stats.compaction_runs, 1);
-        assert_eq!(stats.compaction_input_tables, 2);
+        assert_eq!(stats.compaction_input_tables, 1);
         assert_eq!(stats.compaction_output_tables, 1);
         assert!(stats.compaction_input_bytes > 0);
         assert!(stats.compaction_output_bytes > 0);
@@ -3075,12 +3083,14 @@ fn persistent_reopen_defers_data_block_checksum_until_read() {
 
     corrupt_first_data_block_payload(&table_path);
 
-    let db = Db::open(options).expect("metadata-only table open succeeds");
-    let bucket = db.default_bucket().expect("bucket reopens");
-    let error = bucket
-        .get(b"a")
-        .expect_err("corrupt data block fails when read");
-    assert!(matches!(error, Error::Corruption { .. }));
+    {
+        let db = Db::open(options).expect("metadata-only table open succeeds");
+        let bucket = db.default_bucket().expect("bucket reopens");
+        let error = bucket
+            .get(b"a")
+            .expect_err("corrupt data block fails when read");
+        assert!(matches!(error, Error::Corruption { .. }));
+    }
 
     fs::remove_dir_all(path).expect("cleanup test db");
 }
@@ -3111,24 +3121,26 @@ fn persistent_filter_miss_does_not_read_corrupt_data_block() {
 
     corrupt_first_data_block_payload(&table_path);
 
-    let db = Db::open(options).expect("metadata-only table open succeeds");
-    let bucket = db.default_bucket().expect("bucket reopens");
-    assert_eq!(
-        bucket
-            .get(b"b")
-            .expect("filter miss should not read data block"),
-        None
-    );
-    assert_eq!(
-        db.stats().block_cache_misses,
-        0,
-        "filter miss should avoid block cache lookup"
-    );
-    let filter_stats = db.stats().filters;
-    assert!(
-        filter_stats.table_point_misses + filter_stats.block_point_misses > 0,
-        "a point filter should reject the missing key before data-block read"
-    );
+    {
+        let db = Db::open(options).expect("metadata-only table open succeeds");
+        let bucket = db.default_bucket().expect("bucket reopens");
+        assert_eq!(
+            bucket
+                .get(b"b")
+                .expect("filter miss should not read data block"),
+            None
+        );
+        assert_eq!(
+            db.stats().block_cache_misses,
+            0,
+            "filter miss should avoid block cache lookup"
+        );
+        let filter_stats = db.stats().filters;
+        assert!(
+            filter_stats.table_point_misses + filter_stats.block_point_misses > 0,
+            "a point filter should reject the missing key before data-block read"
+        );
+    }
 
     fs::remove_dir_all(path).expect("cleanup test db");
 }

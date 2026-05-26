@@ -28,8 +28,9 @@ Release packaging notes live in [docs/release.md](docs/release.md).
 - Ordered range scans and prefix scans.
 - Value-lazy range and prefix scans for large-value workloads that need keys
   before reading blob bytes.
-- Persistent mode with WAL replay, manifest recovery, directory locking, flush,
-  compaction, and read-only open.
+- Persistent mode with WAL replay, manifest recovery, directory locking,
+  default background maintenance, backpressure, flush, compaction, and
+  read-only open.
 - Block-based SSTables with partitioned index/filter blocks, data-block hash
   lookup for point reads, block cache, compression, and linear/binary/auto
   index seek policies.

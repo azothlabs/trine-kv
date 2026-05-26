@@ -19,6 +19,7 @@ pub(crate) struct CompactionInput {
     pub(crate) table_level: table::TableLevel,
     pub(crate) table_options: table::TableWriteOptions,
     pub(crate) input_table_ids: Vec<table::TableId>,
+    pub(crate) compaction_range: KeyRange,
     pub(crate) trivial_move: bool,
     full_bucket_compaction: bool,
     pub(crate) input_tables: Vec<Arc<Table>>,
@@ -91,6 +92,7 @@ impl LsmTree {
             table_level: plan.output_level,
             table_options: table_write_options(&self.options),
             input_table_ids,
+            compaction_range: plan.key_range,
             trivial_move,
             full_bucket_compaction,
             input_tables,
@@ -757,6 +759,7 @@ mod tests {
                     target_table_bytes: 1,
                     level_size_multiplier: 2,
                     max_l0_files: 4,
+                    local_l0_compaction: true,
                 },
             )
             .expect("planning succeeds")
@@ -774,7 +777,7 @@ mod tests {
             BucketOptions::default(),
             vec![
                 test_table(&table_dir, 1, 0, "a"),
-                test_table(&table_dir, 2, 0, "b"),
+                test_table(&table_dir, 2, 0, "a"),
             ],
         )
         .expect("tree builds");
@@ -788,6 +791,7 @@ mod tests {
                     target_table_bytes: 1,
                     level_size_multiplier: 2,
                     max_l0_files: 4,
+                    local_l0_compaction: true,
                 },
             )
             .expect("planning succeeds")

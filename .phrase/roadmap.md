@@ -818,3 +818,34 @@ release.
   partition index/filter blocks load lazily.
 - Filter misses can skip data blocks through lazily loaded partition filters.
 - Full local Rust verification passes.
+
+### Phase 41: Background Maintenance Scheduling And Backpressure
+
+**Status**: Complete
+
+**Goal**: Make persistent flush/compaction maintenance run by default, keep
+writes out of heavy maintenance work, and add clear pressure behavior when the
+LSM falls behind.
+
+**Entry Condition**: Phase 40 complete and user identifies maintenance
+scheduling, backpressure, writer-lock scope, compaction picker locality,
+concurrent compaction boundaries, and long-running compaction validation as the
+next release risks.
+
+**Acceptance Gate**:
+
+- Persistent default options start background maintenance workers unless the
+  user explicitly sets `background_worker_count` to `0`.
+- Background maintenance has separate flush and compaction requests, progress
+  notification, in-flight state, and error propagation.
+- Writes wait or help maintenance when immutable memtables or L0 table pressure
+  exceeds configured limits.
+- Table building and compaction merge work run outside the writer coordinator;
+  the writer coordinator is used for commit sequencing and short publish
+  cutovers.
+- Compaction picker selects local key spans and avoids broad rewrites when a
+  narrower safe span exists.
+- Concurrent compactions cannot overlap in the same bucket key range, while
+  non-overlapping compactions may proceed.
+- Tests cover level non-overlap, MVCC retention, range-delete preservation,
+  default worker behavior, and backpressure.

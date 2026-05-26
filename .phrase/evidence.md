@@ -3940,3 +3940,61 @@ Record only evidence that can change planning or durable decisions.
 - `cargo clippy --lib --all-features -- -D warnings` currently fails on the
   same dirty maintenance slice (`src/db.rs` unnested or-pattern and
   needless-pass-by-value).
+
+## 2026-05-26: Phase 41 Background Maintenance Scheduling And Backpressure Completed
+
+### Observation
+
+- Rust skill, concurrency skill, SPEC-AGENTS current context, and the coding
+  module were read before implementation.
+- Persistent writable databases now start one maintenance worker by default.
+  `background_worker_count == 0` keeps manual maintenance behavior, and
+  in-memory/read-only opens do not start workers.
+- Maintenance coordination now separates flush and compaction requests, tracks
+  in-flight flushes and compaction key ranges, publishes progress notifications,
+  records shutdown, and preserves the last background error until a foreground
+  caller observes it.
+- Writes apply pressure handling before taking the writer coordinator when
+  immutable memtables or L0 tables exceed configured limits. They can wait for a
+  background worker or help with one foreground maintenance pass.
+- Flush table writing and compaction output construction now happen outside the
+  writer coordinator. The writer lock is used for sequence/WAL/memtable commit,
+  freeze cutovers, manifest publish, state install, and WAL replay-floor
+  rewrite.
+- Automatic L0 compaction can choose a local seed span and leave unrelated L0
+  files for later passes. Explicit `compact_range` keeps requested-range
+  behavior.
+- Compaction reservations reject overlapping key ranges in the same bucket and
+  allow non-overlapping ranges or different buckets.
+- Protocol, usage docs, durability docs, README, roadmap, and current phase
+  notes were updated.
+
+### Interpretation
+
+- The background maintenance path is now the normal persistent path instead of a
+  disabled-by-default feature.
+- The writer coordinator no longer owns heavy table build and compaction merge
+  work, reducing write-path stalls under flush or compaction pressure.
+- Local L0 compaction reduces avoidable rewrite work, but it may leave more
+  tables behind than the previous broad compaction plan. Stats and tests now
+  assert pressure control rather than forcing every pass to collapse the level
+  into one table.
+- The Phase 40 test/clippy blockers caused by dirty maintenance changes are
+  resolved.
+
+### Verification
+
+- `cargo test --all-targets --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --all --check`
+- `git diff --check`
+- forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, `README.md`, `CHANGELOG.md`, and `Cargo.toml`
+
+### Remaining Blockers
+
+- Remote CI cannot be executed locally; it must run after push.
+
+### Recommended Next Action
+
+- Commit Phase 41, then use remote CI as the external release signal.

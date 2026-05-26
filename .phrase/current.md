@@ -6,53 +6,67 @@ Complete
 
 ## Goal
 
-Harden the table read path so point lookups use a real data-block hash index,
-unsupported search-policy names disappear, and large tables no longer load the
-full block index/filter metadata at open.
+Make persistent background maintenance the normal path and give writes clear
+pressure behavior when immutable memtables, L0 files, or compaction debt build
+up.
 
 ## Entry Condition
 
-- Phase 39 completed automatic blob maintenance policy.
-- User requested the remaining table read-path hardening before release:
-  block hash index, no fake Eytzinger/Galloping switches, and partitioned
-  index/filter loading.
+- Phase 40 completed table read-path index hardening.
+- User identified background flush/compaction scheduling, write backpressure,
+  writer-lock scope, compaction picker locality, concurrent compaction bounds,
+  and long-running compaction validation as the next risks.
 
 ## Scope
 
-- Encode and decode a data-block hash index that maps user-key hash to record
-  ranges and uses key comparison only to resolve hash collisions.
-- Remove `Eytzinger` and `GallopingWithHint` from the public search-policy
-  surface unless fresh benchmark evidence justifies a real implementation.
-- Keep old manifest tags readable by mapping retired search policies to `Auto`.
-- Store table block index/filter metadata in partition blocks behind a small
-  top-level index.
-- Load index partitions lazily for point/range/prefix reads.
-- Update protocol, usage docs, benchmarks, tests, roadmap, and evidence.
+- Start persistent databases with a default background maintenance worker while
+  keeping `background_worker_count == 0` as an explicit manual-maintenance mode.
+- Replace the single maintenance request bit with flush/compaction requests,
+  in-flight state, progress notification, and error propagation.
+- Make writes wait or help maintenance when immutable memtables or L0 files are
+  over configured limits.
+- Keep writer coordinator work focused on sequence/WAL/memtable commit and
+  short publish cutovers; table building and compaction merge work should run
+  outside that lock.
+- Pick compaction inputs by local key span, especially for L0 pressure, instead
+  of rewriting every overlapping table when a narrower span is enough.
+- Prevent concurrent compactions of overlapping ranges in the same bucket while
+  allowing non-overlapping ranges to proceed.
+- Add tests for level non-overlap, MVCC retention, range-delete preservation,
+  default workers, and backpressure behavior.
 
 ## Out Of Scope
 
-- New public tuning knobs for index partition size.
-- A separate index-block cache shared across tables.
-- Changing WAL, MVCC, blob, or compaction semantics.
+- Changing public read/write APIs.
+- Adding async runtime dependencies.
+- Rewriting blob GC scheduling beyond keeping existing safety.
+- New user-facing tuning knobs unless evidence shows the derived thresholds are
+  insufficient.
 
 ## Acceptance Gate
 
-- Point reads inside a decoded data block do not fall back to binary search for
-  normal key lookup.
-- Retired search-policy manifest tags remain readable.
-- Benchmarks no longer advertise Eytzinger/Galloping rows.
-- Persistent open reads only footer/properties/top-level index metadata, not
-  every block filter/index partition.
-- Filter misses can skip data blocks using lazily loaded partition filters.
+- Persistent default options start one background worker; in-memory and read-only
+  databases still do not start workers.
+- Writes do not perform table flush or compaction build work while holding the
+  writer coordinator.
+- Writes apply bounded pressure handling before accepting more work when
+  immutable memtables or L0 tables exceed configured limits.
+- Background maintenance failures surface through later writes, `flush()`, or
+  `compact_range()`.
+- L0 compaction can select a local overlapping group and leave unrelated L0
+  files for later passes.
+- Concurrent compaction reservations reject overlapping same-bucket key ranges
+  and allow non-overlapping ranges.
 - Full local Rust verification passes.
 
 ## Active Task Slice
 
 ```text
-task135 [x] goal:on-disk block hash lookup | scope:src/table.rs tests | verify:data_block_point_lookup_uses_hash_index
-task136 [x] goal:remove fake search policies | scope:options manifest benches docs tests | verify:manifest legacy tag test + bench rows
-task137 [x] goal:lazy partitioned index/filter | scope:src/table.rs persistent tests | verify:filter miss skips data block and partition metadata loads lazily
-task138 [x] goal:update evidence and release gate | scope:.phrase docs | verify:full Rust verification
+task139 [x] goal:maintenance coordinator queue/progress/errors | scope:src/db.rs | verify:background maintenance tests
+task140 [x] goal:writer backpressure and shorter lock scope | scope:src/db.rs src/db/commit.rs | verify:pressure tests
+task141 [x] goal:local compaction picker spans | scope:src/compaction.rs src/lsm/compact.rs | verify:picker tests
+task142 [x] goal:compaction reservation boundaries | scope:src/db.rs tests | verify:concurrent compaction tests
+task143 [x] goal:protocol/docs/evidence update | scope:.phrase docs README | verify:full Rust verification
 ```
 
 ## Known Blockers
@@ -61,27 +75,33 @@ task138 [x] goal:update evidence and release gate | scope:.phrase docs | verify:
 
 ## Evidence
 
-- Rust skill, SPEC-AGENTS context, and the coding module were read before
-  implementation.
-- Data blocks now encode a checked user-key hash index. Point lookup uses the
-  hash index to find candidate record ranges and compares keys only to handle
-  hash collisions.
-- `Eytzinger` and `GallopingWithHint` were removed from the public
-  `IndexSearchPolicy` surface. Retired manifest tags `2` and `3` decode to
-  `Auto`.
-- Persistent table open now reads footer, properties, and the small top-level
-  index. Per-partition block index/filter metadata is loaded on demand.
-- Full table point/prefix filters are not kept in persistent table handles;
-  per-block filters inside lazily loaded index partitions still skip data
-  blocks on misses.
-- `cargo bench --bench v1_bench` reports only linear, binary, and auto search
-  policy rows.
-- `cargo test --all-targets --all-features`, `cargo clippy --all-targets
-  --all-features -- -D warnings`, `cargo fmt --all --check`,
-  `cargo bench --bench v1_bench`, `git diff --check`, and the
-  forbidden-term scan pass locally.
+- Rust skill, concurrency skill, SPEC-AGENTS context, and the coding module
+  were read before implementation.
+- Initial code audit found that persistent background workers exist but are
+  disabled by default, maintenance requests are a single coalesced bit, writes
+  can flush immutable memtables while holding the writer coordinator, and
+  compaction holds the writer coordinator across input selection and output
+  table construction.
+- Persistent default options now start one maintenance worker, while
+  `background_worker_count == 0`, in-memory open, and read-only open keep
+  maintenance manual.
+- Maintenance coordination now tracks separate flush/compaction requests,
+  in-flight flush state, in-flight compaction key ranges, progress, shutdown,
+  and the last background error.
+- Writes apply pressure handling before taking the writer coordinator. They can
+  wait for background progress or help with one foreground flush/compaction
+  pass, and pressure flush remains bucket-local.
+- Flush table writing and compaction output construction now run outside the
+  writer coordinator; the lock is kept for commit sequencing, freeze cutovers,
+  manifest publish, state install, and WAL replay-floor rewrite.
+- Automatic L0 compaction can choose a local seed span; explicit
+  `compact_range` keeps requested-range behavior.
+- Compaction reservations reject overlapping ranges in the same bucket and
+  allow non-overlapping ranges or different buckets to proceed.
+- Verification passed: `cargo test --all-targets --all-features`,
+  `cargo clippy --all-targets --all-features -- -D warnings`,
+  `cargo fmt --all --check`, `git diff --check`, and the forbidden-term scan.
 
 ## Next Recommendation
 
-- Commit Phase 40, then use remote CI as the final external release signal
-  after push.
+- Commit Phase 41, then use remote CI as the external release signal.

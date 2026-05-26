@@ -12,6 +12,7 @@ pub struct CompactionPlan {
     pub input_tables: Vec<TableId>,
     pub output_level: TableLevel,
     pub oldest_active_snapshot: Sequence,
+    pub key_range: KeyRange,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +20,7 @@ pub(crate) struct CompactionOptions {
     pub(crate) target_table_bytes: u64,
     pub(crate) level_size_multiplier: u64,
     pub(crate) max_l0_files: usize,
+    pub(crate) local_l0_compaction: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,12 +77,14 @@ pub(crate) fn plan_compaction(
     oldest_active_snapshot: Sequence,
     options: CompactionOptions,
 ) -> Result<Option<CompactionPlan>> {
-    if let Some(input_tables) = l0_compaction_inputs(tables, range) {
+    if let Some(input_tables) = l0_compaction_inputs(tables, range, options) {
+        let key_range = key_range_for_inputs(tables, &input_tables);
         return Ok(Some(CompactionPlan {
             bucket: bucket.to_owned(),
             input_tables,
             output_level: TableLevel(1),
             oldest_active_snapshot,
+            key_range,
         }));
     }
 
@@ -88,11 +92,13 @@ pub(crate) fn plan_compaction(
         let output_level = level.next().ok_or_else(level_overflow)?;
         let input_tables = narrow_leveled_inputs(tables, range, level, output_level);
         if !input_tables.is_empty() {
+            let key_range = key_range_for_inputs(tables, &input_tables);
             return Ok(Some(CompactionPlan {
                 bucket: bucket.to_owned(),
                 input_tables,
                 output_level,
                 oldest_active_snapshot,
+                key_range,
             }));
         }
     }
@@ -108,14 +114,19 @@ pub(crate) fn plan_compaction(
 
     Ok(Some(CompactionPlan {
         bucket: bucket.to_owned(),
+        key_range: key_range_for_inputs(tables, &input_tables),
         input_tables,
         output_level,
         oldest_active_snapshot,
     }))
 }
 
-fn l0_compaction_inputs(tables: &[CompactionTable], range: &KeyRange) -> Option<Vec<TableId>> {
-    let mut input_tables = l0_inputs_with_overlap(tables, range);
+fn l0_compaction_inputs(
+    tables: &[CompactionTable],
+    range: &KeyRange,
+    options: CompactionOptions,
+) -> Option<Vec<TableId>> {
+    let mut input_tables = l0_inputs_with_overlap(tables, range, options);
     if input_tables.is_empty() {
         return None;
     }
@@ -126,19 +137,31 @@ fn l0_compaction_inputs(tables: &[CompactionTable], range: &KeyRange) -> Option<
     Some(input_tables)
 }
 
-fn l0_inputs_with_overlap(tables: &[CompactionTable], range: &KeyRange) -> Vec<TableId> {
-    let mut inputs = tables
-        .iter()
-        .filter(|table| table.level == TableLevel::ZERO && table.overlaps_range(range))
-        .map(|table| table.id)
-        .collect::<Vec<_>>();
+fn l0_inputs_with_overlap(
+    tables: &[CompactionTable],
+    range: &KeyRange,
+    options: CompactionOptions,
+) -> Vec<TableId> {
+    let mut inputs = if options.local_l0_compaction {
+        let Some(seed) = pick_l0_seed_table(tables, range) else {
+            return Vec::new();
+        };
+        vec![seed.id]
+    } else {
+        tables
+            .iter()
+            .filter(|table| table.level == TableLevel::ZERO && table.overlaps_range(range))
+            .map(|table| table.id)
+            .collect::<Vec<_>>()
+    };
     if inputs.is_empty() {
         return inputs;
     }
 
-    // L0 tables may overlap each other. Once one L0 table is selected, include
-    // every other L0 table whose key bounds touch the selected L0 span so the
-    // replacement can move down without leaving overlapping L0 fragments behind.
+    // L0 tables may overlap each other. Start from one local seed and then
+    // close only the L0 span that touches it; unrelated L0 files remain for a
+    // later pass instead of being rewritten just because the request range was
+    // broad.
     loop {
         let Some(span) = key_span_for_inputs(tables, &inputs) else {
             return inputs;
@@ -156,6 +179,52 @@ fn l0_inputs_with_overlap(tables: &[CompactionTable], range: &KeyRange) -> Vec<T
             return inputs;
         }
     }
+}
+
+fn pick_l0_seed_table<'table>(
+    tables: &'table [CompactionTable],
+    range: &KeyRange,
+) -> Option<&'table CompactionTable> {
+    tables
+        .iter()
+        .filter(|table| table.level == TableLevel::ZERO && table.overlaps_range(range))
+        .max_by(|left, right| compare_l0_seed_candidates(tables, left, right))
+}
+
+fn compare_l0_seed_candidates(
+    tables: &[CompactionTable],
+    left: &CompactionTable,
+    right: &CompactionTable,
+) -> Ordering {
+    let left_overlap = overlapping_level_bytes(tables, left, TableLevel(1));
+    let right_overlap = overlapping_level_bytes(tables, right, TableLevel(1));
+
+    // Prefer the seed that rewrites fewer lower-level bytes. If that is tied,
+    // take the larger L0 file to reduce file-count pressure, then use table id
+    // for deterministic plans.
+    right_overlap
+        .cmp(&left_overlap)
+        .then_with(|| left.bytes.cmp(&right.bytes))
+        .then_with(|| right.id.cmp(&left.id))
+}
+
+fn overlapping_level_bytes(
+    tables: &[CompactionTable],
+    candidate: &CompactionTable,
+    level: TableLevel,
+) -> u64 {
+    let Some(span) = key_span_for_inputs(tables, &[candidate.id]) else {
+        return tables
+            .iter()
+            .filter(|table| table.level == level)
+            .map(|table| table.bytes)
+            .sum();
+    };
+    tables
+        .iter()
+        .filter(|table| table.level == level && table.overlaps_key_span(&span))
+        .map(|table| table.bytes)
+        .sum()
 }
 
 fn shallowest_multi_table_level(
@@ -326,6 +395,13 @@ fn key_span_for_inputs(tables: &[CompactionTable], input_tables: &[TableId]) -> 
     span
 }
 
+fn key_range_for_inputs(tables: &[CompactionTable], input_tables: &[TableId]) -> KeyRange {
+    key_span_for_inputs(tables, input_tables).map_or_else(KeyRange::all, |span| KeyRange {
+        start: Bound::Included(span.smallest),
+        end: Bound::Included(span.largest),
+    })
+}
+
 fn level_overflow() -> Error {
     Error::Corruption {
         message: "table level counter overflow".to_owned(),
@@ -357,6 +433,8 @@ fn key_is_after_end(key: &[u8], end: &Bound<Vec<u8>>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Bound;
+
     use super::{CompactionOptions, CompactionTable, plan_compaction};
     use crate::{
         table::{TableId, TableLevel},
@@ -420,6 +498,30 @@ mod tests {
         .expect("plan exists");
 
         assert_eq!(plan.input_tables, vec![TableId(1)]);
+        assert_eq!(plan.output_level, TableLevel(1));
+    }
+
+    #[test]
+    fn l0_plan_uses_local_seed_for_disjoint_l0_files() {
+        let tables = vec![
+            table_with_bytes(1, 0, b"a", b"b", 10),
+            table_with_bytes(2, 0, b"m", b"n", 20),
+            table_with_bytes(3, 1, b"x", b"z", 1),
+        ];
+
+        let plan = plan_compaction(
+            "default",
+            &tables,
+            &KeyRange::all(),
+            Sequence::ZERO,
+            options(),
+        )
+        .expect("planning succeeds")
+        .expect("plan exists");
+
+        assert_eq!(plan.input_tables, vec![TableId(2)]);
+        assert_eq!(plan.key_range.start, Bound::Included(b"m".to_vec()));
+        assert_eq!(plan.key_range.end, Bound::Included(b"n".to_vec()));
         assert_eq!(plan.output_level, TableLevel(1));
     }
 
@@ -537,6 +639,7 @@ mod tests {
             target_table_bytes: 100,
             level_size_multiplier: 10,
             max_l0_files: 8,
+            local_l0_compaction: true,
         }
     }
 }

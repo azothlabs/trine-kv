@@ -1,12 +1,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    ops::Bound,
     path::Path,
     sync::{
         Arc, Condvar, Mutex, RwLock, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
+    time::Duration,
 };
 
 use crate::{
@@ -36,14 +38,16 @@ use crate::{
 
 mod commit;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Db {
     inner: Arc<DbInner>,
+    counts_as_user_handle: bool,
 }
 
 #[derive(Debug)]
 pub(crate) struct DbInner {
     options: DbOptions,
+    user_handles: AtomicUsize,
     last_sequence: AtomicU64,
     closed: AtomicBool,
     writer: Mutex<()>,
@@ -65,6 +69,7 @@ pub(crate) struct DbInner {
     blob_gc_discarded_bytes: AtomicU64,
     blob_reads: Arc<BlobReadMetrics>,
     maintenance: Arc<MaintenanceCoordinator>,
+    background_workers: Mutex<Vec<thread::JoinHandle<()>>>,
 }
 
 struct NamedFlushInput {
@@ -120,6 +125,46 @@ struct BlobGcRewritePlan {
     records: Vec<BlobGcRewriteRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MaintenanceRequest {
+    flush: bool,
+    compaction: bool,
+}
+
+impl MaintenanceRequest {
+    #[must_use]
+    const fn any(self) -> bool {
+        self.flush || self.compaction
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WritePressure {
+    flush: bool,
+    compaction: bool,
+}
+
+impl WritePressure {
+    #[must_use]
+    const fn none(self) -> bool {
+        !self.flush && !self.compaction
+    }
+
+    #[must_use]
+    const fn request(self) -> MaintenanceRequest {
+        MaintenanceRequest {
+            flush: self.flush,
+            compaction: self.compaction,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompactionReservation {
+    bucket: String,
+    range: KeyRange,
+}
+
 #[derive(Debug)]
 struct MaintenanceCoordinator {
     state: Mutex<MaintenanceState>,
@@ -128,9 +173,24 @@ struct MaintenanceCoordinator {
 
 #[derive(Debug, Default)]
 struct MaintenanceState {
-    requested: bool,
+    flush_requests: usize,
+    compaction_requests: usize,
+    active_flushes: usize,
+    active_compactions: Vec<CompactionReservation>,
+    progress: u64,
     shutdown: bool,
     last_error: Option<String>,
+}
+
+#[derive(Debug)]
+struct MaintenanceFlushGuard {
+    coordinator: Arc<MaintenanceCoordinator>,
+}
+
+#[derive(Debug)]
+struct MaintenanceCompactionGuard {
+    coordinator: Arc<MaintenanceCoordinator>,
+    reservations: Vec<CompactionReservation>,
 }
 
 impl MaintenanceCoordinator {
@@ -141,33 +201,127 @@ impl MaintenanceCoordinator {
         }
     }
 
-    fn request(&self) {
+    fn request(&self, request: MaintenanceRequest) {
+        if !request.any() {
+            return;
+        }
         if let Ok(mut state) = self.state.lock() {
-            state.requested = true;
-            self.wake.notify_one();
+            if request.flush {
+                state.flush_requests = state.flush_requests.saturating_add(1);
+            }
+            if request.compaction {
+                state.compaction_requests = state.compaction_requests.saturating_add(1);
+            }
+            self.wake.notify_all();
         }
     }
 
-    fn wait_for_request(&self) -> bool {
+    fn wait_for_request(&self) -> Option<MaintenanceRequest> {
         let Ok(mut state) = self.state.lock() else {
-            return false;
+            return None;
         };
-        while !state.requested && !state.shutdown {
+        while state.flush_requests == 0 && state.compaction_requests == 0 && !state.shutdown {
             let Ok(next_state) = self.wake.wait(state) else {
-                return false;
+                return None;
             };
             state = next_state;
         }
         if state.shutdown {
-            return false;
+            return None;
         }
-        state.requested = false;
-        true
+        let request = MaintenanceRequest {
+            flush: state.flush_requests != 0,
+            compaction: state.compaction_requests != 0,
+        };
+        state.flush_requests = 0;
+        state.compaction_requests = 0;
+        Some(request)
+    }
+
+    fn progress(&self) -> u64 {
+        self.state.lock().map_or(0, |state| state.progress)
+    }
+
+    fn wait_for_progress(&self, observed_progress: u64, timeout: Duration) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        while state.progress == observed_progress && !state.shutdown && state.last_error.is_none() {
+            let Ok((next_state, wait_result)) = self.wake.wait_timeout(state, timeout) else {
+                return false;
+            };
+            state = next_state;
+            if wait_result.timed_out() {
+                break;
+            }
+        }
+        state.progress != observed_progress || state.shutdown || state.last_error.is_some()
+    }
+
+    fn wait_until_idle(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        while state.active_flushes != 0 || !state.active_compactions.is_empty() {
+            let Ok(next_state) = self.wake.wait(state) else {
+                return;
+            };
+            state = next_state;
+        }
+    }
+
+    fn try_start_flush(self: &Arc<Self>) -> Option<MaintenanceFlushGuard> {
+        let Ok(mut state) = self.state.lock() else {
+            return None;
+        };
+        if state.shutdown || state.active_flushes != 0 {
+            return None;
+        }
+        state.active_flushes = 1;
+        Some(MaintenanceFlushGuard {
+            coordinator: Arc::clone(self),
+        })
+    }
+
+    fn reserve_compactions(
+        self: &Arc<Self>,
+        candidates: Vec<CompactionReservation>,
+    ) -> Option<MaintenanceCompactionGuard> {
+        let Ok(mut state) = self.state.lock() else {
+            return None;
+        };
+        if state.shutdown {
+            return None;
+        }
+
+        let mut reservations = Vec::new();
+        for candidate in candidates {
+            if state
+                .active_compactions
+                .iter()
+                .any(|active| compaction_reservations_conflict(active, &candidate))
+            {
+                continue;
+            }
+            state.active_compactions.push(candidate.clone());
+            reservations.push(candidate);
+        }
+
+        if reservations.is_empty() {
+            return None;
+        }
+
+        Some(MaintenanceCompactionGuard {
+            coordinator: Arc::clone(self),
+            reservations,
+        })
     }
 
     fn record_error(&self, error: &Error) {
         if let Ok(mut state) = self.state.lock() {
             state.last_error = Some(error.to_string());
+            state.progress = state.progress.saturating_add(1);
+            self.wake.notify_all();
         }
     }
 
@@ -184,6 +338,44 @@ impl MaintenanceCoordinator {
             self.wake.notify_all();
         }
     }
+
+    fn finish_flush(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.active_flushes = state.active_flushes.saturating_sub(1);
+            state.progress = state.progress.saturating_add(1);
+            self.wake.notify_all();
+        }
+    }
+
+    fn finish_compactions(&self, reservations: &[CompactionReservation]) {
+        if let Ok(mut state) = self.state.lock() {
+            state
+                .active_compactions
+                .retain(|active| !reservations.iter().any(|finished| finished == active));
+            state.progress = state.progress.saturating_add(1);
+            self.wake.notify_all();
+        }
+    }
+}
+
+impl Drop for MaintenanceFlushGuard {
+    fn drop(&mut self) {
+        self.coordinator.finish_flush();
+    }
+}
+
+impl Drop for MaintenanceCompactionGuard {
+    fn drop(&mut self) {
+        self.coordinator.finish_compactions(&self.reservations);
+    }
+}
+
+impl MaintenanceCompactionGuard {
+    fn contains(&self, bucket: &str, range: &KeyRange) -> bool {
+        self.reservations
+            .iter()
+            .any(|reservation| reservation.bucket == bucket && reservation.range == *range)
+    }
 }
 
 fn record_maintenance_success(_maintenance: &MaintenanceCoordinator) {
@@ -191,10 +383,51 @@ fn record_maintenance_success(_maintenance: &MaintenanceCoordinator) {
     // caller has observed yet. `take_error` is the only path that clears it.
 }
 
+fn compaction_reservations_conflict(
+    left: &CompactionReservation,
+    right: &CompactionReservation,
+) -> bool {
+    left.bucket == right.bucket && key_ranges_overlap(&left.range, &right.range)
+}
+
+fn key_ranges_overlap(left: &KeyRange, right: &KeyRange) -> bool {
+    !range_end_is_before_start(&left.end, &right.start)
+        && !range_end_is_before_start(&right.end, &left.start)
+}
+
+fn range_end_is_before_start(end: &Bound<Vec<u8>>, start: &Bound<Vec<u8>>) -> bool {
+    match (end, start) {
+        (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
+        (Bound::Included(end), Bound::Included(start)) => end < start,
+        (Bound::Included(end), Bound::Excluded(start))
+        | (Bound::Excluded(end), Bound::Included(start) | Bound::Excluded(start)) => end <= start,
+    }
+}
+
+fn shutdown_background_workers(
+    maintenance: &Arc<MaintenanceCoordinator>,
+    workers: &Mutex<Vec<thread::JoinHandle<()>>>,
+) {
+    maintenance.shutdown();
+    let workers = workers
+        .lock()
+        .map(|mut workers| std::mem::take(&mut *workers))
+        .unwrap_or_default();
+    let current_thread = thread::current().id();
+
+    for worker in workers {
+        if worker.thread().id() == current_thread {
+            continue;
+        }
+        let _ = worker.join();
+    }
+    maintenance.wait_until_idle();
+}
+
 impl Drop for DbInner {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::Release);
-        self.maintenance.shutdown();
+        shutdown_background_workers(&self.maintenance, &self.background_workers);
         let _ = cleanup_pending_obsolete_table_files(
             persistent_path_from_options(&self.options),
             &self.snapshots,
@@ -205,6 +438,30 @@ impl Drop for DbInner {
             &self.snapshots,
             self.manifest.as_ref(),
         );
+    }
+}
+
+impl Clone for Db {
+    fn clone(&self) -> Self {
+        if self.counts_as_user_handle {
+            self.inner.user_handles.fetch_add(1, Ordering::AcqRel);
+        }
+        Self {
+            inner: Arc::clone(&self.inner),
+            counts_as_user_handle: self.counts_as_user_handle,
+        }
+    }
+}
+
+impl Drop for Db {
+    fn drop(&mut self) {
+        if !self.counts_as_user_handle {
+            return;
+        }
+        if self.inner.user_handles.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.inner.closed.store(true, Ordering::Release);
+            shutdown_background_workers(&self.inner.maintenance, &self.inner.background_workers);
+        }
     }
 }
 
@@ -242,6 +499,7 @@ impl Db {
         Ok(Self {
             inner: Arc::new(DbInner {
                 options,
+                user_handles: AtomicUsize::new(1),
                 last_sequence: AtomicU64::new(Sequence::ZERO.get()),
                 closed: AtomicBool::new(false),
                 writer: Mutex::new(()),
@@ -263,7 +521,9 @@ impl Db {
                 blob_gc_discarded_bytes: AtomicU64::new(0),
                 blob_reads: Arc::new(BlobReadMetrics::default()),
                 maintenance: Arc::new(MaintenanceCoordinator::new()),
+                background_workers: Mutex::new(Vec::new()),
             }),
+            counts_as_user_handle: true,
         })
     }
 
@@ -327,6 +587,7 @@ impl Db {
         let db = Self {
             inner: Arc::new(DbInner {
                 options,
+                user_handles: AtomicUsize::new(1),
                 last_sequence: AtomicU64::new(Sequence::ZERO.get()),
                 closed: AtomicBool::new(false),
                 writer: Mutex::new(()),
@@ -348,7 +609,9 @@ impl Db {
                 blob_gc_discarded_bytes: AtomicU64::new(0),
                 blob_reads: Arc::new(BlobReadMetrics::default()),
                 maintenance: Arc::new(MaintenanceCoordinator::new()),
+                background_workers: Mutex::new(Vec::new()),
             }),
+            counts_as_user_handle: true,
         };
         db.replay_wal_batches(batches, replay_floor)?;
         if !db.inner.options.read_only {
@@ -740,23 +1003,10 @@ impl Db {
             return Ok(());
         };
         let db_path = path.clone();
-        let flush_sequence = self.last_committed_sequence();
-
-        let should_compact = {
-            // Flush holds the writer coordinator while it freezes active
-            // memtables, writes tables, and advances the WAL replay floor. That
-            // gives the manifest edit and in-memory table list one clear
-            // cutover point relative to commits.
-            let _writer = self
-                .inner
-                .writer
-                .lock()
-                .map_err(|_| lock_poisoned("writer coordinator"))?;
-            self.flush_memtables_locked(&db_path, Some(flush_sequence))?
-        };
+        let should_compact = self.run_flush_once(&db_path, true)?;
 
         if should_compact {
-            self.compact_range(KeyRange::all())?;
+            self.run_compaction_once(&db_path, &KeyRange::all(), true)?;
         }
         self.cleanup_pending_obsolete_table_files(&db_path)?;
         self.cleanup_pending_obsolete_blob_files(&db_path)?;
@@ -783,89 +1033,7 @@ impl Db {
             return Ok(());
         };
         let db_path = path.clone();
-
-        // Compaction holds the writer coordinator while it chooses inputs,
-        // writes replacement tables, and publishes the manifest edit. Readers
-        // keep using the old Arc<Table> handles until the in-memory list is
-        // swapped after publish.
-        let _writer = self
-            .inner
-            .writer
-            .lock()
-            .map_err(|_| lock_poisoned("writer coordinator"))?;
-        let oldest_active_snapshot = self.oldest_active_snapshot_sequence();
-        let compaction_inputs = self.collect_compaction_inputs(&range, oldest_active_snapshot)?;
-        if compaction_inputs.is_empty() {
-            return Ok(());
-        }
-
-        let PendingCompactionOutputs {
-            outputs: written_tables,
-            written_table_ids,
-        } = self.build_compaction_outputs(
-            &db_path,
-            &range,
-            oldest_active_snapshot,
-            &compaction_inputs,
-        )?;
-
-        let output_table_ids = written_tables
-            .iter()
-            .flat_map(|output| {
-                output
-                    .output
-                    .tables
-                    .iter()
-                    .map(|table| table.properties().id)
-            })
-            .collect::<BTreeSet<_>>();
-        let input_table_ids_for_stats = compaction_inputs
-            .iter()
-            .flat_map(|input| input.input.input_table_ids.iter().copied())
-            .collect::<Vec<_>>();
-        // A direct table move keeps the input file alive under the same id, so
-        // cleanup must use only ids that disappeared from the published output.
-        let obsolete_table_ids = compaction_inputs
-            .iter()
-            .flat_map(|input| input.input.input_table_ids.iter().copied())
-            .filter(|table_id| !output_table_ids.contains(table_id))
-            .collect::<Vec<_>>();
-        let output_table_ids_for_stats = output_table_ids.iter().copied().collect::<Vec<_>>();
-        let obsolete_blob_ids =
-            self.obsolete_blob_ids_for_compaction(&compaction_inputs, &written_tables)?;
-
-        if let Err(error) = self.validate_compacted_tables(&written_tables) {
-            let _ = remove_storage_files(&db_path, &written_table_ids);
-            if is_level_layout_compaction_error(&error) {
-                return Ok(());
-            }
-            return Err(error);
-        }
-
-        if !written_table_ids.is_empty() {
-            if let Err(error) = durability::sync_dir_after_renames(&db_path) {
-                let _ = remove_storage_files(&db_path, &written_table_ids);
-                return Err(error);
-            }
-        }
-
-        if let Err(error) = self.publish_compacted_tables(&written_tables, &obsolete_blob_ids) {
-            let _ = remove_storage_files(&db_path, &written_table_ids);
-            return Err(error);
-        }
-
-        self.install_compacted_tables(written_tables)?;
-        self.record_compaction_stats(
-            &db_path,
-            compaction_inputs.len(),
-            &input_table_ids_for_stats,
-            &output_table_ids_for_stats,
-        );
-        self.retire_obsolete_table_files(&db_path, &obsolete_table_ids)?;
-        self.cleanup_pending_obsolete_blob_files(&db_path)?;
-        if self.inner.options.blob_gc_enabled {
-            self.run_blob_gc_once_locked(&db_path)?;
-        }
+        self.run_compaction_once(&db_path, &range, false)?;
 
         Ok(())
     }
@@ -989,7 +1157,7 @@ impl Db {
 
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
-        self.inner.maintenance.shutdown();
+        shutdown_background_workers(&self.inner.maintenance, &self.inner.background_workers);
         // The directory lock is released only after the writer coordinator is
         // idle. Otherwise a second process could open while this one is still
         // publishing files for a commit, flush, or compaction.
@@ -1021,10 +1189,15 @@ impl Db {
         for worker_index in 0..self.inner.options.background_worker_count {
             let inner = Arc::downgrade(&self.inner);
             let maintenance = Arc::clone(&self.inner.maintenance);
-            thread::Builder::new()
+            let worker = thread::Builder::new()
                 .name(format!("trine-kv-maintenance-{worker_index}"))
                 .spawn(move || background_worker_loop(&inner, &maintenance))
                 .map_err(Error::Io)?;
+            self.inner
+                .background_workers
+                .lock()
+                .map_err(|_| lock_poisoned("background worker registry"))?
+                .push(worker);
         }
         self.request_background_maintenance();
 
@@ -1042,7 +1215,28 @@ impl Db {
 
     fn request_background_maintenance(&self) {
         if self.background_workers_enabled() {
-            self.inner.maintenance.request();
+            self.inner.maintenance.request(MaintenanceRequest {
+                flush: true,
+                compaction: true,
+            });
+        }
+    }
+
+    fn request_background_flush(&self) {
+        if self.background_workers_enabled() {
+            self.inner.maintenance.request(MaintenanceRequest {
+                flush: true,
+                compaction: false,
+            });
+        }
+    }
+
+    fn request_background_compaction(&self) {
+        if self.background_workers_enabled() {
+            self.inner.maintenance.request(MaintenanceRequest {
+                flush: false,
+                compaction: true,
+            });
         }
     }
 
@@ -1056,7 +1250,7 @@ impl Db {
         }
     }
 
-    fn run_background_maintenance(&self) -> Result<()> {
+    fn run_background_maintenance(&self, request: MaintenanceRequest) -> Result<()> {
         self.ensure_open()?;
         if self.inner.options.read_only {
             return Ok(());
@@ -1066,22 +1260,20 @@ impl Db {
             return Ok(());
         };
         let db_path = path.clone();
-        let should_compact = {
-            let _writer = self
-                .inner
-                .writer
-                .lock()
-                .map_err(|_| lock_poisoned("writer coordinator"))?;
-            let flushed_needs_compaction = if self.has_immutable_memtables()? {
-                self.flush_memtables_locked(&db_path, None)?
-            } else {
-                false
-            };
-            flushed_needs_compaction || self.l0_pressure_exceeded()?
-        };
+        let mut should_compact = request.compaction || self.l0_pressure_exceeded()?;
+
+        if request.flush && self.has_immutable_memtables()? {
+            should_compact |= self.run_flush_once(&db_path, false)?;
+        }
 
         if should_compact {
-            self.compact_range_internal(KeyRange::all())?;
+            self.run_compaction_once(&db_path, &KeyRange::all(), true)?;
+        }
+        if self.has_immutable_memtables()? {
+            self.request_background_flush();
+        }
+        if self.l0_pressure_exceeded()? {
+            self.request_background_compaction();
         }
 
         Ok(())
@@ -1292,13 +1484,92 @@ impl Db {
         Ok(states)
     }
 
-    fn flush_immutable_memtables_for_write_locked(&self, db_path: &Path) -> Result<()> {
-        let flush_inputs = self.collect_pressure_flush_inputs()?;
-        if !flush_inputs.is_empty() && self.write_flush_inputs(db_path, &flush_inputs)? {
-            self.request_background_maintenance();
+    fn apply_write_backpressure(&self) -> Result<()> {
+        let StorageMode::Persistent { path } = &self.inner.options.storage_mode else {
+            return Ok(());
+        };
+        let db_path = path.clone();
+
+        loop {
+            self.take_background_maintenance_error()?;
+            let pressure = self.write_pressure()?;
+            if pressure.none() {
+                return Ok(());
+            }
+
+            self.inner.maintenance.request(pressure.request());
+            if self.background_workers_enabled() {
+                let progress = self.inner.maintenance.progress();
+                if self
+                    .inner
+                    .maintenance
+                    .wait_for_progress(progress, Duration::from_millis(20))
+                {
+                    continue;
+                }
+            }
+
+            self.run_maintenance_for_pressure(&db_path, pressure)?;
+        }
+    }
+
+    fn write_pressure(&self) -> Result<WritePressure> {
+        let buckets = self
+            .inner
+            .buckets
+            .read()
+            .map_err(|_| lock_poisoned("bucket registry"))?;
+        let mut pressure = WritePressure::default();
+
+        for state in buckets.values() {
+            if state.immutable_memtable_count()? >= self.inner.options.max_immutable_memtables {
+                pressure.flush = true;
+            }
+            if state.l0_table_count()? > self.inner.options.max_l0_files {
+                pressure.compaction = true;
+            }
+        }
+
+        Ok(pressure)
+    }
+
+    fn run_maintenance_for_pressure(&self, db_path: &Path, pressure: WritePressure) -> Result<()> {
+        let mut should_compact = pressure.compaction;
+        if pressure.flush {
+            should_compact |= self.run_pressure_flush_once(db_path)?;
+        }
+        if should_compact {
+            self.run_compaction_once(db_path, &KeyRange::all(), true)?;
         }
 
         Ok(())
+    }
+
+    fn run_pressure_flush_once(&self, db_path: &Path) -> Result<bool> {
+        let Some(_flush_guard) = self.inner.maintenance.try_start_flush() else {
+            return Ok(false);
+        };
+
+        let flush_inputs = self.collect_pressure_flush_inputs()?;
+        self.write_flush_inputs(db_path, &flush_inputs)
+    }
+
+    fn run_flush_once(&self, db_path: &Path, freeze_active: bool) -> Result<bool> {
+        let Some(_flush_guard) = self.inner.maintenance.try_start_flush() else {
+            return Ok(false);
+        };
+
+        if freeze_active {
+            let _writer = self
+                .inner
+                .writer
+                .lock()
+                .map_err(|_| lock_poisoned("writer coordinator"))?;
+            self.freeze_all_active_memtables(self.last_committed_sequence())?;
+        }
+
+        let flush_inputs = self.collect_flush_inputs()?;
+        self.write_flush_inputs(db_path, &flush_inputs)
     }
 
     fn freeze_large_active_memtables_after_commit_locked(
@@ -1353,19 +1624,6 @@ impl Db {
         Ok(frozen_count)
     }
 
-    fn flush_memtables_locked(
-        &self,
-        db_path: &Path,
-        freeze_active_at: Option<Sequence>,
-    ) -> Result<bool> {
-        if let Some(sequence) = freeze_active_at {
-            self.freeze_all_active_memtables(sequence)?;
-        }
-
-        let flush_inputs = self.collect_flush_inputs()?;
-        self.write_flush_inputs(db_path, &flush_inputs)
-    }
-
     fn write_flush_inputs(&self, db_path: &Path, flush_inputs: &[NamedFlushInput]) -> Result<bool> {
         if flush_inputs.is_empty() {
             return Ok(false);
@@ -1403,12 +1661,19 @@ impl Db {
             return Err(error);
         }
 
-        if let Err(error) = self.publish_flushed_tables(&written_tables, flush_sequence) {
-            let _ = remove_storage_files(db_path, &written_table_ids);
-            return Err(error);
+        {
+            let _writer = self
+                .inner
+                .writer
+                .lock()
+                .map_err(|_| lock_poisoned("writer coordinator"))?;
+            if let Err(error) = self.publish_flushed_tables(&written_tables, flush_sequence) {
+                let _ = remove_storage_files(db_path, &written_table_ids);
+                return Err(error);
+            }
+            Self::install_flushed_tables(flush_inputs, written_tables)?;
+            self.rewrite_wal_after_replay_floor(db_path, flush_sequence)?;
         }
-        Self::install_flushed_tables(flush_inputs, written_tables)?;
-        self.rewrite_wal_after_replay_floor(db_path, flush_sequence)?;
         self.l0_pressure_exceeded()
     }
 
@@ -1464,6 +1729,7 @@ impl Db {
         &self,
         range: &KeyRange,
         oldest_active_snapshot: Sequence,
+        local_l0_compaction: bool,
     ) -> Result<Vec<NamedCompactionInput>> {
         let buckets = self
             .inner
@@ -1471,7 +1737,7 @@ impl Db {
             .read()
             .map_err(|_| lock_poisoned("bucket registry"))?;
         let mut inputs = Vec::new();
-        let compaction_options = compaction_options(&self.inner.options);
+        let compaction_options = compaction_options(&self.inner.options, local_l0_compaction);
 
         for (name, state) in buckets.iter() {
             let Some(input) =
@@ -1489,10 +1755,111 @@ impl Db {
         Ok(inputs)
     }
 
-    fn build_compaction_outputs(
+    fn run_compaction_once(
         &self,
         db_path: &Path,
         range: &KeyRange,
+        local_l0_compaction: bool,
+    ) -> Result<bool> {
+        let oldest_active_snapshot = self.oldest_active_snapshot_sequence();
+        let compaction_inputs =
+            self.collect_compaction_inputs(range, oldest_active_snapshot, local_l0_compaction)?;
+        if compaction_inputs.is_empty() {
+            return Ok(false);
+        }
+
+        let reservations = compaction_inputs
+            .iter()
+            .map(|input| CompactionReservation {
+                bucket: input.bucket.clone(),
+                range: input.input.compaction_range.clone(),
+            })
+            .collect::<Vec<_>>();
+        let Some(compaction_guard) = self.inner.maintenance.reserve_compactions(reservations)
+        else {
+            return Ok(false);
+        };
+        let compaction_inputs = compaction_inputs
+            .into_iter()
+            .filter(|input| compaction_guard.contains(&input.bucket, &input.input.compaction_range))
+            .collect::<Vec<_>>();
+        if compaction_inputs.is_empty() {
+            return Ok(false);
+        }
+
+        let PendingCompactionOutputs {
+            outputs: written_tables,
+            written_table_ids,
+        } = self.build_compaction_outputs(db_path, oldest_active_snapshot, &compaction_inputs)?;
+
+        let output_table_ids = written_tables
+            .iter()
+            .flat_map(|output| {
+                output
+                    .output
+                    .tables
+                    .iter()
+                    .map(|table| table.properties().id)
+            })
+            .collect::<BTreeSet<_>>();
+        let input_table_ids_for_stats = compaction_inputs
+            .iter()
+            .flat_map(|input| input.input.input_table_ids.iter().copied())
+            .collect::<Vec<_>>();
+        // A direct table move keeps the input file alive under the same id, so
+        // cleanup must use only ids that disappeared from the published output.
+        let obsolete_table_ids = compaction_inputs
+            .iter()
+            .flat_map(|input| input.input.input_table_ids.iter().copied())
+            .filter(|table_id| !output_table_ids.contains(table_id))
+            .collect::<Vec<_>>();
+        let output_table_ids_for_stats = output_table_ids.iter().copied().collect::<Vec<_>>();
+        let obsolete_blob_ids =
+            self.obsolete_blob_ids_for_compaction(&compaction_inputs, &written_tables)?;
+
+        if !written_table_ids.is_empty() {
+            if let Err(error) = durability::sync_dir_after_renames(db_path) {
+                let _ = remove_storage_files(db_path, &written_table_ids);
+                return Err(error);
+            }
+        }
+
+        let _writer = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| lock_poisoned("writer coordinator"))?;
+        if let Err(error) = self.validate_compacted_tables(&written_tables) {
+            let _ = remove_storage_files(db_path, &written_table_ids);
+            if is_level_layout_compaction_error(&error) {
+                return Ok(false);
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.publish_compacted_tables(&written_tables, &obsolete_blob_ids) {
+            let _ = remove_storage_files(db_path, &written_table_ids);
+            return Err(error);
+        }
+
+        self.install_compacted_tables(written_tables)?;
+        self.record_compaction_stats(
+            db_path,
+            compaction_inputs.len(),
+            &input_table_ids_for_stats,
+            &output_table_ids_for_stats,
+        );
+        self.retire_obsolete_table_files(db_path, &obsolete_table_ids)?;
+        self.cleanup_pending_obsolete_blob_files(db_path)?;
+        if self.inner.options.blob_gc_enabled {
+            self.run_blob_gc_once_locked(db_path)?;
+        }
+
+        Ok(true)
+    }
+
+    fn build_compaction_outputs(
+        &self,
+        db_path: &Path,
         oldest_active_snapshot: Sequence,
         compaction_inputs: &[NamedCompactionInput],
     ) -> Result<PendingCompactionOutputs> {
@@ -1516,7 +1883,7 @@ impl Db {
 
             let payloads = match input.tree.build_compaction_table_payloads(
                 &input.input,
-                range,
+                &input.input.compaction_range,
                 oldest_active_snapshot,
                 self.inner.options.target_table_bytes,
             ) {
@@ -2086,7 +2453,7 @@ fn validate_options(options: &DbOptions) -> Result<()> {
 }
 
 fn background_worker_loop(inner: &Weak<DbInner>, maintenance: &MaintenanceCoordinator) {
-    while maintenance.wait_for_request() {
+    while let Some(request) = maintenance.wait_for_request() {
         let Some(inner) = inner.upgrade() else {
             break;
         };
@@ -2094,8 +2461,11 @@ fn background_worker_loop(inner: &Weak<DbInner>, maintenance: &MaintenanceCoordi
             break;
         }
 
-        let db = Db { inner };
-        match db.run_background_maintenance() {
+        let db = Db {
+            inner,
+            counts_as_user_handle: false,
+        };
+        match db.run_background_maintenance(request) {
             Ok(()) => record_maintenance_success(maintenance),
             Err(Error::Closed) => break,
             Err(error) => maintenance.record_error(&error),
@@ -2418,11 +2788,15 @@ fn validate_bucket_options(options: &BucketOptions) -> Result<()> {
     Ok(())
 }
 
-fn compaction_options(options: &DbOptions) -> compaction::CompactionOptions {
+fn compaction_options(
+    options: &DbOptions,
+    local_l0_compaction: bool,
+) -> compaction::CompactionOptions {
     compaction::CompactionOptions {
         target_table_bytes: usize_to_u64_saturating(options.target_table_bytes),
         level_size_multiplier: usize_to_u64_saturating(options.level_size_multiplier),
         max_l0_files: options.max_l0_files,
+        local_l0_compaction,
     }
 }
 
@@ -2574,7 +2948,13 @@ fn remove_storage_files(db_path: &Path, table_ids: &[table::TableId]) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, MaintenanceCoordinator, record_maintenance_success};
+    use std::sync::Arc;
+
+    use super::{
+        CompactionReservation, Error, MaintenanceCoordinator, compaction_reservations_conflict,
+        record_maintenance_success,
+    };
+    use crate::types::KeyRange;
 
     #[test]
     fn maintenance_success_does_not_clear_unreported_error() {
@@ -2590,5 +2970,62 @@ mod tests {
             .expect("unreported background error remains visible");
         assert!(error.contains("publish failed"));
         assert!(coordinator.take_error().is_none());
+    }
+
+    #[test]
+    fn compaction_reservation_conflicts_are_bucket_and_range_scoped() {
+        let base = reservation("default", KeyRange::half_open(b"a", b"c"));
+
+        assert!(compaction_reservations_conflict(
+            &base,
+            &reservation("default", KeyRange::half_open(b"b", b"d"))
+        ));
+        assert!(!compaction_reservations_conflict(
+            &base,
+            &reservation("default", KeyRange::half_open(b"c", b"e"))
+        ));
+        assert!(!compaction_reservations_conflict(
+            &base,
+            &reservation("other", KeyRange::half_open(b"b", b"d"))
+        ));
+    }
+
+    #[test]
+    fn maintenance_coordinator_allows_non_overlapping_compactions() {
+        let coordinator = Arc::new(MaintenanceCoordinator::new());
+        let first = coordinator
+            .reserve_compactions(vec![reservation(
+                "default",
+                KeyRange::half_open(b"a", b"c"),
+            )])
+            .expect("first compaction reserves");
+        let second = coordinator
+            .reserve_compactions(vec![
+                reservation("default", KeyRange::half_open(b"b", b"d")),
+                reservation("default", KeyRange::half_open(b"c", b"e")),
+                reservation("other", KeyRange::half_open(b"b", b"d")),
+            ])
+            .expect("non-overlapping compactions reserve");
+
+        assert!(!second.contains("default", &KeyRange::half_open(b"b", b"d")));
+        assert!(second.contains("default", &KeyRange::half_open(b"c", b"e")));
+        assert!(second.contains("other", &KeyRange::half_open(b"b", b"d")));
+
+        drop(first);
+        drop(second);
+        let third = coordinator
+            .reserve_compactions(vec![reservation(
+                "default",
+                KeyRange::half_open(b"b", b"d"),
+            )])
+            .expect("released range can reserve again");
+        assert!(third.contains("default", &KeyRange::half_open(b"b", b"d")));
+    }
+
+    fn reservation(bucket: &str, range: KeyRange) -> CompactionReservation {
+        CompactionReservation {
+            bucket: bucket.to_owned(),
+            range,
+        }
     }
 }

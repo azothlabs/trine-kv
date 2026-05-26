@@ -377,8 +377,19 @@ visibility:
 db.compact_range(KeyRange::all())?;
 ```
 
+Persistent writable databases start one background maintenance worker by
+default. Set `DbOptions::background_worker_count = 0` when a test or embedding
+needs fully manual maintenance. In-memory and read-only databases never start
+background workers.
+
 The database can also compact automatically after flush when L0 file pressure
-exceeds `DbOptions::max_l0_files`.
+exceeds `DbOptions::max_l0_files`. Automatic L0 compaction chooses a local
+overlapping key span, so unrelated L0 files may remain for later passes instead
+of every pressure event rewriting the whole level.
+
+Writes apply pressure handling when immutable memtables or L0 files exceed
+configured limits. The write may wait briefly for the background worker or help
+with one foreground maintenance pass before accepting more work.
 
 Inspect live state with `Db::stats`:
 

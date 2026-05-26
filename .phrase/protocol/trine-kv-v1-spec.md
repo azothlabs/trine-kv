@@ -302,13 +302,26 @@ must not require the writer coordinator.
 
 Background work:
 
-- `background_worker_count == 0` disables background maintenance;
-- persistent databases with `background_worker_count > 0` start maintenance
-  workers after open;
+- persistent writable databases start one maintenance worker by default;
+- `background_worker_count == 0` explicitly disables background maintenance;
+- persistent databases with `background_worker_count > 0` start that many
+  maintenance workers after open;
+- in-memory and read-only databases do not start maintenance workers;
 - flush immutable memtables;
 - compact SSTables;
 - clean obsolete files after snapshot safety allows it;
 - never publish partially written tables.
+- track flush requests, compaction requests, in-flight flushes, in-flight
+  compaction key ranges, progress notifications, and the last maintenance
+  error;
+- writes apply pressure handling before taking the writer coordinator when
+  immutable memtables or L0 files exceed configured limits; pressure handling
+  may wait for a background worker or help with a foreground maintenance pass;
+- automatic L0 compaction may choose a local overlapping key span to reduce
+  rewrite work, while explicit `compact_range` preserves requested-range
+  semantics;
+- worker shutdown must join outstanding maintenance threads before the process
+  lock is released;
 - background maintenance failures must be returned by a later write, `flush`,
   or `compact_range` call instead of being silently ignored.
 
@@ -668,6 +681,9 @@ Trine v1 uses leveled compaction:
   publishes a manifest edit.
 - L0 compaction groups overlapping L0 tables and includes overlapping L1 tables
   before publishing L1 replacements;
+- automatic L0 compaction may start from a local seed table and close only the
+  overlapping L0/L1 span needed for that seed; unrelated L0 files can remain for
+  later maintenance passes;
 - L1 and deeper compaction uses level-size pressure from
   `target_table_bytes * level_size_multiplier^(level - 1)` and moves selected
   inputs down one level together with overlapping next-level inputs;
@@ -819,6 +835,7 @@ V1 options include:
 - target table size;
 - level size multiplier;
 - max L0 files before slowdown or flush pressure;
+- background worker count, defaulting to one for persistent writable databases;
 - compression codec;
 - compression profile;
 - block size;
