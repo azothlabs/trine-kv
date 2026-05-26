@@ -17,6 +17,7 @@ pub mod filter;
 pub mod internal_key;
 pub mod iterator;
 pub mod keyspace;
+mod lsm;
 pub mod manifest;
 pub mod memtable;
 pub mod mvcc;

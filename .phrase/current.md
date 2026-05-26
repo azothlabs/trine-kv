@@ -52,8 +52,9 @@ public API behavior or storage formats.
 
 ```text
 task068 [x] goal:write complete LSM core boundary spec | scope:.phrase/protocol,.phrase/current.md,.phrase/roadmap.md | verify:protocol link and doc diff checks
-task069 [ ] goal:create internal LSM module and move tree state boundary | scope:src/lsm,src/db.rs,src/lib.rs | verify:cargo test --all-targets --all-features
-task070 [ ] goal:move point read visibility into LsmTree | scope:src/lsm,src/db.rs,tests | verify:point read, tombstone, transaction, persistent tests
+task069 [x] goal:create internal LSM module and move tree state boundary | scope:src/lsm,src/db.rs,src/lib.rs | verify:cargo test --all-targets --all-features
+task070 [x] goal:move point read visibility into LsmTree | scope:src/lsm,src/db.rs,tests | verify:point read, tombstone, transaction, persistent tests
+task071 [ ] goal:move range and prefix scan setup into LsmTree | scope:src/lsm,src/db.rs,src/iterator.rs,tests | verify:scan, prefix, range-delete, persistent iterator tests
 ```
 
 ## Known Blockers
@@ -61,15 +62,21 @@ task070 [ ] goal:move point read visibility into LsmTree | scope:src/lsm,src/db.
 - Remote CI cannot be executed locally; it must run after push.
 - `AGENTS.md` has a pre-existing unstaged edit outside this phase.
 - Later slices still need range/prefix scans, flush, compaction, and transaction
-  conflict checks moved into LSM core after the first boundary is stable.
+  conflict checks moved into LSM core after point read migration.
 
-## Evidence To Record
+## Evidence
 
 - Boundary spec path and protocol link.
-- First code slice diff proving DB delegates tree-owned behavior to `LsmTree`.
-- Full local verification for each implementation slice.
+- `src/lsm/` now exists with `LsmTree`, `ImmutableMemtable`, and
+  `RangeTombstone`.
+- `DbInner.keyspaces` now stores `Arc<LsmTree>`.
+- Tree table sorting moved behind `LsmTree::sort_tables_for_reads`.
+- Point read visibility moved behind `LsmTree::read_visible_point`.
+- `Db::get_at_with_pin_state` now only finds the tree and supplies
+  `read_sequence`, path, and cache handles.
+- Full local Rust verification passed for the state-boundary slice.
 
 ## Next Recommendation
 
-- Start task069 by introducing `src/lsm/` and moving tree state behind
-  `LsmTree` without changing behavior.
+- Start task071 by moving range and prefix scan setup into `LsmTree` while
+  preserving lazy heap merge behavior.

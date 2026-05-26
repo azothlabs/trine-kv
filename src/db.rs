@@ -1,5 +1,4 @@
 use std::{
-    cmp::Ordering as CmpOrdering,
     collections::{BTreeMap, BTreeSet},
     fs,
     ops::Bound,
@@ -15,21 +14,20 @@ use crate::{
     blob::{self, ValueRef},
     cache, compaction, durability,
     error::{Error, Result},
-    internal_key::{
-        InternalKey, ValueKind, first_internal_key_for_user, last_internal_key_for_user,
-    },
+    internal_key::{InternalKey, ValueKind},
     iterator::{
         Direction, Iter, RecordGroup, RecordSource, ScanRangeTombstone, ScanSelector,
         prefix_successor,
     },
     keyspace::{Keyspace, KeyspaceName},
+    lsm::{ImmutableMemtable, LsmTree, RangeTombstone},
     manifest::{self, ManifestState, ManifestStore},
     memtable::Memtable,
     options::{
         DbOptions, DurabilityMode, FailOnCorruptionPolicy, FilterPolicy, KeyspaceOptions,
         PrefixFilterPolicy, StorageMode,
     },
-    range_tombstone::{self, RangeTombstoneIndex, RangeTombstoneLike},
+    range_tombstone::{self, RangeTombstoneIndex},
     recovery,
     snapshot::{Snapshot, SnapshotTracker},
     stats::{DbStats, LevelStats},
@@ -54,7 +52,7 @@ pub(crate) struct DbInner {
     closed: AtomicBool,
     writer: Mutex<()>,
     process_lock: Mutex<Option<recovery::ProcessLock>>,
-    keyspaces: RwLock<BTreeMap<String, Arc<KeyspaceState>>>,
+    keyspaces: RwLock<BTreeMap<String, Arc<LsmTree>>>,
     snapshots: Arc<SnapshotTracker>,
     manifest: Option<Mutex<ManifestStore>>,
     wal: Option<Mutex<WalWriter>>,
@@ -65,65 +63,6 @@ pub(crate) struct DbInner {
     compaction_input_bytes: AtomicU64,
     compaction_output_bytes: AtomicU64,
     maintenance: Arc<MaintenanceCoordinator>,
-}
-
-#[derive(Debug)]
-pub(crate) struct KeyspaceState {
-    options: KeyspaceOptions,
-    active_memtable: RwLock<Arc<Memtable>>,
-    range_tombstones: RwLock<Vec<RangeTombstone>>,
-    immutable_memtables: RwLock<Vec<ImmutableMemtable>>,
-    tables: RwLock<Vec<Arc<Table>>>,
-}
-
-impl KeyspaceState {
-    fn new(options: KeyspaceOptions, mut tables: Vec<Arc<Table>>) -> Self {
-        sort_tables_for_reads(&mut tables);
-        Self {
-            options,
-            active_memtable: RwLock::new(Arc::new(Memtable::default())),
-            range_tombstones: RwLock::new(Vec::new()),
-            immutable_memtables: RwLock::new(Vec::new()),
-            tables: RwLock::new(tables),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct RangeTombstone {
-    range: KeyRange,
-    sequence: Sequence,
-    batch_index: u32,
-}
-
-impl RangeTombstone {
-    fn covers_visible_point(
-        &self,
-        key: &[u8],
-        point_sequence: Sequence,
-        point_batch_index: u32,
-        read_sequence: Sequence,
-    ) -> bool {
-        if self.sequence > read_sequence || !key_is_in_range(key, &self.range) {
-            return false;
-        }
-
-        self.sequence > point_sequence
-            || (self.sequence == point_sequence && self.batch_index > point_batch_index)
-    }
-}
-
-impl RangeTombstoneLike for RangeTombstone {
-    fn range(&self) -> &KeyRange {
-        &self.range
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ImmutableMemtable {
-    memtable: Arc<Memtable>,
-    range_tombstones: Arc<Vec<RangeTombstone>>,
-    freeze_sequence: Sequence,
 }
 
 struct FlushInput {
@@ -239,12 +178,6 @@ impl Drop for DbInner {
         self.closed.store(true, Ordering::Release);
         self.maintenance.shutdown();
     }
-}
-
-#[derive(Debug, Clone)]
-struct PointRecordCandidate {
-    internal_key: InternalKey,
-    value: Option<ValueRef>,
 }
 
 impl Db {
@@ -417,7 +350,7 @@ impl Db {
                 let keyspace_options = options.clone();
                 keyspaces.insert(
                     name.as_str().to_owned(),
-                    Arc::new(KeyspaceState::new(options, Vec::new())),
+                    Arc::new(LsmTree::new(options, Vec::new())),
                 );
                 keyspace_options
             }
@@ -829,8 +762,7 @@ impl Db {
         };
 
         let state = self.keyspace_state(keyspace)?;
-        read_visible_point(
-            &state,
+        state.read_visible_point(
             key,
             read_sequence,
             self.persistent_path(),
@@ -890,7 +822,7 @@ impl Db {
         ))
     }
 
-    fn keyspace_state(&self, keyspace: &str) -> Result<Arc<KeyspaceState>> {
+    fn keyspace_state(&self, keyspace: &str) -> Result<Arc<LsmTree>> {
         let keyspaces = self
             .inner
             .keyspaces
@@ -936,10 +868,7 @@ impl Db {
         Ok(())
     }
 
-    fn resolve_batch_keyspaces(
-        &self,
-        operations: &[BatchOperation],
-    ) -> Result<Vec<Arc<KeyspaceState>>> {
+    fn resolve_batch_keyspaces(&self, operations: &[BatchOperation]) -> Result<Vec<Arc<LsmTree>>> {
         let keyspaces = self
             .inner
             .keyspaces
@@ -1326,7 +1255,7 @@ impl Db {
                     .write()
                     .map_err(|_| lock_poisoned("table list"))?;
                 tables.push(table);
-                sort_tables_for_reads(&mut tables);
+                LsmTree::sort_tables_for_reads(&mut tables);
             }
             let mut immutable_memtables = state
                 .immutable_memtables
@@ -1357,7 +1286,7 @@ impl Db {
             for table in output.tables {
                 tables.push(table);
             }
-            sort_tables_for_reads(&mut tables);
+            LsmTree::sort_tables_for_reads(&mut tables);
         }
 
         Ok(())
@@ -1499,7 +1428,7 @@ fn background_worker_loop(inner: &Weak<DbInner>, maintenance: &MaintenanceCoordi
 fn keyspaces_from_manifest(
     db_path: &Path,
     manifest: &ManifestState,
-) -> Result<BTreeMap<String, Arc<KeyspaceState>>> {
+) -> Result<BTreeMap<String, Arc<LsmTree>>> {
     let mut keyspaces = BTreeMap::new();
 
     for (name, options) in manifest.keyspaces() {
@@ -1521,14 +1450,14 @@ fn keyspaces_from_manifest(
 
         keyspaces.insert(
             name.clone(),
-            Arc::new(KeyspaceState::new(options.clone(), tables)),
+            Arc::new(LsmTree::new(options.clone(), tables)),
         );
     }
 
     Ok(keyspaces)
 }
 
-fn active_memtable_bytes(state: &KeyspaceState) -> Result<u64> {
+fn active_memtable_bytes(state: &LsmTree) -> Result<u64> {
     let active_memtable = state
         .active_memtable
         .read()
@@ -1547,7 +1476,7 @@ fn active_memtable_bytes(state: &KeyspaceState) -> Result<u64> {
     Ok(entry_bytes.saturating_add(memtable_tombstone_bytes(&range_tombstones)))
 }
 
-fn freeze_active_memtable(state: &KeyspaceState, freeze_sequence: Sequence) -> Result<bool> {
+fn freeze_active_memtable(state: &LsmTree, freeze_sequence: Sequence) -> Result<bool> {
     // Lock order is active pointer -> active tombstones -> immutable queue.
     // Readers follow the same active-before-tombstone path, so a freeze cannot
     // leave a reader seeing the new active memtable without the frozen data.
@@ -1653,22 +1582,6 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
     }
 }
 
-fn sort_tables_for_reads(tables: &mut [Arc<Table>]) {
-    // Keep table handles in level order. Reads still merge candidate records
-    // defensively, but this invariant gives optimized point reads and
-    // compaction picking one stable rule to share.
-    tables.sort_by(compare_tables_for_reads);
-}
-
-fn compare_tables_for_reads(left: &Arc<Table>, right: &Arc<Table>) -> CmpOrdering {
-    let left = left.properties();
-    let right = right.properties();
-    left.level
-        .cmp(&right.level)
-        .then_with(|| right.largest_sequence.cmp(&left.largest_sequence))
-        .then_with(|| right.id.cmp(&left.id))
-}
-
 fn referenced_table_file_ids(manifest: &ManifestState) -> BTreeSet<table::TableId> {
     manifest
         .tables()
@@ -1689,9 +1602,7 @@ fn referenced_blob_file_ids_from_manifest(manifest: &ManifestState) -> BTreeSet<
         .collect()
 }
 
-fn referenced_blob_file_ids(
-    keyspaces: &BTreeMap<String, Arc<KeyspaceState>>,
-) -> Result<BTreeSet<u64>> {
+fn referenced_blob_file_ids(keyspaces: &BTreeMap<String, Arc<LsmTree>>) -> Result<BTreeSet<u64>> {
     let mut file_ids = BTreeSet::new();
 
     for state in keyspaces.values() {
@@ -2154,7 +2065,7 @@ fn validate_batch_len(len: usize) -> Result<()> {
 }
 
 fn scan_sources(
-    state: &KeyspaceState,
+    state: &LsmTree,
     selector: &ScanSelector,
     direction: Direction,
     block_cache: Option<&Arc<cache::BlockCache>>,
@@ -2206,7 +2117,7 @@ fn scan_sources(
 }
 
 fn collect_point_key_records(
-    state: &KeyspaceState,
+    state: &LsmTree,
     key: &[u8],
     block_cache: Option<&cache::BlockCache>,
 ) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
@@ -2267,7 +2178,7 @@ fn collect_point_key_records(
 }
 
 fn collect_range_point_records(
-    state: &KeyspaceState,
+    state: &LsmTree,
     range: &KeyRange,
     block_cache: Option<&cache::BlockCache>,
 ) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
@@ -2324,34 +2235,12 @@ fn collect_range_point_records(
     Ok(records)
 }
 
-fn collect_memtable_range_tombstones(
-    state: &KeyspaceState,
-) -> Result<RangeTombstoneIndex<RangeTombstone>> {
-    let active_tombstones = state
-        .range_tombstones
-        .read()
-        .map_err(|_| lock_poisoned("range tombstones"))?;
-    let mut tombstones = active_tombstones.clone();
-    drop(active_tombstones);
-
-    let immutable_memtables = state
-        .immutable_memtables
-        .read()
-        .map_err(|_| lock_poisoned("immutable memtable queue"))?
-        .clone();
-    for immutable in immutable_memtables {
-        tombstones.extend(immutable.range_tombstones.iter().cloned());
-    }
-
-    Ok(RangeTombstoneIndex::new(tombstones))
-}
-
 fn scan_range_tombstones(
-    state: &KeyspaceState,
+    state: &LsmTree,
     selector: &ScanSelector,
 ) -> Result<Vec<ScanRangeTombstone>> {
     let range = selector_query_range(selector);
-    let memtable_tombstones = collect_memtable_range_tombstones(state)?;
+    let memtable_tombstones = state.memtable_range_tombstones()?;
     let mut tombstones = memtable_tombstones
         .overlapping_range(&range)
         .cloned()
@@ -2394,11 +2283,7 @@ fn selector_query_range(selector: &ScanSelector) -> KeyRange {
     }
 }
 
-fn point_key_modified_after(
-    state: &KeyspaceState,
-    key: &[u8],
-    read_sequence: Sequence,
-) -> Result<bool> {
+fn point_key_modified_after(state: &LsmTree, key: &[u8], read_sequence: Sequence) -> Result<bool> {
     // A point read is invalidated by either a newer point record for that user
     // key or a newer range tombstone covering it.
     for (internal_key, _) in collect_point_key_records(state, key, None)? {
@@ -2411,7 +2296,7 @@ fn point_key_modified_after(
 }
 
 fn key_range_modified_after(
-    state: &KeyspaceState,
+    state: &LsmTree,
     range: &KeyRange,
     read_sequence: Sequence,
 ) -> Result<bool> {
@@ -2424,165 +2309,6 @@ fn key_range_modified_after(
     }
 
     range_tombstone_modified_after_range(state, range, read_sequence)
-}
-
-fn read_visible_point(
-    state: &KeyspaceState,
-    key: &[u8],
-    read_sequence: Sequence,
-    db_path: Option<&Path>,
-    block_cache: Option<&cache::BlockCache>,
-) -> Result<Option<Vec<u8>>> {
-    // The point-read hot path only needs the newest visible record for one user
-    // key. Keep at most one candidate instead of collecting and sorting every
-    // version from every source.
-    let mut candidate = newest_visible_memtable_point_candidate(state, key, read_sequence)?;
-    let memtable_range_tombstones = collect_memtable_range_tombstones(state)?;
-    let tables = state
-        .tables
-        .read()
-        .map_err(|_| lock_poisoned("table list"))?;
-
-    for table in tables.iter() {
-        if !table.may_contain_key(key) {
-            continue;
-        }
-        if let Some(record) = table.newest_visible_point_record_for_key_with_cache(
-            key,
-            read_sequence,
-            state.options.index_search_policy,
-            block_cache,
-        )? {
-            keep_newer_point_candidate(&mut candidate, &record.internal_key, record.value.as_ref());
-        }
-    }
-
-    let Some(candidate) = candidate else {
-        return Ok(None);
-    };
-
-    match candidate.internal_key.kind() {
-        ValueKind::Put => {
-            let covered_by_memtable_tombstone = range_tombstones_cover(
-                &memtable_range_tombstones,
-                key,
-                candidate.internal_key.sequence(),
-                candidate.internal_key.batch_index(),
-                read_sequence,
-            );
-            let mut covered_by_table_tombstone = false;
-            if !covered_by_memtable_tombstone {
-                for table in tables.iter() {
-                    covered_by_table_tombstone = table.range_tombstone_covers_visible_point(
-                        key,
-                        candidate.internal_key.sequence(),
-                        candidate.internal_key.batch_index(),
-                        read_sequence,
-                    )?;
-                    if covered_by_table_tombstone {
-                        break;
-                    }
-                }
-            }
-            if covered_by_memtable_tombstone || covered_by_table_tombstone {
-                Ok(None)
-            } else {
-                drop(tables);
-                value_bytes(candidate.value.as_ref(), db_path).map(Some)
-            }
-        }
-        ValueKind::PointDelete | ValueKind::RangeDelete => Ok(None),
-    }
-}
-
-fn newest_visible_memtable_point_candidate(
-    state: &KeyspaceState,
-    key: &[u8],
-    read_sequence: Sequence,
-) -> Result<Option<PointRecordCandidate>> {
-    let active_memtable = state
-        .active_memtable
-        .read()
-        .map_err(|_| lock_poisoned("active memtable"))?
-        .clone();
-    let mut candidate = None;
-    keep_newest_visible_memtable_point_candidate(
-        &mut candidate,
-        &active_memtable,
-        key,
-        read_sequence,
-    )?;
-
-    let immutable_memtables = state
-        .immutable_memtables
-        .read()
-        .map_err(|_| lock_poisoned("immutable memtable queue"))?
-        .clone();
-    for immutable in immutable_memtables {
-        keep_newest_visible_memtable_point_candidate(
-            &mut candidate,
-            &immutable.memtable,
-            key,
-            read_sequence,
-        )?;
-    }
-
-    Ok(candidate)
-}
-
-fn keep_newest_visible_memtable_point_candidate(
-    candidate: &mut Option<PointRecordCandidate>,
-    memtable: &Memtable,
-    key: &[u8],
-    read_sequence: Sequence,
-) -> Result<()> {
-    let entries = memtable
-        .read_entries()
-        .map_err(|_| lock_poisoned("memtable entries"))?;
-    let start = Bound::Included(first_internal_key_for_user(key));
-    let end = Bound::Included(last_internal_key_for_user(key));
-
-    for (internal_key, value) in entries.range((start, end)) {
-        if internal_key.sequence() > read_sequence {
-            continue;
-        }
-        keep_newer_point_candidate(candidate, internal_key, value.as_ref());
-        break;
-    }
-
-    Ok(())
-}
-
-fn keep_newer_point_candidate(
-    candidate: &mut Option<PointRecordCandidate>,
-    internal_key: &InternalKey,
-    value: Option<&ValueRef>,
-) {
-    let replace = candidate
-        .as_ref()
-        .is_none_or(|current| internal_key < &current.internal_key);
-    if replace {
-        *candidate = Some(PointRecordCandidate {
-            internal_key: internal_key.clone(),
-            value: value.cloned(),
-        });
-    }
-}
-
-fn value_bytes(value: Option<&ValueRef>, db_path: Option<&Path>) -> Result<Vec<u8>> {
-    let value = value.ok_or_else(|| Error::Corruption {
-        message: "put record is missing value bytes".to_owned(),
-    })?;
-
-    match value {
-        ValueRef::Inline(bytes) => Ok(bytes.clone()),
-        ValueRef::Blob { .. } => {
-            let db_path = db_path.ok_or_else(|| Error::Corruption {
-                message: "in-memory database cannot read blob value references".to_owned(),
-            })?;
-            crate::blob::read_value(db_path, value)
-        }
-    }
 }
 
 fn key_is_before_start(key: &[u8], start: &Bound<Vec<u8>>) -> bool {
@@ -2612,24 +2338,12 @@ fn range_is_all(range: &KeyRange) -> bool {
     )
 }
 
-fn range_tombstones_cover(
-    range_tombstones: &RangeTombstoneIndex<RangeTombstone>,
-    key: &[u8],
-    point_sequence: Sequence,
-    point_batch_index: u32,
-    read_sequence: Sequence,
-) -> bool {
-    range_tombstones.covering_key(key).any(|tombstone| {
-        tombstone.covers_visible_point(key, point_sequence, point_batch_index, read_sequence)
-    })
-}
-
 fn range_tombstone_modified_after_key(
-    state: &KeyspaceState,
+    state: &LsmTree,
     key: &[u8],
     read_sequence: Sequence,
 ) -> Result<bool> {
-    let memtable_tombstones = collect_memtable_range_tombstones(state)?;
+    let memtable_tombstones = state.memtable_range_tombstones()?;
     if memtable_tombstones
         .covering_key(key)
         .any(|tombstone| tombstone.sequence > read_sequence)
@@ -2655,11 +2369,11 @@ fn range_tombstone_modified_after_key(
 }
 
 fn range_tombstone_modified_after_range(
-    state: &KeyspaceState,
+    state: &LsmTree,
     range: &KeyRange,
     read_sequence: Sequence,
 ) -> Result<bool> {
-    let memtable_tombstones = collect_memtable_range_tombstones(state)?;
+    let memtable_tombstones = state.memtable_range_tombstones()?;
     if memtable_tombstones
         .overlapping_range(range)
         .any(|tombstone| tombstone.sequence > read_sequence)
@@ -2685,7 +2399,7 @@ fn range_tombstone_modified_after_range(
 }
 
 fn apply_memtable_operation(
-    state: &KeyspaceState,
+    state: &LsmTree,
     operation: BatchOperation,
     sequence: Sequence,
     batch_index: u32,

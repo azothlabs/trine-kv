@@ -2646,3 +2646,87 @@ Record only evidence that can change planning or durable decisions.
 
 - Start task069: create the internal LSM module and move tree state behind
   `LsmTree` without changing behavior.
+
+## 2026-05-26: LSM Tree State Boundary Moved
+
+### Observation
+
+- `src/lsm/` now contains the internal LSM module.
+- `LsmTree` owns the one-keyspace tree state that previously lived directly in
+  `db.rs`: keyspace options, active memtable, active range tombstones,
+  immutable memtable queue, and table list.
+- `RangeTombstone` and `ImmutableMemtable` moved into the LSM module with
+  crate-local visibility.
+- `DbInner.keyspaces` now stores `Arc<LsmTree>`.
+- Table read ordering is now maintained through
+  `LsmTree::sort_tables_for_reads`.
+
+### Interpretation
+
+- Task069 is complete.
+- This slice changes ownership and module boundaries only. It does not change
+  public API behavior, storage formats, WAL, manifest, MVCC rules, or
+  compaction behavior.
+- `Db` still calls tree fields directly for read, scan, flush, compaction, and
+  transaction validation. That remaining coupling is the next task.
+
+### Verification
+
+- `cargo check --all-targets --all-features`
+- `cargo fmt --all`
+- `cargo test --all-targets --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+
+### Remaining Blockers
+
+- Point read visibility still lives in `db.rs`.
+- Range and prefix scan setup still lives in `db.rs`.
+- Flush planning, compaction planning, and transaction conflict checks still
+  live in `db.rs`.
+- Remote CI cannot be executed locally; it must run after push.
+
+### Recommended Next Action
+
+- Move point read visibility into `LsmTree` as task070, then run point read,
+  tombstone, transaction, persistent, and full Rust verification.
+
+## 2026-05-26: Point Read Visibility Moved To LSM Core
+
+### Observation
+
+- `src/lsm/read.rs` now owns point read visible-version selection.
+- `LsmTree::read_visible_point` checks active memtable, immutable memtables,
+  table candidates, point deletes, and range tombstone coverage for one user
+  key.
+- `LsmTree::memtable_range_tombstones` now owns the active plus immutable
+  memtable tombstone query structure.
+- `Db::get_at_with_pin_state` now delegates point read semantics to `LsmTree`
+  after resolving the keyspace and read pin.
+
+### Interpretation
+
+- Task070 is complete.
+- The point read path no longer has DB-level MVCC visible-version logic.
+- Range and prefix scan setup still lives in `db.rs`, so scan visibility and
+  source construction are the next extraction target.
+
+### Verification
+
+- `cargo check --all-targets --all-features`
+- `cargo fmt --all`
+- `cargo test point --all-targets --all-features`
+- `cargo test tombstone --all-targets --all-features`
+- `cargo test --all-targets --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+
+### Remaining Blockers
+
+- Range and prefix scan setup still lives in `db.rs`.
+- Flush planning, compaction planning, and transaction conflict checks still
+  live in `db.rs`.
+- Remote CI cannot be executed locally; it must run after push.
+
+### Recommended Next Action
+
+- Move range and prefix scan setup into `LsmTree` as task071 while preserving
+  lazy heap merge behavior and existing iterator tests.
