@@ -2929,3 +2929,94 @@ Record only evidence that can change planning or durable decisions.
 
 - Start Phase 23 with task080: audit memtable byte accounting, keyspace-local
   freeze behavior, and immutable queue pressure before code changes.
+
+## 2026-05-26: Phase 23 Memtable And Flush Scheduling Completed
+
+### Observation
+
+- `Memtable` now maintains an atomic byte estimate on insert/replace, so normal
+  write-buffer checks no longer scan the full `BTreeMap`.
+- Active range tombstone bytes are tracked incrementally and folded into
+  active memtable byte checks.
+- Frozen immutable memtables carry their byte estimate, so stats no longer
+  re-scan immutable memtable entries to compute memtable bytes.
+- Post-commit write-buffer freezing now checks only keyspaces touched by the
+  committed batch.
+- Immutable pressure flush before a write now flushes only keyspaces whose
+  immutable queue reached the configured limit.
+- In-memory mode now uses the same write-buffer freeze path and reads frozen
+  immutable memtables.
+
+### Interpretation
+
+- Phase 23 acceptance is met locally: byte accounting is incremental, hot
+  keyspaces no longer move unrelated keyspaces during freeze/pressure flush,
+  pressure behavior is tested, and in-memory mode shares the immutable read
+  path.
+- The next phase should move to P4 SSTable read-path details.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo check --all-targets --all-features`
+- `cargo clippy --all-targets --all-features`
+- `cargo test estimated_bytes_tracks_insert_and_replace --lib`
+- `cargo test write_buffer --test persistent_wal`
+- `cargo test immutable_pressure --test persistent_wal`
+- `cargo test write_buffer --test in_memory_mvcc`
+- `cargo test --all-targets --all-features`
+
+### Remaining Blockers
+
+- Remote CI cannot be executed locally; it must run after push.
+
+### Recommended Next Action
+
+- Start Phase 24 with task083: audit SSTable read-path detail gaps in
+  `src/table.rs`, `src/cache.rs`, and focused table/cache tests.
+
+## 2026-05-26: Phase 24 SSTable Read Path Detail Hardening Completed
+
+### Observation
+
+- Persistent table open already reads footer/properties/index/filter metadata
+  first and keeps data blocks lazy.
+- Decoded data blocks now build an in-memory user-key hash index so point reads
+  jump directly to the contiguous version range for a key inside the block.
+- Block cache keys now include block kind classes for data, index, filter,
+  range-tombstone, and blob-related blocks.
+- Cache hits now promote the touched key before eviction decisions, including
+  the race path where another reader inserted the block during a miss.
+- Persistent `Table` now keeps an open file handle and lazy block/range-tombstone
+  reads clone that handle instead of opening the table path for each block.
+- No public API or storage format changed.
+
+### Interpretation
+
+- Phase 24 acceptance is met locally: point lookup has a per-block hash-index
+  path, cache keys are ready for additional block classes, cache replacement is
+  no longer FIFO-only on hits, and file-handle reuse is covered by a focused
+  block-read test.
+- The next phase should move to P5: filter observability and stronger prefix
+  skip-path proof.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo check --all-targets --all-features`
+- `cargo clippy --all-targets --all-features`
+- `cargo test data_block_point_lookup_uses_hash_index --lib`
+- `cargo test block_read_uses_cached_file_handle --lib`
+- `cargo test cache_ --lib`
+- `cargo test --all-targets --all-features`
+
+### Remaining Blockers
+
+- Remote CI cannot be executed locally; it must run after push.
+- Filter hit/miss/false-positive stats are not exposed yet; they are the next
+  phase.
+
+### Recommended Next Action
+
+- Start Phase 25 with task086: audit filter read-path and stats gaps before
+  changing counters or prefix-scan behavior.

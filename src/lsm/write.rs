@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, ops::Bound, sync::Arc};
+use std::{
+    ops::Bound,
+    sync::{Arc, atomic::Ordering},
+};
 
 use crate::{
     blob::ValueRef,
@@ -24,29 +27,29 @@ impl LsmTree {
             .read()
             .map_err(|_| lock_poisoned("active memtable"))?
             .clone();
-        let mut entries = active_memtable
-            .write_entries()
-            .map_err(|_| lock_poisoned("memtable entries"))?;
 
         match operation {
             BatchOperation::Insert { key, value, .. } => {
-                entries.insert(
-                    InternalKey::new(key, sequence, ValueKind::Put, batch_index),
-                    Some(ValueRef::Inline(value)),
-                );
+                active_memtable
+                    .insert(
+                        InternalKey::new(key, sequence, ValueKind::Put, batch_index),
+                        Some(ValueRef::Inline(value)),
+                    )
+                    .map_err(|()| lock_poisoned("memtable entries"))?;
             }
             BatchOperation::Remove { key, .. } => {
-                entries.insert(
-                    InternalKey::new(key, sequence, ValueKind::PointDelete, batch_index),
-                    None,
-                );
+                active_memtable
+                    .insert(
+                        InternalKey::new(key, sequence, ValueKind::PointDelete, batch_index),
+                        None,
+                    )
+                    .map_err(|()| lock_poisoned("memtable entries"))?;
             }
             BatchOperation::RemoveRange { range, .. } => {
                 // Range tombstones share the same commit sequence and batch
-                // order as point records. Drop the point-record lock before
-                // taking the tombstone lock so writers and readers keep a
-                // short, predictable lock path.
-                drop(entries);
+                // order as point records. Keep the tombstone byte counter in
+                // the same step so write-buffer checks stay O(1).
+                let tombstone_bytes = range_tombstone_bytes(&range);
                 let mut range_tombstones = self
                     .range_tombstones
                     .write()
@@ -59,6 +62,8 @@ impl LsmTree {
                         batch_index,
                     },
                 );
+                self.range_tombstone_bytes
+                    .fetch_add(tombstone_bytes, Ordering::AcqRel);
             }
         }
 
@@ -71,17 +76,9 @@ impl LsmTree {
             .read()
             .map_err(|_| lock_poisoned("active memtable"))?
             .clone();
-        let entries = active_memtable
-            .read_entries()
-            .map_err(|_| lock_poisoned("memtable entries"))?;
-        let entry_bytes = memtable_entry_bytes(&entries);
-        drop(entries);
-
-        let range_tombstones = self
-            .range_tombstones
-            .read()
-            .map_err(|_| lock_poisoned("range tombstones"))?;
-        Ok(entry_bytes.saturating_add(memtable_tombstone_bytes(&range_tombstones)))
+        Ok(active_memtable
+            .estimated_bytes()
+            .saturating_add(self.range_tombstone_bytes.load(Ordering::Acquire)))
     }
 
     pub(crate) fn memtable_bytes(&self) -> Result<u64> {
@@ -93,13 +90,7 @@ impl LsmTree {
             .clone();
 
         for immutable in immutable_memtables {
-            let entries = immutable
-                .memtable
-                .read_entries()
-                .map_err(|_| lock_poisoned("memtable entries"))?;
-            bytes = bytes.saturating_add(memtable_entry_bytes(&entries));
-            drop(entries);
-            bytes = bytes.saturating_add(memtable_tombstone_bytes(&immutable.range_tombstones));
+            bytes = bytes.saturating_add(immutable.estimated_bytes);
         }
 
         Ok(bytes)
@@ -126,12 +117,9 @@ impl LsmTree {
             .write()
             .map_err(|_| lock_poisoned("active memtable"))?;
         let active = Arc::clone(&active_memtable);
-        let entries_empty = {
-            let entries = active
-                .read_entries()
-                .map_err(|_| lock_poisoned("memtable entries"))?;
-            entries.is_empty()
-        };
+        let entries_empty = active
+            .is_empty()
+            .map_err(|()| lock_poisoned("memtable entries"))?;
         let mut range_tombstones = self
             .range_tombstones
             .write()
@@ -142,6 +130,9 @@ impl LsmTree {
         }
 
         let immutable = ImmutableMemtable {
+            estimated_bytes: active
+                .estimated_bytes()
+                .saturating_add(self.range_tombstone_bytes.load(Ordering::Acquire)),
             memtable: active,
             range_tombstones: Arc::new(range_tombstones.clone()),
             freeze_sequence,
@@ -153,32 +144,16 @@ impl LsmTree {
 
         *active_memtable = Arc::new(Memtable::default());
         range_tombstones.clear();
+        self.range_tombstone_bytes.store(0, Ordering::Release);
 
         Ok(true)
     }
 }
 
-fn memtable_entry_bytes(entries: &BTreeMap<InternalKey, Option<ValueRef>>) -> u64 {
-    entries
-        .iter()
-        .map(|(internal_key, value)| {
-            let value_len = value.as_ref().map_or(0, ValueRef::len);
-            usize_to_u64_saturating(internal_key.user_key().len())
-                .saturating_add(value_len)
-                .saturating_add(16)
-        })
-        .sum()
-}
-
-fn memtable_tombstone_bytes(tombstones: &[RangeTombstone]) -> u64 {
-    tombstones
-        .iter()
-        .map(|tombstone| {
-            key_range_bytes(&tombstone.range)
-                .saturating_add(usize_to_u64_saturating(std::mem::size_of::<Sequence>()))
-                .saturating_add(usize_to_u64_saturating(std::mem::size_of::<u32>()))
-        })
-        .sum()
+fn range_tombstone_bytes(range: &KeyRange) -> u64 {
+    key_range_bytes(range)
+        .saturating_add(usize_to_u64_saturating(std::mem::size_of::<Sequence>()))
+        .saturating_add(usize_to_u64_saturating(std::mem::size_of::<u32>()))
 }
 
 fn key_range_bytes(range: &KeyRange) -> u64 {

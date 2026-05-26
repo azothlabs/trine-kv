@@ -744,6 +744,95 @@ fn persistent_write_buffer_freezes_active_memtable_and_reads_immutable() {
 }
 
 #[test]
+fn persistent_write_buffer_freezes_only_large_keyspace() {
+    let path = temp_db_path("write-buffer-keyspace-local-freeze");
+    let mut options = DbOptions::persistent(&path);
+    options.write_buffer_bytes = 40;
+    options.max_immutable_memtables = 4;
+
+    {
+        let db = Db::open(options).expect("persistent db opens");
+        let cold = db
+            .keyspace("cold", KeyspaceOptions::default())
+            .expect("cold keyspace opens");
+        let hot = db
+            .keyspace("hot", KeyspaceOptions::default())
+            .expect("hot keyspace opens");
+
+        cold.insert(b"c", b"v").expect("cold write stays active");
+        assert_eq!(db.stats().immutable_memtables, 0);
+
+        hot.insert(b"h", vec![b'x'; 80])
+            .expect("hot write freezes hot keyspace");
+        let stats = db.stats();
+        assert_eq!(stats.immutable_memtables, 1);
+        assert_eq!(stats.total_tables, 0);
+        assert_eq!(
+            cold.get(b"c").expect("cold active row reads"),
+            Some(b"v".to_vec())
+        );
+        assert_eq!(
+            hot.get(b"h").expect("hot immutable row reads"),
+            Some(vec![b'x'; 80])
+        );
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_immutable_pressure_flushes_only_pressure_keyspaces() {
+    let path = temp_db_path("immutable-pressure-keyspace-local-flush");
+    let mut options = DbOptions::persistent(&path);
+    options.write_buffer_bytes = 1;
+    options.max_immutable_memtables = 2;
+
+    {
+        let db = Db::open(options).expect("persistent db opens");
+        let cold = db
+            .keyspace("cold", KeyspaceOptions::default())
+            .expect("cold keyspace opens");
+        let hot = db
+            .keyspace("hot", KeyspaceOptions::default())
+            .expect("hot keyspace opens");
+
+        cold.insert(b"cold", b"c1")
+            .expect("cold write freezes once");
+        hot.insert(b"h1", b"v1").expect("hot write freezes once");
+        hot.insert(b"h2", b"v2")
+            .expect("hot reaches immutable pressure");
+        assert_eq!(db.stats().immutable_memtables, 3);
+        assert_eq!(db.stats().total_tables, 0);
+
+        hot.insert(b"h3", b"v3")
+            .expect("hot pressure flushes hot keyspace first");
+        let stats = db.stats();
+        assert_eq!(
+            stats.total_tables, 2,
+            "only hot immutable memtables should have flushed"
+        );
+        assert_eq!(
+            stats.immutable_memtables, 2,
+            "cold immutable plus new hot immutable should remain queued"
+        );
+        assert_eq!(
+            cold.get(b"cold").expect("cold immutable row reads"),
+            Some(b"c1".to_vec())
+        );
+        assert_eq!(
+            hot.get(b"h1").expect("flushed hot row reads"),
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(
+            hot.get(b"h3").expect("new hot row reads"),
+            Some(b"v3".to_vec())
+        );
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_immutable_range_tombstone_hides_point_records() {
     let path = temp_db_path("immutable-range-tombstone");
     let mut options = DbOptions::persistent(&path);

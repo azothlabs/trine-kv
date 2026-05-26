@@ -427,7 +427,7 @@ Tree Version boundary as the next core LSM risk.
 
 ### Phase 23: Memtable And Flush Scheduling Hardening
 
-**Status**: In Progress
+**Status**: Complete
 
 **Goal**: Harden memtable accounting, keyspace-local freeze behavior, and
 immutable queue pressure before deeper table and compaction optimizations.
@@ -442,4 +442,50 @@ next LSM tree improvement after versioned level layout.
 - Immutable memtable queue pressure and write backpressure are tested.
 - In-memory mode follows the same logical LSM path.
 - Existing public API and storage formats remain unchanged.
+- Full local Rust verification passes.
+
+### Phase 24: SSTable Read Path Detail Hardening
+
+**Status**: Complete
+
+**Goal**: Tighten table read-path details after version and memtable scheduling
+are stable.
+
+**Entry Condition**: Phase 23 complete and user review identifies P4 as the
+next LSM tree improvement.
+
+**Acceptance Gate**:
+
+- Table point lookup has a per-block fast path that avoids unnecessary scans
+  inside large data blocks.
+- Block cache keys distinguish data, index/filter, range-tombstone, and future
+  blob-related block classes.
+- Cache hit behavior promotes recently used blocks instead of simple FIFO-only
+  replacement.
+- Any fd-cache or metadata pinning change is backed by focused corruption and
+  lazy-read tests.
+- Existing public API and storage formats remain unchanged unless protocol docs
+  are updated first.
+- Full local Rust verification passes.
+
+### Phase 25: Filter Strategy Observability
+
+**Status**: In Progress
+
+**Goal**: Make table and block filter behavior observable and harden prefix
+filter skip paths before broader compaction or blob-GC work.
+
+**Entry Condition**: Phase 24 complete and user review identifies P5 as the
+next LSM tree improvement.
+
+**Acceptance Gate**:
+
+- Filter stats distinguish table/block filter hits and misses for point and
+  prefix reads.
+- Prefix filter tests prove nonmatching prefixes skip data-block reads when the
+  extractor matches.
+- False positives are counted only after a filter-allowed candidate yields no
+  matching user key.
+- Existing public API and storage formats remain unchanged unless protocol docs
+  are updated first.
 - Full local Rust verification passes.

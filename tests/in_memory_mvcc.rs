@@ -1,6 +1,24 @@
 use trine_kv::{Db, DbOptions, Error, KeyspaceOptions, WriteBatch, WriteOptions};
 
 #[test]
+fn write_buffer_freeze_reads_immutable_in_memory() {
+    let mut options = DbOptions::memory();
+    options.write_buffer_bytes = 1;
+    let db = Db::memory(options).expect("memory db opens");
+    let keyspace = db
+        .keyspace("default", KeyspaceOptions::default())
+        .expect("keyspace opens");
+
+    keyspace.insert(b"user:1", b"ada").expect("write user");
+
+    assert_eq!(db.stats().immutable_memtables, 1);
+    assert_eq!(
+        keyspace.get(b"user:1").expect("point read sees immutable"),
+        Some(b"ada".to_vec())
+    );
+}
+
+#[test]
 fn point_writes_deletes_and_snapshot_reads_are_mvcc_visible() {
     let db = Db::memory(DbOptions::memory()).expect("memory db opens");
     let keyspace = db

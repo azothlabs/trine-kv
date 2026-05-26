@@ -1,4 +1,7 @@
-use std::sync::{Arc, RwLock};
+use std::{
+    sync::atomic::AtomicU64,
+    sync::{Arc, RwLock},
+};
 
 use crate::{
     error::{Error, Result},
@@ -16,6 +19,7 @@ pub(crate) struct LsmTree {
     pub(crate) options: KeyspaceOptions,
     pub(crate) active_memtable: RwLock<Arc<Memtable>>,
     pub(crate) range_tombstones: RwLock<Vec<RangeTombstone>>,
+    pub(crate) range_tombstone_bytes: AtomicU64,
     pub(crate) immutable_memtables: RwLock<Vec<ImmutableMemtable>>,
     pub(crate) current_version: RwLock<Arc<LsmVersion>>,
 }
@@ -27,6 +31,7 @@ impl LsmTree {
             options,
             active_memtable: RwLock::new(Arc::new(Memtable::default())),
             range_tombstones: RwLock::new(Vec::new()),
+            range_tombstone_bytes: AtomicU64::new(0),
             immutable_memtables: RwLock::new(Vec::new()),
             current_version: RwLock::new(current_version),
         })
@@ -92,6 +97,7 @@ impl RangeTombstoneLike for RangeTombstone {
 pub(crate) struct ImmutableMemtable {
     pub(crate) memtable: Arc<Memtable>,
     pub(crate) range_tombstones: Arc<Vec<RangeTombstone>>,
+    pub(crate) estimated_bytes: u64,
     pub(crate) freeze_sequence: Sequence,
 }
 

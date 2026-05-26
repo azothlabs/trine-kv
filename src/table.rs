@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
     ops::{Bound, Range},
@@ -186,9 +186,19 @@ struct DataBlockIndexEntry {
 pub(crate) struct DecodedDataBlock {
     records: Vec<TablePointRecord>,
     restart_indices: Vec<usize>,
+    point_lookup_index: HashMap<Vec<u8>, Range<usize>>,
 }
 
 impl DecodedDataBlock {
+    fn new(records: Vec<TablePointRecord>, restart_indices: Vec<usize>) -> Self {
+        let point_lookup_index = build_data_block_point_lookup_index(&records);
+        Self {
+            records,
+            restart_indices,
+            point_lookup_index,
+        }
+    }
+
     pub(crate) fn estimated_bytes(&self) -> u64 {
         let records = self.records.iter().fold(0_u64, |bytes, record| {
             bytes
@@ -203,7 +213,23 @@ impl DecodedDataBlock {
                 .len()
                 .saturating_mul(RESTART_POINT_BYTES),
         );
-        records.saturating_add(restarts).max(1)
+        let point_index = self
+            .point_lookup_index
+            .iter()
+            .fold(0_u64, |bytes, (key, _)| {
+                bytes
+                    .saturating_add(usize_to_u64_saturating(key.len()))
+                    .saturating_add(48)
+            });
+        records
+            .saturating_add(restarts)
+            .saturating_add(point_index)
+            .max(1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty_for_cache_test() -> Self {
+        Self::new(Vec::new(), Vec::new())
     }
 }
 
@@ -344,6 +370,7 @@ impl RangeTombstoneLike for TableRangeTombstone {
 #[derive(Debug, Clone)]
 pub(crate) struct Table {
     path: Option<PathBuf>,
+    file: Option<Arc<File>>,
     payload_len: usize,
     footer: TableFooter,
     properties: TableProperties,
@@ -593,6 +620,7 @@ impl Table {
         };
         let (codec, payload) = read_single_block_section_from_file(
             path,
+            self.file.as_deref(),
             self.payload_len,
             self.footer.range_tombstones,
         )?;
@@ -619,10 +647,7 @@ impl Table {
                 .iter()
                 .map(|index| index.saturating_sub(block.record_range.start))
                 .collect();
-            return Ok(Arc::new(DecodedDataBlock {
-                records,
-                restart_indices,
-            }));
+            return Ok(Arc::new(DecodedDataBlock::new(records, restart_indices)));
         }
 
         let block = self
@@ -644,14 +669,21 @@ impl Table {
         };
         if let Some(block_cache) = block_cache {
             let path = path.clone();
+            let file = self.file.as_ref().map(Arc::clone);
             let payload_len = self.payload_len;
             let codec = self.properties.codec;
             block_cache.get_or_insert_with(key, move || {
-                read_data_block_from_file(&path, payload_len, codec, &entry)
+                read_data_block_from_file(&path, file.as_deref(), payload_len, codec, &entry)
             })
         } else {
-            read_data_block_from_file(path, self.payload_len, self.properties.codec, &entry)
-                .map(Arc::new)
+            read_data_block_from_file(
+                path,
+                self.file.as_deref(),
+                self.payload_len,
+                self.properties.codec,
+                &entry,
+            )
+            .map(Arc::new)
         }
     }
 
@@ -1045,13 +1077,8 @@ fn data_block_point_records_for_key(
     key: &[u8],
     policy: IndexSearchPolicy,
 ) -> Vec<TablePointRecord> {
-    let start = data_block_restart_index_for_key(block, key, policy);
-    block.records[start..]
-        .iter()
-        .take_while(move |record| record.internal_key.user_key() <= key)
-        .filter(move |record| record.internal_key.user_key() == key)
-        .cloned()
-        .collect()
+    let range = data_block_point_record_range_for_key(block, key, policy);
+    block.records[range].to_vec()
 }
 
 fn data_block_newest_visible_point_record_for_key(
@@ -1060,10 +1087,9 @@ fn data_block_newest_visible_point_record_for_key(
     read_sequence: Sequence,
     policy: IndexSearchPolicy,
 ) -> Option<TablePointRecord> {
-    let start = data_block_restart_index_for_key(block, key, policy);
-    block.records[start..]
+    let range = data_block_point_record_range_for_key(block, key, policy);
+    block.records[range]
         .iter()
-        .take_while(move |record| record.internal_key.user_key() <= key)
         .find(move |record| {
             record.internal_key.user_key() == key && record.internal_key.sequence() <= read_sequence
         })
@@ -1128,6 +1154,51 @@ fn data_block_restart_index_for_key(
     } else {
         block.restart_indices[upper - 1]
     }
+}
+
+fn data_block_point_record_range_for_key(
+    block: &DecodedDataBlock,
+    key: &[u8],
+    policy: IndexSearchPolicy,
+) -> Range<usize> {
+    if let Some(range) = block.point_lookup_index.get(key) {
+        return range.clone();
+    }
+
+    let start = data_block_first_record_index_for_key(block, key, policy);
+    let end = block.records[start..]
+        .iter()
+        .take_while(|record| record.internal_key.user_key() == key)
+        .count()
+        .saturating_add(start);
+    start..end
+}
+
+fn data_block_first_record_index_for_key(
+    block: &DecodedDataBlock,
+    key: &[u8],
+    policy: IndexSearchPolicy,
+) -> usize {
+    search::partition_point_by(block.records.len(), policy, |index| {
+        block.records[index].internal_key.user_key() < key
+    })
+}
+
+fn build_data_block_point_lookup_index(
+    records: &[TablePointRecord],
+) -> HashMap<Vec<u8>, Range<usize>> {
+    let mut index = HashMap::new();
+    let mut start = 0;
+    while start < records.len() {
+        let key = records[start].internal_key.user_key();
+        let mut end = start + 1;
+        while end < records.len() && records[end].internal_key.user_key() == key {
+            end += 1;
+        }
+        index.insert(key.to_vec(), start..end);
+        start = end;
+    }
+    index
 }
 
 #[must_use]
@@ -1210,6 +1281,7 @@ pub(crate) fn write_table(
 
     let table = Table {
         path: None,
+        file: None,
         payload_len: 0,
         footer: empty_footer(),
         properties: table_properties(
@@ -1299,12 +1371,12 @@ pub(crate) fn read_table(path: &Path) -> Result<Table> {
     validate_footer_sections_by_len(payload_len, &footer)?;
 
     let (properties_codec, properties_payload) =
-        read_single_block_section_from_file(path, payload_len, footer.properties)?;
+        read_single_block_section_from_file(path, Some(&file), payload_len, footer.properties)?;
     let properties = decode_properties_block(&properties_payload)?;
     validate_block_codec(properties_codec, properties.codec, TableSection::Properties)?;
 
     let (index_codec, index_payload) =
-        read_single_block_section_from_file(path, payload_len, footer.indexes)?;
+        read_single_block_section_from_file(path, Some(&file), payload_len, footer.indexes)?;
     validate_block_codec(index_codec, properties.codec, TableSection::Indexes)?;
     let index_entries = decode_index_block(&index_payload)?;
     validate_data_index_covers_section(&index_entries, footer.data_blocks)?;
@@ -1314,12 +1386,13 @@ pub(crate) fn read_table(path: &Path) -> Result<Table> {
         .collect::<Result<Vec<_>>>()?;
 
     let (filter_codec, filter_payload) =
-        read_single_block_section_from_file(path, payload_len, footer.filters)?;
+        read_single_block_section_from_file(path, Some(&file), payload_len, footer.filters)?;
     validate_block_codec(filter_codec, properties.codec, TableSection::Filters)?;
     let (point_key_filter, prefix_filter) = decode_filter_block(&filter_payload)?;
 
     Ok(Table {
         path: Some(path.to_path_buf()),
+        file: Some(Arc::new(file)),
         payload_len,
         footer,
         properties,
@@ -1575,31 +1648,8 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
     let index_entries = decode_index_block(&index_payload)?;
     validate_data_index_covers_section(&index_entries, footer.data_blocks)?;
 
-    let mut point_records = Vec::new();
-    let mut data_blocks = Vec::new();
-    for entry in &index_entries {
-        let (block_codec, block_payload) = read_checked_block(payload, entry.block)?;
-        validate_block_codec(block_codec, properties.codec, TableSection::DataBlocks)?;
-        let decoded_block = decode_data_block(&block_payload)?;
-        validate_data_block_entry(entry, &decoded_block.records)?;
-        validate_data_block_filters(entry, &decoded_block.records)?;
-        let record_start = point_records.len();
-        point_records.extend(decoded_block.records);
-        let record_end = point_records.len();
-        data_blocks.push(TableDataBlock::from_record_range_and_block(
-            &point_records,
-            record_start..record_end,
-            decoded_block
-                .restart_indices
-                .into_iter()
-                .map(|index| record_start + index)
-                .collect(),
-            entry.block,
-            entry.point_key_filter.clone(),
-            entry.prefix_filter.clone(),
-        )?);
-    }
-    validate_sorted_point_records(&point_records)?;
+    let (point_records, data_blocks) =
+        decode_test_point_records_and_blocks(payload, &properties, &index_entries)?;
 
     let (tombstone_codec, tombstone_payload) =
         read_single_block_section(payload, footer.range_tombstones)?;
@@ -1628,6 +1678,7 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
 
     Ok(Table {
         path: None,
+        file: None,
         payload_len: payload.len(),
         footer,
         properties,
@@ -1639,6 +1690,40 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
         point_key_filter,
         prefix_filter,
     })
+}
+
+#[cfg(test)]
+fn decode_test_point_records_and_blocks(
+    payload: &[u8],
+    properties: &TableProperties,
+    index_entries: &[DataBlockIndexEntry],
+) -> Result<(Vec<TablePointRecord>, Vec<TableDataBlock>)> {
+    let mut point_records = Vec::new();
+    let mut data_blocks = Vec::new();
+    for entry in index_entries {
+        let (block_codec, block_payload) = read_checked_block(payload, entry.block)?;
+        validate_block_codec(block_codec, properties.codec, TableSection::DataBlocks)?;
+        let decoded_block = decode_data_block(&block_payload)?;
+        validate_data_block_entry(entry, &decoded_block.records)?;
+        validate_data_block_filters(entry, &decoded_block.records)?;
+        let record_start = point_records.len();
+        point_records.extend(decoded_block.records);
+        let record_end = point_records.len();
+        data_blocks.push(TableDataBlock::from_record_range_and_block(
+            &point_records,
+            record_start..record_end,
+            decoded_block
+                .restart_indices
+                .into_iter()
+                .map(|index| record_start + index)
+                .collect(),
+            entry.block,
+            entry.point_key_filter.clone(),
+            entry.prefix_filter.clone(),
+        )?);
+    }
+    validate_sorted_point_records(&point_records)?;
+    Ok((point_records, data_blocks))
 }
 
 fn append_data_blocks(
@@ -1952,6 +2037,7 @@ fn read_single_block_section(payload: &[u8], section: SectionHandle) -> Result<(
 
 fn read_single_block_section_from_file(
     path: &Path,
+    file: Option<&File>,
     payload_len: usize,
     section: SectionHandle,
 ) -> Result<(CodecId, Vec<u8>)> {
@@ -1977,7 +2063,7 @@ fn read_single_block_section_from_file(
             message: "section block length mismatch".to_owned(),
         });
     }
-    read_checked_block_from_file(path, payload_len, block)
+    read_checked_block_from_file(path, file, payload_len, block)
 }
 
 #[cfg(test)]
@@ -1991,6 +2077,7 @@ fn read_checked_block(payload: &[u8], block: BlockHandle) -> Result<(CodecId, Ve
 
 fn read_checked_block_from_file(
     path: &Path,
+    file: Option<&File>,
     payload_len: usize,
     block: BlockHandle,
 ) -> Result<(CodecId, Vec<u8>)> {
@@ -2002,12 +2089,7 @@ fn read_checked_block_from_file(
     let file_offset = HEADER_LEN
         .checked_add(start)
         .ok_or_else(|| invalid_table("block file offset overflow"))?;
-    let mut file = File::open(path).map_err(|error| Error::Corruption {
-        message: format!(
-            "referenced table {} cannot be opened: {error}",
-            path.display()
-        ),
-    })?;
+    let mut file = table_file_for_block_read(path, file)?;
     file.seek(SeekFrom::Start(usize_to_u64(
         file_offset,
         "block file offset",
@@ -2019,16 +2101,36 @@ fn read_checked_block_from_file(
 
 fn read_data_block_from_file(
     path: &Path,
+    file: Option<&File>,
     payload_len: usize,
     expected_codec: CodecId,
     entry: &DataBlockIndexEntry,
 ) -> Result<DecodedDataBlock> {
-    let (actual_codec, payload) = read_checked_block_from_file(path, payload_len, entry.block)?;
+    let (actual_codec, payload) =
+        read_checked_block_from_file(path, file, payload_len, entry.block)?;
     validate_block_codec(actual_codec, expected_codec, TableSection::DataBlocks)?;
     let decoded = decode_data_block(&payload)?;
     validate_data_block_entry(entry, &decoded.records)?;
     validate_data_block_filters(entry, &decoded.records)?;
     Ok(decoded)
+}
+
+fn table_file_for_block_read(path: &Path, file: Option<&File>) -> Result<File> {
+    if let Some(file) = file {
+        return file.try_clone().map_err(|error| Error::Corruption {
+            message: format!(
+                "referenced table {} handle cannot be cloned: {error}",
+                path.display()
+            ),
+        });
+    }
+
+    File::open(path).map_err(|error| Error::Corruption {
+        message: format!(
+            "referenced table {} cannot be opened: {error}",
+            path.display()
+        ),
+    })
 }
 
 fn read_checked_block_bytes(block_bytes: &[u8]) -> Result<(CodecId, Vec<u8>)> {
@@ -2132,10 +2234,7 @@ fn decode_data_block(bytes: &[u8]) -> Result<DecodedDataBlock> {
     if !cursor.is_finished() {
         return Err(invalid_table("trailing data block bytes"));
     }
-    Ok(DecodedDataBlock {
-        records,
-        restart_indices,
-    })
+    Ok(DecodedDataBlock::new(records, restart_indices))
 }
 
 fn decode_range_tombstone_block(bytes: &[u8]) -> Result<Vec<TableRangeTombstone>> {
@@ -2900,6 +2999,68 @@ mod tests {
     }
 
     #[test]
+    fn data_block_point_lookup_uses_hash_index() {
+        let block = DecodedDataBlock::new(
+            vec![
+                test_point_record(b"a", 10, b"a1"),
+                test_point_record(b"target", 9, b"newer"),
+                test_point_record(b"target", 7, b"older"),
+                test_point_record(b"z", 1, b"z1"),
+            ],
+            vec![0],
+        );
+        assert_eq!(
+            block.point_lookup_index.get(b"target".as_slice()),
+            Some(&(1..3))
+        );
+
+        let records =
+            data_block_point_records_for_key(&block, b"target", IndexSearchPolicy::Binary);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].internal_key.sequence(), Sequence::new(9));
+        assert_eq!(records[1].internal_key.sequence(), Sequence::new(7));
+
+        let visible = data_block_newest_visible_point_record_for_key(
+            &block,
+            b"target",
+            Sequence::new(8),
+            IndexSearchPolicy::Binary,
+        )
+        .expect("older target version is visible");
+        assert_eq!(visible.internal_key.sequence(), Sequence::new(7));
+
+        assert!(
+            data_block_point_records_for_key(&block, b"missing", IndexSearchPolicy::Binary)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn block_read_uses_cached_file_handle() {
+        let mut payload = Vec::new();
+        let block = append_checked_block(&mut payload, CodecId::None, b"cached block")
+            .expect("checked block appends");
+        let path = std::env::temp_dir().join(format!(
+            "trine-kv-cached-table-handle-{}-{}.trinet",
+            std::process::id(),
+            table_time_suffix()
+        ));
+        let mut file_bytes = vec![0_u8; HEADER_LEN];
+        file_bytes.extend_from_slice(&payload);
+        std::fs::write(&path, file_bytes).expect("test table file writes");
+        let file = std::fs::File::open(&path).expect("test table file opens");
+        let missing_path = path.with_extension("missing");
+
+        let (codec, decoded) =
+            read_checked_block_from_file(&missing_path, Some(&file), payload.len(), block)
+                .expect("cached file handle supplies block bytes");
+
+        assert_eq!(codec, CodecId::None);
+        assert_eq!(decoded, b"cached block");
+        std::fs::remove_file(path).expect("test table file removes");
+    }
+
+    #[test]
     fn search_policies_keep_table_candidate_results_stable() {
         let table = table_with_filters(160, CodecId::None);
         let expected_range = (20..30)
@@ -3164,6 +3325,7 @@ mod tests {
         let data_blocks = build_data_blocks(&point_records, options).expect("test blocks build");
         Table {
             path: None,
+            file: None,
             payload_len: 0,
             footer: empty_footer(),
             properties: table_properties(
@@ -3181,6 +3343,25 @@ mod tests {
                 Vec::new(),
             ))))),
         }
+    }
+
+    fn test_point_record(key: &[u8], sequence: u64, value: &[u8]) -> TablePointRecord {
+        TablePointRecord {
+            internal_key: InternalKey::new(
+                key.to_vec(),
+                Sequence::new(sequence),
+                ValueKind::Put,
+                0,
+            ),
+            value: Some(ValueRef::Inline(value.to_vec())),
+        }
+    }
+
+    fn table_time_suffix() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is after epoch")
+            .as_nanos()
     }
 
     const fn test_table_options(codec: CodecId, filters_enabled: bool) -> TableWriteOptions {

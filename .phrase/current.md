@@ -6,69 +6,71 @@ In Progress
 
 ## Goal
 
-Harden memtable and flush scheduling so one hot keyspace does not force every
-tree to move together, and so write-buffer pressure is tracked without scanning
-whole memtables.
+Harden filter strategy behavior after the SSTable read path grew sharper block
+lookup, cache keys, cache replacement, and file-handle reuse.
 
 ## Entry Condition
 
-- Phase 22 completed the versioned LSM level layout.
-- User review identified P3 as the next LSM tree improvement after P0/P1/P2:
-  memtable bytes, keyspace-local freeze, clearer immutable queue pressure,
-  foreground/background flush boundaries, and in-memory mode parity.
+- Phase 24 completed data-block point lookup indexing, richer cache key
+  classes, cache hit promotion, and persistent table file-handle reuse.
+- User review identified P5 as the next LSM tree improvement after SSTable
+  read-path detail hardening.
 
 ## Scope
 
-- Maintain memtable byte estimates incrementally on write and freeze.
-- Keep freeze decisions keyspace-local.
-- Make immutable memtable queue pressure and write backpressure explicit.
-- Keep active memtable and active range tombstones freezing as one unit.
-- Keep in-memory mode on the same logical LSM path.
-- Add focused tests before behavior changes.
+- Audit table-level and per-block whole-key filters, prefix filters, and current
+  stats boundaries.
+- Make filter hit/miss behavior observable enough to tune later with benchmark
+  evidence.
+- Preserve current table format unless the audit proves a format change is
+  necessary and protocol docs are updated first.
+- Keep prefix scans able to skip unrelated tables/blocks when the configured
+  prefix extractor matches.
 
 ## Out Of Scope
 
 - Public API redesign.
-- Storage format changes.
 - WAL or manifest format changes.
-- SSTable hash indexes, fd cache, partitioned metadata loading, blob GC, and
-  full compaction picker rewrite.
-- Replacing the current background worker model beyond what this phase needs to
-  clarify flush scheduling.
+- Compaction picker rewrite.
+- Blob GC.
+- Benchmark-driven policy defaults without new benchmark evidence.
+- Format changes without a protocol update.
 
 ## Acceptance Gate
 
-- Memtable byte accounting no longer needs whole-map scans on normal writes.
-- A hot keyspace freeze/flush decision does not freeze unrelated keyspaces.
-- Immutable memtable queue pressure has tested behavior when the configured
-  limit is reached.
-- In-memory mode follows the same memtable/freeze/read path as persistent mode.
-- Existing public API and storage formats remain unchanged.
+- Filter stats distinguish table/block filter hits and misses for point and
+  prefix reads.
+- Prefix filter tests prove nonmatching prefixes skip data-block reads when the
+  extractor matches.
+- False positives are counted only when a filter allows a candidate but the
+  checked block/table yields no matching user key.
+- Existing public API and storage formats remain unchanged unless protocol docs
+  are updated first.
 - Full local Rust verification passes.
 
 ## Active Task Slice
 
 ```text
-task080 [ ] goal:audit current memtable byte and freeze path | scope:src/lsm/write.rs,src/lsm/flush.rs,src/db.rs,tests | verify:evidence note with exact blockers
-task081 [ ] goal:incrementally maintain memtable byte estimates | scope:src/memtable.rs,src/lsm/write.rs,tests | verify:unit tests plus persistent write-buffer tests
-task082 [ ] goal:make immutable queue pressure explicit | scope:src/lsm/write.rs,src/db.rs,tests | verify:pressure/backpressure regression tests
+task086 [ ] goal:audit filter read-path and stats gaps | scope:src/filter.rs,src/table.rs,src/stats.rs,tests | verify:evidence note with exact blockers
+task087 [ ] goal:add filter hit/miss/false-positive counters | scope:src/cache.rs,src/table.rs,src/stats.rs,tests | verify:stats-focused point/prefix tests
+task088 [ ] goal:strengthen prefix filter skip behavior | scope:src/table.rs,tests | verify:nonmatching prefix avoids data-block reads
 ```
 
 ## Known Blockers
 
 - Remote CI cannot be executed locally; it must run after push.
-- Current background maintenance error boundaries must stay compatible with
-  existing public methods.
+- Any on-disk format change must update protocol docs first; current phase
+  should avoid that unless evidence proves it necessary.
 
 ## Evidence
 
-- Phase 22 introduced `LsmVersion`/`LevelState`, version-swap publish, one
-  read-held version handle for table layout, and old compacted-table file
-  lifetime protection for lazy readers.
-- User review identified `write_buffer_bytes`, `max_immutable_memtables`, and
-  background flush behavior as the next P3 risk area.
+- Phase 24 full local verification passed.
+- Existing Bloom implementations are real bitset filters; the next gap is
+  observability and stronger skip-path proof, not replacing fake filters.
+- Table-level filters and per-block filters already exist; stats do not yet
+  expose filter hit/miss/false-positive behavior.
 
 ## Next Recommendation
 
-- Start task080 with a small code audit and evidence note before changing write
-  or flush behavior.
+- Start task086 with a focused filter read-path audit before changing stats or
+  prefix-scan behavior.

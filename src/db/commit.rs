@@ -1,7 +1,8 @@
-use std::sync::atomic::Ordering;
+use std::sync::{Arc, atomic::Ordering};
 
 use crate::{
     error::{Error, Result},
+    lsm::LsmTree,
     options::{DurabilityMode, WriteOptions},
     transaction::TransactionReadSet,
     types::{CommitInfo, Sequence},
@@ -100,6 +101,11 @@ impl Db {
             effective_durability(self.inner.options.durability, write_options.durability);
         self.append_wal(sequence, &wal_operations, durability)?;
 
+        let touched_states = unique_lsm_trees(
+            indexed_operations
+                .iter()
+                .map(|(_, _, state)| Arc::clone(state)),
+        );
         for (batch_index, operation, state) in indexed_operations {
             state.apply_operation(operation, sequence, batch_index)?;
         }
@@ -107,7 +113,7 @@ impl Db {
         self.inner
             .last_sequence
             .store(sequence.get(), Ordering::Release);
-        if self.freeze_large_active_memtables_after_commit_locked(sequence)? {
+        if self.freeze_large_active_memtables_after_commit_locked(sequence, &touched_states)? {
             self.request_background_maintenance();
         }
         Ok(CommitInfo::new(sequence))
@@ -200,6 +206,17 @@ impl Db {
             .store(last_committed.get(), Ordering::Release);
         Ok(())
     }
+}
+
+fn unique_lsm_trees(states: impl IntoIterator<Item = Arc<LsmTree>>) -> Vec<Arc<LsmTree>> {
+    let mut unique = Vec::<Arc<LsmTree>>::new();
+    for state in states {
+        if unique.iter().any(|existing| Arc::ptr_eq(existing, &state)) {
+            continue;
+        }
+        unique.push(state);
+    }
+    unique
 }
 
 fn effective_durability(default: DurabilityMode, requested: DurabilityMode) -> DurabilityMode {

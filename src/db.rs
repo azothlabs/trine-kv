@@ -857,9 +857,8 @@ impl Db {
     }
 
     fn flush_immutable_memtables_for_write_locked(&self, db_path: &Path) -> Result<()> {
-        if self.immutable_memtable_pressure_reached()?
-            && self.flush_memtables_locked(db_path, None)?
-        {
+        let flush_inputs = self.collect_pressure_flush_inputs()?;
+        if !flush_inputs.is_empty() && self.write_flush_inputs(db_path, &flush_inputs)? {
             self.request_background_maintenance();
         }
 
@@ -869,52 +868,20 @@ impl Db {
     fn freeze_large_active_memtables_after_commit_locked(
         &self,
         sequence: Sequence,
+        states: &[Arc<LsmTree>],
     ) -> Result<bool> {
-        let StorageMode::Persistent { .. } = self.inner.options.storage_mode else {
-            return Ok(false);
-        };
-
-        if self.active_write_buffer_reached()? {
-            return self
-                .freeze_all_active_memtables(sequence)
-                .map(|frozen_count| frozen_count != 0);
-        }
-
-        Ok(false)
-    }
-
-    fn active_write_buffer_reached(&self) -> Result<bool> {
         let threshold = usize_to_u64_saturating(self.inner.options.write_buffer_bytes);
-        let keyspaces = self
-            .inner
-            .keyspaces
-            .read()
-            .map_err(|_| lock_poisoned("keyspace registry"))?;
+        let mut frozen_count = 0_usize;
 
-        for state in keyspaces.values() {
-            if state.active_memtable_bytes()? >= threshold {
-                return Ok(true);
+        for state in states {
+            if state.active_memtable_bytes()? >= threshold
+                && state.freeze_active_memtable(sequence)?
+            {
+                frozen_count += 1;
             }
         }
 
-        Ok(false)
-    }
-
-    fn immutable_memtable_pressure_reached(&self) -> Result<bool> {
-        let max_immutable_memtables = self.inner.options.max_immutable_memtables;
-        let keyspaces = self
-            .inner
-            .keyspaces
-            .read()
-            .map_err(|_| lock_poisoned("keyspace registry"))?;
-
-        for state in keyspaces.values() {
-            if state.immutable_memtable_count()? >= max_immutable_memtables {
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
+        Ok(frozen_count != 0)
     }
 
     fn has_immutable_memtables(&self) -> Result<bool> {
@@ -960,6 +927,10 @@ impl Db {
         }
 
         let flush_inputs = self.collect_flush_inputs()?;
+        self.write_flush_inputs(db_path, &flush_inputs)
+    }
+
+    fn write_flush_inputs(&self, db_path: &Path, flush_inputs: &[NamedFlushInput]) -> Result<bool> {
         if flush_inputs.is_empty() {
             return Ok(false);
         }
@@ -971,7 +942,7 @@ impl Db {
 
         let mut written_tables = Vec::with_capacity(flush_inputs.len());
         let mut written_table_ids = Vec::with_capacity(flush_inputs.len());
-        for input in &flush_inputs {
+        for input in flush_inputs {
             let table_path = table::table_path(db_path, input.input.table_id);
             written_table_ids.push(input.input.table_id);
             let table = match table::write_table(
@@ -1000,9 +971,35 @@ impl Db {
             let _ = remove_storage_files(db_path, &written_table_ids);
             return Err(error);
         }
-        Self::install_flushed_tables(&flush_inputs, written_tables)?;
+        Self::install_flushed_tables(flush_inputs, written_tables)?;
         self.rewrite_wal_after_replay_floor(db_path, flush_sequence)?;
         self.l0_pressure_exceeded()
+    }
+
+    fn collect_pressure_flush_inputs(&self) -> Result<Vec<NamedFlushInput>> {
+        let max_immutable_memtables = self.inner.options.max_immutable_memtables;
+        let mut next_table_id = self.next_table_id()?;
+        let keyspaces = self
+            .inner
+            .keyspaces
+            .read()
+            .map_err(|_| lock_poisoned("keyspace registry"))?;
+        let mut inputs = Vec::new();
+
+        for (name, state) in keyspaces.iter() {
+            if state.immutable_memtable_count()? < max_immutable_memtables {
+                continue;
+            }
+            for input in state.prepare_flush_inputs(&mut next_table_id)? {
+                inputs.push(NamedFlushInput {
+                    keyspace: name.clone(),
+                    tree: Arc::clone(state),
+                    input,
+                });
+            }
+        }
+
+        Ok(inputs)
     }
 
     fn collect_flush_inputs(&self) -> Result<Vec<NamedFlushInput>> {
