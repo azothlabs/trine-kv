@@ -58,10 +58,14 @@ impl LsmVersion {
                     level
                         .tables
                         .iter()
-                        .filter(|table| table.may_contain_key(key))
+                        .filter(|table| {
+                            table.record_point_table_probe();
+                            table.may_contain_key(key)
+                        })
                         .cloned(),
                 );
             } else if let Some(table) = level.table_for_key(key) {
+                table.record_point_table_probe();
                 if table.may_contain_key(key) {
                     tables.push(Arc::clone(table));
                 }

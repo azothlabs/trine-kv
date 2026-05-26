@@ -3907,3 +3907,36 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Commit Phase 40, then push to CI for the external release signal.
+
+## 2026-05-26: Phase 40 Point-Read Hot Path Regression Fix
+
+### Observation
+
+- User audit found that point reads regressed after lazy partitioned
+  index/filter loading: point seek entered a partition at its first block,
+  metadata access cloned per-block filters, normal block decode rebuilt the
+  hash index for validation, and persistent table handles no longer pinned any
+  table-level point filter.
+- The fix makes point seek binary-search inside the selected index partition,
+  uses borrowed block metadata for point/range/prefix scans, pins table-level
+  filters for L0 tables, and leaves full hash-index rebuild validation to the
+  explicit test/verify decode path.
+- `DbStats.read_path` now exposes aggregate point-read probes for tables,
+  index partitions, block metadata, data-block reads, and point filter misses.
+
+### Verification
+
+- `cargo test --lib table::tests::`
+- `cargo test --lib lsm::version::tests::range_tombstone_lookup_uses_key_bounds_without_table_filter`
+- `cargo fmt --all --check`
+
+### Remaining Blockers
+
+- `cargo test --all-targets --all-features` currently fails in
+  `tests/persistent_wal.rs` around background maintenance/default-worker
+  behavior and directory cleanup. These failures reproduce outside the table
+  hot-path slice and line up with the dirty Phase 41 maintenance changes in
+  `src/db.rs` and `src/options.rs`.
+- `cargo clippy --lib --all-features -- -D warnings` currently fails on the
+  same dirty maintenance slice (`src/db.rs` unnested or-pattern and
+  needless-pass-by-value).

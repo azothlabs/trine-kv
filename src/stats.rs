@@ -30,6 +30,7 @@ pub struct DbStats {
     pub compaction_output_bytes: u64,
     pub block_cache_hits: u64,
     pub block_cache_misses: u64,
+    pub read_path: ReadPathStats,
     pub filters: FilterStats,
 }
 
@@ -74,6 +75,35 @@ pub struct FilterStats {
     pub block_prefix_hits: u64,
     pub block_prefix_misses: u64,
     pub block_prefix_false_positives: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadPathStats {
+    pub point_table_probes: u64,
+    pub point_index_partition_probes: u64,
+    pub point_block_metadata_probes: u64,
+    pub point_data_block_reads: u64,
+    pub point_filter_misses: u64,
+}
+
+impl ReadPathStats {
+    pub(crate) fn saturating_add_assign(&mut self, other: Self) {
+        self.point_table_probes = self
+            .point_table_probes
+            .saturating_add(other.point_table_probes);
+        self.point_index_partition_probes = self
+            .point_index_partition_probes
+            .saturating_add(other.point_index_partition_probes);
+        self.point_block_metadata_probes = self
+            .point_block_metadata_probes
+            .saturating_add(other.point_block_metadata_probes);
+        self.point_data_block_reads = self
+            .point_data_block_reads
+            .saturating_add(other.point_data_block_reads);
+        self.point_filter_misses = self
+            .point_filter_misses
+            .saturating_add(other.point_filter_misses);
+    }
 }
 
 impl FilterStats {
