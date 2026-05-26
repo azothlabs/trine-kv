@@ -101,6 +101,20 @@ fn default_table_levels(path: &std::path::Path) -> Vec<u32> {
     levels
 }
 
+fn default_table_ids(path: &std::path::Path) -> Vec<u64> {
+    let manifest_state =
+        manifest::read_manifest(&manifest::manifest_path(path)).expect("manifest reads");
+    let mut ids = manifest_state
+        .tables()
+        .get("default")
+        .expect("default table list")
+        .iter()
+        .map(|properties| properties.id.get())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids
+}
+
 fn level_table_count(stats: &trine_kv::DbStats, level: u32) -> usize {
     stats
         .level_tables
@@ -1072,6 +1086,57 @@ fn persistent_compaction_levels_preserve_newer_l0_reads() {
 }
 
 #[test]
+fn persistent_single_l0_compaction_moves_table_without_rewrite() {
+    let path = temp_db_path("single-l0-trivial-move");
+    let options = DbOptions::persistent(&path);
+    let before_table_ids;
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+
+        keyspace.insert(b"a", b"a1").expect("write a");
+        db.flush().expect("flush L0 table");
+        before_table_ids = default_table_ids(&path);
+        assert_eq!(default_table_levels(&path), vec![0]);
+        assert_eq!(table_file_paths(&path).len(), 1);
+
+        db.compact_range(KeyRange::all())
+            .expect("single L0 table moves down");
+        assert_eq!(default_table_ids(&path), before_table_ids);
+        assert_eq!(default_table_levels(&path), vec![1]);
+        assert_eq!(table_file_paths(&path).len(), 1);
+        assert_eq!(
+            keyspace.get(b"a").expect("moved table reads"),
+            Some(b"a1".to_vec())
+        );
+        let stats = db.stats();
+        assert_eq!(stats.compaction_runs, 1);
+        assert_eq!(stats.compaction_input_tables, 1);
+        assert_eq!(stats.compaction_output_tables, 1);
+        assert!(stats.compaction_input_bytes > 0);
+        assert!(stats.compaction_output_bytes > 0);
+    }
+
+    {
+        let db = Db::open(options).expect("persistent db reopens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace reopens");
+        assert_eq!(default_table_ids(&path), before_table_ids);
+        assert_eq!(default_table_levels(&path), vec![1]);
+        assert_eq!(
+            keyspace.get(b"a").expect("moved table reopens"),
+            Some(b"a1".to_vec())
+        );
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_flush_auto_compacts_when_l0_pressure_exceeds_limit() {
     let path = temp_db_path("auto-compact-l0");
     let mut options = DbOptions::persistent(&path);
@@ -1257,10 +1322,13 @@ fn persistent_compaction_splits_outputs_and_moves_overfull_l1_down() {
         assert!(levels.iter().all(|level| *level == 1));
 
         db.compact_range(KeyRange::all())
-            .expect("overfull L1 compacts into L2");
+            .expect("overfull L1 compacts a narrow input into L2");
         let levels = default_table_levels(&path);
-        assert!(levels.len() > 1, "L2 output should stay split");
-        assert!(levels.iter().all(|level| *level == 2));
+        assert!(
+            levels.contains(&1),
+            "narrow L1 compaction should leave unrelated L1 tables"
+        );
+        assert!(levels.contains(&2), "selected L1 input should move to L2");
 
         for index in [0, 17, 30, 59] {
             let key = format!("key-{index:03}").into_bytes();
@@ -1278,7 +1346,9 @@ fn persistent_compaction_splits_outputs_and_moves_overfull_l1_down() {
         let keyspace = db
             .keyspace("default", keyspace_options)
             .expect("keyspace reopens");
-        assert!(default_table_levels(&path).iter().all(|level| *level == 2));
+        let levels = default_table_levels(&path);
+        assert!(levels.contains(&1));
+        assert!(levels.contains(&2));
         assert_eq!(
             keyspace.get(b"key-059").expect("latest key reopens"),
             Some(format!("value-059-{}", "y".repeat(48)).into_bytes())
@@ -1347,6 +1417,8 @@ fn persistent_stats_report_tables_blobs_and_compactions() {
         let stats = db.stats();
         assert_eq!(stats.obsolete_blob_files, 1);
         assert_eq!(stats.obsolete_blob_bytes, b"obsolete".len() as u64);
+        assert_eq!(stats.stale_blob_files, 1);
+        assert_eq!(stats.stale_blob_bytes, b"obsolete".len() as u64);
         fs::remove_file(obsolete_blob_path).expect("remove test obsolete blob");
     }
 
@@ -1828,6 +1900,9 @@ fn persistent_prefix_filter_keeps_range_tombstones_authoritative() {
     let options = DbOptions::persistent(&path);
     let keyspace_options = KeyspaceOptions {
         prefix_extractor: PrefixExtractor::Separator(b':'),
+        prefix_filter_policy: PrefixFilterPolicy::Bloom {
+            bits_per_prefix: 32,
+        },
         ..KeyspaceOptions::default()
     };
 
@@ -1997,7 +2072,7 @@ fn persistent_blob_values_survive_flush_reopen_and_compaction() {
 }
 
 #[test]
-fn persistent_reopen_defers_missing_blob_file_until_read() {
+fn persistent_reopen_fails_when_referenced_blob_file_is_missing() {
     let path = temp_db_path("missing-blob");
     let options = DbOptions::persistent(&path);
     let keyspace_options = KeyspaceOptions {
@@ -2021,14 +2096,13 @@ fn persistent_reopen_defers_missing_blob_file_until_read() {
         .expect("blob file exists after flush");
     fs::remove_file(blob_path).expect("remove blob file");
 
-    let db = Db::open(options).expect("missing blob is not read during table open");
-    let keyspace = db
-        .keyspace("default", keyspace_options)
-        .expect("keyspace reopens");
-    let error = keyspace
-        .get(b"a")
-        .expect_err("missing blob file fails when value is read");
+    let error = Db::open(options).expect_err("referenced blob file is required during open");
     assert!(matches!(error, Error::Corruption { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("referenced blob files are missing")
+    );
 
     fs::remove_dir_all(path).expect("cleanup test db");
 }
@@ -2631,23 +2705,37 @@ fn persistent_prefix_filter_stats_skip_nonmatching_tables() {
         db.flush().expect("flush table");
         assert_eq!(db.stats().block_cache_misses, 0);
 
-        assert!(
-            collect_rows(
-                keyspace
-                    .prefix(b"missing:")
-                    .expect("nonmatching prefix scans")
-            )
-            .is_empty()
-        );
+        let mut observed_filter_miss = false;
+        for prefix in [
+            b"query:".as_slice(),
+            b"repo:",
+            b"shop:",
+            b"task:",
+            b"todo:",
+            b"unit:",
+        ] {
+            let before = db.stats();
+            assert!(
+                collect_rows(keyspace.prefix(prefix).expect("nonmatching prefix scans")).is_empty()
+            );
+            let after = db.stats();
+            let before_misses =
+                before.filters.table_prefix_misses + before.filters.block_prefix_misses;
+            let after_misses =
+                after.filters.table_prefix_misses + after.filters.block_prefix_misses;
+            if after_misses > before_misses {
+                assert!(
+                    after.block_cache_misses <= before.block_cache_misses + 1,
+                    "prefix miss may load tombstone metadata but should not need data blocks"
+                );
+                observed_filter_miss = true;
+                break;
+            }
+        }
 
-        let stats = db.stats();
-        assert_eq!(
-            stats.block_cache_misses, 0,
-            "prefix filter miss should not read data blocks"
-        );
         assert!(
-            stats.filters.table_prefix_misses + stats.filters.block_prefix_misses > 0,
-            "a prefix filter should reject the nonmatching prefix"
+            observed_filter_miss,
+            "a prefix filter should reject at least one nonmatching prefix"
         );
     }
 

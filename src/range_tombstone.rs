@@ -189,6 +189,7 @@ fn compare_end_bounds(left: &Bound<Vec<u8>>, right: &Bound<Vec<u8>>) -> Ordering
 mod tests {
     use super::{RangeTombstoneIndex, RangeTombstoneLike};
     use crate::types::KeyRange;
+    use std::ops::Bound;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct TestTombstone {
@@ -239,5 +240,117 @@ mod tests {
             name,
             range: KeyRange::half_open(start, end),
         }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RandomTombstone {
+        id: usize,
+        range: KeyRange,
+    }
+
+    impl RangeTombstoneLike for RandomTombstone {
+        fn range(&self) -> &KeyRange {
+            &self.range
+        }
+    }
+
+    #[test]
+    fn randomized_queries_match_brute_force_reference() {
+        let mut rng = TestRng::new(0x9e37_79b9_7f4a_7c15);
+
+        for _case in 0..200 {
+            let tombstones = (0..24)
+                .map(|id| RandomTombstone {
+                    id,
+                    range: random_range(&mut rng),
+                })
+                .collect::<Vec<_>>();
+            let index = RangeTombstoneIndex::new(tombstones.clone());
+
+            for key_index in 0..20 {
+                let key = key_bytes(key_index);
+                let mut actual = index
+                    .covering_key(&key)
+                    .map(|tombstone| tombstone.id)
+                    .collect::<Vec<_>>();
+                let mut expected = tombstones
+                    .iter()
+                    .filter(|tombstone| super::key_is_in_range(&key, &tombstone.range))
+                    .map(|tombstone| tombstone.id)
+                    .collect::<Vec<_>>();
+                actual.sort_unstable();
+                expected.sort_unstable();
+                assert_eq!(actual, expected);
+            }
+
+            for _range_index in 0..20 {
+                let range = random_range(&mut rng);
+                let mut actual = index
+                    .overlapping_range(&range)
+                    .map(|tombstone| tombstone.id)
+                    .collect::<Vec<_>>();
+                let mut expected = tombstones
+                    .iter()
+                    .filter(|tombstone| super::ranges_overlap(&range, &tombstone.range))
+                    .map(|tombstone| tombstone.id)
+                    .collect::<Vec<_>>();
+                actual.sort_unstable();
+                expected.sort_unstable();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct TestRng {
+        state: u64,
+    }
+
+    impl TestRng {
+        const fn new(seed: u64) -> Self {
+            Self { state: seed }
+        }
+
+        fn next(&mut self) -> u64 {
+            self.state = self
+                .state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            self.state
+        }
+
+        fn usize(&mut self, upper: usize) -> usize {
+            let upper = u64::try_from(upper).expect("test upper bound fits u64");
+            usize::try_from(self.next() % upper).expect("bounded random value fits usize")
+        }
+    }
+
+    fn random_range(rng: &mut TestRng) -> KeyRange {
+        let left = rng.usize(19);
+        let right = left + 1 + rng.usize(20 - left);
+        KeyRange {
+            start: random_start_bound(rng, left),
+            end: random_end_bound(rng, right),
+        }
+    }
+
+    fn random_start_bound(rng: &mut TestRng, value: usize) -> Bound<Vec<u8>> {
+        match rng.usize(4) {
+            0 => Bound::Unbounded,
+            1 | 2 => Bound::Included(key_bytes(value)),
+            _ => Bound::Excluded(key_bytes(value)),
+        }
+    }
+
+    fn random_end_bound(rng: &mut TestRng, value: usize) -> Bound<Vec<u8>> {
+        match rng.usize(4) {
+            0 => Bound::Unbounded,
+            1 | 2 => Bound::Excluded(key_bytes(value)),
+            _ => Bound::Included(key_bytes(value)),
+        }
+    }
+
+    fn key_bytes(value: usize) -> Vec<u8> {
+        format!("k{value:02}").into_bytes()
     }
 }

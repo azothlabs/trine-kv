@@ -257,16 +257,10 @@ fn push_group_records(
     rest_records: &mut Vec<ScanRecord>,
     group: RecordGroup,
 ) {
-    if first_record.is_none() && rest_records.is_empty() {
-        *first_record = Some(group.first);
-        rest_records.extend(group.rest);
-        return;
-    }
-
     if let Some(previous_first) = first_record.take() {
         rest_records.push(previous_first);
     }
-    rest_records.push(group.first);
+    *first_record = Some(group.first);
     rest_records.extend(group.rest);
 }
 

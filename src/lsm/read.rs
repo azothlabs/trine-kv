@@ -64,7 +64,7 @@ impl LsmTree {
                 );
                 let mut covered_by_table_tombstone = false;
                 if !covered_by_memtable_tombstone {
-                    for table in version.table_handles() {
+                    for table in version.range_tombstone_tables_for_key(key) {
                         covered_by_table_tombstone = table.range_tombstone_covers_visible_point(
                             key,
                             candidate.internal_key.sequence(),

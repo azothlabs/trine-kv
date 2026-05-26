@@ -150,6 +150,31 @@ pub(crate) fn fail_on_unreferenced_storage_files(
     })
 }
 
+pub(crate) fn fail_on_missing_referenced_blob_files(
+    db_path: &Path,
+    referenced_blob_ids: &BTreeSet<u64>,
+) -> Result<()> {
+    let missing_files = referenced_blob_ids
+        .iter()
+        .copied()
+        .filter_map(|blob_id| {
+            let path = blob::blob_path(db_path, blob_id);
+            (!path.is_file()).then(|| storage_file_name(&path))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if missing_files.is_empty() {
+        return Ok(());
+    }
+
+    Err(Error::Corruption {
+        message: format!(
+            "referenced blob files are missing: {}",
+            missing_files.join(", ")
+        ),
+    })
+}
+
 struct TemporaryFile {
     name: String,
     path: PathBuf,

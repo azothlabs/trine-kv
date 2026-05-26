@@ -1,4 +1,4 @@
-use std::ops::Bound;
+use std::{cmp::Ordering, ops::Bound};
 
 use crate::{
     error::{Error, Result},
@@ -75,7 +75,7 @@ pub(crate) fn plan_compaction(
     oldest_active_snapshot: Sequence,
     options: CompactionOptions,
 ) -> Result<Option<CompactionPlan>> {
-    if let Some(input_tables) = l0_compaction_inputs(tables, range, options) {
+    if let Some(input_tables) = l0_compaction_inputs(tables, range) {
         return Ok(Some(CompactionPlan {
             keyspace: keyspace.to_owned(),
             input_tables,
@@ -86,7 +86,7 @@ pub(crate) fn plan_compaction(
 
     if let Some(level) = highest_scored_level(tables, range, options) {
         let output_level = level.next().ok_or_else(level_overflow)?;
-        let input_tables = leveled_inputs(tables, range, level, output_level);
+        let input_tables = narrow_leveled_inputs(tables, range, level, output_level);
         if !input_tables.is_empty() {
             return Ok(Some(CompactionPlan {
                 keyspace: keyspace.to_owned(),
@@ -114,29 +114,16 @@ pub(crate) fn plan_compaction(
     }))
 }
 
-fn l0_compaction_inputs(
-    tables: &[CompactionTable],
-    range: &KeyRange,
-    options: CompactionOptions,
-) -> Option<Vec<TableId>> {
+fn l0_compaction_inputs(tables: &[CompactionTable], range: &KeyRange) -> Option<Vec<TableId>> {
     let mut input_tables = l0_inputs_with_overlap(tables, range);
     if input_tables.is_empty() {
         return None;
     }
 
-    let l0_count = tables
-        .iter()
-        .filter(|table| table.level == TableLevel::ZERO)
-        .count();
     let span = key_span_for_inputs(tables, &input_tables);
     include_overlapping_level(tables, &mut input_tables, TableLevel(1), span.as_ref());
 
-    let pressure = l0_count > options.max_l0_files;
-    if pressure || input_tables.len() >= 2 {
-        Some(input_tables)
-    } else {
-        None
-    }
+    Some(input_tables)
 }
 
 fn l0_inputs_with_overlap(tables: &[CompactionTable], range: &KeyRange) -> Vec<TableId> {
@@ -262,20 +249,60 @@ fn leveled_inputs(
     input_tables
 }
 
+fn narrow_leveled_inputs(
+    tables: &[CompactionTable],
+    range: &KeyRange,
+    input_level: TableLevel,
+    output_level: TableLevel,
+) -> Vec<TableId> {
+    let Some(table) = pick_leveled_input_table(tables, range, input_level) else {
+        return Vec::new();
+    };
+    let mut input_tables = vec![table.id];
+    let span = key_span_for_inputs(tables, &input_tables);
+    include_overlapping_level(tables, &mut input_tables, output_level, span.as_ref());
+    input_tables
+}
+
+fn pick_leveled_input_table<'table>(
+    tables: &'table [CompactionTable],
+    range: &KeyRange,
+    level: TableLevel,
+) -> Option<&'table CompactionTable> {
+    tables
+        .iter()
+        .filter(|table| table.level == level && table.overlaps_range(range))
+        .max_by(|left, right| compare_input_candidates(left, right))
+}
+
+fn compare_input_candidates(left: &CompactionTable, right: &CompactionTable) -> Ordering {
+    left.bytes
+        .cmp(&right.bytes)
+        .then_with(|| right.id.cmp(&left.id))
+}
+
 fn include_overlapping_level(
     tables: &[CompactionTable],
     input_tables: &mut Vec<TableId>,
     level: TableLevel,
     span: Option<&KeySpan>,
 ) {
-    for table in tables {
-        let overlaps = span.map_or_else(
-            || table.overlaps_range(&KeyRange::all()),
-            |span| table.overlaps_key_span(span),
-        );
-        if table.level == level && overlaps && !input_tables.contains(&table.id) {
-            input_tables.push(table.id);
+    let mut span = span.cloned();
+    loop {
+        let before = input_tables.len();
+        for table in tables {
+            let overlaps = span.as_ref().map_or_else(
+                || table.overlaps_range(&KeyRange::all()),
+                |span| table.overlaps_key_span(span),
+            );
+            if table.level == level && overlaps && !input_tables.contains(&table.id) {
+                input_tables.push(table.id);
+            }
         }
+        if input_tables.len() == before {
+            return;
+        }
+        span = key_span_for_inputs(tables, input_tables);
     }
 }
 
@@ -379,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn single_l0_without_lower_overlap_is_skipped() {
+    fn single_l0_without_lower_overlap_is_planned_for_move() {
         let tables = vec![table(1, 0, b"a", b"c"), table(2, 1, b"x", b"z")];
 
         let plan = plan_compaction(
@@ -389,9 +416,11 @@ mod tests {
             Sequence::ZERO,
             options(),
         )
-        .expect("planning succeeds");
+        .expect("planning succeeds")
+        .expect("plan exists");
 
-        assert!(plan.is_none());
+        assert_eq!(plan.input_tables, vec![TableId(1)]);
+        assert_eq!(plan.output_level, TableLevel(1));
     }
 
     #[test]
@@ -436,6 +465,51 @@ mod tests {
 
         assert_eq!(plan.input_tables, vec![TableId(2), TableId(3)]);
         assert_eq!(plan.output_level, TableLevel(3));
+    }
+
+    #[test]
+    fn overfull_level_uses_narrow_input_and_lower_overlap() {
+        let tables = vec![
+            table_with_bytes(1, 1, b"a", b"b", 60),
+            table_with_bytes(2, 1, b"c", b"d", 90),
+            table_with_bytes(3, 2, b"c", b"e", 1),
+            table_with_bytes(4, 2, b"x", b"z", 1),
+        ];
+
+        let plan = plan_compaction(
+            "default",
+            &tables,
+            &KeyRange::all(),
+            Sequence::ZERO,
+            options(),
+        )
+        .expect("planning succeeds")
+        .expect("plan exists");
+
+        assert_eq!(plan.input_tables, vec![TableId(2), TableId(3)]);
+        assert_eq!(plan.output_level, TableLevel(2));
+    }
+
+    #[test]
+    fn overfull_level_without_lower_overlap_selects_single_move_input() {
+        let tables = vec![
+            table_with_bytes(1, 1, b"a", b"b", 60),
+            table_with_bytes(2, 1, b"c", b"d", 90),
+            table_with_bytes(3, 2, b"x", b"z", 1),
+        ];
+
+        let plan = plan_compaction(
+            "default",
+            &tables,
+            &KeyRange::all(),
+            Sequence::ZERO,
+            options(),
+        )
+        .expect("planning succeeds")
+        .expect("plan exists");
+
+        assert_eq!(plan.input_tables, vec![TableId(2)]);
+        assert_eq!(plan.output_level, TableLevel(2));
     }
 
     fn table(id: u64, level: u32, smallest: &[u8], largest: &[u8]) -> CompactionTable {

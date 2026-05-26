@@ -19,6 +19,8 @@ pub(crate) struct CompactionInput {
     pub(crate) table_level: table::TableLevel,
     pub(crate) table_options: table::TableWriteOptions,
     pub(crate) input_table_ids: Vec<table::TableId>,
+    pub(crate) trivial_move: bool,
+    full_keyspace_compaction: bool,
     input_tables: Vec<Arc<Table>>,
 }
 
@@ -70,6 +72,10 @@ impl LsmTree {
             return Ok(None);
         };
         let input_table_ids = plan.input_tables.iter().copied().collect::<BTreeSet<_>>();
+        let full_keyspace_compaction = range_is_all(range)
+            && tables
+                .iter()
+                .all(|table| input_table_ids.contains(&table.properties().id));
         let input_tables = tables
             .iter()
             .filter(|table| input_table_ids.contains(&table.properties().id))
@@ -79,11 +85,14 @@ impl LsmTree {
             .iter()
             .map(|table| table.properties().id)
             .collect::<Vec<_>>();
+        let trivial_move = can_move_without_rewrite(&input_tables, plan.output_level);
 
         Ok(Some(CompactionInput {
             table_level: plan.output_level,
             table_options: table_write_options(&self.options),
             input_table_ids,
+            trivial_move,
+            full_keyspace_compaction,
             input_tables,
         }))
     }
@@ -95,6 +104,10 @@ impl LsmTree {
         oldest_active_snapshot: Sequence,
         target_table_bytes: usize,
     ) -> Result<Vec<CompactionTablePayload>> {
+        if input.trivial_move {
+            return Ok(Vec::new());
+        }
+
         let mut sources = input
             .input_tables
             .iter()
@@ -113,7 +126,13 @@ impl LsmTree {
         let mut tombstone_has_remaining_put = vec![false; range_tombstones.len()];
         let mut chunks = Vec::new();
         let mut current_chunk = CompactionChunk::default();
-        let target_table_bytes = usize_to_u64_saturating(target_table_bytes).max(1);
+        let mut target_table_bytes = usize_to_u64_saturating(target_table_bytes).max(1);
+        if !range_tombstones.is_empty() {
+            // Range tombstone bounds can be wider than the point records in an
+            // output chunk. Copying that tombstone into multiple output tables
+            // would make those tables overlap inside a non-overlapping level.
+            target_table_bytes = u64::MAX;
+        }
 
         while let Some(user_key) = next_compaction_user_key(&mut sources)? {
             let mut records = Vec::new();
@@ -127,7 +146,11 @@ impl LsmTree {
                 }
             }
 
-            let records = compact_point_record_group(records, oldest_active_snapshot);
+            let records = compact_point_record_group(
+                records,
+                oldest_active_snapshot,
+                input.full_keyspace_compaction,
+            );
             if records.is_empty() {
                 continue;
             }
@@ -151,12 +174,12 @@ impl LsmTree {
         let range_tombstones = cleanup_range_tombstones_by_coverage(
             range_tombstones,
             tombstone_has_remaining_put,
-            range_is_all(range),
+            input.full_keyspace_compaction,
         );
         Ok(compaction_payloads_from_chunks(
             chunks,
             &range_tombstones,
-            range_is_all(range),
+            input.full_keyspace_compaction,
             target_table_bytes,
         ))
     }
@@ -167,6 +190,34 @@ impl LsmTree {
         self.install_version(version)?;
         Ok(())
     }
+
+    pub(crate) fn validate_compaction(&self, output: &CompactionOutput) -> Result<()> {
+        let version = self.current_version()?;
+        version.with_replaced_tables(&output.input_table_ids, output.tables.clone())?;
+        Ok(())
+    }
+}
+
+impl CompactionInput {
+    pub(crate) fn moved_table(&self) -> Result<Arc<Table>> {
+        if !self.trivial_move || self.input_tables.len() != 1 {
+            return Err(crate::Error::Corruption {
+                message: "compaction input is not a single-table move".to_owned(),
+            });
+        }
+        // The table file is reused as-is. Only the in-memory table metadata is
+        // updated so the manifest can publish the new level placement.
+        Ok(Arc::new(
+            self.input_tables[0].clone_with_level(self.table_level),
+        ))
+    }
+}
+
+fn can_move_without_rewrite(input_tables: &[Arc<Table>], output_level: table::TableLevel) -> bool {
+    let [table] = input_tables else {
+        return false;
+    };
+    table.properties().level.next() == Some(output_level)
 }
 
 fn collect_compaction_range_tombstones(
@@ -232,9 +283,17 @@ fn next_compaction_user_key(sources: &mut [CompactionSource]) -> Result<Option<V
 fn compact_point_record_group(
     records: Vec<(InternalKey, Option<ValueRef>)>,
     oldest_active_snapshot: Sequence,
+    full_keyspace_compaction: bool,
 ) -> Vec<(InternalKey, Option<ValueRef>)> {
     let compacted = compact_point_records(records, oldest_active_snapshot);
-    cleanup_point_tombstones(&compacted)
+    if full_keyspace_compaction {
+        cleanup_point_tombstones(&compacted)
+    } else {
+        // A partial compaction sees only selected input tables. Keep point
+        // deletes because older values for the same user key may still live in
+        // a lower level outside this rewrite.
+        compacted
+    }
 }
 
 fn push_compaction_records_to_chunks(
@@ -525,11 +584,24 @@ fn range_tombstone_covers_remaining_put(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        InternalKey, TableRangeTombstone, ValueKind, ValueRef, cleanup_point_tombstones,
-        cleanup_range_tombstones, compact_point_records,
+    use std::{
+        fs,
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
     };
-    use crate::types::{KeyRange, Sequence};
+
+    use super::{
+        CompactionChunk, InternalKey, TableRangeTombstone, ValueKind, ValueRef,
+        cleanup_point_tombstones, cleanup_range_tombstones, compact_point_record_group,
+        compact_point_records, compaction_payloads_from_chunks, table_write_options,
+    };
+    use crate::{
+        compaction::CompactionOptions,
+        lsm::LsmTree,
+        options::KeyspaceOptions,
+        table::{self, TableId, TableLevel},
+        types::{KeyRange, Sequence},
+    };
 
     #[test]
     fn compaction_keeps_newer_versions_and_snapshot_floor() {
@@ -587,6 +659,22 @@ mod tests {
     }
 
     #[test]
+    fn partial_compaction_keeps_point_tombstone_without_local_older_record() {
+        let compacted =
+            compact_point_record_group(vec![tombstone("a", 3)], Sequence::new(3), false);
+
+        assert_eq!(record_sequences(&compacted), vec![("a", 3)]);
+        assert!(matches!(compacted[0].0.kind(), ValueKind::PointDelete));
+    }
+
+    #[test]
+    fn full_compaction_drops_point_tombstone_without_older_record() {
+        let compacted = compact_point_record_group(vec![tombstone("a", 3)], Sequence::new(3), true);
+
+        assert!(compacted.is_empty());
+    }
+
+    #[test]
     fn range_tombstone_cleanup_keeps_tombstone_covering_remaining_put() {
         let tombstones =
             cleanup_range_tombstones(vec![range_tombstone("a", "c", 2)], &[record("b", 1)], true);
@@ -612,6 +700,107 @@ mod tests {
         assert_eq!(tombstones.len(), 1);
     }
 
+    #[test]
+    fn partial_compaction_keeps_original_range_tombstone_bounds() {
+        let payloads = compaction_payloads_from_chunks(
+            vec![CompactionChunk {
+                point_records: vec![record("m", 1)],
+                estimated_bytes: 1,
+            }],
+            &[range_tombstone("a", "z", 2)],
+            false,
+            1024,
+        );
+
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(
+            payloads[0].range_tombstones[0].range,
+            KeyRange::half_open(b"a", b"z")
+        );
+    }
+
+    #[test]
+    fn full_compaction_clips_range_tombstone_to_output_span() {
+        let payloads = compaction_payloads_from_chunks(
+            vec![CompactionChunk {
+                point_records: vec![record("m", 1)],
+                estimated_bytes: 1,
+            }],
+            &[range_tombstone("a", "z", 2)],
+            true,
+            1024,
+        );
+
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(
+            payloads[0].range_tombstones[0].range,
+            crate::range_tombstone::range_from_inclusive_span(b"m", b"m")
+        );
+    }
+
+    #[test]
+    fn range_all_compaction_is_not_full_when_picker_chooses_narrow_input() {
+        let table_dir = temp_table_dir("narrow-compaction");
+        let tree = LsmTree::new(
+            KeyspaceOptions::default(),
+            vec![
+                test_table(&table_dir, 1, 1, "a"),
+                test_table(&table_dir, 2, 1, "c"),
+                test_table(&table_dir, 3, 1, "e"),
+            ],
+        )
+        .expect("tree builds");
+
+        let input = tree
+            .plan_compaction(
+                "default",
+                &KeyRange::all(),
+                Sequence::ZERO,
+                CompactionOptions {
+                    target_table_bytes: 1,
+                    level_size_multiplier: 2,
+                    max_l0_files: 4,
+                },
+            )
+            .expect("planning succeeds")
+            .expect("plan exists");
+
+        assert_eq!(input.input_tables.len(), 1);
+        assert!(!input.full_keyspace_compaction);
+        fs::remove_dir_all(table_dir).expect("cleanup table dir");
+    }
+
+    #[test]
+    fn range_all_compaction_is_full_when_all_tables_are_inputs() {
+        let table_dir = temp_table_dir("full-compaction");
+        let tree = LsmTree::new(
+            KeyspaceOptions::default(),
+            vec![
+                test_table(&table_dir, 1, 0, "a"),
+                test_table(&table_dir, 2, 0, "b"),
+            ],
+        )
+        .expect("tree builds");
+
+        let input = tree
+            .plan_compaction(
+                "default",
+                &KeyRange::all(),
+                Sequence::ZERO,
+                CompactionOptions {
+                    target_table_bytes: 1,
+                    level_size_multiplier: 2,
+                    max_l0_files: 4,
+                },
+            )
+            .expect("planning succeeds")
+            .expect("plan exists");
+
+        assert_eq!(input.input_tables.len(), 2);
+        assert!(input.full_keyspace_compaction);
+        fs::remove_dir_all(table_dir).expect("cleanup table dir");
+    }
+
     fn record(key: &str, sequence: u64) -> (InternalKey, Option<ValueRef>) {
         (
             InternalKey::new(key, Sequence::new(sequence), ValueKind::Put, 0),
@@ -632,6 +821,38 @@ mod tests {
             sequence: Sequence::new(sequence),
             batch_index: 0,
         }
+    }
+
+    fn temp_table_dir(name: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "trine-kv-compact-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("create table dir");
+        path
+    }
+
+    fn test_table(
+        table_dir: &std::path::Path,
+        id: u64,
+        level: u32,
+        key: &str,
+    ) -> Arc<table::Table> {
+        let table_id = TableId(id);
+        let table = table::write_table(
+            &table::table_path(table_dir, table_id),
+            table_id,
+            TableLevel(level),
+            &table_write_options(&KeyspaceOptions::default()),
+            &[record(key, 1)],
+            &[],
+        )
+        .expect("test table writes");
+        Arc::new(table)
     }
 
     fn record_sequences(records: &[(InternalKey, Option<ValueRef>)]) -> Vec<(&str, u64)> {

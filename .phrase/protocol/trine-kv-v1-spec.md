@@ -245,6 +245,12 @@ Reads:
 
 - load an immutable `Arc<VersionSet>`;
 - consult active memtable, immutable memtables, and SSTables;
+- point reads check overlapping L0 tables and at most one table per
+  non-overlapping deeper level for point records and table range tombstones;
+- range and prefix scans select only SSTables whose key bounds overlap the
+  query range;
+- prefix filters may skip point-data cursors, but range tombstone metadata
+  remains authoritative for matching key ranges;
 - do not wait for compaction except for bounded cache misses or file reads.
 
 Writes:
@@ -581,6 +587,10 @@ Version edit operations:
 Publish rules:
 
 - new SSTables become visible only after a manifest edit is durably published;
+- the manifest table entry is authoritative for current level placement;
+- an SSTable file may retain the level it was originally written with after a
+  one-table move, but recovery must validate every other table property against
+  the manifest before using the manifest level;
 - manifest publish is atomic;
 - recovery loads the latest valid manifest state and then replays WAL records
   newer than the replay floor;
@@ -601,9 +611,13 @@ Trine v1 uses leveled compaction:
 - L1 and deeper compaction uses level-size pressure from
   `target_table_bytes * level_size_multiplier^(level - 1)` and moves selected
   inputs down one level together with overlapping next-level inputs;
+- a single input table may move down one level without rewriting when no
+  next-level table overlaps its key range and the move preserves the level
+  non-overlap invariant;
 - compaction output SSTables are split at user-key boundaries according to
   `target_table_bytes`, except a single oversized user-key group may exceed the
-  target by itself.
+  target by itself, and compaction carrying range tombstones may keep one wider
+  output to preserve level non-overlap.
 
 Compaction must preserve:
 
@@ -614,7 +628,13 @@ Compaction must preserve:
 - keyspace boundaries.
 - range tombstones may be clipped to output table key spans only when the
   compaction scope proves older covered data outside the span has been removed;
+  a request over all user keys is still partial when the picker did not include
+  every live table in the keyspace;
   partial compaction must retain the original tombstone bounds.
+- point tombstones may be dropped only when the compaction input proves no
+  older value for that user key can survive in another live table; partial
+  compaction keeps point tombstones even when its selected inputs contain no
+  older local value.
 
 Version cleanup rules for a user key:
 
@@ -622,7 +642,7 @@ Version cleanup rules for a user key:
 - keep the newest version with `sequence <= oldest_active_snapshot_seq`;
 - drop older versions only when no active snapshot can read them;
 - drop point tombstones only when all older covered versions are removed from
-  the relevant compaction scope;
+  the live keyspace, not merely from the selected input tables;
 - drop range tombstones only when all covered older versions are removed from
   the relevant compaction scope.
 
@@ -786,7 +806,7 @@ V1 exposes structured stats:
 - index search comparison/probe counts where practical;
 - compaction input/output bytes;
 - tombstone counts;
-- blob bytes live and obsolete;
+- blob bytes live, stale, and obsolete;
 - recovery replay bytes and time.
 
 ## 29. Required Tests

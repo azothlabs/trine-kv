@@ -79,6 +79,11 @@ struct NamedCompactionOutput {
     output: LsmCompactionOutput,
 }
 
+struct PendingCompactionOutputs {
+    outputs: Vec<NamedCompactionOutput>,
+    written_table_ids: Vec<table::TableId>,
+}
+
 #[derive(Debug)]
 struct MaintenanceCoordinator {
     state: Mutex<MaintenanceState>,
@@ -245,11 +250,13 @@ impl Db {
             options.create_if_missing && !options.read_only,
         )?;
         let replay_floor = manifest.state().wal_replay_floor();
+        let referenced_blob_ids = referenced_blob_file_ids_from_manifest(manifest.state());
         let keyspaces = keyspaces_from_manifest(path, manifest.state())?;
+        recovery::fail_on_missing_referenced_blob_files(path, &referenced_blob_ids)?;
         recovery::fail_on_unreferenced_storage_files(
             path,
             &referenced_table_file_ids(manifest.state()),
-            &referenced_blob_file_ids_from_manifest(manifest.state()),
+            &referenced_blob_ids,
         )?;
 
         let wal_path = wal::wal_path(path);
@@ -428,51 +435,45 @@ impl Db {
             return Ok(());
         }
 
-        let obsolete_table_ids = compaction_inputs
+        let PendingCompactionOutputs {
+            outputs: written_tables,
+            written_table_ids,
+        } = self.build_compaction_outputs(
+            &db_path,
+            &range,
+            oldest_active_snapshot,
+            &compaction_inputs,
+        )?;
+
+        let output_table_ids = written_tables
+            .iter()
+            .flat_map(|output| {
+                output
+                    .output
+                    .tables
+                    .iter()
+                    .map(|table| table.properties().id)
+            })
+            .collect::<BTreeSet<_>>();
+        let input_table_ids_for_stats = compaction_inputs
             .iter()
             .flat_map(|input| input.input.input_table_ids.iter().copied())
             .collect::<Vec<_>>();
-        let mut written_tables = Vec::with_capacity(compaction_inputs.len());
-        let mut written_table_ids = Vec::new();
-        let mut next_table_id = self.next_table_id()?;
-        for input in &compaction_inputs {
-            let payloads = input.tree.build_compaction_table_payloads(
-                &input.input,
-                &range,
-                oldest_active_snapshot,
-                self.inner.options.target_table_bytes,
-            )?;
-            let mut output_tables = Vec::with_capacity(payloads.len());
-            for payload in payloads {
-                let table_id = next_table_id;
-                next_table_id = next_table_id.next().ok_or_else(|| Error::Corruption {
-                    message: "table id counter overflow".to_owned(),
-                })?;
-                let table_path = table::table_path(&db_path, table_id);
-                written_table_ids.push(table_id);
-                let table = match table::write_table(
-                    &table_path,
-                    table_id,
-                    input.input.table_level,
-                    &input.input.table_options,
-                    &payload.point_records,
-                    &payload.range_tombstones,
-                ) {
-                    Ok(table) => table,
-                    Err(error) => {
-                        let _ = remove_storage_files(&db_path, &written_table_ids);
-                        return Err(error);
-                    }
-                };
-                output_tables.push(Arc::new(table));
+        // A direct table move keeps the input file alive under the same id, so
+        // cleanup must use only ids that disappeared from the published output.
+        let obsolete_table_ids = compaction_inputs
+            .iter()
+            .flat_map(|input| input.input.input_table_ids.iter().copied())
+            .filter(|table_id| !output_table_ids.contains(table_id))
+            .collect::<Vec<_>>();
+        let output_table_ids_for_stats = output_table_ids.iter().copied().collect::<Vec<_>>();
+
+        if let Err(error) = self.validate_compacted_tables(&written_tables) {
+            let _ = remove_storage_files(&db_path, &written_table_ids);
+            if is_level_layout_compaction_error(&error) {
+                return Ok(());
             }
-            written_tables.push(NamedCompactionOutput {
-                keyspace: input.keyspace.clone(),
-                output: LsmCompactionOutput {
-                    input_table_ids: input.input.input_table_ids.clone(),
-                    tables: output_tables,
-                },
-            });
+            return Err(error);
         }
 
         if !written_table_ids.is_empty() {
@@ -491,8 +492,8 @@ impl Db {
         self.record_compaction_stats(
             &db_path,
             compaction_inputs.len(),
-            &obsolete_table_ids,
-            &written_table_ids,
+            &input_table_ids_for_stats,
+            &output_table_ids_for_stats,
         );
         self.retire_obsolete_table_files(&db_path, &obsolete_table_ids)?;
         self.remove_unreferenced_blob_files(&db_path)?;
@@ -1054,6 +1055,86 @@ impl Db {
         Ok(inputs)
     }
 
+    fn build_compaction_outputs(
+        &self,
+        db_path: &Path,
+        range: &KeyRange,
+        oldest_active_snapshot: Sequence,
+        compaction_inputs: &[NamedCompactionInput],
+    ) -> Result<PendingCompactionOutputs> {
+        let mut outputs = Vec::with_capacity(compaction_inputs.len());
+        let mut written_table_ids = Vec::new();
+        let mut next_table_id = self.next_table_id()?;
+
+        for input in compaction_inputs {
+            if input.input.trivial_move {
+                outputs.push(NamedCompactionOutput {
+                    keyspace: input.keyspace.clone(),
+                    output: LsmCompactionOutput {
+                        input_table_ids: input.input.input_table_ids.clone(),
+                        tables: vec![input.input.moved_table()?],
+                    },
+                });
+                continue;
+            }
+
+            let payloads = match input.tree.build_compaction_table_payloads(
+                &input.input,
+                range,
+                oldest_active_snapshot,
+                self.inner.options.target_table_bytes,
+            ) {
+                Ok(payloads) => payloads,
+                Err(error) => {
+                    let _ = remove_storage_files(db_path, &written_table_ids);
+                    return Err(error);
+                }
+            };
+            let mut output_tables = Vec::with_capacity(payloads.len());
+            for payload in payloads {
+                let table_id = next_table_id;
+                next_table_id = if let Some(table_id) = next_table_id.next() {
+                    table_id
+                } else {
+                    let _ = remove_storage_files(db_path, &written_table_ids);
+                    return Err(Error::Corruption {
+                        message: "table id counter overflow".to_owned(),
+                    });
+                };
+
+                let table_path = table::table_path(db_path, table_id);
+                written_table_ids.push(table_id);
+                let table = match table::write_table(
+                    &table_path,
+                    table_id,
+                    input.input.table_level,
+                    &input.input.table_options,
+                    &payload.point_records,
+                    &payload.range_tombstones,
+                ) {
+                    Ok(table) => table,
+                    Err(error) => {
+                        let _ = remove_storage_files(db_path, &written_table_ids);
+                        return Err(error);
+                    }
+                };
+                output_tables.push(Arc::new(table));
+            }
+            outputs.push(NamedCompactionOutput {
+                keyspace: input.keyspace.clone(),
+                output: LsmCompactionOutput {
+                    input_table_ids: input.input.input_table_ids.clone(),
+                    tables: output_tables,
+                },
+            });
+        }
+
+        Ok(PendingCompactionOutputs {
+            outputs,
+            written_table_ids,
+        })
+    }
+
     fn next_table_id(&self) -> Result<table::TableId> {
         self.inner
             .manifest
@@ -1141,6 +1222,15 @@ impl Db {
         for output in outputs {
             let state = self.keyspace_state(&output.keyspace)?;
             state.install_compaction(output.output)?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_compacted_tables(&self, outputs: &[NamedCompactionOutput]) -> Result<()> {
+        for output in outputs {
+            let state = self.keyspace_state(&output.keyspace)?;
+            state.validate_compaction(&output.output)?;
         }
 
         Ok(())
@@ -1307,15 +1397,7 @@ fn keyspaces_from_manifest(
         let mut tables = Vec::new();
         for properties in manifest.tables().get(name).into_iter().flatten() {
             let table_path = table::table_path(db_path, properties.id);
-            let table = table::read_table(&table_path)?;
-            if table.properties() != properties {
-                return Err(Error::Corruption {
-                    message: format!(
-                        "manifest properties do not match table {}",
-                        properties.id.get()
-                    ),
-                });
-            }
+            let table = table::read_table(&table_path)?.with_manifest_properties(properties)?;
             tables.push(Arc::new(table));
         }
 
@@ -1349,6 +1431,8 @@ fn add_obsolete_blob_stats(
         let bytes =
             fs::metadata(blob::blob_path(db_path, file_id)).map_or(0, |metadata| metadata.len());
         stats.obsolete_blob_bytes = stats.obsolete_blob_bytes.saturating_add(bytes);
+        stats.stale_blob_files = stats.stale_blob_files.saturating_add(1);
+        stats.stale_blob_bytes = stats.stale_blob_bytes.saturating_add(bytes);
     }
 }
 
@@ -1440,6 +1524,14 @@ fn lock_poisoned(lock_name: &'static str) -> Error {
     Error::Corruption {
         message: format!("{lock_name} lock poisoned"),
     }
+}
+
+fn is_level_layout_compaction_error(error: &Error) -> bool {
+    let Error::Corruption { message } = error else {
+        return false;
+    };
+    message.contains("has overlapping tables")
+        || message.contains("unbounded table mixed with other tables")
 }
 
 fn persistent_path_from_options(options: &DbOptions) -> Option<&Path> {

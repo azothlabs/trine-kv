@@ -527,6 +527,42 @@ impl Table {
         self.filter_stats.snapshot()
     }
 
+    pub(crate) fn with_manifest_properties(mut self, manifest: &TableProperties) -> Result<Self> {
+        // Table files keep their original creation level. A manifest entry owns
+        // the live level after a direct table move, but every other property
+        // still has to match the file before recovery can trust it.
+        let mut expected = self.properties.clone();
+        expected.level = manifest.level;
+        if &expected != manifest {
+            return Err(Error::Corruption {
+                message: format!(
+                    "manifest properties do not match table {}",
+                    manifest.id.get()
+                ),
+            });
+        }
+        self.properties.level = manifest.level;
+        Ok(self)
+    }
+
+    pub(crate) fn clone_with_level(&self, level: TableLevel) -> Self {
+        let mut properties = self.properties.clone();
+        properties.level = level;
+        Self {
+            path: self.path.clone(),
+            file: self.file.as_ref().map(Arc::clone),
+            payload_len: self.payload_len,
+            footer: self.footer.clone(),
+            properties,
+            point_records: self.point_records.clone(),
+            data_blocks: self.data_blocks.clone(),
+            range_tombstones: Arc::clone(&self.range_tombstones),
+            point_key_filter: self.point_key_filter.clone(),
+            prefix_filter: self.prefix_filter.clone(),
+            filter_stats: Arc::clone(&self.filter_stats),
+        }
+    }
+
     #[must_use]
     pub(crate) fn has_key_bounds(&self) -> bool {
         !(self.data_blocks.is_empty()
@@ -693,10 +729,7 @@ impl Table {
 
     #[must_use]
     pub(crate) fn may_contain_key(&self, key: &[u8]) -> bool {
-        if !self.has_key_bounds()
-            || self.properties.smallest_user_key.as_slice() > key
-            || key > self.properties.largest_user_key.as_slice()
-        {
+        if !self.key_bounds_may_contain_key(key) {
             return false;
         }
         let Some(filter) = &self.point_key_filter else {
@@ -705,6 +738,20 @@ impl Table {
         let allowed = filter.may_contain_key(key);
         self.filter_stats.record_table_point(allowed);
         allowed
+    }
+
+    #[must_use]
+    pub(crate) fn key_bounds_may_contain_key(&self, key: &[u8]) -> bool {
+        self.has_key_bounds()
+            && self.properties.smallest_user_key.as_slice() <= key
+            && key <= self.properties.largest_user_key.as_slice()
+    }
+
+    #[must_use]
+    pub(crate) fn key_bounds_overlap_range(&self, range: &KeyRange) -> bool {
+        self.has_key_bounds()
+            && !key_is_after_end(self.properties.smallest_user_key.as_slice(), &range.end)
+            && !key_is_before_start(self.properties.largest_user_key.as_slice(), &range.start)
     }
 
     #[must_use]

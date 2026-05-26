@@ -7,6 +7,7 @@ use std::{
 use crate::{
     error::{Error, Result},
     table::{Table, TableId, TableLevel},
+    types::KeyRange,
 };
 
 #[derive(Debug, Clone)]
@@ -67,6 +68,35 @@ impl LsmVersion {
             }
         }
         tables
+    }
+
+    #[must_use]
+    pub(crate) fn range_tombstone_tables_for_key(&self, key: &[u8]) -> Vec<Arc<Table>> {
+        let mut tables = Vec::new();
+        for level in &self.levels {
+            if level.level == TableLevel::ZERO {
+                tables.extend(
+                    level
+                        .tables
+                        .iter()
+                        .filter(|table| table.key_bounds_may_contain_key(key))
+                        .cloned(),
+                );
+            } else if let Some(table) = level.table_for_key(key) {
+                if table.key_bounds_may_contain_key(key) {
+                    tables.push(Arc::clone(table));
+                }
+            }
+        }
+        tables
+    }
+
+    #[must_use]
+    pub(crate) fn range_scan_tables(&self, range: &KeyRange) -> Vec<Arc<Table>> {
+        self.levels
+            .iter()
+            .flat_map(|level| level.tables_overlapping_range(range))
+            .collect()
     }
 
     #[must_use]
@@ -150,6 +180,14 @@ impl LevelState {
         });
         let table = self.tables.get(index)?;
         table_has_key_bounds(table).then_some(table)
+    }
+
+    fn tables_overlapping_range(&self, range: &KeyRange) -> Vec<Arc<Table>> {
+        self.tables
+            .iter()
+            .filter(|table| table.key_bounds_overlap_range(range))
+            .cloned()
+            .collect()
     }
 }
 
@@ -250,7 +288,7 @@ mod tests {
         options::{FilterPolicy, PrefixFilterPolicy},
         prefix::PrefixExtractor,
         table::{self, TableId, TableLevel},
-        types::Sequence,
+        types::{KeyRange, Sequence},
     };
 
     use super::LsmVersion;
@@ -309,6 +347,76 @@ mod tests {
     }
 
     #[test]
+    fn point_lookup_uses_l0_overlaps_and_one_deeper_table_per_level() {
+        let l0_old = Arc::new(test_table(32, TableLevel::ZERO, b"k", 10));
+        let l0_new = Arc::new(test_table(33, TableLevel::ZERO, b"k", 20));
+        let l1_hit = Arc::new(test_table(34, TableLevel(1), b"k", 5));
+        let l1_miss = Arc::new(test_table(35, TableLevel(1), b"z", 5));
+        let l2_hit = Arc::new(test_table(36, TableLevel(2), b"k", 4));
+        let version = LsmVersion::new(vec![
+            Arc::clone(&l0_old),
+            Arc::clone(&l0_new),
+            Arc::clone(&l1_hit),
+            Arc::clone(&l1_miss),
+            Arc::clone(&l2_hit),
+        ])
+        .expect("valid version");
+
+        let ids = table_ids(version.point_lookup_tables(b"k"));
+
+        assert_eq!(
+            ids,
+            vec![
+                l0_new.properties().id,
+                l0_old.properties().id,
+                l1_hit.properties().id,
+                l2_hit.properties().id,
+            ]
+        );
+    }
+
+    #[test]
+    fn range_scan_tables_skip_unrelated_non_overlapping_tables() {
+        let l0_hit = Arc::new(test_table(37, TableLevel::ZERO, b"c", 10));
+        let l0_miss = Arc::new(test_table(38, TableLevel::ZERO, b"z", 10));
+        let l1_left = Arc::new(test_table(39, TableLevel(1), b"a", 5));
+        let l1_hit = Arc::new(test_table(40, TableLevel(1), b"c", 5));
+        let l1_right = Arc::new(test_table(41, TableLevel(1), b"z", 5));
+        let version = LsmVersion::new(vec![
+            Arc::clone(&l0_hit),
+            Arc::clone(&l0_miss),
+            Arc::clone(&l1_left),
+            Arc::clone(&l1_hit),
+            Arc::clone(&l1_right),
+        ])
+        .expect("valid version");
+
+        let ids = table_ids(version.range_scan_tables(&KeyRange::half_open(b"b", b"d")));
+
+        assert_eq!(ids, vec![l0_hit.properties().id, l1_hit.properties().id]);
+    }
+
+    #[test]
+    fn range_tombstone_lookup_uses_key_bounds_without_point_filter() {
+        let tombstone_table = Arc::new(test_table_with_tombstone(
+            43,
+            TableLevel(1),
+            b"a",
+            KeyRange::half_open(b"a", b"z"),
+        ));
+        let version = LsmVersion::new(vec![Arc::clone(&tombstone_table)]).expect("valid version");
+
+        assert!(
+            version.point_lookup_tables(b"m").is_empty(),
+            "point filter should skip point lookup for a missing key"
+        );
+        assert_eq!(
+            table_ids(version.range_tombstone_tables_for_key(b"m")),
+            vec![tombstone_table.properties().id]
+        );
+    }
+
+    #[test]
     fn replace_tables_installs_outputs_and_removes_inputs() {
         let old_l0 = Arc::new(test_table(40, TableLevel::ZERO, b"a", 10));
         let old_l1 = Arc::new(test_table(41, TableLevel(1), b"z", 10));
@@ -356,6 +464,13 @@ mod tests {
         assert_eq!(next_ids, vec![output.properties().id]);
     }
 
+    fn table_ids(tables: Vec<Arc<table::Table>>) -> Vec<TableId> {
+        tables
+            .into_iter()
+            .map(|table| table.properties().id)
+            .collect()
+    }
+
     fn test_table(id: u64, level: TableLevel, key: &[u8], sequence: u64) -> table::Table {
         let path = test_table_path(id);
         let _ = fs::remove_file(&path);
@@ -369,6 +484,32 @@ mod tests {
                 Some(ValueRef::Inline(vec![b'v'])),
             )],
             &[],
+        )
+        .expect("test table writes")
+    }
+
+    fn test_table_with_tombstone(
+        id: u64,
+        level: TableLevel,
+        point_key: &[u8],
+        range: KeyRange,
+    ) -> table::Table {
+        let path = test_table_path(id);
+        let _ = fs::remove_file(&path);
+        table::write_table(
+            &path,
+            TableId(id),
+            level,
+            &test_table_options_with_filter(),
+            &[(
+                InternalKey::new(point_key.to_vec(), Sequence::new(1), ValueKind::Put, 0),
+                Some(ValueRef::Inline(vec![b'v'])),
+            )],
+            &[table::TableRangeTombstone {
+                range,
+                sequence: Sequence::new(2),
+                batch_index: 0,
+            }],
         )
         .expect("test table writes")
     }
@@ -387,6 +528,17 @@ mod tests {
             codec: CodecId::None,
             block_bytes: 4096,
             filter_policy: FilterPolicy::Disabled,
+            prefix_extractor: PrefixExtractor::Disabled,
+            prefix_filter_policy: PrefixFilterPolicy::Disabled,
+            blob_threshold_bytes: usize::MAX,
+        }
+    }
+
+    fn test_table_options_with_filter() -> table::TableWriteOptions {
+        table::TableWriteOptions {
+            codec: CodecId::None,
+            block_bytes: 4096,
+            filter_policy: FilterPolicy::Bloom { bits_per_key: 64 },
             prefix_extractor: PrefixExtractor::Disabled,
             prefix_filter_policy: PrefixFilterPolicy::Disabled,
             blob_threshold_bytes: usize::MAX,

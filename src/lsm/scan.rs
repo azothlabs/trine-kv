@@ -60,7 +60,8 @@ impl LsmTree {
             RecordSource::memtable(immutable.memtable, selector.clone(), direction)
         }));
 
-        for table in version.table_handles() {
+        let query_range = selector_query_range(selector);
+        for table in version.range_scan_tables(&query_range) {
             if let Some(prefix) = selector.prefix() {
                 if !table.may_contain_prefix(prefix, &self.options.prefix_extractor) {
                     continue;
@@ -92,7 +93,7 @@ impl LsmTree {
             .cloned()
             .collect::<Vec<_>>();
 
-        for table in version.table_handles() {
+        for table in version.range_scan_tables(&range) {
             tombstones.extend(
                 table
                     .range_tombstones_overlapping_range(&range)?

@@ -3063,3 +3063,250 @@ Record only evidence that can change planning or durable decisions.
 
 - Start Phase 26 with task089: audit compaction picker gaps before changing
   input selection or move behavior.
+
+## 2026-05-26: Phase 26 Compaction Picker Hardening Completed
+
+### Observation
+
+- L0 compaction now plans a single overlapping L0 input even when there is no
+  lower-level overlap, allowing the table to move down one level without
+  rewriting.
+- L1+ compaction now selects a narrow overfull-level input table and adds only
+  overlapping next-level tables, instead of rewriting the whole level.
+- Compaction outputs can include a direct table move that reuses the table id
+  and file while publishing the new level in the manifest.
+- Recovery treats the manifest level as the live placement and validates every
+  other table property against the table file.
+- Protocol docs now record manifest-level authority and direct one-table move
+  rules.
+- Tests cover L0 direct moves, narrow L1 input selection, lower-level overlap
+  inclusion, persistent reopen after a direct move, stats for moved tables, and
+  the updated split-output compaction expectation.
+
+### Interpretation
+
+- Phase 26 acceptance is met locally: picker scope is narrower, L0 overlap
+  closure remains intact, direct table moves are supported without storage
+  format changes, and target-size output splitting still works.
+- The next phase should address P7: MVCC and deletion semantics hardening.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo check --all-targets --all-features`
+- `cargo clippy --all-targets --all-features`
+- `cargo test single_l0_without_lower_overlap_is_planned_for_move --lib`
+- `cargo test overfull_level_uses_narrow_input_and_lower_overlap --lib`
+- `cargo test overfull_level_without_lower_overlap_selects_single_move_input --lib`
+- `cargo test persistent_single_l0_compaction_moves_table_without_rewrite --test persistent_wal`
+- `cargo test persistent_reopen_fails_when_table_metadata_differs_from_manifest --test persistent_wal`
+- `cargo test persistent_compaction_splits_outputs_and_moves_overfull_l1_down --test persistent_wal`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- forbidden-term scan over `.phrase`, `src`, and `tests`
+
+### Remaining Blockers
+
+- Remote CI cannot be executed locally; it must run after push.
+- P7 MVCC/delete semantics, P8 read-path level optimization, P9 blob GC, and
+  P10 verification expansion remain open.
+
+### Recommended Next Action
+
+- Start Phase 27 with task092: audit existing MVCC/delete retention tests and
+  compaction cleanup rules before changing semantics.
+
+## 2026-05-26: Phase 27 MVCC And Deletion Semantics Hardening Completed
+
+### Observation
+
+- Phase 26 made `compact_range(KeyRange::all())` capable of selecting a narrow
+  L1+ input rather than every live table.
+- Range tombstone cleanup previously used the requested range to decide whether
+  tombstones could be clipped or removed.
+- `CompactionInput` now records whether the selected input covers every live
+  table in the keyspace; range tombstone cleanup and output clipping use that
+  flag instead of only checking the requested range.
+- Focused tests prove that a range-all request with a narrow input is not full
+  keyspace cleanup, while all-live-table input is.
+- Output payload tests prove partial compaction keeps original range tombstone
+  bounds and full-keyspace compaction may clip to the output span.
+- `RangeTombstoneIndex` now has a deterministic random reference test for
+  covering-key and overlapping-range queries.
+- Protocol docs now state that a request over all user keys is still partial
+  when the picker did not include every live table.
+
+### Interpretation
+
+- Phase 27 acceptance is met locally: MVCC point-version retention remains
+  covered, point-delete cleanup remains snapshot-aware, and range-delete cleanup
+  is now tied to input coverage rather than the caller's requested range.
+- The next phase should move to P8 read-path level optimization.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo check --all-targets --all-features`
+- `cargo clippy --all-targets --all-features`
+- `cargo test range_all_compaction_is_not_full_when_picker_chooses_narrow_input --lib`
+- `cargo test range_all_compaction_is_full_when_all_tables_are_inputs --lib`
+- `cargo test partial_compaction_keeps_original_range_tombstone_bounds --lib`
+- `cargo test full_compaction_clips_range_tombstone_to_output_span --lib`
+- `cargo test randomized_queries_match_brute_force_reference --lib`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- forbidden-term scan over `.phrase`, `src`, and `tests`
+
+### Remaining Blockers
+
+- Remote CI cannot be executed locally; it must run after push.
+- P8 read-path level optimization, P9 blob GC, and P10 verification expansion
+  remain open.
+
+### Recommended Next Action
+
+- Start Phase 28 with task095: audit current point/scan table selection against
+  the versioned level layout before changing source selection.
+
+## 2026-05-26: Phase 28 Level-Aware Read Path Optimization Completed
+
+### Observation
+
+- Point record reads already used `LsmVersion::point_lookup_tables`, but table
+  range tombstone checks still looped all live tables.
+- Range and prefix scan setup selected all live tables before table-local
+  filtering.
+- `Table` now exposes key-bound checks that do not consult point filters.
+- `LsmVersion` now exposes point tombstone candidates by key and scan
+  candidates by query range.
+- Point reads use key-bound table candidates for range tombstone coverage, so
+  point filters cannot hide range tombstones.
+- Range and prefix scans use key-bound-overlap candidates before building table
+  cursors or loading table range tombstones.
+- Prefix filter stats tests now account for Bloom false positives and the fact
+  that range tombstone metadata remains authoritative.
+- Protocol docs now record level-aware point reads and range/prefix table
+  selection.
+
+### Interpretation
+
+- Phase 28 acceptance is met locally: point reads keep L0 overlap behavior and
+  one non-overlapping candidate per deeper level, scans skip unrelated tables,
+  and range tombstones remain table scoped and authoritative.
+- The next phase should move to P9 blob GC hardening.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo check --all-targets --all-features`
+- `cargo clippy --all-targets --all-features`
+- `cargo test point_lookup_uses_l0_overlaps_and_one_deeper_table_per_level --lib`
+- `cargo test range_scan_tables_skip_unrelated_non_overlapping_tables --lib`
+- `cargo test range_tombstone_lookup_uses_key_bounds_without_point_filter --lib`
+- `cargo test persistent_prefix_filter_stats_skip_nonmatching_tables --test persistent_wal`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- forbidden-term scan over `.phrase`, `src`, and `tests`
+
+### Remaining Blockers
+
+- Remote CI cannot be executed locally; it must run after push.
+- P9 blob GC and P10 verification expansion remain open.
+
+### Recommended Next Action
+
+- Start Phase 29 with task098: audit current blob stats, compaction cleanup,
+  and recovery consistency before changing blob lifecycle behavior.
+
+## 2026-05-26: Phase 29 Blob GC Hardening Completed
+
+### Observation
+
+- Existing compaction tests already covered live blob survival, stale blob file
+  removal after dropped versions, delete cleanup, and failed publish cleanup.
+- `DbStats` exposed live and obsolete blob bytes, but not the stale naming from
+  the P9 checklist.
+- Missing referenced blob files previously failed when the value was read, not
+  at persistent open.
+- `DbStats` now exposes `stale_blob_files` and `stale_blob_bytes` while keeping
+  the existing obsolete fields.
+- Persistent open now fails closed when a blob id referenced by manifest table
+  metadata has no formal blob file.
+- Protocol docs now list live, stale, and obsolete blob byte stats.
+
+### Interpretation
+
+- Phase 29 acceptance is met locally: blob lifecycle stats are clearer, cleanup
+  remains compaction/version/snapshot gated, and recovery now verifies
+  referenced blob file presence.
+- The next phase should move to P10 verification expansion.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo check --all-targets --all-features`
+- `cargo clippy --all-targets --all-features`
+- `cargo test persistent_reopen_fails_when_referenced_blob_file_is_missing --test persistent_wal`
+- `cargo test persistent_stats_report_tables_blobs_and_compactions --test persistent_wal`
+- `cargo test persistent_compaction_removes_blob_files_for_dropped_versions --test persistent_wal`
+- `cargo test persistent_compaction_removes_blob_files_after_delete_cleanup --test persistent_wal`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- forbidden-term scan over `.phrase`, `src`, and `tests`
+
+### Remaining Blockers
+
+- Remote CI cannot be executed locally; it must run after push.
+- P10 verification expansion remains open.
+
+### Recommended Next Action
+
+- Start Phase 30 with task101: add a deterministic randomized MVCC model test
+  against a small reference implementation.
+
+## 2026-05-26: Phase 30 Verification Expansion Completed
+
+### Observation
+
+- Added `tests/model_reference.rs`, a deterministic randomized integration test
+  that compares Trine with a small MVCC `BTreeMap` reference model.
+- The model test covers point writes, point deletes, range deletes, point
+  reads, full range scans, snapshots, flush, compaction, and reopen.
+- The first run exposed a real partial-compaction bug: a point delete could be
+  dropped after the selected input tables had no older local value, even though
+  a lower live level still contained an older value for the same user key.
+- Partial compaction now keeps point deletes unless the compaction input covers
+  the whole live keyspace.
+- A scan merge bug was also fixed: when multiple sources had the same user key,
+  the previous first record is now retained before the next source group becomes
+  the group head.
+- Protocol docs now record that point-delete cleanup must be based on the live
+  keyspace, not only selected compaction inputs.
+
+### Interpretation
+
+- Phase 30 acceptance is met locally. Randomized MVCC comparison now runs with
+  normal `cargo test`, and it protects the point-delete/partial-compaction case
+  that focused tests had missed.
+- The P0-P10 LSM hardening checklist from the current roadmap has no remaining
+  local implementation item. Remote CI remains the only unverified gate.
+
+### Verification
+
+- `cargo check --all-targets --all-features`
+- `cargo clippy --all-targets --all-features`
+- `cargo fmt --check`
+- `cargo test point_tombstone --lib`
+- `cargo test --test model_reference`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- forbidden-term scan over `.phrase`, `src`, and `tests`
+
+### Remaining Blockers
+
+- Remote CI cannot be executed locally; it must run after push.
+
+### Recommended Next Action
+
+- Push to CI when ready, then treat any remote failure as fresh evidence for
+  the next phase.

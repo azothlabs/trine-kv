@@ -492,7 +492,7 @@ next LSM tree improvement.
 
 ### Phase 26: Compaction Picker Hardening
 
-**Status**: In Progress
+**Status**: Complete
 
 **Goal**: Improve compaction input selection and move behavior without changing
 storage format or MVCC retention rules.
@@ -510,4 +510,87 @@ next LSM tree improvement.
 - Output table splitting continues to respect target table bytes.
 - Existing public API and storage formats remain unchanged unless protocol docs
   are updated first.
+- Full local Rust verification passes.
+
+### Phase 27: MVCC And Deletion Semantics Hardening
+
+**Status**: Complete
+
+**Goal**: Strengthen compaction retention and delete coverage rules before
+read-path and blob-GC work continues.
+
+**Entry Condition**: Phase 26 complete and the remaining P7/P8/P9/P10 LSM
+hardening items are still open.
+
+**Acceptance Gate**:
+
+- Compaction keeps all versions newer than the oldest active snapshot and the
+  newest version visible at or before that snapshot.
+- Point deletes and range deletes are removed only when active snapshots and
+  lower-level data make removal safe.
+- Range tombstone coverage rules have dedicated randomized coverage tests
+  against a simple reference model.
+- Future single-delete support remains possible without changing current delete
+  behavior.
+- Existing public API and storage formats remain unchanged unless protocol docs
+  are updated first.
+- Full local Rust verification passes.
+
+### Phase 28: Level-Aware Read Path Optimization
+
+**Status**: Complete
+
+**Goal**: Make point and scan table selection use the level layout more
+directly, keeping read cost close to the number of relevant sources.
+
+**Entry Condition**: Phase 27 complete and P8 read-path level optimization is
+still open.
+
+**Acceptance Gate**:
+
+- Point reads check memtables, immutable memtables, overlapping L0 tables, and
+  at most one candidate table per non-overlapping level.
+- Range and prefix scans avoid selecting unrelated non-overlapping tables.
+- L0 behavior remains overlap-safe.
+- Range tombstones remain lazy and table/level scoped.
+- Existing public API and storage formats remain unchanged unless protocol docs
+  are updated first.
+- Full local Rust verification passes.
+
+### Phase 29: Blob GC Hardening
+
+**Status**: Complete
+
+**Goal**: Close the remaining value-separation lifecycle gaps around stale blob
+bytes, compaction cleanup, and recovery consistency.
+
+**Entry Condition**: Phase 28 complete and P9 blob-GC hardening is still open.
+
+**Acceptance Gate**:
+
+- Stats expose live and stale blob bytes.
+- Compaction keeps live blob references and removes stale blob files only when
+  snapshots and version handles no longer need them.
+- Recovery verifies manifest/table/blob consistency for referenced blob files.
+- Blob cleanup remains tied to compaction and version-file lifetime rules.
+- Existing public API and storage formats remain unchanged unless protocol docs
+  are updated first.
+- Full local Rust verification passes.
+
+### Phase 30: Verification Expansion
+
+**Status**: Complete
+
+**Goal**: Close the remaining validation gap with a deterministic randomized
+model test across MVCC, deletes, scans, snapshots, and reopen.
+
+**Entry Condition**: Phase 29 complete and P10 verification expansion is still
+open.
+
+**Acceptance Gate**:
+
+- Random operation testing compares Trine against a simple MVCC reference
+  model.
+- Existing crash/reopen, corruption, long scan, and benchmark gates remain in
+  the verification list.
 - Full local Rust verification passes.

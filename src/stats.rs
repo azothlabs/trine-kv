@@ -11,6 +11,8 @@ pub struct DbStats {
     pub wal_bytes_pending_sync: u64,
     pub live_blob_files: usize,
     pub live_blob_bytes: u64,
+    pub stale_blob_files: usize,
+    pub stale_blob_bytes: u64,
     pub obsolete_blob_files: usize,
     pub obsolete_blob_bytes: u64,
     pub compaction_runs: u64,
