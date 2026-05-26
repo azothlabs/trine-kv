@@ -8,10 +8,10 @@ use std::{
 };
 
 use trine_kv::{
-    BlobGcRatio, BucketOptions, CompressionProfile, Db, DbOptions, DurabilityMode, Error,
-    FailOnCorruptionPolicy, FilterPolicy, IndexSearchPolicy, KeyRange, PrefixExtractor,
-    PrefixFilterPolicy, Sequence, TransactionOptions, WriteBatch, WriteOptions, blob,
-    codec::CodecId, manifest, recovery, table, wal,
+    BlobGcRatio, BlobLevelMergePolicy, BucketOptions, CompressionProfile, Db, DbOptions,
+    DurabilityMode, Error, FailOnCorruptionPolicy, FilterPolicy, IndexSearchPolicy, KeyRange,
+    PrefixExtractor, PrefixFilterPolicy, Sequence, TransactionOptions, WriteBatch, WriteOptions,
+    blob, codec::CodecId, manifest, recovery, table, wal,
 };
 
 fn temp_db_path(name: &str) -> PathBuf {
@@ -298,7 +298,7 @@ fn persistent_manifest_keeps_bucket_options_across_reopen() {
         prefix_filter_policy: PrefixFilterPolicy::Bloom { bits_per_prefix: 8 },
         index_search_policy: IndexSearchPolicy::Binary,
         blob_threshold_bytes: 128 * 1024,
-        blob_level_merge_enabled: true,
+        blob_level_merge_policy: BlobLevelMergePolicy::Always,
     };
 
     {
@@ -1589,7 +1589,7 @@ fn persistent_stats_report_tables_blobs_and_compactions() {
         assert_eq!(stats.total_tables, 1);
         assert_eq!(stats.l0_tables, 0);
         assert_eq!(level_table_count(&stats, 1), 1);
-        assert_eq!(stats.live_blob_files, 2);
+        assert_eq!(stats.live_blob_files, 1);
         assert_eq!(
             stats.live_blob_bytes,
             (large_a.len() + large_b.len()) as u64
@@ -2197,9 +2197,10 @@ fn persistent_blob_values_survive_flush_reopen_and_compaction() {
             bucket.get(b"c").expect("blob c reads"),
             Some(large_c.clone())
         );
-        assert!(
-            blob_file_paths(&path).len() >= 2,
-            "flushed blob values should create blob files"
+        assert_eq!(
+            blob_file_paths(&path).len(),
+            1,
+            "auto Level Merge should keep retained compacted blob values together"
         );
     }
 
@@ -2221,13 +2222,12 @@ fn persistent_blob_values_survive_flush_reopen_and_compaction() {
 }
 
 #[test]
-fn persistent_blob_level_merge_rewrites_retained_blob_indexes() {
+fn persistent_blob_level_merge_auto_rewrites_retained_blob_indexes() {
     let path = temp_db_path("blob-level-merge");
     let mut options = DbOptions::persistent(&path);
     options.blob_gc_enabled = false;
     options.default_bucket_options = BucketOptions {
         blob_threshold_bytes: 8,
-        blob_level_merge_enabled: true,
         ..BucketOptions::default()
     };
     let old_b = b"large-value-b-old-large-value-b-old".to_vec();
@@ -2272,6 +2272,46 @@ fn persistent_blob_level_merge_rewrites_retained_blob_indexes() {
         assert_eq!(bucket.get(b"a").expect("new a reopens"), Some(new_a));
         assert_eq!(bucket.get(b"b").expect("old b reopens"), Some(old_b));
         assert_eq!(blob_file_paths(&path).len(), 1);
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_blob_level_merge_can_be_disabled() {
+    let path = temp_db_path("blob-level-merge-disabled");
+    let mut options = DbOptions::persistent(&path);
+    options.blob_gc_enabled = false;
+    options.default_bucket_options = BucketOptions {
+        blob_threshold_bytes: 8,
+        blob_level_merge_policy: BlobLevelMergePolicy::Disabled,
+        ..BucketOptions::default()
+    };
+
+    {
+        let db = Db::open(options).expect("persistent db opens");
+        let bucket = db.default_bucket().expect("bucket opens");
+
+        bucket
+            .put(b"a", b"large-value-a-old-large-value-a-old".to_vec())
+            .expect("write old a");
+        bucket
+            .put(b"b", b"large-value-b-old-large-value-b-old".to_vec())
+            .expect("write old b");
+        db.flush().expect("flush shared old blob file");
+        bucket
+            .put(b"a", b"large-value-a-new-large-value-a-new".to_vec())
+            .expect("write new a");
+        db.flush().expect("flush new a blob file");
+
+        db.compact_range(KeyRange::all())
+            .expect("disabled level merge compaction succeeds");
+
+        assert_eq!(
+            blob_file_paths(&path).len(),
+            2,
+            "disabled Level Merge should keep retained blob indexes pointing at old files"
+        );
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");
@@ -2526,6 +2566,7 @@ fn persistent_blob_gc_rewrites_live_records_from_partially_stale_file() {
     options.blob_gc_discardable_ratio = BlobGcRatio::from_millionths(400_000);
     options.default_bucket_options = BucketOptions {
         blob_threshold_bytes: 8,
+        blob_level_merge_policy: BlobLevelMergePolicy::Disabled,
         ..BucketOptions::default()
     };
     let old_a = b"large-value-a-old-large-value-a-old".to_vec();
@@ -2583,6 +2624,73 @@ fn persistent_blob_gc_rewrites_live_records_from_partially_stale_file() {
 }
 
 #[test]
+fn persistent_blob_gc_batches_multiple_stale_candidates() {
+    let path = temp_db_path("blob-gc-multi-candidate");
+    let mut options = DbOptions::persistent(&path);
+    options.blob_gc_min_file_bytes = 1;
+    options.blob_gc_discardable_ratio = BlobGcRatio::from_millionths(400_000);
+    options.default_bucket_options = BucketOptions {
+        blob_threshold_bytes: 8,
+        blob_level_merge_policy: BlobLevelMergePolicy::Disabled,
+        ..BucketOptions::default()
+    };
+    let new_a = b"large-value-a-new-large-value-a-new".to_vec();
+    let old_b = b"large-value-b-old-large-value-b-old".to_vec();
+    let new_c = b"large-value-c-new-large-value-c-new".to_vec();
+    let old_d = b"large-value-d-old-large-value-d-old".to_vec();
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let bucket = db.default_bucket().expect("bucket opens");
+
+        bucket
+            .put(b"a", b"large-value-a-old-large-value-a-old".to_vec())
+            .expect("write old a");
+        bucket.put(b"b", old_b.clone()).expect("write old b");
+        db.flush().expect("flush first candidate blob");
+        bucket
+            .put(b"c", b"large-value-c-old-large-value-c-old".to_vec())
+            .expect("write old c");
+        bucket.put(b"d", old_d.clone()).expect("write old d");
+        db.flush().expect("flush second candidate blob");
+        bucket.put(b"a", new_a.clone()).expect("write new a");
+        bucket.put(b"c", new_c.clone()).expect("write new c");
+        db.flush().expect("flush replacement blob");
+        assert_eq!(blob_file_paths(&path).len(), 3);
+
+        db.compact_range(KeyRange::all())
+            .expect("compaction runs batched blob GC");
+
+        assert_eq!(bucket.get(b"a").expect("new a reads"), Some(new_a));
+        assert_eq!(bucket.get(b"b").expect("old b reads"), Some(old_b));
+        assert_eq!(bucket.get(b"c").expect("new c reads"), Some(new_c));
+        assert_eq!(bucket.get(b"d").expect("old d reads"), Some(old_d));
+        assert_eq!(
+            blob_file_paths(&path).len(),
+            2,
+            "two stale candidate files should be replaced by one GC output blob"
+        );
+        let stats = db.stats();
+        assert_eq!(stats.blob_gc_runs, 1);
+        assert!(stats.blob_gc_input_bytes > stats.blob_gc_output_bytes);
+        assert!(stats.blob_gc_discarded_bytes > 0);
+    }
+
+    fs::remove_file(wal::wal_path(&path)).expect("remove WAL after batched blob GC");
+
+    {
+        let db = Db::open(options).expect("persistent db reopens after batched blob GC");
+        assert_eq!(blob_file_paths(&path).len(), 2);
+        assert_eq!(
+            db.get(b"d").expect("rewritten d reopens"),
+            Some(b"large-value-d-old-large-value-d-old".to_vec())
+        );
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_blob_gc_keeps_old_blob_while_read_pin_can_reach_it() {
     let path = temp_db_path("blob-gc-read-pin");
     let mut options = DbOptions::persistent(&path);
@@ -2590,6 +2698,7 @@ fn persistent_blob_gc_keeps_old_blob_while_read_pin_can_reach_it() {
     options.blob_gc_discardable_ratio = BlobGcRatio::from_millionths(400_000);
     options.default_bucket_options = BucketOptions {
         blob_threshold_bytes: 8,
+        blob_level_merge_policy: BlobLevelMergePolicy::Disabled,
         ..BucketOptions::default()
     };
     let old_a = b"large-value-a-old-large-value-a-old".to_vec();

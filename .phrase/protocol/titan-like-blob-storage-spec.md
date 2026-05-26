@@ -52,7 +52,8 @@ Trine's large-value subsystem follows these rules:
 - Do not separate small values.
 - Do not separate values during WAL append or foreground memtable writes.
 - Do not add punch-hole GC first.
-- Do not enable Level Merge before correctness and benchmark evidence exist.
+- Do not force aggressive Level Merge without correctness and benchmark
+  evidence.
 - Do not change user-visible MVCC semantics.
 - Do not delete old blob files while any snapshot or read pin can still reach
   an old `BlobIndex`.
@@ -191,7 +192,8 @@ Bucket-level options:
   large-value-heavy buckets;
 - blob record compression follows the bucket compression profile, using Trine's
   `none` or `fast-lz4-block` codec ids;
-- `blob_level_merge_enabled`: default `false`.
+- `blob_level_merge_policy`: default `auto`, with `disabled` and `always`
+  available for workload-specific tuning.
 
 Database-level persistent options:
 
@@ -241,9 +243,13 @@ For retained records:
 - existing `BlobIndex` records may be kept unchanged during normal compaction;
 - large inline values created by WAL replay or legacy tables are separated when
   written into new SSTables;
-- if `blob_level_merge_enabled` is true for the bucket, compaction reads
-  retained `BlobIndex` values, writes them into the output blob file, and stores
-  fresh `BlobIndex` records in the output SSTable.
+- if `blob_level_merge_policy` is `auto`, compaction rewrites retained
+  `BlobIndex` values when the output keeps references to multiple blob files or
+  when compaction drops part of an input blob file's references;
+- if `blob_level_merge_policy` is `always`, compaction rewrites retained
+  `BlobIndex` values whenever the output still references blob values;
+- if `blob_level_merge_policy` is `disabled`, compaction keeps retained
+  `BlobIndex` values unchanged.
 
 For dropped records:
 
@@ -346,23 +352,25 @@ Estimate maintenance:
 - after compaction, compare input and output SSTable blob-reference properties;
 - when references disappear from live SSTables, add the removed referenced bytes
   to the owning blob file's discardable estimate;
-- select a candidate when
+- select candidates when
   `discardable_bytes / total_bytes >= blob_gc_discardable_ratio` and
   `total_bytes >= blob_gc_min_file_bytes`.
 
 GC rewrite:
 
 1. pin the current LSM versions and snapshot floor;
-2. read candidate blob-file properties from the footer/properties block without
-   decoding every record payload;
-3. for each live SSTable reference to that blob file, read the referenced blob
-   record by `BlobIndex.offset` and validate that the
+2. read candidate blob-file properties from each footer/properties block
+   without decoding every record payload;
+3. batch all candidates that pass the GC threshold in the same maintenance
+   publish;
+4. for each live SSTable reference to a selected blob file, read the referenced
+   blob record by `BlobIndex.offset` and validate that the
    `BlobRecord` metadata matches the exact internal key and old `BlobIndex`;
-4. copy still-referenced values into a new blob file and publish equivalent
+5. copy still-referenced values into a new blob file and publish equivalent
    `BlobIndex` records for the same internal keys;
-5. drop blob records that are no longer referenced by live SSTables;
-6. publish a manifest edit that marks the old blob file pending deletion at the
-   GC publish sequence.
+6. drop blob records that are no longer referenced by live SSTables;
+7. publish one manifest edit that marks the old blob files pending deletion at
+   the GC publish sequence.
 
 GC must not create a new user-visible MVCC version. It rewrites blob indexes for
 the same internal keys as maintenance work.
@@ -465,4 +473,5 @@ large-value LSM for values at or above the configured threshold:
   reclaimable by GC;
 - persistent recovery validates table/blob/manifest consistency;
 - in-memory mode remains inline and simple;
-- benchmark evidence exists before enabling Level Merge.
+- benchmark evidence exists before forcing aggressive Level Merge beyond the
+  automatic policy.

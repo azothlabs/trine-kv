@@ -7,7 +7,7 @@ mod tree;
 mod version;
 mod write;
 
-pub(crate) use compact::{CompactionInput, CompactionOutput};
+pub(crate) use compact::{CompactionInput, CompactionOutput, CompactionTablePayload};
 pub(crate) use flush::FlushInput;
 pub(crate) use tree::LsmTree;
 pub(crate) use version::LsmVersion;

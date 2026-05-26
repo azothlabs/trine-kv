@@ -6,90 +6,93 @@ Complete
 
 ## Goal
 
-Finish the first pass of post-GC large-value maintenance: optional Titan-style
-Level Merge, value-lazy iteration, GC rewrite throughput tightening, and a
-more systematic recovery fault matrix.
+Close the policy gaps from Phase 38 by making blob Level Merge automatic by
+default and letting blob GC rewrite multiple stale candidates in one maintenance
+publish.
 
 ## Entry Condition
 
-- Phase 37 completed direct `BlobIndex` read tuning and benchmark coverage.
-- User asked to finish Level Merge, value-lazy iterator, blob GC throughput
-  optimization, and broader crash/recovery fault injection.
+- Phase 38 completed the first pass of Level Merge, value-lazy iteration, GC
+  throughput tightening, and recovery fault injection.
+- User clarified that Level Merge should use an automatic strategy and blob GC
+  should batch multiple candidates.
 
 ## Scope
 
-- Add bucket-level `blob_level_merge_enabled` and persist it in manifest v6.
-- Let compaction rewrite retained `BlobIndex` values into output blob files
-  only when the bucket enables Level Merge.
-- Add public value-lazy range and prefix iterator APIs for `Db`, `Bucket`, and
-  `Snapshot`.
-- Make blob GC candidate selection read only blob footer/properties metadata,
-  and make GC live-record copying use direct indexed blob reads.
-- Add focused persistent and in-memory tests plus a table-driven recovery fault
-  matrix.
-- Update the Titan-like blob protocol, usage docs, README, and benchmark notes.
+- Replace the boolean Level Merge option with `BlobLevelMergePolicy`.
+- Default Level Merge to `Auto`.
+- Make `Auto` rewrite retained blob values when compaction output would keep
+  references to multiple blob files or leave stale input blob refs behind.
+- Preserve `Disabled` and `Always` for tuning and benchmarks.
+- Bump manifest encoding to v7 and decode v5/v6 manifests into the new policy.
+- Batch all blob GC candidates that pass the discard threshold into one rewrite
+  plan and one manifest publish.
+- Update tests, benchmarks, protocol, usage docs, roadmap, and evidence.
 
 ## Out Of Scope
 
-- Automatic Level Merge policy selection.
-- Value caching inside `LazyValue`.
-- Multi-file batch planning for blob GC.
-- New on-disk blob format changes beyond manifest v6 bucket options.
+- New knobs for maximum GC batch size.
+- Workload-adaptive policy learned from long-running telemetry.
+- Changing the blob file format.
 
 ## Acceptance Gate
 
-- Level Merge rewrites retained large values only when explicitly enabled.
-- Value-lazy iterators do not read blob bytes until the caller asks for the
-  value, and in-memory mode still returns inline values.
-- GC candidate selection no longer decodes every blob record payload.
-- Recovery fault matrix covers representative publish, missing-file,
-  corruption, and unreferenced-file failures.
-- Protocol/docs describe the implemented behavior.
+- Default bucket options use `BlobLevelMergePolicy::Auto`.
+- Auto Level Merge rewrites retained large values without requiring users to
+  enable a boolean option.
+- `Disabled` keeps old blob references for tests and GC-only workloads.
+- GC rewrites multiple stale candidates in one pass and records one run.
+- Manifest v5/v6 compatibility tests pass.
+- Benchmark rows continue to distinguish lazy range, GC rewrite, and Level
+  Merge.
 - Full local Rust verification passes.
 
 ## Active Task Slice
 
 ```text
-task126 [x] goal:add optional blob Level Merge | scope:options manifest table compaction tests | verify:persistent_blob_level_merge_rewrites_retained_blob_indexes
-task127 [x] goal:add value-lazy iterator API | scope:iterator db bucket snapshot docs tests | verify:persistent_value_lazy_iterator_defers_blob_reads_until_value_access + in-memory lazy test
-task128 [x] goal:tighten blob GC throughput path | scope:blob db bench protocol tests | verify:properties_read_skips_record_payload_decode + cargo bench row
-task129 [x] goal:add recovery fault matrix | scope:tests/persistent_wal.rs | verify:persistent_recovery_fault_injection_matrix_fails_closed
-task130 [x] goal:record docs/evidence and run full gate | scope:.phrase docs README | verify:full Rust verification
+task131 [x] goal:replace Level Merge boolean with policy | scope:options manifest docs tests | verify:manifest_decode_* + persistent_manifest_keeps_bucket_options_across_reopen
+task132 [x] goal:auto-rewrite retained blob refs | scope:db compaction tests | verify:persistent_blob_level_merge_auto_rewrites_retained_blob_indexes
+task133 [x] goal:batch blob GC candidates | scope:db tests benches | verify:persistent_blob_gc_batches_multiple_stale_candidates
+task134 [x] goal:update docs/evidence and full gate | scope:.phrase docs README | verify:full Rust verification
 ```
 
 ## Known Blockers
 
 - Remote CI cannot be executed locally; it must run after push.
-- Level Merge policy is explicit and manual. Automatic policy should be
-  benchmark-driven later.
-- GC still rewrites one selected candidate per maintenance pass.
+- GC still writes one output blob file per batch. A future phase can add a
+  maximum output size if benchmarks show large batches causing stalls.
 
 ## Evidence
 
-- `blob_level_merge_enabled` defaults to false and is persisted in manifest v6;
-  v5 manifests decode the option as false.
-- `range_lazy` and `prefix_lazy` return keys plus `LazyValue`; blob bytes are
-  read only by `LazyValue::read` or `LazyKeyValue::into_key_value`.
-- Lazy blob rows share the iterator read pin through `Arc<Snapshot>`, so each
-  returned row does not re-pin the global snapshot tracker.
-- GC candidate selection reads blob footer/properties metadata without
-  decoding every blob record payload.
-- GC rewrite reads live records by exact `BlobIndex` and internal key.
-- Release benchmark rows from `cargo bench --bench v1_bench`:
-  - `blob range scan`: 17705 us for 32 scans.
-  - `blob range lazy keys`: 174 us for 32 scans.
-  - `blob GC rewrite`: 154265 us.
-  - `blob level merge`: 143299 us.
-- `cargo test --all-targets --all-features` passes.
-- `cargo clippy --all-targets --all-features` passes.
-- `cargo fmt --all --check` passes.
-- `git diff --check` passes.
-- Forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
-  `docs`, and `README.md` passes.
+- Rust skill and SPEC-AGENTS context were read before implementation.
+- `BucketOptions` now stores `blob_level_merge_policy`; default is `Auto`.
+- Manifest v7 writes the policy enum. v6 boolean manifests decode `true` as
+  `Always` and `false` as `Auto`; v5 and older manifests default to `Auto`.
+- Auto Level Merge rewrites retained blob refs when output refs span multiple
+  blob files or when compaction drops part of an input blob file's refs.
+- `Disabled` prevents Level Merge and lets GC-only tests exercise stale blob
+  cleanup.
+- Blob GC candidate selection returns all candidates that pass the configured
+  threshold, and the rewrite plan handles each table once even if it references
+  multiple candidates.
+- Benchmark rows from `cargo bench --bench v1_bench`:
+  - `blob range scan`: 12929 us for 32 scans.
+  - `blob range lazy keys`: 173 us for 32 scans.
+  - `blob GC rewrite`: 126649 us.
+  - `blob level merge`: 123261 us.
+- Targeted tests passed:
+  - `cargo test --test persistent_wal --all-features`
+  - `cargo test manifest_decode --all-features`
+  - `cargo test blob::tests --all-features`
+- Full local gate passed:
+  - `cargo test --all-targets --all-features`
+  - `cargo clippy --all-targets --all-features`
+  - `cargo fmt --all --check`
+  - `git diff --check`
+  - forbidden-term scan over `.phrase`, `src`, `tests`, `benches`,
+    `examples`, `docs`, and `README.md`
 
 ## Next Recommendation
 
-- Commit Phase 38. After CI push, the next large-value work should be
-  benchmark-driven policy tuning: when to enable Level Merge, whether GC should
-  batch multiple candidates, and how lazy value APIs should expose key-only or
-  value-caching ergonomics.
+- Commit Phase 39. After CI, use workload benchmarks to decide whether GC
+  batching needs a configurable byte limit.

@@ -307,21 +307,28 @@ memtables flush or compaction writes new SSTables. WAL records and memtables
 still keep the complete value, so ordinary writes do not need a blob file on
 the foreground path.
 
-Configure the default bucket threshold through `DbOptions`:
+Configure the default bucket threshold and Level Merge policy through
+`DbOptions`:
 
 ```rust
-use trine_kv::{BucketOptions, Db, DbOptions};
+use trine_kv::{BlobLevelMergePolicy, BucketOptions, Db, DbOptions};
 
 let db = Db::open(
     DbOptions::persistent("./trine-data").with_default_bucket_options(
         BucketOptions {
             blob_threshold_bytes: 64 * 1024,
-            blob_level_merge_enabled: true,
+            blob_level_merge_policy: BlobLevelMergePolicy::Auto,
             ..BucketOptions::default()
         },
     ),
 )?;
 ```
+
+`Auto` is the default. It rewrites retained blob values during compaction when
+the output would otherwise keep references to multiple blob files or leave
+stale bytes behind in input blob files. Use `Disabled` only when you want GC to
+handle old blob files without compaction-time rewriting, and `Always` for
+benchmarking or workloads that prefer aggressive blob locality.
 
 When range or prefix scans mostly need keys first, use the value-lazy iterator
 variants. They keep the same MVCC and range-delete semantics, but blob bytes
@@ -338,8 +345,9 @@ for row in db.range_lazy(&trine_kv::KeyRange::all())? {
 ```
 
 Blob GC is enabled for persistent databases by default. It runs from the
-compaction path, rewrites still-live records out of stale blob files, and keeps
-old blob files until no snapshot or range iterator can still reach them.
+compaction path, batches all blob files that pass the discard threshold,
+rewrites still-live records out of stale blob files, and keeps old blob files
+until no snapshot or range iterator can still reach them.
 
 Use database-level options to tune when GC is considered:
 

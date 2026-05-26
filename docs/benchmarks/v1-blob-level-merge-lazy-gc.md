@@ -22,11 +22,11 @@ Context:
 
 | name | elapsed_us | units_per_sec |
 | --- | ---: | ---: |
-| blob point read | 16650 | 15375 |
-| blob range scan | 17705 | 1807 |
-| blob range lazy keys | 174 | 183205 |
-| blob GC rewrite | 154265 | 829 |
-| blob level merge | 143299 | 893 |
+| blob point read | 13518 | 18936 |
+| blob range scan | 12929 | 2475 |
+| blob range lazy keys | 173 | 184926 |
+| blob GC rewrite | 126649 | 1010 |
+| blob level merge | 123261 | 1038 |
 
 ## Interpretation
 
@@ -34,12 +34,14 @@ Context:
 It is much cheaper than value-returning range scans because it avoids blob
 record reads until the caller requests a value.
 
-`blob GC rewrite` now selects candidates from blob footer/properties metadata
-and reads only live referenced records by `BlobIndex`. Recovery still validates
-full blob files.
+`blob GC rewrite` now selects candidates from blob footer/properties metadata,
+batches all candidates that pass the discard threshold, and reads only live
+referenced records by `BlobIndex`. This row disables Level Merge so it measures
+GC directly. Recovery still validates full blob files.
 
-`blob level merge` measures optional compaction rewriting of retained large
-values into the output blob file when `blob_level_merge_enabled` is set.
+`blob level merge` measures compaction rewriting of retained large values into
+the output blob file. The default `Auto` policy triggers this when output refs
+would otherwise span multiple blob files or leave stale input refs behind.
 
 ## Verification
 

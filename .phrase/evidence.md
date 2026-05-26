@@ -3787,3 +3787,66 @@ Record only evidence that can change planning or durable decisions.
 
 - Commit Phase 38, then push to CI. Future large-value work should use the new
   benchmark rows to tune Level Merge policy and GC candidate batching.
+
+## 2026-05-26: Phase 39 Automatic Blob Maintenance Policy Completed
+
+### Observation
+
+- Rust skill and SPEC-AGENTS current context were read before implementation.
+- `BucketOptions` now stores `blob_level_merge_policy` instead of requiring
+  users to reason about a Level Merge boolean. The default is
+  `BlobLevelMergePolicy::Auto`.
+- `with_blob_level_merge_enabled` remains as a compatibility builder and maps
+  `true` to `Always`, `false` to `Disabled`.
+- Manifest v7 writes the policy enum. v6 boolean manifests decode `true` as
+  `Always` and `false` as `Auto`; v5 and older bucket options default to
+  `Auto`.
+- Auto Level Merge rewrites retained blob references when compaction output
+  would keep references to multiple blob files, or when compaction drops part
+  of an input blob file's references.
+- `Disabled` prevents Level Merge rewrites and lets GC-only tests exercise
+  stale blob cleanup directly.
+- Blob GC candidate selection now returns every file that passes the configured
+  discard threshold, and the rewrite plan handles all selected candidates in
+  one publish.
+- Benchmark notes distinguish the GC row from the Level Merge row by disabling
+  Level Merge in the GC rewrite benchmark.
+
+### Interpretation
+
+- The large-value maintenance path no longer depends on users enabling an
+  internal-looking knob to get sane compaction behavior.
+- GC batching removes the prior one-candidate maintenance bottleneck while
+  keeping the first pass simple: all selected live records are copied into one
+  output blob file and old files remain snapshot-gated.
+- A future workload-tuning phase can add GC batch byte limits if real
+  deployments show long stalls.
+
+### Verification
+
+- `cargo test --test persistent_wal --all-features`
+- `cargo test manifest_decode --all-features`
+- `cargo test blob::tests --all-features`
+- `cargo bench --bench v1_bench`
+  - `blob range scan`: 12929 us for 32 scans.
+  - `blob range lazy keys`: 173 us for 32 scans.
+  - `blob GC rewrite`: 126649 us.
+  - `blob level merge`: 123261 us.
+- `cargo test --all-targets --all-features`
+- `cargo clippy --all-targets --all-features`
+- `cargo fmt --all --check`
+- `git diff --check`
+- forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, and `README.md`
+
+### Remaining Blockers
+
+- Remote CI cannot be executed locally; it must run after push.
+- GC batches currently write one output blob file. Add a byte cap only with
+  benchmark evidence.
+
+### Recommended Next Action
+
+- Commit Phase 39, then push to CI. After CI, use larger workload benchmarks to
+  decide whether auto Level Merge and GC batching need additional policy
+  thresholds.

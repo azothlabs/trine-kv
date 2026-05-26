@@ -11,7 +11,8 @@ use crate::{
     error::{Error, Result},
     internal_key::{InternalKey, ValueKind},
     options::{
-        BucketOptions, CompressionProfile, FilterPolicy, IndexSearchPolicy, PrefixFilterPolicy,
+        BlobLevelMergePolicy, BucketOptions, CompressionProfile, FilterPolicy, IndexSearchPolicy,
+        PrefixFilterPolicy,
     },
     prefix::PrefixExtractor,
     table::{TableBlobReference, TableId, TableLevel, TableProperties},
@@ -20,7 +21,7 @@ use crate::{
 
 pub const MANIFEST_FILE_NAME: &str = "MANIFEST";
 const MANIFEST_MAGIC: u32 = 0x5452_4d46;
-const MANIFEST_VERSION: u16 = 6;
+const MANIFEST_VERSION: u16 = 7;
 const MIN_SUPPORTED_MANIFEST_VERSION: u16 = 4;
 const HEADER_LEN: usize = 14;
 // The lower bound for one table entry: fixed fields plus two empty byte fields.
@@ -432,7 +433,7 @@ fn put_bucket_options(bytes: &mut Vec<u8>, options: &BucketOptions) -> Result<()
     put_prefix_filter_policy(bytes, options.prefix_filter_policy);
     put_index_search_policy(bytes, options.index_search_policy);
     put_usize(bytes, options.blob_threshold_bytes)?;
-    put_bool(bytes, options.blob_level_merge_enabled);
+    put_blob_level_merge_policy(bytes, options.blob_level_merge_policy);
     Ok(())
 }
 
@@ -498,6 +499,17 @@ fn put_index_search_policy(bytes: &mut Vec<u8>, value: IndexSearchPolicy) {
             IndexSearchPolicy::Eytzinger => 2,
             IndexSearchPolicy::GallopingWithHint => 3,
             IndexSearchPolicy::Auto => 4,
+        },
+    );
+}
+
+fn put_blob_level_merge_policy(bytes: &mut Vec<u8>, value: BlobLevelMergePolicy) {
+    put_u8(
+        bytes,
+        match value {
+            BlobLevelMergePolicy::Disabled => 0,
+            BlobLevelMergePolicy::Auto => 1,
+            BlobLevelMergePolicy::Always => 2,
         },
     );
 }
@@ -718,10 +730,16 @@ impl<'payload> Cursor<'payload> {
             prefix_filter_policy: self.read_prefix_filter_policy()?,
             index_search_policy: self.read_index_search_policy()?,
             blob_threshold_bytes: self.read_usize()?,
-            blob_level_merge_enabled: if version >= 6 {
-                self.read_bool()?
+            blob_level_merge_policy: if version >= 7 {
+                self.read_blob_level_merge_policy()?
+            } else if version >= 6 {
+                if self.read_bool()? {
+                    BlobLevelMergePolicy::Always
+                } else {
+                    BlobLevelMergePolicy::Auto
+                }
             } else {
-                false
+                BlobLevelMergePolicy::Auto
             },
         })
     }
@@ -923,6 +941,17 @@ impl<'payload> Cursor<'payload> {
         }
     }
 
+    fn read_blob_level_merge_policy(&mut self) -> Result<BlobLevelMergePolicy> {
+        match self.read_u8()? {
+            0 => Ok(BlobLevelMergePolicy::Disabled),
+            1 => Ok(BlobLevelMergePolicy::Auto),
+            2 => Ok(BlobLevelMergePolicy::Always),
+            tag => Err(Error::InvalidFormat {
+                message: format!("unknown manifest blob level merge policy {tag}"),
+            }),
+        }
+    }
+
     fn read_codec(&mut self) -> Result<CodecId> {
         match self.read_u8()? {
             0 => Ok(CodecId::None),
@@ -953,7 +982,8 @@ mod tests {
     use super::{MANIFEST_VERSION, ManifestStore, decode_state, manifest_path};
     use crate::{
         options::{
-            BucketOptions, CompressionProfile, FilterPolicy, IndexSearchPolicy, PrefixFilterPolicy,
+            BlobLevelMergePolicy, BucketOptions, CompressionProfile, FilterPolicy,
+            IndexSearchPolicy, PrefixFilterPolicy,
         },
         prefix::PrefixExtractor,
     };
@@ -991,7 +1021,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_decode_v5_bucket_options_default_blob_level_merge() {
+    fn manifest_decode_v5_bucket_options_default_blob_level_merge_policy() {
         let mut payload = Vec::new();
         super::put_u64(&mut payload, 0);
         super::put_u32(&mut payload, 1);
@@ -1013,8 +1043,35 @@ mod tests {
 
         let state = decode_state(&payload, 5).expect("v5 manifest decodes");
         let options = state.buckets().get("users").expect("bucket options exist");
-        assert!(!options.blob_level_merge_enabled);
+        assert_eq!(options.blob_level_merge_policy, BlobLevelMergePolicy::Auto);
         assert_eq!(options.blob_threshold_bytes, 128 * 1024);
+    }
+
+    #[test]
+    fn manifest_decode_v6_bool_bucket_options_as_policy() {
+        let mut payload = Vec::new();
+        super::put_u64(&mut payload, 0);
+        super::put_u32(&mut payload, 1);
+        super::put_bytes(&mut payload, b"users").expect("bucket name encodes");
+        super::put_bool(&mut payload, true);
+        super::put_compression_profile(&mut payload, CompressionProfile::Fast);
+        super::put_usize(&mut payload, 4096).expect("block size encodes");
+        super::put_filter_policy(&mut payload, FilterPolicy::Disabled);
+        super::put_prefix_extractor(&mut payload, &PrefixExtractor::Disabled)
+            .expect("prefix extractor encodes");
+        super::put_prefix_filter_policy(&mut payload, PrefixFilterPolicy::Disabled);
+        super::put_index_search_policy(&mut payload, IndexSearchPolicy::Auto);
+        super::put_usize(&mut payload, 128 * 1024).expect("threshold encodes");
+        super::put_bool(&mut payload, true);
+        super::put_u32(&mut payload, 0);
+        super::put_u32(&mut payload, 0);
+
+        let state = decode_state(&payload, 6).expect("v6 manifest decodes");
+        let options = state.buckets().get("users").expect("bucket options exist");
+        assert_eq!(
+            options.blob_level_merge_policy,
+            BlobLevelMergePolicy::Always
+        );
     }
 
     #[test]

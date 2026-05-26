@@ -761,12 +761,37 @@ crash/recovery fault injection.
 
 **Acceptance Gate**:
 
-- `blob_level_merge_enabled` controls compaction-time rewriting of retained
-  large values into output blob files.
+- Level Merge has a compaction-time rewrite path for retained large values.
 - Value-lazy range/prefix APIs avoid blob reads until callers request values.
 - GC candidate selection uses blob properties metadata and live-record copying
   uses indexed blob reads.
 - Recovery fault matrix covers representative temp publish, missing file,
   corrupt file, and unreferenced formal file cases.
 - Protocol/docs and benchmark notes describe the implemented behavior.
+- Full local Rust verification passes.
+
+### Phase 39: Automatic Blob Maintenance Policy
+
+**Status**: Complete
+
+**Goal**: Close the Phase 38 policy gaps by making blob Level Merge automatic
+by default and batching blob GC candidates.
+
+**Entry Condition**: Phase 38 complete and user clarifies that Level Merge
+should use an automatic strategy and GC should handle multiple candidates in
+one maintenance pass.
+
+**Acceptance Gate**:
+
+- `BucketOptions` exposes `BlobLevelMergePolicy` with `Auto` as the default.
+- Manifest v7 persists the policy, while v5/v6 bucket options decode into the
+  new policy without losing compatibility.
+- Auto Level Merge rewrites retained blob values when compaction output would
+  otherwise keep scattered blob references or leave stale input blob refs
+  behind.
+- `Disabled` and `Always` remain available for benchmarks and explicit tuning.
+- Blob GC batches all candidates that pass the discard threshold into one
+  rewrite plan and one manifest publish.
+- Protocol, usage docs, README, benchmark notes, tests, and evidence describe
+  the implemented behavior.
 - Full local Rust verification passes.

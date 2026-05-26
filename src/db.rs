@@ -17,12 +17,12 @@ use crate::{
     iterator::{Direction, Iter, LazyIter, ScanSelector},
     lsm::{
         CompactionInput as LsmCompactionInput, CompactionOutput as LsmCompactionOutput,
-        FlushInput as LsmFlushInput, LsmTree,
+        CompactionTablePayload as LsmCompactionTablePayload, FlushInput as LsmFlushInput, LsmTree,
     },
     manifest::{self, ManifestState, ManifestStore},
     options::{
-        BucketOptions, DbOptions, DurabilityMode, FailOnCorruptionPolicy, FilterPolicy,
-        PrefixFilterPolicy, StorageMode, WriteOptions,
+        BlobLevelMergePolicy, BucketOptions, DbOptions, DurabilityMode, FailOnCorruptionPolicy,
+        FilterPolicy, PrefixFilterPolicy, StorageMode, WriteOptions,
     },
     recovery,
     snapshot::{Snapshot, SnapshotTracker},
@@ -114,7 +114,7 @@ struct BlobGcRewriteRecord {
 }
 
 struct BlobGcRewritePlan {
-    candidate: BlobGcCandidate,
+    candidates: Vec<BlobGcCandidate>,
     new_blob_file_id: u64,
     tables: Vec<BlobGcRewriteTable>,
     records: Vec<BlobGcRewriteRecord>,
@@ -1498,7 +1498,9 @@ impl Db {
         let mut next_table_id = self.next_table_id()?;
 
         for input in compaction_inputs {
-            if input.input.trivial_move {
+            let force_rewrite_trivial =
+                input.tree.options.blob_level_merge_policy == BlobLevelMergePolicy::Always;
+            if input.input.trivial_move && !force_rewrite_trivial {
                 outputs.push(NamedCompactionOutput {
                     bucket: input.bucket.clone(),
                     output: LsmCompactionOutput {
@@ -1521,6 +1523,12 @@ impl Db {
                     return Err(error);
                 }
             };
+            let mut table_options = input.input.table_options.clone();
+            table_options.rewrite_blob_indexes = should_rewrite_blob_indexes_for_compaction(
+                &input.input,
+                &payloads,
+                input.tree.options.blob_level_merge_policy,
+            );
             let mut output_tables = Vec::with_capacity(payloads.len());
             for payload in payloads {
                 let table_id = next_table_id;
@@ -1539,7 +1547,7 @@ impl Db {
                     &table_path,
                     table_id,
                     input.input.table_level,
-                    &input.input.table_options,
+                    &table_options,
                     &payload.point_records,
                     &payload.range_tombstones,
                 ) {
@@ -1571,11 +1579,17 @@ impl Db {
             return Ok(());
         };
 
-        let input_bytes = plan.candidate.total_bytes;
-        let discarded_bytes = plan
-            .candidate
-            .total_bytes
-            .saturating_sub(plan.candidate.live_bytes);
+        let input_bytes = plan.candidates.iter().fold(0_u64, |bytes, candidate| {
+            bytes.saturating_add(candidate.total_bytes)
+        });
+        let discarded_bytes = plan.candidates.iter().fold(0_u64, |bytes, candidate| {
+            bytes.saturating_add(candidate.total_bytes.saturating_sub(candidate.live_bytes))
+        });
+        let obsolete_blob_ids = plan
+            .candidates
+            .iter()
+            .map(|candidate| candidate.file_id)
+            .collect::<Vec<_>>();
 
         let header = blob::BlobFileHeader::new(
             plan.new_blob_file_id,
@@ -1625,7 +1639,7 @@ impl Db {
             return Err(error);
         }
 
-        if let Err(error) = self.publish_compacted_tables(&outputs, &[plan.candidate.file_id]) {
+        if let Err(error) = self.publish_compacted_tables(&outputs, &obsolete_blob_ids) {
             let _ = remove_storage_files(db_path, &written_table_ids);
             return Err(error);
         }
@@ -1646,9 +1660,14 @@ impl Db {
     }
 
     fn build_blob_gc_rewrite_plan(&self, db_path: &Path) -> Result<Option<BlobGcRewritePlan>> {
-        let Some(candidate) = self.choose_blob_gc_candidate(db_path)? else {
+        let candidates = self.choose_blob_gc_candidates(db_path)?;
+        if candidates.is_empty() {
             return Ok(None);
-        };
+        }
+        let candidate_file_ids = candidates
+            .iter()
+            .map(|candidate| candidate.file_id)
+            .collect::<BTreeSet<_>>();
 
         let mut next_table_id = self.next_table_id()?;
         let new_blob_file_id = next_table_id.get();
@@ -1662,7 +1681,11 @@ impl Db {
 
         for (bucket, tree) in buckets.iter() {
             for table in tree.tables_snapshot()? {
-                if !table.blob_file_ids().contains(&candidate.file_id) {
+                if !table
+                    .blob_file_ids()
+                    .iter()
+                    .any(|file_id| candidate_file_ids.contains(file_id))
+                {
                     continue;
                 }
                 let output_table_id = next_table_id;
@@ -1676,7 +1699,7 @@ impl Db {
                     let Some(ValueRef::BlobIndex(index)) = point_record.value.as_ref() else {
                         continue;
                     };
-                    if index.file_id != candidate.file_id {
+                    if !candidate_file_ids.contains(&index.file_id) {
                         continue;
                     }
                     let blob_record = blob::read_record_for_index(
@@ -1712,16 +1735,16 @@ impl Db {
         rewrite_records.sort_by(|left, right| left.internal_key.cmp(&right.internal_key));
 
         Ok(Some(BlobGcRewritePlan {
-            candidate,
+            candidates,
             new_blob_file_id,
             tables,
             records: rewrite_records,
         }))
     }
 
-    fn choose_blob_gc_candidate(&self, db_path: &Path) -> Result<Option<BlobGcCandidate>> {
+    fn choose_blob_gc_candidates(&self, db_path: &Path) -> Result<Vec<BlobGcCandidate>> {
         let live_bytes_by_file = self.live_blob_bytes_by_file()?;
-        let mut best = None;
+        let mut candidates = Vec::new();
 
         for (file_id, live_bytes) in live_bytes_by_file {
             let properties = blob::read_blob_file_properties(db_path, file_id)?;
@@ -1740,20 +1763,19 @@ impl Db {
                 continue;
             }
 
-            let candidate = BlobGcCandidate {
+            candidates.push(BlobGcCandidate {
                 file_id,
                 total_bytes,
                 live_bytes,
-            };
-            let replace = best.as_ref().is_none_or(|current: &BlobGcCandidate| {
-                discardable_bytes > current.total_bytes.saturating_sub(current.live_bytes)
             });
-            if replace {
-                best = Some(candidate);
-            }
         }
+        candidates.sort_by(|left, right| {
+            let left_discardable = left.total_bytes.saturating_sub(left.live_bytes);
+            let right_discardable = right.total_bytes.saturating_sub(right.live_bytes);
+            right_discardable.cmp(&left_discardable)
+        });
 
-        Ok(best)
+        Ok(candidates)
     }
 
     fn next_table_id(&self) -> Result<table::TableId> {
@@ -2205,6 +2227,82 @@ fn allowed_blob_file_ids_from_manifest(manifest: &ManifestState) -> BTreeSet<u64
     let mut file_ids = referenced_blob_file_ids_from_manifest(manifest);
     file_ids.extend(manifest.pending_blob_deletions().keys().copied());
     file_ids
+}
+
+fn should_rewrite_blob_indexes_for_compaction(
+    input: &LsmCompactionInput,
+    payloads: &[LsmCompactionTablePayload],
+    policy: BlobLevelMergePolicy,
+) -> bool {
+    match policy {
+        BlobLevelMergePolicy::Disabled => false,
+        BlobLevelMergePolicy::Always => payloads_have_blob_references(payloads),
+        BlobLevelMergePolicy::Auto => {
+            let output_bytes = payload_blob_bytes_by_file(payloads);
+            if output_bytes.is_empty() {
+                return false;
+            }
+            if output_bytes.len() > 1 {
+                return true;
+            }
+
+            let input_bytes = input_blob_bytes_by_file(input);
+            input_bytes.iter().any(|(file_id, input_bytes)| {
+                let output_bytes = output_bytes.get(file_id).copied().unwrap_or(0);
+                *input_bytes > output_bytes
+            })
+        }
+    }
+}
+
+fn payloads_have_blob_references(payloads: &[LsmCompactionTablePayload]) -> bool {
+    payloads.iter().any(|payload| {
+        payload
+            .point_records
+            .iter()
+            .any(|(_, value)| matches!(value, Some(ValueRef::BlobIndex(_) | ValueRef::Blob { .. })))
+    })
+}
+
+fn input_blob_bytes_by_file(input: &LsmCompactionInput) -> BTreeMap<u64, u64> {
+    let mut bytes_by_file = BTreeMap::new();
+    for table in &input.input_tables {
+        for reference in table.properties().blob_references() {
+            bytes_by_file
+                .entry(reference.file_id)
+                .and_modify(|bytes: &mut u64| {
+                    *bytes = bytes.saturating_add(reference.referenced_bytes);
+                })
+                .or_insert(reference.referenced_bytes);
+        }
+    }
+    bytes_by_file
+}
+
+fn payload_blob_bytes_by_file(payloads: &[LsmCompactionTablePayload]) -> BTreeMap<u64, u64> {
+    let mut bytes_by_file = BTreeMap::new();
+    for payload in payloads {
+        for (_, value) in &payload.point_records {
+            let Some((file_id, referenced_bytes)) = blob_reference_bytes(value.as_ref()) else {
+                continue;
+            };
+            bytes_by_file
+                .entry(file_id)
+                .and_modify(|bytes: &mut u64| {
+                    *bytes = bytes.saturating_add(referenced_bytes);
+                })
+                .or_insert(referenced_bytes);
+        }
+    }
+    bytes_by_file
+}
+
+fn blob_reference_bytes(value: Option<&ValueRef>) -> Option<(u64, u64)> {
+    match value {
+        Some(ValueRef::BlobIndex(index)) => Some((index.file_id, index.encoded_len)),
+        Some(ValueRef::Blob { file_id, len, .. }) => Some((*file_id, *len)),
+        Some(ValueRef::Inline(_)) | None => None,
+    }
 }
 
 fn blob_gc_table_write_options(options: &BucketOptions) -> table::TableWriteOptions {

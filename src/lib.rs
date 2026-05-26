@@ -41,9 +41,9 @@ pub use error::{Error, Result};
 pub use iterator::{Direction, Iter, LazyIter, LazyKeyValue, LazyValue};
 pub use mvcc::SnapshotSequence;
 pub use options::{
-    BlobGcRatio, BucketOptions, CompressionProfile, DbOptions, DurabilityMode,
-    FailOnCorruptionPolicy, FilterPolicy, IndexSearchPolicy, PrefixFilterPolicy, StorageMode,
-    WriteOptions,
+    BlobGcRatio, BlobLevelMergePolicy, BucketOptions, CompressionProfile, DbOptions,
+    DurabilityMode, FailOnCorruptionPolicy, FilterPolicy, IndexSearchPolicy, PrefixFilterPolicy,
+    StorageMode, WriteOptions,
 };
 pub use prefix::PrefixExtractor;
 pub use recovery::RecoveryReport;

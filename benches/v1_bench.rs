@@ -6,8 +6,9 @@ use std::{
 };
 
 use trine_kv::{
-    BlobGcRatio, BucketOptions, Db, DbOptions, FilterPolicy, IndexSearchPolicy, KeyRange,
-    PrefixExtractor, PrefixFilterPolicy, TransactionOptions, WriteBatch, WriteOptions,
+    BlobGcRatio, BlobLevelMergePolicy, BucketOptions, Db, DbOptions, FilterPolicy,
+    IndexSearchPolicy, KeyRange, PrefixExtractor, PrefixFilterPolicy, TransactionOptions,
+    WriteBatch, WriteOptions,
     codec::{BlockCodec, FastLz4BlockCodec, NoneCodec},
     search,
 };
@@ -448,7 +449,10 @@ fn bench_blob_gc_rewrite() -> BenchResult {
         let mut options = DbOptions::persistent(&dir);
         options.blob_gc_min_file_bytes = 1;
         options.blob_gc_discardable_ratio = BlobGcRatio::from_millionths(300_000);
-        options.default_bucket_options = large_blob_options();
+        options.default_bucket_options = BucketOptions {
+            blob_level_merge_policy: BlobLevelMergePolicy::Disabled,
+            ..large_blob_options()
+        };
         let db = Db::open(options).expect("persistent db opens");
         let bucket = db.default_bucket().expect("bucket opens");
 
@@ -484,7 +488,7 @@ fn bench_blob_level_merge() -> BenchResult {
         let mut options = DbOptions::persistent(&dir);
         options.blob_gc_enabled = false;
         options.default_bucket_options = BucketOptions {
-            blob_level_merge_enabled: true,
+            blob_level_merge_policy: BlobLevelMergePolicy::Always,
             ..large_blob_options()
         };
         let db = Db::open(options).expect("persistent db opens");

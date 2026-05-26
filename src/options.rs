@@ -212,6 +212,14 @@ impl Default for BlobGcRatio {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BlobLevelMergePolicy {
+    Disabled,
+    #[default]
+    Auto,
+    Always,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketOptions {
     pub allow_empty_keys: bool,
@@ -222,7 +230,7 @@ pub struct BucketOptions {
     pub prefix_filter_policy: PrefixFilterPolicy,
     pub index_search_policy: IndexSearchPolicy,
     pub blob_threshold_bytes: usize,
-    pub blob_level_merge_enabled: bool,
+    pub blob_level_merge_policy: BlobLevelMergePolicy,
 }
 
 impl BucketOptions {
@@ -242,8 +250,18 @@ impl BucketOptions {
     }
 
     #[must_use]
+    pub const fn with_blob_level_merge_policy(mut self, policy: BlobLevelMergePolicy) -> Self {
+        self.blob_level_merge_policy = policy;
+        self
+    }
+
+    #[must_use]
     pub const fn with_blob_level_merge_enabled(mut self, enabled: bool) -> Self {
-        self.blob_level_merge_enabled = enabled;
+        self.blob_level_merge_policy = if enabled {
+            BlobLevelMergePolicy::Always
+        } else {
+            BlobLevelMergePolicy::Disabled
+        };
         self
     }
 }
@@ -259,7 +277,7 @@ impl Default for BucketOptions {
             prefix_filter_policy: PrefixFilterPolicy::default(),
             index_search_policy: IndexSearchPolicy::Auto,
             blob_threshold_bytes: Self::DEFAULT_BLOB_THRESHOLD_BYTES,
-            blob_level_merge_enabled: false,
+            blob_level_merge_policy: BlobLevelMergePolicy::Auto,
         }
     }
 }
