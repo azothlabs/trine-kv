@@ -2,80 +2,74 @@
 
 ## Status
 
-Complete
+In Progress
 
 ## Goal
 
-Harden iterator merge and write-path maintenance scheduling: make range/prefix
-iteration choose the next source through a heap and make
-`background_worker_count` drive real foreground-safe background maintenance.
+Separate the internal LSM core from database-wide coordination without changing
+public API behavior or storage formats.
 
 ## Entry Condition
 
-- Phase 19 leveled compaction and range tombstone queries passed locally.
-- Remaining evidence identifies linear scan source merge and foreground-only
-  flush/compaction scheduling as the next production-readiness risks.
+- Phase 20 iterator merge and background maintenance passed locally.
+- User identified that the current tree data structure and database layer are
+  too tightly mixed.
+- Current evidence shows `db.rs` still owns tree state, read visibility,
+  tombstone checks, flush input selection, and compaction retention helpers.
 
 ## Scope
 
-- Replace lazy scan source selection with a heap keyed by user key and scan
-  direction.
-- Keep L0 multi-source merge and L1+ table cursor behavior correct under MVCC
-  visibility and range tombstones.
-- Start background maintenance workers when persistent mode has
-  `background_worker_count > 0`.
-- Schedule immutable memtable flush and compaction work after commits and
-  explicit flushes without publishing partially written tables.
-- Surface background maintenance errors through later writes, `flush()`, and
-  `compact_range()`.
-- Keep in-memory mode free of background worker threads.
-- Preserve in-memory mode behavior.
+- Use `.phrase/protocol/lsm-core-boundary-spec.md` as the source of truth for
+  the extraction.
+- Keep WAL, manifest publish, process lock, recovery, background worker
+  lifecycle, and cross-keyspace batch coordination in the database layer.
+- Move one-keyspace tree state and tree-local rules behind an internal
+  `LsmTree` boundary.
+- Keep MVCC read visibility, range tombstone checks, scan grouping, transaction
+  conflict checks, flush planning, and compaction retention inside LSM core.
+- Preserve in-memory mode as the same logical engine over volatile storage.
+- Keep public API and storage format unchanged.
 
 ## Out Of Scope
 
-- Changing public API.
-- Changing compression policy.
-- Parallel compaction inside one compaction job.
-- Full asynchronous public API.
+- Public API redesign.
+- Storage format changes.
+- WAL or manifest format changes.
+- New compression codecs.
+- Replacing the background worker model.
+- Cross-keyspace compaction.
 
 ## Acceptance Gate
 
-- Iterator `next()` selects candidate source groups through heap operations.
-- Range and prefix scans preserve forward/reverse order and MVCC visibility.
-- `background_worker_count` starts persistent maintenance workers and `0`
-  leaves maintenance synchronous/explicit.
-- Background flush/compaction can reduce immutable/L0 pressure without an
-  explicit user `flush()`.
-- Background errors are not swallowed.
-- Full local Rust verification passes.
+- The boundary spec is written and linked from the v1 protocol.
+- `src/lsm/` exists and owns the first tree-local state boundary.
+- `Db` keeps database-wide coordination but no longer owns the first extracted
+  tree rules for the task slice.
+- Full local Rust verification passes after each code slice.
+- Evidence records what moved and what remains in DB for the next phase.
 
 ## Active Task Slice
 
 ```text
-task064 [x] goal:heap-based lazy iterator source merge | scope:src/iterator.rs,tests | verify:iterator heap unit and persistent scan tests
-task065 [x] goal:background maintenance workers honor background_worker_count | scope:src/db.rs,src/db/commit.rs,tests | verify:background flush/compaction persistent tests
-task066 [x] goal:background maintenance errors surface to callers | scope:src/db.rs,tests | verify:publish-failure/background-error test
-task067 [x] goal:update protocol and evidence for P5/P6 behavior | scope:.phrase | verify:evidence delta and protocol notes
+task068 [x] goal:write complete LSM core boundary spec | scope:.phrase/protocol,.phrase/current.md,.phrase/roadmap.md | verify:protocol link and doc diff checks
+task069 [ ] goal:create internal LSM module and move tree state boundary | scope:src/lsm,src/db.rs,src/lib.rs | verify:cargo test --all-targets --all-features
+task070 [ ] goal:move point read visibility into LsmTree | scope:src/lsm,src/db.rs,tests | verify:point read, tombstone, transaction, persistent tests
 ```
 
 ## Known Blockers
 
-- Background work remains thread-based and bounded to persistent databases.
 - Remote CI cannot be executed locally; it must run after push.
-- GitHub Actions cannot be executed locally; remote CI must run after push.
+- `AGENTS.md` has a pre-existing unstaged edit outside this phase.
+- Later slices still need range/prefix scans, flush, compaction, and transaction
+  conflict checks moved into LSM core after the first boundary is stable.
 
-## Evidence
+## Evidence To Record
 
-- Iterator tests prove heap ordering for forward/reverse scans and live scan
-  correctness.
-- Persistent tests prove background workers flush immutable memtables and compact
-  L0 pressure.
-- A focused failure test proves background maintenance errors are returned to
-  later callers.
-- A coordinator unit test proves a later success does not hide an unreported
-  background failure.
-- Full local Rust verification passed with all targets and features.
+- Boundary spec path and protocol link.
+- First code slice diff proving DB delegates tree-owned behavior to `LsmTree`.
+- Full local verification for each implementation slice.
 
 ## Next Recommendation
 
-- Move to remaining benchmark-guided refinements or release-readiness review.
+- Start task069 by introducing `src/lsm/` and moving tree state behind
+  `LsmTree` without changing behavior.

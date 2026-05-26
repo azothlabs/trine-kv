@@ -2605,3 +2605,44 @@ Record only evidence that can change planning or durable decisions.
 
 - Run benchmark-guided follow-up for wide iterator merges and sustained
   write-load maintenance, or move to release-readiness review if CI is clean.
+
+## 2026-05-26: LSM Core Boundary Spec Added
+
+### Observation
+
+- `db.rs` still owns database-wide coordination and one-keyspace tree rules in
+  the same module.
+- The mixed responsibilities include tree state, point read visibility, range
+  and prefix scan setup, range tombstone lookup, flush input selection,
+  compaction retention, and transaction conflict helpers.
+- `.phrase/protocol/lsm-core-boundary-spec.md` now defines the target boundary
+  between the database layer and one-keyspace `LsmTree`.
+- The v1 protocol now links to the LSM core boundary spec as the internal module
+  boundary source of truth.
+
+### Interpretation
+
+- Phase 21 should proceed as an incremental refactor, not a storage or public
+  API change.
+- MVCC visibility belongs in the LSM core so point read, scan, transaction
+  validation, range tombstone handling, and compaction share one rule set.
+- The first safe code slice is to introduce `src/lsm/` and move tree state
+  behind `LsmTree` before moving read behavior.
+
+### Verification
+
+- `.phrase/protocol/lsm-core-boundary-spec.md` written.
+- `.phrase/protocol/trine-kv-v1-spec.md` links the boundary spec.
+- `git diff --check`
+- forbidden-term scan
+
+### Remaining Blockers
+
+- No Rust code has been moved yet.
+- Remote CI cannot be executed locally; it must run after push.
+- `AGENTS.md` has a pre-existing unstaged edit outside this phase.
+
+### Recommended Next Action
+
+- Start task069: create the internal LSM module and move tree state behind
+  `LsmTree` without changing behavior.

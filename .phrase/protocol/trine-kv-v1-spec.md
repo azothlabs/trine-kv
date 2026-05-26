@@ -36,6 +36,9 @@ Rules:
 - do not copy another database file format;
 - do not change engine behavior without updating this spec or a follow-up ADR;
 - implementation decisions must be proven by Trine tests and benchmarks.
+- internal database/LSM module boundaries are governed by
+  `.phrase/protocol/lsm-core-boundary-spec.md`; that boundary spec does not
+  change the public API or storage format by itself.
 
 ## 3. Vocabulary
 

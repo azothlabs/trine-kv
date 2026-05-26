@@ -377,3 +377,26 @@ risks.
   `compact_range()`.
 - In-memory mode does not start background worker threads.
 - Full local Rust verification passes.
+
+### Phase 21: Internal LSM Core Boundary
+
+**Status**: In Progress
+
+**Goal**: Separate one-keyspace LSM tree rules from database-wide coordination
+without changing public API behavior or storage formats.
+
+**Entry Condition**: Phase 20 complete and user identifies DB/LSM coupling as
+the next maintainability and correctness risk.
+
+**Acceptance Gate**:
+
+- The LSM core boundary spec is written and linked from the v1 protocol.
+- `Db` remains responsible for WAL, manifest publish, process lock, recovery,
+  background worker lifecycle, snapshots, transactions, and cross-keyspace
+  atomicity.
+- `LsmTree` owns active and immutable memtables, table layout, tree-local reads,
+  range tombstones, flush planning, compaction planning, and MVCC retention for
+  one keyspace as the extraction progresses.
+- In-memory mode continues to use the same LSM core.
+- Public API and storage formats remain unchanged.
+- Full local Rust verification passes after each extraction slice.
