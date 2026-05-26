@@ -496,8 +496,6 @@ fn put_index_search_policy(bytes: &mut Vec<u8>, value: IndexSearchPolicy) {
         match value {
             IndexSearchPolicy::Linear => 0,
             IndexSearchPolicy::Binary => 1,
-            IndexSearchPolicy::Eytzinger => 2,
-            IndexSearchPolicy::GallopingWithHint => 3,
             IndexSearchPolicy::Auto => 4,
         },
     );
@@ -932,9 +930,7 @@ impl<'payload> Cursor<'payload> {
         match self.read_u8()? {
             0 => Ok(IndexSearchPolicy::Linear),
             1 => Ok(IndexSearchPolicy::Binary),
-            2 => Ok(IndexSearchPolicy::Eytzinger),
-            3 => Ok(IndexSearchPolicy::GallopingWithHint),
-            4 => Ok(IndexSearchPolicy::Auto),
+            2..=4 => Ok(IndexSearchPolicy::Auto),
             tag => Err(Error::InvalidFormat {
                 message: format!("unknown manifest index search policy {tag}"),
             }),
@@ -1072,6 +1068,30 @@ mod tests {
             options.blob_level_merge_policy,
             BlobLevelMergePolicy::Always
         );
+    }
+
+    #[test]
+    fn manifest_decode_legacy_search_policy_tags_as_auto() {
+        let mut payload = Vec::new();
+        super::put_u64(&mut payload, 0);
+        super::put_u32(&mut payload, 1);
+        super::put_bytes(&mut payload, b"users").expect("bucket name encodes");
+        super::put_bool(&mut payload, true);
+        super::put_compression_profile(&mut payload, CompressionProfile::Fast);
+        super::put_usize(&mut payload, 4096).expect("block size encodes");
+        super::put_filter_policy(&mut payload, FilterPolicy::Disabled);
+        super::put_prefix_extractor(&mut payload, &PrefixExtractor::Disabled)
+            .expect("prefix extractor encodes");
+        super::put_prefix_filter_policy(&mut payload, PrefixFilterPolicy::Disabled);
+        super::put_u8(&mut payload, 2);
+        super::put_usize(&mut payload, 128 * 1024).expect("threshold encodes");
+        super::put_blob_level_merge_policy(&mut payload, BlobLevelMergePolicy::Auto);
+        super::put_u32(&mut payload, 0);
+        super::put_u32(&mut payload, 0);
+
+        let state = decode_state(&payload, 7).expect("v7 manifest decodes");
+        let options = state.buckets().get("users").expect("bucket options exist");
+        assert_eq!(options.index_search_policy, IndexSearchPolicy::Auto);
     }
 
     #[test]

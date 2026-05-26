@@ -1898,8 +1898,6 @@ fn persistent_index_search_policies_preserve_table_reads() {
         ("linear", IndexSearchPolicy::Linear),
         ("binary", IndexSearchPolicy::Binary),
         ("auto", IndexSearchPolicy::Auto),
-        ("eytzinger", IndexSearchPolicy::Eytzinger),
-        ("galloping", IndexSearchPolicy::GallopingWithHint),
     ];
 
     {

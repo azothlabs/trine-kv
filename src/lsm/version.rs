@@ -397,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn range_tombstone_lookup_uses_key_bounds_without_point_filter() {
+    fn range_tombstone_lookup_uses_key_bounds_without_table_filter() {
         let tombstone_table = Arc::new(test_table_with_tombstone(
             43,
             TableLevel(1),
@@ -406,9 +406,10 @@ mod tests {
         ));
         let version = LsmVersion::new(vec![Arc::clone(&tombstone_table)]).expect("valid version");
 
-        assert!(
-            version.point_lookup_tables(b"m").is_empty(),
-            "point filter should skip point lookup for a missing key"
+        assert_eq!(
+            table_ids(version.point_lookup_tables(b"m")),
+            vec![tombstone_table.properties().id],
+            "key bounds keep the table visible when full-table filters are absent"
         );
         assert_eq!(
             table_ids(version.range_tombstone_tables_for_key(b"m")),

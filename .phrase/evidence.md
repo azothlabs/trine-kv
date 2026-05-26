@@ -3850,3 +3850,60 @@ Record only evidence that can change planning or durable decisions.
 - Commit Phase 39, then push to CI. After CI, use larger workload benchmarks to
   decide whether auto Level Merge and GC batching need additional policy
   thresholds.
+
+## 2026-05-26: Phase 40 Table Read-Path Index Hardening Completed
+
+### Observation
+
+- Rust skill, SPEC-AGENTS current context, and the coding module were read
+  before implementation.
+- Data blocks now encode a checked user-key hash index. Point reads use the
+  hash index to find candidate record ranges and compare the real key only for
+  hash collision handling.
+- `IndexSearchPolicy` now exposes only `Linear`, `Binary`, and `Auto`.
+  Manifest tags for the retired policies decode to `Auto`.
+- The benchmark harness no longer reports retired search-policy rows.
+- Persistent table open now reads footer, properties, and the small top-level
+  index. Partition index/filter blocks are read and cached on demand.
+- Per-block point and prefix filters live in partition index blocks, so misses
+  can skip the covered data block after only the relevant partition metadata is
+  loaded.
+- The top-level partition index is stored uncompressed so absolute partition
+  offsets have a stable block length. Partition blocks still use the table
+  codec.
+- `cargo bench --bench v1_bench` after this phase reported:
+  - `random get`: 1488 us for 2048 reads.
+  - `missing get`: 665 us for 2048 reads.
+  - `prefix scan table partitions nonmatching`: 82 us for 128 scans.
+  - `block cache warm read`: 2856 us for 2048 reads.
+  - `cold table read`: 174357 us for 32 reads.
+  - `index seek policy auto large`: 20048 us for 2048 seeks.
+
+### Interpretation
+
+- The table read path now avoids both fake public search-policy switches and
+  the previous all-index/all-filter persistent open behavior.
+- Large tables still need a top-level index in memory, but detailed block
+  filters and block handles are now behind lazy partition loads.
+- Full table filters are no longer kept on persistent table handles; range
+  tombstone checks still use key bounds and loaded tombstone metadata for
+  correctness.
+
+### Verification
+
+- `cargo test randomized_operations_match_mvcc_reference_across_reopen --test model_reference --all-features`
+- `cargo test --all-targets --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --all --check`
+- `cargo bench --bench v1_bench`
+- `git diff --check`
+- forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, `README.md`, `CHANGELOG.md`, and `Cargo.toml`
+
+### Remaining Blockers
+
+- Remote CI cannot be executed locally; it must run after push.
+
+### Recommended Next Action
+
+- Commit Phase 40, then push to CI for the external release signal.

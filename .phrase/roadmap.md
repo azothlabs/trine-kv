@@ -795,3 +795,26 @@ one maintenance pass.
 - Protocol, usage docs, README, benchmark notes, tests, and evidence describe
   the implemented behavior.
 - Full local Rust verification passes.
+
+### Phase 40: Table Read-Path Index Hardening
+
+**Status**: Complete
+
+**Goal**: Remove fake search-policy surface area and make large persistent
+tables open with only the small top-level table index resident.
+
+**Entry Condition**: Phase 39 complete and user requests block hash lookup,
+real search-policy behavior, and partitioned index/filter loading before
+release.
+
+**Acceptance Gate**:
+
+- Data blocks encode and decode a checked point-lookup hash index.
+- Point lookup inside a decoded data block uses the hash index and compares
+  keys only for hash collisions.
+- Retired search-policy manifest tags remain readable by mapping to `Auto`.
+- Benchmark rows advertise only implemented linear, binary, and auto policies.
+- Persistent table open reads footer, properties, and top-level index metadata;
+  partition index/filter blocks load lazily.
+- Filter misses can skip data blocks through lazily loaded partition filters.
+- Full local Rust verification passes.

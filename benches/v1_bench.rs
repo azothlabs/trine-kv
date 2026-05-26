@@ -567,8 +567,6 @@ fn bench_index_seek_policies() -> Vec<BenchResult> {
         for (policy, policy_label) in [
             (IndexSearchPolicy::Linear, "linear"),
             (IndexSearchPolicy::Binary, "binary"),
-            (IndexSearchPolicy::Eytzinger, "eytzinger"),
-            (IndexSearchPolicy::GallopingWithHint, "galloping"),
             (IndexSearchPolicy::Auto, "auto"),
         ] {
             results.push(bench_index_seek_policy(size, label, policy, policy_label));

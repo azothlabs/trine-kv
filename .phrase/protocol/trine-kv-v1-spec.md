@@ -400,6 +400,8 @@ Data block rules:
 
 - records are sorted by internal key;
 - blocks have restart points for efficient seek;
+- blocks store a checked user-key hash index for point lookup, and reads still
+  compare the real user key to handle hash collisions;
 - prefix compression is allowed inside a block;
 - every block has checksum coverage;
 - every block declares compression codec id;
@@ -407,8 +409,10 @@ Data block rules:
 
 Index rules:
 
-- top-level table index maps key ranges to blocks;
-- partitioned index is allowed and preferred for large tables;
+- top-level table index maps key ranges to partition index blocks;
+- partition index blocks map key ranges to data blocks and carry per-block
+  point/prefix filters;
+- partitioned index is required for large tables;
 - index blocks keep a canonical sorted order for validation, range traversal,
   and debugging;
 - index blocks may also carry a search layout optimized for point seek;
@@ -418,10 +422,10 @@ Index rules:
 
 Filter rules:
 
-- each table may have point-key Bloom filters;
-- each table may have prefix filters when a bucket prefix extractor is
+- each table partition may have point-key Bloom filters;
+- each table partition may have prefix filters when a bucket prefix extractor is
   configured;
-- filters are partitionable by table key range for large tables;
+- filters are partitioned by table key range for large tables;
 - filters are advisory only; false positives are allowed, false negatives are
   not.
 - `bits_per_key` and `bits_per_prefix` control Bloom bit counts; implementations
@@ -436,7 +440,9 @@ Footer rules:
 
 Persistent read rule:
 
-- opening a table reads only footer, properties, index, and filter metadata;
+- opening a table reads only footer, properties, and the small top-level index;
+- partition index/filter blocks are read lazily before their covered data
+  blocks;
 - data blocks are read on demand and must verify checksum, codec, and index
   bounds before decoded records affect a read;
 - corrupt data blocks fail the read that touches them, while unrelated filter
@@ -506,22 +512,17 @@ advance_to(cursor, key)
 Allowed policies:
 
 - linear search for tiny arrays;
-- binary or branchless binary search for general sorted arrays;
-- Eytzinger layout for immutable search-only arrays;
-- galloping search followed by local binary search when a cursor has a useful
-  current-position hint.
+- binary search for general sorted arrays;
+- auto policy, currently linear for tiny arrays and binary otherwise.
 
 Design rules:
 
 - data blocks and SSTable record order remain sorted; do not store primary data
-  only in Eytzinger order;
-- Eytzinger layout is allowed for top-level indexes, partition indexes, block
-  restart indexes, and other immutable offset arrays;
-- if Eytzinger is used, the canonical sorted order must still be reconstructable
-  or separately available for verification and sequential traversal;
-- galloping search is used only when the target is likely to be near or after a
-  known cursor position;
-- random point lookup must not default to galloping search without evidence;
+  in a search-only layout;
+- do not expose a public search policy unless the implementation has a distinct
+  data structure or algorithm behind it;
+- retired manifest search-policy tags must decode to `Auto` when they preserve
+  read correctness;
 - search policy thresholds are configuration and benchmark decisions, not
   public API contracts;
 - every optimized policy must have a simple sorted-search fallback;
@@ -534,13 +535,13 @@ small index:
   linear search
 
 medium sorted index:
-  binary or branchless binary search
+  binary search
 
 large immutable index:
-  Eytzinger search layout if benchmarks justify the memory cost
+  partitioned sorted index blocks, loaded lazily
 
 cursor advance with position hint:
-  galloping search, then local binary search
+  advance from the current sorted position, then binary search when needed
 ```
 
 This is a good design only when it stays local to immutable indexes and cursor
@@ -908,8 +909,8 @@ Format tests:
 - internal key ordering;
 - block restart seek;
 - search policy fallback returns the same block as canonical binary search;
-- Eytzinger search layout preserves canonical index ordering externally;
-- galloping `advance_to` never skips the first matching visible key;
+- retired search-policy manifest tags decode to `auto`;
+- sorted `advance_to` never skips the first matching visible key;
 - filter false-negative rejection through deterministic fixtures;
 - prefix extractor compatibility across manifest option changes;
 - prefix filter partition skip behavior;

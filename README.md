@@ -30,8 +30,9 @@ Release packaging notes live in [docs/release.md](docs/release.md).
   before reading blob bytes.
 - Persistent mode with WAL replay, manifest recovery, directory locking, flush,
   compaction, and read-only open.
-- Block-based SSTables with filters, block cache, compression, and configurable
-  index search policies.
+- Block-based SSTables with partitioned index/filter blocks, data-block hash
+  lookup for point reads, block cache, compression, and linear/binary/auto
+  index seek policies.
 - Large values can be separated into Titan-like blob files with `BlobIndex`
   records in SSTables.
 - Automatic blob Level Merge can rewrite retained large values into output blob

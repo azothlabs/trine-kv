@@ -45,10 +45,9 @@ pub(crate) fn partition_point_by(
     match policy {
         IndexSearchPolicy::Linear => linear_partition_point(len, predicate),
         IndexSearchPolicy::Auto if len <= 8 => linear_partition_point(len, predicate),
-        IndexSearchPolicy::Auto
-        | IndexSearchPolicy::Binary
-        | IndexSearchPolicy::Eytzinger
-        | IndexSearchPolicy::GallopingWithHint => binary_partition_point(len, predicate),
+        IndexSearchPolicy::Auto | IndexSearchPolicy::Binary => {
+            binary_partition_point(len, predicate)
+        }
     }
 }
 
@@ -107,8 +106,6 @@ mod tests {
             IndexSearchPolicy::Linear,
             IndexSearchPolicy::Binary,
             IndexSearchPolicy::Auto,
-            IndexSearchPolicy::Eytzinger,
-            IndexSearchPolicy::GallopingWithHint,
         ] {
             let index = partition_point_by(items.len(), policy, |index| items[index] <= 10);
             assert_eq!(index, 5, "policy {policy:?} changed the boundary");

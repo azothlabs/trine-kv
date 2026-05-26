@@ -6,93 +6,82 @@ Complete
 
 ## Goal
 
-Close the policy gaps from Phase 38 by making blob Level Merge automatic by
-default and letting blob GC rewrite multiple stale candidates in one maintenance
-publish.
+Harden the table read path so point lookups use a real data-block hash index,
+unsupported search-policy names disappear, and large tables no longer load the
+full block index/filter metadata at open.
 
 ## Entry Condition
 
-- Phase 38 completed the first pass of Level Merge, value-lazy iteration, GC
-  throughput tightening, and recovery fault injection.
-- User clarified that Level Merge should use an automatic strategy and blob GC
-  should batch multiple candidates.
+- Phase 39 completed automatic blob maintenance policy.
+- User requested the remaining table read-path hardening before release:
+  block hash index, no fake Eytzinger/Galloping switches, and partitioned
+  index/filter loading.
 
 ## Scope
 
-- Replace the boolean Level Merge option with `BlobLevelMergePolicy`.
-- Default Level Merge to `Auto`.
-- Make `Auto` rewrite retained blob values when compaction output would keep
-  references to multiple blob files or leave stale input blob refs behind.
-- Preserve `Disabled` and `Always` for tuning and benchmarks.
-- Bump manifest encoding to v7 and decode v5/v6 manifests into the new policy.
-- Batch all blob GC candidates that pass the discard threshold into one rewrite
-  plan and one manifest publish.
-- Update tests, benchmarks, protocol, usage docs, roadmap, and evidence.
+- Encode and decode a data-block hash index that maps user-key hash to record
+  ranges and uses key comparison only to resolve hash collisions.
+- Remove `Eytzinger` and `GallopingWithHint` from the public search-policy
+  surface unless fresh benchmark evidence justifies a real implementation.
+- Keep old manifest tags readable by mapping retired search policies to `Auto`.
+- Store table block index/filter metadata in partition blocks behind a small
+  top-level index.
+- Load index partitions lazily for point/range/prefix reads.
+- Update protocol, usage docs, benchmarks, tests, roadmap, and evidence.
 
 ## Out Of Scope
 
-- New knobs for maximum GC batch size.
-- Workload-adaptive policy learned from long-running telemetry.
-- Changing the blob file format.
+- New public tuning knobs for index partition size.
+- A separate index-block cache shared across tables.
+- Changing WAL, MVCC, blob, or compaction semantics.
 
 ## Acceptance Gate
 
-- Default bucket options use `BlobLevelMergePolicy::Auto`.
-- Auto Level Merge rewrites retained large values without requiring users to
-  enable a boolean option.
-- `Disabled` keeps old blob references for tests and GC-only workloads.
-- GC rewrites multiple stale candidates in one pass and records one run.
-- Manifest v5/v6 compatibility tests pass.
-- Benchmark rows continue to distinguish lazy range, GC rewrite, and Level
-  Merge.
+- Point reads inside a decoded data block do not fall back to binary search for
+  normal key lookup.
+- Retired search-policy manifest tags remain readable.
+- Benchmarks no longer advertise Eytzinger/Galloping rows.
+- Persistent open reads only footer/properties/top-level index metadata, not
+  every block filter/index partition.
+- Filter misses can skip data blocks using lazily loaded partition filters.
 - Full local Rust verification passes.
 
 ## Active Task Slice
 
 ```text
-task131 [x] goal:replace Level Merge boolean with policy | scope:options manifest docs tests | verify:manifest_decode_* + persistent_manifest_keeps_bucket_options_across_reopen
-task132 [x] goal:auto-rewrite retained blob refs | scope:db compaction tests | verify:persistent_blob_level_merge_auto_rewrites_retained_blob_indexes
-task133 [x] goal:batch blob GC candidates | scope:db tests benches | verify:persistent_blob_gc_batches_multiple_stale_candidates
-task134 [x] goal:update docs/evidence and full gate | scope:.phrase docs README | verify:full Rust verification
+task135 [x] goal:on-disk block hash lookup | scope:src/table.rs tests | verify:data_block_point_lookup_uses_hash_index
+task136 [x] goal:remove fake search policies | scope:options manifest benches docs tests | verify:manifest legacy tag test + bench rows
+task137 [x] goal:lazy partitioned index/filter | scope:src/table.rs persistent tests | verify:filter miss skips data block and partition metadata loads lazily
+task138 [x] goal:update evidence and release gate | scope:.phrase docs | verify:full Rust verification
 ```
 
 ## Known Blockers
 
 - Remote CI cannot be executed locally; it must run after push.
-- GC still writes one output blob file per batch. A future phase can add a
-  maximum output size if benchmarks show large batches causing stalls.
 
 ## Evidence
 
-- Rust skill and SPEC-AGENTS context were read before implementation.
-- `BucketOptions` now stores `blob_level_merge_policy`; default is `Auto`.
-- Manifest v7 writes the policy enum. v6 boolean manifests decode `true` as
-  `Always` and `false` as `Auto`; v5 and older manifests default to `Auto`.
-- Auto Level Merge rewrites retained blob refs when output refs span multiple
-  blob files or when compaction drops part of an input blob file's refs.
-- `Disabled` prevents Level Merge and lets GC-only tests exercise stale blob
-  cleanup.
-- Blob GC candidate selection returns all candidates that pass the configured
-  threshold, and the rewrite plan handles each table once even if it references
-  multiple candidates.
-- Benchmark rows from `cargo bench --bench v1_bench`:
-  - `blob range scan`: 12929 us for 32 scans.
-  - `blob range lazy keys`: 173 us for 32 scans.
-  - `blob GC rewrite`: 126649 us.
-  - `blob level merge`: 123261 us.
-- Targeted tests passed:
-  - `cargo test --test persistent_wal --all-features`
-  - `cargo test manifest_decode --all-features`
-  - `cargo test blob::tests --all-features`
-- Full local gate passed:
-  - `cargo test --all-targets --all-features`
-  - `cargo clippy --all-targets --all-features`
-  - `cargo fmt --all --check`
-  - `git diff --check`
-  - forbidden-term scan over `.phrase`, `src`, `tests`, `benches`,
-    `examples`, `docs`, and `README.md`
+- Rust skill, SPEC-AGENTS context, and the coding module were read before
+  implementation.
+- Data blocks now encode a checked user-key hash index. Point lookup uses the
+  hash index to find candidate record ranges and compares keys only to handle
+  hash collisions.
+- `Eytzinger` and `GallopingWithHint` were removed from the public
+  `IndexSearchPolicy` surface. Retired manifest tags `2` and `3` decode to
+  `Auto`.
+- Persistent table open now reads footer, properties, and the small top-level
+  index. Per-partition block index/filter metadata is loaded on demand.
+- Full table point/prefix filters are not kept in persistent table handles;
+  per-block filters inside lazily loaded index partitions still skip data
+  blocks on misses.
+- `cargo bench --bench v1_bench` reports only linear, binary, and auto search
+  policy rows.
+- `cargo test --all-targets --all-features`, `cargo clippy --all-targets
+  --all-features -- -D warnings`, `cargo fmt --all --check`,
+  `cargo bench --bench v1_bench`, `git diff --check`, and the
+  forbidden-term scan pass locally.
 
 ## Next Recommendation
 
-- Commit Phase 39. After CI, use workload benchmarks to decide whether GC
-  batching needs a configurable byte limit.
+- Commit Phase 40, then use remote CI as the final external release signal
+  after push.

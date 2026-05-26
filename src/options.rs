@@ -70,8 +70,6 @@ impl Default for PrefixFilterPolicy {
 pub enum IndexSearchPolicy {
     Linear,
     Binary,
-    Eytzinger,
-    GallopingWithHint,
     #[default]
     Auto,
 }
