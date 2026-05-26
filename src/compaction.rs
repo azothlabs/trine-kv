@@ -32,7 +32,7 @@ impl CompactionTable {
         }
     }
 
-    const fn has_key_bounds(&self) -> bool {
+    fn has_key_bounds(&self) -> bool {
         !(self.smallest_user_key.is_empty() && self.largest_user_key.is_empty())
     }
 

@@ -25,7 +25,7 @@ pub enum ValueRef {
 
 impl ValueRef {
     #[must_use]
-    pub const fn len(&self) -> u64 {
+    pub fn len(&self) -> u64 {
         match self {
             Self::Inline(bytes) => bytes.len() as u64,
             Self::Blob { len, .. } => *len,
@@ -33,7 +33,7 @@ impl ValueRef {
     }
 
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 

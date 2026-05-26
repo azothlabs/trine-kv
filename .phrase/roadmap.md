@@ -204,3 +204,20 @@ tuning.
 - A hotspot is selected from benchmark evidence before implementation.
 - The tuning change has before/after benchmark evidence and keeps the full
   release gate passing.
+
+### Phase 13: Rust 1.85 CI Compatibility Fix
+
+**Status**: Complete
+
+**Goal**: Restore CI compatibility with the declared Rust 1.85 MSRV without
+raising the crate's minimum supported compiler.
+
+**Entry Condition**: Remote CI reports Rust 1.85 rejecting crate code that
+newer local toolchains accepted.
+
+**Acceptance Gate**:
+
+- Code no longer uses unstable-in-1.85 `Vec` methods inside `const fn`.
+- Runtime public API behavior and storage formats remain unchanged.
+- Local verification passes for formatting, clippy, tests, examples, package
+  checks, and dry-run publishing.

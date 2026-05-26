@@ -2111,3 +2111,54 @@ Record only evidence that can change planning or durable decisions.
 
 - Push and let CI run, then use the `Publish` workflow with `mode=dry-run`
   before any real publish.
+
+## 2026-05-26: Rust 1.85 CI Compatibility Fix Passed
+
+### Observation
+
+- Remote CI runs Rust 1.85 because `Cargo.toml` declares
+  `rust-version = "1.85"` and the CI workflow installs
+  `dtolnay/rust-toolchain@1.85.0`.
+- Rust 1.85 rejects `Vec::len` and `Vec::is_empty` inside `const fn` bodies.
+- `ValueRef::len`, `ValueRef::is_empty`, and
+  `CompactionTable::has_key_bounds` no longer use `const fn`.
+- The local machine has Rust 1.87 as the default toolchain and does not have
+  Rust 1.85 installed.
+
+### Interpretation
+
+- Task048 is complete.
+- Phase 13 satisfies its local acceptance gate.
+- Keeping Rust 1.85 in CI is intentional because it protects the crate's
+  declared MSRV. A newer stable job can be added later, but it should not
+  replace the MSRV gate while `rust-version` remains 1.85.
+- The fix changes compile-time const availability only; runtime behavior,
+  public operation semantics, and storage formats are unchanged.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo check --target x86_64-pc-windows-gnu`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo run --example quickstart`
+- `cargo run --example user_store`
+- `cargo run --example event_index`
+- `cargo package --allow-dirty --list`
+- `cargo package --allow-dirty --locked`
+- `cargo publish --dry-run --allow-dirty --locked`
+- `git diff --check`
+- forbidden terminology scan over workflows, source, tests, phase notes, Cargo
+  metadata, benches, docs, README, examples, and changelog
+- targeted scan for the removed `const fn` names
+
+### Remaining Blockers
+
+- GitHub Actions was not executed locally; the remote workflow must run after
+  push to confirm the exact Rust 1.85 environment.
+
+### Recommended Next Action
+
+- Push and let CI run. If the MSRV job passes, consider adding a second
+  `stable` CI job for newer-toolchain coverage without weakening the Rust 1.85
+  gate.
