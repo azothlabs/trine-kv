@@ -290,7 +290,7 @@ impl SourceCursor {
     fn next_group(&mut self) -> Result<Option<RecordGroup>> {
         match self {
             Self::Memtable(cursor) => cursor.next_group(),
-            Self::Table(cursor) => Ok(cursor.next_group()),
+            Self::Table(cursor) => cursor.next_group(),
         }
     }
 }

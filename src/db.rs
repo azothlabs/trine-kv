@@ -21,7 +21,10 @@ use crate::{
     keyspace::{Keyspace, KeyspaceName},
     manifest::{self, ManifestState, ManifestStore},
     memtable::Memtable,
-    options::{DbOptions, DurabilityMode, FailOnCorruptionPolicy, KeyspaceOptions, StorageMode},
+    options::{
+        DbOptions, DurabilityMode, FailOnCorruptionPolicy, FilterPolicy, KeyspaceOptions,
+        PrefixFilterPolicy, StorageMode,
+    },
     recovery,
     snapshot::{Snapshot, SnapshotTracker},
     stats::{DbStats, LevelStats},
@@ -229,7 +232,7 @@ impl Db {
         recovery::fail_on_unreferenced_storage_files(
             path,
             &referenced_table_file_ids(manifest.state()),
-            &referenced_blob_file_ids(&keyspaces)?,
+            &referenced_blob_file_ids_from_manifest(manifest.state()),
         )?;
 
         let wal_path = wal::wal_path(path);
@@ -547,12 +550,14 @@ impl Db {
                 level_entry.tables += 1;
                 level_entry.bytes = level_entry.bytes.saturating_add(table_bytes);
 
-                for record in table.point_records() {
-                    if let Some(ValueRef::Blob { file_id, len, .. }) = &record.value {
-                        live_blob_bytes_by_file
-                            .entry(*file_id)
-                            .and_modify(|bytes| *bytes = bytes.saturating_add(*len))
-                            .or_insert(*len);
+                if let Ok(records) = table.point_records() {
+                    for record in records {
+                        if let Some(ValueRef::Blob { file_id, len, .. }) = record.value {
+                            live_blob_bytes_by_file
+                                .entry(file_id)
+                                .and_modify(|bytes| *bytes = bytes.saturating_add(len))
+                                .or_insert(len);
+                        }
                     }
                 }
             }
@@ -994,11 +999,12 @@ impl Db {
                 input_table_ids.push(table.properties().id);
                 point_records.extend(
                     table
-                        .point_records()
-                        .iter()
-                        .map(|record| (record.internal_key.clone(), record.value.clone())),
+                        .point_records()?
+                        .into_iter()
+                        .map(|record| (record.internal_key, record.value)),
                 );
-                range_tombstones.extend(table.range_tombstones().iter().cloned());
+                let table_tombstones = table.range_tombstones()?;
+                range_tombstones.extend(table_tombstones.iter().cloned());
             }
             let point_records = compact_point_records(point_records, oldest_active_snapshot);
             let point_records = cleanup_point_tombstones(&point_records);
@@ -1277,7 +1283,6 @@ fn keyspaces_from_manifest(
                     ),
                 });
             }
-            validate_table_blob_refs(db_path, &table)?;
             tables.push(Arc::new(table));
         }
 
@@ -1288,16 +1293,6 @@ fn keyspaces_from_manifest(
     }
 
     Ok(keyspaces)
-}
-
-fn validate_table_blob_refs(db_path: &Path, table: &Table) -> Result<()> {
-    for record in table.point_records() {
-        if let Some(value @ ValueRef::Blob { .. }) = record.value.as_ref() {
-            crate::blob::read_value(db_path, value)?;
-        }
-    }
-
-    Ok(())
 }
 
 fn active_memtable_bytes(state: &KeyspaceState) -> Result<u64> {
@@ -1449,6 +1444,18 @@ fn referenced_table_file_ids(manifest: &ManifestState) -> BTreeSet<table::TableI
         .collect()
 }
 
+fn referenced_blob_file_ids_from_manifest(manifest: &ManifestState) -> BTreeSet<u64> {
+    manifest
+        .tables()
+        .values()
+        .flat_map(|tables| {
+            tables
+                .iter()
+                .flat_map(|properties| properties.blob_file_ids.iter().copied())
+        })
+        .collect()
+}
+
 fn referenced_blob_file_ids(
     keyspaces: &BTreeMap<String, Arc<KeyspaceState>>,
 ) -> Result<BTreeSet<u64>> {
@@ -1471,6 +1478,22 @@ fn validate_keyspace_options(options: &KeyspaceOptions) -> Result<()> {
     if options.block_bytes == 0 {
         return Err(Error::invalid_options("block size must be non-zero"));
     }
+    if matches!(
+        options.filter_policy,
+        FilterPolicy::Bloom { bits_per_key: 0 }
+    ) {
+        return Err(Error::invalid_options(
+            "bits_per_key must be non-zero for Bloom filters",
+        ));
+    }
+    if matches!(
+        options.prefix_filter_policy,
+        PrefixFilterPolicy::Bloom { bits_per_prefix: 0 }
+    ) {
+        return Err(Error::invalid_options(
+            "bits_per_prefix must be non-zero for Bloom filters",
+        ));
+    }
     if options.blob_threshold_bytes == 0 {
         return Err(Error::invalid_options("blob threshold must be non-zero"));
     }
@@ -1481,6 +1504,7 @@ fn validate_keyspace_options(options: &KeyspaceOptions) -> Result<()> {
 fn table_write_options(options: &KeyspaceOptions) -> table::TableWriteOptions {
     table::TableWriteOptions {
         codec: options.compression.codec_id(),
+        block_bytes: options.block_bytes,
         filter_policy: options.filter_policy,
         prefix_extractor: options.prefix_extractor.clone(),
         prefix_filter_policy: options.prefix_filter_policy,
@@ -1699,9 +1723,9 @@ fn collect_point_key_records(
                     key,
                     state.options.index_search_policy,
                     block_cache,
-                )
+                )?
                 .into_iter()
-                .map(|record| (record.internal_key.clone(), record.value.clone())),
+                .map(|record| (record.internal_key, record.value)),
         );
     }
     records.sort_by(|left, right| left.0.cmp(&right.0));
@@ -1757,9 +1781,9 @@ fn collect_range_point_records(
                     range,
                     state.options.index_search_policy,
                     block_cache,
-                )
+                )?
                 .into_iter()
-                .map(|record| (record.internal_key.clone(), record.value.clone())),
+                .map(|record| (record.internal_key, record.value)),
         );
     }
     records.sort_by(|left, right| left.0.cmp(&right.0));
@@ -1775,16 +1799,12 @@ fn collect_range_tombstones(state: &KeyspaceState) -> Result<Vec<RangeTombstone>
         .read()
         .map_err(|_| lock_poisoned("table list"))?;
     for table in tables.iter() {
-        tombstones.extend(
-            table
-                .range_tombstones()
-                .iter()
-                .map(|tombstone| RangeTombstone {
-                    range: tombstone.range.clone(),
-                    sequence: tombstone.sequence,
-                    batch_index: tombstone.batch_index,
-                }),
-        );
+        let table_tombstones = table.range_tombstones()?;
+        tombstones.extend(table_tombstones.iter().map(|tombstone| RangeTombstone {
+            range: tombstone.range.clone(),
+            sequence: tombstone.sequence,
+            batch_index: tombstone.batch_index,
+        }));
     }
 
     Ok(tombstones)
@@ -1877,7 +1897,7 @@ fn read_visible_point(
             read_sequence,
             state.options.index_search_policy,
             block_cache,
-        ) {
+        )? {
             keep_newer_point_candidate(&mut candidate, &record.internal_key, record.value.as_ref());
         }
     }
@@ -1895,9 +1915,11 @@ fn read_visible_point(
                 candidate.internal_key.batch_index(),
                 read_sequence,
             );
-            let covered_by_table_tombstone = !covered_by_memtable_tombstone
-                && tables.iter().any(|table| {
-                    table.range_tombstones().iter().any(|tombstone| {
+            let mut covered_by_table_tombstone = false;
+            if !covered_by_memtable_tombstone {
+                for table in tables.iter() {
+                    let table_tombstones = table.range_tombstones()?;
+                    covered_by_table_tombstone = table_tombstones.iter().any(|tombstone| {
                         table_range_tombstone_covers_visible_point(
                             tombstone,
                             key,
@@ -1905,8 +1927,12 @@ fn read_visible_point(
                             candidate.internal_key.batch_index(),
                             read_sequence,
                         )
-                    })
-                });
+                    });
+                    if covered_by_table_tombstone {
+                        break;
+                    }
+                }
+            }
             if covered_by_memtable_tombstone || covered_by_table_tombstone {
                 Ok(None)
             } else {

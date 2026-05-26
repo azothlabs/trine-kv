@@ -1,12 +1,15 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{
-        RwLock,
+        Arc, RwLock,
         atomic::{AtomicU64, Ordering},
     },
 };
 
-use crate::table::TableId;
+use crate::{
+    Result,
+    table::{DecodedDataBlock, TableId},
+};
 
 const BLOCK_CACHE_SHARD_COUNT: usize = 64;
 
@@ -68,39 +71,46 @@ impl BlockCache {
         }
     }
 
-    pub(crate) fn record_access(&self, key: BlockCacheKey, estimated_bytes: u64) {
+    pub(crate) fn get_or_insert_with(
+        &self,
+        key: BlockCacheKey,
+        load: impl FnOnce() -> Result<DecodedDataBlock>,
+    ) -> Result<Arc<DecodedDataBlock>> {
         if self.capacity_bytes == 0 {
-            return;
+            self.misses.fetch_add(1, Ordering::AcqRel);
+            return load().map(Arc::new);
         }
 
         // Hits are the hot path, so split cache metadata across shards and let
-        // concurrent readers share each shard. Misses still take the shard write
-        // lock because they update FIFO order and byte accounting.
+        // concurrent readers share each shard. Misses load the block outside
+        // the shard write lock; another reader may race and insert the same
+        // block first, which is harmless and keeps file I/O out of the lock.
         let shard = &self.shards[block_cache_shard_index(key)];
         if let Ok(state) = shard.read() {
-            if state.entries.contains_key(&key) {
+            if let Some(entry) = state.entries.get(&key) {
                 self.hits.fetch_add(1, Ordering::AcqRel);
-                return;
+                return Ok(Arc::clone(&entry.bytes));
             }
-        } else {
-            return;
         }
 
+        let loaded = Arc::new(load()?);
+        let loaded_bytes = loaded.estimated_bytes().max(1);
         let Ok(mut state) = shard.write() else {
-            return;
+            self.misses.fetch_add(1, Ordering::AcqRel);
+            return Ok(loaded);
         };
-        if state.entries.contains_key(&key) {
+        if let Some(entry) = state.entries.get(&key) {
             self.hits.fetch_add(1, Ordering::AcqRel);
-            return;
+            return Ok(Arc::clone(&entry.bytes));
         }
 
         self.misses.fetch_add(1, Ordering::AcqRel);
-        let estimated_bytes = estimated_bytes.max(1);
-        if estimated_bytes > self.capacity_bytes {
-            return;
+        if loaded_bytes <= self.capacity_bytes {
+            state.insert(key, loaded_bytes, Arc::clone(&loaded));
+            state.evict_to(self.shard_capacity_bytes);
         }
-        state.insert(key, estimated_bytes);
-        state.evict_to(self.shard_capacity_bytes);
+
+        Ok(loaded)
     }
 
     pub(crate) fn stats(&self) -> CacheStats {
@@ -131,16 +141,26 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
 
 #[derive(Debug, Default)]
 struct BlockCacheState {
-    entries: BTreeMap<BlockCacheKey, u64>,
+    entries: BTreeMap<BlockCacheKey, BlockCacheEntry>,
     order: VecDeque<BlockCacheKey>,
     bytes: u64,
 }
 
+#[derive(Debug, Clone)]
+struct BlockCacheEntry {
+    bytes: Arc<DecodedDataBlock>,
+    size: u64,
+}
+
 impl BlockCacheState {
-    fn insert(&mut self, key: BlockCacheKey, bytes: u64) {
-        if self.entries.insert(key, bytes).is_none() {
+    fn insert(&mut self, key: BlockCacheKey, size: u64, bytes: Arc<DecodedDataBlock>) {
+        if self
+            .entries
+            .insert(key, BlockCacheEntry { bytes, size })
+            .is_none()
+        {
             self.order.push_back(key);
-            self.bytes = self.bytes.saturating_add(bytes);
+            self.bytes = self.bytes.saturating_add(size);
         }
     }
 
@@ -151,8 +171,8 @@ impl BlockCacheState {
                 self.bytes = 0;
                 return;
             };
-            if let Some(bytes) = self.entries.remove(&key) {
-                self.bytes = self.bytes.saturating_sub(bytes);
+            if let Some(entry) = self.entries.remove(&key) {
+                self.bytes = self.bytes.saturating_sub(entry.size);
             }
         }
     }

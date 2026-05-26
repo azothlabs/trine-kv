@@ -19,11 +19,11 @@ use crate::{
 
 pub const MANIFEST_FILE_NAME: &str = "MANIFEST";
 const MANIFEST_MAGIC: u32 = 0x5452_4d46;
-const MANIFEST_VERSION: u16 = 2;
+const MANIFEST_VERSION: u16 = 3;
 const HEADER_LEN: usize = 14;
 // The lower bound for one table entry: fixed fields plus two empty byte fields.
 // Decoding uses this to reject impossible counts before reserving memory.
-const MIN_TABLE_PROPERTY_BYTES: usize = 37;
+const MIN_TABLE_PROPERTY_BYTES: usize = 41;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestEdit {
@@ -469,6 +469,14 @@ fn put_table_properties(bytes: &mut Vec<u8>, properties: &TableProperties) -> Re
     put_u64(bytes, properties.smallest_sequence.get());
     put_u64(bytes, properties.largest_sequence.get());
     put_codec(bytes, properties.codec);
+    put_u32(
+        bytes,
+        u32::try_from(properties.blob_file_ids.len())
+            .map_err(|_| Error::invalid_options("too many blob file ids for table properties"))?,
+    );
+    for file_id in &properties.blob_file_ids {
+        put_u64(bytes, *file_id);
+    }
     Ok(())
 }
 
@@ -646,7 +654,26 @@ impl<'payload> Cursor<'payload> {
             smallest_sequence: Sequence::new(self.read_u64()?),
             largest_sequence: Sequence::new(self.read_u64()?),
             codec: self.read_codec()?,
+            blob_file_ids: self.read_blob_file_ids()?,
         })
+    }
+
+    fn read_blob_file_ids(&mut self) -> Result<Vec<u64>> {
+        let file_id_count = self.read_u32()? as usize;
+        if file_id_count > self.remaining_len() / 8 {
+            return Err(invalid_manifest("blob file id count exceeds payload bytes"));
+        }
+        let mut file_ids = Vec::with_capacity(file_id_count);
+        let mut previous = None;
+        for _ in 0..file_id_count {
+            let file_id = self.read_u64()?;
+            if previous.is_some_and(|previous| previous >= file_id) {
+                return Err(invalid_manifest("blob file ids are not sorted"));
+            }
+            file_ids.push(file_id);
+            previous = Some(file_id);
+        }
+        Ok(file_ids)
     }
 
     fn read_compression_profile(&mut self) -> Result<CompressionProfile> {

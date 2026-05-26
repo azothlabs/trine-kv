@@ -2393,3 +2393,110 @@ Record only evidence that can change planning or durable decisions.
 - Move next to file-backed SSTable block loading and table-cache work, because
   the write path now has a stable active/immutable/flush/WAL lifecycle to build
   on.
+
+## 2026-05-26: File-Backed SSTable Reader Passed
+
+### Observation
+
+- User audit identified full SSTable loading at open time as the P0 production
+  risk for startup time, memory, and random reads.
+- Persistent table open now reads only table header, footer, properties, index,
+  and filter sections. Data blocks remain on disk until a read cursor, point
+  read, compaction, stats pass, or blob cleanup needs their records.
+- Data block reads now verify checksum, codec, decoded record order, index
+  bounds, and filter false-negative safety before returned records are used.
+- `BlockCache` stores decoded data blocks behind sharded locks. Hits return
+  shared decoded blocks; misses read and verify outside the cache lock.
+- `KeyspaceOptions::block_bytes` now controls data block splitting.
+- Table and manifest metadata now carry referenced blob file ids. Startup can
+  reject unreferenced formal blob files without scanning data blocks, and
+  compaction outputs can retain references to older blob files safely.
+- Table and manifest on-disk format versions moved to 3 for the metadata
+  change.
+
+### Interpretation
+
+- Phase 17 is complete for the P0/P1 table-read slice.
+- Missing-key point reads can avoid data block reads when table/filter metadata
+  rules out the key.
+- In-memory mode still uses memory-resident memtables and all in-memory tests
+  pass.
+- This phase intentionally leaves exact-set filters, compaction streaming, and
+  tombstone query indexing for later phases.
+
+### Verification
+
+- `cargo fmt --all`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- Focused coverage:
+  - `persistent_reopen_defers_data_block_checksum_until_read`
+  - `persistent_filter_miss_does_not_read_corrupt_data_block`
+  - `persistent_block_cache_records_hits_and_misses`
+  - `configured_block_bytes_controls_data_block_count`
+  - blob compaction/reopen/recovery tests in `tests/persistent_wal.rs`
+
+### Remaining Blockers
+
+- GitHub Actions was not executed locally; remote CI must run after push.
+- Bloom filters are still exact sets and should be replaced before claiming
+  realistic filter memory costs.
+- Compaction still collects complete input records and does not split output by
+  target table size.
+- Range tombstones still use a table-level on-demand list instead of a query
+  structure.
+
+### Recommended Next Action
+
+- Implement real Bloom bitsets and partitioned filters now that SSTable reads
+  have a true metadata/data-block boundary.
+
+## 2026-05-26: Real Bloom Filters Passed
+
+### Observation
+
+- Point-key and prefix filters now store compact Bloom bitsets instead of
+  complete key or prefix sets.
+- `bits_per_key` and `bits_per_prefix` determine Bloom bit count. Hash count is
+  derived from the bit budget and capped to keep read-path CPU bounded.
+- Table-level and block-level filters share the same Bloom implementation.
+- Table filter/index block encoding now writes Bloom metadata and bit bytes.
+- Block validation checks every decoded record against its block filters and
+  fails closed if a filter misses its own key or prefix.
+- `FilterPolicy::Bloom` and `PrefixFilterPolicy::Bloom` reject zero bit budgets
+  during keyspace option validation.
+
+### Interpretation
+
+- Phase 18 is complete.
+- Filter memory now follows the configured cost model instead of growing with
+  full key/prefix byte length.
+- Bloom false positives can read an extra candidate block, but false negatives
+  are treated as table corruption before records affect reads.
+
+### Verification
+
+- `cargo check --all-targets --all-features`
+- `cargo fmt --all`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- Focused coverage:
+  - `point_filter_bit_count_tracks_bits_per_key`
+  - `point_filter_round_trips_from_parts`
+  - `prefix_filter_uses_extractor_prefixes`
+  - `data_block_filter_false_negative_fails_closed`
+  - `prefix_block_filter_false_negative_fails_closed`
+  - `persistent_filter_miss_does_not_read_corrupt_data_block`
+
+### Remaining Blockers
+
+- GitHub Actions was not executed locally; remote CI must run after push.
+- Compaction still collects complete input records and does not split output by
+  target table size.
+- Range tombstones still use a table-level on-demand list instead of a query
+  structure.
+
+### Recommended Next Action
+
+- Move to compaction output sizing and level scoring, unless delete-heavy
+  workloads make range tombstone query structures the sharper next risk.

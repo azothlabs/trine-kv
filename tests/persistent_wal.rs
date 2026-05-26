@@ -42,6 +42,16 @@ fn flushed_default_table_path(path: &std::path::Path, options: &DbOptions) -> Pa
     table::table_path(path, table_id)
 }
 
+fn corrupt_first_data_block_payload(table_path: &std::path::Path) {
+    let mut bytes = fs::read(table_path).expect("read table");
+    let encoded_byte_offset = 14 + 13;
+    let byte = bytes
+        .get_mut(encoded_byte_offset)
+        .expect("table has a first data block payload byte");
+    *byte ^= 0xff;
+    fs::write(table_path, bytes).expect("write corrupted table");
+}
+
 fn collect_rows(iter: trine_kv::Iter) -> Vec<(Vec<u8>, Vec<u8>)> {
     iter.map(|item| {
         let item = item.expect("iterator item reads");
@@ -155,7 +165,7 @@ fn persistent_api_helpers_cover_open_options_and_keyspace_writes() {
     {
         let db = Db::open_read_only(&path).expect("read-only db opens");
         let keyspace = db
-            .keyspace("default", keyspace_options)
+            .keyspace("default", keyspace_options.clone())
             .expect("read-only keyspace opens");
         assert_eq!(
             keyspace.get(b"user:001").expect("user reads"),
@@ -530,7 +540,7 @@ fn persistent_recovery_fails_closed_on_unreferenced_blob_file_even_with_temp_rep
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
         let keyspace = db
-            .keyspace("default", keyspace_options)
+            .keyspace("default", keyspace_options.clone())
             .expect("keyspace opens");
         keyspace
             .insert(b"a", b"large-value-a-large-value-a".to_vec())
@@ -866,7 +876,7 @@ fn persistent_flush_publish_failure_removes_unpublished_table_and_blob_files() {
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
         let keyspace = db
-            .keyspace("default", keyspace_options)
+            .keyspace("default", keyspace_options.clone())
             .expect("keyspace opens");
         keyspace
             .insert(b"a", value.clone())
@@ -1723,7 +1733,7 @@ fn persistent_blob_values_survive_flush_reopen_and_compaction() {
 }
 
 #[test]
-fn persistent_reopen_fails_when_blob_file_is_missing() {
+fn persistent_reopen_defers_missing_blob_file_until_read() {
     let path = temp_db_path("missing-blob");
     let options = DbOptions::persistent(&path);
     let keyspace_options = KeyspaceOptions {
@@ -1734,7 +1744,7 @@ fn persistent_reopen_fails_when_blob_file_is_missing() {
     {
         let db = Db::open(options.clone()).expect("persistent db opens");
         let keyspace = db
-            .keyspace("default", keyspace_options)
+            .keyspace("default", keyspace_options.clone())
             .expect("keyspace opens");
         keyspace
             .insert(b"a", b"large-value-a-large-value-a".to_vec())
@@ -1747,7 +1757,13 @@ fn persistent_reopen_fails_when_blob_file_is_missing() {
         .expect("blob file exists after flush");
     fs::remove_file(blob_path).expect("remove blob file");
 
-    let error = Db::open(options).expect_err("missing blob file fails closed");
+    let db = Db::open(options).expect("missing blob is not read during table open");
+    let keyspace = db
+        .keyspace("default", keyspace_options)
+        .expect("keyspace reopens");
+    let error = keyspace
+        .get(b"a")
+        .expect_err("missing blob file fails when value is read");
     assert!(matches!(error, Error::Corruption { .. }));
 
     fs::remove_dir_all(path).expect("cleanup test db");
@@ -2171,6 +2187,73 @@ fn persistent_reopen_fails_when_table_checksum_is_corrupt() {
 
     let error = Db::open(options).expect_err("corrupt referenced table fails closed");
     assert!(matches!(error, Error::Corruption { .. }));
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_reopen_defers_data_block_checksum_until_read() {
+    let path = temp_db_path("corrupt-data-block-read");
+    let options = DbOptions::persistent(&path);
+    let table_path = flushed_default_table_path(&path, &options);
+
+    corrupt_first_data_block_payload(&table_path);
+
+    let db = Db::open(options).expect("metadata-only table open succeeds");
+    let keyspace = db
+        .keyspace("default", KeyspaceOptions::default())
+        .expect("keyspace reopens");
+    let error = keyspace
+        .get(b"a")
+        .expect_err("corrupt data block fails when read");
+    assert!(matches!(error, Error::Corruption { .. }));
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_filter_miss_does_not_read_corrupt_data_block() {
+    let path = temp_db_path("filter-miss-skips-data-block");
+    let options = DbOptions::persistent(&path);
+    let table_path;
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+        keyspace.insert(b"a", b"a1").expect("write a");
+        keyspace.insert(b"c", b"c1").expect("write c");
+        db.flush().expect("flush table");
+
+        let manifest_state =
+            manifest::read_manifest(&manifest::manifest_path(&path)).expect("manifest reads");
+        let table_id = manifest_state
+            .tables()
+            .get("default")
+            .and_then(|tables| tables.first())
+            .expect("default table exists")
+            .id;
+        table_path = table::table_path(&path, table_id);
+    }
+
+    corrupt_first_data_block_payload(&table_path);
+
+    let db = Db::open(options).expect("metadata-only table open succeeds");
+    let keyspace = db
+        .keyspace("default", KeyspaceOptions::default())
+        .expect("keyspace reopens");
+    assert_eq!(
+        keyspace
+            .get(b"b")
+            .expect("filter miss should not read data block"),
+        None
+    );
+    assert_eq!(
+        db.stats().block_cache_misses,
+        0,
+        "filter miss should avoid block cache lookup"
+    );
 
     fs::remove_dir_all(path).expect("cleanup test db");
 }

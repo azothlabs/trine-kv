@@ -363,16 +363,19 @@ Index rules:
 - index blocks keep a canonical sorted order for validation, range traversal,
   and debugging;
 - index blocks may also carry a search layout optimized for point seek;
-- table properties include smallest/largest user key and sequence range.
+- table properties include smallest/largest user key, sequence range, and
+  referenced blob file ids.
 
 Filter rules:
 
-- each table may have point-key filters;
+- each table may have point-key Bloom filters;
 - each table may have prefix filters when a keyspace prefix extractor is
   configured;
 - filters are partitionable by table key range for large tables;
 - filters are advisory only; false positives are allowed, false negatives are
   not.
+- `bits_per_key` and `bits_per_prefix` control Bloom bit counts; implementations
+  must not store every full key or prefix as the long-lived filter structure.
 
 Footer rules:
 
@@ -380,6 +383,14 @@ Footer rules:
   checksum;
 - unknown incompatible major versions fail closed;
 - compatible minor versions may ignore unknown optional sections.
+
+Persistent read rule:
+
+- opening a table reads only footer, properties, index, and filter metadata;
+- data blocks are read on demand and must verify checksum, codec, and index
+  bounds before decoded records affect a read;
+- corrupt data blocks fail the read that touches them, while unrelated filter
+  misses may still return without reading that data block.
 
 ## 15. Prefix Extractors And Filters
 
@@ -674,7 +685,7 @@ Persistent startup:
 1. acquire process lock;
 2. read current manifest pointer;
 3. load manifest edits and build VersionSet;
-4. validate referenced table and blob files;
+4. validate referenced table files and blob files named by table metadata;
 5. replay WAL records newer than the replay floor;
 6. rebuild memtables from replay;
 7. detect obsolete unreferenced files;

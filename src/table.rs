@@ -1,10 +1,10 @@
 use std::{
     collections::BTreeSet,
     fs::{self, File},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     ops::{Bound, Range},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
 use crate::{
@@ -26,12 +26,11 @@ use crate::{
 
 pub const TABLE_FILE_EXTENSION: &str = "trinet";
 const TABLE_MAGIC: u32 = 0x5452_5442;
-const TABLE_VERSION: u16 = 2;
+const TABLE_VERSION: u16 = 3;
 const HEADER_LEN: usize = 14;
 const FOOTER_MAGIC: u32 = 0x5452_5446;
 const FOOTER_LEN: usize = 90;
 const BLOCK_HEADER_LEN: usize = 13;
-const DATA_BLOCK_TARGET_BYTES: usize = 1024;
 const DATA_BLOCK_RESTART_INTERVAL: usize = 16;
 
 const VALUE_KIND_PUT: u8 = 1;
@@ -65,7 +64,6 @@ const MIN_VALUE_REF_BYTES: usize = 1;
 const MIN_DATA_RECORD_BYTES: usize = MIN_INTERNAL_KEY_BYTES + MIN_VALUE_REF_BYTES;
 const MIN_INDEX_ENTRY_BYTES: usize = MIN_INTERNAL_KEY_BYTES * 2 + 16 + 1 + 1;
 const MIN_RANGE_TOMBSTONE_BYTES: usize = 14;
-const MIN_FILTER_ENTRY_BYTES: usize = 4;
 const RESTART_POINT_BYTES: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -125,11 +123,13 @@ pub struct TableProperties {
     pub smallest_sequence: Sequence,
     pub largest_sequence: Sequence,
     pub codec: CodecId,
+    pub(crate) blob_file_ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableWriteOptions {
     pub(crate) codec: CodecId,
+    pub(crate) block_bytes: usize,
     pub(crate) filter_policy: FilterPolicy,
     pub(crate) prefix_extractor: PrefixExtractor,
     pub(crate) prefix_filter_policy: PrefixFilterPolicy,
@@ -181,10 +181,29 @@ struct DataBlockIndexEntry {
     prefix_filter: Option<PrefixFilter>,
 }
 
-#[derive(Debug)]
-struct DecodedDataBlock {
+#[derive(Debug, Clone)]
+pub(crate) struct DecodedDataBlock {
     records: Vec<TablePointRecord>,
     restart_indices: Vec<usize>,
+}
+
+impl DecodedDataBlock {
+    pub(crate) fn estimated_bytes(&self) -> u64 {
+        let records = self.records.iter().fold(0_u64, |bytes, record| {
+            bytes
+                .saturating_add(usize_to_u64_saturating(
+                    record.internal_key.user_key().len(),
+                ))
+                .saturating_add(record.value.as_ref().map_or(0, ValueRef::len))
+                .saturating_add(32)
+        });
+        let restarts = usize_to_u64_saturating(
+            self.restart_indices
+                .len()
+                .saturating_mul(RESTART_POINT_BYTES),
+        );
+        records.saturating_add(restarts).max(1)
+    }
 }
 
 // Loaded tables keep one sorted record array. Each data block stores only the
@@ -194,6 +213,7 @@ struct DecodedDataBlock {
 struct TableDataBlock {
     smallest_internal_key: InternalKey,
     largest_internal_key: InternalKey,
+    block: BlockHandle,
     record_range: Range<usize>,
     restart_indices: Vec<usize>,
     point_key_filter: Option<PointKeyFilter>,
@@ -205,6 +225,24 @@ impl TableDataBlock {
         point_records: &[TablePointRecord],
         record_range: Range<usize>,
         restart_indices: Vec<usize>,
+        point_key_filter: Option<PointKeyFilter>,
+        prefix_filter: Option<PrefixFilter>,
+    ) -> Result<Self> {
+        Self::from_record_range_and_block(
+            point_records,
+            record_range,
+            restart_indices,
+            BlockHandle { offset: 0, len: 0 },
+            point_key_filter,
+            prefix_filter,
+        )
+    }
+
+    fn from_record_range_and_block(
+        point_records: &[TablePointRecord],
+        record_range: Range<usize>,
+        restart_indices: Vec<usize>,
+        block: BlockHandle,
         point_key_filter: Option<PointKeyFilter>,
         prefix_filter: Option<PrefixFilter>,
     ) -> Result<Self> {
@@ -234,6 +272,7 @@ impl TableDataBlock {
         Ok(Self {
             smallest_internal_key: first.internal_key.clone(),
             largest_internal_key: last.internal_key.clone(),
+            block,
             record_range,
             restart_indices,
             point_key_filter,
@@ -241,66 +280,22 @@ impl TableDataBlock {
         })
     }
 
-    fn point_records_for_key<'records>(
-        &self,
-        point_records: &'records [TablePointRecord],
-        key: &[u8],
-        policy: IndexSearchPolicy,
-    ) -> Vec<&'records TablePointRecord> {
-        let start = self.restart_index_for_key(point_records, key, policy);
-        point_records[start..self.record_range.end]
-            .iter()
-            .take_while(move |record| record.internal_key.user_key() <= key)
-            .filter(move |record| record.internal_key.user_key() == key)
-            .collect()
-    }
+    fn from_index_entry(entry: DataBlockIndexEntry) -> Result<Self> {
+        if entry.smallest_internal_key > entry.largest_internal_key {
+            return Err(Error::Corruption {
+                message: "data block index key bounds are inverted".to_owned(),
+            });
+        }
 
-    fn newest_visible_point_record_for_key<'records>(
-        &self,
-        point_records: &'records [TablePointRecord],
-        key: &[u8],
-        read_sequence: Sequence,
-        policy: IndexSearchPolicy,
-    ) -> Option<&'records TablePointRecord> {
-        let start = self.restart_index_for_key(point_records, key, policy);
-        point_records[start..self.record_range.end]
-            .iter()
-            .take_while(move |record| record.internal_key.user_key() <= key)
-            .find(move |record| {
-                record.internal_key.user_key() == key
-                    && record.internal_key.sequence() <= read_sequence
-            })
-    }
-
-    fn point_records_in_range<'records>(
-        &self,
-        point_records: &'records [TablePointRecord],
-        range: &KeyRange,
-        policy: IndexSearchPolicy,
-    ) -> Vec<&'records TablePointRecord> {
-        let start = self.restart_index_for_bound(point_records, &range.start, policy);
-        point_records[start..self.record_range.end]
-            .iter()
-            .skip_while(move |record| {
-                key_is_before_start(record.internal_key.user_key(), &range.start)
-            })
-            .take_while(move |record| !key_is_after_end(record.internal_key.user_key(), &range.end))
-            .collect()
-    }
-
-    #[cfg(test)]
-    fn point_records_with_prefix<'records>(
-        &self,
-        point_records: &'records [TablePointRecord],
-        prefix: &[u8],
-        policy: IndexSearchPolicy,
-    ) -> Vec<&'records TablePointRecord> {
-        let start = self.restart_index_for_key(point_records, prefix, policy);
-        point_records[start..self.record_range.end]
-            .iter()
-            .skip_while(move |record| record.internal_key.user_key() < prefix)
-            .take_while(move |record| record.internal_key.user_key().starts_with(prefix))
-            .collect()
+        Ok(Self {
+            smallest_internal_key: entry.smallest_internal_key,
+            largest_internal_key: entry.largest_internal_key,
+            block: entry.block,
+            record_range: 0..0,
+            restart_indices: Vec::new(),
+            point_key_filter: entry.point_key_filter,
+            prefix_filter: entry.prefix_filter,
+        })
     }
 
     fn may_contain_key(&self, key: &[u8]) -> bool {
@@ -325,57 +320,10 @@ impl TableDataBlock {
                 .is_none_or(|filter| filter.may_contain_query_prefix(prefix, extractor))
     }
 
-    fn estimated_bytes(&self, point_records: &[TablePointRecord]) -> u64 {
-        point_records
-            .get(self.record_range.clone())
-            .into_iter()
-            .flatten()
-            .map(|record| {
-                usize_to_u64_saturating(record.internal_key.user_key().len())
-                    .saturating_add(record.value.as_ref().map_or(0, ValueRef::len))
-                    .saturating_add(16)
-            })
-            .sum::<u64>()
-            .max(1)
-    }
-
     fn prefix_bounds_may_overlap(&self, prefix: &[u8]) -> bool {
         self.largest_internal_key.user_key() >= prefix
             && (self.smallest_internal_key.user_key().starts_with(prefix)
                 || self.smallest_internal_key.user_key() <= prefix)
-    }
-
-    fn restart_index_for_bound(
-        &self,
-        point_records: &[TablePointRecord],
-        bound: &Bound<Vec<u8>>,
-        policy: IndexSearchPolicy,
-    ) -> usize {
-        match bound {
-            Bound::Included(key) | Bound::Excluded(key) => {
-                self.restart_index_for_key(point_records, key, policy)
-            }
-            Bound::Unbounded => self.record_range.start,
-        }
-    }
-
-    fn restart_index_for_key(
-        &self,
-        point_records: &[TablePointRecord],
-        key: &[u8],
-        policy: IndexSearchPolicy,
-    ) -> usize {
-        let upper = search::partition_point_by(self.restart_indices.len(), policy, |index| {
-            point_records[self.restart_indices[index]]
-                .internal_key
-                .user_key()
-                <= key
-        });
-        if upper == 0 {
-            self.record_range.start
-        } else {
-            self.restart_indices[upper - 1]
-        }
     }
 }
 
@@ -388,10 +336,13 @@ pub(crate) struct TableRangeTombstone {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Table {
+    path: Option<PathBuf>,
+    payload_len: usize,
+    footer: TableFooter,
     properties: TableProperties,
-    point_records: Vec<TablePointRecord>,
+    point_records: Option<Vec<TablePointRecord>>,
     data_blocks: Vec<TableDataBlock>,
-    range_tombstones: Vec<TableRangeTombstone>,
+    range_tombstones: Arc<RwLock<Option<Arc<Vec<TableRangeTombstone>>>>>,
     point_key_filter: Option<PointKeyFilter>,
     prefix_filter: Option<PrefixFilter>,
 }
@@ -402,23 +353,31 @@ impl Table {
         &self.properties
     }
 
-    #[must_use]
-    pub(crate) fn point_records(&self) -> &[TablePointRecord] {
-        &self.point_records
+    pub(crate) fn point_records(&self) -> Result<Vec<TablePointRecord>> {
+        self.all_point_records()
     }
 
-    #[must_use]
-    pub(crate) fn range_tombstones(&self) -> &[TableRangeTombstone] {
-        &self.range_tombstones
+    pub(crate) fn range_tombstones(&self) -> Result<Arc<Vec<TableRangeTombstone>>> {
+        if let Ok(guard) = self.range_tombstones.read() {
+            if let Some(tombstones) = guard.as_ref() {
+                return Ok(Arc::clone(tombstones));
+            }
+        }
+
+        let tombstones = self.load_range_tombstones()?;
+        let tombstones = Arc::new(tombstones);
+        let mut guard = self
+            .range_tombstones
+            .write()
+            .map_err(|_| Error::Corruption {
+                message: "table range tombstone cache lock poisoned".to_owned(),
+            })?;
+        let cached = guard.get_or_insert_with(|| Arc::clone(&tombstones));
+        Ok(Arc::clone(cached))
     }
 
-    pub(crate) fn blob_file_ids(&self) -> impl Iterator<Item = u64> + '_ {
-        self.point_records
-            .iter()
-            .filter_map(|record| match record.value.as_ref() {
-                Some(ValueRef::Blob { file_id, .. }) => Some(*file_id),
-                Some(ValueRef::Inline(_)) | None => None,
-            })
+    pub(crate) fn blob_file_ids(&self) -> Vec<u64> {
+        self.properties.blob_file_ids.clone()
     }
 
     #[cfg(test)]
@@ -426,7 +385,7 @@ impl Table {
         &self,
         key: &[u8],
         policy: IndexSearchPolicy,
-    ) -> Vec<&TablePointRecord> {
+    ) -> Result<Vec<TablePointRecord>> {
         self.point_records_for_key_with_cache(key, policy, None)
     }
 
@@ -435,9 +394,9 @@ impl Table {
         key: &[u8],
         policy: IndexSearchPolicy,
         block_cache: Option<&BlockCache>,
-    ) -> Vec<&TablePointRecord> {
+    ) -> Result<Vec<TablePointRecord>> {
         let Some(start) = self.first_block_for_key(key, policy) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
 
         let mut records = Vec::new();
@@ -448,10 +407,10 @@ impl Table {
             if !block.may_contain_key(key) {
                 continue;
             }
-            self.record_block_cache_access(block_cache, start + offset);
-            records.extend(block.point_records_for_key(&self.point_records, key, policy));
+            let block = self.load_data_block(start + offset, block_cache)?;
+            records.extend(data_block_point_records_for_key(&block, key, policy));
         }
-        records
+        Ok(records)
     }
 
     pub(crate) fn newest_visible_point_record_for_key_with_cache(
@@ -460,8 +419,10 @@ impl Table {
         read_sequence: Sequence,
         policy: IndexSearchPolicy,
         block_cache: Option<&BlockCache>,
-    ) -> Option<&TablePointRecord> {
-        let start = self.first_block_for_key(key, policy)?;
+    ) -> Result<Option<TablePointRecord>> {
+        let Some(start) = self.first_block_for_key(key, policy) else {
+            return Ok(None);
+        };
 
         for (offset, block) in self.data_blocks[start..].iter().enumerate() {
             if block.smallest_internal_key.user_key() > key {
@@ -470,18 +431,15 @@ impl Table {
             if !block.may_contain_key(key) {
                 continue;
             }
-            self.record_block_cache_access(block_cache, start + offset);
-            if let Some(record) = block.newest_visible_point_record_for_key(
-                &self.point_records,
-                key,
-                read_sequence,
-                policy,
-            ) {
-                return Some(record);
+            let block = self.load_data_block(start + offset, block_cache)?;
+            if let Some(record) =
+                data_block_newest_visible_point_record_for_key(&block, key, read_sequence, policy)
+            {
+                return Ok(Some(record));
             }
         }
 
-        None
+        Ok(None)
     }
 
     #[cfg(test)]
@@ -489,7 +447,7 @@ impl Table {
         &self,
         range: &KeyRange,
         policy: IndexSearchPolicy,
-    ) -> Vec<&TablePointRecord> {
+    ) -> Result<Vec<TablePointRecord>> {
         self.point_records_in_range_with_cache(range, policy, None)
     }
 
@@ -498,9 +456,9 @@ impl Table {
         range: &KeyRange,
         policy: IndexSearchPolicy,
         block_cache: Option<&BlockCache>,
-    ) -> Vec<&TablePointRecord> {
+    ) -> Result<Vec<TablePointRecord>> {
         let Some(start) = self.first_block_for_range(range, policy) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
 
         let mut records = Vec::new();
@@ -511,10 +469,10 @@ impl Table {
             if !block.overlaps_range(range) {
                 continue;
             }
-            self.record_block_cache_access(block_cache, start + offset);
-            records.extend(block.point_records_in_range(&self.point_records, range, policy));
+            let block = self.load_data_block(start + offset, block_cache)?;
+            records.extend(data_block_point_records_in_range(&block, range, policy));
         }
-        records
+        Ok(records)
     }
 
     #[cfg(test)]
@@ -523,7 +481,7 @@ impl Table {
         prefix: &[u8],
         extractor: &PrefixExtractor,
         policy: IndexSearchPolicy,
-    ) -> Vec<&TablePointRecord> {
+    ) -> Result<Vec<TablePointRecord>> {
         self.point_records_with_prefix_with_cache(prefix, extractor, policy, None)
     }
 
@@ -534,9 +492,9 @@ impl Table {
         extractor: &PrefixExtractor,
         policy: IndexSearchPolicy,
         block_cache: Option<&BlockCache>,
-    ) -> Vec<&TablePointRecord> {
+    ) -> Result<Vec<TablePointRecord>> {
         let Some(start) = self.first_block_for_prefix(prefix, policy) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
 
         let mut records = Vec::new();
@@ -547,21 +505,10 @@ impl Table {
             if !block.may_contain_prefix(prefix, extractor) {
                 continue;
             }
-            self.record_block_cache_access(block_cache, start + offset);
-            records.extend(block.point_records_with_prefix(&self.point_records, prefix, policy));
+            let block = self.load_data_block(start + offset, block_cache)?;
+            records.extend(data_block_point_records_with_prefix(&block, prefix, policy));
         }
-        records
-    }
-
-    fn record_block_cache_access(&self, block_cache: Option<&BlockCache>, block_index: usize) {
-        if let Some(block_cache) = block_cache {
-            let estimated_bytes =
-                self.data_blocks[block_index].estimated_bytes(&self.point_records);
-            block_cache.record_access(
-                BlockCacheKey::new(self.properties.id, block_index),
-                estimated_bytes,
-            );
-        }
+        Ok(records)
     }
 
     #[must_use]
@@ -579,6 +526,90 @@ impl Table {
         self.prefix_filter
             .as_ref()
             .is_none_or(|filter| filter.may_contain_query_prefix(prefix, extractor))
+    }
+
+    fn all_point_records(&self) -> Result<Vec<TablePointRecord>> {
+        if let Some(records) = &self.point_records {
+            return Ok(records.clone());
+        }
+
+        let mut records = Vec::new();
+        for block_index in 0..self.data_blocks.len() {
+            let block = self.load_data_block(block_index, None)?;
+            records.extend(block.records.iter().cloned());
+        }
+        validate_sorted_point_records(&records)?;
+        Ok(records)
+    }
+
+    fn load_range_tombstones(&self) -> Result<Vec<TableRangeTombstone>> {
+        let Some(path) = &self.path else {
+            return Err(Error::Corruption {
+                message: "table range tombstones are not loaded".to_owned(),
+            });
+        };
+        let (codec, payload) = read_single_block_section_from_file(
+            path,
+            self.payload_len,
+            self.footer.range_tombstones,
+        )?;
+        validate_block_codec(codec, self.properties.codec, TableSection::RangeTombstones)?;
+        decode_range_tombstone_block(&payload)
+    }
+
+    fn load_data_block(
+        &self,
+        block_index: usize,
+        block_cache: Option<&BlockCache>,
+    ) -> Result<Arc<DecodedDataBlock>> {
+        if let Some(records) = &self.point_records {
+            let block = self
+                .data_blocks
+                .get(block_index)
+                .ok_or_else(|| invalid_table("data block index outside table"))?;
+            let records = records
+                .get(block.record_range.clone())
+                .ok_or_else(|| invalid_table("data block record range outside table"))?
+                .to_vec();
+            let restart_indices = block
+                .restart_indices
+                .iter()
+                .map(|index| index.saturating_sub(block.record_range.start))
+                .collect();
+            return Ok(Arc::new(DecodedDataBlock {
+                records,
+                restart_indices,
+            }));
+        }
+
+        let block = self
+            .data_blocks
+            .get(block_index)
+            .ok_or_else(|| invalid_table("data block index outside table"))?;
+        let Some(path) = &self.path else {
+            return Err(Error::Corruption {
+                message: "table data block has no file path".to_owned(),
+            });
+        };
+        let key = BlockCacheKey::new(self.properties.id, block_index);
+        let entry = DataBlockIndexEntry {
+            smallest_internal_key: block.smallest_internal_key.clone(),
+            largest_internal_key: block.largest_internal_key.clone(),
+            block: block.block,
+            point_key_filter: block.point_key_filter.clone(),
+            prefix_filter: block.prefix_filter.clone(),
+        };
+        if let Some(block_cache) = block_cache {
+            let path = path.clone();
+            let payload_len = self.payload_len;
+            let codec = self.properties.codec;
+            block_cache.get_or_insert_with(key, move || {
+                read_data_block_from_file(&path, payload_len, codec, &entry)
+            })
+        } else {
+            read_data_block_from_file(path, self.payload_len, self.properties.codec, &entry)
+                .map(Arc::new)
+        }
     }
 
     fn first_block_for_key(&self, key: &[u8], policy: IndexSearchPolicy) -> Option<usize> {
@@ -649,11 +680,12 @@ pub(crate) struct TablePointCursor {
     selector: ScanSelector,
     prefix_extractor: PrefixExtractor,
     direction: Direction,
+    policy: IndexSearchPolicy,
     block_cache: Option<Arc<BlockCache>>,
     block_index: Option<usize>,
     record_index: usize,
+    current_block: Option<(usize, Arc<DecodedDataBlock>)>,
     pending: Option<ScanRecord>,
-    recorded_block_index: Option<usize>,
     exhausted: bool,
 }
 
@@ -670,31 +702,34 @@ impl TablePointCursor {
             Direction::Forward => first_block_for_selector(&table, &selector, policy),
             Direction::Reverse => last_block_for_selector(&table, &selector, policy),
         };
-        let record_index = block_index.map_or(0, |index| match direction {
-            Direction::Forward => first_record_index_for_block(&table, &selector, index, policy),
-            Direction::Reverse => table.data_blocks[index].record_range.end,
-        });
-
         Self {
             table,
             selector,
             prefix_extractor,
             direction,
+            policy,
             block_cache,
             block_index,
-            record_index,
+            record_index: 0,
+            current_block: None,
             pending: None,
-            recorded_block_index: None,
             exhausted: false,
         }
     }
 
-    pub(crate) fn next_group(&mut self) -> Option<RecordGroup> {
-        let first = self.pending.take().or_else(|| self.next_record())?;
+    pub(crate) fn next_group(&mut self) -> Result<Option<RecordGroup>> {
+        let first = if let Some(record) = self.pending.take() {
+            record
+        } else {
+            let Some(record) = self.next_record()? else {
+                return Ok(None);
+            };
+            record
+        };
         let user_key = first.0.user_key().to_vec();
         let mut rest = Vec::new();
 
-        while let Some(record) = self.next_record() {
+        while let Some(record) = self.next_record()? {
             if record.0.user_key() == user_key.as_slice() {
                 rest.push(record);
             } else {
@@ -704,23 +739,25 @@ impl TablePointCursor {
         }
         let (first, rest) = sort_group_records(first, rest);
 
-        Some(RecordGroup {
+        Ok(Some(RecordGroup {
             user_key,
             first,
             rest,
-        })
+        }))
     }
 
-    fn next_record(&mut self) -> Option<ScanRecord> {
+    fn next_record(&mut self) -> Result<Option<ScanRecord>> {
         match self.direction {
             Direction::Forward => self.next_record_forward(),
             Direction::Reverse => self.next_record_reverse(),
         }
     }
 
-    fn next_record_forward(&mut self) -> Option<ScanRecord> {
+    fn next_record_forward(&mut self) -> Result<Option<ScanRecord>> {
         while !self.exhausted {
-            let block_index = self.block_index?;
+            let Some(block_index) = self.block_index else {
+                return Ok(None);
+            };
             match self.forward_block_state(block_index) {
                 CursorBlockState::Scan => {}
                 CursorBlockState::Skip => {
@@ -729,14 +766,12 @@ impl TablePointCursor {
                 }
                 CursorBlockState::Done => {
                     self.exhausted = true;
-                    return None;
+                    return Ok(None);
                 }
             }
 
-            self.record_block_cache_access(block_index);
-            let block_end = self.table.data_blocks[block_index].record_range.end;
-            while self.record_index < block_end {
-                let record = &self.table.point_records[self.record_index];
+            while self.record_index < self.current_block_len(block_index)? {
+                let record = self.current_block_record(block_index, self.record_index)?;
                 self.record_index += 1;
 
                 match self
@@ -745,11 +780,11 @@ impl TablePointCursor {
                 {
                     ForwardKeyState::Before => {}
                     ForwardKeyState::Match => {
-                        return Some((record.internal_key.clone(), record.value.clone()));
+                        return Ok(Some((record.internal_key, record.value)));
                     }
                     ForwardKeyState::After => {
                         self.exhausted = true;
-                        return None;
+                        return Ok(None);
                     }
                 }
             }
@@ -757,12 +792,14 @@ impl TablePointCursor {
             self.move_to_next_block();
         }
 
-        None
+        Ok(None)
     }
 
-    fn next_record_reverse(&mut self) -> Option<ScanRecord> {
+    fn next_record_reverse(&mut self) -> Result<Option<ScanRecord>> {
         while !self.exhausted {
-            let block_index = self.block_index?;
+            let Some(block_index) = self.block_index else {
+                return Ok(None);
+            };
             match self.reverse_block_state(block_index) {
                 CursorBlockState::Scan => {}
                 CursorBlockState::Skip => {
@@ -771,15 +808,14 @@ impl TablePointCursor {
                 }
                 CursorBlockState::Done => {
                     self.exhausted = true;
-                    return None;
+                    return Ok(None);
                 }
             }
 
-            self.record_block_cache_access(block_index);
-            let block_start = self.table.data_blocks[block_index].record_range.start;
-            while self.record_index > block_start {
+            self.ensure_current_block(block_index)?;
+            while self.record_index > 0 {
                 self.record_index -= 1;
-                let record = &self.table.point_records[self.record_index];
+                let record = self.current_block_record(block_index, self.record_index)?;
 
                 match self
                     .selector
@@ -787,11 +823,11 @@ impl TablePointCursor {
                 {
                     ReverseKeyState::Above => {}
                     ReverseKeyState::Match => {
-                        return Some((record.internal_key.clone(), record.value.clone()));
+                        return Ok(Some((record.internal_key, record.value)));
                     }
                     ReverseKeyState::Below => {
                         self.exhausted = true;
-                        return None;
+                        return Ok(None);
                     }
                 }
             }
@@ -799,7 +835,7 @@ impl TablePointCursor {
             self.move_to_previous_block();
         }
 
-        None
+        Ok(None)
     }
 
     fn forward_block_state(&self, block_index: usize) -> CursorBlockState {
@@ -861,9 +897,8 @@ impl TablePointCursor {
         };
         let next = block_index + 1;
         self.block_index = (next < self.table.data_blocks.len()).then_some(next);
-        self.record_index = self
-            .block_index
-            .map_or(0, |index| self.table.data_blocks[index].record_range.start);
+        self.record_index = 0;
+        self.current_block = None;
     }
 
     fn move_to_previous_block(&mut self) {
@@ -872,21 +907,51 @@ impl TablePointCursor {
             return;
         };
         self.block_index = block_index.checked_sub(1);
-        self.record_index = self
-            .block_index
-            .map_or(0, |index| self.table.data_blocks[index].record_range.end);
+        self.record_index = 0;
+        self.current_block = None;
     }
 
-    fn record_block_cache_access(&mut self, block_index: usize) {
-        if self.recorded_block_index == Some(block_index) {
-            return;
+    fn ensure_current_block(&mut self, block_index: usize) -> Result<()> {
+        if self
+            .current_block
+            .as_ref()
+            .is_some_and(|(current_index, _)| *current_index == block_index)
+        {
+            return Ok(());
         }
-        self.recorded_block_index = Some(block_index);
 
-        if let Some(block_cache) = &self.block_cache {
-            self.table
-                .record_block_cache_access(Some(block_cache.as_ref()), block_index);
-        }
+        let block = self
+            .table
+            .load_data_block(block_index, self.block_cache.as_deref())?;
+        self.record_index = match self.direction {
+            Direction::Forward => {
+                first_record_index_for_decoded_block(&block, &self.selector, self.policy)
+            }
+            Direction::Reverse => block.records.len(),
+        };
+        self.current_block = Some((block_index, block));
+        Ok(())
+    }
+
+    fn current_block_len(&mut self, block_index: usize) -> Result<usize> {
+        self.ensure_current_block(block_index)?;
+        Ok(self
+            .current_block
+            .as_ref()
+            .map_or(0, |(_, block)| block.records.len()))
+    }
+
+    fn current_block_record(
+        &mut self,
+        block_index: usize,
+        record_index: usize,
+    ) -> Result<TablePointRecord> {
+        self.ensure_current_block(block_index)?;
+        self.current_block
+            .as_ref()
+            .and_then(|(_, block)| block.records.get(record_index))
+            .cloned()
+            .ok_or_else(|| invalid_table("cursor record index outside data block"))
     }
 }
 
@@ -919,20 +984,106 @@ fn last_block_for_selector(
     }
 }
 
-fn first_record_index_for_block(
-    table: &Table,
+fn first_record_index_for_decoded_block(
+    block: &DecodedDataBlock,
     selector: &ScanSelector,
-    block_index: usize,
     policy: IndexSearchPolicy,
 ) -> usize {
-    let block = &table.data_blocks[block_index];
     match selector {
         ScanSelector::Range(range) => {
-            block.restart_index_for_bound(&table.point_records, &range.start, policy)
+            data_block_restart_index_for_bound(block, &range.start, policy)
         }
-        ScanSelector::Prefix(prefix) => {
-            block.restart_index_for_key(&table.point_records, prefix, policy)
+        ScanSelector::Prefix(prefix) => data_block_restart_index_for_key(block, prefix, policy),
+    }
+}
+
+fn data_block_point_records_for_key(
+    block: &DecodedDataBlock,
+    key: &[u8],
+    policy: IndexSearchPolicy,
+) -> Vec<TablePointRecord> {
+    let start = data_block_restart_index_for_key(block, key, policy);
+    block.records[start..]
+        .iter()
+        .take_while(move |record| record.internal_key.user_key() <= key)
+        .filter(move |record| record.internal_key.user_key() == key)
+        .cloned()
+        .collect()
+}
+
+fn data_block_newest_visible_point_record_for_key(
+    block: &DecodedDataBlock,
+    key: &[u8],
+    read_sequence: Sequence,
+    policy: IndexSearchPolicy,
+) -> Option<TablePointRecord> {
+    let start = data_block_restart_index_for_key(block, key, policy);
+    block.records[start..]
+        .iter()
+        .take_while(move |record| record.internal_key.user_key() <= key)
+        .find(move |record| {
+            record.internal_key.user_key() == key && record.internal_key.sequence() <= read_sequence
+        })
+        .cloned()
+}
+
+fn data_block_point_records_in_range(
+    block: &DecodedDataBlock,
+    range: &KeyRange,
+    policy: IndexSearchPolicy,
+) -> Vec<TablePointRecord> {
+    let start = data_block_restart_index_for_bound(block, &range.start, policy);
+    block.records[start..]
+        .iter()
+        .skip_while(move |record| key_is_before_start(record.internal_key.user_key(), &range.start))
+        .take_while(move |record| !key_is_after_end(record.internal_key.user_key(), &range.end))
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+fn data_block_point_records_with_prefix(
+    block: &DecodedDataBlock,
+    prefix: &[u8],
+    policy: IndexSearchPolicy,
+) -> Vec<TablePointRecord> {
+    let start = data_block_restart_index_for_key(block, prefix, policy);
+    block.records[start..]
+        .iter()
+        .skip_while(move |record| record.internal_key.user_key() < prefix)
+        .take_while(move |record| record.internal_key.user_key().starts_with(prefix))
+        .cloned()
+        .collect()
+}
+
+fn data_block_restart_index_for_bound(
+    block: &DecodedDataBlock,
+    bound: &Bound<Vec<u8>>,
+    policy: IndexSearchPolicy,
+) -> usize {
+    match bound {
+        Bound::Included(key) | Bound::Excluded(key) => {
+            data_block_restart_index_for_key(block, key, policy)
         }
+        Bound::Unbounded => 0,
+    }
+}
+
+fn data_block_restart_index_for_key(
+    block: &DecodedDataBlock,
+    key: &[u8],
+    policy: IndexSearchPolicy,
+) -> usize {
+    let upper = search::partition_point_by(block.restart_indices.len(), policy, |index| {
+        block.records[block.restart_indices[index]]
+            .internal_key
+            .user_key()
+            <= key
+    });
+    if upper == 0 {
+        0
+    } else {
+        block.restart_indices[upper - 1]
     }
 }
 
@@ -1015,6 +1166,9 @@ pub(crate) fn write_table(
     let data_blocks = build_data_blocks(&point_records, options)?;
 
     let table = Table {
+        path: None,
+        payload_len: 0,
+        footer: empty_footer(),
         properties: table_properties(
             table_id,
             level,
@@ -1024,9 +1178,9 @@ pub(crate) fn write_table(
         ),
         point_key_filter: build_point_key_filter(options, &point_records),
         prefix_filter: build_prefix_filter(options, &point_records),
-        point_records,
+        point_records: Some(point_records),
         data_blocks,
-        range_tombstones: range_tombstones.to_vec(),
+        range_tombstones: Arc::new(RwLock::new(Some(Arc::new(range_tombstones.to_vec())))),
     };
     let payload = encode_table(&table)?;
     let payload_len = u32::try_from(payload.len())
@@ -1052,25 +1206,84 @@ pub(crate) fn write_table(
     }
     fs::rename(tmp_path, path)?;
 
-    Ok(table)
+    read_table(path)
 }
 
 pub(crate) fn read_table(path: &Path) -> Result<Table> {
-    let mut bytes = Vec::new();
     let mut file = File::open(path).map_err(|error| Error::Corruption {
         message: format!(
             "referenced table {} cannot be opened: {error}",
             path.display()
         ),
     })?;
-    file.read_to_end(&mut bytes)
+    let mut header = [0_u8; HEADER_LEN];
+    file.read_exact(&mut header)
         .map_err(|error| Error::Corruption {
             message: format!(
-                "referenced table {} cannot be read: {error}",
+                "referenced table {} header cannot be read: {error}",
                 path.display()
             ),
         })?;
-    decode_table(&bytes)
+    let magic = read_u32_at(&header, 0)?;
+    let version = read_u16_at(&header, 4)?;
+    let payload_len = read_u32_at(&header, 6)? as usize;
+    if magic != TABLE_MAGIC {
+        return Err(Error::Corruption {
+            message: "table magic mismatch".to_owned(),
+        });
+    }
+    if version != TABLE_VERSION {
+        return Err(Error::UnsupportedFormat {
+            message: format!("unsupported table version {version}"),
+        });
+    }
+    let file_len = file.metadata()?.len();
+    let expected_len = usize_to_u64(
+        HEADER_LEN
+            .checked_add(payload_len)
+            .ok_or_else(|| invalid_table("table length overflow"))?,
+        "table file length",
+    )?;
+    if file_len != expected_len {
+        return Err(Error::Corruption {
+            message: "table length mismatch".to_owned(),
+        });
+    }
+
+    let footer = read_footer_from_file(&mut file, payload_len)?;
+    validate_footer_sections_by_len(payload_len, &footer)?;
+
+    let (properties_codec, properties_payload) =
+        read_single_block_section_from_file(path, payload_len, footer.properties)?;
+    let properties = decode_properties_block(&properties_payload)?;
+    validate_block_codec(properties_codec, properties.codec, TableSection::Properties)?;
+
+    let (index_codec, index_payload) =
+        read_single_block_section_from_file(path, payload_len, footer.indexes)?;
+    validate_block_codec(index_codec, properties.codec, TableSection::Indexes)?;
+    let index_entries = decode_index_block(&index_payload)?;
+    validate_data_index_covers_section(&index_entries, footer.data_blocks)?;
+    let data_blocks = index_entries
+        .into_iter()
+        .map(TableDataBlock::from_index_entry)
+        .collect::<Result<Vec<_>>>()?;
+
+    let (filter_codec, filter_payload) =
+        read_single_block_section_from_file(path, payload_len, footer.filters)?;
+    validate_block_codec(filter_codec, properties.codec, TableSection::Filters)?;
+    let (point_key_filter, prefix_filter) = decode_filter_block(&filter_payload)?;
+
+    Ok(Table {
+        path: Some(path.to_path_buf()),
+        payload_len,
+        footer,
+        properties,
+        point_records: None,
+        data_blocks,
+        range_tombstones: Arc::new(RwLock::new(None)),
+        point_key_filter,
+        prefix_filter,
+    })
 }
 
 fn table_properties(
@@ -1094,6 +1307,16 @@ fn table_properties(
             Some(largest_sequence.map_or(sequence, |current| std::cmp::max(current, sequence)));
     }
 
+    let blob_file_ids = point_records
+        .iter()
+        .filter_map(|record| match record.value.as_ref() {
+            Some(ValueRef::Blob { file_id, .. }) => Some(*file_id),
+            Some(ValueRef::Inline(_)) | None => None,
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
     TableProperties {
         id: table_id,
         level,
@@ -1106,6 +1329,7 @@ fn table_properties(
         smallest_sequence: smallest_sequence.unwrap_or(Sequence::ZERO),
         largest_sequence: largest_sequence.unwrap_or(Sequence::ZERO),
         codec,
+        blob_file_ids,
     }
 }
 
@@ -1113,31 +1337,31 @@ fn build_prefix_filter(
     options: &TableWriteOptions,
     point_records: &[TablePointRecord],
 ) -> Option<PrefixFilter> {
-    if matches!(options.prefix_filter_policy, PrefixFilterPolicy::Disabled) {
-        return None;
+    match options.prefix_filter_policy {
+        PrefixFilterPolicy::Disabled => None,
+        PrefixFilterPolicy::Bloom { bits_per_prefix } => PrefixFilter::from_keys(
+            options.prefix_extractor.clone(),
+            point_records
+                .iter()
+                .map(|record| record.internal_key.user_key()),
+            bits_per_prefix,
+        ),
     }
-
-    PrefixFilter::from_keys(
-        options.prefix_extractor.clone(),
-        point_records
-            .iter()
-            .map(|record| record.internal_key.user_key()),
-    )
 }
 
 fn build_point_key_filter(
     options: &TableWriteOptions,
     point_records: &[TablePointRecord],
 ) -> Option<PointKeyFilter> {
-    if matches!(options.filter_policy, FilterPolicy::Disabled) {
-        return None;
+    match options.filter_policy {
+        FilterPolicy::Disabled => None,
+        FilterPolicy::Bloom { bits_per_key } => Some(PointKeyFilter::from_keys(
+            point_records
+                .iter()
+                .map(|record| record.internal_key.user_key()),
+            bits_per_key,
+        )),
     }
-
-    Some(PointKeyFilter::from_keys(
-        point_records
-            .iter()
-            .map(|record| record.internal_key.user_key()),
-    ))
 }
 
 fn build_data_blocks(
@@ -1152,7 +1376,7 @@ fn build_data_blocks(
         let mut estimated_len = 0_usize;
         while block_end < point_records.len() {
             let next_len = point_record_encoded_len(&point_records[block_end]);
-            if block_end > block_start && estimated_len + next_len > DATA_BLOCK_TARGET_BYTES {
+            if block_end > block_start && estimated_len + next_len > options.block_bytes {
                 break;
             }
             estimated_len += next_len;
@@ -1179,8 +1403,12 @@ fn build_data_blocks(
 fn encode_table(table: &Table) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let codec = table.properties.codec;
+    let point_records = table
+        .point_records
+        .as_deref()
+        .ok_or_else(|| invalid_table("cannot encode table without point records"))?;
     let (data_blocks, index_entries) =
-        append_data_blocks(&mut bytes, codec, &table.point_records, &table.data_blocks)?;
+        append_data_blocks(&mut bytes, codec, point_records, &table.data_blocks)?;
     let range_tombstones =
         append_single_block_section(&mut bytes, codec, &encode_range_tombstone_block(table)?)?;
     let filters = append_single_block_section(&mut bytes, codec, &encode_filter_block(table)?)?;
@@ -1205,6 +1433,7 @@ fn encode_table(table: &Table) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn decode_table(bytes: &[u8]) -> Result<Table> {
     if bytes.len() < HEADER_LEN {
         return Err(invalid_table("short header"));
@@ -1261,7 +1490,7 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
         let record_start = point_records.len();
         point_records.extend(decoded_block.records);
         let record_end = point_records.len();
-        data_blocks.push(TableDataBlock::from_record_range(
+        data_blocks.push(TableDataBlock::from_record_range_and_block(
             &point_records,
             record_start..record_end,
             decoded_block
@@ -1269,6 +1498,7 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
                 .into_iter()
                 .map(|index| record_start + index)
                 .collect(),
+            entry.block,
             entry.point_key_filter.clone(),
             entry.prefix_filter.clone(),
         )?);
@@ -1301,10 +1531,13 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
     }
 
     Ok(Table {
+        path: None,
+        payload_len: payload.len(),
+        footer,
         properties,
-        point_records,
+        point_records: Some(point_records),
         data_blocks,
-        range_tombstones,
+        range_tombstones: Arc::new(RwLock::new(Some(Arc::new(range_tombstones)))),
         point_key_filter,
         prefix_filter,
     })
@@ -1400,15 +1633,13 @@ fn encode_data_block(records: &[TablePointRecord]) -> Result<Vec<u8>> {
 }
 
 fn encode_range_tombstone_block(table: &Table) -> Result<Vec<u8>> {
+    let range_tombstones = table.range_tombstones()?;
     let mut bytes = Vec::new();
     put_u32(
         &mut bytes,
-        usize_to_u32(
-            table.range_tombstones.len(),
-            "range tombstone block record count",
-        )?,
+        usize_to_u32(range_tombstones.len(), "range tombstone block record count")?,
     );
-    for tombstone in &table.range_tombstones {
+    for tombstone in range_tombstones.iter() {
         put_bound(&mut bytes, &tombstone.range.start)?;
         put_bound(&mut bytes, &tombstone.range.end)?;
         put_u64(&mut bytes, tombstone.sequence.get());
@@ -1446,13 +1677,9 @@ fn put_point_key_filter(bytes: &mut Vec<u8>, filter: Option<&PointKeyFilter>) ->
         None => put_u8(bytes, POINT_KEY_FILTER_ABSENT),
         Some(filter) => {
             put_u8(bytes, POINT_KEY_FILTER_PRESENT);
-            put_u32(
-                bytes,
-                usize_to_u32(filter.keys().len(), "point-key filter entry count")?,
-            );
-            for key in filter.keys() {
-                put_bytes(bytes, key)?;
-            }
+            put_u64(bytes, filter.bit_count());
+            put_u8(bytes, filter.hash_count());
+            put_bytes(bytes, filter.bytes())?;
         }
     }
 
@@ -1465,13 +1692,9 @@ fn put_prefix_filter(bytes: &mut Vec<u8>, filter: Option<&PrefixFilter>) -> Resu
         Some(filter) => {
             put_u8(bytes, PREFIX_FILTER_PRESENT);
             put_prefix_extractor(bytes, filter.extractor())?;
-            put_u32(
-                bytes,
-                usize_to_u32(filter.prefixes().len(), "prefix filter entry count")?,
-            );
-            for prefix in filter.prefixes() {
-                put_bytes(bytes, prefix)?;
-            }
+            put_u64(bytes, filter.bit_count());
+            put_u8(bytes, filter.hash_count());
+            put_bytes(bytes, filter.bytes())?;
         }
     }
 
@@ -1484,12 +1707,35 @@ fn encode_properties_block(properties: &TableProperties) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn read_footer(payload: &[u8]) -> Result<TableFooter> {
     if payload.len() < FOOTER_LEN {
         return Err(invalid_table("short footer"));
     }
     let footer_start = payload.len() - FOOTER_LEN;
-    let footer = &payload[footer_start..];
+    read_footer_bytes(&payload[footer_start..])
+}
+
+fn read_footer_from_file(file: &mut File, payload_len: usize) -> Result<TableFooter> {
+    if payload_len < FOOTER_LEN {
+        return Err(invalid_table("short footer"));
+    }
+    let footer_start = HEADER_LEN
+        .checked_add(payload_len - FOOTER_LEN)
+        .ok_or_else(|| invalid_table("footer offset overflow"))?;
+    file.seek(SeekFrom::Start(usize_to_u64(
+        footer_start,
+        "footer file offset",
+    )?))?;
+    let mut footer = [0_u8; FOOTER_LEN];
+    file.read_exact(&mut footer)?;
+    read_footer_bytes(&footer)
+}
+
+fn read_footer_bytes(footer: &[u8]) -> Result<TableFooter> {
+    if footer.len() != FOOTER_LEN {
+        return Err(invalid_table("short footer"));
+    }
     let stored_checksum = read_u32_at(footer, FOOTER_LEN - 4)?;
     if checksum(&footer[..FOOTER_LEN - 4]) != stored_checksum {
         return Err(Error::Corruption {
@@ -1541,8 +1787,24 @@ fn put_footer(bytes: &mut Vec<u8>, footer: &TableFooter) {
     bytes.extend_from_slice(&footer_bytes);
 }
 
+const fn empty_footer() -> TableFooter {
+    let empty = SectionHandle { offset: 0, len: 0 };
+    TableFooter {
+        data_blocks: empty,
+        range_tombstones: empty,
+        filters: empty,
+        indexes: empty,
+        properties: empty,
+    }
+}
+
+#[cfg(test)]
 fn validate_footer_sections(payload: &[u8], footer: &TableFooter) -> Result<()> {
-    let footer_start = payload.len() - FOOTER_LEN;
+    validate_footer_sections_by_len(payload.len(), footer)
+}
+
+fn validate_footer_sections_by_len(payload_len: usize, footer: &TableFooter) -> Result<()> {
+    let footer_start = payload_len - FOOTER_LEN;
     let mut expected_start = 0_usize;
     for section in [
         footer.data_blocks,
@@ -1568,6 +1830,7 @@ fn validate_footer_sections(payload: &[u8], footer: &TableFooter) -> Result<()> 
     Ok(())
 }
 
+#[cfg(test)]
 fn read_single_block_section(payload: &[u8], section: SectionHandle) -> Result<(CodecId, Vec<u8>)> {
     let (_, section_end) = section_bounds(section)?;
     if section.len == 0 {
@@ -1586,11 +1849,88 @@ fn read_single_block_section(payload: &[u8], section: SectionHandle) -> Result<(
     read_checked_block(payload, block)
 }
 
+fn read_single_block_section_from_file(
+    path: &Path,
+    payload_len: usize,
+    section: SectionHandle,
+) -> Result<(CodecId, Vec<u8>)> {
+    if payload_len < FOOTER_LEN {
+        return Err(invalid_table("short footer"));
+    }
+    let (_, section_end) = section_bounds(section)?;
+    if section.len == 0 {
+        return Err(invalid_table("empty single-block section"));
+    }
+    if section_end > payload_len - FOOTER_LEN {
+        return Err(Error::Corruption {
+            message: "table section layout is inconsistent".to_owned(),
+        });
+    }
+    let block = BlockHandle {
+        offset: section.offset,
+        len: section.len,
+    };
+    let (_, block_end) = block_bounds(block)?;
+    if block_end != section_end {
+        return Err(Error::Corruption {
+            message: "section block length mismatch".to_owned(),
+        });
+    }
+    read_checked_block_from_file(path, payload_len, block)
+}
+
+#[cfg(test)]
 fn read_checked_block(payload: &[u8], block: BlockHandle) -> Result<(CodecId, Vec<u8>)> {
     let (start, end) = block_bounds(block)?;
     let block_bytes = payload
         .get(start..end)
         .ok_or_else(|| invalid_table("block outside table payload"))?;
+    read_checked_block_bytes(block_bytes)
+}
+
+fn read_checked_block_from_file(
+    path: &Path,
+    payload_len: usize,
+    block: BlockHandle,
+) -> Result<(CodecId, Vec<u8>)> {
+    let (start, end) = block_bounds(block)?;
+    if end > payload_len {
+        return Err(invalid_table("block outside table payload"));
+    }
+
+    let file_offset = HEADER_LEN
+        .checked_add(start)
+        .ok_or_else(|| invalid_table("block file offset overflow"))?;
+    let mut file = File::open(path).map_err(|error| Error::Corruption {
+        message: format!(
+            "referenced table {} cannot be opened: {error}",
+            path.display()
+        ),
+    })?;
+    file.seek(SeekFrom::Start(usize_to_u64(
+        file_offset,
+        "block file offset",
+    )?))?;
+    let mut block_bytes = vec![0_u8; end - start];
+    file.read_exact(&mut block_bytes)?;
+    read_checked_block_bytes(&block_bytes)
+}
+
+fn read_data_block_from_file(
+    path: &Path,
+    payload_len: usize,
+    expected_codec: CodecId,
+    entry: &DataBlockIndexEntry,
+) -> Result<DecodedDataBlock> {
+    let (actual_codec, payload) = read_checked_block_from_file(path, payload_len, entry.block)?;
+    validate_block_codec(actual_codec, expected_codec, TableSection::DataBlocks)?;
+    let decoded = decode_data_block(&payload)?;
+    validate_data_block_entry(entry, &decoded.records)?;
+    validate_data_block_filters(entry, &decoded.records)?;
+    Ok(decoded)
+}
+
+fn read_checked_block_bytes(block_bytes: &[u8]) -> Result<(CodecId, Vec<u8>)> {
     if block_bytes.len() < BLOCK_HEADER_LEN {
         return Err(invalid_table("short block header"));
     }
@@ -1736,18 +2076,12 @@ fn read_point_key_filter(cursor: &mut Cursor<'_>) -> Result<Option<PointKeyFilte
     match cursor.read_u8()? {
         POINT_KEY_FILTER_ABSENT => Ok(None),
         POINT_KEY_FILTER_PRESENT => {
-            let key_count = cursor.read_u32()? as usize;
-            ensure_count_fits_remaining(
-                key_count,
-                cursor.remaining_len(),
-                MIN_FILTER_ENTRY_BYTES,
-                "point-key filter count exceeds block bytes",
-            )?;
-            let mut keys = Vec::with_capacity(key_count);
-            for _ in 0..key_count {
-                keys.push(cursor.read_bytes()?.to_vec());
-            }
-            Ok(Some(PointKeyFilter::from_sorted_keys(keys)?))
+            let bit_count = cursor.read_u64()?;
+            let hash_count = cursor.read_u8()?;
+            let bytes = cursor.read_bytes()?.to_vec();
+            Ok(Some(PointKeyFilter::from_parts(
+                bit_count, hash_count, bytes,
+            )?))
         }
         tag => Err(Error::InvalidFormat {
             message: format!("unknown table point-key filter tag {tag}"),
@@ -1760,19 +2094,11 @@ fn read_prefix_filter(cursor: &mut Cursor<'_>) -> Result<Option<PrefixFilter>> {
         PREFIX_FILTER_ABSENT => Ok(None),
         PREFIX_FILTER_PRESENT => {
             let extractor = cursor.read_prefix_extractor()?;
-            let prefix_count = cursor.read_u32()? as usize;
-            ensure_count_fits_remaining(
-                prefix_count,
-                cursor.remaining_len(),
-                MIN_FILTER_ENTRY_BYTES,
-                "prefix filter count exceeds block bytes",
-            )?;
-            let mut prefixes = Vec::with_capacity(prefix_count);
-            for _ in 0..prefix_count {
-                prefixes.push(cursor.read_bytes()?.to_vec());
-            }
-            Ok(Some(PrefixFilter::from_sorted_prefixes(
-                extractor, prefixes,
+            let bit_count = cursor.read_u64()?;
+            let hash_count = cursor.read_u8()?;
+            let bytes = cursor.read_bytes()?.to_vec();
+            Ok(Some(PrefixFilter::from_parts(
+                extractor, bit_count, hash_count, bytes,
             )?))
         }
         tag => Err(Error::InvalidFormat {
@@ -1923,7 +2249,7 @@ fn validate_data_block_filters(
             if filter
                 .extractor()
                 .extract(user_key)
-                .is_some_and(|prefix| !filter.prefixes().contains(prefix))
+                .is_some_and(|prefix| !filter.may_contain_prefix(prefix))
             {
                 return Err(Error::Corruption {
                     message: "data block prefix filter misses a block prefix".to_owned(),
@@ -1955,6 +2281,16 @@ fn put_properties(bytes: &mut Vec<u8>, properties: &TableProperties) -> Result<(
     put_u64(bytes, properties.smallest_sequence.get());
     put_u64(bytes, properties.largest_sequence.get());
     put_codec(bytes, properties.codec);
+    put_u32(
+        bytes,
+        usize_to_u32(
+            properties.blob_file_ids.len(),
+            "properties blob file id count",
+        )?,
+    );
+    for file_id in &properties.blob_file_ids {
+        put_u64(bytes, *file_id);
+    }
     Ok(())
 }
 
@@ -2255,6 +2591,7 @@ impl<'payload> Cursor<'payload> {
             smallest_sequence: Sequence::new(self.read_u64()?),
             largest_sequence: Sequence::new(self.read_u64()?),
             codec: self.read_codec()?,
+            blob_file_ids: self.read_blob_file_ids()?,
         })
     }
 
@@ -2295,6 +2632,27 @@ impl<'payload> Cursor<'payload> {
 
     fn read_codec(&mut self) -> Result<CodecId> {
         codec_from_tag(self.read_u8()?)
+    }
+
+    fn read_blob_file_ids(&mut self) -> Result<Vec<u64>> {
+        let file_id_count = self.read_u32()? as usize;
+        ensure_count_fits_remaining(
+            file_id_count,
+            self.remaining_len(),
+            8,
+            "properties blob file id count exceeds block bytes",
+        )?;
+        let mut file_ids = Vec::with_capacity(file_id_count);
+        let mut previous = None;
+        for _ in 0..file_id_count {
+            let file_id = self.read_u64()?;
+            if previous.is_some_and(|previous| previous >= file_id) {
+                return Err(invalid_table("properties blob file ids are not sorted"));
+            }
+            file_ids.push(file_id);
+            previous = Some(file_id);
+        }
+        Ok(file_ids)
     }
 
     fn read_section_handle(&mut self) -> Result<SectionHandle> {
@@ -2369,7 +2727,10 @@ mod tests {
 
         let decoded = decode_table(&table_file_bytes(&payload)).expect("table decodes");
         assert_eq!(decoded.properties(), table.properties());
-        assert_eq!(decoded.point_records(), table.point_records());
+        assert_eq!(
+            decoded.point_records().expect("decoded records load"),
+            table.point_records().expect("source records load")
+        );
     }
 
     #[test]
@@ -2378,7 +2739,10 @@ mod tests {
         let payload = encode_table(&table).expect("table encodes");
         let decoded = decode_table(&table_file_bytes(&payload)).expect("table decodes");
         assert_eq!(decoded.properties(), table.properties());
-        assert_eq!(decoded.point_records(), table.point_records());
+        assert_eq!(
+            decoded.point_records().expect("decoded records load"),
+            table.point_records().expect("source records load")
+        );
     }
 
     #[test]
@@ -2391,6 +2755,7 @@ mod tests {
 
         let point_keys = table
             .point_records_for_key(b"key-127", IndexSearchPolicy::Binary)
+            .expect("point records load")
             .into_iter()
             .map(|record| record.internal_key.user_key().to_vec())
             .collect::<Vec<_>>();
@@ -2398,6 +2763,7 @@ mod tests {
         assert!(
             table
                 .point_records_for_key(b"missing", IndexSearchPolicy::Binary)
+                .expect("missing point probe loads")
                 .is_empty()
         );
 
@@ -2406,6 +2772,7 @@ mod tests {
                 &KeyRange::half_open(b"key-020", b"key-030"),
                 IndexSearchPolicy::Binary,
             )
+            .expect("range records load")
             .into_iter()
             .map(|record| record.internal_key.user_key().to_vec())
             .collect::<Vec<_>>();
@@ -2420,6 +2787,7 @@ mod tests {
                 &PrefixExtractor::Disabled,
                 IndexSearchPolicy::Binary,
             )
+            .expect("prefix records load")
             .into_iter()
             .map(|record| record.internal_key.user_key().to_vec())
             .collect::<Vec<_>>();
@@ -2448,6 +2816,7 @@ mod tests {
         ] {
             let point_keys = table
                 .point_records_for_key(b"key-127", policy)
+                .expect("point records load")
                 .into_iter()
                 .map(|record| record.internal_key.user_key().to_vec())
                 .collect::<Vec<_>>();
@@ -2455,6 +2824,7 @@ mod tests {
 
             let range_keys = table
                 .point_records_in_range(&KeyRange::half_open(b"key-020", b"key-030"), policy)
+                .expect("range records load")
                 .into_iter()
                 .map(|record| record.internal_key.user_key().to_vec())
                 .collect::<Vec<_>>();
@@ -2462,11 +2832,28 @@ mod tests {
 
             let prefix_keys = table
                 .point_records_with_prefix(b"key-12", &PrefixExtractor::FixedLen(6), policy)
+                .expect("prefix records load")
                 .into_iter()
                 .map(|record| record.internal_key.user_key().to_vec())
                 .collect::<Vec<_>>();
             assert_eq!(prefix_keys, expected_prefix, "policy {policy:?}");
         }
+    }
+
+    #[test]
+    fn configured_block_bytes_controls_data_block_count() {
+        let mut small_blocks = test_table_options(CodecId::None, false);
+        small_blocks.block_bytes = 256;
+        let mut large_blocks = test_table_options(CodecId::None, false);
+        large_blocks.block_bytes = 4096;
+
+        let small_table = table_with_options(160, &small_blocks);
+        let large_table = table_with_options(160, &large_blocks);
+
+        assert!(
+            small_table.data_blocks.len() > large_table.data_blocks.len(),
+            "smaller configured blocks should split records into more data blocks"
+        );
     }
 
     #[test]
@@ -2498,7 +2885,8 @@ mod tests {
             .as_ref()
             .expect("point filter exists");
         assert!(point_filter.may_contain_key(first_entry.smallest_internal_key.user_key()));
-        assert!(!point_filter.may_contain_key(b"not-present"));
+        let missing = point_filter_miss(point_filter);
+        assert!(!point_filter.may_contain_key(&missing));
 
         let decoded = decode_table(&table_file_bytes(&payload)).expect("table decodes");
         let prefix_keys = decoded
@@ -2507,6 +2895,7 @@ mod tests {
                 &PrefixExtractor::FixedLen(6),
                 IndexSearchPolicy::Binary,
             )
+            .expect("prefix records load")
             .into_iter()
             .map(|record| record.internal_key.user_key().to_vec())
             .collect::<Vec<_>>();
@@ -2520,12 +2909,15 @@ mod tests {
     fn data_block_filter_false_negative_fails_closed() {
         let table = table_with_filters(32, CodecId::None);
         let block = table.data_blocks.first().expect("test table has a block");
-        let records = &table.point_records[block.record_range.clone()];
+        let point_records = table.point_records.as_ref().expect("test records loaded");
+        let records = &point_records[block.record_range.clone()];
         let entry = DataBlockIndexEntry {
             smallest_internal_key: block.smallest_internal_key.clone(),
             largest_internal_key: block.largest_internal_key.clone(),
             block: BlockHandle { offset: 0, len: 0 },
-            point_key_filter: Some(PointKeyFilter::from_keys(std::iter::empty::<&[u8]>())),
+            point_key_filter: Some(
+                PointKeyFilter::from_parts(1, 1, vec![0]).expect("test filter decodes"),
+            ),
             prefix_filter: None,
         };
 
@@ -2535,19 +2927,43 @@ mod tests {
     }
 
     #[test]
+    fn prefix_block_filter_false_negative_fails_closed() {
+        let table = table_with_filters(32, CodecId::None);
+        let block = table.data_blocks.first().expect("test table has a block");
+        let point_records = table.point_records.as_ref().expect("test records loaded");
+        let records = &point_records[block.record_range.clone()];
+        let entry = DataBlockIndexEntry {
+            smallest_internal_key: block.smallest_internal_key.clone(),
+            largest_internal_key: block.largest_internal_key.clone(),
+            block: BlockHandle { offset: 0, len: 0 },
+            point_key_filter: None,
+            prefix_filter: Some(
+                PrefixFilter::from_parts(PrefixExtractor::FixedLen(6), 1, 1, vec![0])
+                    .expect("test filter decodes"),
+            ),
+        };
+
+        let error = validate_data_block_filters(&entry, records)
+            .expect_err("missing block prefix should fail");
+        assert!(matches!(error, Error::Corruption { .. }));
+    }
+
+    #[test]
     fn point_key_filter_round_trips_and_rejects_missing_keys() {
         let mut table = table_with_records(8, CodecId::None);
+        let point_records = table.point_records().expect("test records load");
         table.point_key_filter = Some(PointKeyFilter::from_keys(
-            table
-                .point_records()
+            point_records
                 .iter()
                 .map(|record| record.internal_key.user_key()),
+            10,
         ));
         let payload = encode_table(&table).expect("table encodes");
         let decoded = decode_table(&table_file_bytes(&payload)).expect("table decodes");
 
         assert!(decoded.may_contain_key(b"key-003"));
-        assert!(!decoded.may_contain_key(b"missing"));
+        let missing = point_filter_miss(decoded.point_key_filter.as_ref().expect("filter exists"));
+        assert!(!decoded.may_contain_key(&missing));
     }
 
     #[test]
@@ -2599,22 +3015,26 @@ mod tests {
     }
 
     #[test]
-    fn table_decode_rejects_filter_counts_before_large_allocation() {
+    fn table_decode_rejects_malformed_bloom_filters() {
         let mut point_bytes = Vec::new();
         put_u8(&mut point_bytes, POINT_KEY_FILTER_PRESENT);
-        put_u32(&mut point_bytes, u32::MAX);
-        let error = decode_filter_block(&point_bytes)
-            .expect_err("impossible point-key filter count should fail");
-        assert_invalid_table_message(&error, "point-key filter count exceeds block bytes");
+        put_u64(&mut point_bytes, 16);
+        put_u8(&mut point_bytes, 1);
+        put_bytes(&mut point_bytes, &[0]).expect("bitset encodes");
+        let error =
+            decode_filter_block(&point_bytes).expect_err("short point-key bitset should fail");
+        assert!(error.to_string().contains("byte length"));
 
         let mut prefix_bytes = Vec::new();
         put_u8(&mut prefix_bytes, POINT_KEY_FILTER_ABSENT);
         put_u8(&mut prefix_bytes, PREFIX_FILTER_PRESENT);
         put_u8(&mut prefix_bytes, PREFIX_EXTRACTOR_DISABLED);
-        put_u32(&mut prefix_bytes, u32::MAX);
-        let error = decode_filter_block(&prefix_bytes)
-            .expect_err("impossible prefix filter count should fail");
-        assert_invalid_table_message(&error, "prefix filter count exceeds block bytes");
+        put_u64(&mut prefix_bytes, 16);
+        put_u8(&mut prefix_bytes, 0);
+        put_bytes(&mut prefix_bytes, &[0, 0]).expect("bitset encodes");
+        let error =
+            decode_filter_block(&prefix_bytes).expect_err("invalid prefix hash count should fail");
+        assert!(error.to_string().contains("hash count"));
     }
 
     fn table_with_records(count: usize, codec: CodecId) -> Table {
@@ -2641,6 +3061,9 @@ mod tests {
             .collect::<Vec<_>>();
         let data_blocks = build_data_blocks(&point_records, options).expect("test blocks build");
         Table {
+            path: None,
+            payload_len: 0,
+            footer: empty_footer(),
             properties: table_properties(
                 TableId(7),
                 TableLevel::ZERO,
@@ -2650,15 +3073,16 @@ mod tests {
             ),
             point_key_filter: build_point_key_filter(options, &point_records),
             prefix_filter: build_prefix_filter(options, &point_records),
-            point_records,
+            point_records: Some(point_records),
             data_blocks,
-            range_tombstones: Vec::new(),
+            range_tombstones: Arc::new(RwLock::new(Some(Arc::new(Vec::new())))),
         }
     }
 
     const fn test_table_options(codec: CodecId, filters_enabled: bool) -> TableWriteOptions {
         TableWriteOptions {
             codec,
+            block_bytes: 1024,
             filter_policy: if filters_enabled {
                 FilterPolicy::Bloom { bits_per_key: 10 }
             } else {
@@ -2703,5 +3127,15 @@ mod tests {
             error.to_string().contains(expected),
             "unexpected error: {error}"
         );
+    }
+
+    fn point_filter_miss(filter: &PointKeyFilter) -> Vec<u8> {
+        for index in 0..10_000 {
+            let key = format!("missing-{index:05}").into_bytes();
+            if !filter.may_contain_key(&key) {
+                return key;
+            }
+        }
+        panic!("test filter should have at least one definite miss");
     }
 }

@@ -286,3 +286,46 @@ flush, and unbounded WAL replay as the next P1 production risks.
   old flushed batches.
 - Existing MVCC, range-delete, persistent, transaction, recovery, and release
   gates pass.
+
+### Phase 17: File-Backed SSTable Reader
+
+**Status**: Complete
+
+**Goal**: Replace startup-time full SSTable decoding with metadata-only table
+open and on-demand verified data block reads.
+
+**Entry Condition**: Phase 16 complete and user audit identifies full SSTable
+loading as the highest P0 production-readiness risk.
+
+**Acceptance Gate**:
+
+- Persistent table open reads footer, properties, index, and filter metadata
+  without decoding data blocks.
+- Point and range reads load only candidate data blocks and verify checksum,
+  codec, and block/index consistency at read time.
+- `KeyspaceOptions::block_bytes` controls data block sizing.
+- Block cache stores real decoded data blocks and reports misses/hits
+  around actual block reads.
+- Startup validates formal blob files using table/manifest metadata, including
+  compaction outputs that keep older blob references.
+- In-memory mode and persistent mode tests continue to pass.
+
+### Phase 18: Real Bloom Filters
+
+**Status**: Complete
+
+**Goal**: Replace exact-set table filters with compact Bloom bitsets for
+point-key and prefix filtering.
+
+**Entry Condition**: Phase 17 complete and evidence shows exact-set filters are
+the next read-path memory-cost mismatch.
+
+**Acceptance Gate**:
+
+- Point-key and prefix filters store Bloom bitsets, not complete key/prefix
+  sets.
+- `bits_per_key` and `bits_per_prefix` control bit counts and hash counts.
+- Table-level and block-level filters still guard point and prefix read paths.
+- False positives are allowed, but false negatives are rejected by table/block
+  validation.
+- In-memory and persistent mode tests continue to pass.
