@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DbStats {
     pub live_buckets: usize,
@@ -15,6 +17,12 @@ pub struct DbStats {
     pub stale_blob_bytes: u64,
     pub obsolete_blob_files: usize,
     pub obsolete_blob_bytes: u64,
+    pub blob_gc_runs: u64,
+    pub blob_gc_input_bytes: u64,
+    pub blob_gc_output_bytes: u64,
+    pub blob_gc_discarded_bytes: u64,
+    pub blob_read_count: u64,
+    pub blob_read_bytes: u64,
     pub compaction_runs: u64,
     pub compaction_input_tables: u64,
     pub compaction_output_tables: u64,
@@ -23,6 +31,26 @@ pub struct DbStats {
     pub block_cache_hits: u64,
     pub block_cache_misses: u64,
     pub filters: FilterStats,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct BlobReadMetrics {
+    count: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl BlobReadMetrics {
+    pub(crate) fn record(&self, bytes: u64) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn snapshot(&self) -> (u64, u64) {
+        (
+            self.count.load(Ordering::Acquire),
+            self.bytes.load(Ordering::Acquire),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

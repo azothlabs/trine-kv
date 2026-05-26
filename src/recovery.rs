@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{ErrorKind, Read, Write},
     path::{Path, PathBuf},
@@ -10,6 +10,7 @@ use crate::{
     blob,
     durability::sync_parent_dir_after_rename,
     error::{Error, Result},
+    manifest::ManifestState,
     options::FailOnCorruptionPolicy,
     table::{self, TableId},
     wal,
@@ -173,6 +174,83 @@ pub(crate) fn fail_on_missing_referenced_blob_files(
             missing_files.join(", ")
         ),
     })
+}
+
+pub(crate) fn fail_on_invalid_referenced_blob_files(
+    db_path: &Path,
+    manifest: &ManifestState,
+) -> Result<()> {
+    let referenced_blob_ids = manifest
+        .tables()
+        .values()
+        .flat_map(|tables| {
+            tables
+                .iter()
+                .flat_map(|properties| properties.blob_file_ids().iter().copied())
+        })
+        .collect::<BTreeSet<_>>();
+    let mut blob_properties = BTreeMap::new();
+    for blob_id in referenced_blob_ids {
+        blob_properties.insert(blob_id, blob::validate_blob_file(db_path, blob_id)?);
+    }
+
+    for (bucket, tables) in manifest.tables() {
+        for table in tables {
+            let reference_ids = table
+                .blob_references()
+                .iter()
+                .map(|reference| reference.file_id)
+                .collect::<BTreeSet<_>>();
+            let file_ids = table
+                .blob_file_ids()
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            if file_ids != reference_ids {
+                return Err(Error::Corruption {
+                    message: format!(
+                        "table {} in bucket {bucket} has inconsistent blob reference ids",
+                        table.id.get()
+                    ),
+                });
+            }
+
+            for reference in table.blob_references() {
+                let properties =
+                    blob_properties
+                        .get(&reference.file_id)
+                        .ok_or_else(|| Error::Corruption {
+                            message: format!(
+                                "table {} in bucket {bucket} references missing blob metadata {}",
+                                table.id.get(),
+                                reference.file_id
+                            ),
+                        })?;
+                if reference.referenced_bytes > properties.encoded_bytes {
+                    return Err(Error::Corruption {
+                        message: format!(
+                            "table {} in bucket {bucket} references too many blob bytes in file {}",
+                            table.id.get(),
+                            reference.file_id
+                        ),
+                    });
+                }
+                if reference.smallest_internal_key < properties.smallest_internal_key
+                    || reference.largest_internal_key > properties.largest_internal_key
+                {
+                    return Err(Error::Corruption {
+                        message: format!(
+                            "table {} in bucket {bucket} has blob key span outside file {}",
+                            table.id.get(),
+                            reference.file_id
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 struct TemporaryFile {

@@ -92,7 +92,8 @@ The manifest stores:
 
 - bucket definitions and options;
 - live SSTable ids and compaction levels;
-- live blob file ids;
+- live blob file ids plus per-table blob reference bytes, counts, and key
+  spans;
 - the WAL replay floor.
 
 New SSTables become part of the live database only after the manifest edit is
@@ -126,8 +127,10 @@ checksums, has an unsupported format, or disagrees with manifest metadata.
 
 Large separated values live in blob files. Blob references are visible only
 through committed WAL records or published SSTables. Blob files include
-checksums, and cleanup cannot remove a blob that is still referenced by a live
-table or an active snapshot.
+internal-key metadata, properties, footer checksums, and per-record value
+checksums. Startup decodes manifest-referenced blob files and fails closed if a
+referenced file is missing or corrupt. Cleanup cannot remove a blob that is
+still referenced by a live table or an active snapshot.
 
 ## Compaction And Cleanup
 

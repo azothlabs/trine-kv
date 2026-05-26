@@ -11,6 +11,7 @@ use crate::{
     memtable::Memtable,
     range_tombstone::{RangeTombstoneIndex, RangeTombstoneLike},
     snapshot::Snapshot,
+    stats::BlobReadMetrics,
     table::TablePointCursor,
     types::{KeyRange, KeyValue, Sequence},
 };
@@ -57,6 +58,7 @@ impl Iter {
         read_sequence: Sequence,
         read_pin: Snapshot,
         db_path: Option<PathBuf>,
+        blob_reads: Option<Arc<BlobReadMetrics>>,
         range_tombstones: Vec<ScanRangeTombstone>,
         sources: Vec<RecordSource>,
     ) -> Self {
@@ -67,6 +69,7 @@ impl Iter {
                 read_sequence,
                 _read_pin: read_pin,
                 db_path,
+                blob_reads,
                 range_tombstones: RangeTombstoneIndex::new(range_tombstones),
                 sources,
                 source_heap: BinaryHeap::new(),
@@ -98,6 +101,7 @@ struct LazyScan {
     read_sequence: Sequence,
     _read_pin: Snapshot,
     db_path: Option<PathBuf>,
+    blob_reads: Option<Arc<BlobReadMetrics>>,
     range_tombstones: RangeTombstoneIndex<ScanRangeTombstone>,
     sources: Vec<RecordSource>,
     source_heap: BinaryHeap<SourceHeapEntry>,
@@ -216,7 +220,12 @@ impl LazyScan {
 
                     return Ok(Some(KeyValue::new(
                         internal_key.user_key().to_vec(),
-                        value_bytes(value.as_ref(), self.db_path.as_deref())?,
+                        value_bytes(
+                            value.as_ref(),
+                            &internal_key,
+                            self.db_path.as_deref(),
+                            self.blob_reads.as_deref(),
+                        )?,
                     )));
                 }
                 ValueKind::PointDelete => return Ok(None),
@@ -652,18 +661,28 @@ fn lock_poisoned(lock_name: &'static str) -> Error {
     }
 }
 
-fn value_bytes(value: Option<&ValueRef>, db_path: Option<&std::path::Path>) -> Result<Vec<u8>> {
+fn value_bytes(
+    value: Option<&ValueRef>,
+    internal_key: &InternalKey,
+    db_path: Option<&std::path::Path>,
+    blob_reads: Option<&BlobReadMetrics>,
+) -> Result<Vec<u8>> {
     let value = value.ok_or_else(|| Error::Corruption {
         message: "put record is missing value bytes".to_owned(),
     })?;
 
     match value {
         ValueRef::Inline(bytes) => Ok(bytes.clone()),
-        ValueRef::Blob { .. } => {
+        ValueRef::BlobIndex(_) | ValueRef::Blob { .. } => {
             let db_path = db_path.ok_or_else(|| Error::Corruption {
                 message: "in-memory database cannot read blob value references".to_owned(),
             })?;
-            crate::blob::read_value(db_path, value)
+            let bytes =
+                crate::blob::read_value_for_internal_key(db_path, value, Some(internal_key))?;
+            if let Some(blob_reads) = blob_reads {
+                blob_reads.record(bytes.len() as u64);
+            }
+            Ok(bytes)
         }
     }
 }
@@ -746,6 +765,7 @@ mod tests {
             Sequence::new(4),
             Snapshot::new(Sequence::new(4)),
             None,
+            None,
             Vec::new(),
             vec![
                 RecordSource::memtable(
@@ -769,6 +789,7 @@ mod tests {
             Direction::Reverse,
             Sequence::new(4),
             Snapshot::new(Sequence::new(4)),
+            None,
             None,
             Vec::new(),
             vec![

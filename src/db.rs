@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::{
-    blob::{self, ValueRef},
+    blob,
     bucket::{Bucket, BucketName, DEFAULT_BUCKET_NAME},
     cache, compaction, durability,
     error::{Error, Result},
@@ -26,7 +26,7 @@ use crate::{
     },
     recovery,
     snapshot::{Snapshot, SnapshotTracker},
-    stats::{DbStats, LevelStats},
+    stats::{BlobReadMetrics, DbStats, LevelStats},
     table::{self, Table},
     transaction::{Transaction, TransactionOptions},
     types::{CommitInfo, KeyRange, Sequence, Value},
@@ -59,6 +59,7 @@ pub(crate) struct DbInner {
     compaction_output_tables: AtomicU64,
     compaction_input_bytes: AtomicU64,
     compaction_output_bytes: AtomicU64,
+    blob_reads: Arc<BlobReadMetrics>,
     maintenance: Arc<MaintenanceCoordinator>,
 }
 
@@ -216,6 +217,7 @@ impl Db {
                 compaction_output_tables: AtomicU64::new(0),
                 compaction_input_bytes: AtomicU64::new(0),
                 compaction_output_bytes: AtomicU64::new(0),
+                blob_reads: Arc::new(BlobReadMetrics::default()),
                 maintenance: Arc::new(MaintenanceCoordinator::new()),
             }),
         })
@@ -261,6 +263,7 @@ impl Db {
         let mut buckets = buckets_from_manifest(path, manifest.state())?;
         ensure_default_bucket_loaded(&mut buckets, &options)?;
         recovery::fail_on_missing_referenced_blob_files(path, &referenced_blob_ids)?;
+        recovery::fail_on_invalid_referenced_blob_files(path, manifest.state())?;
         recovery::fail_on_unreferenced_storage_files(
             path,
             &referenced_table_file_ids(manifest.state()),
@@ -293,6 +296,7 @@ impl Db {
                 compaction_output_tables: AtomicU64::new(0),
                 compaction_input_bytes: AtomicU64::new(0),
                 compaction_output_bytes: AtomicU64::new(0),
+                blob_reads: Arc::new(BlobReadMetrics::default()),
                 maintenance: Arc::new(MaintenanceCoordinator::new()),
             }),
         };
@@ -732,6 +736,9 @@ impl Db {
             compaction_output_bytes: self.inner.compaction_output_bytes.load(Ordering::Acquire),
             ..DbStats::default()
         };
+        let (blob_read_count, blob_read_bytes) = self.inner.blob_reads.snapshot();
+        stats.blob_read_count = blob_read_count;
+        stats.blob_read_bytes = blob_read_bytes;
         let cache_stats = self.inner.block_cache.stats();
         stats.block_cache_hits = cache_stats.hits;
         stats.block_cache_misses = cache_stats.misses;
@@ -778,15 +785,13 @@ impl Db {
                     level_entry.tables += 1;
                     level_entry.bytes = level_entry.bytes.saturating_add(table_bytes);
 
-                    if let Ok(records) = table.point_records() {
-                        for record in records {
-                            if let Some(ValueRef::Blob { file_id, len, .. }) = record.value {
-                                live_blob_bytes_by_file
-                                    .entry(file_id)
-                                    .and_modify(|bytes| *bytes = bytes.saturating_add(len))
-                                    .or_insert(len);
-                            }
-                        }
+                    for reference in &properties.blob_references {
+                        live_blob_bytes_by_file
+                            .entry(reference.file_id)
+                            .and_modify(|bytes| {
+                                *bytes = bytes.saturating_add(reference.referenced_bytes);
+                            })
+                            .or_insert(reference.referenced_bytes);
                     }
                 }
             }
@@ -946,6 +951,7 @@ impl Db {
             read_sequence,
             self.persistent_path(),
             Some(self.inner.block_cache.as_ref()),
+            Some(self.inner.blob_reads.as_ref()),
         )
     }
 
@@ -969,6 +975,7 @@ impl Db {
             read_sequence,
             read_pin,
             db_path,
+            Some(Arc::clone(&self.inner.blob_reads)),
             scan.range_tombstones,
             scan.sources,
         ))
@@ -994,6 +1001,7 @@ impl Db {
             read_sequence,
             read_pin,
             db_path,
+            Some(Arc::clone(&self.inner.blob_reads)),
             scan.range_tombstones,
             scan.sources,
         ))

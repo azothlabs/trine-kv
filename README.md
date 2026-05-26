@@ -30,8 +30,8 @@ Release packaging notes live in [docs/release.md](docs/release.md).
   compaction, and read-only open.
 - Block-based SSTables with filters, block cache, compression, and configurable
   index search policies.
-- Large values can use the current blob-value path instead of staying inline in
-  every SSTable block.
+- Large values can be separated into Titan-like blob files with `BlobIndex`
+  records in SSTables.
 
 ## Install
 

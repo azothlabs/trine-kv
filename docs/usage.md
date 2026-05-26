@@ -323,8 +323,8 @@ Inspect live state with `Db::stats`:
 ```rust
 let stats = db.stats();
 println!(
-    "buckets={} tables={} cache_hits={}",
-    stats.live_buckets, stats.total_tables, stats.block_cache_hits
+    "buckets={} tables={} cache_hits={} blob_reads={}",
+    stats.live_buckets, stats.total_tables, stats.block_cache_hits, stats.blob_read_count
 );
 ```
 

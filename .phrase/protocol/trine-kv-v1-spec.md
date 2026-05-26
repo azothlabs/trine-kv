@@ -412,8 +412,9 @@ Index rules:
 - index blocks keep a canonical sorted order for validation, range traversal,
   and debugging;
 - index blocks may also carry a search layout optimized for point seek;
-- table properties include smallest/largest user key, sequence range, and
-  referenced blob file ids.
+- table properties include smallest/largest user key, sequence range,
+  referenced blob file ids, referenced blob bytes, record counts, and blob key
+  spans.
 
 Filter rules:
 

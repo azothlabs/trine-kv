@@ -686,6 +686,114 @@ fn persistent_flush_writes_table_and_reopen_can_skip_wal() {
 }
 
 #[test]
+fn persistent_flush_writes_blob_index_file_and_reopen_reads_large_values() {
+    let path = temp_db_path("flush-blob-index");
+    let mut options = DbOptions::persistent(&path);
+    options.default_bucket_options = BucketOptions {
+        blob_threshold_bytes: 8,
+        ..BucketOptions::default()
+    };
+    let large_value = b"large-value-a-large-value-a".to_vec();
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let bucket = db.default_bucket().expect("bucket opens");
+        bucket.put(b"small", b"tiny").expect("write small value");
+        bucket
+            .put(b"large", large_value.clone())
+            .expect("write large value");
+        db.flush().expect("flush table and blob file");
+
+        let blob_paths = blob_file_paths(&path);
+        assert_eq!(blob_paths.len(), 1);
+        let blob_bytes = fs::read(&blob_paths[0]).expect("read blob file");
+        let blob_file = blob::decode_blob_file(&blob_bytes).expect("blob file decodes");
+        assert_eq!(blob_file.properties.record_count, 1);
+        assert_eq!(
+            blob_file.records[0].record.internal_key.user_key(),
+            b"large"
+        );
+        assert_eq!(blob_file.records[0].record.value, large_value);
+
+        let manifest_state =
+            manifest::read_manifest(&manifest::manifest_path(&path)).expect("manifest reads");
+        let table_properties = manifest_state
+            .tables()
+            .get("default")
+            .and_then(|tables| tables.first())
+            .expect("default table properties exist");
+        assert_eq!(
+            table_properties.blob_file_ids(),
+            &[blob_file.header.file_id]
+        );
+        let references = table_properties.blob_references();
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].file_id, blob_file.header.file_id);
+        assert_eq!(references[0].referenced_record_count, 1);
+        assert_eq!(references[0].referenced_bytes, large_value.len() as u64);
+
+        assert_eq!(
+            bucket.get(b"large").expect("large reads after flush"),
+            Some(large_value.clone())
+        );
+        let stats = db.stats();
+        assert_eq!(stats.blob_read_count, 1);
+        assert_eq!(stats.blob_read_bytes, large_value.len() as u64);
+    }
+
+    {
+        let db = Db::open(options).expect("persistent db reopens");
+        let bucket = db.default_bucket().expect("bucket reopens");
+        assert_eq!(
+            bucket.get(b"large").expect("large reads after reopen"),
+            Some(large_value)
+        );
+        assert_eq!(
+            bucket.get(b"small").expect("small reads after reopen"),
+            Some(b"tiny".to_vec())
+        );
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_reopen_fails_on_corrupt_referenced_blob_file() {
+    let path = temp_db_path("corrupt-referenced-blob");
+    let mut options = DbOptions::persistent(&path);
+    options.default_bucket_options = BucketOptions {
+        blob_threshold_bytes: 8,
+        ..BucketOptions::default()
+    };
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let bucket = db.default_bucket().expect("bucket opens");
+        bucket
+            .put(b"large", b"large-value-a-large-value-a".to_vec())
+            .expect("write large value");
+        db.flush().expect("flush blob table");
+    }
+
+    let blob_path = blob_file_paths(&path)
+        .into_iter()
+        .next()
+        .expect("blob file exists");
+    let mut bytes = fs::read(&blob_path).expect("read blob file");
+    let byte = bytes.get_mut(8).expect("blob file has header bytes");
+    *byte ^= 0xff;
+    fs::write(&blob_path, bytes).expect("write corrupted blob file");
+
+    let error = Db::open(options).expect_err("corrupt referenced blob must fail closed");
+    assert!(matches!(
+        error,
+        Error::Corruption { .. } | Error::InvalidFormat { .. }
+    ));
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_write_buffer_freezes_active_memtable_and_reads_immutable() {
     let path = temp_db_path("write-buffer-freeze");
     let mut options = DbOptions::persistent(&path);

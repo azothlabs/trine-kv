@@ -3530,3 +3530,91 @@ Record only evidence that can change planning or durable decisions.
 
 - Commit the bucket API and README polish, then continue with Phase 34
   `BlobIndex` and `BlobFile` format tests.
+
+## 2026-05-26: Phase 34 Blob Format Foundation Completed
+
+### Observation
+
+- Added `BlobIndex` with file id, record offset, encoded length, decoded value
+  length, value checksum, record checksum, and compression id.
+- Added a Trine-owned blob file encoder/decoder with header, record frames,
+  properties block, footer, checksum validation, ordered-record checks, and
+  exact indexed-value reads.
+- Table value-reference serialization can now carry `BlobIndex` records while
+  the current flush path still writes the primitive blob shape.
+- Focused tests cover round trip, corrupt header, corrupt footer, corrupt
+  properties, corrupt record checksum, corrupt value checksum, unsupported
+  record compression id, unordered records, and exact index validation.
+
+### Interpretation
+
+- Phase 34 acceptance is met for the standalone format foundation.
+- Keeping flush on the old path is intentional; it confines this phase to
+  storage-format validation before changing publish/recovery behavior.
+
+### Verification
+
+- `cargo test blob::tests --all-features`
+- `cargo fmt --all --check`
+- `cargo test --all-targets --all-features`
+- `cargo clippy --all-targets --all-features`
+- `git diff --check`
+- forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, and `README.md`
+
+### Remaining Blockers
+
+- Flush does not yet emit the new `BlobFile` format.
+- Manifest blob-file metadata and snapshot-safe blob GC are still follow-up
+  phases.
+- Remote CI cannot be executed locally; it must run after push.
+
+### Recommended Next Action
+
+- Start the next implementation slice by wiring flush to write the new
+  `BlobFile` format and table `BlobIndex` records, then add recovery checks for
+  manifest-referenced blob files.
+
+## 2026-05-26: Phase 35 Blob Flush And Recovery Integration Completed
+
+### Observation
+
+- Persistent table writes now separate values at or above
+  `blob_threshold_bytes` into the new `BlobFile` format and store
+  `ValueRef::BlobIndex` in SSTables.
+- Blob records keep internal-key metadata and reads verify that the decoded
+  blob record matches the visible LSM record owner.
+- Table properties and manifest entries now carry per-blob-file reference
+  metadata: file id, referenced bytes, referenced record count, and key span.
+- Persistent open validates manifest-referenced blob files by decoding the blob
+  file, checking the path/header file id, and comparing table blob-reference
+  ids, bytes, and key spans against blob file properties.
+- `DbStats` now reports blob read count and bytes.
+
+### Interpretation
+
+- The durable flush/reopen path now uses the Titan-like value model instead of
+  the older primitive blob shape.
+- The remaining large-value lifecycle gap is snapshot-safe blob GC rewrite and
+  publish/delete metadata, which should remain its own phase.
+
+### Verification
+
+- `cargo test persistent_flush_writes_blob_index_file_and_reopen_reads_large_values --all-features`
+- `cargo test persistent_reopen_fails_on_corrupt_referenced_blob_file --all-features`
+- `cargo test --all-targets --all-features`
+- `cargo clippy --all-targets --all-features`
+- `cargo fmt --all --check`
+- `git diff --check`
+- forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, and `README.md`
+
+### Remaining Blockers
+
+- Snapshot-safe blob GC rewrite is not implemented in this phase.
+- Remote CI cannot be executed locally; it must run after push.
+
+### Recommended Next Action
+
+- Implement blob GC rewrite with snapshot-gated old-file deletion and
+  idempotent recovery metadata when the large-value lifecycle work continues.

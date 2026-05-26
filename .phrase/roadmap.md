@@ -662,7 +662,7 @@ API concerns before key-value separation.
 
 ### Phase 34: Titan-Like Blob Format Foundation
 
-**Status**: Planned
+**Status**: Complete
 
 **Goal**: Stabilize the new `BlobIndex` and `BlobFile` encode/decode format
 with focused tests before changing flush behavior.
@@ -679,3 +679,25 @@ accepted as the implementation source of truth.
 - Corruption tests cover missing/corrupt header, footer, record checksum, value
   checksum, and unsupported compression id.
 - Existing small-value behavior remains unchanged.
+
+### Phase 35: Titan-Like Blob Flush And Recovery Integration
+
+**Status**: Complete
+
+**Goal**: Use the new `BlobFile` format in real persistent table output and
+validate referenced blob files during recovery.
+
+**Entry Condition**: Phase 34 complete and user asks to finish the remaining
+spec integration work.
+
+**Acceptance Gate**:
+
+- Flush and compaction table output store large inline values as `BlobIndex`
+  records backed by the new `BlobFile` format.
+- Small values remain inline and in-memory mode does not create disk blob files.
+- Table and manifest metadata carry per-blob-file referenced bytes, record
+  count, and key span.
+- Persistent open validates every manifest-referenced blob file and fails
+  closed on corrupt blob data.
+- `DbStats` exposes blob read count and bytes.
+- Full local Rust verification passes.

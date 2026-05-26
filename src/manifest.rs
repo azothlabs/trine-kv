@@ -9,21 +9,22 @@ use crate::{
     codec::CodecId,
     durability::sync_parent_dir_after_rename,
     error::{Error, Result},
+    internal_key::{InternalKey, ValueKind},
     options::{
         BucketOptions, CompressionProfile, FilterPolicy, IndexSearchPolicy, PrefixFilterPolicy,
     },
     prefix::PrefixExtractor,
-    table::{TableId, TableLevel, TableProperties},
+    table::{TableBlobReference, TableId, TableLevel, TableProperties},
     types::Sequence,
 };
 
 pub const MANIFEST_FILE_NAME: &str = "MANIFEST";
 const MANIFEST_MAGIC: u32 = 0x5452_4d46;
-const MANIFEST_VERSION: u16 = 3;
+const MANIFEST_VERSION: u16 = 4;
 const HEADER_LEN: usize = 14;
 // The lower bound for one table entry: fixed fields plus two empty byte fields.
 // Decoding uses this to reject impossible counts before reserving memory.
-const MIN_TABLE_PROPERTY_BYTES: usize = 41;
+const MIN_TABLE_PROPERTY_BYTES: usize = 45;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestEdit {
@@ -492,6 +493,33 @@ fn put_table_properties(bytes: &mut Vec<u8>, properties: &TableProperties) -> Re
     for file_id in &properties.blob_file_ids {
         put_u64(bytes, *file_id);
     }
+    put_u32(
+        bytes,
+        u32::try_from(properties.blob_references.len())
+            .map_err(|_| Error::invalid_options("too many blob references for table properties"))?,
+    );
+    for reference in &properties.blob_references {
+        put_u64(bytes, reference.file_id);
+        put_u64(bytes, reference.referenced_bytes);
+        put_u64(bytes, reference.referenced_record_count);
+        put_internal_key(bytes, &reference.smallest_internal_key)?;
+        put_internal_key(bytes, &reference.largest_internal_key)?;
+    }
+    Ok(())
+}
+
+fn put_internal_key(bytes: &mut Vec<u8>, internal_key: &InternalKey) -> Result<()> {
+    put_bytes(bytes, internal_key.user_key())?;
+    put_u64(bytes, internal_key.sequence().get());
+    put_u8(
+        bytes,
+        match internal_key.kind() {
+            ValueKind::Put => 1,
+            ValueKind::PointDelete => 2,
+            ValueKind::RangeDelete => 3,
+        },
+    );
+    put_u32(bytes, internal_key.batch_index());
     Ok(())
 }
 
@@ -670,6 +698,7 @@ impl<'payload> Cursor<'payload> {
             largest_sequence: Sequence::new(self.read_u64()?),
             codec: self.read_codec()?,
             blob_file_ids: self.read_blob_file_ids()?,
+            blob_references: self.read_blob_references()?,
         })
     }
 
@@ -689,6 +718,59 @@ impl<'payload> Cursor<'payload> {
             previous = Some(file_id);
         }
         Ok(file_ids)
+    }
+
+    fn read_blob_references(&mut self) -> Result<Vec<TableBlobReference>> {
+        let reference_count = self.read_u32()? as usize;
+        if reference_count > self.remaining_len() / 58 {
+            return Err(invalid_manifest(
+                "blob reference count exceeds payload bytes",
+            ));
+        }
+
+        let mut references = Vec::with_capacity(reference_count);
+        let mut previous = None;
+        for _ in 0..reference_count {
+            let file_id = self.read_u64()?;
+            if previous.is_some_and(|previous| previous >= file_id) {
+                return Err(invalid_manifest("blob references are not sorted"));
+            }
+            let referenced_bytes = self.read_u64()?;
+            let referenced_record_count = self.read_u64()?;
+            let smallest_internal_key = self.read_internal_key()?;
+            let largest_internal_key = self.read_internal_key()?;
+            if smallest_internal_key > largest_internal_key {
+                return Err(invalid_manifest("blob reference key bounds are invalid"));
+            }
+            references.push(TableBlobReference {
+                file_id,
+                referenced_bytes,
+                referenced_record_count,
+                smallest_internal_key,
+                largest_internal_key,
+            });
+            previous = Some(file_id);
+        }
+        Ok(references)
+    }
+
+    fn read_internal_key(&mut self) -> Result<InternalKey> {
+        let user_key = self.read_bytes()?.to_vec();
+        let sequence = Sequence::new(self.read_u64()?);
+        let kind = self.read_value_kind()?;
+        let batch_index = self.read_u32()?;
+        Ok(InternalKey::new(user_key, sequence, kind, batch_index))
+    }
+
+    fn read_value_kind(&mut self) -> Result<ValueKind> {
+        match self.read_u8()? {
+            1 => Ok(ValueKind::Put),
+            2 => Ok(ValueKind::PointDelete),
+            3 => Ok(ValueKind::RangeDelete),
+            tag => Err(Error::InvalidFormat {
+                message: format!("unknown manifest internal value kind {tag}"),
+            }),
+        }
     }
 
     fn read_compression_profile(&mut self) -> Result<CompressionProfile> {

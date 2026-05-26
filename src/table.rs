@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
     ops::{Bound, Range},
@@ -11,7 +11,7 @@ use std::{
 };
 
 use crate::{
-    blob::ValueRef,
+    blob::{BlobIndex, ValueRef},
     cache::{BlockCache, BlockCacheKey},
     codec::{self, CodecId},
     error::{Error, Result},
@@ -31,7 +31,7 @@ use crate::{
 
 pub const TABLE_FILE_EXTENSION: &str = "trinet";
 const TABLE_MAGIC: u32 = 0x5452_5442;
-const TABLE_VERSION: u16 = 3;
+const TABLE_VERSION: u16 = 4;
 const HEADER_LEN: usize = 14;
 const FOOTER_MAGIC: u32 = 0x5452_5446;
 const FOOTER_LEN: usize = 90;
@@ -45,6 +45,7 @@ const VALUE_KIND_RANGE_DELETE: u8 = 3;
 const VALUE_NONE: u8 = 0;
 const VALUE_INLINE: u8 = 1;
 const VALUE_BLOB: u8 = 2;
+const VALUE_BLOB_INDEX: u8 = 3;
 
 const BOUND_UNBOUNDED: u8 = 0;
 const BOUND_INCLUDED: u8 = 1;
@@ -120,6 +121,15 @@ pub enum TableSection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableBlobReference {
+    pub file_id: u64,
+    pub referenced_bytes: u64,
+    pub referenced_record_count: u64,
+    pub smallest_internal_key: InternalKey,
+    pub largest_internal_key: InternalKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableProperties {
     pub id: TableId,
     pub level: TableLevel,
@@ -129,6 +139,19 @@ pub struct TableProperties {
     pub largest_sequence: Sequence,
     pub codec: CodecId,
     pub(crate) blob_file_ids: Vec<u64>,
+    pub(crate) blob_references: Vec<TableBlobReference>,
+}
+
+impl TableProperties {
+    #[must_use]
+    pub fn blob_file_ids(&self) -> &[u64] {
+        &self.blob_file_ids
+    }
+
+    #[must_use]
+    pub fn blob_references(&self) -> &[TableBlobReference] {
+        &self.blob_references
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -468,6 +491,7 @@ impl Table {
         &self.properties
     }
 
+    #[cfg(test)]
     pub(crate) fn point_records(&self) -> Result<Vec<TablePointRecord>> {
         self.all_point_records()
     }
@@ -800,6 +824,7 @@ impl Table {
         (allowed, true)
     }
 
+    #[cfg(test)]
     fn all_point_records(&self) -> Result<Vec<TablePointRecord>> {
         if let Some(records) = &self.point_records {
             return Ok(records.clone());
@@ -1529,6 +1554,7 @@ pub(crate) fn write_table(
         db_path,
         table_id.get(),
         options.blob_threshold_bytes,
+        CodecId::None,
         &point_records,
     )?
     .into_iter()
@@ -1687,14 +1713,10 @@ fn table_properties(
             Some(largest_sequence.map_or(sequence, |current| std::cmp::max(current, sequence)));
     }
 
-    let blob_file_ids = point_records
+    let blob_references = table_blob_references(point_records);
+    let blob_file_ids = blob_references
         .iter()
-        .filter_map(|record| match record.value.as_ref() {
-            Some(ValueRef::Blob { file_id, .. }) => Some(*file_id),
-            Some(ValueRef::Inline(_)) | None => None,
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
+        .map(|reference| reference.file_id)
         .collect();
 
     let (smallest_user_key, largest_user_key) = table_key_bounds(point_records, range_tombstones);
@@ -1708,7 +1730,47 @@ fn table_properties(
         largest_sequence: largest_sequence.unwrap_or(Sequence::ZERO),
         codec,
         blob_file_ids,
+        blob_references,
     }
+}
+
+fn table_blob_references(point_records: &[TablePointRecord]) -> Vec<TableBlobReference> {
+    let mut references = BTreeMap::<u64, TableBlobReference>::new();
+
+    for record in point_records {
+        let Some(value) = record.value.as_ref() else {
+            continue;
+        };
+        let (file_id, referenced_bytes) = match value {
+            ValueRef::BlobIndex(index) => (index.file_id, index.encoded_len),
+            ValueRef::Blob { file_id, len, .. } => (*file_id, *len),
+            ValueRef::Inline(_) => continue,
+        };
+
+        references
+            .entry(file_id)
+            .and_modify(|reference| {
+                reference.referenced_bytes =
+                    reference.referenced_bytes.saturating_add(referenced_bytes);
+                reference.referenced_record_count =
+                    reference.referenced_record_count.saturating_add(1);
+                if record.internal_key < reference.smallest_internal_key {
+                    reference.smallest_internal_key = record.internal_key.clone();
+                }
+                if record.internal_key > reference.largest_internal_key {
+                    reference.largest_internal_key = record.internal_key.clone();
+                }
+            })
+            .or_insert_with(|| TableBlobReference {
+                file_id,
+                referenced_bytes,
+                referenced_record_count: 1,
+                smallest_internal_key: record.internal_key.clone(),
+                largest_internal_key: record.internal_key.clone(),
+            });
+    }
+
+    references.into_values().collect()
 }
 
 fn table_key_bounds(
@@ -2755,6 +2817,20 @@ fn put_properties(bytes: &mut Vec<u8>, properties: &TableProperties) -> Result<(
     for file_id in &properties.blob_file_ids {
         put_u64(bytes, *file_id);
     }
+    put_u32(
+        bytes,
+        usize_to_u32(
+            properties.blob_references.len(),
+            "properties blob reference count",
+        )?,
+    );
+    for reference in &properties.blob_references {
+        put_u64(bytes, reference.file_id);
+        put_u64(bytes, reference.referenced_bytes);
+        put_u64(bytes, reference.referenced_record_count);
+        put_internal_key(bytes, &reference.smallest_internal_key)?;
+        put_internal_key(bytes, &reference.largest_internal_key)?;
+    }
     Ok(())
 }
 
@@ -2784,6 +2860,10 @@ fn put_value_ref(bytes: &mut Vec<u8>, value: Option<&ValueRef>) -> Result<()> {
             put_u8(bytes, VALUE_INLINE);
             put_bytes(bytes, inline)?;
         }
+        Some(ValueRef::BlobIndex(index)) => {
+            put_u8(bytes, VALUE_BLOB_INDEX);
+            put_blob_index(bytes, *index);
+        }
         Some(ValueRef::Blob {
             file_id,
             offset,
@@ -2798,6 +2878,16 @@ fn put_value_ref(bytes: &mut Vec<u8>, value: Option<&ValueRef>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn put_blob_index(bytes: &mut Vec<u8>, index: BlobIndex) {
+    put_u64(bytes, index.file_id);
+    put_u64(bytes, index.offset);
+    put_u64(bytes, index.encoded_len);
+    put_u64(bytes, index.value_len);
+    put_u32(bytes, index.value_checksum);
+    put_u32(bytes, index.record_checksum);
+    put_codec(bytes, index.compression);
 }
 
 fn put_codec(bytes: &mut Vec<u8>, codec: CodecId) {
@@ -2900,6 +2990,7 @@ fn value_ref_encoded_len(value: Option<&ValueRef>) -> usize {
     match value {
         None => 1,
         Some(ValueRef::Inline(bytes)) => 1 + 4 + bytes.len(),
+        Some(ValueRef::BlobIndex(_)) => 1 + 8 + 8 + 8 + 8 + 4 + 4 + 1,
         Some(ValueRef::Blob { .. }) => 1 + 8 + 8 + 8 + 4,
     }
 }
@@ -3056,6 +3147,7 @@ impl<'payload> Cursor<'payload> {
             largest_sequence: Sequence::new(self.read_u64()?),
             codec: self.read_codec()?,
             blob_file_ids: self.read_blob_file_ids()?,
+            blob_references: self.read_blob_references()?,
         })
     }
 
@@ -3088,6 +3180,15 @@ impl<'payload> Cursor<'payload> {
                 len: self.read_u64()?,
                 checksum: self.read_u32()?,
             })),
+            VALUE_BLOB_INDEX => Ok(Some(ValueRef::BlobIndex(BlobIndex {
+                file_id: self.read_u64()?,
+                offset: self.read_u64()?,
+                encoded_len: self.read_u64()?,
+                value_len: self.read_u64()?,
+                value_checksum: self.read_u32()?,
+                record_checksum: self.read_u32()?,
+                compression: self.read_codec()?,
+            }))),
             tag => Err(Error::InvalidFormat {
                 message: format!("unknown table value reference {tag}"),
             }),
@@ -3117,6 +3218,42 @@ impl<'payload> Cursor<'payload> {
             previous = Some(file_id);
         }
         Ok(file_ids)
+    }
+
+    fn read_blob_references(&mut self) -> Result<Vec<TableBlobReference>> {
+        let reference_count = self.read_u32()? as usize;
+        ensure_count_fits_remaining(
+            reference_count,
+            self.remaining_len(),
+            8 + 8 + 8 + MIN_INTERNAL_KEY_BYTES * 2,
+            "properties blob reference count exceeds block bytes",
+        )?;
+        let mut references = Vec::with_capacity(reference_count);
+        let mut previous = None;
+        for _ in 0..reference_count {
+            let file_id = self.read_u64()?;
+            if previous.is_some_and(|previous| previous >= file_id) {
+                return Err(invalid_table("properties blob references are not sorted"));
+            }
+            let referenced_bytes = self.read_u64()?;
+            let referenced_record_count = self.read_u64()?;
+            let smallest_internal_key = self.read_internal_key()?;
+            let largest_internal_key = self.read_internal_key()?;
+            if smallest_internal_key > largest_internal_key {
+                return Err(invalid_table(
+                    "properties blob reference key bounds are invalid",
+                ));
+            }
+            references.push(TableBlobReference {
+                file_id,
+                referenced_bytes,
+                referenced_record_count,
+                smallest_internal_key,
+                largest_internal_key,
+            });
+            previous = Some(file_id);
+        }
+        Ok(references)
     }
 
     fn read_section_handle(&mut self) -> Result<SectionHandle> {
