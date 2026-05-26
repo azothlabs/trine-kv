@@ -440,9 +440,11 @@ fn persistent_recovery_repairs_safe_temporary_files_and_writes_report() {
     }
 
     let manifest_tmp = manifest::manifest_path(&path).with_extension("tmp");
+    let wal_tmp = path.join(wal::WAL_REWRITE_TMP_FILE_NAME);
     let blob_tmp = path.join("blob-00000000000000000999.tmp");
     let table_tmp = table::table_path(&path, table::TableId(999)).with_extension("tmp");
     write_file(&manifest_tmp, b"partial manifest publish");
+    write_file(&wal_tmp, b"partial WAL rewrite");
     write_file(&blob_tmp, b"partial blob file");
     write_file(&table_tmp, b"partial table file");
 
@@ -459,6 +461,7 @@ fn persistent_recovery_repairs_safe_temporary_files_and_writes_report() {
     }
 
     assert!(!manifest_tmp.exists());
+    assert!(!wal_tmp.exists());
     assert!(!blob_tmp.exists());
     assert!(!table_tmp.exists());
     let report = recovery::read_recovery_report(&path).expect("recovery report reads");
@@ -468,6 +471,7 @@ fn persistent_recovery_repairs_safe_temporary_files_and_writes_report() {
             "MANIFEST.tmp".to_owned(),
             "blob-00000000000000000999.tmp".to_owned(),
             "table-00000000000000000999.tmp".to_owned(),
+            "trine.wal.tmp".to_owned(),
         ]
     );
 
@@ -639,6 +643,12 @@ fn persistent_flush_writes_table_and_reopen_can_skip_wal() {
     assert_eq!(tables.len(), 1);
     assert_eq!(tables[0].level.get(), 0);
     assert!(table::table_path(&path, tables[0].id).exists());
+    assert!(
+        wal::read_batches(&wal::wal_path(&path))
+            .expect("WAL reads after checkpoint")
+            .is_empty(),
+        "flushed batches should not remain in the WAL"
+    );
 
     fs::remove_file(wal::wal_path(&path)).expect("remove WAL after flush");
 
@@ -672,6 +682,172 @@ fn persistent_flush_writes_table_and_reopen_can_skip_wal() {
             )
             .expect("post-table write commits");
         assert_eq!(info.sequence(), Sequence::new(6));
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_write_buffer_freezes_active_memtable_and_reads_immutable() {
+    let path = temp_db_path("write-buffer-freeze");
+    let mut options = DbOptions::persistent(&path);
+    options.write_buffer_bytes = 1;
+    options.max_immutable_memtables = 4;
+
+    {
+        let db = Db::open(options).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+
+        keyspace.insert(b"user:1", b"ada").expect("write user");
+
+        let stats = db.stats();
+        assert_eq!(stats.immutable_memtables, 1);
+        assert_eq!(stats.total_tables, 0);
+        assert_eq!(
+            keyspace.get(b"user:1").expect("point read sees immutable"),
+            Some(b"ada".to_vec())
+        );
+        assert_eq!(
+            collect_rows(keyspace.range(&KeyRange::all()).expect("range reads")),
+            vec![(b"user:1".to_vec(), b"ada".to_vec())]
+        );
+        assert_eq!(
+            collect_rows(keyspace.prefix(b"user:").expect("prefix reads")),
+            vec![(b"user:1".to_vec(), b"ada".to_vec())]
+        );
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_immutable_range_tombstone_hides_point_records() {
+    let path = temp_db_path("immutable-range-tombstone");
+    let mut options = DbOptions::persistent(&path);
+    options.write_buffer_bytes = 1;
+    options.max_immutable_memtables = 4;
+
+    {
+        let db = Db::open(options).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+
+        keyspace.insert(b"k1", b"v1").expect("write k1");
+        keyspace
+            .remove_range(KeyRange::half_open(b"k", b"l"))
+            .expect("range delete freezes");
+
+        assert_eq!(
+            keyspace
+                .get(b"k1")
+                .expect("point read checks immutable tombstone"),
+            None
+        );
+        assert!(collect_rows(keyspace.range(&KeyRange::all()).expect("range reads")).is_empty());
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_immutable_pressure_flushes_before_next_write_and_keeps_new_wal_batch() {
+    let path = temp_db_path("immutable-pressure-flush");
+    let mut options = DbOptions::persistent(&path);
+    options.write_buffer_bytes = 1;
+    options.max_immutable_memtables = 1;
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+
+        let first = keyspace
+            .insert_with_options(b"a", b"a1", WriteOptions::sync_all())
+            .expect("first write freezes");
+        assert_eq!(first.sequence(), Sequence::new(1));
+        assert_eq!(db.stats().immutable_memtables, 1);
+        assert_eq!(db.stats().total_tables, 0);
+
+        let second = keyspace
+            .insert_with_options(b"b", b"b1", WriteOptions::sync_all())
+            .expect("second write flushes pressure first");
+        assert_eq!(second.sequence(), Sequence::new(2));
+
+        let stats = db.stats();
+        assert_eq!(stats.total_tables, 1);
+        assert_eq!(stats.immutable_memtables, 1);
+        assert_eq!(
+            keyspace.get(b"a").expect("flushed row reads"),
+            Some(b"a1".to_vec())
+        );
+        assert_eq!(
+            keyspace.get(b"b").expect("new immutable row reads"),
+            Some(b"b1".to_vec())
+        );
+
+        let manifest_state =
+            manifest::read_manifest(&manifest::manifest_path(&path)).expect("manifest reads");
+        assert_eq!(manifest_state.wal_replay_floor(), Sequence::new(1));
+        let wal_batches = wal::read_batches(&wal::wal_path(&path)).expect("WAL reads");
+        assert_eq!(
+            wal_batches
+                .iter()
+                .map(|batch| batch.sequence)
+                .collect::<Vec<_>>(),
+            vec![Sequence::new(2)]
+        );
+    }
+
+    {
+        let db = Db::open(options).expect("persistent db reopens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace reopens");
+        assert_eq!(
+            keyspace.get(b"a").expect("flushed row survives reopen"),
+            Some(b"a1".to_vec())
+        );
+        assert_eq!(
+            keyspace.get(b"b").expect("WAL row survives reopen"),
+            Some(b"b1".to_vec())
+        );
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_transaction_conflict_checks_immutable_memtables() {
+    let path = temp_db_path("transaction-immutable-conflict");
+    let mut options = DbOptions::persistent(&path);
+    options.write_buffer_bytes = 1;
+    options.max_immutable_memtables = 4;
+
+    {
+        let db = Db::open(options).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+        keyspace.insert(b"a", b"a1").expect("write first value");
+
+        let mut txn = db.transaction(TransactionOptions::default());
+        assert_eq!(
+            txn.get("default", b"a").expect("transaction reads a"),
+            Some(b"a1".to_vec())
+        );
+
+        keyspace
+            .insert(b"a", b"a2")
+            .expect("write conflicting value");
+        txn.insert("default", b"b", b"b1");
+        let error = txn
+            .commit()
+            .expect_err("immutable memtable update should conflict");
+        assert!(matches!(error, Error::Conflict { .. }));
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");

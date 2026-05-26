@@ -2336,3 +2336,60 @@ Record only evidence that can change planning or durable decisions.
 
 - Run the external benchmark harness that exposed the 4-thread vs 32-thread
   scaling issue.
+
+## 2026-05-26: LSM Write Path And WAL Lifecycle Passed
+
+### Observation
+
+- User audit identified three P1 write-path risks: only an active memtable, no
+  size-driven freeze/flush path, and WAL replay that decoded old flushed
+  batches forever.
+- Keyspaces now keep an immutable memtable queue beside the active memtable.
+- Persistent writes freeze all non-empty active memtables when
+  `write_buffer_bytes` is reached.
+- Reads, range/prefix scans, range tombstones, and transaction validation now
+  include immutable memtables before SSTables.
+- `Db::flush()` first freezes active memtables, then flushes immutable
+  memtables to L0 SSTables.
+- `max_immutable_memtables` is now write-side pressure: queued immutable
+  memtables are flushed before accepting the next write.
+- After flushed SSTables are manifest-published, the WAL is atomically rewritten
+  through `trine.wal.tmp` to keep only batches newer than the replay floor.
+- Startup now uses `read_batches_after(replay_floor)`, which validates old WAL
+  frames but does not rebuild operation lists for batches already represented by
+  published SSTables.
+
+### Interpretation
+
+- Phase 16 is complete for the foreground LSM write path.
+- Auto-freeze happens after a successful write; pressure flush happens before
+  the next write so an I/O error does not make the new write's result
+  ambiguous.
+- The WAL format did not change; this phase adds a safe checkpoint rewrite path
+  and safe recovery cleanup for interrupted WAL rewrites.
+
+### Verification
+
+- `cargo test --test persistent_wal`
+- `wal_decode_after_floor_skips_old_operation_payloads`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo run --example quickstart`
+- `cargo run --example user_store`
+- `cargo run --example event_index`
+- `cargo check --target x86_64-pc-windows-gnu`
+- `git diff --check`
+
+### Remaining Blockers
+
+- GitHub Actions was not executed locally; remote CI must run after push.
+- SSTables are still loaded as complete table objects at open time.
+- Background worker scheduling, target-size table splitting, probabilistic
+  Bloom bits, and concrete Eytzinger/galloping layouts remain later phases.
+
+### Recommended Next Action
+
+- Move next to file-backed SSTable block loading and table-cache work, because
+  the write path now has a stable active/immutable/flush/WAL lifecycle to build
+  on.

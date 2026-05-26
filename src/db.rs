@@ -63,6 +63,7 @@ pub(crate) struct KeyspaceState {
     options: KeyspaceOptions,
     active_memtable: RwLock<Arc<Memtable>>,
     range_tombstones: RwLock<Vec<RangeTombstone>>,
+    immutable_memtables: RwLock<Vec<ImmutableMemtable>>,
     tables: RwLock<Vec<Arc<Table>>>,
 }
 
@@ -73,6 +74,7 @@ impl KeyspaceState {
             options,
             active_memtable: RwLock::new(Arc::new(Memtable::default())),
             range_tombstones: RwLock::new(Vec::new()),
+            immutable_memtables: RwLock::new(Vec::new()),
             tables: RwLock::new(tables),
         }
     }
@@ -102,9 +104,17 @@ impl RangeTombstone {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ImmutableMemtable {
+    memtable: Arc<Memtable>,
+    range_tombstones: Arc<Vec<RangeTombstone>>,
+    freeze_sequence: Sequence,
+}
+
 struct FlushInput {
     keyspace: String,
-    active_memtable: Arc<Memtable>,
+    memtable: Arc<Memtable>,
+    freeze_sequence: Sequence,
     table_id: table::TableId,
     table_level: table::TableLevel,
     table_options: table::TableWriteOptions,
@@ -223,7 +233,7 @@ impl Db {
         )?;
 
         let wal_path = wal::wal_path(path);
-        let batches = wal::read_batches(&wal_path)?;
+        let batches = wal::read_batches_after(&wal_path, replay_floor)?;
         let wal = if options.read_only {
             None
         } else {
@@ -339,52 +349,16 @@ impl Db {
         let flush_sequence = self.last_committed_sequence();
 
         let should_compact = {
-            // Flush holds the writer coordinator while it copies and clears
-            // memtables. That gives the manifest edit and the in-memory table
-            // list one clear cutover point relative to commits.
+            // Flush holds the writer coordinator while it freezes active
+            // memtables, writes tables, and advances the WAL replay floor. That
+            // gives the manifest edit and in-memory table list one clear
+            // cutover point relative to commits.
             let _writer = self
                 .inner
                 .writer
                 .lock()
                 .map_err(|_| lock_poisoned("writer coordinator"))?;
-            let flush_inputs = self.collect_flush_inputs()?;
-            if flush_inputs.is_empty() {
-                return Ok(());
-            }
-
-            let mut written_tables = Vec::with_capacity(flush_inputs.len());
-            let mut written_table_ids = Vec::with_capacity(flush_inputs.len());
-            for input in &flush_inputs {
-                let table_path = table::table_path(&db_path, input.table_id);
-                written_table_ids.push(input.table_id);
-                let table = match table::write_table(
-                    &table_path,
-                    input.table_id,
-                    input.table_level,
-                    &input.table_options,
-                    &input.point_records,
-                    &input.range_tombstones,
-                ) {
-                    Ok(table) => table,
-                    Err(error) => {
-                        let _ = remove_storage_files(&db_path, &written_table_ids);
-                        return Err(error);
-                    }
-                };
-                written_tables.push((input.keyspace.clone(), Arc::new(table)));
-            }
-
-            if let Err(error) = durability::sync_dir_after_renames(&db_path) {
-                let _ = remove_storage_files(&db_path, &written_table_ids);
-                return Err(error);
-            }
-
-            if let Err(error) = self.publish_flushed_tables(&written_tables, flush_sequence) {
-                let _ = remove_storage_files(&db_path, &written_table_ids);
-                return Err(error);
-            }
-            self.install_flushed_tables(&flush_inputs, written_tables)?;
-            self.l0_pressure_exceeded()?
+            self.flush_memtables_locked(&db_path, Some(flush_sequence))?
         };
 
         if should_compact {
@@ -535,6 +509,21 @@ impl Db {
                 stats.memtable_bytes = stats
                     .memtable_bytes
                     .saturating_add(memtable_tombstone_bytes(&tombstones));
+            }
+            if let Ok(immutable_memtables) = state.immutable_memtables.read() {
+                stats.immutable_memtables = stats
+                    .immutable_memtables
+                    .saturating_add(immutable_memtables.len());
+                for immutable in immutable_memtables.iter() {
+                    if let Ok(entries) = immutable.memtable.read_entries() {
+                        stats.memtable_bytes = stats
+                            .memtable_bytes
+                            .saturating_add(memtable_entry_bytes(&entries));
+                    }
+                    stats.memtable_bytes = stats
+                        .memtable_bytes
+                        .saturating_add(memtable_tombstone_bytes(&immutable.range_tombstones));
+                }
             }
             let Ok(tables) = state.tables.read() else {
                 continue;
@@ -771,6 +760,136 @@ impl Db {
         Ok(states)
     }
 
+    fn flush_immutable_memtables_for_write_locked(&self, db_path: &Path) -> Result<()> {
+        if self.immutable_memtable_pressure_reached()? {
+            let _should_compact = self.flush_memtables_locked(db_path, None)?;
+        }
+
+        Ok(())
+    }
+
+    fn freeze_large_active_memtables_after_commit_locked(&self, sequence: Sequence) -> Result<()> {
+        let StorageMode::Persistent { .. } = self.inner.options.storage_mode else {
+            return Ok(());
+        };
+
+        if self.active_write_buffer_reached()? {
+            self.freeze_all_active_memtables(sequence)?;
+        }
+
+        Ok(())
+    }
+
+    fn active_write_buffer_reached(&self) -> Result<bool> {
+        let threshold = usize_to_u64_saturating(self.inner.options.write_buffer_bytes);
+        let keyspaces = self
+            .inner
+            .keyspaces
+            .read()
+            .map_err(|_| lock_poisoned("keyspace registry"))?;
+
+        for state in keyspaces.values() {
+            if active_memtable_bytes(state)? >= threshold {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn immutable_memtable_pressure_reached(&self) -> Result<bool> {
+        let max_immutable_memtables = self.inner.options.max_immutable_memtables;
+        let keyspaces = self
+            .inner
+            .keyspaces
+            .read()
+            .map_err(|_| lock_poisoned("keyspace registry"))?;
+
+        for state in keyspaces.values() {
+            let immutable_memtables = state
+                .immutable_memtables
+                .read()
+                .map_err(|_| lock_poisoned("immutable memtable queue"))?;
+            if immutable_memtables.len() >= max_immutable_memtables {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn freeze_all_active_memtables(&self, freeze_sequence: Sequence) -> Result<usize> {
+        let keyspaces = self
+            .inner
+            .keyspaces
+            .read()
+            .map_err(|_| lock_poisoned("keyspace registry"))?;
+        let mut frozen_count = 0;
+
+        for state in keyspaces.values() {
+            if freeze_active_memtable(state, freeze_sequence)? {
+                frozen_count += 1;
+            }
+        }
+
+        Ok(frozen_count)
+    }
+
+    fn flush_memtables_locked(
+        &self,
+        db_path: &Path,
+        freeze_active_at: Option<Sequence>,
+    ) -> Result<bool> {
+        if let Some(sequence) = freeze_active_at {
+            self.freeze_all_active_memtables(sequence)?;
+        }
+
+        let flush_inputs = self.collect_flush_inputs()?;
+        if flush_inputs.is_empty() {
+            return Ok(false);
+        }
+        let flush_sequence = flush_inputs
+            .iter()
+            .map(|input| input.freeze_sequence)
+            .max()
+            .expect("non-empty flush input list has a max sequence");
+
+        let mut written_tables = Vec::with_capacity(flush_inputs.len());
+        let mut written_table_ids = Vec::with_capacity(flush_inputs.len());
+        for input in &flush_inputs {
+            let table_path = table::table_path(db_path, input.table_id);
+            written_table_ids.push(input.table_id);
+            let table = match table::write_table(
+                &table_path,
+                input.table_id,
+                input.table_level,
+                &input.table_options,
+                &input.point_records,
+                &input.range_tombstones,
+            ) {
+                Ok(table) => table,
+                Err(error) => {
+                    let _ = remove_storage_files(db_path, &written_table_ids);
+                    return Err(error);
+                }
+            };
+            written_tables.push((input.keyspace.clone(), Arc::new(table)));
+        }
+
+        if let Err(error) = durability::sync_dir_after_renames(db_path) {
+            let _ = remove_storage_files(db_path, &written_table_ids);
+            return Err(error);
+        }
+
+        if let Err(error) = self.publish_flushed_tables(&written_tables, flush_sequence) {
+            let _ = remove_storage_files(db_path, &written_table_ids);
+            return Err(error);
+        }
+        self.install_flushed_tables(&flush_inputs, written_tables)?;
+        self.rewrite_wal_after_replay_floor(db_path, flush_sequence)?;
+        self.l0_pressure_exceeded()
+    }
+
     fn collect_flush_inputs(&self) -> Result<Vec<FlushInput>> {
         let mut next_table_id = self.next_table_id()?;
         let keyspaces = self
@@ -781,51 +900,51 @@ impl Db {
         let mut inputs = Vec::new();
 
         for (name, state) in keyspaces.iter() {
-            let active_memtable = state
-                .active_memtable
+            let immutable_memtables = state
+                .immutable_memtables
                 .read()
-                .map_err(|_| lock_poisoned("active memtable"))?
+                .map_err(|_| lock_poisoned("immutable memtable queue"))?
                 .clone();
-            let point_records = {
-                let entries = active_memtable
-                    .read_entries()
-                    .map_err(|_| lock_poisoned("memtable entries"))?;
-                entries
-                    .iter()
-                    .map(|(internal_key, value)| (internal_key.clone(), value.clone()))
-                    .collect::<Vec<_>>()
-            };
-            let range_tombstones = {
-                let tombstones = state
+
+            for immutable in immutable_memtables {
+                let point_records = {
+                    let entries = immutable
+                        .memtable
+                        .read_entries()
+                        .map_err(|_| lock_poisoned("memtable entries"))?;
+                    entries
+                        .iter()
+                        .map(|(internal_key, value)| (internal_key.clone(), value.clone()))
+                        .collect::<Vec<_>>()
+                };
+                let range_tombstones = immutable
                     .range_tombstones
-                    .read()
-                    .map_err(|_| lock_poisoned("range tombstones"))?;
-                tombstones
                     .iter()
                     .map(|tombstone| TableRangeTombstone {
                         range: tombstone.range.clone(),
                         sequence: tombstone.sequence,
                         batch_index: tombstone.batch_index,
                     })
-                    .collect::<Vec<_>>()
-            };
+                    .collect::<Vec<_>>();
 
-            if point_records.is_empty() && range_tombstones.is_empty() {
-                continue;
+                if point_records.is_empty() && range_tombstones.is_empty() {
+                    continue;
+                }
+
+                inputs.push(FlushInput {
+                    keyspace: name.clone(),
+                    memtable: Arc::clone(&immutable.memtable),
+                    freeze_sequence: immutable.freeze_sequence,
+                    table_id: next_table_id,
+                    table_level: table::TableLevel::ZERO,
+                    table_options: table_write_options(&state.options),
+                    point_records,
+                    range_tombstones,
+                });
+                next_table_id = next_table_id.next().ok_or_else(|| Error::Corruption {
+                    message: "table id counter overflow".to_owned(),
+                })?;
             }
-
-            inputs.push(FlushInput {
-                keyspace: name.clone(),
-                active_memtable,
-                table_id: next_table_id,
-                table_level: table::TableLevel::ZERO,
-                table_options: table_write_options(&state.options),
-                point_records,
-                range_tombstones,
-            });
-            next_table_id = next_table_id.next().ok_or_else(|| Error::Corruption {
-                message: "table id counter overflow".to_owned(),
-            })?;
         }
 
         Ok(inputs)
@@ -960,6 +1079,18 @@ impl Db {
             .replace_tables_batch(edits)
     }
 
+    fn rewrite_wal_after_replay_floor(&self, db_path: &Path, replay_floor: Sequence) -> Result<()> {
+        let Some(wal) = &self.inner.wal else {
+            return Ok(());
+        };
+
+        let wal_path = wal::wal_path(db_path);
+        let mut writer = wal.lock().map_err(|_| lock_poisoned("WAL writer"))?;
+        writer.persist(DurabilityMode::SyncAll)?;
+        wal::rewrite_batches_after(&wal_path, replay_floor)?;
+        writer.reopen_append(&wal_path)
+    }
+
     fn install_flushed_tables(
         &self,
         inputs: &[FlushInput],
@@ -976,25 +1107,19 @@ impl Db {
                 tables.push(table);
                 sort_tables_for_reads(&mut tables);
             }
-            state
-                .active_memtable
+            let mut immutable_memtables = state
+                .immutable_memtables
                 .write()
-                .map_err(|_| lock_poisoned("active memtable"))
-                .and_then(|mut active_memtable| {
-                    if Arc::ptr_eq(&*active_memtable, &input.active_memtable) {
-                        *active_memtable = Arc::new(Memtable::default());
-                        Ok(())
-                    } else {
-                        Err(Error::Corruption {
-                            message: "active memtable changed during flush".to_owned(),
-                        })
-                    }
-                })?;
-            state
-                .range_tombstones
-                .write()
-                .map_err(|_| lock_poisoned("range tombstones"))?
-                .clear();
+                .map_err(|_| lock_poisoned("immutable memtable queue"))?;
+            let Some(position) = immutable_memtables.iter().position(|immutable| {
+                immutable.freeze_sequence == input.freeze_sequence
+                    && Arc::ptr_eq(&immutable.memtable, &input.memtable)
+            }) else {
+                return Err(Error::Corruption {
+                    message: "flushed immutable memtable is no longer queued".to_owned(),
+                });
+            };
+            immutable_memtables.remove(position);
         }
 
         Ok(())
@@ -1173,6 +1298,66 @@ fn validate_table_blob_refs(db_path: &Path, table: &Table) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn active_memtable_bytes(state: &KeyspaceState) -> Result<u64> {
+    let active_memtable = state
+        .active_memtable
+        .read()
+        .map_err(|_| lock_poisoned("active memtable"))?
+        .clone();
+    let entries = active_memtable
+        .read_entries()
+        .map_err(|_| lock_poisoned("memtable entries"))?;
+    let entry_bytes = memtable_entry_bytes(&entries);
+    drop(entries);
+
+    let range_tombstones = state
+        .range_tombstones
+        .read()
+        .map_err(|_| lock_poisoned("range tombstones"))?;
+    Ok(entry_bytes.saturating_add(memtable_tombstone_bytes(&range_tombstones)))
+}
+
+fn freeze_active_memtable(state: &KeyspaceState, freeze_sequence: Sequence) -> Result<bool> {
+    // Lock order is active pointer -> active tombstones -> immutable queue.
+    // Readers follow the same active-before-tombstone path, so a freeze cannot
+    // leave a reader seeing the new active memtable without the frozen data.
+    let mut active_memtable = state
+        .active_memtable
+        .write()
+        .map_err(|_| lock_poisoned("active memtable"))?;
+    let active = Arc::clone(&active_memtable);
+    let entries_empty = {
+        let entries = active
+            .read_entries()
+            .map_err(|_| lock_poisoned("memtable entries"))?;
+        entries.is_empty()
+    };
+    let mut range_tombstones = state
+        .range_tombstones
+        .write()
+        .map_err(|_| lock_poisoned("range tombstones"))?;
+
+    if entries_empty && range_tombstones.is_empty() {
+        return Ok(false);
+    }
+
+    let immutable = ImmutableMemtable {
+        memtable: active,
+        range_tombstones: Arc::new(range_tombstones.clone()),
+        freeze_sequence,
+    };
+    state
+        .immutable_memtables
+        .write()
+        .map_err(|_| lock_poisoned("immutable memtable queue"))?
+        .push(immutable);
+
+    *active_memtable = Arc::new(Memtable::default());
+    range_tombstones.clear();
+
+    Ok(true)
 }
 
 fn memtable_entry_bytes(entries: &BTreeMap<InternalKey, Option<ValueRef>>) -> u64 {
@@ -1428,6 +1613,16 @@ fn scan_sources(
         selector.clone(),
         direction,
     )];
+    let immutable_memtables = state
+        .immutable_memtables
+        .read()
+        .map_err(|_| lock_poisoned("immutable memtable queue"))?
+        .clone();
+    sources.extend(
+        immutable_memtables.into_iter().map(|immutable| {
+            RecordSource::memtable(immutable.memtable, selector.clone(), direction)
+        }),
+    );
 
     let tables = state
         .tables
@@ -1472,6 +1667,23 @@ fn collect_point_key_records(
         .map(|(internal_key, value)| (internal_key.clone(), value.clone()))
         .collect::<Vec<_>>();
     drop(entries);
+    let immutable_memtables = state
+        .immutable_memtables
+        .read()
+        .map_err(|_| lock_poisoned("immutable memtable queue"))?
+        .clone();
+    for immutable in immutable_memtables {
+        let entries = immutable
+            .memtable
+            .read_entries()
+            .map_err(|_| lock_poisoned("memtable entries"))?;
+        records.extend(
+            entries
+                .iter()
+                .filter(|(internal_key, _)| internal_key.user_key() == key)
+                .map(|(internal_key, value)| (internal_key.clone(), value.clone())),
+        );
+    }
 
     let tables = state
         .tables
@@ -1516,6 +1728,23 @@ fn collect_range_point_records(
         .map(|(internal_key, value)| (internal_key.clone(), value.clone()))
         .collect::<Vec<_>>();
     drop(entries);
+    let immutable_memtables = state
+        .immutable_memtables
+        .read()
+        .map_err(|_| lock_poisoned("immutable memtable queue"))?
+        .clone();
+    for immutable in immutable_memtables {
+        let entries = immutable
+            .memtable
+            .read_entries()
+            .map_err(|_| lock_poisoned("memtable entries"))?;
+        records.extend(
+            entries
+                .iter()
+                .filter(|(internal_key, _)| key_is_in_range(internal_key.user_key(), range))
+                .map(|(internal_key, value)| (internal_key.clone(), value.clone())),
+        );
+    }
 
     let tables = state
         .tables
@@ -1539,12 +1768,7 @@ fn collect_range_point_records(
 }
 
 fn collect_range_tombstones(state: &KeyspaceState) -> Result<Vec<RangeTombstone>> {
-    let range_tombstones = state
-        .range_tombstones
-        .read()
-        .map_err(|_| lock_poisoned("range tombstones"))?;
-    let mut tombstones = range_tombstones.clone();
-    drop(range_tombstones);
+    let mut tombstones = collect_memtable_range_tombstones(state)?;
 
     let tables = state
         .tables
@@ -1561,6 +1785,26 @@ fn collect_range_tombstones(state: &KeyspaceState) -> Result<Vec<RangeTombstone>
                     batch_index: tombstone.batch_index,
                 }),
         );
+    }
+
+    Ok(tombstones)
+}
+
+fn collect_memtable_range_tombstones(state: &KeyspaceState) -> Result<Vec<RangeTombstone>> {
+    let active_tombstones = state
+        .range_tombstones
+        .read()
+        .map_err(|_| lock_poisoned("range tombstones"))?;
+    let mut tombstones = active_tombstones.clone();
+    drop(active_tombstones);
+
+    let immutable_memtables = state
+        .immutable_memtables
+        .read()
+        .map_err(|_| lock_poisoned("immutable memtable queue"))?
+        .clone();
+    for immutable in immutable_memtables {
+        tombstones.extend(immutable.range_tombstones.iter().cloned());
     }
 
     Ok(tombstones)
@@ -1618,10 +1862,7 @@ fn read_visible_point(
     // key. Keep at most one candidate instead of collecting and sorting every
     // version from every source.
     let mut candidate = newest_visible_memtable_point_candidate(state, key, read_sequence)?;
-    let range_tombstones = state
-        .range_tombstones
-        .read()
-        .map_err(|_| lock_poisoned("range tombstones"))?;
+    let memtable_range_tombstones = collect_memtable_range_tombstones(state)?;
     let tables = state
         .tables
         .read()
@@ -1648,7 +1889,7 @@ fn read_visible_point(
     match candidate.internal_key.kind() {
         ValueKind::Put => {
             let covered_by_memtable_tombstone = range_tombstones_cover(
-                &range_tombstones,
+                &memtable_range_tombstones,
                 key,
                 candidate.internal_key.sequence(),
                 candidate.internal_key.batch_index(),
@@ -1670,7 +1911,6 @@ fn read_visible_point(
                 Ok(None)
             } else {
                 drop(tables);
-                drop(range_tombstones);
                 value_bytes(candidate.value.as_ref(), db_path).map(Some)
             }
         }
@@ -1688,7 +1928,38 @@ fn newest_visible_memtable_point_candidate(
         .read()
         .map_err(|_| lock_poisoned("active memtable"))?
         .clone();
-    let entries = active_memtable
+    let mut candidate = None;
+    keep_newest_visible_memtable_point_candidate(
+        &mut candidate,
+        &active_memtable,
+        key,
+        read_sequence,
+    )?;
+
+    let immutable_memtables = state
+        .immutable_memtables
+        .read()
+        .map_err(|_| lock_poisoned("immutable memtable queue"))?
+        .clone();
+    for immutable in immutable_memtables {
+        keep_newest_visible_memtable_point_candidate(
+            &mut candidate,
+            &immutable.memtable,
+            key,
+            read_sequence,
+        )?;
+    }
+
+    Ok(candidate)
+}
+
+fn keep_newest_visible_memtable_point_candidate(
+    candidate: &mut Option<PointRecordCandidate>,
+    memtable: &Memtable,
+    key: &[u8],
+    read_sequence: Sequence,
+) -> Result<()> {
+    let entries = memtable
         .read_entries()
         .map_err(|_| lock_poisoned("memtable entries"))?;
     let start = Bound::Included(first_internal_key_for_user(key));
@@ -1698,13 +1969,11 @@ fn newest_visible_memtable_point_candidate(
         if internal_key.sequence() > read_sequence {
             continue;
         }
-        return Ok(Some(PointRecordCandidate {
-            internal_key: internal_key.clone(),
-            value: value.clone(),
-        }));
+        keep_newer_point_candidate(candidate, internal_key, value.as_ref());
+        break;
     }
 
-    Ok(None)
+    Ok(())
 }
 
 fn keep_newer_point_candidate(

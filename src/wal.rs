@@ -6,6 +6,7 @@ use std::{
 };
 
 use crate::{
+    durability::sync_parent_dir_after_rename,
     error::{Error, Result},
     options::DurabilityMode,
     types::{KeyRange, Sequence},
@@ -15,6 +16,7 @@ use crate::{
 pub const WAL_MAGIC: u32 = 0x5452_574c;
 pub const WAL_FORMAT_VERSION: u16 = 1;
 pub const WAL_FILE_NAME: &str = "trine.wal";
+pub const WAL_REWRITE_TMP_FILE_NAME: &str = "trine.wal.tmp";
 
 const HEADER_LEN: usize = 18;
 const OP_INSERT: u8 = 1;
@@ -62,19 +64,7 @@ impl WalWriter {
         operations: &[BatchOperation],
         durability: DurabilityMode,
     ) -> Result<()> {
-        let payload = encode_payload(sequence, operations)?;
-        let payload_checksum = checksum(&payload);
-        let payload_len = u32::try_from(payload.len())
-            .map_err(|_| Error::invalid_options("WAL payload exceeds u32::MAX bytes"))?;
-        let header_checksum = header_checksum(payload_len, payload_checksum);
-
-        self.file.write_all(&WAL_MAGIC.to_le_bytes())?;
-        self.file.write_all(&WAL_FORMAT_VERSION.to_le_bytes())?;
-        self.file.write_all(&payload_len.to_le_bytes())?;
-        self.file.write_all(&header_checksum.to_le_bytes())?;
-        self.file.write_all(&payload_checksum.to_le_bytes())?;
-        self.file.write_all(&payload)?;
-
+        write_batch_frame(&mut self.file, sequence, operations)?;
         self.persist(durability)?;
 
         Ok(())
@@ -89,6 +79,15 @@ impl WalWriter {
         }
         Ok(())
     }
+
+    pub fn reopen_append(&mut self, path: &Path) -> Result<()> {
+        self.file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(Error::from)?;
+        Ok(())
+    }
 }
 
 #[must_use]
@@ -97,17 +96,62 @@ pub fn wal_path(db_path: &Path) -> PathBuf {
 }
 
 pub fn read_batches(path: &Path) -> Result<Vec<WalBatch>> {
+    read_batches_after(path, Sequence::ZERO)
+}
+
+pub fn read_batches_after(path: &Path, replay_floor: Sequence) -> Result<Vec<WalBatch>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
 
     let mut bytes = Vec::new();
     File::open(path)?.read_to_end(&mut bytes)?;
-    decode_frames(&bytes)
+    decode_frames_after(&bytes, replay_floor)
+}
+
+pub fn rewrite_batches_after(path: &Path, replay_floor: Sequence) -> Result<()> {
+    let batches = read_batches_after(path, replay_floor)?;
+    let tmp_path = wal_rewrite_tmp_path(path);
+    {
+        let mut file = File::create(&tmp_path)?;
+        for batch in batches.iter().filter(|batch| batch.sequence > replay_floor) {
+            write_batch_frame(&mut file, batch.sequence, &batch.operations)?;
+        }
+        file.sync_all()?;
+    }
+    fs::rename(&tmp_path, path)?;
+    sync_parent_dir_after_rename(path)?;
+
+    Ok(())
 }
 
 pub fn ensure_parent_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path).map_err(Error::from)
+}
+
+fn wal_rewrite_tmp_path(path: &Path) -> PathBuf {
+    path.with_file_name(WAL_REWRITE_TMP_FILE_NAME)
+}
+
+fn write_batch_frame(
+    file: &mut File,
+    sequence: Sequence,
+    operations: &[BatchOperation],
+) -> Result<()> {
+    let payload = encode_payload(sequence, operations)?;
+    let payload_checksum = checksum(&payload);
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| Error::invalid_options("WAL payload exceeds u32::MAX bytes"))?;
+    let header_checksum = header_checksum(payload_len, payload_checksum);
+
+    file.write_all(&WAL_MAGIC.to_le_bytes())?;
+    file.write_all(&WAL_FORMAT_VERSION.to_le_bytes())?;
+    file.write_all(&payload_len.to_le_bytes())?;
+    file.write_all(&header_checksum.to_le_bytes())?;
+    file.write_all(&payload_checksum.to_le_bytes())?;
+    file.write_all(&payload)?;
+
+    Ok(())
 }
 
 fn encode_payload(sequence: Sequence, operations: &[BatchOperation]) -> Result<Vec<u8>> {
@@ -146,7 +190,7 @@ fn encode_payload(sequence: Sequence, operations: &[BatchOperation]) -> Result<V
     Ok(bytes)
 }
 
-fn decode_frames(bytes: &[u8]) -> Result<Vec<WalBatch>> {
+fn decode_frames_after(bytes: &[u8], replay_floor: Sequence) -> Result<Vec<WalBatch>> {
     let mut batches = Vec::new();
     let mut offset = 0;
 
@@ -192,11 +236,17 @@ fn decode_frames(bytes: &[u8]) -> Result<Vec<WalBatch>> {
             });
         }
 
-        batches.push(decode_payload(payload)?);
+        if payload_sequence(payload)? > replay_floor {
+            batches.push(decode_payload(payload)?);
+        }
         offset = payload_end;
     }
 
     Ok(batches)
+}
+
+fn payload_sequence(payload: &[u8]) -> Result<Sequence> {
+    Ok(Sequence::new(read_u64_at(payload, 0)?))
 }
 
 fn decode_payload(payload: &[u8]) -> Result<WalBatch> {
@@ -310,6 +360,15 @@ fn read_u32_at(bytes: &[u8], offset: usize) -> Result<u32> {
     Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
 }
 
+fn read_u64_at(bytes: &[u8], offset: usize) -> Result<u64> {
+    let value = bytes
+        .get(offset..offset + 8)
+        .ok_or_else(|| invalid_wal("short u64"))?;
+    Ok(u64::from_le_bytes([
+        value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+    ]))
+}
+
 fn header_checksum(payload_len: u32, payload_checksum: u32) -> u32 {
     let mut bytes = Vec::with_capacity(14);
     bytes.extend_from_slice(&WAL_MAGIC.to_le_bytes());
@@ -360,14 +419,9 @@ impl<'payload> Cursor<'payload> {
     }
 
     fn read_u64(&mut self) -> Result<u64> {
-        let value = self
-            .payload
-            .get(self.offset..self.offset + 8)
-            .ok_or_else(|| invalid_wal("short u64"))?;
+        let value = read_u64_at(self.payload, self.offset)?;
         self.offset += 8;
-        Ok(u64::from_le_bytes([
-            value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
-        ]))
+        Ok(value)
     }
 
     fn read_bytes(&mut self) -> Result<&'payload [u8]> {
@@ -402,7 +456,9 @@ impl<'payload> Cursor<'payload> {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_payload;
+    use crate::{types::Sequence, write_batch::BatchOperation};
+
+    use super::{WAL_FORMAT_VERSION, WAL_MAGIC, checksum, decode_frames_after, decode_payload};
 
     #[test]
     fn wal_decode_rejects_operation_count_before_large_allocation() {
@@ -417,5 +473,53 @@ mod tests {
                 .contains("operation count exceeds payload bytes"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn wal_decode_after_floor_skips_old_operation_payloads() {
+        let mut old_payload = Vec::new();
+        old_payload.extend_from_slice(&1_u64.to_le_bytes());
+        old_payload.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let new_payload = super::encode_payload(
+            Sequence::new(2),
+            &[BatchOperation::Insert {
+                keyspace: "default".to_owned(),
+                key: b"a".to_vec(),
+                value: b"a1".to_vec(),
+            }],
+        )
+        .expect("new payload encodes");
+
+        let mut bytes = frame_for_payload(&old_payload);
+        bytes.extend_from_slice(&frame_for_payload(&new_payload));
+
+        let batches =
+            decode_frames_after(&bytes, Sequence::new(1)).expect("old payload is skipped");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].sequence, Sequence::new(2));
+
+        let error = decode_frames_after(&bytes, Sequence::ZERO)
+            .expect_err("old payload is decoded without a replay floor");
+        assert!(
+            error
+                .to_string()
+                .contains("operation count exceeds payload bytes"),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn frame_for_payload(payload: &[u8]) -> Vec<u8> {
+        let payload_len = u32::try_from(payload.len()).expect("test payload fits u32");
+        let payload_checksum = checksum(payload);
+        let header_checksum = super::header_checksum(payload_len, payload_checksum);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&WAL_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&WAL_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&payload_len.to_le_bytes());
+        bytes.extend_from_slice(&header_checksum.to_le_bytes());
+        bytes.extend_from_slice(&payload_checksum.to_le_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
     }
 }

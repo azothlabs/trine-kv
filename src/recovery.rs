@@ -12,6 +12,7 @@ use crate::{
     error::{Error, Result},
     options::FailOnCorruptionPolicy,
     table::{self, TableId},
+    wal,
 };
 
 pub const RECOVERY_REPORT_FILE_NAME: &str = "RECOVERY_REPORT";
@@ -187,6 +188,7 @@ fn is_safe_temporary_file(name: &str) -> bool {
     // when the caller explicitly chooses the repair policy.
     name == "MANIFEST.tmp"
         || name == "RECOVERY_REPORT.tmp"
+        || name == wal::WAL_REWRITE_TMP_FILE_NAME
         || (name.starts_with("table-") && has_tmp_extension(name))
         || (name.starts_with("blob-") && has_tmp_extension(name))
 }

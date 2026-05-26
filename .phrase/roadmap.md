@@ -259,3 +259,30 @@ as point-read bottlenecks.
   the newest visible record without building and sorting a full record vector.
 - Block-cache hit tracking no longer depends on one global exclusive lock.
 - Existing MVCC, range-delete, persistent, transaction, and benchmark gates pass.
+
+### Phase 16: LSM Write Path And WAL Lifecycle
+
+**Status**: Complete
+
+**Goal**: Make the write path match the v1 LSM shape by adding immutable
+memtables, size-triggered active memtable freeze, pressure-triggered flush, and
+bounded WAL replay after flush.
+
+**Entry Condition**: User audit identifies active-only memtables, manual-only
+flush, and unbounded WAL replay as the next P1 production risks.
+
+**Acceptance Gate**:
+
+- Active memtables freeze into immutable memtables when the configured write
+  buffer threshold is reached.
+- Reads, transactions, range scans, and prefix scans include immutable
+  memtables before SSTables.
+- Flush consumes immutable memtables and manual flush first freezes current
+  active memtables.
+- Immutable memtable pressure is handled before accepting the next write, so
+  storage errors do not leave a new write half-reported.
+- Manifest WAL replay floor advances only after flushed SSTables are published,
+  and the WAL is atomically rewritten so startup does not decode indefinitely
+  old flushed batches.
+- Existing MVCC, range-delete, persistent, transaction, recovery, and release
+  gates pass.

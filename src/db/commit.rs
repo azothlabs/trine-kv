@@ -61,6 +61,9 @@ impl Db {
             .writer
             .lock()
             .map_err(|_| lock_poisoned("writer coordinator"))?;
+        if let crate::options::StorageMode::Persistent { path } = &self.inner.options.storage_mode {
+            self.flush_immutable_memtables_for_write_locked(path)?;
+        }
 
         // Read validation and writes share one commit slot. Once validation
         // succeeds, no other writer can sneak in before this batch lands.
@@ -106,6 +109,7 @@ impl Db {
         self.inner
             .last_sequence
             .store(sequence.get(), Ordering::Release);
+        self.freeze_large_active_memtables_after_commit_locked(sequence)?;
         Ok(CommitInfo::new(sequence))
     }
 
