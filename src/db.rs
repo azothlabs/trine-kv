@@ -15,9 +15,10 @@ use crate::{
     cache, compaction, durability,
     error::{Error, Result},
     internal_key::{InternalKey, ValueKind},
-    iterator::{Direction, Iter, RecordSource, ScanRangeTombstone, ScanSelector, prefix_successor},
+    iterator::{Direction, Iter, RecordSource, ScanRangeTombstone, ScanSelector},
     keyspace::{Keyspace, KeyspaceName},
     manifest::{self, ManifestState, ManifestStore},
+    memtable::Memtable,
     options::{DbOptions, DurabilityMode, FailOnCorruptionPolicy, KeyspaceOptions, StorageMode},
     recovery,
     snapshot::{Snapshot, SnapshotTracker},
@@ -58,7 +59,7 @@ pub(crate) struct DbInner {
 #[derive(Debug)]
 pub(crate) struct KeyspaceState {
     options: KeyspaceOptions,
-    entries: RwLock<BTreeMap<InternalKey, Option<ValueRef>>>,
+    active_memtable: RwLock<Arc<Memtable>>,
     range_tombstones: RwLock<Vec<RangeTombstone>>,
     tables: RwLock<Vec<Arc<Table>>>,
 }
@@ -68,7 +69,7 @@ impl KeyspaceState {
         sort_tables_for_reads(&mut tables);
         Self {
             options,
-            entries: RwLock::new(BTreeMap::new()),
+            active_memtable: RwLock::new(Arc::new(Memtable::default())),
             range_tombstones: RwLock::new(Vec::new()),
             tables: RwLock::new(tables),
         }
@@ -101,6 +102,7 @@ impl RangeTombstone {
 
 struct FlushInput {
     keyspace: String,
+    active_memtable: Arc<Memtable>,
     table_id: table::TableId,
     table_level: table::TableLevel,
     table_options: table::TableWriteOptions,
@@ -510,10 +512,16 @@ impl Db {
         stats.live_keyspaces = keyspaces.len();
 
         for state in keyspaces.values() {
-            if let Ok(entries) = state.entries.read() {
-                stats.memtable_bytes = stats
-                    .memtable_bytes
-                    .saturating_add(memtable_entry_bytes(&entries));
+            let active_memtable = state
+                .active_memtable
+                .read()
+                .map(|memtable| Arc::clone(&memtable));
+            if let Ok(active_memtable) = active_memtable {
+                if let Ok(entries) = active_memtable.read_entries() {
+                    stats.memtable_bytes = stats
+                        .memtable_bytes
+                        .saturating_add(memtable_entry_bytes(&entries));
+                }
             }
             if let Ok(tombstones) = state.range_tombstones.read() {
                 stats.memtable_bytes = stats
@@ -754,10 +762,14 @@ impl Db {
         let mut inputs = Vec::new();
 
         for (name, state) in keyspaces.iter() {
+            let active_memtable = state
+                .active_memtable
+                .read()
+                .map_err(|_| lock_poisoned("active memtable"))?
+                .clone();
             let point_records = {
-                let entries = state
-                    .entries
-                    .read()
+                let entries = active_memtable
+                    .read_entries()
                     .map_err(|_| lock_poisoned("memtable entries"))?;
                 entries
                     .iter()
@@ -785,6 +797,7 @@ impl Db {
 
             inputs.push(FlushInput {
                 keyspace: name.clone(),
+                active_memtable,
                 table_id: next_table_id,
                 table_level: table::TableLevel::ZERO,
                 table_options: table_write_options(&state.options),
@@ -936,17 +949,28 @@ impl Db {
         for (input, (keyspace, table)) in inputs.iter().zip(tables) {
             debug_assert_eq!(input.keyspace, keyspace);
             let state = self.keyspace_state(&keyspace)?;
-            let mut tables = state
-                .tables
-                .write()
-                .map_err(|_| lock_poisoned("table list"))?;
-            tables.push(table);
-            sort_tables_for_reads(&mut tables);
+            {
+                let mut tables = state
+                    .tables
+                    .write()
+                    .map_err(|_| lock_poisoned("table list"))?;
+                tables.push(table);
+                sort_tables_for_reads(&mut tables);
+            }
             state
-                .entries
+                .active_memtable
                 .write()
-                .map_err(|_| lock_poisoned("memtable entries"))?
-                .clear();
+                .map_err(|_| lock_poisoned("active memtable"))
+                .and_then(|mut active_memtable| {
+                    if Arc::ptr_eq(&*active_memtable, &input.active_memtable) {
+                        *active_memtable = Arc::new(Memtable::default());
+                        Ok(())
+                    } else {
+                        Err(Error::Corruption {
+                            message: "active memtable changed during flush".to_owned(),
+                        })
+                    }
+                })?;
             state
                 .range_tombstones
                 .write()
@@ -1374,15 +1398,14 @@ fn scan_sources(
     direction: Direction,
     block_cache: Option<&Arc<cache::BlockCache>>,
 ) -> Result<Vec<RecordSource>> {
-    let entries = state
-        .entries
+    let active_memtable = state
+        .active_memtable
         .read()
-        .map_err(|_| lock_poisoned("memtable entries"))?;
-    let memtable_records = collect_memtable_scan_records(&entries, selector);
-    drop(entries);
+        .map_err(|_| lock_poisoned("active memtable"))?
+        .clone();
 
     let mut sources = vec![RecordSource::memtable(
-        memtable_records,
+        active_memtable,
         selector.clone(),
         direction,
     )];
@@ -1411,71 +1434,18 @@ fn scan_sources(
     Ok(sources)
 }
 
-fn collect_memtable_scan_records(
-    entries: &BTreeMap<InternalKey, Option<ValueRef>>,
-    selector: &ScanSelector,
-) -> Vec<(InternalKey, Option<ValueRef>)> {
-    let (start, end) = memtable_scan_bounds(selector);
-    entries
-        .range((start, end))
-        .filter(|(internal_key, _)| selector.contains_key(internal_key.user_key()))
-        .map(|(internal_key, value)| (internal_key.clone(), value.clone()))
-        .collect()
-}
-
-fn memtable_scan_bounds(selector: &ScanSelector) -> (Bound<InternalKey>, Bound<InternalKey>) {
-    match selector {
-        ScanSelector::Range(range) => (
-            memtable_start_bound(&range.start),
-            memtable_end_bound(&range.end),
-        ),
-        ScanSelector::Prefix(prefix) => {
-            let start = Bound::Included(first_internal_key_for_user(prefix));
-            let end = prefix_successor(prefix).map_or(Bound::Unbounded, |end| {
-                Bound::Excluded(first_internal_key_for_user(&end))
-            });
-            (start, end)
-        }
-    }
-}
-
-fn memtable_start_bound(start: &Bound<Vec<u8>>) -> Bound<InternalKey> {
-    match start {
-        Bound::Included(key) => Bound::Included(first_internal_key_for_user(key)),
-        Bound::Excluded(key) => Bound::Excluded(last_internal_key_for_user(key)),
-        Bound::Unbounded => Bound::Unbounded,
-    }
-}
-
-fn memtable_end_bound(end: &Bound<Vec<u8>>) -> Bound<InternalKey> {
-    match end {
-        Bound::Included(key) => Bound::Included(last_internal_key_for_user(key)),
-        Bound::Excluded(key) => Bound::Excluded(first_internal_key_for_user(key)),
-        Bound::Unbounded => Bound::Unbounded,
-    }
-}
-
-fn first_internal_key_for_user(user_key: &[u8]) -> InternalKey {
-    InternalKey::new(
-        user_key.to_vec(),
-        Sequence::new(u64::MAX),
-        ValueKind::Put,
-        u32::MAX,
-    )
-}
-
-fn last_internal_key_for_user(user_key: &[u8]) -> InternalKey {
-    InternalKey::new(user_key.to_vec(), Sequence::ZERO, ValueKind::RangeDelete, 0)
-}
-
 fn collect_point_key_records(
     state: &KeyspaceState,
     key: &[u8],
     block_cache: Option<&cache::BlockCache>,
 ) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
-    let entries = state
-        .entries
+    let active_memtable = state
+        .active_memtable
         .read()
+        .map_err(|_| lock_poisoned("active memtable"))?
+        .clone();
+    let entries = active_memtable
+        .read_entries()
         .map_err(|_| lock_poisoned("memtable entries"))?;
     let mut records = entries
         .iter()
@@ -1513,9 +1483,13 @@ fn collect_range_point_records(
     range: &KeyRange,
     block_cache: Option<&cache::BlockCache>,
 ) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
-    let entries = state
-        .entries
+    let active_memtable = state
+        .active_memtable
         .read()
+        .map_err(|_| lock_poisoned("active memtable"))?
+        .clone();
+    let entries = active_memtable
+        .read_entries()
         .map_err(|_| lock_poisoned("memtable entries"))?;
     let mut records = entries
         .iter()
@@ -1794,9 +1768,13 @@ fn apply_memtable_operation(
     sequence: Sequence,
     batch_index: u32,
 ) -> Result<()> {
-    let mut entries = state
-        .entries
-        .write()
+    let active_memtable = state
+        .active_memtable
+        .read()
+        .map_err(|_| lock_poisoned("active memtable"))?
+        .clone();
+    let mut entries = active_memtable
+        .write_entries()
         .map_err(|_| lock_poisoned("memtable entries"))?;
 
     match operation {

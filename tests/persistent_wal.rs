@@ -9,7 +9,8 @@ use std::{
 use trine_kv::{
     CompressionProfile, Db, DbOptions, DurabilityMode, Error, FailOnCorruptionPolicy, FilterPolicy,
     IndexSearchPolicy, KeyRange, KeyspaceOptions, PrefixExtractor, PrefixFilterPolicy, Sequence,
-    WriteBatch, WriteOptions, blob, codec::CodecId, manifest, recovery, table, wal,
+    TransactionOptions, WriteBatch, WriteOptions, blob, codec::CodecId, manifest, recovery, table,
+    wal,
 };
 
 fn temp_db_path(name: &str) -> PathBuf {
@@ -991,6 +992,73 @@ fn persistent_range_iterator_defers_table_block_reads_until_next() {
         assert!(
             stats.block_cache_misses > 0,
             "first iterator advance should touch the table block"
+        );
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_range_iterator_keeps_active_memtable_after_flush() {
+    let path = temp_db_path("range-iterator-memtable-handle");
+    let options = DbOptions::persistent(&path);
+
+    {
+        let db = Db::open(options).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+        keyspace.insert(b"key-010", b"before-a").expect("write row");
+        keyspace.insert(b"key-020", b"before-b").expect("write row");
+
+        let iter = keyspace
+            .range(&KeyRange::all())
+            .expect("range cursor is created");
+        db.flush().expect("flush active memtable");
+        keyspace
+            .insert(b"key-000", b"after")
+            .expect("write later row");
+
+        assert_eq!(
+            collect_rows(iter),
+            vec![
+                (b"key-010".to_vec(), b"before-a".to_vec()),
+                (b"key-020".to_vec(), b"before-b".to_vec()),
+            ]
+        );
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_transaction_read_range_consumes_scan_before_tracking() {
+    let path = temp_db_path("transaction-read-range-consumes-scan");
+    let options = DbOptions::persistent(&path);
+
+    {
+        let db = Db::open(options).expect("persistent db opens");
+        let keyspace = db
+            .keyspace("default", KeyspaceOptions::default())
+            .expect("keyspace opens");
+        for index in 0..64 {
+            keyspace
+                .insert(
+                    format!("key-{index:03}").as_bytes(),
+                    format!("value-{index:03}").as_bytes(),
+                )
+                .expect("write row");
+        }
+        db.flush().expect("flush table");
+        assert_eq!(db.stats().block_cache_misses, 0);
+
+        let mut txn = db.transaction(TransactionOptions::default());
+        txn.read_range("default", KeyRange::all())
+            .expect("transaction range read succeeds");
+
+        assert!(
+            db.stats().block_cache_misses > 0,
+            "transaction range read should advance the table cursor"
         );
     }
 

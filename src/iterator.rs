@@ -1,9 +1,10 @@
-use std::{cmp::Ordering as CmpOrdering, ops::Bound, path::PathBuf};
+use std::{cmp::Ordering as CmpOrdering, ops::Bound, path::PathBuf, sync::Arc};
 
 use crate::{
     blob::ValueRef,
     error::{Error, Result},
     internal_key::{InternalKey, ValueKind},
+    memtable::Memtable,
     snapshot::Snapshot,
     table::TablePointCursor,
     types::{KeyRange, KeyValue, Sequence},
@@ -97,19 +98,28 @@ struct LazyScan {
 impl LazyScan {
     fn next(&mut self) -> Option<Result<KeyValue>> {
         loop {
-            let user_key = self.next_user_key()?;
+            let user_key = match self.next_user_key() {
+                Ok(Some(user_key)) => user_key,
+                Ok(None) => return None,
+                Err(error) => return Some(Err(error)),
+            };
             let mut first_record = None;
             let mut rest_records = Vec::new();
 
             for source in &mut self.sources {
-                let source_matches = source
-                    .current_key()
-                    .is_some_and(|source_key| source_key == user_key.as_slice());
+                let source_matches = match source.current_key() {
+                    Ok(Some(source_key)) => source_key == user_key.as_slice(),
+                    Ok(None) => false,
+                    Err(error) => return Some(Err(error)),
+                };
                 if source_matches {
-                    let Some(group) = source.take_current_group() else {
-                        continue;
-                    };
-                    push_group_records(&mut first_record, &mut rest_records, group);
+                    match source.take_current_group() {
+                        Ok(Some(group)) => {
+                            push_group_records(&mut first_record, &mut rest_records, group);
+                        }
+                        Ok(None) => {}
+                        Err(error) => return Some(Err(error)),
+                    }
                 }
             }
 
@@ -123,11 +133,11 @@ impl LazyScan {
         }
     }
 
-    fn next_user_key(&mut self) -> Option<Vec<u8>> {
+    fn next_user_key(&mut self) -> Result<Option<Vec<u8>>> {
         let mut selected: Option<Vec<u8>> = None;
 
         for source in &mut self.sources {
-            let Some(user_key) = source.current_key() else {
+            let Some(user_key) = source.current_key()? else {
                 continue;
             };
             let replace = selected.as_ref().is_none_or(|selected| {
@@ -138,7 +148,7 @@ impl LazyScan {
             }
         }
 
-        selected
+        Ok(selected)
     }
 
     fn visible_item_from_records(
@@ -233,12 +243,12 @@ pub(crate) struct RecordSource {
 
 impl RecordSource {
     pub(crate) fn memtable(
-        records: Vec<ScanRecord>,
+        memtable: Arc<Memtable>,
         selector: ScanSelector,
         direction: Direction,
     ) -> Self {
         Self {
-            cursor: SourceCursor::Memtable(MemtableCursor::new(records, selector, direction)),
+            cursor: SourceCursor::Memtable(MemtableCursor::new(memtable, selector, direction)),
             current: None,
         }
     }
@@ -250,20 +260,21 @@ impl RecordSource {
         }
     }
 
-    fn current_key(&mut self) -> Option<&[u8]> {
-        self.ensure_current();
-        self.current.as_ref().map(|group| group.user_key.as_slice())
+    fn current_key(&mut self) -> Result<Option<&[u8]>> {
+        self.ensure_current()?;
+        Ok(self.current.as_ref().map(|group| group.user_key.as_slice()))
     }
 
-    fn take_current_group(&mut self) -> Option<RecordGroup> {
-        self.ensure_current();
-        self.current.take()
+    fn take_current_group(&mut self) -> Result<Option<RecordGroup>> {
+        self.ensure_current()?;
+        Ok(self.current.take())
     }
 
-    fn ensure_current(&mut self) {
+    fn ensure_current(&mut self) -> Result<()> {
         if self.current.is_none() {
-            self.current = self.cursor.next_group();
+            self.current = self.cursor.next_group()?;
         }
+        Ok(())
     }
 }
 
@@ -274,101 +285,143 @@ enum SourceCursor {
 }
 
 impl SourceCursor {
-    fn next_group(&mut self) -> Option<RecordGroup> {
+    fn next_group(&mut self) -> Result<Option<RecordGroup>> {
         match self {
             Self::Memtable(cursor) => cursor.next_group(),
-            Self::Table(cursor) => cursor.next_group(),
+            Self::Table(cursor) => Ok(cursor.next_group()),
         }
     }
 }
 
 #[derive(Debug, Clone)]
 struct MemtableCursor {
-    records: Vec<ScanRecord>,
+    // The cursor keeps the memtable handle that was active when the scan was
+    // created. A later flush can swap in a fresh active memtable without
+    // changing what this iterator is allowed to see.
+    memtable: Arc<Memtable>,
     selector: ScanSelector,
     direction: Direction,
-    index: usize,
-    pending: Option<ScanRecord>,
+    lower_bound: Bound<InternalKey>,
+    upper_bound: Bound<InternalKey>,
+    exhausted: bool,
 }
 
 impl MemtableCursor {
-    fn new(mut records: Vec<ScanRecord>, selector: ScanSelector, direction: Direction) -> Self {
-        records.sort_by(|left, right| left.0.cmp(&right.0));
-        let index = match direction {
-            Direction::Forward => forward_start_index(&records, &selector),
-            Direction::Reverse => reverse_start_index(&records, &selector),
-        };
+    fn new(memtable: Arc<Memtable>, selector: ScanSelector, direction: Direction) -> Self {
+        let (lower_bound, upper_bound) = memtable_scan_bounds(&selector);
 
         Self {
-            records,
+            memtable,
             selector,
             direction,
-            index,
-            pending: None,
+            lower_bound,
+            upper_bound,
+            exhausted: false,
         }
     }
 
-    fn next_group(&mut self) -> Option<RecordGroup> {
-        let first = self.pending.take().or_else(|| self.next_record())?;
-        let user_key = first.0.user_key().to_vec();
-        let mut rest = Vec::new();
-
-        while let Some(record) = self.next_record() {
-            if record.0.user_key() == user_key.as_slice() {
-                rest.push(record);
-            } else {
-                self.pending = Some(record);
-                break;
-            }
-        }
-        let (first, rest) = sort_group_records(first, rest);
-
-        Some(RecordGroup {
-            user_key,
-            first,
-            rest,
-        })
-    }
-
-    fn next_record(&mut self) -> Option<ScanRecord> {
+    fn next_group(&mut self) -> Result<Option<RecordGroup>> {
         match self.direction {
-            Direction::Forward => self.next_record_forward(),
-            Direction::Reverse => self.next_record_reverse(),
+            Direction::Forward => self.next_group_forward(),
+            Direction::Reverse => self.next_group_reverse(),
         }
     }
 
-    fn next_record_forward(&mut self) -> Option<ScanRecord> {
-        while self.index < self.records.len() {
-            let record = self.records[self.index].clone();
-            self.index += 1;
-            match self.selector.forward_key_state(record.0.user_key()) {
+    fn next_group_forward(&mut self) -> Result<Option<RecordGroup>> {
+        if self.exhausted {
+            return Ok(None);
+        }
+
+        let entries = self
+            .memtable
+            .read_entries()
+            .map_err(|_| lock_poisoned("memtable entries"))?;
+        let mut records = Vec::new();
+        let mut group_user_key = None;
+
+        for (internal_key, value) in
+            entries.range((self.lower_bound.clone(), self.upper_bound.clone()))
+        {
+            match self.selector.forward_key_state(internal_key.user_key()) {
                 ForwardKeyState::Before => {}
-                ForwardKeyState::Match => return Some(record),
+                ForwardKeyState::Match => {
+                    let user_key =
+                        group_user_key.get_or_insert_with(|| internal_key.user_key().to_vec());
+                    if internal_key.user_key() == user_key.as_slice() {
+                        records.push((internal_key.clone(), value.clone()));
+                    } else {
+                        break;
+                    }
+                }
                 ForwardKeyState::After => {
-                    self.index = self.records.len();
-                    return None;
+                    self.exhausted = true;
+                    return Ok(None);
                 }
             }
         }
+        drop(entries);
 
-        None
+        let Some(user_key) = group_user_key else {
+            self.exhausted = true;
+            return Ok(None);
+        };
+        self.lower_bound = Bound::Excluded(last_internal_key_for_user(&user_key));
+        Ok(Some(record_group_from_records(user_key, records)))
     }
 
-    fn next_record_reverse(&mut self) -> Option<ScanRecord> {
-        while self.index > 0 {
-            self.index -= 1;
-            let record = self.records[self.index].clone();
-            match self.selector.reverse_key_state(record.0.user_key()) {
+    fn next_group_reverse(&mut self) -> Result<Option<RecordGroup>> {
+        if self.exhausted {
+            return Ok(None);
+        }
+
+        let entries = self
+            .memtable
+            .read_entries()
+            .map_err(|_| lock_poisoned("memtable entries"))?;
+        let mut records = Vec::new();
+        let mut group_user_key = None;
+
+        for (internal_key, value) in entries
+            .range((self.lower_bound.clone(), self.upper_bound.clone()))
+            .rev()
+        {
+            match self.selector.reverse_key_state(internal_key.user_key()) {
                 ReverseKeyState::Above => {}
-                ReverseKeyState::Match => return Some(record),
+                ReverseKeyState::Match => {
+                    let user_key =
+                        group_user_key.get_or_insert_with(|| internal_key.user_key().to_vec());
+                    if internal_key.user_key() == user_key.as_slice() {
+                        records.push((internal_key.clone(), value.clone()));
+                    } else {
+                        break;
+                    }
+                }
                 ReverseKeyState::Below => {
-                    self.index = 0;
-                    return None;
+                    self.exhausted = true;
+                    return Ok(None);
                 }
             }
         }
+        drop(entries);
 
-        None
+        let Some(user_key) = group_user_key else {
+            self.exhausted = true;
+            return Ok(None);
+        };
+        self.upper_bound = Bound::Excluded(first_internal_key_for_user(&user_key));
+        Ok(Some(record_group_from_records(user_key, records)))
+    }
+}
+
+fn record_group_from_records(user_key: Vec<u8>, mut records: Vec<ScanRecord>) -> RecordGroup {
+    let first = records
+        .pop()
+        .expect("memtable cursor only builds groups after finding a record");
+    let (first, rest) = sort_group_records(first, records);
+    RecordGroup {
+        user_key,
+        first,
+        rest,
     }
 }
 
@@ -390,23 +443,49 @@ pub(crate) fn sort_group_records(
     (first, rest)
 }
 
-fn forward_start_index(records: &[ScanRecord], selector: &ScanSelector) -> usize {
-    records.partition_point(|(internal_key, _)| {
-        selector.forward_key_state(internal_key.user_key()) == ForwardKeyState::Before
-    })
+fn memtable_scan_bounds(selector: &ScanSelector) -> (Bound<InternalKey>, Bound<InternalKey>) {
+    match selector {
+        ScanSelector::Range(range) => (
+            memtable_start_bound(&range.start),
+            memtable_end_bound(&range.end),
+        ),
+        ScanSelector::Prefix(prefix) => {
+            let start = Bound::Included(first_internal_key_for_user(prefix));
+            let end = prefix_successor(prefix).map_or(Bound::Unbounded, |end| {
+                Bound::Excluded(first_internal_key_for_user(&end))
+            });
+            (start, end)
+        }
+    }
 }
 
-fn reverse_start_index(records: &[ScanRecord], selector: &ScanSelector) -> usize {
-    match selector {
-        ScanSelector::Range(range) => records.partition_point(|(internal_key, _)| {
-            !key_is_after_end(internal_key.user_key(), &range.end)
-        }),
-        ScanSelector::Prefix(prefix) => match prefix_successor(prefix) {
-            Some(end) => records
-                .partition_point(|(internal_key, _)| internal_key.user_key() < end.as_slice()),
-            None => records.len(),
-        },
+fn memtable_start_bound(start: &Bound<Vec<u8>>) -> Bound<InternalKey> {
+    match start {
+        Bound::Included(key) => Bound::Included(first_internal_key_for_user(key)),
+        Bound::Excluded(key) => Bound::Excluded(last_internal_key_for_user(key)),
+        Bound::Unbounded => Bound::Unbounded,
     }
+}
+
+fn memtable_end_bound(end: &Bound<Vec<u8>>) -> Bound<InternalKey> {
+    match end {
+        Bound::Included(key) => Bound::Included(last_internal_key_for_user(key)),
+        Bound::Excluded(key) => Bound::Excluded(first_internal_key_for_user(key)),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
+fn first_internal_key_for_user(user_key: &[u8]) -> InternalKey {
+    InternalKey::new(
+        user_key.to_vec(),
+        Sequence::new(u64::MAX),
+        ValueKind::Put,
+        u32::MAX,
+    )
+}
+
+fn last_internal_key_for_user(user_key: &[u8]) -> InternalKey {
+    InternalKey::new(user_key.to_vec(), Sequence::ZERO, ValueKind::RangeDelete, 0)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -416,10 +495,6 @@ pub(crate) enum ScanSelector {
 }
 
 impl ScanSelector {
-    pub(crate) fn contains_key(&self, key: &[u8]) -> bool {
-        self.forward_key_state(key) == ForwardKeyState::Match
-    }
-
     pub(crate) fn forward_key_state(&self, key: &[u8]) -> ForwardKeyState {
         match self {
             Self::Range(range) => {
@@ -531,6 +606,12 @@ fn range_tombstones_cover(
     range_tombstones.iter().any(|tombstone| {
         tombstone.covers_visible_point(key, point_sequence, point_batch_index, read_sequence)
     })
+}
+
+fn lock_poisoned(lock_name: &'static str) -> Error {
+    Error::Corruption {
+        message: format!("{lock_name} lock poisoned"),
+    }
 }
 
 fn value_bytes(value: Option<&ValueRef>, db_path: Option<&std::path::Path>) -> Result<Vec<u8>> {

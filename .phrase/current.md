@@ -21,6 +21,8 @@ memtable and SSTable records under MVCC visibility.
 - Change `Iter` so range/prefix scans can own lazy source cursors.
 - Add memtable and SSTable point-record cursors with forward and reverse scan
   support.
+- Keep range/prefix iterators tied to the active memtable handle they were
+  created from, so a later flush cannot change what the iterator sees.
 - Merge source groups by user key, then apply MVCC point and range-delete
   visibility before returning each row.
 - Keep point reads on the existing focused lookup path.
@@ -36,8 +38,12 @@ memtable and SSTable records under MVCC visibility.
 ## Acceptance Gate
 
 - Range and prefix scans no longer call the eager visible-range builder.
+- Range and prefix scans no longer prebuild matching memtable records before
+  iterator construction returns.
 - The lazy cursor preserves ordering, snapshot visibility, point deletes, range
   deletes, blob values, and reverse scans.
+- Transaction range reads consume their scan before recording the read range,
+  so read-path errors are returned before commit validation accepts the range.
 - A focused test shows table block-cache access starts on `next()`, not at
   iterator construction.
 - Local verification passes for `cargo fmt --check`,
@@ -48,6 +54,7 @@ memtable and SSTable records under MVCC visibility.
 
 ```text
 task049 [x] goal:range/prefix iterator advances lazily over merged source cursors | scope:src/iterator.rs,src/db.rs,src/table.rs,tests,.phrase | verify:focused lazy test + full Rust gate
+task050 [x] goal:range/prefix iterator keeps active memtable scan lazy and flush-stable | scope:src/memtable.rs,src/db.rs,src/iterator.rs,src/transaction.rs,tests,.phrase | verify:memtable-after-flush test + transaction range-read test + full Rust gate
 ```
 
 ## Known Blockers
@@ -64,8 +71,17 @@ task049 [x] goal:range/prefix iterator advances lazily over merged source cursor
 
 - `Iter` owns lazy source cursors for range/prefix scans; point reads keep the
   focused lookup path.
+- `RecordSource::memtable` owns an `Arc<Memtable>` and advances by user-key
+  groups instead of receiving a prebuilt vector of all matching records.
+- `Transaction::read_range` consumes the range cursor before adding the read
+  range to its optimistic validation set.
 - `persistent_range_iterator_defers_table_block_reads_until_next` proves range
   construction does not touch table blocks.
+- `persistent_range_iterator_keeps_active_memtable_after_flush` proves an
+  iterator created before flush keeps reading the active memtable it was
+  created from.
+- `persistent_transaction_read_range_consumes_scan_before_tracking` proves
+  transaction range reads advance table cursors before tracking the read range.
 - The full local Rust gate passed on Rust 1.87; remote CI remains the exact
   Rust 1.85 proof after push.
 

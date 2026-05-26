@@ -79,12 +79,18 @@ impl Transaction {
     pub fn read_range(&mut self, keyspace: impl Into<String>, range: KeyRange) -> Result<()> {
         self.db.ensure_open()?;
         let keyspace = keyspace.into();
-        self.db.range_at(
+        let iter = self.db.range_at(
             &keyspace,
             &range,
             self.read_sequence,
             crate::Direction::Forward,
         )?;
+        // The transaction API records a range that was actually read at the
+        // transaction sequence. Consume the cursor here so table/blob read
+        // errors are returned before the read set is accepted.
+        for item in iter {
+            item?;
+        }
         // Range reads conflict with any later committed point mutation inside
         // the range, plus any later range tombstone that overlaps it.
         self.range_reads.push(ReadRange { keyspace, range });

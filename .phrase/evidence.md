@@ -2230,3 +2230,53 @@ Record only evidence that can change planning or durable decisions.
 
 - Push and let CI run. If CI passes, consider a follow-up prefix-scan tuning
   slice only if release benchmarks keep showing the small local slowdown.
+
+## 2026-05-26: Lazy Range Iterator Hardening Passed
+
+### Observation
+
+- Review found that the lazy range iterator still built a vector of all matching
+  active memtable records before returning the iterator.
+- `KeyspaceState` now stores the active memtable as an `Arc<Memtable>`.
+- Range/prefix iterators clone the active memtable handle at creation and the
+  memtable cursor advances by user-key group under bounded `BTreeMap` ranges.
+- Flush publishes the SSTable, then swaps in a fresh active memtable. Existing
+  iterators keep their old active memtable handle.
+- `Transaction::read_range` now consumes its range cursor before recording the
+  read range, so read-path errors are returned before the read set is accepted.
+
+### Interpretation
+
+- The Phase 14 lazy scan shape now covers both memtable and SSTable sources.
+- Flush cannot change the active memtable records visible to an iterator that
+  was created before the flush.
+- The transaction range-read API keeps its previous validation behavior even
+  though ordinary range scans are lazy.
+
+### Verification
+
+- `cargo test persistent_range_iterator_keeps_active_memtable_after_flush --test persistent_wal`
+- `cargo test persistent_transaction_read_range_consumes_scan_before_tracking --test persistent_wal`
+- `cargo test --test in_memory_transaction`
+- `cargo test --test in_memory_iteration`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo check --target x86_64-pc-windows-gnu`
+- `cargo run --example quickstart`
+- `cargo run --example user_store`
+- `cargo run --example event_index`
+- `cargo bench --bench v1_bench`
+- `git diff --check`
+
+### Remaining Blockers
+
+- GitHub Actions was not executed locally; the remote workflow must run after
+  push to confirm the exact Rust 1.85 environment.
+- Tables are still loaded as complete table objects; this remains outside the
+  Phase 14 cursor-shape fix.
+
+### Recommended Next Action
+
+- Push and let CI run. If CI passes, continue with the next evidence-selected
+  release-readiness task.
