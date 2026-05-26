@@ -170,3 +170,20 @@ before publishing.
   storage formats.
 - Focused regression coverage exists for the hardening mechanism.
 - The full local release gate still passes.
+
+### Phase 11: Windows Directory Sync Hardening
+
+**Status**: Complete
+
+**Goal**: Extend parent-directory sync after atomic file publish to Windows
+before crate publish.
+
+**Entry Condition**: Phase 10 complete and user asks how non-Unix targets are
+handled.
+
+**Acceptance Gate**:
+
+- Windows uses a directory handle path for parent-directory sync after rename.
+- Unix behavior remains unchanged.
+- Other targets are documented as best-effort.
+- The full local release gate still passes.

@@ -6,34 +6,35 @@ Complete
 
 ## Goal
 
-Harden one concrete pre-publish durability risk without changing public API or
-the v1 storage contract.
+Close the Windows side of the pre-publish directory-sync durability hardening
+without changing public API or the v1 storage contract.
 
 ## Entry Condition
 
-- Phase 9 CI and publishing workflow is complete.
-- User asked for targeted hardening before publishing.
+- Phase 10 synced parent directories after atomic file publish on Unix.
+- User asked to handle non-Unix, with Windows as the concrete supported target.
 
 ## Scope
 
-- Atomic file publish paths for manifest, table, blob, and recovery report
-  writes.
-- Focused tests for the new durability helper.
+- Windows implementation of parent-directory sync after rename.
+- Durability documentation for Unix, Windows, and other targets.
 - Local release gate after the hardening change.
+- Best available Windows target validation in this environment.
 
 ## Out Of Scope
 
 - Changing the table, manifest, WAL, blob, or recovery file formats.
 - Adding new public API.
 - Publishing the crate.
-- Broad performance tuning.
+- Platform-specific directory sync for targets other than Unix and Windows.
 
 ## Acceptance Gate
 
-- Atomic publish paths sync the new file contents before rename and sync the
-  parent directory after rename on Unix platforms.
+- Atomic publish paths sync the parent directory after rename on Unix and
+  Windows.
+- Other targets are explicitly documented as best-effort because no portable
+  `std` directory sync is available.
 - Existing persistent behavior remains unchanged.
-- Focused helper coverage passes.
 - Local verification passes for `cargo fmt --check`,
   `cargo clippy --all-targets --all-features -- -D warnings`,
   `cargo test --all-targets --all-features`, examples, package list, package
@@ -42,21 +43,21 @@ the v1 storage contract.
 ## Active Task Slice
 
 ```text
-task045 [x] goal:atomic file publish paths sync parent directory after rename | scope:src/{durability,manifest,table,blob,recovery}.rs,docs/durability.md,.phrase | verify:focused helper test + full release gate
+task046 [x] goal:Windows parent-directory sync is implemented and documented | scope:src/durability.rs,docs/durability.md,.phrase | verify:local release gate + Windows target check
 ```
 
 ## Known Blockers
 
 - GitHub Actions cannot be executed locally in this environment; remote CI must
   run after push.
-- Parent-directory fsync is Unix-specific here; non-Unix builds keep the
-  previous behavior because portable directory syncing is not available through
-  `std`.
+- The Windows branch was compile-checked with `x86_64-pc-windows-gnu`, but not
+  executed on a real Windows filesystem in this environment.
+- Targets other than Unix and Windows remain best-effort for parent-directory
+  sync.
 
 ## Evidence To Record
 
-- Audit result for atomic publish paths.
-- Focused helper test result.
+- Windows target validation result.
 - Full local release gate result.
 
 ## Next Recommendation

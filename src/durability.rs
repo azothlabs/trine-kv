@@ -24,10 +24,32 @@ fn sync_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn sync_dir(path: &Path) -> Result<()> {
+    use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+
+    // Windows requires backup semantics to open a directory handle. Once the
+    // handle is open, `sync_all` asks the platform to flush that directory
+    // metadata, which is the directory-entry half of atomic file publish.
+    OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?
+        .sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn sync_dir(_path: &Path) -> Result<()> {
     // Rust's standard library does not expose a portable directory sync for all
-    // platforms. Non-Unix targets keep the previous best-effort behavior.
+    // platforms. Targets without a concrete implementation keep the previous
+    // best-effort behavior.
     Ok(())
 }
 

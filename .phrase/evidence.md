@@ -1989,3 +1989,58 @@ Record only evidence that can change planning or durable decisions.
 
 - Configure the publish secret/environment, run the `Publish` workflow with
   `mode=dry-run`, review CI, then decide whether to publish.
+
+## 2026-05-26: Windows Directory Sync Hardening Passed
+
+### Observation
+
+- Phase 10 left non-Unix parent-directory sync as best-effort because Rust
+  `std` has no single portable directory sync API.
+- Windows can still be handled concretely by opening the parent directory with
+  backup semantics and calling `sync_all` on that handle.
+- `durability::sync_parent_dir_after_rename` now has three platform branches:
+  Unix opens and syncs the parent directory, Windows opens the directory with
+  `FILE_FLAG_BACKUP_SEMANTICS` and share flags before `sync_all`, and other
+  targets remain best-effort.
+- `docs/durability.md` now states that Unix and Windows sync the parent
+  directory after rename, while other targets keep the conservative best-effort
+  path.
+
+### Interpretation
+
+- Task046 is complete.
+- Phase 11 satisfies its acceptance gate.
+- The supported desktop/server targets now cover parent-directory sync after
+  atomic file publish without changing public API or v1 file formats.
+
+### Verification
+
+- `rustup target add x86_64-pc-windows-gnu`
+- `cargo check --target x86_64-pc-windows-gnu`
+- `cargo test sync_parent_dir_after_rename_accepts_published_file`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo run --example quickstart`
+- `cargo run --example user_store`
+- `cargo run --example event_index`
+- `cargo package --allow-dirty --list`
+- `cargo package --allow-dirty --locked`
+- `cargo publish --dry-run --allow-dirty --locked`
+- `git diff --check`
+- forbidden terminology scan over workflows, source, tests, phase notes, Cargo
+  metadata, benches, docs, README, examples, and changelog
+
+### Remaining Blockers
+
+- GitHub Actions was not executed locally; the remote workflow must run after
+  push.
+- The Windows branch was compile-checked but not run on a real Windows
+  filesystem in this environment.
+- Targets other than Unix and Windows remain best-effort for parent-directory
+  sync.
+
+### Recommended Next Action
+
+- Push and let CI run, then use the `Publish` workflow with `mode=dry-run`
+  before any real publish.
