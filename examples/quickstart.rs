@@ -1,6 +1,5 @@
 use trine_kv::{
-    BucketOptions, Db, DbOptions, DurabilityMode, KeyRange, PrefixExtractor, TransactionOptions,
-    WriteBatch, WriteOptions,
+    Db, DbOptions, DurabilityMode, KeyRange, TransactionOptions, WriteBatch, WriteOptions,
 };
 
 fn main() -> trine_kv::Result<()> {
@@ -10,7 +9,7 @@ fn main() -> trine_kv::Result<()> {
     }
 
     let db = Db::open(DbOptions::persistent(&path).with_durability(DurabilityMode::Flush))?;
-    let users = db.bucket_with_options("users", user_bucket_options())?;
+    let users = db.bucket("users")?;
 
     users.put_with_options(b"user:001", b"Ada", WriteOptions::sync_all())?;
 
@@ -51,7 +50,7 @@ fn main() -> trine_kv::Result<()> {
     drop(db);
 
     let reopened = Db::open(DbOptions::persistent(&path))?;
-    let users = reopened.bucket_with_options("users", user_bucket_options())?;
+    let users = reopened.bucket("users")?;
     assert_eq!(users.get(b"user:004")?, Some(b"Barbara".to_vec()));
 
     let stats = reopened.stats();
@@ -62,10 +61,6 @@ fn main() -> trine_kv::Result<()> {
     drop(reopened);
     std::fs::remove_dir_all(path)?;
     Ok(())
-}
-
-fn user_bucket_options() -> BucketOptions {
-    BucketOptions::default().with_prefix_extractor(PrefixExtractor::Separator(b':'))
 }
 
 fn display_key(bytes: &[u8]) -> String {

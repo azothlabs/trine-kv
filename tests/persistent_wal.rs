@@ -1443,15 +1443,17 @@ fn persistent_bucket_reader_keeps_memtable_source_after_flush() {
         let reader = bucket.reader(&snapshot).expect("reader opens");
         db.flush().expect("flush after reader creation");
 
-        assert_eq!(
-            reader.get(b"a").expect("reader sees pre-flush memtable"),
-            Some(b"a1".to_vec())
-        );
         let value = reader
-            .get_value(b"a")
+            .get(b"a")
             .expect("reader value lookup")
             .expect("value is visible");
-        assert_eq!(value.as_ref(), b"a1");
+        assert_eq!(value.as_bytes(), b"a1");
+        assert_eq!(
+            reader
+                .get_owned(b"a")
+                .expect("reader sees pre-flush memtable"),
+            Some(b"a1".to_vec())
+        );
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");

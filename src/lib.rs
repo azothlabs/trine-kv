@@ -1,8 +1,9 @@
 //! Trine KV is an embedded LSM MVCC key-value database.
 //!
-//! The v1 API exposes in-memory and persistent databases, named buckets,
-//! atomic write batches, snapshots, optimistic transactions, range/prefix
-//! iteration, WAL recovery, `SSTable` flush/compaction, and live stats.
+//! The v1 API exposes a built-in default bucket for direct `Db` reads and
+//! writes, optional named buckets, atomic write batches, snapshots, optimistic
+//! transactions, range/prefix iteration, WAL recovery, `SSTable`
+//! flush/compaction, and live stats.
 
 #![allow(clippy::missing_errors_doc, clippy::module_name_repetitions)]
 

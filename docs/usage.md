@@ -243,6 +243,27 @@ for item in snapshot.prefix(&users, b"user:")? {
 Keep snapshots short-lived when possible. Long-lived snapshots can delay
 cleanup of old versions and blob files.
 
+## Repeated Point Reads
+
+You do not need a reader for a normal point read. Use `db.get(key)` for the
+default bucket or `bucket.get(key)` for a named bucket.
+
+Use a `BucketReader` only when a read-heavy workload performs many point reads
+under one snapshot. `reader.get` returns a `PointValue`, which can be inspected
+through `as_bytes()` without forcing an owned `Vec<u8>` for inline table values:
+
+```rust
+let snapshot = db.snapshot();
+let reader = users.reader(&snapshot)?;
+
+if let Some(value) = reader.get(b"user:001")? {
+    assert_eq!(value.as_bytes(), b"Ada");
+}
+```
+
+Use `reader.get_owned(key)` when the caller needs the same owned-value shape as
+the regular `get` API.
+
 ## Optimistic Transactions
 
 Transactions read at a fixed sequence and validate their read set at commit:

@@ -31,10 +31,11 @@ shared SSTable block access, and avoidable overlapping-L0 read amplification.
 
 ## Acceptance Gate
 
-- `BucketReader::get_value` returns a `PointValue` with `AsRef<[u8]>`.
+- `BucketReader::get` returns a `PointValue` with `as_bytes`.
+- `BucketReader::get_owned` keeps the explicit owned-value path.
 - Existing `get` APIs keep returning owned `Vec<u8>` for compatibility.
 - A reader remains correct if memtable data is flushed after reader creation.
-- The benchmark adapter uses `get_value`.
+- The benchmark adapter uses the reader value-handle path.
 - Block-cache hit/miss accounting no longer writes one global atomic counter on
   every hit.
 - With background workers disabled, foreground `flush()` compacts overlapping

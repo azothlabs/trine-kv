@@ -683,8 +683,8 @@ impl Db {
         ))
     }
 
-    /// Returns an existing named bucket or creates it with default bucket
-    /// options.
+    /// Returns an existing named bucket or creates it with default
+    /// `BucketOptions`.
     ///
     /// The built-in default bucket is reserved for direct `Db` helpers and
     /// `Db::default_bucket`; using `"default"` as a named bucket returns an

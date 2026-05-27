@@ -60,8 +60,10 @@ pub struct Bucket {
 
 /// Point-read handle bound to one bucket and one snapshot.
 ///
-/// The handle pins the current memtable and table sources once, so repeated
-/// `get` calls do not reacquire the bucket's version lock.
+/// Create one with `Bucket::reader` when a workload performs many point reads
+/// under the same snapshot. The reader keeps a stable set of memtable and table
+/// sources, so repeated `get` calls avoid reacquiring the bucket's version
+/// lock.
 #[derive(Debug)]
 pub struct BucketReader<'snapshot> {
     db: Db,
@@ -120,6 +122,9 @@ impl Bucket {
     }
 
     /// Creates a point-read handle for repeated reads under `snapshot`.
+    ///
+    /// Use `BucketReader::get` when the caller can inspect bytes through
+    /// `PointValue::as_bytes` and does not need an owned `Vec<u8>`.
     pub fn reader<'snapshot>(
         &self,
         snapshot: &'snapshot Snapshot,
@@ -372,15 +377,11 @@ impl BucketReader<'_> {
         }
     }
 
-    /// Reads `key` using the version pinned when this reader was created.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Value>> {
-        self.get_value(key)?
-            .map(|value| Ok(value.into_value()))
-            .transpose()
-    }
-
-    /// Reads `key` without copying inline table values out of cached data blocks.
-    pub fn get_value(&self, key: &[u8]) -> Result<Option<PointValue>> {
+    /// Reads `key` using the sources pinned when this reader was created.
+    ///
+    /// This returns a `PointValue` so inline table values can be inspected
+    /// without first copying them into an owned `Vec<u8>`.
+    pub fn get(&self, key: &[u8]) -> Result<Option<PointValue>> {
         self.db.get_value_at_state_snapshot_with_pin_state(
             &self.state,
             &self.read_snapshot,
@@ -388,5 +389,15 @@ impl BucketReader<'_> {
             self.read_sequence,
             true,
         )
+    }
+
+    /// Reads `key` and returns an owned value.
+    ///
+    /// Use this when the caller needs the same owned-value shape as `Db::get`
+    /// or `Bucket::get`.
+    pub fn get_owned(&self, key: &[u8]) -> Result<Option<Value>> {
+        self.get(key)?
+            .map(|value| Ok(value.into_value()))
+            .transpose()
     }
 }

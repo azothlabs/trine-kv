@@ -4114,10 +4114,10 @@ Record only evidence that can change planning or durable decisions.
 
 - Stable threaded reads with background workers disabled still showed a
   4-thread to 32-thread plateau after smaller hot-path fixes.
-- `BucketReader::get_value` now returns `PointValue`, so inline SSTable values
+- `BucketReader` now has a value-handle point-read path, so inline SSTable values
   can be read from decoded block bytes without allocating an owned `Vec<u8>`
   for the benchmark result.
-- The Azoth benchmark adapter now uses `BucketReader::get_value`.
+- The Azoth benchmark adapter now uses the reader value-handle path.
 - Benchmark after the value-handle path: random reads were about 3989ms,
   3416ms, 4203ms, and 4191ms for 4, 8, 16, and 32 threads.
 - An experiment that pinned decoded L0 data blocks with per-block `OnceLock`
@@ -4282,3 +4282,83 @@ Record only evidence that can change planning or durable decisions.
 
 - Commit the point-read source fix and use remote CI as the external release
   signal.
+
+## 2026-05-27: Public API Copy Review
+
+### Observation
+
+- README and `quickstart` still showed `bucket_with_options` in the common
+  named-bucket path, even though `db.bucket("users")?` is the intended default.
+- `bucket_with_options` remains useful for prefix filters and storage tuning,
+  so it belongs in the custom bucket-options section rather than the first API
+  example.
+- Public docs for `BucketReader` and `PointValue` needed to explain the new
+  repeated point-read path without promising owned-value allocation avoidance
+  in cases where blob or owned values are returned.
+
+### Interpretation
+
+- The first public path should minimize caller setup: direct `Db` operations
+  for the default bucket, then `db.bucket(name)` for named buckets.
+- Advanced bucket configuration should stay documented, but not as the normal
+  quickstart path.
+
+### Verification
+
+- `cargo run --example quickstart`
+- `cargo fmt --all --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo test --doc`
+- `git diff --check`
+- forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, `README.md`, `CHANGELOG.md`, and `Cargo.toml`
+
+### Remaining Blockers
+
+- None for this public-copy pass.
+
+### Recommended Next Action
+
+- Commit the public-copy polish with the point-read documentation alignment.
+
+## 2026-05-27: Reader Get API Shape
+
+### Observation
+
+- User feedback showed that `get_value` made the hot point-read path feel like
+  a special long-form API, while ordinary point reads should remain `db.get`
+  and `bucket.get`.
+- `BucketReader` is already an explicit repeated-read handle, so its shortest
+  `get` method can return `PointValue` without complicating the common `Db`
+  and `Bucket` APIs.
+
+### Interpretation
+
+- Keep `Db::get` and `Bucket::get` as the one-call owned-value path.
+- Make `BucketReader::get` return `PointValue`, and keep the owned conversion
+  explicit through `BucketReader::get_owned`.
+- Usage docs should introduce `BucketReader` only under repeated point reads,
+  not as the normal way to read one key.
+
+### Verification
+
+- `cargo fmt --all --check`
+- `cargo test --test persistent_wal persistent_bucket_reader_keeps_memtable_source_after_flush --all-features`
+- `cargo run --example quickstart`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo test --doc`
+- `git diff --check`
+- forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, `README.md`, `CHANGELOG.md`, and `Cargo.toml`
+- public `get_value` scan over `src`, `tests`, `benches`, `examples`, `docs`,
+  and `README.md`
+
+### Remaining Blockers
+
+- None for this API/docs rename.
+
+### Recommended Next Action
+
+- Commit the API/docs rename with the public-copy polish.

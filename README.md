@@ -24,6 +24,8 @@ Release packaging notes live in [docs/release.md](docs/release.md).
   separation or independent tuning.
 - Atomic write batches across the default bucket and named buckets.
 - MVCC snapshots that keep old reads stable while newer writes commit.
+- Snapshot-bound point readers that can avoid copying inline table values when
+  callers can work with borrowed bytes.
 - Optimistic transactions with point and range conflict checks.
 - Ordered range scans and prefix scans.
 - Value-lazy range and prefix scans for large-value workloads that need keys
@@ -63,9 +65,7 @@ trine-kv = { path = "../trine-kv" }
 ## Common API Example
 
 ```rust
-use trine_kv::{
-    BucketOptions, Db, KeyRange, PrefixExtractor, TransactionOptions, WriteBatch, WriteOptions,
-};
+use trine_kv::{Db, KeyRange, TransactionOptions, WriteBatch, WriteOptions};
 
 fn main() -> trine_kv::Result<()> {
     let db = Db::open_memory()?;
@@ -74,11 +74,8 @@ fn main() -> trine_kv::Result<()> {
     db.put(b"settings:theme", b"dark")?;
     assert_eq!(db.get(b"settings:theme")?, Some(b"dark".to_vec()));
 
-    // Named buckets are created on demand and can carry their own options.
-    let users = db.bucket_with_options(
-        "users",
-        BucketOptions::default().with_prefix_extractor(PrefixExtractor::Separator(b':')),
-    )?;
+    // Named buckets are created on demand when you need logical separation.
+    let users = db.bucket("users")?;
     users.put(b"user:001", b"Ada")?;
 
     // Snapshots keep a stable read sequence while newer writes continue.
