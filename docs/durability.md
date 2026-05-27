@@ -162,6 +162,10 @@ Automatic compaction may run after flush when L0 file pressure exceeds
 `DbOptions::max_l0_files`. Automatic L0 compaction can choose a local
 overlapping key span and leave unrelated L0 files for later passes. The same
 recovery and manifest-publish rules apply to manual and automatic compaction.
+`Db::flush()` is a foreground barrier for writes committed before the call:
+those writes must be published out of active and immutable memtables before the
+method returns `Ok(())`. `Db::compact_range()` waits for overlapping active
+compaction reservations instead of treating a busy maintenance guard as success.
 
 When immutable memtables or L0 files exceed configured limits, writes apply
 pressure handling before taking the writer coordinator. They may wait for the

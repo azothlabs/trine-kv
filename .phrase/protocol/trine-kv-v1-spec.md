@@ -154,6 +154,14 @@ API rules:
   default `BucketOptions`;
 - `Db::bucket_with_options(name, options)` returns an existing named bucket
   only when options match, or creates one with those fixed options;
+- `Db::flush()` is a public barrier for persistent writable databases: when it
+  returns `Ok(())`, data committed before the call has left active and
+  immutable memtables and has been published as SSTables. Concurrent writes
+  committed after the call boundary may remain in the active memtable.
+- `Db::compact_range(range)` waits and retries if an overlapping compaction
+  reservation is already active. It may return after one successful compaction
+  pass or when no compaction plan exists, but it must not report success solely
+  because a maintenance guard was busy.
 - named buckets are optional and used for logical isolation or different
   per-bucket options;
 - Iterators keep the read VersionSet alive.
@@ -314,6 +322,10 @@ Background work:
 - track flush requests, compaction requests, in-flight flushes, in-flight
   compaction key ranges, progress notifications, and the last maintenance
   error;
+- public `flush` waits until pending flush requests and active flushes that can
+  contain its captured sequence boundary are idle before reporting success;
+- public `compact_range` waits for overlapping active compaction reservations
+  instead of treating a busy guard as a successful no-op;
 - writes apply pressure handling before taking the writer coordinator when
   immutable memtables or L0 files exceed configured limits; pressure handling
   may wait for a background worker or help with a foreground maintenance pass;

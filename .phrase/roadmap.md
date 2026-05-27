@@ -873,3 +873,25 @@ benchmark-gated key encoding as the next release risks.
   low-priority data churn.
 - Shared-prefix key benchmark evidence exists before any key-encoding change.
 - Full local Rust verification passes.
+
+### Phase 43: Public Maintenance Barrier Semantics
+
+**Status**: Complete
+
+**Goal**: Make public `flush()` and `compact_range()` preserve their foreground
+API contracts when background maintenance already owns the relevant guard.
+
+**Entry Condition**: Phase 42 complete and user identifies that public
+maintenance APIs can return success after non-blocking helper conflicts.
+
+**Acceptance Gate**:
+
+- Public `flush()` captures the call boundary and returns only after writes
+  committed before that boundary are out of active and immutable memtables.
+- Background workers and write-pressure handling keep non-blocking best-effort
+  helpers.
+- Public `compact_range()` waits and retries when overlapping compaction
+  reservations are active instead of silently succeeding.
+- Focused tests cover flush guard contention, default background flush publish,
+  and compaction reservation contention.
+- Full local Rust verification passes.

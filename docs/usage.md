@@ -370,12 +370,20 @@ floor:
 db.flush()?;
 ```
 
+For persistent writable databases, `flush()` is a barrier for writes committed
+before the call. It returns after those writes have left active and immutable
+memtables and have been published as SSTables. Writes committed concurrently
+after the call starts may remain in memory for a later flush.
+
 Manual compaction rewrites overlapping tables while preserving snapshot
 visibility:
 
 ```rust
 db.compact_range(KeyRange::all())?;
 ```
+
+If another compaction already owns an overlapping key range, `compact_range()`
+waits and retries instead of reporting success while the guard is busy.
 
 Persistent writable databases start one background maintenance worker by
 default. Set `DbOptions::background_worker_count = 0` when a test or embedding

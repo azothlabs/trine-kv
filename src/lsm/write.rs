@@ -108,6 +108,20 @@ impl LsmTree {
             .map(|immutable_memtables| immutable_memtables != 0)
     }
 
+    pub(crate) fn has_immutable_memtables_at_or_below(
+        &self,
+        max_sequence: Sequence,
+    ) -> Result<bool> {
+        self.immutable_memtables
+            .read()
+            .map_err(|_| lock_poisoned("immutable memtable queue"))
+            .map(|immutable_memtables| {
+                immutable_memtables
+                    .iter()
+                    .any(|immutable| immutable.freeze_sequence <= max_sequence)
+            })
+    }
+
     pub(crate) fn freeze_active_memtable(&self, freeze_sequence: Sequence) -> Result<bool> {
         // Lock order is active pointer -> active tombstones -> immutable queue.
         // The new active memtable is installed only after the frozen point

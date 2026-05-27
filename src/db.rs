@@ -89,6 +89,13 @@ struct NamedCompactionOutput {
     output: LsmCompactionOutput,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaintenanceRunOutcome {
+    Ran,
+    NoWork,
+    Busy,
+}
+
 struct PendingCompactionOutputs {
     outputs: Vec<NamedCompactionOutput>,
     written_table_ids: Vec<table::TableId>,
@@ -235,6 +242,7 @@ impl MaintenanceCoordinator {
         };
         state.flush_requests = 0;
         state.compaction_requests = 0;
+        self.wake.notify_all();
         Some(request)
     }
 
@@ -268,6 +276,42 @@ impl MaintenanceCoordinator {
             };
             state = next_state;
         }
+    }
+
+    fn wait_until_flush_idle(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        while (state.flush_requests != 0 || state.active_flushes != 0)
+            && !state.shutdown
+            && state.last_error.is_none()
+        {
+            let Ok(next_state) = self.wake.wait(state) else {
+                return;
+            };
+            state = next_state;
+        }
+    }
+
+    fn wait_until_compaction_idle(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        while (state.compaction_requests != 0 || !state.active_compactions.is_empty())
+            && !state.shutdown
+            && state.last_error.is_none()
+        {
+            let Ok(next_state) = self.wake.wait(state) else {
+                return;
+            };
+            state = next_state;
+        }
+    }
+
+    fn has_pending_compaction(&self) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            state.compaction_requests != 0 || !state.active_compactions.is_empty()
+        })
     }
 
     fn try_start_flush(self: &Arc<Self>) -> Option<MaintenanceFlushGuard> {
@@ -1003,13 +1047,26 @@ impl Db {
             return Ok(());
         };
         let db_path = path.clone();
-        let should_compact = self.run_flush_once(&db_path, true)?;
+        let target_sequence = self.freeze_public_flush_target()?;
+        let mut should_compact = false;
 
-        if should_compact {
-            self.run_compaction_once(&db_path, &KeyRange::all(), true)?;
+        while self.has_immutable_memtables_at_or_below(target_sequence)? {
+            self.take_background_maintenance_error()?;
+            if self.run_flush_once(&db_path, false)? {
+                should_compact |= self.l0_pressure_exceeded()?;
+                continue;
+            }
+
+            self.request_background_flush();
+            self.inner.maintenance.wait_until_flush_idle();
+        }
+
+        if should_compact || self.l0_pressure_exceeded()? {
+            self.run_compaction_barrier(&db_path, &KeyRange::all(), true)?;
         }
         self.cleanup_pending_obsolete_table_files(&db_path)?;
         self.cleanup_pending_obsolete_blob_files(&db_path)?;
+        self.take_background_maintenance_error()?;
 
         Ok(())
     }
@@ -1033,7 +1090,7 @@ impl Db {
             return Ok(());
         };
         let db_path = path.clone();
-        self.run_compaction_once(&db_path, &range, false)?;
+        self.run_compaction_barrier(&db_path, &range, false)?;
 
         Ok(())
     }
@@ -1591,6 +1648,21 @@ impl Db {
         Ok(frozen_count != 0)
     }
 
+    fn freeze_public_flush_target(&self) -> Result<Sequence> {
+        // Capture the public flush boundary while the writer coordinator is
+        // held. Later concurrent commits may fill the new active memtable, but
+        // `flush()` only waits for data committed before this sequence.
+        let _writer = self
+            .inner
+            .writer
+            .lock()
+            .map_err(|_| lock_poisoned("writer coordinator"))?;
+        let target_sequence = self.last_committed_sequence();
+        self.freeze_all_active_memtables(target_sequence)?;
+
+        Ok(target_sequence)
+    }
+
     fn has_immutable_memtables(&self) -> Result<bool> {
         let buckets = self
             .inner
@@ -1600,6 +1672,22 @@ impl Db {
 
         for state in buckets.values() {
             if state.has_immutable_memtables()? {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn has_immutable_memtables_at_or_below(&self, max_sequence: Sequence) -> Result<bool> {
+        let buckets = self
+            .inner
+            .buckets
+            .read()
+            .map_err(|_| lock_poisoned("bucket registry"))?;
+
+        for state in buckets.values() {
+            if state.has_immutable_memtables_at_or_below(max_sequence)? {
                 return Ok(true);
             }
         }
@@ -1755,17 +1843,39 @@ impl Db {
         Ok(inputs)
     }
 
+    fn run_compaction_barrier(
+        &self,
+        db_path: &Path,
+        range: &KeyRange,
+        local_l0_compaction: bool,
+    ) -> Result<()> {
+        loop {
+            self.take_background_maintenance_error()?;
+            match self.run_compaction_once(db_path, range, local_l0_compaction)? {
+                MaintenanceRunOutcome::Ran | MaintenanceRunOutcome::NoWork => return Ok(()),
+                MaintenanceRunOutcome::Busy => {
+                    if !self.inner.maintenance.has_pending_compaction() {
+                        return Ok(());
+                    }
+                    self.request_background_compaction();
+                    self.inner.maintenance.wait_until_compaction_idle();
+                    self.take_background_maintenance_error()?;
+                }
+            }
+        }
+    }
+
     fn run_compaction_once(
         &self,
         db_path: &Path,
         range: &KeyRange,
         local_l0_compaction: bool,
-    ) -> Result<bool> {
+    ) -> Result<MaintenanceRunOutcome> {
         let oldest_active_snapshot = self.oldest_active_snapshot_sequence();
         let compaction_inputs =
             self.collect_compaction_inputs(range, oldest_active_snapshot, local_l0_compaction)?;
         if compaction_inputs.is_empty() {
-            return Ok(false);
+            return Ok(MaintenanceRunOutcome::NoWork);
         }
 
         let reservations = compaction_inputs
@@ -1777,14 +1887,14 @@ impl Db {
             .collect::<Vec<_>>();
         let Some(compaction_guard) = self.inner.maintenance.reserve_compactions(reservations)
         else {
-            return Ok(false);
+            return Ok(MaintenanceRunOutcome::Busy);
         };
         let compaction_inputs = compaction_inputs
             .into_iter()
             .filter(|input| compaction_guard.contains(&input.bucket, &input.input.compaction_range))
             .collect::<Vec<_>>();
         if compaction_inputs.is_empty() {
-            return Ok(false);
+            return Ok(MaintenanceRunOutcome::Busy);
         }
 
         let PendingCompactionOutputs {
@@ -1832,7 +1942,7 @@ impl Db {
         if let Err(error) = self.validate_compacted_tables(&written_tables) {
             let _ = remove_storage_files(db_path, &written_table_ids);
             if is_level_layout_compaction_error(&error) {
-                return Ok(false);
+                return Ok(MaintenanceRunOutcome::NoWork);
             }
             return Err(error);
         }
@@ -1854,7 +1964,7 @@ impl Db {
             self.run_blob_gc_once_locked(db_path)?;
         }
 
-        Ok(true)
+        Ok(MaintenanceRunOutcome::Ran)
     }
 
     fn build_compaction_outputs(
@@ -2948,13 +3058,18 @@ fn remove_storage_files(db_path: &Path, table_ids: &[table::TableId]) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        fs,
+        sync::{Arc, mpsc},
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
 
     use super::{
-        CompactionReservation, Error, MaintenanceCoordinator, compaction_reservations_conflict,
+        CompactionReservation, Db, Error, MaintenanceCoordinator, compaction_reservations_conflict,
         record_maintenance_success,
     };
-    use crate::types::KeyRange;
+    use crate::{bucket::DEFAULT_BUCKET_NAME, options::DbOptions, types::KeyRange};
 
     #[test]
     fn maintenance_success_does_not_clear_unreported_error() {
@@ -3022,10 +3137,131 @@ mod tests {
         assert!(third.contains("default", &KeyRange::half_open(b"b", b"d")));
     }
 
+    #[test]
+    fn flush_waits_for_existing_flush_guard() {
+        let path = temp_db_path("flush-waits-for-existing-guard");
+        let mut options = DbOptions::persistent(&path);
+        options.background_worker_count = 0;
+        let db = Db::open(options).expect("open db");
+        db.put(b"key", b"value").expect("write");
+
+        let flush_guard = db
+            .inner
+            .maintenance
+            .try_start_flush()
+            .expect("test holds flush guard");
+        let thread_db = db.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            started_tx.send(()).expect("report flush thread start");
+            done_tx.send(thread_db.flush()).expect("send flush result");
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("flush thread starts");
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "public flush must wait while another flush guard is active"
+        );
+
+        drop(flush_guard);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("flush finishes after guard release")
+            .expect("flush succeeds");
+        handle.join().expect("flush thread joins");
+
+        let stats = db.stats();
+        assert_eq!(stats.memtable_bytes, 0);
+        assert_eq!(stats.immutable_memtables, 0);
+        assert!(stats.total_tables > 0);
+
+        drop(db);
+        fs::remove_dir_all(path).expect("cleanup test db");
+    }
+
+    #[test]
+    fn flush_returns_after_default_background_flush_publishes_tables() {
+        let path = temp_db_path("flush-default-background-publishes");
+        let mut options = DbOptions::persistent(&path);
+        options.write_buffer_bytes = 128;
+        let db = Db::open(options).expect("open db");
+
+        for index in 0..128_u32 {
+            let key = format!("key-{index:04}");
+            db.put(key.as_bytes(), [b'x'; 96]).expect("write");
+        }
+
+        db.flush().expect("public flush");
+        let stats = db.stats();
+        assert_eq!(stats.memtable_bytes, 0);
+        assert_eq!(stats.immutable_memtables, 0);
+        assert!(stats.total_tables > 0);
+
+        drop(db);
+        fs::remove_dir_all(path).expect("cleanup test db");
+    }
+
+    #[test]
+    fn compact_range_is_not_silent_best_effort() {
+        let path = temp_db_path("compact-range-waits-for-guard");
+        let mut options = DbOptions::persistent(&path);
+        options.background_worker_count = 0;
+        let db = Db::open(options).expect("open db");
+        db.put(b"a1", b"one").expect("write first");
+        db.flush().expect("flush first table");
+        db.put(b"a2", b"two").expect("write second");
+        db.flush().expect("flush second table");
+
+        let compaction_guard = db
+            .inner
+            .maintenance
+            .reserve_compactions(vec![reservation(DEFAULT_BUCKET_NAME, KeyRange::all())])
+            .expect("test holds compaction reservation");
+        let thread_db = db.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            started_tx.send(()).expect("report compaction thread start");
+            done_tx
+                .send(thread_db.compact_range(KeyRange::all()))
+                .expect("send compaction result");
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("compaction thread starts");
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "public compact_range must wait while its range is reserved"
+        );
+
+        drop(compaction_guard);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("compaction finishes after guard release")
+            .expect("compaction succeeds");
+        handle.join().expect("compaction thread joins");
+        assert!(db.stats().compaction_runs > 0);
+
+        drop(db);
+        fs::remove_dir_all(path).expect("cleanup test db");
+    }
+
     fn reservation(bucket: &str, range: KeyRange) -> CompactionReservation {
         CompactionReservation {
             bucket: bucket.to_owned(),
             range,
         }
+    }
+
+    fn temp_db_path(name: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after UNIX epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("trine-kv-{name}-{}-{nonce}", std::process::id()))
     }
 }

@@ -4064,3 +4064,46 @@ Record only evidence that can change planning or durable decisions.
 - Commit Phase 42, then use remote CI as the external release signal. If
   shared-prefix workloads remain important, start a focused data-block key
   encoding phase with explicit compatibility tests.
+
+## 2026-05-27: Public Maintenance Barrier Semantics
+
+### Observation
+
+- `Db::flush()` reused the same non-blocking guard helper as background
+  maintenance. If another flush already held the guard, public `flush()` could
+  return success without publishing the caller's already committed data out of
+  memtables.
+- `compact_range()` had the same shape for compaction reservation conflicts:
+  a busy guard could look like a successful no-op to the public API.
+
+### Interpretation
+
+- Background workers and write-pressure paths should keep best-effort helpers,
+  but foreground APIs need barrier behavior.
+- The flush barrier needs a captured sequence boundary so concurrent writers do
+  not make `flush()` chase new writes indefinitely.
+- Public compaction should wait/retry on active overlapping reservations while
+  preserving the existing one-pass/no-plan return behavior.
+
+### Verification
+
+- `cargo test --lib flush_waits_for_existing_flush_guard --all-features`
+- `cargo test --lib flush_returns_after_default_background_flush_publishes_tables --all-features`
+- `cargo test --lib compact_range_is_not_silent_best_effort --all-features`
+- `cargo test --test model_reference randomized_operations_match_mvcc_reference_across_reopen --all-features`
+- `cargo test --test persistent_wal persistent_flush_auto_compacts_when_l0_pressure_exceeds_limit --all-features`
+- `cargo test --test persistent_wal persistent_stats_report_tables_blobs_and_compactions --all-features`
+- `cargo test --all-targets --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --all --check`
+- `git diff --check`
+- forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, `README.md`, `CHANGELOG.md`, and `Cargo.toml`
+
+### Remaining Blockers
+
+- Remote CI still has to run after push.
+
+### Recommended Next Action
+
+- Commit Phase 43, then use remote CI as the external release signal.
