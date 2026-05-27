@@ -5,8 +5,12 @@ Date: 2026-05-25
 ## 1. Purpose
 
 Trine KV is a clean embedded key-value database implemented in Rust. It uses an
-LSM tree as its primary data structure and supports both volatile in-memory mode
-and durable local-file mode.
+LSM tree as its primary data structure and supports volatile in-memory mode plus
+durable persistent backends.
+
+Trine is async-first at the database API and storage boundary. Blocking native
+APIs are adapters over the primary async engine, not the source of engine
+semantics.
 
 The v1 target is a complete database-shaped engine, not a temporary toy. The
 implementation may be sliced, but each slice must preserve the final v1 model:
@@ -24,6 +28,8 @@ implementation may be sliced, but each slice must preserve the final v1 model:
 - search-policy aware immutable indexes
 - configurable durability
 - in-memory mode using the same logical engine
+- async-first public API over portable storage backends
+- future WASM-capable storage and runtime boundaries
 
 ## 2. Source Of Truth
 
@@ -39,6 +45,17 @@ Rules:
 - internal database/LSM module boundaries are governed by
   `.phrase/protocol/lsm-core-boundary-spec.md`; that boundary spec does not
   change the public API or storage format by itself.
+- the next production write-path target is governed by
+  `.phrase/protocol/lock-free-foreground-write-path.md`; that protocol defines
+  foreground no-global-lock write semantics, WAL sharding, delta publication,
+  visible sequence advancement, and recovery requirements.
+- async-first API, portable storage backend, durability capability, runtime,
+  and WASM-readiness rules are governed by
+  `.phrase/protocol/async-first-portable-storage-and-wasm.md`.
+- implementation order between the async-first storage protocol and the
+  foreground write-path protocol must remain staged: API/storage/cancellation
+  boundaries first, then commit tracker and visible sequence, then WAL shards
+  and key-sharded delta publication.
 
 ## 3. Vocabulary
 
@@ -58,23 +75,30 @@ Rules:
   published SSTables.
 - **Compaction**: merge of sorted tables into new sorted tables while preserving
   MVCC visibility.
+- **Storage backend**: async capability-based implementation used by the engine
+  for WAL, SSTable, blob, manifest, lease, report, and temporary objects.
+- **Blocking adapter**: native synchronous wrapper over the primary async API.
+- **Cursor**: fallible async range or prefix traversal handle.
 
 ## 4. Storage Modes
 
-Trine supports the same public API in both modes.
+Trine supports the same primary async public API in every mode.
 
 ### 4.1 Persistent Mode
 
-Persistent mode stores WALs, SSTables, manifests, value files, locks, and repair
-reports under a local directory.
+Persistent mode stores WALs, SSTables, manifests, value files, leases, and
+repair reports through a storage backend. The native-file backend stores these
+objects under a local directory.
 
 Rules:
 
-- only one process may open a database path for writing;
-- startup must acquire an exclusive lock unless opened read-only;
+- only one writer may open the same persistent database scope for writing;
+- startup must acquire an exclusive writer lease unless opened read-only;
 - all files include format version and checksum coverage;
 - manifest publish is atomic;
 - crash recovery must replay committed WAL records after the manifest snapshot.
+- the engine core must not call platform filesystem APIs directly;
+- backend capability checks must reject unsupported durability or lease modes.
 
 ### 4.2 In-Memory Mode
 
@@ -93,34 +117,57 @@ Rules:
 In-memory mode is not a separate toy engine. It is the same engine over a
 volatile storage backend.
 
+### 4.3 Portable Storage And WASM Readiness
+
+The storage model is capability-based. Local files, memory, WASI storage, and
+browser persistence are backend families behind the same database-level
+operations.
+
+Rules:
+
+- core LSM, MVCC, WAL, SSTable, manifest, and compaction logic must not depend
+  on native threads, blocking filesystem calls, process locks, memory mapping,
+  direct I/O, OS page size, or native endian behavior;
+- persistent writable open requires a reliable writer lease;
+- manifest publish is a backend protocol operation, not a hard-coded rename;
+- unsupported durability strength returns a typed error instead of silently
+  downgrading;
+- background maintenance must support both native workers and cooperative async
+  workers;
+- memory mode must remain available for WASM-capable builds.
+
 ## 5. Public API Shape
 
-The exact Rust names may evolve, but the v1 API must expose these concepts:
+The exact Rust names may evolve, but the v1 API must expose these async-first
+concepts:
 
 ```rust
-Db::open(options) -> Result<Db>
+Db::open(options).await -> Result<Db>
 Db::memory(options) -> Result<Db>
-Db::put(key, value) -> Result<()>
-Db::get(key) -> Result<Option<Value>>
-Db::range(range) -> Result<Iter>
-Db::prefix(prefix) -> Result<Iter>
+Db::put(key, value).await -> Result<()>
+Db::get(key).await -> Result<Option<Value>>
+Db::range(range).await -> Result<Cursor>
+Db::prefix(prefix).await -> Result<Cursor>
 Db::default_bucket() -> Result<Bucket>
 Db::bucket(name) -> Result<Bucket>
 Db::bucket_with_options(name, options) -> Result<Bucket>
-Db::persist(mode) -> Result<()>
-Db::flush() -> Result<()>
-Db::compact_range(range) -> Result<()>
+Db::persist(mode).await -> Result<()>
+Db::flush().await -> Result<()>
+Db::compact_range(range).await -> Result<()>
+Db::close().await -> Result<()>
 Db::snapshot() -> Snapshot
 Db::transaction(options) -> Transaction
 Db::stats() -> DbStats
 
 DbOptions::with_default_bucket_options(options) -> DbOptions
 
-Bucket::get(key) -> Result<Option<Value>>
-Bucket::put(key, value) -> Result<()>
-Bucket::delete(key) -> Result<()>
-Bucket::range(range) -> Result<Iter>
-Bucket::prefix(prefix) -> Result<Iter>
+Bucket::get(key).await -> Result<Option<Value>>
+Bucket::put(key, value).await -> Result<()>
+Bucket::delete(key).await -> Result<()>
+Bucket::range(range).await -> Result<Cursor>
+Bucket::prefix(prefix).await -> Result<Cursor>
+
+Cursor::next().await -> Result<Option<KeyValue>>
 
 WriteBatch::put(key, value)
 WriteBatch::delete(key)
@@ -128,22 +175,32 @@ WriteBatch::delete_range(range)
 WriteBatch::put_bucket(bucket, key, value) -> Result<()>
 WriteBatch::delete_bucket(bucket, key) -> Result<()>
 WriteBatch::delete_range_bucket(bucket, range) -> Result<()>
-Db::write(batch, write_options) -> Result<CommitInfo>
+Db::write(batch, write_options).await -> Result<CommitInfo>
 
-Transaction::get(key) -> Result<Option<Value>>
-Transaction::put(key, value)
-Transaction::delete(key)
-Transaction::read_range(range) -> Result<()>
-Transaction::get_bucket(bucket, key) -> Result<Option<Value>>
+Transaction::get(key).await -> Result<Option<Value>>
+Transaction::put(key, value) -> Result<()>
+Transaction::delete(key) -> Result<()>
+Transaction::read_range(range).await -> Result<()>
+Transaction::get_bucket(bucket, key).await -> Result<Option<Value>>
 Transaction::put_bucket(bucket, key, value) -> Result<()>
 Transaction::delete_bucket(bucket, key) -> Result<()>
 Transaction::delete_range_bucket(bucket, range) -> Result<()>
-Transaction::read_range_bucket(bucket, range) -> Result<()>
+Transaction::read_range_bucket(bucket, range).await -> Result<()>
+Transaction::commit().await -> Result<CommitInfo>
+
+BlockingDb::open(options) -> Result<BlockingDb>
+BlockingDb::get(key) -> Result<Option<Value>>
+BlockingDb::put(key, value) -> Result<()>
 ```
 
 API rules:
 
 - `Db`, `Bucket`, and `Snapshot` handles are cloneable and thread-safe.
+- persistent operations that can wait on storage or maintenance are async in
+  the primary API;
+- builders and local staging methods may remain synchronous;
+- blocking APIs are optional native adapters and must delegate to the primary
+  async engine;
 - the default bucket always exists and is the target for direct `Db` reads and
   writes;
 - the default bucket is configured with `DbOptions::default_bucket_options`;
@@ -154,18 +211,20 @@ API rules:
   default `BucketOptions`;
 - `Db::bucket_with_options(name, options)` returns an existing named bucket
   only when options match, or creates one with those fixed options;
-- `Db::flush()` is a public barrier for persistent writable databases: when it
-  returns `Ok(())`, data committed before the call has left active and
+- `Db::flush().await` is a public barrier for persistent writable databases:
+  when it returns `Ok(())`, data committed before the call has left active and
   immutable memtables and has been published as SSTables. Concurrent writes
   committed after the call boundary may remain in the active memtable.
-- `Db::compact_range(range)` waits and retries if an overlapping compaction
-  reservation is already active. It may return after one successful compaction
-  pass or when no compaction plan exists, but it must not report success solely
-  because a maintenance guard was busy.
+- `Db::compact_range(range).await` waits and retries if an overlapping
+  compaction reservation is already active. It may return after one successful
+  compaction pass or when no compaction plan exists, but it must not report
+  success solely because a maintenance guard was busy.
 - named buckets are optional and used for logical isolation or different
   per-bucket options;
-- Iterators keep the read VersionSet alive.
-- Iterators are snapshot-consistent.
+- Cursors keep the read VersionSet alive.
+- Cursors are snapshot-consistent.
+- Cursor advancement is async because storage reads can be required after
+  construction;
 - `WriteBatch` is atomic across buckets.
 - values returned by reads may borrow shared immutable buffers through an owned
   guard type; callers can copy to `Vec<u8>` when they need independent storage.
@@ -300,7 +359,7 @@ Writes:
 
 - enter a writer coordinator;
 - receive a sequence;
-- append WAL;
+- append WAL through the async storage backend;
 - apply to the active memtable;
 - publish the new `last_committed_seq`;
 - optionally trigger flush or compaction scheduling.
@@ -339,21 +398,23 @@ Background work:
 
 ## 11. Durability Modes
 
-Write options include a durability mode:
+Write options include a durability mode. The requested mode is mapped through
+the storage backend capability contract:
 
 ```text
 Buffered   -> append to WAL buffer and apply to memtable
-Flush      -> flush WAL bytes to the OS
-SyncData   -> fsync data needed for WAL durability
-SyncAll    -> fsync WAL and required directory or metadata state
+Flush      -> push WAL bytes to the backend flush boundary
+SyncData   -> backend durable data sync for WAL data
+SyncAll    -> backend durable data and metadata sync where required
 ```
 
-The exact platform implementation may vary, but the names must remain honest.
-A write acknowledged with `SyncAll` must survive a normal power-loss model as
-far as the platform allows.
+The exact backend implementation may vary, but the names must remain honest.
+A write acknowledged with `SyncAll` must survive the backend's declared normal
+power-loss model. If the backend cannot support the requested durability, Trine
+must return `UnsupportedDurability`.
 
-`Db::persist(mode)` forces pending durable state according to the requested
-mode.
+`Db::persist(mode).await` forces pending durable state according to the
+requested mode.
 
 ## 12. WAL Format
 
@@ -527,7 +588,7 @@ and never replace MVCC, point tombstone, or range tombstone checks.
 
 Trine treats search algorithms as internal policies behind stable index APIs.
 The storage model remains sorted by internal key. Search-policy work must never
-change MVCC visibility, iterator ordering, or table publish rules.
+change MVCC visibility, cursor ordering, or table publish rules.
 
 Required index APIs:
 
@@ -680,7 +741,7 @@ Publish rules:
 - an SSTable file may retain the level it was originally written with after a
   one-table move, but recovery must validate every other table property against
   the manifest before using the manifest level;
-- manifest publish is atomic;
+- manifest publish is an atomic backend operation;
 - recovery loads the latest valid manifest state and then replays WAL records
   newer than the replay floor;
 - obsolete files are removed only after they are no longer referenced by any
@@ -761,9 +822,9 @@ Rules:
 
 ## 22. Iteration
 
-Iterators are created from a snapshot sequence.
+Cursors are created from a snapshot sequence.
 
-Required iterators:
+Required cursors:
 
 - full range forward;
 - full range reverse;
@@ -772,14 +833,14 @@ Required iterators:
 - prefix forward;
 - prefix reverse.
 
-Iterator rules:
+Cursor rules:
 
 - return each user key at most once;
 - return newest visible live value;
 - skip point-deleted and range-deleted keys;
 - preserve lexicographic ordering;
 - hold a VersionSet guard for repeatability;
-- expose fallible iteration because storage reads can fail;
+- expose fallible async advancement because storage reads can fail;
 - merge source cursors through heap selection so one returned key advances only
   the sources that currently point at that key;
 - use `advance_to` rather than restarting from the beginning when a merge or
@@ -826,8 +887,8 @@ Rules:
 
 Persistent startup:
 
-1. acquire process lock;
-2. read current manifest pointer;
+1. acquire writer lease when writable;
+2. read current manifest through the storage backend;
 3. load manifest edits and build VersionSet;
 4. validate referenced table files and blob files named by table metadata;
 5. replay WAL records newer than the replay floor;
@@ -845,6 +906,8 @@ In-memory startup starts empty.
 V1 options include:
 
 - storage mode;
+- storage backend;
+- runtime backend;
 - create-if-missing;
 - read-only;
 - default bucket options;
@@ -884,6 +947,9 @@ Errors are typed:
 - `Closed`
 - `BucketMissing`
 - `InvalidOptions`
+- `UnsupportedBackend`
+- `UnsupportedDurability`
+- `LeaseUnavailable`
 
 Library code must not panic for expected runtime errors. Panics are only
 acceptable for internal invariant violations in tests or debug assertions.
@@ -929,6 +995,10 @@ Correctness tests:
 - prefix scan skips incompatible tables safely;
 - prefix filter false positives still run MVCC and tombstone checks;
 - reverse iteration ordering;
+- async cursor advancement stays snapshot-consistent across backend reads;
+- blocking adapter delegates to the primary async engine;
+- unsupported durability returns a typed error;
+- missing writer lease rejects persistent writable open;
 - WAL replay recovers committed batches;
 - torn final WAL record is ignored;
 - non-tail WAL corruption fails closed;
@@ -951,7 +1021,8 @@ Format tests:
 - prefix extractor compatibility across manifest option changes;
 - prefix filter partition skip behavior;
 - footer version compatibility;
-- unknown codec fail-closed behavior.
+- unknown codec fail-closed behavior;
+- portable memory backend builds for a WASM target.
 
 ## 30. Required Benchmarks
 
@@ -973,10 +1044,11 @@ Benchmarks must cover persistent and in-memory modes where relevant:
 - large inline values;
 - separated blob values;
 - block cache warm read;
-- cold table read.
+- cold table read;
+- primary async API overhead for hot memory reads and warm persistent reads;
 - index seek policy comparison over small, medium, and large index arrays;
 - long shared-prefix point reads before changing key encoding;
-- iterator `advance_to` with near, far, and random targets.
+- cursor `advance_to` with near, far, and random targets;
 - codec comparison for `none` and fast block compression over
   Trine data blocks, index blocks, and range tombstone blocks.
 
@@ -985,8 +1057,11 @@ Benchmarks must cover persistent and in-memory modes where relevant:
 Trine KV v1 is complete when:
 
 - all public API concepts in this spec are implemented;
+- primary public database operations are async-first, with blocking APIs only as
+  native adapters;
 - persistent mode passes crash/recovery tests;
 - in-memory mode passes the shared logical test suite;
+- portable memory mode builds for a WASM target;
 - MVCC snapshots and optimistic transactions pass conflict tests;
 - range deletes work through memtable, SSTable, scan, and compaction paths;
 - prefix filters are implemented and prefix scans remain correct under MVCC and

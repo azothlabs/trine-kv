@@ -4362,3 +4362,106 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Commit the API/docs rename with the public-copy polish.
+
+## 2026-05-27: Lock-Free Foreground Write Path Spec
+
+### Observation
+
+- User chose the stronger production-grade direction: Trine should pursue
+  foreground point reads and blind writes without a global write lock, while
+  keeping background I/O and maintenance as explicit owner workers.
+- A fully lock-free database is not the correct target because WAL file writes,
+  fsync, manifest publish, segment rollover, compaction scheduling, and cleanup
+  have real ordering and I/O boundaries.
+- The useful target is zero avoidable implementation conflict: blind writes do
+  not abort because of shared write-path structure, reads do not wait for
+  writers, and transactions only fail for real isolation conflicts.
+
+### Interpretation
+
+- The next implementation work should be driven by
+  `.phrase/protocol/lock-free-foreground-write-path.md`.
+- The central correctness risks are visible-sequence gaps, multi-shard commit
+  publication, WAL-shard recovery, and delta-chain read amplification.
+- Writer-local construction is useful, but published writer-local chains must
+  be routed into bucket/key shards so point reads do not scan every writer.
+
+### Verification
+
+- Read `.phrase/decision.md`, `.phrase/roadmap.md`, `.phrase/current.md`,
+  `.phrase/protocol/trine-kv-v1-spec.md`, and ADR 0001.
+- Read `.rust-skills/AGENTS.md`, `m07-concurrency`, `m10-performance`,
+  `m04-zero-cost`, and `coding-guidelines`.
+- Added `.phrase/protocol/lock-free-foreground-write-path.md`.
+- Linked the new protocol from `.phrase/protocol/trine-kv-v1-spec.md`.
+- Updated `.phrase/roadmap.md` and `.phrase/current.md`.
+- `git diff --check`
+- forbidden-term scan over changed `.phrase` files.
+
+### Remaining Blockers
+
+- No Rust implementation has started.
+- Exact atomic ordering choices must be made and tested during implementation.
+- WAL shard recovery must prove mixed durability and missing sequence behavior.
+
+### Recommended Next Action
+
+- Review and accept the protocol.
+- Start implementation with the commit tracker and visible sequence behind the
+  existing write coordinator before changing WAL sharding or delta publication.
+
+## 2026-05-27: Async-First Portable Storage And WASM Spec
+
+### Observation
+
+- The v1 spec still described the public database API as synchronous, including
+  `Db::open`, point reads, range creation, writes, flush, and compaction.
+- That shape conflicts with a portable storage design because open, recovery,
+  cache-miss reads, WAL append, manifest publish, and maintenance barriers can
+  wait on platform storage.
+- Future WASM support cannot rely on blocking filesystem calls, native threads,
+  process locks, memory mapping, or local-file rename as the only publish
+  mechanism.
+
+### Interpretation
+
+- The primary Trine API should be async-first, with native blocking calls as an
+  adapter rather than the core contract.
+- The engine core should depend on database-level storage operations and
+  explicit backend capabilities instead of direct native file APIs.
+- Durability options must map through backend capabilities and return typed
+  unsupported errors rather than silently downgrading.
+- WASM readiness requires memory-mode build coverage now, while persistent WASI
+  and browser backends should be staged later behind the same storage contract.
+- Async-first storage and the no-global-lock foreground write path should share
+  the final design, but implementation must separate API/storage/cancellation
+  migration from commit tracker, WAL sharding, and shard-delta publication.
+
+### Verification
+
+- Read `.phrase/decision.md`, `.phrase/roadmap.md`, `.phrase/current.md`, and
+  `.phrase/protocol/trine-kv-v1-spec.md`.
+- Added `.phrase/protocol/async-first-portable-storage-and-wasm.md`.
+- Updated `.phrase/protocol/trine-kv-v1-spec.md` with async-first public API,
+  portable storage, durability, cursor, error, test, benchmark, and acceptance
+  language.
+- Updated `.phrase/decision.md`, `.phrase/roadmap.md`, and
+  `.phrase/current.md`.
+- Added explicit implementation relationship rules to the async-first storage
+  protocol, foreground write-path protocol, and v1 spec.
+- `git diff --check`.
+- Forbidden-term scan over changed spec/current/evidence files.
+
+### Remaining Blockers
+
+- No Rust implementation has started.
+- Async runtime boundary and trait signatures must be designed during the first
+  implementation slice.
+- WASI and browser persistent backends need backend-specific capability probes
+  and failure fixtures.
+
+### Recommended Next Action
+
+- Review and accept the async-first portable storage protocol.
+- Start with an async primary API compatibility slice before changing storage
+  backend internals.

@@ -45,6 +45,13 @@ Evidence notes should separate:
 - Do not change MVCC, WAL, SSTable, manifest, compaction, transaction,
   prefix-filter, compression, or search-policy behavior without updating the
   protocol spec or adding a follow-up ADR.
+- Trine's primary database API and storage boundary are async-first. Blocking
+  native APIs are adapters over the primary async engine.
+- Persistent storage behavior is governed by backend capabilities, including
+  writer lease, manifest publish, durability strength, and background-work
+  support.
+- WASM readiness is a design constraint for public API, runtime boundary, and
+  storage backend boundaries.
 - Titan and other external storage engines may be used as design references,
   but Trine must keep its own code, file formats, tests, and recovery contract.
 

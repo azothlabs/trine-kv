@@ -2,86 +2,90 @@
 
 ## Status
 
-Complete
+Active
 
 ## Goal
 
-Fix the measured point-read bottleneck at its source: public read ownership,
-shared SSTable block access, and avoidable overlapping-L0 read amplification.
+Define the async-first public API and portable storage boundary before changing
+open, read, write, cursor, durability, runtime, or backend implementation.
 
 ## Scope
 
-- Add a point-read value handle that can return inline SSTable values without
-  copying bytes out of decoded data blocks.
-- Let `BucketReader` keep a stable point-read source snapshot for repeated
-  reads under one snapshot.
-- Update the Azoth benchmark adapter to use the reader/value path so it
-  measures point lookup instead of forcing an owned `Vec` for every read.
-- Reduce block-cache shared-state contention on the measured point-read path.
-- Trigger local compaction when L0 key spans overlap, because overlapping L0
-  files directly multiply point-read table probes.
+- Specify the primary async `Db`, `Bucket`, `Transaction`, and cursor API.
+- Specify the native blocking API as an adapter over the async engine.
+- Specify storage backend capabilities and typed unsupported-capability errors.
+- Specify manifest publish as a backend protocol operation.
+- Specify durability mapping through backend capabilities.
+- Specify cancellation rules for async write and maintenance futures.
+- Specify WASM readiness constraints for memory, WASI, and browser-style
+  backends.
+- Link the new protocol from the v1 protocol, decision framework, and roadmap.
+- Record the implementation relationship between async-first storage work and
+  the no-global-lock foreground write path.
 
 ## Out Of Scope
 
-- Changing MVCC, WAL, manifest, table format, compaction retention, or recovery
-  rules.
-- Keeping unbounded decoded data block pinning: the experiment improved 4/8
-  threads but regressed 16/32 threads and was rejected.
-- Replacing the global block cache without a bounded design.
+- Rust behavior changes in this phase.
+- Choosing a concrete async runtime crate.
+- Implementing WASI or browser persistence in this phase.
+- Promising identical durability strength on every platform.
+- Making CPU-only LSM search, decode, MVCC, or merge logic async.
+- Changing SSTable, WAL, manifest, blob, compaction, or transaction semantics
+  beyond the API/storage boundary rules recorded here.
+- Implementing async API migration and no-global-lock write-path changes in one
+  slice.
 
 ## Acceptance Gate
 
-- `BucketReader::get` returns a `PointValue` with `as_bytes`.
-- `BucketReader::get_owned` keeps the explicit owned-value path.
-- Existing `get` APIs keep returning owned `Vec<u8>` for compatibility.
-- A reader remains correct if memtable data is flushed after reader creation.
-- The benchmark adapter uses the reader value-handle path.
-- Block-cache hit/miss accounting no longer writes one global atomic counter on
-  every hit.
-- With background workers disabled, foreground `flush()` compacts overlapping
-  L0 tables before read-heavy states keep paying repeated table-filter misses.
-- Full Rust tests pass.
-- Evidence records which cache paths improved and which alternatives were
-  rejected.
+- `.phrase/protocol/async-first-portable-storage-and-wasm.md` exists and
+  covers async API shape, blocking adapter, storage capabilities, manifest
+  publish, durability mapping, cancellation, background work, backend families,
+  recovery, observability, tests, and staging.
+- `.phrase/protocol/trine-kv-v1-spec.md` links to the new protocol and updates
+  API/storage/durability/cursor/error/test/benchmark language.
+- `.phrase/decision.md` records async-first storage and WASM readiness as
+  durable boundaries.
+- `.phrase/roadmap.md` records Phase 45 and marks Phase 44 complete.
+- The async-first and foreground write-path protocols both state the staged
+  implementation relationship.
+- Markdown/spec checks pass where applicable.
 
 ## Active Task Slice
 
 ```text
-task152 [x] goal:point value handle | scope:src/point_value.rs src/table.rs src/lsm/read.rs | verify:tests
-task153 [x] goal:reader stable source snapshot | scope:src/bucket.rs src/db.rs src/lsm/read.rs | verify:flush-after-reader test
-task154 [x] goal:benchmark adapter uses value handle | scope:azoth-kv-bench trine_benchmark.rs | verify:bench check
-task155 [x] goal:block-cache counter sharding | scope:src/cache.rs | verify:cache tests/clippy
-task156 [x] goal:overlapping-L0 pressure trigger | scope:src/lsm/version.rs src/db.rs | verify:L0 overlap tests
-task157 [x] goal:evidence and verification closeout | scope:.phrase/evidence.md cargo test | verify:full gate
+task163 [x] goal:read current decision context | scope:.phrase decision/roadmap/current | verify:manual
+task164 [x] goal:inspect v1 API/storage/durability sections | scope:v1 protocol | verify:manual
+task165 [x] goal:write async-first portable storage protocol | scope:.phrase/protocol | verify:markdown review
+task166 [x] goal:link durable source-of-truth docs | scope:v1 protocol decision roadmap current | verify:git diff
+task167 [x] goal:close evidence and checks | scope:.phrase/evidence.md changed docs | verify:git diff --check and scans
+task168 [x] goal:record async/write-path implementation relationship | scope:async protocol lock-free protocol v1 current evidence | verify:git diff
 ```
 
 ## Known Blockers
 
-- The measured threaded-read source problem is closed: diagnostics now show one
-  table probe per data-block read after overlapping L0 compaction.
-- A tried L0 decoded-block `OnceLock` cache removed global cache hits but
-  regressed 16/32 threads, so table-local decoded-block pinning remains a
-  rejected path.
-- Remote CI still has to run after push.
+- No Rust implementation has started for this phase.
+- The exact async runtime boundary and trait signatures still need code-level
+  design during implementation.
+- WASI and browser persistent backends require separate capability probes and
+  fixtures before they can be accepted.
+- Existing synchronous public API code will need a staged compatibility plan.
+- Async API/storage migration and no-global-lock write-path changes must stay
+  as separate implementation slices even though they share the final design.
 
 ## Evidence
 
-- Rust skill, performance skill, zero-cost skill, SPEC-AGENTS context, and
-  current roadmap files were read before review.
-- Review found that pinning only the table version was not enough for
-  `BucketReader`: a flush after reader creation could move records from the
-  memtable into a newer table version. `BucketReader` now captures active and
-  immutable memtable sources together with the table version.
-- `persistent_bucket_reader_keeps_memtable_source_after_flush` covers that
-  regression.
-- Verification passed: `cargo test --all-targets --all-features`,
-  `cargo clippy --all-targets --all-features -- -D warnings`,
-  `cargo fmt --all --check`, `git diff --check`, and the forbidden-term scan.
-- Benchmark evidence in `.phrase/evidence.md` records the value-handle path,
-  rejected decoded-block pinning experiment, block-cache counter sharding, and
-  overlapping-L0 source fix.
+- Current decision framework, roadmap, current phase, and v1 protocol were read.
+- The v1 API shape was still synchronous at the persistent database boundary.
+- Persistent storage language assumed native local files in places that should
+  be backend capabilities.
+- Async-first storage is required for future WASM support because persistent
+  browser-style storage cannot safely depend on blocking calls.
+- Async-first storage and no-global-lock writes are co-designed, but the first
+  implementation must isolate API/storage/cancellation changes from commit
+  visibility, WAL sharding, and delta publication changes.
 
 ## Next Recommendation
 
-- Commit this performance/correctness slice, then run the broad benchmark suite
-  before making broader tuning decisions.
+- Review and accept the async-first portable storage protocol, then implement a
+  first compatibility slice that introduces async primary handles while keeping
+  the current native behavior reachable through a blocking adapter.

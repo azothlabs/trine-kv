@@ -895,3 +895,52 @@ maintenance APIs can return success after non-blocking helper conflicts.
 - Focused tests cover flush guard contention, default background flush publish,
   and compaction reservation contention.
 - Full local Rust verification passes.
+
+### Phase 44: Lock-Free Foreground Write Path Spec
+
+**Status**: Complete
+
+**Goal**: Define the production-grade multi-writer write-path contract before
+changing commit, WAL, delta, visibility, or recovery code.
+
+**Entry Condition**: User chooses the stronger production direction: foreground
+reads and blind writes should avoid a global writer lock, while background I/O
+and maintenance can remain single-owner.
+
+**Acceptance Gate**:
+
+- Protocol defines the exact boundary between foreground no-global-lock paths
+  and background owner workers.
+- Protocol covers `PreparedCommit`, key-sharded immutable deltas, WAL shards,
+  commit slot states, visible sequence advancement, recovery, backpressure,
+  actor/worker boundaries, stats, and tests.
+- Existing v1 protocol links to the new write-path protocol as the source of
+  truth for the next implementation phase.
+- Current phase file records scope, out-of-scope, verification, and blockers.
+  No Rust behavior changes are made in this spec phase.
+
+### Phase 45: Async-First Portable Storage And WASM Spec
+
+**Status**: Active
+
+**Goal**: Make the v1 spec async-first at the public API and storage boundary,
+with portable backend capabilities and WASM readiness defined before
+implementation.
+
+**Entry Condition**: User identifies synchronous `Db::open` and native-file
+assumptions as the wrong long-term architecture for cross-platform storage.
+
+**Acceptance Gate**:
+
+- Protocol defines the primary async API, blocking adapter role, storage
+  backend capabilities, manifest publish abstraction, durability mapping,
+  cancellation rules, background work, backend families, recovery, stats, tests,
+  and implementation staging.
+- V1 protocol links to the async-first storage protocol and updates public API,
+  storage mode, durability, cursor, error, test, benchmark, and acceptance-gate
+  language.
+- Decision framework records async-first storage and WASM readiness as durable
+  boundaries.
+- Current phase and evidence record scope, out-of-scope, verification, and
+  remaining blockers.
+- No Rust behavior changes are made in this spec phase.
