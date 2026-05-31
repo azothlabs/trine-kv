@@ -1785,3 +1785,29 @@ blocking adapter when a runtime-enabled backend is used.
   storage behavior remain unchanged.
 - Focused runtime/storage tests, formatting, clippy, full tests, and diff
   checks pass.
+
+### Phase 83: Native-File Runtime-Owned Storage Mutations
+
+**Status**: Complete
+
+**Goal**: Route native-file owned storage writes, append operations, manifest
+publish, and object listing through the bounded runtime blocking adapter when a
+runtime-enabled backend is used.
+
+**Entry Condition**: Phase 82 complete and native-file read operations can use
+runtime-owned blocking work.
+
+**Acceptance Gate**:
+
+- Runtime-enabled native-file object writes/deletes execute through the bounded
+  blocking adapter.
+- Runtime-enabled native-file WAL rewrite, manifest read/publish, directory
+  operations, and object listing execute through the bounded blocking adapter.
+- Runtime-enabled native-file append-object open, append, and persist execute
+  through the bounded blocking adapter.
+- Blocking storage adapters remain direct synchronous paths.
+- Inline/no-runtime storage operations remain immediately pollable.
+- Public async API, blocking API, publish barrier, commit tracker,
+  WAL/table/blob/manifest formats, MVCC, compaction, recovery, cleanup, and
+  storage behavior remain unchanged.
+- Focused storage tests, formatting, clippy, full tests, and diff checks pass.

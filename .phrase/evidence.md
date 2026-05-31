@@ -6368,3 +6368,64 @@ Record only evidence that can change planning or durable decisions.
 - Add owned runtime-submittable wrappers for storage writes, append, manifest
   publish, and object listing before migrating database call sites onto
   runtime-enabled storage backends.
+
+## 2026-05-31: Native-File Runtime-Owned Storage Mutations
+
+### Observation
+
+- Phase 82 moved native-file owned reads behind the bounded runtime blocking
+  adapter, but owned storage mutations still performed blocking file I/O on the
+  polling thread.
+- Native-file blocking adapters previously reused async futures with
+  `poll_ready`, which is the wrong shape once async mutation futures can be
+  pending behind a runtime worker.
+- Append objects need an owned file handle and owned bytes before append and
+  persist operations can cross the runtime boundary safely.
+
+### Interpretation
+
+- Runtime-enabled native-file mutation futures should submit owned closures to
+  the bounded blocking adapter, while no-runtime and inline-runtime paths remain
+  immediately pollable.
+- Synchronous storage callers need direct native-file implementations so they do
+  not depend on runtime queue availability.
+- The database can migrate to runtime-enabled native-file backends later without
+  changing table/blob block decode semantics in the same phase.
+
+### Verification
+
+- Added a shared native-file owned storage task helper for bounded
+  runtime-owned storage operations.
+- Routed native-file object writes/deletes, object listing, WAL rewrite,
+  writer-lease acquire, directory create/list/sync, manifest read/publish, and
+  append open/append/persist through the bounded blocking adapter when a native
+  runtime is attached.
+- Changed native-file blocking storage adapters to call direct synchronous
+  native functions instead of polling pending-capable async futures.
+- Kept default blocking trait bridges for backends that use immediately-ready
+  storage futures.
+- Added focused storage tests proving runtime-enabled mutation futures wait
+  behind an occupied blocking worker, blocking native-file calls stay direct,
+  and inline runtime mutation futures remain ready.
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test storage --lib`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan outside the repository instruction file
+
+### Remaining Blockers
+
+- Current database call sites mostly construct no-runtime native-file backends.
+- Table/blob block reads and cursor advancement still use synchronous
+  advancement paths.
+- True async file I/O is not implemented.
+- Runtime worker and queue limits remain internal defaults.
+- True multi-writer execution still needs writer-local deltas and WAL
+  partitioning before the publish barrier can be narrowed further.
+
+### Recommended Next Action
+
+- Migrate database construction paths to runtime-enabled native-file backends in
+  small groups, preserving the existing borrowed block decode path until a
+  dedicated read-path phase changes it.

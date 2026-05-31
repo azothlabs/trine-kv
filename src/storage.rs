@@ -403,9 +403,13 @@ pub(crate) trait StorageAppendObject: Send {
 }
 
 pub(crate) trait BlockingStorageAppendObject: StorageAppendObject {
-    fn append_blocking(&mut self, bytes: &[u8], durability: DurabilityMode) -> Result<()>;
+    fn append_blocking(&mut self, bytes: &[u8], durability: DurabilityMode) -> Result<()> {
+        poll_ready_storage_future(StorageAppendObject::append(self, bytes, durability))
+    }
 
-    fn persist_blocking(&mut self, durability: DurabilityMode) -> Result<()>;
+    fn persist_blocking(&mut self, durability: DurabilityMode) -> Result<()> {
+        poll_ready_storage_future(StorageAppendObject::persist(self, durability))
+    }
 }
 
 pub(crate) trait StorageAppendBackend: StorageReadBackend {
@@ -418,7 +422,9 @@ pub(crate) trait BlockingStorageAppendBackend: StorageAppendBackend
 where
     Self::AppendObject: BlockingStorageAppendObject,
 {
-    fn open_append_blocking(&self, object: StorageObjectId) -> Result<Self::AppendObject>;
+    fn open_append_blocking(&self, object: StorageObjectId) -> Result<Self::AppendObject> {
+        poll_ready_storage_future(self.open_append(object))
+    }
 }
 
 pub(crate) trait StorageWalRewriteBackend: StorageReadBackend {
@@ -438,7 +444,9 @@ pub(crate) trait BlockingStorageWalRewriteBackend: StorageWalRewriteBackend {
         temporary_object: StorageObjectId,
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
-    ) -> Result<()>;
+    ) -> Result<()> {
+        poll_ready_storage_future(self.rewrite_wal(object, temporary_object, bytes, durability))
+    }
 }
 
 pub(crate) trait StorageWriterLeaseBackend: StorageReadBackend {
@@ -449,7 +457,9 @@ pub(crate) trait StorageWriterLeaseBackend: StorageReadBackend {
 }
 
 pub(crate) trait BlockingStorageWriterLeaseBackend: StorageWriterLeaseBackend {
-    fn acquire_writer_lease_blocking(&self, object: StorageObjectId) -> Result<Self::WriterLease>;
+    fn acquire_writer_lease_blocking(&self, object: StorageObjectId) -> Result<Self::WriterLease> {
+        poll_ready_storage_future(self.acquire_writer_lease(object))
+    }
 }
 
 pub(crate) trait StorageDirectoryCreateBackend: StorageReadBackend {
@@ -459,7 +469,9 @@ pub(crate) trait StorageDirectoryCreateBackend: StorageReadBackend {
 pub(crate) trait BlockingStorageDirectoryCreateBackend:
     StorageDirectoryCreateBackend
 {
-    fn create_directory_all_blocking(&self, directory: StorageDirectoryId) -> Result<()>;
+    fn create_directory_all_blocking(&self, directory: StorageDirectoryId) -> Result<()> {
+        poll_ready_storage_future(self.create_directory_all(directory))
+    }
 }
 
 pub(crate) trait StorageDirectoryListBackend: StorageReadBackend {
@@ -473,7 +485,9 @@ pub(crate) trait BlockingStorageDirectoryListBackend: StorageDirectoryListBacken
     fn list_directory_files_blocking(
         &self,
         directory: StorageDirectoryId,
-    ) -> Result<Vec<StorageDirectoryFile>>;
+    ) -> Result<Vec<StorageDirectoryFile>> {
+        poll_ready_storage_future(self.list_directory_files(directory))
+    }
 }
 
 pub(crate) trait StorageDirectorySyncBackend: StorageReadBackend {
@@ -481,7 +495,9 @@ pub(crate) trait StorageDirectorySyncBackend: StorageReadBackend {
 }
 
 pub(crate) trait BlockingStorageDirectorySyncBackend: StorageDirectorySyncBackend {
-    fn sync_directory_after_renames_blocking(&self, directory: StorageDirectoryId) -> Result<()>;
+    fn sync_directory_after_renames_blocking(&self, directory: StorageDirectoryId) -> Result<()> {
+        poll_ready_storage_future(self.sync_directory_after_renames(directory))
+    }
 }
 
 pub(crate) trait StorageManifestReadBackend: StorageReadBackend {
@@ -492,7 +508,9 @@ pub(crate) trait StorageManifestReadBackend: StorageReadBackend {
 }
 
 pub(crate) trait BlockingStorageManifestReadBackend: StorageManifestReadBackend {
-    fn read_current_manifest_blocking(&self, object: StorageObjectId) -> Result<Option<Arc<[u8]>>>;
+    fn read_current_manifest_blocking(&self, object: StorageObjectId) -> Result<Option<Arc<[u8]>>> {
+        poll_ready_storage_future(self.read_current_manifest(object))
+    }
 }
 
 pub(crate) trait StorageManifestPublishBackend: StorageReadBackend {
@@ -512,7 +530,9 @@ pub(crate) trait BlockingStorageManifestPublishBackend:
         object: StorageObjectId,
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
-    ) -> Result<()>;
+    ) -> Result<()> {
+        poll_ready_storage_future(self.publish_manifest(object, bytes, durability))
+    }
 }
 
 pub(crate) trait StorageObjectWriteBackend: StorageReadBackend {
@@ -530,7 +550,9 @@ pub(crate) trait BlockingStorageObjectWriteBackend: StorageObjectWriteBackend {
         object: StorageObjectId,
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
-    ) -> Result<()>;
+    ) -> Result<()> {
+        poll_ready_storage_future(self.write_object(object, bytes, durability))
+    }
 }
 
 pub(crate) trait StorageObjectDeleteBackend: StorageReadBackend {
@@ -538,7 +560,9 @@ pub(crate) trait StorageObjectDeleteBackend: StorageReadBackend {
 }
 
 pub(crate) trait BlockingStorageObjectDeleteBackend: StorageObjectDeleteBackend {
-    fn delete_object_blocking(&self, object: StorageObjectId) -> Result<()>;
+    fn delete_object_blocking(&self, object: StorageObjectId) -> Result<()> {
+        poll_ready_storage_future(self.delete_object(object))
+    }
 }
 
 pub(crate) trait StorageObjectListBackend: StorageReadBackend {
@@ -552,7 +576,9 @@ pub(crate) trait BlockingStorageObjectListBackend: StorageObjectListBackend {
     fn list_objects_blocking(
         &self,
         request: StorageObjectListRequest,
-    ) -> Result<Vec<StorageObjectId>>;
+    ) -> Result<Vec<StorageObjectId>> {
+        poll_ready_storage_future(self.list_objects(request))
+    }
 }
 
 #[allow(dead_code)]
@@ -708,6 +734,22 @@ impl NativeFileBackend {
             runtime: Some(runtime),
         }
     }
+
+    fn run_owned_storage_task<T>(
+        &self,
+        task: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> StorageFuture<'_, T>
+    where
+        T: Send + 'static,
+    {
+        if let Some(runtime) = self.runtime.clone() {
+            if runtime.capabilities().blocking_adapter() {
+                return Box::pin(async move { runtime.spawn_blocking_result(task)?.await });
+            }
+        }
+
+        Box::pin(async move { task() })
+    }
 }
 
 impl StorageReadBackend for NativeFileBackend {
@@ -736,23 +778,13 @@ impl StorageReadBackend for NativeFileBackend {
 
 impl BlockingStorageReadBackend for NativeFileBackend {
     fn open_read_blocking(&self, object: StorageObjectId) -> Result<Self::ReadObject> {
-        poll_ready_storage_future(self.open_read(object))
+        NativeFileObject::open(object, self.runtime.clone())
     }
 }
 
 impl StorageObjectReadBackend for NativeFileBackend {
     fn read_object_bytes(&self, object: StorageObjectId) -> StorageFuture<'_, Option<Arc<[u8]>>> {
-        let runtime = self.runtime.clone();
-        Box::pin(async move {
-            if let Some(runtime) = runtime {
-                if runtime.capabilities().blocking_adapter() {
-                    return runtime
-                        .spawn_blocking_result(move || read_native_file_object_bytes(&object))?
-                        .await;
-                }
-            }
-            read_native_file_object_bytes(&object)
-        })
+        self.run_owned_storage_task(move || read_native_file_object_bytes(&object))
     }
 }
 
@@ -766,13 +798,14 @@ impl StorageAppendBackend for NativeFileBackend {
     type AppendObject = NativeFileAppendObject;
 
     fn open_append(&self, object: StorageObjectId) -> StorageFuture<'_, Self::AppendObject> {
-        Box::pin(async move { NativeFileAppendObject::open(&object) })
+        let runtime = self.runtime.clone();
+        self.run_owned_storage_task(move || NativeFileAppendObject::open(&object, runtime))
     }
 }
 
 impl BlockingStorageAppendBackend for NativeFileBackend {
     fn open_append_blocking(&self, object: StorageObjectId) -> Result<Self::AppendObject> {
-        poll_ready_storage_future(self.open_append(object))
+        NativeFileAppendObject::open(&object, self.runtime.clone())
     }
 }
 
@@ -784,9 +817,9 @@ impl StorageWalRewriteBackend for NativeFileBackend {
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
     ) -> StorageFuture<'_, ()> {
-        Box::pin(
-            async move { rewrite_native_file_wal(&object, &temporary_object, &bytes, durability) },
-        )
+        self.run_owned_storage_task(move || {
+            rewrite_native_file_wal(&object, &temporary_object, &bytes, durability)
+        })
     }
 }
 
@@ -798,7 +831,7 @@ impl BlockingStorageWalRewriteBackend for NativeFileBackend {
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
     ) -> Result<()> {
-        poll_ready_storage_future(self.rewrite_wal(object, temporary_object, bytes, durability))
+        rewrite_native_file_wal(&object, &temporary_object, &bytes, durability)
     }
 }
 
@@ -809,25 +842,25 @@ impl StorageWriterLeaseBackend for NativeFileBackend {
         &self,
         object: StorageObjectId,
     ) -> StorageFuture<'_, Self::WriterLease> {
-        Box::pin(async move { NativeFileWriterLease::acquire(object) })
+        self.run_owned_storage_task(move || NativeFileWriterLease::acquire(object))
     }
 }
 
 impl BlockingStorageWriterLeaseBackend for NativeFileBackend {
     fn acquire_writer_lease_blocking(&self, object: StorageObjectId) -> Result<Self::WriterLease> {
-        poll_ready_storage_future(self.acquire_writer_lease(object))
+        NativeFileWriterLease::acquire(object)
     }
 }
 
 impl StorageDirectoryCreateBackend for NativeFileBackend {
     fn create_directory_all(&self, directory: StorageDirectoryId) -> StorageFuture<'_, ()> {
-        Box::pin(async move { create_native_file_directory_all(&directory) })
+        self.run_owned_storage_task(move || create_native_file_directory_all(&directory))
     }
 }
 
 impl BlockingStorageDirectoryCreateBackend for NativeFileBackend {
     fn create_directory_all_blocking(&self, directory: StorageDirectoryId) -> Result<()> {
-        poll_ready_storage_future(self.create_directory_all(directory))
+        create_native_file_directory_all(&directory)
     }
 }
 
@@ -836,7 +869,7 @@ impl StorageDirectoryListBackend for NativeFileBackend {
         &self,
         directory: StorageDirectoryId,
     ) -> StorageFuture<'_, Vec<StorageDirectoryFile>> {
-        Box::pin(async move { list_native_file_directory_files(&directory) })
+        self.run_owned_storage_task(move || list_native_file_directory_files(&directory))
     }
 }
 
@@ -845,19 +878,19 @@ impl BlockingStorageDirectoryListBackend for NativeFileBackend {
         &self,
         directory: StorageDirectoryId,
     ) -> Result<Vec<StorageDirectoryFile>> {
-        poll_ready_storage_future(self.list_directory_files(directory))
+        list_native_file_directory_files(&directory)
     }
 }
 
 impl StorageDirectorySyncBackend for NativeFileBackend {
     fn sync_directory_after_renames(&self, directory: StorageDirectoryId) -> StorageFuture<'_, ()> {
-        Box::pin(async move { sync_native_file_directory_after_renames(&directory) })
+        self.run_owned_storage_task(move || sync_native_file_directory_after_renames(&directory))
     }
 }
 
 impl BlockingStorageDirectorySyncBackend for NativeFileBackend {
     fn sync_directory_after_renames_blocking(&self, directory: StorageDirectoryId) -> Result<()> {
-        poll_ready_storage_future(self.sync_directory_after_renames(directory))
+        sync_native_file_directory_after_renames(&directory)
     }
 }
 
@@ -866,13 +899,13 @@ impl StorageManifestReadBackend for NativeFileBackend {
         &self,
         object: StorageObjectId,
     ) -> StorageFuture<'_, Option<Arc<[u8]>>> {
-        Box::pin(async move { read_current_manifest_from_native_file(&object) })
+        self.run_owned_storage_task(move || read_current_manifest_from_native_file(&object))
     }
 }
 
 impl BlockingStorageManifestReadBackend for NativeFileBackend {
     fn read_current_manifest_blocking(&self, object: StorageObjectId) -> Result<Option<Arc<[u8]>>> {
-        poll_ready_storage_future(self.read_current_manifest(object))
+        read_current_manifest_from_native_file(&object)
     }
 }
 
@@ -883,7 +916,9 @@ impl StorageManifestPublishBackend for NativeFileBackend {
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
     ) -> StorageFuture<'_, ()> {
-        Box::pin(async move { publish_manifest_to_native_file(&object, &bytes, durability) })
+        self.run_owned_storage_task(move || {
+            publish_manifest_to_native_file(&object, &bytes, durability)
+        })
     }
 }
 
@@ -894,7 +929,7 @@ impl BlockingStorageManifestPublishBackend for NativeFileBackend {
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
     ) -> Result<()> {
-        poll_ready_storage_future(self.publish_manifest(object, bytes, durability))
+        publish_manifest_to_native_file(&object, &bytes, durability)
     }
 }
 
@@ -905,7 +940,7 @@ impl StorageObjectWriteBackend for NativeFileBackend {
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
     ) -> StorageFuture<'_, ()> {
-        Box::pin(async move { write_native_file_object(&object, &bytes, durability) })
+        self.run_owned_storage_task(move || write_native_file_object(&object, &bytes, durability))
     }
 }
 
@@ -916,19 +951,19 @@ impl BlockingStorageObjectWriteBackend for NativeFileBackend {
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
     ) -> Result<()> {
-        poll_ready_storage_future(self.write_object(object, bytes, durability))
+        write_native_file_object(&object, &bytes, durability)
     }
 }
 
 impl StorageObjectDeleteBackend for NativeFileBackend {
     fn delete_object(&self, object: StorageObjectId) -> StorageFuture<'_, ()> {
-        Box::pin(async move { delete_native_file_object(&object) })
+        self.run_owned_storage_task(move || delete_native_file_object(&object))
     }
 }
 
 impl BlockingStorageObjectDeleteBackend for NativeFileBackend {
     fn delete_object_blocking(&self, object: StorageObjectId) -> Result<()> {
-        poll_ready_storage_future(self.delete_object(object))
+        delete_native_file_object(&object)
     }
 }
 
@@ -937,7 +972,7 @@ impl StorageObjectListBackend for NativeFileBackend {
         &self,
         request: StorageObjectListRequest,
     ) -> StorageFuture<'_, Vec<StorageObjectId>> {
-        Box::pin(async move { list_native_file_objects(&request) })
+        self.run_owned_storage_task(move || list_native_file_objects(&request))
     }
 }
 
@@ -946,7 +981,7 @@ impl BlockingStorageObjectListBackend for NativeFileBackend {
         &self,
         request: StorageObjectListRequest,
     ) -> Result<Vec<StorageObjectId>> {
-        poll_ready_storage_future(self.list_objects(request))
+        list_native_file_objects(&request)
     }
 }
 
@@ -1048,13 +1083,33 @@ impl BlockingStorageReadObject for NativeFileObject {
 
 #[derive(Debug)]
 pub(crate) struct NativeFileAppendObject {
-    file: File,
+    object: StorageObjectId,
+    file: Arc<Mutex<File>>,
+    runtime: Option<Runtime>,
 }
 
 impl NativeFileAppendObject {
-    fn open(object: &StorageObjectId) -> Result<Self> {
+    fn open(object: &StorageObjectId, runtime: Option<Runtime>) -> Result<Self> {
         let file = open_native_append_file(object)?;
-        Ok(Self { file })
+        Ok(Self {
+            object: object.clone(),
+            file: Arc::new(Mutex::new(file)),
+            runtime,
+        })
+    }
+
+    fn append_to_file(&self, bytes: &[u8], durability: DurabilityMode) -> Result<()> {
+        let mut file = self.lock_file()?;
+        append_native_file_object(&mut file, bytes, durability)
+    }
+
+    fn persist_file(&self, durability: DurabilityMode) -> Result<()> {
+        let mut file = self.lock_file()?;
+        persist_native_append_file(&mut file, durability)
+    }
+
+    fn lock_file(&self) -> Result<MutexGuard<'_, File>> {
+        lock_native_append_file(self.file.as_ref(), &self.object)
     }
 }
 
@@ -1064,21 +1119,52 @@ impl StorageAppendObject for NativeFileAppendObject {
         bytes: &'op [u8],
         durability: DurabilityMode,
     ) -> StorageFuture<'op, ()> {
-        Box::pin(async move { append_native_file_object(&mut self.file, bytes, durability) })
+        if let Some(runtime) = self.runtime.clone() {
+            if runtime.capabilities().blocking_adapter() {
+                let object = self.object.clone();
+                let file = Arc::clone(&self.file);
+                let bytes: Arc<[u8]> = Arc::from(bytes);
+                return Box::pin(async move {
+                    runtime
+                        .spawn_blocking_result(move || {
+                            let mut file = lock_native_append_file(file.as_ref(), &object)?;
+                            append_native_file_object(&mut file, bytes.as_ref(), durability)
+                        })?
+                        .await
+                });
+            }
+        }
+
+        Box::pin(async move { self.append_to_file(bytes, durability) })
     }
 
     fn persist(&mut self, durability: DurabilityMode) -> StorageFuture<'_, ()> {
-        Box::pin(async move { persist_native_append_file(&mut self.file, durability) })
+        if let Some(runtime) = self.runtime.clone() {
+            if runtime.capabilities().blocking_adapter() {
+                let object = self.object.clone();
+                let file = Arc::clone(&self.file);
+                return Box::pin(async move {
+                    runtime
+                        .spawn_blocking_result(move || {
+                            let mut file = lock_native_append_file(file.as_ref(), &object)?;
+                            persist_native_append_file(&mut file, durability)
+                        })?
+                        .await
+                });
+            }
+        }
+
+        Box::pin(async move { self.persist_file(durability) })
     }
 }
 
 impl BlockingStorageAppendObject for NativeFileAppendObject {
     fn append_blocking(&mut self, bytes: &[u8], durability: DurabilityMode) -> Result<()> {
-        poll_ready_storage_future(StorageAppendObject::append(self, bytes, durability))
+        self.append_to_file(bytes, durability)
     }
 
     fn persist_blocking(&mut self, durability: DurabilityMode) -> Result<()> {
-        poll_ready_storage_future(StorageAppendObject::persist(self, durability))
+        self.persist_file(durability)
     }
 }
 
@@ -1239,6 +1325,19 @@ fn open_native_append_file(object: &StorageObjectId) -> Result<File> {
         .append(true)
         .open(object.path())
         .map_err(Error::from)
+}
+
+fn lock_native_append_file<'file>(
+    file: &'file Mutex<File>,
+    object: &StorageObjectId,
+) -> Result<MutexGuard<'file, File>> {
+    file.lock().map_err(|_| Error::Corruption {
+        message: format!(
+            "referenced {} {} append handle lock poisoned",
+            object.kind().as_str(),
+            object.path().display()
+        ),
+    })
 }
 
 fn append_native_file_object(
@@ -1638,6 +1737,34 @@ mod tests {
         release_tx
     }
 
+    fn complete_after_blocking_worker_release<T>(
+        runtime: &Runtime,
+        mut future: StorageFuture<'_, T>,
+        pending_message: &str,
+    ) -> Result<T> {
+        let release = hold_runtime_blocking_worker(runtime);
+        let waker = test_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(
+            matches!(future.as_mut().poll(&mut context), Poll::Pending),
+            "{pending_message}"
+        );
+
+        release.send(()).expect("release blocking worker");
+        block_on_test_future(future)
+    }
+
+    fn temp_storage_root(prefix: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ))
+    }
+
     #[test]
     fn native_file_backend_exposes_async_read_shape() {
         let path = std::env::temp_dir().join(format!(
@@ -1686,6 +1813,278 @@ mod tests {
         assert_eq!(&*owned_blocking.into_bytes(), b"de");
 
         std::fs::remove_file(path).expect("test file removes");
+    }
+
+    #[test]
+    fn runtime_enabled_native_file_object_mutations_use_blocking_adapter() {
+        let root = temp_storage_root("trine-kv-runtime-object-mutations");
+        let path = root.join("table-00000000000000000011.trinet");
+        let object = StorageObjectId::native_file(StorageObjectKind::Table, &path);
+        let runtime = Runtime::with_blocking_limits(RuntimeOptions::native_threads(), 1, 8);
+        let backend = NativeFileBackend::with_runtime(runtime.clone());
+
+        complete_after_blocking_worker_release(
+            &runtime,
+            backend.write_object(
+                object.clone(),
+                Arc::from(&b"table bytes"[..]),
+                DurabilityMode::Buffered,
+            ),
+            "object write should wait behind the occupied blocking worker",
+        )
+        .expect("runtime object write completes");
+        assert_eq!(
+            std::fs::read(object.path()).expect("table object reads"),
+            b"table bytes"
+        );
+
+        complete_after_blocking_worker_release(
+            &runtime,
+            backend.delete_object(object.clone()),
+            "object delete should wait behind the occupied blocking worker",
+        )
+        .expect("runtime object delete completes");
+        assert!(!object.path().exists(), "table object should be deleted");
+
+        let blocking_path = root.join("table-00000000000000000012.trinet");
+        let blocking_object =
+            StorageObjectId::native_file(StorageObjectKind::Table, &blocking_path);
+        let release = hold_runtime_blocking_worker(&runtime);
+        backend
+            .write_object_blocking(
+                blocking_object.clone(),
+                Arc::from(&b"blocking table"[..]),
+                DurabilityMode::Buffered,
+            )
+            .expect("blocking object write stays direct");
+        backend
+            .delete_object_blocking(blocking_object)
+            .expect("blocking object delete stays direct");
+        release.send(()).expect("release blocking worker");
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[test]
+    fn runtime_enabled_native_file_directory_and_lease_ops_use_blocking_adapter() {
+        let root = temp_storage_root("trine-kv-runtime-directory-storage");
+        let runtime = Runtime::with_blocking_limits(RuntimeOptions::native_threads(), 1, 8);
+        let backend = NativeFileBackend::with_runtime(runtime.clone());
+        let directory = StorageDirectoryId::native_file(&root);
+
+        complete_after_blocking_worker_release(
+            &runtime,
+            backend.create_directory_all(directory.clone()),
+            "directory create should wait behind the occupied blocking worker",
+        )
+        .expect("runtime directory create completes");
+        assert!(root.is_dir(), "runtime directory create should create root");
+
+        let lease_object =
+            StorageObjectId::native_file(StorageObjectKind::WriterLease, root.join("LOCK"));
+        let lease = complete_after_blocking_worker_release(
+            &runtime,
+            backend.acquire_writer_lease(lease_object.clone()),
+            "writer lease acquire should wait behind the occupied blocking worker",
+        )
+        .expect("runtime writer lease acquire completes");
+        assert!(
+            lease_object.path().exists(),
+            "runtime writer lease should create marker"
+        );
+        drop(lease);
+        assert!(
+            !lease_object.path().exists(),
+            "dropping runtime writer lease should remove marker"
+        );
+
+        let listed_path = root.join("directory-file.tmp");
+        std::fs::write(&listed_path, b"listed").expect("directory file writes");
+        let files = complete_after_blocking_worker_release(
+            &runtime,
+            backend.list_directory_files(directory.clone()),
+            "directory listing should wait behind the occupied blocking worker",
+        )
+        .expect("runtime directory listing completes");
+        assert!(
+            files.iter().any(|file| file.path() == listed_path),
+            "directory listing should include the written file"
+        );
+
+        let sync_tmp = root.join("sync.tmp");
+        let sync_published = root.join("sync.trinet");
+        std::fs::write(&sync_tmp, b"sync").expect("sync temp file writes");
+        std::fs::rename(&sync_tmp, &sync_published).expect("sync temp file renames");
+        complete_after_blocking_worker_release(
+            &runtime,
+            backend.sync_directory_after_renames(directory),
+            "directory sync should wait behind the occupied blocking worker",
+        )
+        .expect("runtime directory sync completes");
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[test]
+    fn runtime_enabled_native_file_manifest_wal_and_listing_use_blocking_adapter() {
+        let root = temp_storage_root("trine-kv-runtime-metadata-storage");
+        std::fs::create_dir_all(&root).expect("test dir creates");
+        let runtime = Runtime::with_blocking_limits(RuntimeOptions::native_threads(), 1, 8);
+        let backend = NativeFileBackend::with_runtime(runtime.clone());
+
+        let manifest =
+            StorageObjectId::native_file(StorageObjectKind::Manifest, root.join("MANIFEST"));
+        complete_after_blocking_worker_release(
+            &runtime,
+            backend.publish_manifest(
+                manifest.clone(),
+                Arc::from(&b"manifest"[..]),
+                DurabilityMode::Buffered,
+            ),
+            "manifest publish should wait behind the occupied blocking worker",
+        )
+        .expect("runtime manifest publish completes");
+        let manifest_bytes = complete_after_blocking_worker_release(
+            &runtime,
+            backend.read_current_manifest(manifest.clone()),
+            "manifest read should wait behind the occupied blocking worker",
+        )
+        .expect("runtime manifest read completes")
+        .expect("manifest exists");
+        assert_eq!(&*manifest_bytes, b"manifest");
+
+        let wal = StorageObjectId::native_file(StorageObjectKind::Wal, root.join("trine.wal"));
+        let wal_tmp =
+            StorageObjectId::native_file(StorageObjectKind::Wal, root.join("trine.wal.tmp"));
+        std::fs::write(wal.path(), b"old wal").expect("old WAL writes");
+        complete_after_blocking_worker_release(
+            &runtime,
+            backend.rewrite_wal(
+                wal.clone(),
+                wal_tmp.clone(),
+                Arc::from(&b"new wal"[..]),
+                DurabilityMode::Buffered,
+            ),
+            "WAL rewrite should wait behind the occupied blocking worker",
+        )
+        .expect("runtime WAL rewrite completes");
+        assert_eq!(std::fs::read(wal.path()).expect("WAL reads"), b"new wal");
+        assert!(
+            !wal_tmp.path().exists(),
+            "runtime WAL rewrite should remove the temporary object"
+        );
+
+        let table_path = root.join("table-00000000000000000021.trinet");
+        std::fs::write(&table_path, b"table").expect("table file writes");
+        let objects = complete_after_blocking_worker_release(
+            &runtime,
+            backend.list_objects(
+                StorageObjectListRequest::native_file(StorageObjectKind::Table, &root)
+                    .with_file_extension("trinet"),
+            ),
+            "object listing should wait behind the occupied blocking worker",
+        )
+        .expect("runtime object listing completes");
+        assert_eq!(
+            objects,
+            vec![StorageObjectId::native_file(
+                StorageObjectKind::Table,
+                &table_path
+            )]
+        );
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[test]
+    fn runtime_enabled_native_file_append_operations_use_blocking_adapter() {
+        let root = temp_storage_root("trine-kv-runtime-append-storage");
+        let object = StorageObjectId::native_file(StorageObjectKind::Wal, root.join("trine.wal"));
+        let runtime = Runtime::with_blocking_limits(RuntimeOptions::native_threads(), 1, 8);
+        let backend = NativeFileBackend::with_runtime(runtime.clone());
+
+        let mut append = complete_after_blocking_worker_release(
+            &runtime,
+            backend.open_append(object.clone()),
+            "append open should wait behind the occupied blocking worker",
+        )
+        .expect("runtime append object opens");
+        complete_after_blocking_worker_release(
+            &runtime,
+            StorageAppendObject::append(&mut append, b"first", DurabilityMode::Buffered),
+            "append write should wait behind the occupied blocking worker",
+        )
+        .expect("runtime append write completes");
+        complete_after_blocking_worker_release(
+            &runtime,
+            StorageAppendObject::persist(&mut append, DurabilityMode::Flush),
+            "append persist should wait behind the occupied blocking worker",
+        )
+        .expect("runtime append persist completes");
+        assert_eq!(
+            std::fs::read(object.path()).expect("WAL object reads"),
+            b"first"
+        );
+
+        let release = hold_runtime_blocking_worker(&runtime);
+        append
+            .append_blocking(b"second", DurabilityMode::Buffered)
+            .expect("blocking append stays direct");
+        append
+            .persist_blocking(DurabilityMode::Buffered)
+            .expect("blocking append persist stays direct");
+        release.send(()).expect("release blocking worker");
+        assert_eq!(
+            std::fs::read(object.path()).expect("WAL object reads"),
+            b"firstsecond"
+        );
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[test]
+    fn inline_runtime_native_file_mutations_remain_ready() {
+        let root = temp_storage_root("trine-kv-inline-runtime-mutations");
+        let runtime = Runtime::new(RuntimeOptions::inline());
+        let backend = NativeFileBackend::with_runtime(runtime);
+        let table = StorageObjectId::native_file(
+            StorageObjectKind::Table,
+            root.join("table-00000000000000000031.trinet"),
+        );
+        poll_ready_storage_future(backend.write_object(
+            table.clone(),
+            Arc::from(&b"inline table"[..]),
+            DurabilityMode::Buffered,
+        ))
+        .expect("inline runtime object write is ready");
+        assert_eq!(
+            std::fs::read(table.path()).expect("table object reads"),
+            b"inline table"
+        );
+
+        let wal = StorageObjectId::native_file(StorageObjectKind::Wal, root.join("trine.wal"));
+        let mut append =
+            poll_ready_storage_future(backend.open_append(wal.clone())).expect("WAL opens");
+        poll_ready_storage_future(StorageAppendObject::append(
+            &mut append,
+            b"inline wal",
+            DurabilityMode::Buffered,
+        ))
+        .expect("inline runtime append is ready");
+        poll_ready_storage_future(StorageAppendObject::persist(
+            &mut append,
+            DurabilityMode::Buffered,
+        ))
+        .expect("inline runtime append persist is ready");
+        assert_eq!(
+            std::fs::read(wal.path()).expect("WAL object reads"),
+            b"inline wal"
+        );
+
+        poll_ready_storage_future(backend.delete_object(table))
+            .expect("inline runtime object delete is ready");
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
     }
 
     #[test]

@@ -6,15 +6,19 @@ Complete
 
 ## Goal
 
-Route native-file owned storage reads through the bounded runtime blocking
-adapter when a runtime-enabled backend is used.
+Route native-file owned storage writes, append operations, manifest publish,
+and object listing through the bounded runtime blocking adapter when a
+runtime-enabled backend is used.
 
 ## Scope
 
-- Add a result-bearing blocking runtime future for short-lived owned work.
-- Allow native-file storage backends to carry a runtime boundary.
-- Route native-file whole-object reads and owned read-buffer operations through
-  the bounded blocking adapter when the backend/object has a native runtime.
+- Route native-file object writes and deletes through the runtime boundary when
+  the backend has a native runtime.
+- Route native-file WAL rewrite, manifest read/publish, and object listing
+  through the runtime boundary when the backend has a native runtime.
+- Route native-file append-object open, append, and persist through the runtime
+  boundary when the backend/object has a native runtime.
+- Preserve direct blocking adapters for synchronous callers.
 - Preserve inline/no-runtime storage behavior.
 - Preserve existing borrowed blocking read paths for current table/blob decode
   code.
@@ -28,8 +32,7 @@ adapter when a runtime-enabled backend is used.
 - Adding a public executor dependency.
 - Adding public runtime tuning options.
 - Converting table/blob/block decode call sites to async advancement.
-- Converting storage writes, append, manifest publish, and object listing to
-  owned runtime-submittable requests.
+- Migrating database call sites to runtime-enabled native-file backends.
 - Removing the serialized publish barrier.
 - Adding WAL shards or writer-local deltas.
 - Changing transaction conflict rules.
@@ -38,12 +41,15 @@ adapter when a runtime-enabled backend is used.
 
 ## Acceptance Gate
 
-- Roadmap records this as the native-file runtime-owned storage read phase.
-- Runtime exposes a result-bearing bounded blocking future.
-- Native-file backends can be constructed with a runtime.
-- Runtime-enabled native-file whole-object reads and owned read-buffer reads
-  execute through the bounded blocking adapter.
-- Inline/no-runtime storage reads remain immediately pollable.
+- Roadmap records this as the native-file runtime-owned storage mutation phase.
+- Runtime-enabled native-file object writes/deletes execute through the bounded
+  blocking adapter.
+- Runtime-enabled native-file WAL rewrite, manifest read/publish, directory
+  operations, and object listing execute through the bounded blocking adapter.
+- Runtime-enabled native-file append-object open, append, and persist execute
+  through the bounded blocking adapter.
+- Blocking storage adapters remain direct synchronous paths.
+- Inline/no-runtime storage operations remain immediately pollable.
 - Existing borrowed blocking read paths remain unchanged for current decode
   code.
 - Focused runtime/storage tests, formatting, clippy, full tests,
@@ -53,12 +59,12 @@ adapter when a runtime-enabled backend is used.
 ## Active Task Slice
 
 ```text
-task328 [x] goal:start native-file runtime-owned read slice | scope:current roadmap | verify:manual
-task329 [x] goal:add result-bearing runtime blocking future | scope:src/runtime.rs | verify:runtime tests
-task330 [x] goal:attach runtime boundary to native-file backend/object | scope:src/storage.rs | verify:storage tests
-task331 [x] goal:route owned native-file reads through runtime when available | scope:src/storage.rs | verify:storage tests
-task332 [x] goal:preserve borrowed blocking table/blob read paths | scope:src/storage.rs table/blob tests | verify:full tests
-task333 [x] goal:record evidence and commit | scope:.phrase/evidence.md current roadmap | verify:git status
+task334 [x] goal:start native-file runtime-owned storage mutation slice | scope:current roadmap | verify:manual
+task335 [x] goal:route object write/delete and listing through runtime | scope:src/storage.rs | verify:storage tests
+task336 [x] goal:route manifest read/publish, WAL rewrite, and directory ops through runtime | scope:src/storage.rs | verify:storage tests
+task337 [x] goal:route append open/append/persist through runtime | scope:src/storage.rs | verify:storage tests
+task338 [x] goal:preserve direct blocking adapters and no-runtime behavior | scope:src/storage.rs | verify:storage tests full tests
+task339 [x] goal:record evidence and commit | scope:.phrase/evidence.md current roadmap | verify:git status
 ```
 
 ## Known Blockers
@@ -68,12 +74,9 @@ task333 [x] goal:record evidence and commit | scope:.phrase/evidence.md current 
 - Table/blob decode paths still use blocking native-file calls.
 - Range and prefix cursor advancement still expose async compatibility wrappers
   over synchronous iterator advancement.
-- Storage writes, append, manifest publish, and object listing still need owned
-  runtime-submittable request/completion wrappers.
 - True multi-writer execution still needs writer-local deltas and WAL
   partitioning.
-- Default native-file backend construction remains no-runtime until call sites
-  are migrated.
+- Database call sites still mostly construct no-runtime native-file backends.
 
 ## Evidence
 
@@ -146,8 +149,29 @@ task333 [x] goal:record evidence and commit | scope:.phrase/evidence.md current 
   `cargo test --all-targets --all-features`.
 - `git diff --check` passed.
 - Forbidden-term scan passed outside the repository instruction file.
+- Native-file owned storage mutations now share a runtime-owned task helper
+  that submits owned closures to the bounded blocking adapter when a native
+  runtime is attached.
+- Runtime-enabled object writes/deletes, object listing, WAL rewrite,
+  writer-lease acquire, directory create/list/sync, manifest read/publish, and
+  append open/append/persist now wait behind an occupied blocking worker.
+- Native-file blocking storage adapters now call the native synchronous
+  operations directly, so synchronous callers are not coupled to runtime queue
+  state.
+- Blocking trait defaults still provide an async-to-blocking bridge for future
+  backends that do not need native-file direct overrides.
+- Inline runtime and no-runtime native-file mutation paths remain immediately
+  pollable.
+- Existing table/blob block decode paths still use borrowed blocking reads and
+  were not converted in this phase.
+- Verification passed: `cargo fmt --check`,
+  `cargo clippy --all-targets --all-features -- -D warnings`,
+  `cargo test storage --lib`, and
+  `cargo test --all-targets --all-features`.
+- `git diff --check` passed.
+- Forbidden-term scan passed outside the repository instruction file.
 
 ## Next Recommendation
 
-- Add owned runtime-submittable wrappers for storage writes, append, manifest
-  publish, and object listing before migrating DB call sites.
+- Migrate database construction paths to runtime-enabled native-file backends
+  in small groups, while keeping current borrowed block decode paths explicit.
