@@ -1255,3 +1255,25 @@ deletion already route through backend-owned object operations.
   recovery, compaction, public API behavior, MVCC, WAL, manifest, and storage
   formats remain unchanged.
 - Focused blob/persistent tests, formatting, clippy, and diff checks pass.
+
+### Phase 60: Native-File Blob Object Listing Backend
+
+**Status**: Complete
+
+**Goal**: Route blob object listing through the storage backend object listing
+operation.
+
+**Entry Condition**: Phase 59 complete and blob object bytes already route
+through backend read/write/delete operations.
+
+**Acceptance Gate**:
+
+- Blob file discovery uses the storage backend object listing operation.
+- Blob file-id parsing remains in the blob module.
+- Directory skipping, non-blob extension filtering, non-blob prefix filtering,
+  uppercase extension handling, and malformed blob filename corruption behavior
+  remain unchanged.
+- Recovery, stats, blob GC, public API behavior, MVCC, WAL, manifest,
+  compaction, and storage formats remain unchanged.
+- Focused blob/recovery/persistent tests, formatting, clippy, and diff checks
+  pass.

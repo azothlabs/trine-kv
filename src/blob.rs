@@ -1,6 +1,5 @@
 use std::{
     collections::BTreeSet,
-    fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -11,8 +10,9 @@ use crate::{
     internal_key::{InternalKey, ValueKind},
     options::DurabilityMode,
     storage::{
-        BlockingStorageObjectWriteBackend, BlockingStorageReadBackend, BlockingStorageReadObject,
-        NativeFileBackend, StorageCapability, StorageObjectId, StorageObjectKind,
+        BlockingStorageObjectListBackend, BlockingStorageObjectWriteBackend,
+        BlockingStorageReadBackend, BlockingStorageReadObject, NativeFileBackend,
+        StorageCapability, StorageObjectId, StorageObjectKind, StorageObjectListRequest,
         StorageReadBackend,
     },
     types::Sequence,
@@ -141,35 +141,35 @@ pub fn blob_path(db_path: &Path, file_id: u64) -> PathBuf {
 
 pub(crate) fn list_blob_file_ids(db_path: &Path) -> Result<BTreeSet<u64>> {
     let mut file_ids = BTreeSet::new();
+    let backend = blob_storage_backend();
+    backend
+        .capabilities()
+        .require(StorageCapability::ObjectListing)?;
+    let request = StorageObjectListRequest::native_file(StorageObjectKind::Blob, db_path)
+        .with_file_extension(BLOB_FILE_EXTENSION);
 
-    for entry in fs::read_dir(db_path)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
+    for object in backend.list_objects_blocking(request)? {
+        if let Some(file_id) = blob_file_id_from_path(object.path())? {
+            file_ids.insert(file_id);
         }
-
-        let path = entry.path();
-        let has_blob_extension = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case(BLOB_FILE_EXTENSION));
-        if !has_blob_extension {
-            continue;
-        }
-
-        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            continue;
-        };
-        let Some(file_id) = stem.strip_prefix("blob-") else {
-            continue;
-        };
-        let file_id = file_id.parse::<u64>().map_err(|_| Error::Corruption {
-            message: format!("invalid blob file name: {}", path.display()),
-        })?;
-        file_ids.insert(file_id);
     }
 
     Ok(file_ids)
+}
+
+fn blob_file_id_from_path(path: &Path) -> Result<Option<u64>> {
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return Ok(None);
+    };
+    let Some(file_id) = stem.strip_prefix("blob-") else {
+        return Ok(None);
+    };
+    file_id
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| Error::Corruption {
+            message: format!("invalid blob file name: {}", path.display()),
+        })
 }
 
 pub(crate) fn write_large_values(
@@ -1062,6 +1062,8 @@ impl<'payload> Cursor<'payload> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use crate::{
         blob::{
             BlobFileHeader, BlobRecord, decode_blob_file, encode_blob_file, read_indexed_value,
@@ -1339,6 +1341,42 @@ mod tests {
         assert_eq!(blob_file.records[1].record, records[1]);
         assert_eq!(properties, blob_file.properties);
         assert_eq!(indexed_value, b"value-b");
+
+        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn list_blob_file_ids_reads_backend_object_listing() {
+        let temp = temp_blob_dir("list-object");
+        std::fs::write(temp.join("blob-00000000000000000017.trineb"), b"blob-a")
+            .expect("blob file writes");
+        std::fs::write(temp.join("blob-00000000000000000018.TRINEB"), b"blob-b")
+            .expect("uppercase blob file writes");
+        std::fs::write(
+            temp.join("blob-00000000000000000019.trinet"),
+            b"wrong extension",
+        )
+        .expect("non-blob file writes");
+        std::fs::write(temp.join("notes.trineb"), b"wrong prefix").expect("non-blob prefix writes");
+        std::fs::create_dir(temp.join("blob-00000000000000000020.trineb"))
+            .expect("blob-shaped directory creates");
+
+        let ids = super::list_blob_file_ids(&temp).expect("blob file ids list");
+
+        assert_eq!(ids, BTreeSet::from([17, 18]));
+
+        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn list_blob_file_ids_rejects_malformed_blob_names() {
+        let temp = temp_blob_dir("list-malformed");
+        std::fs::write(temp.join("blob-not-a-number.trineb"), b"bad blob")
+            .expect("malformed blob file writes");
+
+        let error = super::list_blob_file_ids(&temp).expect_err("malformed blob file name fails");
+
+        assert!(error.to_string().contains("invalid blob file name"));
 
         std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }

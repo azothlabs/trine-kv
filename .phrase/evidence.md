@@ -5208,3 +5208,51 @@ Record only evidence that can change planning or durable decisions.
 
 - Route blob listing through backend object listing so blob discovery and blob
   reads share the same storage boundary.
+
+## 2026-05-31: Native-File Blob Object Listing Backend
+
+### Observation
+
+- Blob object reads now route through backend random-read operations.
+- Table file discovery already routes through `StorageObjectListBackend`.
+- Blob file discovery still used a direct native directory scan while recovery,
+  stats, and blob cleanup depend on that discovery result.
+
+### Interpretation
+
+- Blob object listing can move behind the backend boundary without moving blob
+  filename rules into storage.
+- Storage should provide candidate blob objects by kind and extension; the blob
+  module should keep file-id parsing and malformed-name corruption behavior.
+- This closes the native-file blob object lifecycle around write, read, list,
+  and delete operations.
+
+### Verification
+
+- `list_blob_file_ids` now requires `StorageCapability::ObjectListing` and
+  calls `StorageObjectListBackend`.
+- Blob file-id parsing remains in `src/blob.rs`.
+- Added `list_blob_file_ids_reads_backend_object_listing`.
+- Added `list_blob_file_ids_rejects_malformed_blob_names`.
+- The listing tests cover uppercase blob extensions, wrong extensions, wrong
+  prefixes, blob-shaped directories, and malformed blob names.
+- Direct native directory reads are gone from `src/blob.rs`.
+- `cargo test blob --lib`
+- `cargo test recovery --all-targets`
+- `cargo test persistent_stats_report_tables_blobs_and_compactions --test persistent_wal`
+- `cargo test persistent_blob --test persistent_wal`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+
+### Remaining Blockers
+
+- Public async API, async runtime selection, WAL append, writer lease handling,
+  parent-directory sync routing, and production in-memory object routing remain
+  later phases.
+
+### Recommended Next Action
+
+- Reassess remaining direct native-file operations and choose between WAL
+  append, writer lease handling, or parent-directory sync routing as the next
+  storage-boundary slice.
