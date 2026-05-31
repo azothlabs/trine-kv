@@ -1640,3 +1640,25 @@ routes through the runtime boundary.
   compaction, recovery, cleanup, and public API behavior remain unchanged.
 - Focused runtime/background tests, formatting, clippy, full tests, and diff
   checks pass.
+
+### Phase 77: Owned Write Request And Completion Shape
+
+**Status**: Complete
+
+**Goal**: Introduce the owned write request and completion waiter needed before
+accepted writes can move to runtime-owned task execution.
+
+**Entry Condition**: Phase 76 complete and runtime cancellation/task-join
+primitives exist.
+
+**Acceptance Gate**:
+
+- Batch writes and transaction commits build an owned write request.
+- Current write execution completes through an internal accepted-write waiter.
+- The waiter delivers successful and failed commit results without cloning
+  commit errors.
+- Existing async cancellation tests continue to pass.
+- Writer coordinator, commit tracker, WAL/table/blob/manifest formats, MVCC,
+  compaction, recovery, cleanup, and public API behavior remain unchanged.
+- Focused write/async tests, formatting, clippy, full tests, and diff checks
+  pass.

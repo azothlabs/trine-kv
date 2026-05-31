@@ -6,83 +6,77 @@ Complete
 
 ## Goal
 
-Add runtime cancellation and task-join primitives, then wire the cancellation
-token into background maintenance shutdown.
+Introduce an owned write request and completion waiter so accepted write
+execution can later move behind the runtime boundary without changing commit
+semantics.
 
 ## Scope
 
-- Add a cloneable runtime cancellation token.
-- Expose runtime capabilities for cancellation tokens and task join.
-- Keep native-thread background task join behavior behind the runtime boundary.
-- Store a database shutdown token and cancel it when background workers are
-  stopped.
-- Make background maintenance workers observe the runtime cancellation token in
-  addition to the existing maintenance shutdown state.
+- Add an internal owned write request type for batch and transaction commits.
+- Add an internal accepted-write/completion waiter shape.
+- Route current synchronous write and transaction commit paths through the
+  owned request/completion path while still executing inline.
+- Preserve cancellation-before-poll behavior for public async compatibility
+  methods.
 - Preserve current default native-thread behavior, writer coordinator, commit
   tracker, WAL/table/blob/manifest formats, MVCC, compaction, recovery,
   cleanup, and storage behavior.
 
 ## Out Of Scope
 
-- Selecting or integrating a concrete async runtime crate.
-- Moving commits onto owned runtime tasks.
-- Adding async channels, timers, sleeps, or executor yield.
+- Moving accepted writes onto runtime tasks.
+- Adding channels or async executor integration.
 - Removing the writer coordinator mutex.
-- Changing maintenance scheduling semantics.
+- Changing transaction conflict rules.
+- Introducing WAL shards or writer-local deltas.
 - Changing persistent native-file blocking behavior.
 
 ## Acceptance Gate
 
-- Roadmap records this as the runtime cancellation primitive phase.
-- Runtime exposes cancellation token capability and task-join capability.
-- Cancellation token clones share state and are test-covered.
-- Native-thread background tasks can observe cancellation and join in tests.
-- Database background worker shutdown cancels the runtime token.
-- Existing default background worker behavior remains unchanged.
-- Focused runtime/background tests, formatting, clippy, full tests,
-  `git diff --check`, and forbidden-term scan pass.
-- Evidence records remaining runtime primitives needed before owned async commit
-  execution.
+- Roadmap records this as the owned write request/completion phase.
+- Batch writes and transaction commits build an owned write request.
+- Current write execution completes through an internal accepted-write waiter.
+- The waiter delivers both successful and failed commit results without cloning
+  commit errors.
+- Existing async cancellation tests still pass.
+- Focused write/async tests, formatting, clippy, full tests, `git diff --check`,
+  and forbidden-term scan pass.
+- Evidence records that moving execution to runtime tasks remains a later phase.
 
 ## Active Task Slice
 
 ```text
-task294 [x] goal:start runtime cancellation slice | scope:current roadmap | verify:manual
-task295 [x] goal:add cancellation token and capability flags | scope:src/runtime.rs src/lib.rs | verify:runtime unit tests
-task296 [x] goal:wire db background shutdown to cancellation token | scope:src/db.rs | verify:focused db/runtime tests
-task297 [x] goal:run verification gate | scope:workspace | verify:fmt clippy tests diff
-task298 [x] goal:record evidence and commit | scope:.phrase/evidence.md current roadmap | verify:git status
+task299 [x] goal:start owned write request slice | scope:current roadmap | verify:manual
+task300 [x] goal:add owned write request and completion types | scope:src/db/commit.rs | verify:unit tests
+task301 [x] goal:route write and transaction commit through owned request | scope:src/db/commit.rs | verify:write tests
+task302 [x] goal:run verification gate | scope:workspace | verify:fmt clippy tests diff
+task303 [x] goal:record evidence and commit | scope:.phrase/evidence.md current roadmap | verify:git status
 ```
 
 ## Known Blockers
 
-- None for this runtime primitive slice.
-- Owned async commit execution still needs an owned request/task shape, waiter
-  result delivery, and a target-specific blocking policy.
+- None for this request/completion shape slice.
+- Moving accepted writes to runtime tasks still needs a scheduling path and
+  waiter wake strategy.
 
 ## Evidence
 
-- Phase 75 introduced runtime-owned background task spawning and task handles.
-- Evidence from Phase 75 says the runtime boundary still lacks cancellation
-  tokens and shutdown joins before owned async commit execution.
-- Current background worker shutdown already wakes workers through the
-  maintenance coordinator, so the runtime cancellation token can be added
-  without changing scheduling semantics.
-- `CancellationToken` is now public, cloneable, and backed by shared atomic
-  state.
-- Runtime capabilities now use method-based capability queries instead of
-  growing public bool fields.
-- Native-thread runtime tasks can observe cancellation and join in focused
-  tests.
-- `DbInner` now stores a runtime shutdown token, shutdown paths cancel it, and
-  background maintenance workers check it after wakeup.
-- Verification passed: `cargo fmt --check`, `cargo test runtime --lib`,
-  `cargo test persistent_background_workers_flush_and_compact_pressure --test
-  persistent_wal`, `cargo clippy --all-targets --all-features -- -D warnings`,
-  `cargo test --all-targets --all-features`, `git diff --check`, and the
-  forbidden-term scan outside the repository instruction file.
+- Phase 76 added cancellation tokens and task join primitives.
+- Evidence from Phase 76 says owned async commit execution still needs an owned
+  write request/task shape and waiter result delivery.
+- The current write path already has explicit commit tracker terminal states,
+  so this phase can change ownership shape without changing commit visibility.
+- Batch writes and transaction commits now build `WriteRequest`.
+- Current inline execution now passes through `AcceptedWrite` and `WriteWaiter`.
+- Completion waiter tests cover successful and failed commit results without
+  cloning commit errors.
+- Existing async cancellation tests still pass.
+- Verification passed: `cargo fmt --check`, `cargo test accepted_write --lib`,
+  `cargo test --test async_api`, clippy with all targets/features and warnings
+  denied, `cargo test --all-targets --all-features`, `git diff --check`, and
+  the forbidden-term scan outside the repository instruction file.
 
 ## Next Recommendation
 
-- Commit this slice, then define the owned write request/task shape on top of
-  the runtime boundary.
+- Commit this slice, then move accepted write execution behind a runtime-owned
+  task in the next phase.

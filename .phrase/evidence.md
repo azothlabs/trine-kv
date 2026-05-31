@@ -6019,3 +6019,54 @@ Record only evidence that can change planning or durable decisions.
 
 - Define the owned write request/task shape on top of the runtime cancellation
   and commit tracker boundaries.
+
+## 2026-05-31: Owned Write Request And Completion Shape
+
+### Observation
+
+- Write execution had commit tracker terminal states and runtime cancellation
+  primitives, but write parameters still entered the commit path as loose
+  function arguments.
+- Moving accepted writes to a runtime-owned task requires a single owned request
+  value and a result-delivery shape.
+- Existing async compatibility tests already cover cancellation before polling
+  and terminal commit after polling.
+
+### Interpretation
+
+- The write path can adopt an owned request and completion waiter while still
+  executing inline.
+- This preserves current behavior and creates the handoff point needed by the
+  next runtime-owned execution phase.
+- Completion should move the `Result<CommitInfo>` into the waiter once rather
+  than cloning errors.
+
+### Verification
+
+- Added internal `WriteRequest` for batch and transaction commits.
+- Added internal `AcceptedWrite`, `WriteCompletion`, and `WriteWaiter`.
+- Routed `Db::write` and transaction commit through the owned
+  request/completion path.
+- Kept commit protocol execution inline for this phase.
+- Added focused tests for successful and failed accepted write completion.
+- Existing async cancellation tests still pass.
+- `cargo fmt --check`
+- `cargo test accepted_write --lib`
+- `cargo test --test async_api`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan outside the repository instruction file
+
+### Remaining Blockers
+
+- Accepted writes still execute inline.
+- Runtime-owned write execution needs a scheduling step that runs
+  `AcceptedWrite` independently from the caller future.
+- True multi-writer execution still needs writer-local deltas, WAL partitioning,
+  and a publish barrier.
+
+### Recommended Next Action
+
+- Move accepted write execution behind the runtime boundary while preserving the
+  cancellation-before-poll and terminal-after-acceptance tests.

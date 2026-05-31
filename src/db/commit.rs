@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::{
     error::{Error, Result},
@@ -12,9 +12,121 @@ use crate::{
 
 use super::{Db, lock_poisoned, validate_batch_len};
 
+#[derive(Debug)]
+struct WriteRequest {
+    operations: Vec<BatchOperation>,
+    write_options: WriteOptions,
+    transaction_reads: Option<TransactionReads>,
+}
+
+#[derive(Debug)]
+struct TransactionReads {
+    read_sequence: Sequence,
+    read_set: TransactionReadSet,
+}
+
+#[derive(Debug)]
+struct AcceptedWrite {
+    request: WriteRequest,
+    completion: Arc<WriteCompletion>,
+}
+
+#[derive(Debug)]
+struct WriteWaiter {
+    completion: Arc<WriteCompletion>,
+}
+
+#[derive(Debug)]
+struct WriteCompletion {
+    result: Mutex<Option<Result<CommitInfo>>>,
+    ready: Condvar,
+}
+
+impl WriteRequest {
+    fn batch(batch: WriteBatch, write_options: WriteOptions) -> Self {
+        Self {
+            operations: batch.into_operations(),
+            write_options,
+            transaction_reads: None,
+        }
+    }
+
+    fn transaction(
+        read_sequence: Sequence,
+        read_set: TransactionReadSet,
+        batch: WriteBatch,
+        write_options: WriteOptions,
+    ) -> Self {
+        Self {
+            operations: batch.into_operations(),
+            write_options,
+            transaction_reads: Some(TransactionReads {
+                read_sequence,
+                read_set,
+            }),
+        }
+    }
+}
+
+impl AcceptedWrite {
+    fn accept(request: WriteRequest) -> (Self, WriteWaiter) {
+        let completion = Arc::new(WriteCompletion::new());
+        (
+            Self {
+                request,
+                completion: Arc::clone(&completion),
+            },
+            WriteWaiter { completion },
+        )
+    }
+
+    fn execute(self, db: &Db) {
+        let result = db.commit_write_request(self.request);
+        self.completion.complete(result);
+    }
+}
+
+impl WriteCompletion {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn complete(&self, result: Result<CommitInfo>) {
+        let mut slot = match self.result.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *slot = Some(result);
+        self.ready.notify_all();
+    }
+}
+
+impl WriteWaiter {
+    fn wait(self) -> Result<CommitInfo> {
+        let mut result = self
+            .completion
+            .result
+            .lock()
+            .map_err(|_| lock_poisoned("write completion"))?;
+        loop {
+            if let Some(result) = result.take() {
+                return result;
+            }
+            result = self
+                .completion
+                .ready
+                .wait(result)
+                .map_err(|_| lock_poisoned("write completion"))?;
+        }
+    }
+}
+
 impl Db {
     pub fn write(&self, batch: WriteBatch, options: WriteOptions) -> Result<CommitInfo> {
-        self.commit_operations(batch.into_operations(), options, None)
+        self.run_accepted_write(WriteRequest::batch(batch, options))
     }
 
     pub(crate) fn commit_transaction(
@@ -24,19 +136,26 @@ impl Db {
         batch: WriteBatch,
         write_options: WriteOptions,
     ) -> Result<CommitInfo> {
-        self.commit_operations(
-            batch.into_operations(),
+        self.run_accepted_write(WriteRequest::transaction(
+            read_sequence,
+            read_set,
+            batch,
             write_options,
-            Some((read_sequence, read_set)),
-        )
+        ))
     }
 
-    fn commit_operations(
-        &self,
-        operations: Vec<BatchOperation>,
-        write_options: WriteOptions,
-        transaction_reads: Option<(Sequence, TransactionReadSet)>,
-    ) -> Result<CommitInfo> {
+    fn run_accepted_write(&self, request: WriteRequest) -> Result<CommitInfo> {
+        let (accepted_write, waiter) = AcceptedWrite::accept(request);
+        accepted_write.execute(self);
+        waiter.wait()
+    }
+
+    fn commit_write_request(&self, request: WriteRequest) -> Result<CommitInfo> {
+        let WriteRequest {
+            operations,
+            write_options,
+            transaction_reads,
+        } = request;
         self.ensure_open()?;
 
         if operations.is_empty() && transaction_reads.is_none() {
@@ -66,7 +185,11 @@ impl Db {
 
         // Read validation and writes share one commit slot. Once validation
         // succeeds, no other writer can sneak in before this batch lands.
-        if let Some((read_sequence, read_set)) = transaction_reads {
+        if let Some(TransactionReads {
+            read_sequence,
+            read_set,
+        }) = transaction_reads
+        {
             self.validate_transaction_reads(read_sequence, &read_set)?;
         }
         if operations.is_empty() {
@@ -243,9 +366,15 @@ const fn durability_rank(mode: DurabilityMode) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use crate::{db::CommitTracker, types::Sequence};
+    use crate::{
+        Db, WriteBatch,
+        db::CommitTracker,
+        error::Error,
+        options::{DbOptions, WriteOptions},
+        types::Sequence,
+    };
 
-    use super::{DurabilityMode, effective_durability};
+    use super::{AcceptedWrite, DurabilityMode, WriteRequest, effective_durability};
 
     #[test]
     fn database_durability_is_a_write_floor() {
@@ -287,5 +416,40 @@ mod tests {
 
         assert!(tracker.mark_skipped(slot).is_err());
         assert_eq!(tracker.visible_sequence(), Sequence::new(1));
+    }
+
+    #[test]
+    fn accepted_write_completion_delivers_success_result() {
+        let db = Db::open_memory().expect("memory db opens");
+        let mut batch = WriteBatch::new();
+        batch.put(b"k".to_vec(), b"v".to_vec());
+        let request = WriteRequest::batch(batch, WriteOptions::default());
+        let (accepted_write, waiter) = AcceptedWrite::accept(request);
+
+        accepted_write.execute(&db);
+        let commit = waiter.wait().expect("waiter receives commit result");
+
+        assert_eq!(commit.sequence(), db.last_committed_sequence());
+        assert_eq!(
+            db.get(b"k").expect("read committed key"),
+            Some(b"v".to_vec())
+        );
+    }
+
+    #[test]
+    fn accepted_write_completion_delivers_error_result() {
+        let mut options = DbOptions::memory();
+        options.read_only = true;
+        let db = Db::memory(options).expect("read-only memory db opens");
+        let mut batch = WriteBatch::new();
+        batch.put(b"k".to_vec(), b"v".to_vec());
+        let request = WriteRequest::batch(batch, WriteOptions::default());
+        let (accepted_write, waiter) = AcceptedWrite::accept(request);
+
+        accepted_write.execute(&db);
+        let error = waiter.wait().expect_err("waiter receives commit error");
+
+        assert!(matches!(error, Error::ReadOnly));
+        assert_eq!(db.get(b"k").expect("read missing key"), None);
     }
 }
