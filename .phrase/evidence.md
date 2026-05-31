@@ -5770,3 +5770,45 @@ Record only evidence that can change planning or durable decisions.
 
 - Commit the slice, then reassess whether the next async-first step should be
   cursor advancement or cancellation-safe write acceptance.
+
+## 2026-05-31: Async Cursor Compatibility Advancement
+
+### Observation
+
+- Phase 71 added async construction methods for range/prefix iterators.
+- Cursor advancement itself was still exposed only through blocking
+  `Iterator::next`.
+- The async-first protocol expects cursor advancement to have an async public
+  shape returning a fallible optional row.
+
+### Interpretation
+
+- `Result<Option<_>>` async compatibility methods match the target cursor API
+  shape without removing existing iterator behavior.
+- This slice should not claim non-blocking native-file I/O; Blob read routing,
+  runtime selection, and cancellation-safe writes remain separate phases.
+
+### Verification
+
+- Added `Iter::next_async -> Result<Option<KeyValue>>`.
+- Added `LazyIter::next_async -> Result<Option<LazyKeyValue>>`.
+- Added async compatibility read/conversion methods for `LazyValue` and
+  `LazyKeyValue`.
+- Extended `memory_async_compatibility_surface_smoke` to consume normal and
+  lazy cursors through async advancement.
+- `cargo fmt --check`
+- `cargo test memory_async_compatibility_surface_smoke --test async_api`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan
+
+### Remaining Blockers
+
+- Async runtime selection, non-blocking native-file execution,
+  cancellation-safe write acceptance, Blob read storage routing, and production
+  in-memory object routing remain later phases.
+
+### Recommended Next Action
+
+- Reassess cancellation-safe write acceptance as the next async-first step.

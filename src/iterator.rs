@@ -151,6 +151,13 @@ impl LazyKeyValue {
     }
 }
 
+#[allow(clippy::unused_async)]
+impl LazyKeyValue {
+    pub async fn into_key_value_async(self) -> Result<KeyValue> {
+        self.into_key_value()
+    }
+}
+
 impl LazyValue {
     #[must_use]
     pub fn is_inline(&self) -> bool {
@@ -197,6 +204,39 @@ impl LazyValue {
                 }
                 Ok(bytes)
             }
+        }
+    }
+}
+
+#[allow(clippy::unused_async)]
+impl LazyValue {
+    pub async fn read_async(&self) -> Result<Value> {
+        self.read()
+    }
+
+    pub async fn into_value_async(self) -> Result<Value> {
+        self.into_value()
+    }
+}
+
+#[allow(clippy::unused_async)]
+impl Iter {
+    pub async fn next_async(&mut self) -> Result<Option<KeyValue>> {
+        match <Self as Iterator>::next(self) {
+            Some(Ok(item)) => Ok(Some(item)),
+            Some(Err(error)) => Err(error),
+            None => Ok(None),
+        }
+    }
+}
+
+#[allow(clippy::unused_async)]
+impl LazyIter {
+    pub async fn next_async(&mut self) -> Result<Option<LazyKeyValue>> {
+        match <Self as Iterator>::next(self) {
+            Some(Ok(item)) => Ok(Some(item)),
+            Some(Err(error)) => Err(error),
+            None => Ok(None),
         }
     }
 }

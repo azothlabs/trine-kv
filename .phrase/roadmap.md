@@ -1528,3 +1528,25 @@ have async-shaped futures plus blocking adapters.
 - Existing blocking API behavior remains unchanged.
 - Focused async API tests, formatting, clippy, full tests, and diff checks
   pass.
+
+### Phase 72: Async Cursor Compatibility Advancement
+
+**Status**: Complete
+
+**Goal**: Add async compatibility advancement for range/prefix cursors and lazy
+values without removing existing blocking iterator behavior.
+
+**Entry Condition**: Phase 71 complete and async range/prefix construction
+methods already exist for `Db` and `Bucket`.
+
+**Acceptance Gate**:
+
+- `Iter` exposes async advancement returning `Result<Option<KeyValue>>`.
+- `LazyIter` exposes async advancement returning `Result<Option<LazyKeyValue>>`.
+- `LazyValue` and `LazyKeyValue` expose async compatibility read/conversion
+  methods.
+- Existing `Iterator` implementations remain unchanged.
+- A focused memory-mode async smoke test consumes normal and lazy iterators
+  through async cursor methods without an external runtime crate.
+- Focused async API tests, formatting, clippy, full tests, and diff checks
+  pass.
