@@ -30,9 +30,10 @@ use crate::{
     search,
     stats::{FilterStats, ReadPathStats},
     storage::{
-        BlockingStorageReadBackend, BlockingStorageReadObject, NativeFileBackend, NativeFileObject,
-        NativeFileReadSource, StorageCapability, StorageObjectId, StorageObjectKind,
-        StorageReadBackend, StorageReadSource,
+        BlockingStorageObjectListBackend, BlockingStorageReadBackend, BlockingStorageReadObject,
+        NativeFileBackend, NativeFileObject, NativeFileReadSource, StorageCapability,
+        StorageObjectId, StorageObjectKind, StorageObjectListRequest, StorageReadBackend,
+        StorageReadSource,
     },
     types::{KeyRange, Sequence},
 };
@@ -2435,15 +2436,16 @@ pub fn table_path(db_path: &Path, table_id: TableId) -> PathBuf {
 }
 
 pub(crate) fn list_table_file_ids(db_path: &Path) -> Result<BTreeSet<TableId>> {
+    let backend = table_storage_backend();
+    backend
+        .capabilities()
+        .require(StorageCapability::ObjectListing)?;
+    let request = StorageObjectListRequest::native_file(StorageObjectKind::Table, db_path)
+        .with_file_extension(TABLE_FILE_EXTENSION);
     let mut table_ids = BTreeSet::new();
 
-    for entry in fs::read_dir(db_path)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-
-        let path = entry.path();
+    for object in backend.list_objects_blocking(request)? {
+        let path = object.path();
         let has_table_extension = path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -4826,6 +4828,30 @@ mod tests {
     use super::*;
     use crate::filter::PointKeyFilter;
     use crate::options::BucketOptions;
+
+    #[test]
+    fn list_table_file_ids_reads_backend_object_listing() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-list-table-ids-{}-{}",
+            std::process::id(),
+            table_time_suffix()
+        ));
+        std::fs::create_dir_all(&root).expect("test dir creates");
+        std::fs::write(table_path(&root, TableId(2)), b"table").expect("first table file writes");
+        std::fs::write(table_path(&root, TableId(4)), b"table").expect("second table file writes");
+        std::fs::write(root.join("MANIFEST"), b"manifest").expect("manifest writes");
+        std::fs::write(root.join("table-00000000000000000005.tmp"), b"tmp")
+            .expect("tmp file writes");
+        std::fs::create_dir(table_path(&root, TableId(6))).expect("table-shaped dir creates");
+
+        let ids = list_table_file_ids(&root).expect("table ids list");
+        assert_eq!(
+            ids.iter().copied().collect::<Vec<_>>(),
+            vec![TableId(2), TableId(4)]
+        );
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
 
     #[test]
     fn checked_block_index_round_trips_multiple_data_blocks() {

@@ -62,6 +62,40 @@ impl StorageObjectId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageObjectListRequest {
+    kind: StorageObjectKind,
+    root: PathBuf,
+    file_extension: Option<&'static str>,
+}
+
+impl StorageObjectListRequest {
+    pub(crate) fn native_file(kind: StorageObjectKind, root: impl Into<PathBuf>) -> Self {
+        Self {
+            kind,
+            root: root.into(),
+            file_extension: None,
+        }
+    }
+
+    pub(crate) fn with_file_extension(mut self, file_extension: &'static str) -> Self {
+        self.file_extension = Some(file_extension);
+        self
+    }
+
+    pub(crate) const fn kind(&self) -> StorageObjectKind {
+        self.kind
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    const fn file_extension(&self) -> Option<&'static str> {
+        self.file_extension
+    }
+}
+
 pub(crate) type StorageFuture<'op, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'op>>;
 pub(crate) type StorageReadFuture<'op, T> = StorageFuture<'op, T>;
 
@@ -71,6 +105,7 @@ pub(crate) enum StorageCapability {
     Volatile,
     Persistent,
     RandomRead,
+    ObjectListing,
     Append,
     AtomicManifestPublish,
     WriterLease,
@@ -88,6 +123,7 @@ impl StorageCapability {
             Self::Volatile => "volatile storage",
             Self::Persistent => "persistent storage",
             Self::RandomRead => "random read",
+            Self::ObjectListing => "object listing",
             Self::Append => "append",
             Self::AtomicManifestPublish => "atomic manifest publish",
             Self::WriterLease => "writer lease",
@@ -105,15 +141,16 @@ impl StorageCapability {
             Self::Volatile => 1 << 0,
             Self::Persistent => 1 << 1,
             Self::RandomRead => 1 << 2,
-            Self::Append => 1 << 3,
-            Self::AtomicManifestPublish => 1 << 4,
-            Self::WriterLease => 1 << 5,
-            Self::Flush => 1 << 6,
-            Self::StrictDataSync => 1 << 7,
-            Self::StrictMetadataSync => 1 << 8,
-            Self::BackgroundThreads => 1 << 9,
-            Self::AsyncTasks => 1 << 10,
-            Self::CooperativeTasks => 1 << 11,
+            Self::ObjectListing => 1 << 3,
+            Self::Append => 1 << 4,
+            Self::AtomicManifestPublish => 1 << 5,
+            Self::WriterLease => 1 << 6,
+            Self::Flush => 1 << 7,
+            Self::StrictDataSync => 1 << 8,
+            Self::StrictMetadataSync => 1 << 9,
+            Self::BackgroundThreads => 1 << 10,
+            Self::AsyncTasks => 1 << 11,
+            Self::CooperativeTasks => 1 << 12,
         }
     }
 }
@@ -132,6 +169,7 @@ impl StorageCapabilities {
         Self::empty()
             .with(StorageCapability::Persistent)
             .with(StorageCapability::RandomRead)
+            .with(StorageCapability::ObjectListing)
     }
 
     pub(crate) const fn native_file() -> Self {
@@ -252,6 +290,20 @@ pub(crate) trait BlockingStorageManifestPublishBackend:
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
     ) -> Result<()>;
+}
+
+pub(crate) trait StorageObjectListBackend: StorageReadBackend {
+    fn list_objects(
+        &self,
+        request: StorageObjectListRequest,
+    ) -> StorageFuture<'_, Vec<StorageObjectId>>;
+}
+
+pub(crate) trait BlockingStorageObjectListBackend: StorageObjectListBackend {
+    fn list_objects_blocking(
+        &self,
+        request: StorageObjectListRequest,
+    ) -> Result<Vec<StorageObjectId>>;
 }
 
 #[allow(dead_code)]
@@ -441,6 +493,24 @@ impl BlockingStorageManifestPublishBackend for NativeFileBackend {
     }
 }
 
+impl StorageObjectListBackend for NativeFileBackend {
+    fn list_objects(
+        &self,
+        request: StorageObjectListRequest,
+    ) -> StorageFuture<'_, Vec<StorageObjectId>> {
+        Box::pin(async move { list_native_file_objects(&request) })
+    }
+}
+
+impl BlockingStorageObjectListBackend for NativeFileBackend {
+    fn list_objects_blocking(
+        &self,
+        request: StorageObjectListRequest,
+    ) -> Result<Vec<StorageObjectId>> {
+        poll_ready_storage_future(self.list_objects(request))
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct NativeFileObject {
     object: StorageObjectId,
@@ -588,6 +658,33 @@ fn read_current_manifest_from_native_file(object: &StorageObjectId) -> Result<Op
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+fn list_native_file_objects(request: &StorageObjectListRequest) -> Result<Vec<StorageObjectId>> {
+    let mut objects = Vec::new();
+    for entry in fs::read_dir(request.root())? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+
+        let path = entry.path();
+        if !native_file_matches_list_request(request, &path) {
+            continue;
+        }
+
+        objects.push(StorageObjectId::native_file(request.kind(), path));
+    }
+    objects.sort_unstable();
+    Ok(objects)
+}
+
+fn native_file_matches_list_request(request: &StorageObjectListRequest, path: &Path) -> bool {
+    request.file_extension().is_none_or(|expected| {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
+    })
 }
 
 fn publish_manifest_to_native_file(
@@ -781,6 +878,63 @@ mod tests {
     }
 
     #[test]
+    fn native_file_backend_lists_matching_file_objects() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-storage-list-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("test dir creates");
+        std::fs::write(root.join("table-00000000000000000001.trinet"), b"table")
+            .expect("table file writes");
+        std::fs::write(root.join("table-00000000000000000002.TRINET"), b"table")
+            .expect("uppercase table file writes");
+        std::fs::write(root.join("MANIFEST"), b"manifest").expect("manifest file writes");
+        std::fs::create_dir(root.join("table-00000000000000000003.trinet"))
+            .expect("table-shaped dir creates");
+
+        let backend = NativeFileBackend::new();
+        backend
+            .capabilities()
+            .require(StorageCapability::ObjectListing)
+            .expect("native-file backend supports object listing");
+        let request = StorageObjectListRequest::native_file(StorageObjectKind::Table, &root)
+            .with_file_extension("trinet");
+        let objects = backend
+            .list_objects_blocking(request)
+            .expect("objects list");
+        assert!(
+            objects
+                .iter()
+                .all(|object| object.kind() == StorageObjectKind::Table)
+        );
+        let mut names = objects
+            .iter()
+            .map(|object| {
+                object
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("listed path has utf-8 file name")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "table-00000000000000000001.trinet".to_owned(),
+                "table-00000000000000000002.TRINET".to_owned(),
+            ]
+        );
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[test]
     fn memory_storage_backend_exposes_async_read_shape() {
         let backend = MemoryStorageBackend::new();
         let capabilities = backend.capabilities();
@@ -821,6 +975,7 @@ mod tests {
         let read_only = StorageCapabilities::native_file_read();
         assert!(read_only.supports(StorageCapability::Persistent));
         assert!(read_only.supports(StorageCapability::RandomRead));
+        assert!(read_only.supports(StorageCapability::ObjectListing));
         assert!(matches!(
             read_only.require(StorageCapability::Append),
             Err(Error::UnsupportedBackend { feature: "append" })

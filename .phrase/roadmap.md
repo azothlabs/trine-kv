@@ -1133,3 +1133,29 @@ async storage protocol.
   unchanged.
 - Focused storage/manifest/persistent tests, formatting, clippy, and diff
   checks pass.
+
+### Phase 55: Native-File Object Listing Backend
+
+**Status**: Complete
+
+**Goal**: Route table file id discovery through the storage backend object
+listing operation.
+
+**Entry Condition**: Phase 54 complete and the async storage protocol plan is
+the active implementation guide.
+
+**Acceptance Gate**:
+
+- Roadmap and current phase map completed storage-boundary work to the async
+  storage protocol staging.
+- Native-file backend exposes an object listing operation for database storage
+  object kinds.
+- Native-file backend reports object listing capability before table discovery
+  uses that operation.
+- Table file id listing uses the backend listing operation while preserving
+  current filename validation and filtering behavior.
+- Public API behavior, SSTable format, MVCC, manifest, WAL, blob, compaction,
+  transaction, table read/write behavior, cleanup behavior, and storage format
+  remain unchanged.
+- Focused storage/table/persistent tests, formatting, clippy, and diff checks
+  pass.

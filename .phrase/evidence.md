@@ -4932,3 +4932,59 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Route object listing or table write output through storage backend operations.
+
+## 2026-05-31: Native-File Object Listing Backend
+
+### Observation
+
+- The async-first storage protocol includes `list_objects(kind)` as a core
+  backend operation.
+- Manifest publish/read now routes through the native-file backend, but table
+  file id discovery still scanned the database directory directly in the table
+  layer.
+- Table file id discovery is already part of recovery/startup and has narrow,
+  well-tested filename validation behavior.
+
+### Interpretation
+
+- Object listing is the next safe backend operation after manifest reads: it
+  moves discovery behind the storage boundary without changing table bytes,
+  manifest state, WAL replay, blob behavior, or cleanup policy.
+- The native-file backend should list file objects and skip directories; table
+  filename parsing should remain in the table layer.
+
+### Verification
+
+- Added `StorageObjectListRequest`, `StorageObjectListBackend`, and
+  `BlockingStorageObjectListBackend` in `src/storage.rs`.
+- Added an internal object listing capability and required it before table file
+  discovery uses the backend operation.
+- `NativeFileBackend` now lists matching file objects under a native-file root,
+  supports optional extension filtering, skips directories, and returns sorted
+  object ids.
+- `list_table_file_ids` now uses the backend listing operation and keeps table
+  id parsing and corruption checks in `src/table.rs`.
+- Added focused storage and table coverage for object listing and table id
+  discovery.
+- `cargo test storage --lib`
+- `cargo test table --lib`
+- `cargo test block --all-targets`
+- `cargo test persistent --all-targets`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --check`
+- `git diff --check`
+- Forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, `README.md`, `CHANGELOG.md`, and `Cargo.toml`
+
+### Remaining Blockers
+
+- None for the native-file object listing slice.
+- Table output writes, deletion routing, WAL append, blob files, writer lease
+  handling, public async API, runtime selection, async cursor advancement, WASM
+  memory checks, and production in-memory table-object routing remain later
+  slices.
+
+### Recommended Next Action
+
+- Route table output writes through storage backend operations next; deletion
+  routing should follow once backend-owned table object creation is in place.
