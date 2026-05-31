@@ -1884,10 +1884,46 @@ impl TablePointCursor {
         }))
     }
 
+    pub(crate) async fn next_group_async(&mut self) -> Result<Option<RecordGroup>> {
+        let first = if let Some(record) = self.pending.take() {
+            record
+        } else {
+            let Some(record) = self.next_record_async().await? else {
+                return Ok(None);
+            };
+            record
+        };
+        let user_key = first.0.user_key().to_vec();
+        let mut rest = Vec::new();
+
+        while let Some(record) = self.next_record_async().await? {
+            if record.0.user_key() == user_key.as_slice() {
+                rest.push(record);
+            } else {
+                self.pending = Some(record);
+                break;
+            }
+        }
+        let (first, rest) = sort_group_records(first, rest);
+
+        Ok(Some(RecordGroup {
+            user_key,
+            first,
+            rest,
+        }))
+    }
+
     fn next_record(&mut self) -> Result<Option<ScanRecord>> {
         match self.direction {
             Direction::Forward => self.next_record_forward(),
             Direction::Reverse => self.next_record_reverse(),
+        }
+    }
+
+    async fn next_record_async(&mut self) -> Result<Option<ScanRecord>> {
+        match self.direction {
+            Direction::Forward => self.next_record_forward_async().await,
+            Direction::Reverse => self.next_record_reverse_async().await,
         }
     }
 
@@ -1933,6 +1969,50 @@ impl TablePointCursor {
         Ok(None)
     }
 
+    async fn next_record_forward_async(&mut self) -> Result<Option<ScanRecord>> {
+        while !self.exhausted {
+            let Some(block_index) = self.block_index else {
+                return Ok(None);
+            };
+            match self.forward_block_state(block_index)? {
+                CursorBlockState::Scan => {}
+                CursorBlockState::Skip => {
+                    self.move_to_next_block();
+                    continue;
+                }
+                CursorBlockState::Done => {
+                    self.exhausted = true;
+                    return Ok(None);
+                }
+            }
+
+            while self.record_index < self.current_block_len_async(block_index).await? {
+                let record = self
+                    .current_block_record_async(block_index, self.record_index)
+                    .await?;
+                self.record_index += 1;
+
+                match self
+                    .selector
+                    .forward_key_state(record.internal_key.user_key())
+                {
+                    ForwardKeyState::Before => {}
+                    ForwardKeyState::Match => {
+                        return Ok(Some((record.internal_key, record.value)));
+                    }
+                    ForwardKeyState::After => {
+                        self.exhausted = true;
+                        return Ok(None);
+                    }
+                }
+            }
+
+            self.move_to_next_block();
+        }
+
+        Ok(None)
+    }
+
     fn next_record_reverse(&mut self) -> Result<Option<ScanRecord>> {
         while !self.exhausted {
             let Some(block_index) = self.block_index else {
@@ -1954,6 +2034,51 @@ impl TablePointCursor {
             while self.record_index > 0 {
                 self.record_index -= 1;
                 let record = self.current_block_record(block_index, self.record_index)?;
+
+                match self
+                    .selector
+                    .reverse_key_state(record.internal_key.user_key())
+                {
+                    ReverseKeyState::Above => {}
+                    ReverseKeyState::Match => {
+                        return Ok(Some((record.internal_key, record.value)));
+                    }
+                    ReverseKeyState::Below => {
+                        self.exhausted = true;
+                        return Ok(None);
+                    }
+                }
+            }
+
+            self.move_to_previous_block();
+        }
+
+        Ok(None)
+    }
+
+    async fn next_record_reverse_async(&mut self) -> Result<Option<ScanRecord>> {
+        while !self.exhausted {
+            let Some(block_index) = self.block_index else {
+                return Ok(None);
+            };
+            match self.reverse_block_state(block_index)? {
+                CursorBlockState::Scan => {}
+                CursorBlockState::Skip => {
+                    self.move_to_previous_block();
+                    continue;
+                }
+                CursorBlockState::Done => {
+                    self.exhausted = true;
+                    return Ok(None);
+                }
+            }
+
+            self.ensure_current_block_async(block_index).await?;
+            while self.record_index > 0 {
+                self.record_index -= 1;
+                let record = self
+                    .current_block_record_async(block_index, self.record_index)
+                    .await?;
 
                 match self
                     .selector
@@ -2122,8 +2247,55 @@ impl TablePointCursor {
         Ok(())
     }
 
+    // Future read-path phases can await owned storage completion here. This
+    // phase deliberately preserves synchronous table block loading.
+    #[allow(clippy::unused_async)]
+    async fn ensure_current_block_async(&mut self, block_index: usize) -> Result<()> {
+        if self
+            .current_block
+            .as_ref()
+            .is_some_and(|(current_index, _)| *current_index == block_index)
+        {
+            return Ok(());
+        }
+
+        let block = self
+            .table
+            .load_data_block(block_index, self.block_cache.as_deref())?;
+        if let ScanSelector::Prefix(prefix) = &self.selector {
+            if self.table.with_data_block_metadata(
+                block_index,
+                self.block_cache.as_deref(),
+                |table_block| {
+                    Ok(table_block
+                        .prefix_filter_result(prefix, &self.prefix_extractor)
+                        .is_some())
+                },
+            )? && !data_block_has_prefix(&block, prefix, self.policy)?
+            {
+                self.table.filter_stats.record_block_prefix_false_positive();
+            }
+        }
+        self.record_index = match self.direction {
+            Direction::Forward => {
+                first_record_index_for_decoded_block(&block, &self.selector, self.policy)?
+            }
+            Direction::Reverse => block.record_count(),
+        };
+        self.current_block = Some((block_index, block));
+        Ok(())
+    }
+
     fn current_block_len(&mut self, block_index: usize) -> Result<usize> {
         self.ensure_current_block(block_index)?;
+        Ok(self
+            .current_block
+            .as_ref()
+            .map_or(0, |(_, block)| block.record_count()))
+    }
+
+    async fn current_block_len_async(&mut self, block_index: usize) -> Result<usize> {
+        self.ensure_current_block_async(block_index).await?;
         Ok(self
             .current_block
             .as_ref()
@@ -2136,6 +2308,19 @@ impl TablePointCursor {
         record_index: usize,
     ) -> Result<TablePointRecord> {
         self.ensure_current_block(block_index)?;
+        let (_, block) = self
+            .current_block
+            .as_ref()
+            .ok_or_else(|| invalid_table("cursor record index outside data block"))?;
+        block.record_owned(record_index)
+    }
+
+    async fn current_block_record_async(
+        &mut self,
+        block_index: usize,
+        record_index: usize,
+    ) -> Result<TablePointRecord> {
+        self.ensure_current_block_async(block_index).await?;
         let (_, block) = self
             .current_block
             .as_ref()

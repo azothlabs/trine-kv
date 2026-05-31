@@ -6734,3 +6734,66 @@ Record only evidence that can change planning or durable decisions.
 - Start the async cursor advancement phase by adding an explicit awaitable
   advancement shape for async range and prefix callers, while preserving the
   current synchronous iterator path.
+
+## Phase 89: Async Cursor Advancement Path
+
+### Observation
+
+- `Iter::next_async` and `LazyIter::next_async` previously called synchronous
+  `Iterator::next` from the public async wrapper.
+- Table range/prefix scans already use `LazyScan`, `RecordSource`, and
+  `TablePointCursor`, but those internal layers had only synchronous
+  advancement methods.
+- Phase 88 measurement showed the next useful read-path slice was an awaitable
+  cursor shape, not routing today's synchronous block decode through the
+  runtime queue.
+
+### Interpretation
+
+- Async callers need a distinct internal advancement path before table block
+  loads can await owned storage completions.
+- The synchronous iterator path should remain unchanged so blocking callers do
+  not inherit async scheduling behavior.
+- Memtable advancement has no I/O, but it still needs an async method so mixed
+  memtable/table scans share one internal async source interface.
+
+### Change
+
+- Routed `Iter::next_async` and `LazyIter::next_async` through async
+  `LazyScan` advancement for lazy scans.
+- Added async advancement methods for `LazyScan`, `RecordSource`,
+  `SourceCursor`, and `MemtableCursor`.
+- Added async group/record/block advancement hooks to `TablePointCursor`.
+- Kept async table block loading synchronous inside
+  `ensure_current_block_async` for this phase, preserving current decode
+  scheduling while creating the future await point.
+- Added a persistent async range/prefix test that flushes rows into table files
+  and advances forward range, lazy prefix, and reverse lazy prefix through
+  async iterators.
+
+### Verification
+
+- `cargo test --test async_api`
+- `cargo test table --lib`
+- `cargo test iterator --lib`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan passed outside the repository instruction file.
+
+### Remaining Blockers
+
+- Async table cursor block loading still calls the synchronous table block
+  loader.
+- Table header/footer metadata reads still use the borrowed read path.
+- True async file I/O is not implemented.
+- Runtime tuning options are still internal.
+- True multi-writer execution still needs writer-local deltas and WAL
+  partitioning.
+
+### Recommended Next Action
+
+- Start the async table block-load phase by making the async table cursor load
+  data blocks through an awaited owned-read completion while preserving the
+  current synchronous iterator path.

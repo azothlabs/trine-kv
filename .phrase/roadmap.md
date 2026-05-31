@@ -1944,3 +1944,28 @@ the runtime blocking queue.
   remain unchanged.
 - Benchmark output, focused tests, formatting, clippy, full tests, and diff
   checks pass.
+
+### Phase 89: Async Cursor Advancement Path
+
+**Status**: Complete
+
+**Goal**: Route async range and prefix iterator advancement through an internal
+awaitable scan/source/table cursor path while preserving synchronous iterator
+behavior.
+
+**Entry Condition**: Phase 88 complete and benchmark evidence says the next
+useful read-path slice is cursor advancement shape rather than routing current
+synchronous block decode through the runtime queue.
+
+**Acceptance Gate**:
+
+- Async `next_async` for range and prefix lazy scans advances through internal
+  async scan/source/table cursor methods.
+- Synchronous `Iterator::next` remains unchanged.
+- Persistent async range and prefix coverage proves async advancement works
+  after records are flushed into table files.
+- Storage formats, MVCC, recovery contract, public async/blocking API, publish
+  barrier, commit tracker, compaction behavior, and synchronous decode
+  scheduling remain unchanged.
+- Focused async/table tests, formatting, clippy, full tests, and diff checks
+  pass.

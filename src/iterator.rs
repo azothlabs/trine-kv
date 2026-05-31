@@ -219,25 +219,18 @@ impl LazyValue {
     }
 }
 
-#[allow(clippy::unused_async)]
 impl Iter {
     pub async fn next_async(&mut self) -> Result<Option<KeyValue>> {
-        match <Self as Iterator>::next(self) {
-            Some(Ok(item)) => Ok(Some(item)),
-            Some(Err(error)) => Err(error),
-            None => Ok(None),
+        match &mut self.inner {
+            IterInner::Items(items) => Ok(items.next()),
+            IterInner::Lazy(scan) => scan.next_async().await,
         }
     }
 }
 
-#[allow(clippy::unused_async)]
 impl LazyIter {
     pub async fn next_async(&mut self) -> Result<Option<LazyKeyValue>> {
-        match <Self as Iterator>::next(self) {
-            Some(Ok(item)) => Ok(Some(item)),
-            Some(Err(error)) => Err(error),
-            None => Ok(None),
-        }
+        self.scan.next_lazy_async().await
     }
 }
 
@@ -277,6 +270,13 @@ impl LazyScan {
     fn next(&mut self) -> Option<Result<KeyValue>> {
         self.next_lazy()
             .map(|item| item.and_then(LazyKeyValue::into_key_value))
+    }
+
+    async fn next_async(&mut self) -> Result<Option<KeyValue>> {
+        self.next_lazy_async()
+            .await?
+            .map(LazyKeyValue::into_key_value)
+            .transpose()
     }
 
     fn next_lazy(&mut self) -> Option<Result<LazyKeyValue>> {
@@ -329,9 +329,62 @@ impl LazyScan {
         }
     }
 
+    async fn next_lazy_async(&mut self) -> Result<Option<LazyKeyValue>> {
+        if !self.source_heap_initialized {
+            self.initialize_source_heap_async().await?;
+        }
+
+        loop {
+            let Some(entry) = self.source_heap.pop() else {
+                return Ok(None);
+            };
+            let user_key = entry.user_key;
+            let mut source_indices = vec![entry.source_index];
+            while self
+                .source_heap
+                .peek()
+                .is_some_and(|entry| entry.user_key == user_key)
+            {
+                let entry = self
+                    .source_heap
+                    .pop()
+                    .expect("heap peek promised another source entry");
+                source_indices.push(entry.source_index);
+            }
+
+            let mut first_record = None;
+            let mut rest_records = Vec::new();
+
+            for source_index in source_indices {
+                if let Some(group) = self.sources[source_index]
+                    .take_current_group_async()
+                    .await?
+                {
+                    push_group_records(&mut first_record, &mut rest_records, group);
+                }
+                self.push_source_heap_entry_async(source_index).await?;
+            }
+
+            let Some(first_record) = first_record else {
+                continue;
+            };
+            if let Some(item) = self.visible_lazy_item_from_records(first_record, rest_records)? {
+                return Ok(Some(item));
+            }
+        }
+    }
+
     fn initialize_source_heap(&mut self) -> Result<()> {
         for source_index in 0..self.sources.len() {
             self.push_source_heap_entry(source_index)?;
+        }
+        self.source_heap_initialized = true;
+        Ok(())
+    }
+
+    async fn initialize_source_heap_async(&mut self) -> Result<()> {
+        for source_index in 0..self.sources.len() {
+            self.push_source_heap_entry_async(source_index).await?;
         }
         self.source_heap_initialized = true;
         Ok(())
@@ -342,6 +395,18 @@ impl LazyScan {
             .current_key()?
             .map(<[u8]>::to_vec)
         else {
+            return Ok(());
+        };
+        self.source_heap.push(SourceHeapEntry {
+            user_key,
+            source_index,
+            direction: self.direction,
+        });
+        Ok(())
+    }
+
+    async fn push_source_heap_entry_async(&mut self, source_index: usize) -> Result<()> {
+        let Some(user_key) = self.sources[source_index].current_user_key_async().await? else {
             return Ok(());
         };
         self.source_heap.push(SourceHeapEntry {
@@ -494,9 +559,26 @@ impl RecordSource {
         Ok(self.current.take())
     }
 
+    async fn current_user_key_async(&mut self) -> Result<Option<Vec<u8>>> {
+        self.ensure_current_async().await?;
+        Ok(self.current.as_ref().map(|group| group.user_key.clone()))
+    }
+
+    async fn take_current_group_async(&mut self) -> Result<Option<RecordGroup>> {
+        self.ensure_current_async().await?;
+        Ok(self.current.take())
+    }
+
     fn ensure_current(&mut self) -> Result<()> {
         if self.current.is_none() {
             self.current = self.cursor.next_group()?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_current_async(&mut self) -> Result<()> {
+        if self.current.is_none() {
+            self.current = self.cursor.next_group_async().await?;
         }
         Ok(())
     }
@@ -513,6 +595,13 @@ impl SourceCursor {
         match self {
             Self::Memtable(cursor) => cursor.next_group(),
             Self::Table(cursor) => cursor.next_group(),
+        }
+    }
+
+    async fn next_group_async(&mut self) -> Result<Option<RecordGroup>> {
+        match self {
+            Self::Memtable(cursor) => cursor.next_group_async().await,
+            Self::Table(cursor) => cursor.next_group_async().await,
         }
     }
 }
@@ -549,6 +638,13 @@ impl MemtableCursor {
             Direction::Forward => self.next_group_forward(),
             Direction::Reverse => self.next_group_reverse(),
         }
+    }
+
+    // Memtable advancement has no I/O, but it participates in the async scan
+    // chain so mixed memtable/table sources share one awaitable shape.
+    #[allow(clippy::unused_async)]
+    async fn next_group_async(&mut self) -> Result<Option<RecordGroup>> {
+        self.next_group()
     }
 
     fn next_group_forward(&mut self) -> Result<Option<RecordGroup>> {

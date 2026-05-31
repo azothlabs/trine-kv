@@ -1,14 +1,16 @@
 use std::{
+    fs,
     future::Future,
+    path::PathBuf,
     sync::Arc,
     task::{Context, Poll, Wake, Waker},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use trine_kv::{
-    Db, DbOptions, DurabilityMode, Iter, KeyRange, KeyValue, LazyIter, RuntimeOptions, Sequence,
-    TransactionOptions, WriteBatch, WriteOptions,
+    BucketOptions, Db, DbOptions, DurabilityMode, Iter, KeyRange, KeyValue, LazyIter,
+    RuntimeOptions, Sequence, TransactionOptions, WriteBatch, WriteOptions,
 };
 
 struct ThreadWake {
@@ -59,6 +61,25 @@ fn wait_until(mut condition: impl FnMut() -> bool) {
         thread::sleep(Duration::from_millis(1));
     }
     panic!("condition did not become true before timeout");
+}
+
+fn temp_db_path(name: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "trine-kv-async-{name}-{}-{nonce}",
+        std::process::id()
+    ))
+}
+
+fn cleanup_dir(path: &PathBuf) {
+    match fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("failed to remove {}: {error}", path.display()),
+    }
 }
 
 fn collect_async(mut iter: Iter) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -170,6 +191,61 @@ fn memory_async_compatibility_surface_smoke() {
     block_on(db.flush_async()).expect("memory flush is accepted");
     block_on(db.compact_range_async(KeyRange::all())).expect("memory compact is accepted");
     block_on(db.close_async());
+}
+
+#[test]
+fn persistent_async_range_and_prefix_advance_flushed_tables() {
+    let path = temp_db_path("cursor-advance");
+    let mut options = DbOptions::persistent(&path);
+    options.default_bucket_options = BucketOptions {
+        block_bytes: 128,
+        ..BucketOptions::default()
+    };
+    let db = Db::open(options).expect("persistent db opens");
+    block_on(db.put_async(b"tenant:01:key-000".to_vec(), b"one".to_vec()))
+        .expect("first async put succeeds");
+    block_on(db.put_async(b"tenant:01:key-001".to_vec(), b"two".to_vec()))
+        .expect("second async put succeeds");
+    block_on(db.put_async(b"tenant:02:key-000".to_vec(), b"three".to_vec()))
+        .expect("third async put succeeds");
+    block_on(db.put_async(b"zeta".to_vec(), b"four".to_vec())).expect("fourth async put succeeds");
+    db.flush().expect("flush writes table files");
+
+    let tenant_one = KeyRange::half_open(b"tenant:01:".to_vec(), b"tenant:02:".to_vec());
+    let range_rows =
+        collect_async(block_on(db.range_async(&tenant_one)).expect("async range opens"));
+    assert_eq!(
+        range_rows,
+        vec![
+            (b"tenant:01:key-000".to_vec(), b"one".to_vec()),
+            (b"tenant:01:key-001".to_vec(), b"two".to_vec()),
+        ]
+    );
+
+    let prefix_rows = collect_lazy_async(
+        block_on(db.prefix_lazy_async(b"tenant:01:".to_vec())).expect("async lazy prefix opens"),
+    );
+    assert_eq!(prefix_rows, range_rows);
+
+    let reverse_rows = collect_lazy_async(
+        block_on(db.prefix_lazy_reverse_async(b"tenant:01:".to_vec()))
+            .expect("async reverse lazy prefix opens"),
+    );
+    assert_eq!(
+        reverse_rows,
+        vec![
+            (b"tenant:01:key-001".to_vec(), b"two".to_vec()),
+            (b"tenant:01:key-000".to_vec(), b"one".to_vec()),
+        ]
+    );
+
+    let stats = db.stats();
+    assert!(
+        stats.total_tables > 0,
+        "async cursor coverage should advance over flushed table files"
+    );
+    drop(db);
+    cleanup_dir(&path);
 }
 
 #[test]
