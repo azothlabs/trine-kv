@@ -1737,3 +1737,27 @@ behind Trine's runtime boundary after first poll.
   storage behavior remain unchanged.
 - Focused runtime/async tests, formatting, clippy, full tests, and diff checks
   pass.
+
+### Phase 81: Owned Async Storage Read Completion
+
+**Status**: Complete
+
+**Goal**: Define an owned async storage read completion boundary so storage
+reads can cross runtime and portable backend boundaries without borrowing the
+caller's output buffer.
+
+**Entry Condition**: Phase 80 complete and runtime-owned blocking work has a
+bounded scheduler.
+
+**Acceptance Gate**:
+
+- Storage read objects expose an owned read-buffer completion API.
+- Memory and native-file storage objects implement the owned read-buffer API.
+- Blocking storage read objects expose a blocking adapter for owned read
+  completions.
+- Existing borrowed blocking read paths remain unchanged for current table/blob
+  decode code.
+- Public async API, blocking API, publish barrier, commit tracker,
+  WAL/table/blob/manifest formats, MVCC, compaction, recovery, cleanup, and
+  storage behavior remain unchanged.
+- Focused storage tests, formatting, clippy, full tests, and diff checks pass.

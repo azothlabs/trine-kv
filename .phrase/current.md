@@ -6,17 +6,17 @@ Complete
 
 ## Goal
 
-Add a bounded native blocking task scheduler so runtime-owned async work does
-not create an unbounded thread per accepted write.
+Define an owned async storage read completion boundary so storage reads can
+eventually cross runtime and portable backend boundaries without borrowing the
+caller's output buffer.
 
 ## Scope
 
-- Add an internal bounded blocking task pool for native runtime mode.
-- Keep long-lived background maintenance workers on dedicated background
-  threads.
-- Route accepted async writes through the bounded blocking adapter instead of
-  spawning one thread per accepted write.
-- Preserve inline runtime behavior.
+- Add an owned read-buffer completion API to storage read objects.
+- Keep the existing borrowed blocking read path for current table/blob decode
+  code.
+- Implement owned read completion for memory and native-file storage objects.
+- Add blocking adapter methods over the owned read completion API.
 - Preserve existing public async API, blocking API, publish barrier, commit
   tracker, WAL/table/blob/manifest formats, MVCC, compaction, recovery,
   cleanup, and storage behavior.
@@ -26,6 +26,8 @@ not create an unbounded thread per accepted write.
 - Adding true async file I/O.
 - Adding a public executor dependency.
 - Adding public runtime tuning options.
+- Routing native-file reads through the bounded blocking scheduler.
+- Converting table/blob/block decode call sites to async advancement.
 - Removing the serialized publish barrier.
 - Adding WAL shards or writer-local deltas.
 - Changing transaction conflict rules.
@@ -34,34 +36,40 @@ not create an unbounded thread per accepted write.
 
 ## Acceptance Gate
 
-- Roadmap records this as the bounded runtime blocking scheduler phase.
-- Native runtime mode has a bounded blocking task pool.
-- Blocking adapter submissions return a recoverable error when the queue is
-  full or shutting down.
-- Async writes use the blocking adapter after first poll.
-- Inline runtime async writes still complete without background threads.
-- Focused runtime/async tests, formatting, clippy, full tests,
+- Roadmap records this as the owned async storage read completion phase.
+- Storage read objects expose an owned read-buffer completion API.
+- Memory and native-file storage objects implement the owned read-buffer API.
+- Blocking storage read objects expose a blocking adapter for owned read
+  completions.
+- Existing borrowed blocking read paths remain unchanged for current decode
+  code.
+- Focused storage tests, formatting, clippy, full tests,
   `git diff --check`, and forbidden-term scan pass.
 - Evidence records remaining async blockers.
 
 ## Active Task Slice
 
 ```text
-task316 [x] goal:start bounded runtime scheduler slice | scope:current roadmap | verify:manual
-task317 [x] goal:add native bounded blocking task pool | scope:src/runtime.rs | verify:runtime tests
-task318 [x] goal:route accepted async writes through blocking adapter | scope:src/db/commit.rs | verify:async tests
-task319 [x] goal:preserve inline runtime and background worker behavior | scope:runtime/db tests | verify:focused tests
-task320 [x] goal:run verification gate | scope:workspace | verify:fmt clippy tests diff
-task321 [x] goal:record evidence and commit | scope:.phrase/evidence.md current roadmap | verify:git status
+task322 [x] goal:start owned async storage read completion slice | scope:current roadmap | verify:manual
+task323 [x] goal:add owned read-buffer completion API | scope:src/storage.rs | verify:storage tests
+task324 [x] goal:implement memory and native-file owned reads | scope:src/storage.rs | verify:storage tests
+task325 [x] goal:preserve existing borrowed blocking read path | scope:src/storage.rs table/blob tests | verify:full tests
+task326 [x] goal:run verification gate | scope:workspace | verify:fmt clippy tests diff
+task327 [x] goal:record evidence and commit | scope:.phrase/evidence.md current roadmap | verify:git status
 ```
 
 ## Known Blockers
 
 - True async file I/O is not implemented.
 - Runtime tuning options are still internal.
+- Storage reads still use blocking native-file calls behind the current decode
+  paths.
+- Range and prefix cursor advancement still expose async compatibility wrappers
+  over synchronous iterator advancement.
 - True multi-writer execution still needs writer-local deltas and WAL
   partitioning.
-- Native-file storage remains blocking behind native-thread runtime execution.
+- Native-file storage remains blocking unless a later phase routes owned
+  storage requests through the runtime boundary.
 
 ## Evidence
 
@@ -103,9 +111,23 @@ task321 [x] goal:record evidence and commit | scope:.phrase/evidence.md current 
   `cargo test --all-targets --all-features`.
 - `git diff --check` passed.
 - Forbidden-term scan passed outside the repository instruction file.
+- Phase 80 evidence recommends defining a shared storage async boundary before
+  public executor or backend-specific work.
+- Storage read objects now expose `read_exact_at_owned` returning
+  `StorageReadBuffer`.
+- Blocking storage read objects now expose `read_exact_at_owned_blocking`.
+- Native whole-object reads now use owned read completion internally.
+- Existing table/blob block decode call sites still use borrowed blocking reads
+  and were not converted in this phase.
+- Verification passed: `cargo fmt --check`,
+  `cargo clippy --all-targets --all-features -- -D warnings`,
+  `cargo test storage --lib`, and
+  `cargo test --all-targets --all-features`.
+- `git diff --check` passed.
+- Forbidden-term scan passed outside the repository instruction file.
 
 ## Next Recommendation
 
-- Move to the next async foundation: define the storage async boundary so
-  native-file I/O, memory mode, and future non-threaded backends can share one
-  API shape before public executor integration or WASM backend work.
+- Route native-file owned storage requests through the bounded runtime blocking
+  adapter, then convert table/blob read call sites and cursor advancement in
+  separate measured slices.

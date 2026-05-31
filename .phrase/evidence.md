@@ -6245,3 +6245,60 @@ Record only evidence that can change planning or durable decisions.
 - Define the storage async boundary next, keeping native-file I/O, memory mode,
   and future non-threaded backends on one API shape before public executor or
   backend-specific work.
+
+## 2026-05-31: Owned Async Storage Read Completion
+
+### Observation
+
+- Storage traits already returned `StorageFuture`, but random reads still used
+  a borrowed caller output buffer.
+- A borrowed `&mut [u8]` read future is fine for current synchronous block
+  decode, but it is a poor completion shape for runtime-owned blocking tasks or
+  portable async backends.
+- Phase 80 added a bounded blocking scheduler, so the next storage step needed
+  an owned completion payload before routing file reads through that scheduler.
+
+### Interpretation
+
+- The storage boundary needs an owned read-buffer result before native-file
+  operations can safely cross the runtime task boundary.
+- The current table/blob block decode path should remain borrowed and blocking
+  until cursor advancement is converted in a measured read-path phase.
+- Whole-object reads are a suitable first internal caller because they already
+  return owned bytes and are not the table block hot path.
+
+### Verification
+
+- Added `StorageReadBuffer` as an owned storage read completion payload.
+- Added `StorageReadObject::read_exact_at_owned` with a default implementation
+  over the existing borrowed read method.
+- Added `BlockingStorageReadObject::read_exact_at_owned_blocking` as the native
+  blocking adapter for owned read completions.
+- Routed native whole-object reads through owned read completion while
+  preserving `NotFound -> Ok(None)` behavior.
+- Kept existing borrowed blocking read methods in place for table/blob block
+  decode and current `BlockReadSource` call sites.
+- Added storage tests for native-file and memory owned read completions,
+  including empty reads.
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test storage --lib`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan outside the repository instruction file
+
+### Remaining Blockers
+
+- Native-file owned read operations still execute blocking file I/O on the
+  polling thread.
+- Storage writes, append, manifest publish, and object listing still need owned
+  runtime-submittable request/completion wrappers.
+- Table/blob block reads and cursor advancement still use synchronous
+  advancement paths.
+- Runtime worker and queue limits remain internal defaults.
+
+### Recommended Next Action
+
+- Route native-file owned storage requests through the bounded runtime blocking
+  adapter without changing table/blob decode semantics, then convert cursor
+  advancement in a later measured phase.

@@ -146,6 +146,34 @@ impl StorageObjectListRequest {
 pub(crate) type StorageFuture<'op, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'op>>;
 pub(crate) type StorageReadFuture<'op, T> = StorageFuture<'op, T>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageReadBuffer {
+    offset: usize,
+    bytes: Arc<[u8]>,
+}
+
+impl StorageReadBuffer {
+    fn new(offset: usize, bytes: Arc<[u8]>) -> Self {
+        Self { offset, bytes }
+    }
+
+    pub(crate) const fn offset(&self) -> usize {
+        self.offset
+    }
+
+    pub(crate) fn into_bytes(self) -> Arc<[u8]> {
+        self.bytes
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StorageCapability {
@@ -316,12 +344,28 @@ pub(crate) trait StorageReadObject: Send + Sync {
         offset: usize,
         bytes: &'op mut [u8],
     ) -> StorageReadFuture<'op, ()>;
+
+    fn read_exact_at_owned(
+        &self,
+        offset: usize,
+        len: usize,
+    ) -> StorageReadFuture<'_, StorageReadBuffer> {
+        Box::pin(async move {
+            let mut bytes = allocate_read_buffer(len)?;
+            self.read_exact_at(offset, &mut bytes).await?;
+            Ok(StorageReadBuffer::new(offset, Arc::from(bytes)))
+        })
+    }
 }
 
 pub(crate) trait BlockingStorageReadObject: StorageReadObject {
     fn len_blocking(&self) -> Result<u64>;
 
     fn read_exact_at_blocking(&self, offset: usize, bytes: &mut [u8]) -> Result<()>;
+
+    fn read_exact_at_owned_blocking(&self, offset: usize, len: usize) -> Result<StorageReadBuffer> {
+        poll_ready_storage_future(StorageReadObject::read_exact_at_owned(self, offset, len))
+    }
 }
 
 pub(crate) trait StorageReadBackend: Send + Sync {
@@ -1084,11 +1128,21 @@ fn read_native_file_object_bytes(object: &StorageObjectId) -> Result<Option<Arc<
     let capabilities = StorageCapabilities::native_file_read();
     capabilities.require(StorageCapability::ObjectRead)?;
 
-    match fs::read(object.path()) {
-        Ok(bytes) => Ok(Some(Arc::from(bytes))),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(Error::Io(error)),
-    }
+    let file = match File::open(object.path()) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(Error::Io(error)),
+    };
+    let object = NativeFileObject {
+        object: object.clone(),
+        file: Mutex::new(file),
+    };
+    let len = u64_to_usize(object.len_blocking()?, "storage object length")?;
+    let buffer = object.read_exact_at_owned_blocking(0, len)?;
+    debug_assert_eq!(buffer.offset(), 0);
+    debug_assert_eq!(buffer.len(), len);
+    debug_assert_eq!(buffer.is_empty(), len == 0);
+    Ok(Some(buffer.into_bytes()))
 }
 
 fn open_native_append_file(object: &StorageObjectId) -> Result<File> {
@@ -1431,8 +1485,22 @@ fn poll_ready_storage_future<T>(future: impl Future<Output = Result<T>>) -> Resu
     }
 }
 
+fn allocate_read_buffer(len: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| Error::invalid_options("storage read length exceeds addressable memory"))?;
+    bytes.resize(len, 0);
+    Ok(bytes)
+}
+
 fn usize_to_u64(value: usize, field: &'static str) -> Result<u64> {
     u64::try_from(value).map_err(|_| Error::invalid_options(format!("{field} exceeds u64::MAX")))
+}
+
+fn u64_to_usize(value: u64, field: &'static str) -> Result<usize> {
+    usize::try_from(value)
+        .map_err(|_| Error::invalid_options(format!("{field} exceeds usize::MAX")))
 }
 
 #[cfg(test)]
@@ -1473,6 +1541,20 @@ mod tests {
         poll_ready_storage_future(StorageReadObject::read_exact_at(&object, 2, &mut bytes))
             .expect("range reads");
         assert_eq!(&bytes, b"cde");
+
+        let owned =
+            poll_ready_storage_future(StorageReadObject::read_exact_at_owned(&object, 1, 4))
+                .expect("owned range reads");
+        assert_eq!(owned.offset(), 1);
+        assert_eq!(owned.len(), 4);
+        assert!(!owned.is_empty());
+        assert_eq!(&*owned.into_bytes(), b"bcde");
+
+        let owned_blocking = object
+            .read_exact_at_owned_blocking(3, 2)
+            .expect("blocking owned range reads");
+        assert_eq!(owned_blocking.offset(), 3);
+        assert_eq!(&*owned_blocking.into_bytes(), b"de");
 
         std::fs::remove_file(path).expect("test file removes");
     }
@@ -2177,6 +2259,22 @@ mod tests {
         poll_ready_storage_future(StorageReadObject::read_exact_at(&object, 1, &mut bytes))
             .expect("range reads");
         assert_eq!(&bytes, b"bcd");
+
+        let owned =
+            poll_ready_storage_future(StorageReadObject::read_exact_at_owned(&object, 2, 3))
+                .expect("owned range reads");
+        assert_eq!(owned.offset(), 2);
+        assert_eq!(owned.len(), 3);
+        assert!(!owned.is_empty());
+        assert_eq!(&*owned.into_bytes(), b"cde");
+
+        let owned_blocking = object
+            .read_exact_at_owned_blocking(0, 0)
+            .expect("empty owned range reads");
+        assert_eq!(owned_blocking.offset(), 0);
+        assert_eq!(owned_blocking.len(), 0);
+        assert!(owned_blocking.is_empty());
+        assert_eq!(&*owned_blocking.into_bytes(), b"");
 
         let full = backend
             .read_object_bytes_blocking(StorageObjectId::memory(
