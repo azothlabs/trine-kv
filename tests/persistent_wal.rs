@@ -121,6 +121,14 @@ fn level_table_count(stats: &trine_kv::DbStats, level: u32) -> usize {
         .map_or(0, |level_stats| level_stats.tables)
 }
 
+fn level_table_bytes(stats: &trine_kv::DbStats, level: u32) -> u64 {
+    stats
+        .level_tables
+        .iter()
+        .find(|level_stats| level_stats.level == level)
+        .map_or(0, |level_stats| level_stats.bytes)
+}
+
 fn write_file(path: &std::path::Path, bytes: &[u8]) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).expect("create parent directory");
@@ -1646,6 +1654,7 @@ fn persistent_stats_report_tables_blobs_and_compactions() {
         assert_eq!(stats.l0_tables, 1);
         assert_eq!(level_table_count(&stats, 0), 1);
         assert!(stats.table_bytes > 0);
+        assert_eq!(level_table_bytes(&stats, 0), stats.table_bytes);
         assert_eq!(stats.live_blob_files, 1);
         assert_eq!(stats.live_blob_bytes, large_a.len() as u64);
 
@@ -1656,6 +1665,7 @@ fn persistent_stats_report_tables_blobs_and_compactions() {
         assert_eq!(stats.total_tables, 2);
         assert_eq!(stats.l0_tables, 1);
         assert_eq!(level_table_count(&stats, 1), 1);
+        assert!(level_table_bytes(&stats, 1) > 0);
         assert_eq!(stats.live_blob_files, 2);
         assert_eq!(
             stats.live_blob_bytes,

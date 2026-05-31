@@ -1462,3 +1462,23 @@ used for backend directory sync.
   MVCC, compaction, stats, and cleanup semantics remain unchanged.
 - Focused storage/persistent/recovery tests, formatting, clippy, and diff
   checks pass.
+
+### Phase 69: Stats Object Length Backend Reads
+
+**Status**: Complete
+
+**Goal**: Route persistent stats byte accounting through storage backend
+object-open and object-length operations.
+
+**Entry Condition**: Phase 68 complete and native-file random reads are already
+available as storage backend operations.
+
+**Acceptance Gate**:
+
+- Table byte stats use backend object length reads.
+- Obsolete blob byte stats use backend object length reads.
+- Stats keep the previous fail-open behavior for missing or unreadable files.
+- Public API behavior, recovery policy, WAL, manifest, table/blob formats,
+  MVCC, compaction, and cleanup semantics remain unchanged.
+- Focused stats/persistent tests, formatting, clippy, full tests, and diff
+  checks pass.

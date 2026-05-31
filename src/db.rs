@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
     ops::Bound,
     path::Path,
     sync::{
@@ -33,8 +32,9 @@ use crate::{
     stats::{BlobReadMetrics, DbStats, LevelStats},
     storage::{
         BlockingStorageDirectoryCreateBackend, BlockingStorageDirectorySyncBackend,
-        BlockingStorageObjectDeleteBackend, NativeFileBackend, StorageCapability,
-        StorageDirectoryId, StorageObjectId, StorageObjectKind, StorageReadBackend,
+        BlockingStorageObjectDeleteBackend, BlockingStorageReadBackend, BlockingStorageReadObject,
+        NativeFileBackend, StorageCapability, StorageDirectoryId, StorageObjectId,
+        StorageObjectKind, StorageReadBackend,
     },
     table::{self, Table},
     transaction::{Transaction, TransactionOptions},
@@ -2722,7 +2722,10 @@ fn ensure_default_bucket_loaded(
 }
 
 fn table_file_bytes(db_path: &Path, table_id: table::TableId) -> u64 {
-    fs::metadata(table::table_path(db_path, table_id)).map_or(0, |metadata| metadata.len())
+    storage_object_file_bytes(
+        StorageObjectKind::Table,
+        &table::table_path(db_path, table_id),
+    )
 }
 
 fn add_obsolete_blob_stats(
@@ -2752,11 +2755,29 @@ fn add_obsolete_blob_stats(
         }
         stats.obsolete_blob_files += 1;
         let bytes =
-            fs::metadata(blob::blob_path(db_path, file_id)).map_or(0, |metadata| metadata.len());
+            storage_object_file_bytes(StorageObjectKind::Blob, &blob::blob_path(db_path, file_id));
         stats.obsolete_blob_bytes = stats.obsolete_blob_bytes.saturating_add(bytes);
         stats.stale_blob_files = stats.stale_blob_files.saturating_add(1);
         stats.stale_blob_bytes = stats.stale_blob_bytes.saturating_add(bytes);
     }
+}
+
+fn storage_object_file_bytes(kind: StorageObjectKind, path: &Path) -> u64 {
+    let backend = NativeFileBackend::new();
+    if backend
+        .capabilities()
+        .require(StorageCapability::RandomRead)
+        .is_err()
+    {
+        return 0;
+    }
+
+    let object_id = StorageObjectId::native_file(kind, path);
+    let Ok(object) = backend.open_read_blocking(object_id) else {
+        return 0;
+    };
+
+    object.len_blocking().unwrap_or(0)
 }
 
 fn usize_to_u64_saturating(value: usize) -> u64 {

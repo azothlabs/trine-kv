@@ -5626,3 +5626,48 @@ Record only evidence that can change planning or durable decisions.
 - Reassess whether safe temporary file repair should become a backend
   operation, because it still performs native directory listing and file
   deletion directly.
+
+## 2026-05-31: Stats Object Length Backend Reads
+
+### Observation
+
+- Persistent stats table-byte accounting still used direct native-file metadata
+  reads.
+- Obsolete blob-byte accounting also used direct native-file metadata reads.
+- Existing storage read backend objects already support object length reads.
+
+### Interpretation
+
+- Stats byte accounting can use the same storage object-open boundary used by
+  table reads without adding a new capability or changing public behavior.
+- The previous stats contract was fail-open for missing or unreadable files, so
+  the backend-routed helper must continue returning zero bytes on read/open
+  failures.
+
+### Verification
+
+- `table_file_bytes` now opens table storage objects through
+  `NativeFileBackend` and reads object length.
+- Obsolete blob byte stats now open blob storage objects through
+  `NativeFileBackend` and reads object length.
+- Persistent stats coverage now checks level byte accounting in addition to
+  table bytes, compaction bytes, and obsolete blob bytes.
+- `cargo fmt --check`
+- `cargo test storage --lib`
+- `cargo test persistent_stats_report_tables_blobs_and_compactions --test
+  persistent_wal`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan
+
+### Remaining Blockers
+
+- Safe temporary file listing/deletion, public async API, async runtime
+  selection, and production in-memory object routing remain later phases.
+
+### Recommended Next Action
+
+- Reassess whether safe temporary file repair should get explicit backend
+  directory-list/delete operations, because it still performs native directory
+  listing and file deletion directly.
