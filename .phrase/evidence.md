@@ -6919,3 +6919,62 @@ Record only evidence that can change planning or durable decisions.
 - Move to writer-local deltas before WAL partitioning. The async read cursor
   path now has awaited owned-read completions for both data-block metadata and
   data-block body reads; table open metadata can remain a smaller follow-up.
+
+## Phase 92: Writer-Local Prepared Deltas
+
+### Observation
+
+- Phase 91 completed the main async cursor owned-read path for table metadata
+  and data-block body loads.
+- The foreground write-path protocol identifies immutable prepared commits and
+  shard delta types as the next post-tracker implementation slice.
+- Before this phase, accepted writer-local state still stored raw operations,
+  and bucket routing, WAL payload construction, and touched-tree collection
+  happened inside the publish barrier.
+
+### Interpretation
+
+- The useful next write-path step was to move non-publishing commit preparation
+  into writer-local data before the barrier.
+- The current engine should still use one in-memory shard per bucket and the
+  existing publish barrier until key-sharded heads are introduced and tested.
+
+### Change
+
+- Added `PreparedCommit`, current single-shard bucket deltas, prepared delta
+  operations, shard ids, coarse key bounds, estimated bytes, and touched LSM
+  tree tracking.
+- Accepted non-empty writes now prepare WAL operation order and bucket deltas
+  before entering the publish barrier.
+- Publish still runs transaction validation, sequence assignment, WAL append,
+  memtable publication, visible marking, and post-commit freeze under the named
+  publish barrier.
+- Added focused commit tests proving preparation remains invisible and same
+  bucket operations keep batch indexes, bounds, and estimates.
+
+### Verification
+
+- `cargo test commit --lib`
+- `cargo test --test async_api`
+- `cargo test --test in_memory_mvcc`
+- `cargo test --test in_memory_transaction`
+- `cargo test persistent_write_buffer --test persistent_wal`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --check`
+- `cargo test --all-targets --all-features`
+
+### Remaining Blockers
+
+- Prepared deltas still use one current in-memory shard per bucket.
+- The publish barrier still serializes WAL append, memtable publication, visible
+  marking, and freeze.
+- Persistent commits still use the single WAL writer.
+- Native-file async reads still use the bounded blocking adapter rather than
+  platform-native async file I/O.
+- Table open header/footer reads still use synchronous borrowed reads.
+
+### Recommended Next Action
+
+- Continue with in-memory key-sharded delta heads before WAL shard front doors,
+  because prepared commit data now exists but publication still writes directly
+  into active memtables under the publish barrier.

@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    ops::Bound,
     pin::Pin,
     sync::{Arc, Condvar, Mutex},
     task::{Context, Poll, Waker},
@@ -15,7 +16,7 @@ use crate::{
     write_batch::{BatchOperation, WriteBatch},
 };
 
-use super::{Db, PublishBarrierGuard, lock_poisoned, validate_batch_len};
+use super::{Db, PublishBarrierGuard, lock_poisoned, usize_to_u64_saturating, validate_batch_len};
 
 #[derive(Debug)]
 struct WriteRequest {
@@ -32,16 +33,44 @@ enum AcceptedWriteState {
 
 #[derive(Debug)]
 struct WriterLocalWriteState {
-    operations: Vec<BatchOperation>,
-    write_options: WriteOptions,
-    transaction_reads: Option<TransactionReads>,
+    prepared: PreparedCommit,
 }
 
 #[derive(Debug)]
-struct RoutedWriteOperation {
+struct PreparedCommit {
+    write_options: WriteOptions,
+    transaction_reads: Option<TransactionReads>,
+    wal_operations: Vec<BatchOperation>,
+    deltas: Vec<PreparedShardDelta>,
+    touched_states: Vec<Arc<LsmTree>>,
+    estimated_bytes: u64,
+}
+
+#[derive(Debug)]
+struct PreparedShardDelta {
+    bucket: String,
+    shard: PreparedShardId,
+    state: Arc<LsmTree>,
+    operations: Vec<PreparedDeltaOperation>,
+    key_bounds: PreparedDeltaKeyBounds,
+    estimated_bytes: u64,
+}
+
+#[derive(Debug)]
+struct PreparedDeltaOperation {
     batch_index: u32,
     operation: BatchOperation,
-    state: Arc<LsmTree>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreparedShardId(u32);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PreparedDeltaKeyBounds {
+    lower: Option<Vec<u8>>,
+    upper: Option<Vec<u8>>,
+    lower_unbounded: bool,
+    upper_unbounded: bool,
 }
 
 #[derive(Debug)]
@@ -119,15 +148,122 @@ impl WriteRequest {
 }
 
 impl WriterLocalWriteState {
+    const fn new(prepared: PreparedCommit) -> Self {
+        Self { prepared }
+    }
+}
+
+impl PreparedCommit {
     fn new(
-        operations: Vec<BatchOperation>,
         write_options: WriteOptions,
         transaction_reads: Option<TransactionReads>,
+        wal_operations: Vec<BatchOperation>,
+        deltas: Vec<PreparedShardDelta>,
     ) -> Self {
+        let touched_states = unique_lsm_trees(deltas.iter().map(|delta| Arc::clone(&delta.state)));
+        let estimated_bytes = deltas.iter().fold(0_u64, |bytes, delta| {
+            bytes.saturating_add(delta.estimated_bytes)
+        });
         Self {
-            operations,
             write_options,
             transaction_reads,
+            wal_operations,
+            deltas,
+            touched_states,
+            estimated_bytes,
+        }
+    }
+
+    #[must_use]
+    fn operation_count(&self) -> usize {
+        self.wal_operations.len()
+    }
+}
+
+impl PreparedShardDelta {
+    fn new(bucket: String, shard: PreparedShardId, state: Arc<LsmTree>) -> Self {
+        Self {
+            bucket,
+            shard,
+            state,
+            operations: Vec::new(),
+            key_bounds: PreparedDeltaKeyBounds::default(),
+            estimated_bytes: 0,
+        }
+    }
+
+    fn matches(&self, state: &Arc<LsmTree>, shard: PreparedShardId) -> bool {
+        self.shard == shard && Arc::ptr_eq(&self.state, state)
+    }
+
+    fn push_operation(&mut self, batch_index: u32, operation: BatchOperation) {
+        self.key_bounds.include_operation(&operation);
+        self.estimated_bytes = self
+            .estimated_bytes
+            .saturating_add(operation_estimated_bytes(&operation));
+        self.operations.push(PreparedDeltaOperation {
+            batch_index,
+            operation,
+        });
+    }
+}
+
+impl PreparedShardId {
+    const CURRENT_SINGLE_SHARD: Self = Self(0);
+
+    #[must_use]
+    const fn for_operation(_operation: &BatchOperation) -> Self {
+        Self::CURRENT_SINGLE_SHARD
+    }
+}
+
+impl PreparedDeltaKeyBounds {
+    fn include_operation(&mut self, operation: &BatchOperation) {
+        match operation {
+            BatchOperation::Put { key, .. } | BatchOperation::Delete { key, .. } => {
+                self.include_point_key(key);
+            }
+            BatchOperation::DeleteRange { range, .. } => {
+                self.include_lower(&range.start);
+                self.include_upper(&range.end);
+            }
+        }
+    }
+
+    fn include_point_key(&mut self, key: &[u8]) {
+        if !self.lower_unbounded {
+            include_min_key(&mut self.lower, key);
+        }
+        if !self.upper_unbounded {
+            include_max_key(&mut self.upper, key);
+        }
+    }
+
+    fn include_lower(&mut self, bound: &Bound<Vec<u8>>) {
+        match bound {
+            Bound::Included(key) | Bound::Excluded(key) => {
+                if !self.lower_unbounded {
+                    include_min_key(&mut self.lower, key);
+                }
+            }
+            Bound::Unbounded => {
+                self.lower = None;
+                self.lower_unbounded = true;
+            }
+        }
+    }
+
+    fn include_upper(&mut self, bound: &Bound<Vec<u8>>) {
+        match bound {
+            Bound::Included(key) | Bound::Excluded(key) => {
+                if !self.upper_unbounded {
+                    include_max_key(&mut self.upper, key);
+                }
+            }
+            Bound::Unbounded => {
+                self.upper = None;
+                self.upper_unbounded = true;
+            }
         }
     }
 }
@@ -394,10 +530,10 @@ impl Db {
             self.apply_write_backpressure()?;
         }
 
+        let prepared =
+            self.prepare_writer_local_commit(operations, write_options, transaction_reads)?;
         Ok(AcceptedWriteState::Pending(WriterLocalWriteState::new(
-            operations,
-            write_options,
-            transaction_reads,
+            prepared,
         )))
     }
 
@@ -424,11 +560,7 @@ impl Db {
         writer_state: WriterLocalWriteState,
         _publish: &PublishBarrierGuard<'_>,
     ) -> Result<PublishedWrite> {
-        let WriterLocalWriteState {
-            operations,
-            write_options,
-            transaction_reads,
-        } = writer_state;
+        let WriterLocalWriteState { prepared } = writer_state;
 
         // Read validation, sequence assignment, WAL append, and delta
         // publication share one publish slot. Once validation succeeds, no
@@ -436,81 +568,92 @@ impl Db {
         if let Some(TransactionReads {
             read_sequence,
             read_set,
-        }) = transaction_reads
+        }) = &prepared.transaction_reads
         {
-            self.validate_transaction_reads(read_sequence, &read_set)?;
+            self.validate_transaction_reads(*read_sequence, read_set)?;
         }
-        if operations.is_empty() {
+        if prepared.operation_count() == 0 {
             return Ok(PublishedWrite::new(
                 CommitInfo::new(self.last_committed_sequence()),
                 false,
             ));
         }
+        debug_assert!(prepared.estimated_bytes > 0);
 
-        let routed_operations = self.route_writer_local_operations(operations)?;
-        let wal_operations = routed_operations
-            .iter()
-            .map(|routed| routed.operation.clone())
-            .collect::<Vec<_>>();
-
-        let durability =
-            effective_durability(self.inner.options.durability, write_options.durability);
+        let durability = effective_durability(
+            self.inner.options.durability,
+            prepared.write_options.durability,
+        );
         let slot = self.inner.commit_tracker.reserve_slot()?;
         let sequence = slot.sequence();
-        if let Err(error) = self.append_wal(sequence, &wal_operations, durability) {
+        if let Err(error) = self.append_wal(sequence, &prepared.wal_operations, durability) {
             self.inner.commit_tracker.mark_skipped(slot)?;
             return Err(error);
         }
 
-        let touched_states = unique_lsm_trees(
-            routed_operations
-                .iter()
-                .map(|routed| Arc::clone(&routed.state)),
-        );
         let mut delta_publication_started = false;
-        for routed in routed_operations {
-            if let Err(error) =
-                routed
-                    .state
-                    .apply_operation(routed.operation, sequence, routed.batch_index)
-            {
-                if !delta_publication_started {
-                    self.inner.commit_tracker.mark_skipped(slot)?;
+        for delta in prepared.deltas {
+            debug_assert!(!delta.bucket.is_empty());
+            for operation in delta.operations {
+                if let Err(error) = delta.state.apply_operation(
+                    operation.operation,
+                    sequence,
+                    operation.batch_index,
+                ) {
+                    if !delta_publication_started {
+                        self.inner.commit_tracker.mark_skipped(slot)?;
+                    }
+                    return Err(error);
                 }
-                return Err(error);
+                delta_publication_started = true;
             }
-            delta_publication_started = true;
         }
 
         self.inner.commit_tracker.mark_visible(slot)?;
-        let request_flush = self
-            .freeze_large_active_memtables_after_commit_under_barrier(sequence, &touched_states)?;
+        let request_flush = self.freeze_large_active_memtables_after_commit_under_barrier(
+            sequence,
+            &prepared.touched_states,
+        )?;
         Ok(PublishedWrite::new(
             CommitInfo::new(sequence),
             request_flush,
         ))
     }
 
-    fn route_writer_local_operations(
+    fn prepare_writer_local_commit(
         &self,
         operations: Vec<BatchOperation>,
-    ) -> Result<Vec<RoutedWriteOperation>> {
+        write_options: WriteOptions,
+        transaction_reads: Option<TransactionReads>,
+    ) -> Result<PreparedCommit> {
         let states = self.resolve_batch_buckets(&operations)?;
-        operations
-            .into_iter()
-            .zip(states)
-            .enumerate()
-            .map(|(batch_index, (operation, state))| {
-                let batch_index = u32::try_from(batch_index).map_err(|_| {
-                    Error::invalid_options("write batch operation count exceeds u32::MAX")
-                })?;
-                Ok(RoutedWriteOperation {
-                    batch_index,
-                    operation,
-                    state,
-                })
-            })
-            .collect()
+        let wal_operations = operations.clone();
+        let mut deltas = Vec::new();
+
+        for (batch_index, (operation, state)) in operations.into_iter().zip(states).enumerate() {
+            let batch_index = u32::try_from(batch_index).map_err(|_| {
+                Error::invalid_options("write batch operation count exceeds u32::MAX")
+            })?;
+            let shard = PreparedShardId::for_operation(&operation);
+            let delta_index = deltas
+                .iter()
+                .position(|delta: &PreparedShardDelta| delta.matches(&state, shard));
+            if let Some(index) = delta_index {
+                deltas[index].push_operation(batch_index, operation);
+            } else {
+                let bucket = operation.bucket().to_owned();
+                let mut delta = PreparedShardDelta::new(bucket, shard, state);
+                delta.push_operation(batch_index, operation);
+                deltas.push(delta);
+            }
+        }
+
+        Ok(PreparedCommit::new(
+            write_options,
+            transaction_reads,
+            wal_operations,
+            deltas,
+        ))
     }
 
     fn validate_transaction_reads(
@@ -600,6 +743,49 @@ impl Db {
     }
 }
 
+fn include_min_key(slot: &mut Option<Vec<u8>>, key: &[u8]) {
+    if slot
+        .as_ref()
+        .is_none_or(|existing| key < existing.as_slice())
+    {
+        *slot = Some(key.to_vec());
+    }
+}
+
+fn include_max_key(slot: &mut Option<Vec<u8>>, key: &[u8]) {
+    if slot
+        .as_ref()
+        .is_none_or(|existing| key > existing.as_slice())
+    {
+        *slot = Some(key.to_vec());
+    }
+}
+
+fn operation_estimated_bytes(operation: &BatchOperation) -> u64 {
+    const PREPARED_OPERATION_OVERHEAD_BYTES: u64 = 32;
+
+    let payload_bytes = match operation {
+        BatchOperation::Put { bucket, key, value } => usize_to_u64_saturating(bucket.len())
+            .saturating_add(usize_to_u64_saturating(key.len()))
+            .saturating_add(usize_to_u64_saturating(value.len())),
+        BatchOperation::Delete { bucket, key } => {
+            usize_to_u64_saturating(bucket.len()).saturating_add(usize_to_u64_saturating(key.len()))
+        }
+        BatchOperation::DeleteRange { bucket, range } => usize_to_u64_saturating(bucket.len())
+            .saturating_add(bound_estimated_bytes(&range.start))
+            .saturating_add(bound_estimated_bytes(&range.end)),
+    };
+
+    PREPARED_OPERATION_OVERHEAD_BYTES.saturating_add(payload_bytes)
+}
+
+fn bound_estimated_bytes(bound: &Bound<Vec<u8>>) -> u64 {
+    match bound {
+        Bound::Included(key) | Bound::Excluded(key) => usize_to_u64_saturating(key.len()),
+        Bound::Unbounded => 0,
+    }
+}
+
 fn unique_lsm_trees(states: impl IntoIterator<Item = Arc<LsmTree>>) -> Vec<Arc<LsmTree>> {
     let mut unique = Vec::<Arc<LsmTree>>::new();
     for state in states {
@@ -641,10 +827,12 @@ mod tests {
         error::Error,
         options::{DbOptions, WriteOptions},
         types::Sequence,
+        write_batch::BatchOperation,
     };
 
     use super::{
-        AcceptedWrite, AcceptedWriteState, DurabilityMode, WriteRequest, effective_durability,
+        AcceptedWrite, AcceptedWriteState, DurabilityMode, PreparedShardId, WriteRequest,
+        effective_durability,
     };
 
     #[test]
@@ -742,19 +930,106 @@ mod tests {
             panic!("non-empty write must produce writer-local state");
         };
 
-        assert_eq!(writer_state.operations.len(), 2);
-        assert!(writer_state.transaction_reads.is_none());
+        let prepared = writer_state.prepared;
+        assert_eq!(prepared.operation_count(), 2);
+        assert!(prepared.transaction_reads.is_none());
+        assert_eq!(
+            prepared
+                .wal_operations
+                .iter()
+                .map(BatchOperation::bucket)
+                .collect::<Vec<_>>(),
+            ["default", "events"]
+        );
         assert_eq!(db.last_committed_sequence(), Sequence::ZERO);
         assert_eq!(db.get(b"default").expect("preflight is not visible"), None);
 
-        let routed = db
-            .route_writer_local_operations(writer_state.operations)
-            .expect("route writer-local operations");
-        assert_eq!(routed[0].batch_index, 0);
-        assert_eq!(routed[0].operation.bucket(), "default");
-        assert_eq!(routed[1].batch_index, 1);
-        assert_eq!(routed[1].operation.bucket(), "events");
-        assert!(!Arc::ptr_eq(&routed[0].state, &routed[1].state));
+        assert_eq!(prepared.deltas.len(), 2);
+        assert_eq!(prepared.touched_states.len(), 2);
+        assert_eq!(prepared.deltas[0].bucket, "default");
+        assert_eq!(
+            prepared.deltas[0].shard,
+            PreparedShardId::CURRENT_SINGLE_SHARD
+        );
+        assert_eq!(prepared.deltas[0].operations[0].batch_index, 0);
+        assert_eq!(
+            prepared.deltas[0].operations[0].operation.bucket(),
+            "default"
+        );
+        assert_eq!(
+            prepared.deltas[0].key_bounds.lower.as_deref(),
+            Some(b"default".as_slice())
+        );
+        assert_eq!(
+            prepared.deltas[0].key_bounds.upper.as_deref(),
+            Some(b"default".as_slice())
+        );
+        assert_eq!(prepared.deltas[1].bucket, "events");
+        assert_eq!(prepared.deltas[1].operations[0].batch_index, 1);
+        assert_eq!(
+            prepared.deltas[1].operations[0].operation.bucket(),
+            "events"
+        );
+        assert!(prepared.estimated_bytes > 0);
+        assert!(
+            prepared
+                .deltas
+                .iter()
+                .all(|delta| delta.estimated_bytes > 0)
+        );
+        assert!(!Arc::ptr_eq(
+            &prepared.deltas[0].state,
+            &prepared.deltas[1].state
+        ));
+    }
+
+    #[test]
+    fn writer_local_preparation_groups_same_bucket_delta_with_bounds() {
+        let db = Db::open_memory().expect("memory db opens");
+        let mut batch = WriteBatch::new();
+        batch.put(b"b".to_vec(), b"v".to_vec());
+        batch.delete(b"a".to_vec());
+        batch.delete_range(crate::types::KeyRange::half_open(
+            b"c".to_vec(),
+            b"e".to_vec(),
+        ));
+        let request = WriteRequest::batch(batch, WriteOptions::default());
+
+        let accepted_state = db
+            .accept_write_request(request)
+            .expect("write request is accepted");
+        let AcceptedWriteState::Pending(writer_state) = accepted_state else {
+            panic!("non-empty write must produce writer-local state");
+        };
+        let prepared = writer_state.prepared;
+
+        assert_eq!(prepared.operation_count(), 3);
+        assert_eq!(prepared.deltas.len(), 1);
+        assert_eq!(prepared.touched_states.len(), 1);
+        assert_eq!(prepared.deltas[0].bucket, "default");
+        assert_eq!(
+            prepared.deltas[0].shard,
+            PreparedShardId::CURRENT_SINGLE_SHARD
+        );
+        assert_eq!(
+            prepared.deltas[0]
+                .operations
+                .iter()
+                .map(|operation| operation.batch_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            prepared.deltas[0].key_bounds.lower.as_deref(),
+            Some(b"a".as_slice())
+        );
+        assert_eq!(
+            prepared.deltas[0].key_bounds.upper.as_deref(),
+            Some(b"e".as_slice())
+        );
+        assert!(!prepared.deltas[0].key_bounds.lower_unbounded);
+        assert!(!prepared.deltas[0].key_bounds.upper_unbounded);
+        assert!(prepared.deltas[0].estimated_bytes > 0);
     }
 
     #[test]

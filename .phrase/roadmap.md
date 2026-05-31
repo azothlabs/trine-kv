@@ -2013,3 +2013,30 @@ await owned read completion.
   barrier, commit tracker, and compaction behavior remain unchanged.
 - Focused async/table/cache tests, formatting, clippy, full tests, and diff
   checks pass.
+
+### Phase 92: Writer-Local Prepared Deltas
+
+**Status**: Complete
+
+**Goal**: Build immutable writer-local prepared commit data before entering the
+publish barrier, without changing commit visibility, WAL format, or memtable
+publication behavior.
+
+**Entry Condition**: Phase 91 complete and the foreground write-path protocol
+identifies immutable prepared commits and shard delta types as the next
+post-tracker write-path slice.
+
+**Acceptance Gate**:
+
+- Accepted non-empty writes prepare bucket delta data before entering the
+  publish barrier and remain invisible until publication.
+- Prepared deltas preserve WAL operation order, batch indexes, touched bucket
+  states, coarse key bounds, and estimated bytes.
+- Publish-time transaction validation, sequence assignment, WAL append,
+  memtable publication, visible marking, and post-commit freeze remain
+  serialized by the named publish barrier.
+- Public async/blocking API, storage formats, MVCC, recovery contract, commit
+  tracker, compaction behavior, and WAL/table/blob/manifest formats remain
+  unchanged.
+- Focused commit/write/async tests, formatting, clippy, full tests, and diff
+  checks pass.
