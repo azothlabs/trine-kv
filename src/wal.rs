@@ -6,12 +6,12 @@ use std::{
 };
 
 use crate::{
-    durability::sync_parent_dir_after_rename,
     error::{Error, Result},
     options::DurabilityMode,
     storage::{
-        BlockingStorageAppendBackend, BlockingStorageAppendObject, NativeFileAppendObject,
-        NativeFileBackend, StorageCapability, StorageObjectId, StorageObjectKind,
+        BlockingStorageAppendBackend, BlockingStorageAppendObject,
+        BlockingStorageDirectorySyncBackend, NativeFileAppendObject, NativeFileBackend,
+        StorageCapability, StorageDirectoryId, StorageObjectId, StorageObjectKind,
         StorageReadBackend,
     },
     types::{KeyRange, Sequence},
@@ -109,7 +109,7 @@ pub fn rewrite_batches_after(path: &Path, replay_floor: Sequence) -> Result<()> 
         file.sync_all()?;
     }
     fs::rename(&tmp_path, path)?;
-    sync_parent_dir_after_rename(path)?;
+    sync_wal_parent_directory_after_rename(path)?;
 
     Ok(())
 }
@@ -126,6 +126,17 @@ fn open_wal_append_object(path: &Path) -> Result<NativeFileAppendObject> {
     let backend = NativeFileBackend::new();
     backend.capabilities().require(StorageCapability::Append)?;
     backend.open_append_blocking(wal_storage_object(path))
+}
+
+fn sync_wal_parent_directory_after_rename(path: &Path) -> Result<()> {
+    let Some(parent) = StorageDirectoryId::native_file_parent_of(path) else {
+        return Ok(());
+    };
+    let backend = NativeFileBackend::new();
+    backend
+        .capabilities()
+        .require(StorageCapability::DirectorySync)?;
+    backend.sync_directory_after_renames_blocking(parent)
 }
 
 fn wal_storage_object(path: &Path) -> StorageObjectId {

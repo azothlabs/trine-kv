@@ -14,7 +14,7 @@ use std::{
 use crate::{
     blob::{self, ValueRef},
     bucket::{Bucket, BucketName, BucketReader, DEFAULT_BUCKET_NAME},
-    cache, compaction, durability,
+    cache, compaction,
     error::{Error, Result},
     iterator::{Direction, Iter, LazyIter, ScanSelector},
     lsm::{
@@ -32,8 +32,9 @@ use crate::{
     snapshot::{Snapshot, SnapshotTracker},
     stats::{BlobReadMetrics, DbStats, LevelStats},
     storage::{
-        BlockingStorageObjectDeleteBackend, NativeFileBackend, StorageCapability, StorageObjectId,
-        StorageObjectKind, StorageReadBackend,
+        BlockingStorageDirectorySyncBackend, BlockingStorageObjectDeleteBackend, NativeFileBackend,
+        StorageCapability, StorageDirectoryId, StorageObjectId, StorageObjectKind,
+        StorageReadBackend,
     },
     table::{self, Table},
     transaction::{Transaction, TransactionOptions},
@@ -1799,7 +1800,7 @@ impl Db {
             written_tables.push((input.bucket.clone(), Arc::new(table)));
         }
 
-        if let Err(error) = durability::sync_dir_after_renames(db_path) {
+        if let Err(error) = sync_storage_directory_after_renames(db_path) {
             let _ = remove_storage_files(db_path, &written_table_ids);
             return Err(error);
         }
@@ -1983,7 +1984,7 @@ impl Db {
             self.obsolete_blob_ids_for_compaction(&compaction_inputs, &written_tables)?;
 
         if !written_table_ids.is_empty() {
-            if let Err(error) = durability::sync_dir_after_renames(db_path) {
+            if let Err(error) = sync_storage_directory_after_renames(db_path) {
                 let _ = remove_storage_files(db_path, &written_table_ids);
                 return Err(error);
             }
@@ -2169,7 +2170,7 @@ impl Db {
             }
         };
 
-        if let Err(error) = durability::sync_dir_after_renames(db_path) {
+        if let Err(error) = sync_storage_directory_after_renames(db_path) {
             let _ = remove_storage_files(db_path, &written_table_ids);
             return Err(error);
         }
@@ -3127,6 +3128,14 @@ fn delete_storage_object(kind: StorageObjectKind, path: &Path) -> Result<()> {
         .capabilities()
         .require(StorageCapability::ObjectDelete)?;
     backend.delete_object_blocking(StorageObjectId::native_file(kind, path))
+}
+
+fn sync_storage_directory_after_renames(path: &Path) -> Result<()> {
+    let backend = NativeFileBackend::new();
+    backend
+        .capabilities()
+        .require(StorageCapability::DirectorySync)?;
+    backend.sync_directory_after_renames_blocking(StorageDirectoryId::native_file(path))
 }
 
 fn remove_storage_files(db_path: &Path, table_ids: &[table::TableId]) -> Result<()> {

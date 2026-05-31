@@ -12,7 +12,7 @@ use std::{
 
 use crate::{
     block::BlockReadSource,
-    durability::sync_parent_dir_after_rename,
+    durability::{sync_dir_after_renames, sync_parent_dir_after_rename},
     error::{Error, Result},
     options::DurabilityMode,
 };
@@ -69,6 +69,27 @@ impl StorageObjectId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct StorageDirectoryId {
+    path: PathBuf,
+}
+
+impl StorageDirectoryId {
+    pub(crate) fn native_file(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub(crate) fn native_file_parent_of(path: &Path) -> Option<Self> {
+        path.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Self::native_file)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageObjectListRequest {
     kind: StorageObjectKind,
@@ -116,6 +137,7 @@ pub(crate) enum StorageCapability {
     ObjectWrite,
     ObjectDelete,
     Append,
+    DirectorySync,
     AtomicManifestPublish,
     WriterLease,
     Flush,
@@ -136,6 +158,7 @@ impl StorageCapability {
             Self::ObjectWrite => "object write",
             Self::ObjectDelete => "object delete",
             Self::Append => "append",
+            Self::DirectorySync => "directory sync",
             Self::AtomicManifestPublish => "atomic manifest publish",
             Self::WriterLease => "writer lease",
             Self::Flush => "flush",
@@ -147,7 +170,7 @@ impl StorageCapability {
         }
     }
 
-    const fn bit(self) -> u16 {
+    const fn bit(self) -> u32 {
         match self {
             Self::Volatile => 1 << 0,
             Self::Persistent => 1 << 1,
@@ -156,21 +179,22 @@ impl StorageCapability {
             Self::ObjectWrite => 1 << 4,
             Self::ObjectDelete => 1 << 5,
             Self::Append => 1 << 6,
-            Self::AtomicManifestPublish => 1 << 7,
-            Self::WriterLease => 1 << 8,
-            Self::Flush => 1 << 9,
-            Self::StrictDataSync => 1 << 10,
-            Self::StrictMetadataSync => 1 << 11,
-            Self::BackgroundThreads => 1 << 12,
-            Self::AsyncTasks => 1 << 13,
-            Self::CooperativeTasks => 1 << 14,
+            Self::DirectorySync => 1 << 7,
+            Self::AtomicManifestPublish => 1 << 8,
+            Self::WriterLease => 1 << 9,
+            Self::Flush => 1 << 10,
+            Self::StrictDataSync => 1 << 11,
+            Self::StrictMetadataSync => 1 << 12,
+            Self::BackgroundThreads => 1 << 13,
+            Self::AsyncTasks => 1 << 14,
+            Self::CooperativeTasks => 1 << 15,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StorageCapabilities {
-    bits: u16,
+    bits: u32,
 }
 
 impl StorageCapabilities {
@@ -190,6 +214,7 @@ impl StorageCapabilities {
             .with(StorageCapability::ObjectWrite)
             .with(StorageCapability::ObjectDelete)
             .with(StorageCapability::Append)
+            .with(StorageCapability::DirectorySync)
             .with(StorageCapability::AtomicManifestPublish)
             .with(StorageCapability::WriterLease)
             .with(StorageCapability::Flush)
@@ -316,6 +341,14 @@ pub(crate) trait StorageWriterLeaseBackend: StorageReadBackend {
 
 pub(crate) trait BlockingStorageWriterLeaseBackend: StorageWriterLeaseBackend {
     fn acquire_writer_lease_blocking(&self, object: StorageObjectId) -> Result<Self::WriterLease>;
+}
+
+pub(crate) trait StorageDirectorySyncBackend: StorageReadBackend {
+    fn sync_directory_after_renames(&self, directory: StorageDirectoryId) -> StorageFuture<'_, ()>;
+}
+
+pub(crate) trait BlockingStorageDirectorySyncBackend: StorageDirectorySyncBackend {
+    fn sync_directory_after_renames_blocking(&self, directory: StorageDirectoryId) -> Result<()>;
 }
 
 pub(crate) trait StorageManifestReadBackend: StorageReadBackend {
@@ -567,6 +600,18 @@ impl StorageWriterLeaseBackend for NativeFileBackend {
 impl BlockingStorageWriterLeaseBackend for NativeFileBackend {
     fn acquire_writer_lease_blocking(&self, object: StorageObjectId) -> Result<Self::WriterLease> {
         poll_ready_storage_future(self.acquire_writer_lease(object))
+    }
+}
+
+impl StorageDirectorySyncBackend for NativeFileBackend {
+    fn sync_directory_after_renames(&self, directory: StorageDirectoryId) -> StorageFuture<'_, ()> {
+        Box::pin(async move { sync_native_file_directory_after_renames(&directory) })
+    }
+}
+
+impl BlockingStorageDirectorySyncBackend for NativeFileBackend {
+    fn sync_directory_after_renames_blocking(&self, directory: StorageDirectoryId) -> Result<()> {
+        poll_ready_storage_future(self.sync_directory_after_renames(directory))
     }
 }
 
@@ -960,6 +1005,22 @@ fn write_native_file_writer_lease_owner(file: &mut File, owner: &str) -> Result<
     Ok(())
 }
 
+fn sync_native_file_directory_after_renames(directory: &StorageDirectoryId) -> Result<()> {
+    let capabilities = StorageCapabilities::native_file();
+    capabilities.require(StorageCapability::DirectorySync)?;
+    capabilities.require(StorageCapability::StrictMetadataSync)?;
+
+    sync_dir_after_renames(directory.path())
+}
+
+fn sync_native_file_parent_directory_after_rename(path: &Path) -> Result<()> {
+    let capabilities = StorageCapabilities::native_file();
+    capabilities.require(StorageCapability::DirectorySync)?;
+    capabilities.require(StorageCapability::StrictMetadataSync)?;
+
+    sync_parent_dir_after_rename(path)
+}
+
 fn read_current_manifest_from_native_file(object: &StorageObjectId) -> Result<Option<Arc<[u8]>>> {
     if object.kind() != StorageObjectKind::Manifest {
         return Err(Error::invalid_options(
@@ -1073,7 +1134,7 @@ fn publish_manifest_to_native_file(
     }
     fs::rename(tmp_path, path)?;
     if durability == DurabilityMode::SyncAll {
-        sync_parent_dir_after_rename(path)?;
+        sync_native_file_parent_directory_after_rename(path)?;
     }
 
     Ok(())
@@ -1584,6 +1645,43 @@ mod tests {
     }
 
     #[test]
+    fn native_file_backend_syncs_directory_after_renames() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-storage-directory-sync-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("test dir creates");
+
+        let tmp_path = root.join("value.tmp");
+        let published_path = root.join("value.trinet");
+        std::fs::write(&tmp_path, b"published").expect("temp file writes");
+        std::fs::rename(&tmp_path, &published_path).expect("file renames");
+
+        let backend = NativeFileBackend::new();
+        backend
+            .capabilities()
+            .require(StorageCapability::DirectorySync)
+            .expect("native-file backend supports directory sync");
+        backend
+            .sync_directory_after_renames_blocking(StorageDirectoryId::native_file(&root))
+            .expect("directory sync succeeds");
+
+        let parent = StorageDirectoryId::native_file_parent_of(&published_path)
+            .expect("published path has parent directory");
+        assert_eq!(parent.path(), root.as_path());
+        assert_eq!(
+            std::fs::read(&published_path).expect("published file reads"),
+            b"published"
+        );
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[test]
     fn memory_storage_backend_exposes_async_read_shape() {
         let backend = MemoryStorageBackend::new();
         let capabilities = backend.capabilities();
@@ -1628,6 +1726,7 @@ mod tests {
         assert!(!read_only.supports(StorageCapability::ObjectWrite));
         assert!(!read_only.supports(StorageCapability::ObjectDelete));
         assert!(!read_only.supports(StorageCapability::Append));
+        assert!(!read_only.supports(StorageCapability::DirectorySync));
         assert!(!read_only.supports(StorageCapability::WriterLease));
         assert!(matches!(
             read_only.require(StorageCapability::Append),

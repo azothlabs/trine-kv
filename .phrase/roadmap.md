@@ -1325,3 +1325,29 @@ already routes through storage backend operations.
   behavior remain unchanged.
 - Focused storage/writer-lock/persistent tests, formatting, clippy, and diff
   checks pass.
+
+### Phase 63: Native-File Directory Sync Backend
+
+**Status**: Complete
+
+**Goal**: Route native-file directory metadata sync after atomic renames through
+the storage backend.
+
+**Entry Condition**: Phase 62 complete and the persistent writable-open,
+commit-append, table/blob object, and cleanup paths already route through
+backend operations.
+
+**Acceptance Gate**:
+
+- Native-file backend reports directory-sync capability.
+- Native-file backend exposes a directory-sync operation for rename publish
+  barriers.
+- WAL rewrite, recovery report publish, flush output publish barriers,
+  compaction output publish barriers, and blob-GC output publish barriers use
+  the backend directory-sync operation.
+- Table/blob output batching remains one directory sync after one or more
+  renames and before manifest publish.
+- Public API behavior, WAL, manifest, table/blob formats, MVCC, compaction,
+  recovery policy, and storage format remain unchanged.
+- Focused storage/recovery/WAL/persistent tests, formatting, clippy, and diff
+  checks pass.

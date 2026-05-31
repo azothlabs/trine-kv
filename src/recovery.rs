@@ -7,13 +7,13 @@ use std::{
 
 use crate::{
     blob,
-    durability::sync_parent_dir_after_rename,
     error::{Error, Result},
     manifest::ManifestState,
     options::FailOnCorruptionPolicy,
     storage::{
-        BlockingStorageWriterLeaseBackend, NativeFileBackend, NativeFileWriterLease,
-        StorageCapability, StorageObjectId, StorageObjectKind, StorageReadBackend,
+        BlockingStorageDirectorySyncBackend, BlockingStorageWriterLeaseBackend, NativeFileBackend,
+        NativeFileWriterLease, StorageCapability, StorageDirectoryId, StorageObjectId,
+        StorageObjectKind, StorageReadBackend,
     },
     table::{self, TableId},
     wal,
@@ -313,9 +313,20 @@ fn write_recovery_report(db_path: &Path, report: &RecoveryReport) -> Result<()> 
     file.sync_all()?;
     drop(file);
     fs::rename(tmp_path, &path)?;
-    sync_parent_dir_after_rename(&path)?;
+    sync_recovery_report_parent_directory_after_rename(&path)?;
 
     Ok(())
+}
+
+fn sync_recovery_report_parent_directory_after_rename(path: &Path) -> Result<()> {
+    let Some(parent) = StorageDirectoryId::native_file_parent_of(path) else {
+        return Ok(());
+    };
+    let backend = NativeFileBackend::new();
+    backend
+        .capabilities()
+        .require(StorageCapability::DirectorySync)?;
+    backend.sync_directory_after_renames_blocking(parent)
 }
 
 fn encode_report(report: &RecoveryReport) -> String {

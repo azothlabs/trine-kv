@@ -5364,3 +5364,55 @@ Record only evidence that can change planning or durable decisions.
 - Route parent-directory sync through the storage backend so native-file atomic
   publish durability no longer calls the durability helper directly from engine
   modules.
+
+## 2026-05-31: Native-File Directory Sync Backend
+
+### Observation
+
+- WAL rewrite, recovery report publish, flush output barriers, compaction
+  output barriers, and blob-GC output barriers still called directory sync
+  helpers directly.
+- Manifest publish already lived inside the storage backend, but its
+  parent-directory sync still used a backend-local direct helper call.
+- Table/blob output paths intentionally sync the database directory once after
+  one or more output-file renames and before publishing the manifest.
+
+### Interpretation
+
+- Directory metadata sync is a storage capability, not engine logic.
+- Routing it through the backend lets native-file strict metadata durability
+  stay platform-specific while preserving the current batched sync shape.
+- This slice should not make table/blob writes sync their parent directory one
+  file at a time because that would add durable install work on flush,
+  compaction, and blob-GC paths.
+
+### Verification
+
+- Added `StorageCapability::DirectorySync`.
+- Added `StorageDirectoryId`, `StorageDirectorySyncBackend`, and
+  `BlockingStorageDirectorySyncBackend`.
+- Native-file backend now exposes async and blocking directory-sync operations.
+- Manifest publish now calls a backend-owned native-file parent-directory sync
+  helper after `SyncAll` rename publish.
+- WAL rewrite and recovery report publish now route parent-directory sync via
+  the backend directory-sync operation.
+- Flush, compaction, and blob-GC output barriers now route batched database
+  directory sync via the backend directory-sync operation.
+- Direct directory sync helper calls remain only in `durability.rs` and the
+  native-file storage backend implementation.
+- `cargo test storage --lib`
+- `cargo test wal --lib`
+- `cargo test recovery --all-targets`
+- `cargo test persistent_flush --test persistent_wal`
+- `cargo test persistent_compaction --test persistent_wal`
+- `cargo test persistent_blob_gc --test persistent_wal`
+
+### Remaining Blockers
+
+- Public async API, async runtime selection, WAL rewrite storage-object routing,
+  and production in-memory object routing remain later phases.
+
+### Recommended Next Action
+
+- Route WAL rewrite maintenance through storage backend operations so the
+  append path and rewrite-after-flush path share the same storage boundary.
