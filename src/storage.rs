@@ -1,10 +1,11 @@
 use std::{
+    collections::BTreeMap,
     fs::File,
     future::Future,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
     task::{Context, Poll, Waker},
 };
 
@@ -14,7 +15,7 @@ use crate::{
     options::DurabilityMode,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum StorageObjectKind {
     Table,
 }
@@ -27,7 +28,7 @@ impl StorageObjectKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct StorageObjectId {
     kind: StorageObjectKind,
     path: PathBuf,
@@ -38,6 +39,14 @@ impl StorageObjectId {
         Self {
             kind,
             path: path.into(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn memory(kind: StorageObjectKind, name: impl Into<PathBuf>) -> Self {
+        Self {
+            kind,
+            path: name.into(),
         }
     }
 
@@ -121,6 +130,12 @@ impl StorageCapabilities {
             .with(StorageCapability::RandomRead)
     }
 
+    pub(crate) const fn memory_read() -> Self {
+        Self::empty()
+            .with(StorageCapability::Volatile)
+            .with(StorageCapability::RandomRead)
+    }
+
     pub(crate) const fn with(self, capability: StorageCapability) -> Self {
         Self {
             bits: self.bits | capability.bit(),
@@ -163,6 +178,7 @@ impl StorageCapabilities {
 }
 
 pub(crate) trait StorageReadObject: Send + Sync {
+    #[allow(dead_code)]
     fn object(&self) -> &StorageObjectId;
 
     fn len(&self) -> StorageReadFuture<'_, u64>;
@@ -193,6 +209,129 @@ where
     Self::ReadObject: BlockingStorageReadObject,
 {
     fn open_read_blocking(&self, object: StorageObjectId) -> Result<Self::ReadObject>;
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Default, Clone)]
+pub(crate) struct MemoryStorageBackend {
+    objects: Arc<Mutex<BTreeMap<StorageObjectId, Arc<[u8]>>>>,
+}
+
+#[allow(dead_code)]
+impl MemoryStorageBackend {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn insert_read_object(
+        &self,
+        object: StorageObjectId,
+        bytes: impl Into<Arc<[u8]>>,
+    ) -> Result<()> {
+        let mut objects = self.lock_objects()?;
+        objects.insert(object, bytes.into());
+        Ok(())
+    }
+
+    fn object_bytes(&self, object: &StorageObjectId) -> Result<Arc<[u8]>> {
+        let objects = self.lock_objects()?;
+        objects
+            .get(object)
+            .cloned()
+            .ok_or_else(|| Error::Corruption {
+                message: format!(
+                    "referenced memory {} {} cannot be opened",
+                    object.kind().as_str(),
+                    object.path().display()
+                ),
+            })
+    }
+
+    fn lock_objects(&self) -> Result<MutexGuard<'_, BTreeMap<StorageObjectId, Arc<[u8]>>>> {
+        self.objects.lock().map_err(|_| Error::Corruption {
+            message: "memory storage registry lock poisoned".to_owned(),
+        })
+    }
+}
+
+impl StorageReadBackend for MemoryStorageBackend {
+    type ReadObject = MemoryStorageObject;
+
+    fn capabilities(&self) -> StorageCapabilities {
+        StorageCapabilities::memory_read()
+    }
+
+    fn open_read(&self, object: StorageObjectId) -> StorageReadFuture<'_, Self::ReadObject> {
+        Box::pin(async move {
+            let bytes = self.object_bytes(&object)?;
+            Ok(MemoryStorageObject { object, bytes })
+        })
+    }
+}
+
+impl BlockingStorageReadBackend for MemoryStorageBackend {
+    fn open_read_blocking(&self, object: StorageObjectId) -> Result<Self::ReadObject> {
+        poll_ready_storage_future(self.open_read(object))
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct MemoryStorageObject {
+    object: StorageObjectId,
+    bytes: Arc<[u8]>,
+}
+
+impl MemoryStorageObject {
+    fn len_from_memory(&self) -> Result<u64> {
+        usize_to_u64(self.bytes.len(), "memory storage object length")
+    }
+
+    fn read_exact_at_offset(&self, offset: usize, bytes: &mut [u8]) -> Result<()> {
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or_else(|| Error::invalid_options("memory storage object read offset overflow"))?;
+        let source = self
+            .bytes
+            .get(offset..end)
+            .ok_or_else(|| Error::Corruption {
+                message: format!(
+                    "referenced memory {} {} short read",
+                    self.object.kind().as_str(),
+                    self.object.path().display()
+                ),
+            })?;
+        bytes.copy_from_slice(source);
+        Ok(())
+    }
+}
+
+impl StorageReadObject for MemoryStorageObject {
+    fn object(&self) -> &StorageObjectId {
+        &self.object
+    }
+
+    fn len(&self) -> StorageReadFuture<'_, u64> {
+        Box::pin(async move { self.len_from_memory() })
+    }
+
+    fn read_exact_at<'op>(
+        &'op self,
+        offset: usize,
+        bytes: &'op mut [u8],
+    ) -> StorageReadFuture<'op, ()> {
+        Box::pin(async move { self.read_exact_at_offset(offset, bytes) })
+    }
+}
+
+impl BlockingStorageReadObject for MemoryStorageObject {
+    fn len_blocking(&self) -> Result<u64> {
+        poll_ready_storage_future(StorageReadObject::len(self))
+    }
+
+    fn read_exact_at_blocking(&self, offset: usize, bytes: &mut [u8]) -> Result<()> {
+        poll_ready_storage_future(StorageReadObject::read_exact_at(self, offset, bytes))
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -286,6 +425,25 @@ impl BlockingStorageReadObject for NativeFileObject {
     }
 }
 
+pub(crate) struct StorageReadSource<'src, H> {
+    object: &'src H,
+}
+
+impl<'src, H> StorageReadSource<'src, H> {
+    pub(crate) const fn new(object: &'src H) -> Self {
+        Self { object }
+    }
+}
+
+impl<H> BlockReadSource for StorageReadSource<'_, H>
+where
+    H: BlockingStorageReadObject,
+{
+    fn read_exact_at(&self, offset: usize, bytes: &mut [u8]) -> Result<()> {
+        self.object.read_exact_at_blocking(offset, bytes)
+    }
+}
+
 pub(crate) struct NativeFileReadSource<'src, H> {
     object: StorageObjectId,
     cached: Option<&'src H>,
@@ -345,7 +503,7 @@ fn poll_ready_storage_future<T>(future: impl Future<Output = Result<T>>) -> Resu
     match future.as_mut().poll(&mut context) {
         Poll::Ready(value) => value,
         Poll::Pending => Err(Error::unsupported_backend(
-            "runtime for pending native-file storage future",
+            "runtime for pending storage future",
         )),
     }
 }
@@ -394,6 +552,42 @@ mod tests {
         assert_eq!(&bytes, b"cde");
 
         std::fs::remove_file(path).expect("test file removes");
+    }
+
+    #[test]
+    fn memory_storage_backend_exposes_async_read_shape() {
+        let backend = MemoryStorageBackend::new();
+        let capabilities = backend.capabilities();
+        assert!(capabilities.supports(StorageCapability::Volatile));
+        assert!(capabilities.supports(StorageCapability::RandomRead));
+        assert!(!capabilities.supports(StorageCapability::Persistent));
+        assert!(matches!(
+            capabilities.require(StorageCapability::Persistent),
+            Err(Error::UnsupportedBackend {
+                feature: "persistent storage"
+            })
+        ));
+
+        let object_id = StorageObjectId::memory(StorageObjectKind::Table, "table-7");
+        backend
+            .insert_read_object(object_id.clone(), Vec::from(&b"abcdef"[..]))
+            .expect("memory object inserts");
+
+        let object =
+            poll_ready_storage_future(backend.open_read(object_id)).expect("memory object opens");
+        assert_eq!(
+            StorageReadObject::object(&object).kind(),
+            StorageObjectKind::Table
+        );
+        assert_eq!(
+            poll_ready_storage_future(StorageReadObject::len(&object)).expect("length reads"),
+            6
+        );
+
+        let mut bytes = [0_u8; 3];
+        poll_ready_storage_future(StorageReadObject::read_exact_at(&object, 1, &mut bytes))
+            .expect("range reads");
+        assert_eq!(&bytes, b"bcd");
     }
 
     #[test]

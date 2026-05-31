@@ -4770,3 +4770,57 @@ Record only evidence that can change planning or durable decisions.
 
 - Route memory mode through the same async read contract, or add write/publish
   trait methods behind the capability checks.
+
+## 2026-05-31: Memory Storage Read Backend
+
+### Observation
+
+- Native-file storage already implemented the async read trait shape, but
+  memory byte objects did not.
+- The async-first storage protocol names the memory backend as volatile,
+  immediately completable, and the baseline for WASM logical correctness tests.
+- Existing production in-memory DB behavior does not currently create SSTable
+  storage objects, so this slice should prove the read contract without
+  changing flush, compaction, WAL, manifest, blob, or public API behavior.
+
+### Interpretation
+
+- A volatile memory read backend is the smallest useful follow-up after typed
+  capabilities: it proves the same storage read boundary supports non-file byte
+  objects.
+- Table decode tests are the right first consumer because they can read encoded
+  table bytes through the same checked-block source path without changing
+  production in-memory mode.
+
+### Verification
+
+- Added `MemoryStorageBackend` and `MemoryStorageObject` in `src/storage.rs`.
+- Memory storage reports volatile random-read capability and rejects persistent
+  capability checks.
+- Added `StorageReadSource` for already-opened storage read objects.
+- Persistent `read_table` uses `StorageReadSource` for the opened native-file
+  object.
+- Test table decoding now opens encoded table bytes through
+  `MemoryStorageBackend` and reads header, footer, properties, indexes, data
+  blocks, range tombstones, and filters through the storage read source.
+- `cargo test storage --lib`
+- `cargo test table --lib`
+- `cargo test block --all-targets`
+- `cargo test persistent --all-targets`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --check`
+- `git diff --check`
+- Forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, `README.md`, `CHANGELOG.md`, and `Cargo.toml`
+
+### Remaining Blockers
+
+- None for the memory read backend slice.
+- Public async API, production in-memory table-object routing, write/publish
+  routing, WAL, manifest, blob files, cleanup, writer lease handling, and
+  runtime selection remain later slices.
+
+### Recommended Next Action
+
+- Add write/publish trait methods behind capability checks, starting with a
+  small native-file table write or manifest publish adapter slice.

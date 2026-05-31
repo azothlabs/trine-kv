@@ -6,15 +6,15 @@ Complete
 
 ## Goal
 
-Add explicit storage capability and unsupported-capability error types.
+Route memory storage objects through the async read contract.
 
 ## Scope
 
-- Add an internal storage capability vocabulary for backend guarantees.
-- Add capability checking helpers for storage operations and durability modes.
-- Add typed unsupported backend and unsupported durability errors.
-- Route the existing table random-read requirement through the typed
-  capability helper.
+- Add a volatile memory storage read backend and read object using the same
+  internal async read trait shape as native-file storage.
+- Add memory backend capability reporting for volatile random reads.
+- Exercise table-byte decoding through a memory storage object so checked
+  table reads can use the same read contract.
 - Keep block cache behavior, stats, cache keys, and SSTable format unchanged.
 - Keep SSTable, WAL, manifest, blob, compaction, transaction, and public API
   behavior unchanged.
@@ -28,18 +28,21 @@ Add explicit storage capability and unsupported-capability error types.
   key semantics.
 - Moving table writes, manifest publish, WAL append, blob reads, or file cleanup
   to the new adapter in this slice.
-- Defining or routing full write, manifest publish, lease, cleanup, or runtime
-  traits in this slice.
+- Defining or routing full write, manifest publish, lease, cleanup, runtime, or
+  public async API traits in this slice.
+- Reworking in-memory DB flush behavior or making memory mode create SSTable
+  storage objects in production paths.
 - Moving MVCC visibility, table version lifetime, compaction planning, manifest
   publish, blob GC, or public API behavior.
 
 ## Acceptance Gate
 
-- Internal storage capability types cover current read guarantees and named
-  later write/publish/durability guarantees.
-- Unsupported backend capability and unsupported durability errors are explicit
-  variants.
-- Current table random-read capability check uses the typed helper.
+- Memory storage backend implements the same read backend/object traits as
+  native-file storage.
+- Memory backend reports volatile random-read capability and does not claim
+  persistence or write/publish guarantees.
+- Table-byte decode coverage reads via the memory storage object and checked
+  block source path.
 - Persistent table open/header/footer/startup metadata reads still go through a
   native-file storage object and adapter keyed by a storage object id.
 - Persistent table checked-block reads continue to go through the same adapter.
@@ -52,34 +55,40 @@ Add explicit storage capability and unsupported-capability error types.
 ## Active Task Slice
 
 ```text
-task189 [x] goal:start storage capability/error slice | scope:current roadmap protocol | verify:manual
-task190 [x] goal:add capability and unsupported error types | scope:src/storage.rs src/error.rs src/options.rs | verify:focused tests
-task191 [x] goal:use typed capability check in table read path | scope:src/table.rs | verify:table tests
-task192 [x] goal:record evidence and next step | scope:.phrase/evidence.md current roadmap | verify:git diff
+task193 [x] goal:start memory storage read slice | scope:current roadmap protocol | verify:manual
+task194 [x] goal:add volatile memory read backend/object | scope:src/storage.rs | verify:storage tests
+task195 [x] goal:exercise table-byte reads through memory object | scope:src/table.rs | verify:table tests
+task196 [x] goal:record evidence and next step | scope:.phrase/evidence.md current roadmap | verify:git diff
 ```
 
 ## Known Blockers
 
-- None for this storage capability/error slice.
+- None identified for this memory storage read slice.
 - Public async API, async runtime selection, table writes, manifest, WAL, blob
-  files, lease handling, and cleanup remain later phases.
+  files, lease handling, cleanup, and production in-memory table-object routing
+  remain later phases.
 
 ## Evidence
 
 - Phase 50 defined the first async read trait shape and native-file blocking
   adapter.
-- The async-first protocol requires honest backend capabilities and typed
-  unsupported durability/capability errors before write/publish routing.
-- The current native-file read backend only needs to claim persistent random
-  read in this slice; write and publish capabilities should be named but not
-  claimed yet.
-- `src/storage.rs` now defines `StorageCapability` and `StorageCapabilities`,
-  including current read capability and later write, publish, durability,
-  lease, background, and runtime capability names.
-- `src/error.rs` now has explicit `UnsupportedBackend` and
-  `UnsupportedDurability` variants.
-- `src/table.rs` now requires `StorageCapability::RandomRead` through the
-  typed capability helper before opening a table read object.
+- Phase 51 added typed capability checks and unsupported backend/durability
+  errors.
+- The async-first protocol names the memory backend as volatile, immediately
+  completable, and the baseline for WASM logical correctness tests.
+- The next useful slice is a memory read backend that proves the same storage
+  read contract can serve non-file byte objects without changing public API or
+  production in-memory DB behavior.
+- `src/storage.rs` now has `MemoryStorageBackend` and `MemoryStorageObject`
+  implementing the same read traits as `NativeFileBackend`.
+- Memory storage reports volatile random-read capability and rejects persistent
+  capability checks.
+- `src/table.rs` test decode now opens table bytes through a memory storage
+  object and reads header, footer, checked blocks, filters, and indexes through
+  `StorageReadSource`.
+- Persistent table reads now use `StorageReadSource` for already-opened native
+  read objects, while the native-file fallback source remains for lazy paths
+  that do not hold an opened object.
 - Verification passed: `cargo test storage --lib`, `cargo test table --lib`,
   `cargo test block --all-targets`, `cargo test persistent --all-targets`,
   `cargo clippy --all-targets --all-features -- -D warnings`,
@@ -87,5 +96,5 @@ task192 [x] goal:record evidence and next step | scope:.phrase/evidence.md curre
 
 ## Next Recommendation
 
-- Route memory mode through the same async read contract, or add write/publish
-  trait methods behind the capability checks.
+- After memory read coverage lands, add write/publish trait methods behind the
+  capability checks.

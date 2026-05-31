@@ -32,7 +32,7 @@ use crate::{
     storage::{
         BlockingStorageReadBackend, BlockingStorageReadObject, NativeFileBackend, NativeFileObject,
         NativeFileReadSource, StorageCapability, StorageObjectId, StorageObjectKind,
-        StorageReadBackend, StorageReadObject,
+        StorageReadBackend, StorageReadSource,
     },
     types::{KeyRange, Sequence},
 };
@@ -2580,10 +2580,7 @@ pub(crate) fn read_table(path: &Path) -> Result<Table> {
         .require(StorageCapability::RandomRead)?;
     let object = table_storage_object(path);
     let table_file = Arc::new(backend.open_read_blocking(object)?);
-    let source = NativeFileReadSource::new(
-        StorageReadObject::object(table_file.as_ref()).clone(),
-        Some(table_file.as_ref()),
-    );
+    let source = StorageReadSource::new(table_file.as_ref());
 
     let header = read_table_header(path, &source)?;
     let magic = read_u32_at(&header, 0)?;
@@ -2636,8 +2633,6 @@ pub(crate) fn read_table(path: &Path) -> Result<Table> {
         properties.codec,
         properties.level,
     )?));
-    drop(source);
-
     Ok(Table {
         path: Some(path.to_path_buf()),
         file: Some(table_file),
@@ -3006,14 +3001,33 @@ fn encode_table(table: &Table) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 fn decode_table(bytes: &[u8]) -> Result<Table> {
-    if bytes.len() < HEADER_LEN {
+    let backend = crate::storage::MemoryStorageBackend::new();
+    backend
+        .capabilities()
+        .require(StorageCapability::RandomRead)?;
+    let object = StorageObjectId::memory(StorageObjectKind::Table, "test-table");
+    backend.insert_read_object(object.clone(), bytes.to_vec())?;
+    let table_object = backend.open_read_blocking(object)?;
+    decode_table_from_storage_object(&table_object)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_lines)]
+fn decode_table_from_storage_object(
+    table_object: &impl BlockingStorageReadObject,
+) -> Result<Table> {
+    let source = StorageReadSource::new(table_object);
+    let file_len = table_object.len_blocking()?;
+    if file_len < HEADER_LEN as u64 {
         return Err(invalid_table("short header"));
     }
 
-    let magic = read_u32_at(bytes, 0)?;
-    let version = read_u16_at(bytes, 4)?;
-    let payload_len = read_u32_at(bytes, 6)? as usize;
-    let payload_checksum = read_u32_at(bytes, 10)?;
+    let mut header = [0_u8; HEADER_LEN];
+    source.read_exact_at(0, &mut header)?;
+    let magic = read_u32_at(&header, 0)?;
+    let version = read_u16_at(&header, 4)?;
+    let payload_len = read_u32_at(&header, 6)? as usize;
+    let payload_checksum = read_u32_at(&header, 10)?;
     if magic != TABLE_MAGIC {
         return Err(Error::Corruption {
             message: "table magic mismatch".to_owned(),
@@ -3024,50 +3038,59 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
             message: format!("unsupported table version {version}"),
         });
     }
-    if bytes.len() != HEADER_LEN + payload_len {
+    let expected_len = usize_to_u64(
+        HEADER_LEN
+            .checked_add(payload_len)
+            .ok_or_else(|| invalid_table("table length overflow"))?,
+        "table file length",
+    )?;
+    if file_len != expected_len {
         return Err(Error::Corruption {
             message: "table length mismatch".to_owned(),
         });
     }
 
-    let payload = &bytes[HEADER_LEN..];
-    if checksum(payload) != payload_checksum {
+    let mut payload = vec![0_u8; payload_len];
+    source.read_exact_at(HEADER_LEN, &mut payload)?;
+    if checksum(&payload) != payload_checksum {
         return Err(Error::Corruption {
             message: "table checksum mismatch".to_owned(),
         });
     }
 
-    let footer = read_footer(payload)?;
-    validate_footer_sections(payload, &footer)?;
+    let footer = read_footer_from_source(&source, payload_len)?;
+    validate_footer_sections_by_len(payload_len, &footer)?;
 
     let (properties_codec, properties_payload) =
-        read_single_block_section(payload, footer.properties)?;
+        read_single_block_section_from_source(&source, payload_len, footer.properties)?;
     let properties = decode_properties_block(&properties_payload)?;
     validate_block_codec(properties_codec, properties.codec, TableSection::Properties)?;
 
     let (top_level_block, index_codec, index_payload) =
-        read_first_block_in_section(payload, footer.indexes)?;
+        read_first_block_in_section_from_source(&source, payload_len, footer.indexes)?;
     validate_index_top_level_codec(index_codec, properties.codec)?;
     let index_partitions = decode_index_top_level(&index_payload)?;
     let data_block_count =
         validate_index_top_level(top_level_block, &index_partitions, footer.indexes)?;
 
-    let (point_records, data_blocks) = decode_test_point_records_and_blocks(
-        payload,
+    let (point_records, data_blocks) = decode_test_point_records_and_blocks_from_source(
+        &source,
+        payload_len,
         &properties,
         &index_partitions,
         footer.data_blocks,
     )?;
 
     let (tombstone_codec, tombstone_payload) =
-        read_single_block_section(payload, footer.range_tombstones)?;
+        read_single_block_section_from_source(&source, payload_len, footer.range_tombstones)?;
     validate_block_codec(
         tombstone_codec,
         properties.codec,
         TableSection::RangeTombstones,
     )?;
     let range_tombstones = decode_range_tombstone_block(&tombstone_payload)?;
-    let (filter_codec, filter_payload) = read_single_block_section(payload, footer.filters)?;
+    let (filter_codec, filter_payload) =
+        read_single_block_section_from_source(&source, payload_len, footer.filters)?;
     validate_block_codec(filter_codec, properties.codec, TableSection::Filters)?;
     let (point_key_filter, prefix_filter) = decode_filter_block(&filter_payload)?;
     if properties
@@ -3089,7 +3112,7 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
     Ok(Table {
         path: None,
         file: None,
-        payload_len: payload.len(),
+        payload_len,
         footer,
         properties,
         point_records: Some(point_records),
@@ -3109,8 +3132,9 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
 }
 
 #[cfg(test)]
-fn decode_test_point_records_and_blocks(
-    payload: &[u8],
+fn decode_test_point_records_and_blocks_from_source(
+    source: &impl BlockReadSource,
+    payload_len: usize,
     properties: &TableProperties,
     index_partitions: &[IndexPartitionEntry],
     data_blocks_section: SectionHandle,
@@ -3118,12 +3142,14 @@ fn decode_test_point_records_and_blocks(
     let mut point_records = Vec::new();
     let mut data_blocks = Vec::new();
     for partition in index_partitions {
-        let (index_codec, index_payload) = read_checked_block(payload, partition.block)?;
+        let (index_codec, index_payload) =
+            read_checked_block_from_source(source, payload_len, partition.block)?;
         validate_block_codec(index_codec, properties.codec, TableSection::Indexes)?;
         let index_entries = decode_index_block(&index_payload)?;
         validate_index_partition(partition, &index_entries, data_blocks_section)?;
         for entry in index_entries {
-            let (block_codec, block_payload) = read_checked_block(payload, entry.block)?;
+            let (block_codec, block_payload) =
+                read_checked_block_from_source(source, payload_len, entry.block)?;
             validate_block_codec(block_codec, properties.codec, TableSection::DataBlocks)?;
             let decoded_block = decode_data_block_for_verify(block_payload)?;
             validate_decoded_data_block_entry(&entry, &decoded_block)?;
@@ -3490,11 +3516,6 @@ const fn empty_footer() -> TableFooter {
     }
 }
 
-#[cfg(test)]
-fn validate_footer_sections(payload: &[u8], footer: &TableFooter) -> Result<()> {
-    validate_footer_sections_by_len(payload.len(), footer)
-}
-
 fn validate_footer_sections_by_len(payload_len: usize, footer: &TableFooter) -> Result<()> {
     let footer_start = payload_len - FOOTER_LEN;
     let mut expected_start = 0_usize;
@@ -3520,25 +3541,6 @@ fn validate_footer_sections_by_len(payload_len: usize, footer: &TableFooter) -> 
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-fn read_single_block_section(payload: &[u8], section: SectionHandle) -> Result<(CodecId, Vec<u8>)> {
-    let (_, section_end) = section_bounds(section)?;
-    if section.len == 0 {
-        return Err(invalid_table("empty single-block section"));
-    }
-    let block = BlockHandle {
-        offset: section.offset,
-        len: section.len,
-    };
-    let (_, block_end) = block_bounds(block)?;
-    if block_end != section_end {
-        return Err(Error::Corruption {
-            message: "section block length mismatch".to_owned(),
-        });
-    }
-    read_checked_block(payload, block)
 }
 
 #[cfg(test)]

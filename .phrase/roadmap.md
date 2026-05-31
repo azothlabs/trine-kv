@@ -1065,3 +1065,25 @@ backend migration.
 - Public API behavior, SSTable format, MVCC, manifest, WAL, blob, compaction,
   transaction, and cleanup behavior remain unchanged.
 - Focused table/persistent tests, formatting, clippy, and diff checks pass.
+
+### Phase 52: Memory Storage Read Backend
+
+**Status**: Complete
+
+**Goal**: Route memory storage objects through the same internal async read
+contract as native-file table reads.
+
+**Entry Condition**: Phase 51 complete and user asks to continue storage
+backend migration.
+
+**Acceptance Gate**:
+
+- Volatile memory storage backend implements the same read backend/object traits
+  as native-file storage.
+- Memory backend reports volatile random-read capability and no persistence,
+  write, publish, lease, cleanup, or durability guarantees.
+- Table-byte decode coverage reads through the memory storage object and checked
+  block source path.
+- Public API behavior, SSTable format, MVCC, manifest, WAL, blob, compaction,
+  transaction, and production in-memory DB behavior remain unchanged.
+- Focused storage/table tests, formatting, clippy, and diff checks pass.
