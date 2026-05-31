@@ -5100,3 +5100,54 @@ Record only evidence that can change planning or durable decisions.
 
 - Route cleanup deletion or blob read/list operations through storage backend
   operations as the next narrow storage-boundary slice.
+
+## 2026-05-31: Native-File Object Delete Backend
+
+### Observation
+
+- Table and blob output creation now route through backend object write
+  operations.
+- Cleanup deletion still called native-file removal directly for obsolete table
+  files, pending obsolete blob files, and failed flush/compaction output files.
+- Existing cleanup eligibility rules already protect active snapshots and use
+  manifest pending-blob metadata as the deletion authority.
+
+### Interpretation
+
+- Object deletion is the next safe backend operation because it moves physical
+  cleanup behind the storage boundary without changing when cleanup is allowed.
+- The backend delete operation should be idempotent for missing table/blob
+  objects, matching the existing cleanup behavior.
+- Manifest objects should remain outside generic object deletion so manifest
+  publish remains the only manifest update path.
+
+### Verification
+
+- Added `StorageCapability::ObjectDelete`.
+- Added `StorageObjectDeleteBackend` and
+  `BlockingStorageObjectDeleteBackend`.
+- `NativeFileBackend` now deletes table/blob objects through the backend
+  operation, ignores missing table/blob files, and rejects manifest objects.
+- Pending obsolete table cleanup, pending obsolete blob cleanup, and failed
+  flush/compaction output cleanup now route through backend deletion.
+- Snapshot-count gates and manifest pending-blob deletion checks remain in
+  `src/db.rs`.
+- `cargo test storage --lib`
+- `cargo test cleanup --lib`
+- `cargo test persistent_compaction_publish_failure_removes_unpublished_table_and_blob_files --test persistent_wal`
+- `cargo test persistent_flush_publish_failure_removes_unpublished_table_and_blob_files --test persistent_wal`
+- `cargo test persistent_recovery_cleans_manifest_pending_blob_deletion --test persistent_wal`
+- `cargo test persistent --all-targets`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+
+### Remaining Blockers
+
+- Public async API, async runtime selection, WAL append, blob reads, blob
+  listing, writer lease handling, parent-directory sync routing, and production
+  in-memory object routing remain later phases.
+
+### Recommended Next Action
+
+- Route blob reads or blob listing through storage backend operations next.

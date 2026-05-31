@@ -109,6 +109,7 @@ pub(crate) enum StorageCapability {
     RandomRead,
     ObjectListing,
     ObjectWrite,
+    ObjectDelete,
     Append,
     AtomicManifestPublish,
     WriterLease,
@@ -128,6 +129,7 @@ impl StorageCapability {
             Self::RandomRead => "random read",
             Self::ObjectListing => "object listing",
             Self::ObjectWrite => "object write",
+            Self::ObjectDelete => "object delete",
             Self::Append => "append",
             Self::AtomicManifestPublish => "atomic manifest publish",
             Self::WriterLease => "writer lease",
@@ -147,15 +149,16 @@ impl StorageCapability {
             Self::RandomRead => 1 << 2,
             Self::ObjectListing => 1 << 3,
             Self::ObjectWrite => 1 << 4,
-            Self::Append => 1 << 5,
-            Self::AtomicManifestPublish => 1 << 6,
-            Self::WriterLease => 1 << 7,
-            Self::Flush => 1 << 8,
-            Self::StrictDataSync => 1 << 9,
-            Self::StrictMetadataSync => 1 << 10,
-            Self::BackgroundThreads => 1 << 11,
-            Self::AsyncTasks => 1 << 12,
-            Self::CooperativeTasks => 1 << 13,
+            Self::ObjectDelete => 1 << 5,
+            Self::Append => 1 << 6,
+            Self::AtomicManifestPublish => 1 << 7,
+            Self::WriterLease => 1 << 8,
+            Self::Flush => 1 << 9,
+            Self::StrictDataSync => 1 << 10,
+            Self::StrictMetadataSync => 1 << 11,
+            Self::BackgroundThreads => 1 << 12,
+            Self::AsyncTasks => 1 << 13,
+            Self::CooperativeTasks => 1 << 14,
         }
     }
 }
@@ -180,6 +183,7 @@ impl StorageCapabilities {
     pub(crate) const fn native_file() -> Self {
         Self::native_file_read()
             .with(StorageCapability::ObjectWrite)
+            .with(StorageCapability::ObjectDelete)
             .with(StorageCapability::AtomicManifestPublish)
             .with(StorageCapability::Flush)
             .with(StorageCapability::StrictDataSync)
@@ -314,6 +318,14 @@ pub(crate) trait BlockingStorageObjectWriteBackend: StorageObjectWriteBackend {
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
     ) -> Result<()>;
+}
+
+pub(crate) trait StorageObjectDeleteBackend: StorageReadBackend {
+    fn delete_object(&self, object: StorageObjectId) -> StorageFuture<'_, ()>;
+}
+
+pub(crate) trait BlockingStorageObjectDeleteBackend: StorageObjectDeleteBackend {
+    fn delete_object_blocking(&self, object: StorageObjectId) -> Result<()>;
 }
 
 pub(crate) trait StorageObjectListBackend: StorageReadBackend {
@@ -536,6 +548,18 @@ impl BlockingStorageObjectWriteBackend for NativeFileBackend {
         durability: DurabilityMode,
     ) -> Result<()> {
         poll_ready_storage_future(self.write_object(object, bytes, durability))
+    }
+}
+
+impl StorageObjectDeleteBackend for NativeFileBackend {
+    fn delete_object(&self, object: StorageObjectId) -> StorageFuture<'_, ()> {
+        Box::pin(async move { delete_native_file_object(&object) })
+    }
+}
+
+impl BlockingStorageObjectDeleteBackend for NativeFileBackend {
+    fn delete_object_blocking(&self, object: StorageObjectId) -> Result<()> {
+        poll_ready_storage_future(self.delete_object(object))
     }
 }
 
@@ -762,6 +786,23 @@ fn write_native_file_object(
     fs::rename(tmp_path, path)?;
 
     Ok(())
+}
+
+fn delete_native_file_object(object: &StorageObjectId) -> Result<()> {
+    if object.kind() == StorageObjectKind::Manifest {
+        return Err(Error::invalid_options(
+            "manifest storage objects must use manifest publish",
+        ));
+    }
+
+    let capabilities = StorageCapabilities::native_file();
+    capabilities.require(StorageCapability::ObjectDelete)?;
+
+    match fs::remove_file(object.path()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::Io(error)),
+    }
 }
 
 fn publish_manifest_to_native_file(
@@ -1111,6 +1152,72 @@ mod tests {
     }
 
     #[test]
+    fn native_file_backend_deletes_table_and_blob_objects() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-storage-delete-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("test dir creates");
+        let table_path = root.join("table-00000000000000000007.trinet");
+        let blob_path = root.join("blob-00000000000000000007.trineb");
+        std::fs::write(&table_path, b"table").expect("table object writes");
+        std::fs::write(&blob_path, b"blob").expect("blob object writes");
+
+        let backend = NativeFileBackend::new();
+        backend
+            .capabilities()
+            .require(StorageCapability::ObjectDelete)
+            .expect("native-file backend supports object deletes");
+        backend
+            .delete_object_blocking(StorageObjectId::native_file(
+                StorageObjectKind::Table,
+                &table_path,
+            ))
+            .expect("table object deletes");
+        backend
+            .delete_object_blocking(StorageObjectId::native_file(
+                StorageObjectKind::Blob,
+                &blob_path,
+            ))
+            .expect("blob object deletes");
+        backend
+            .delete_object_blocking(StorageObjectId::native_file(
+                StorageObjectKind::Blob,
+                &blob_path,
+            ))
+            .expect("missing object delete is idempotent");
+
+        assert!(!table_path.exists(), "table object should be deleted");
+        assert!(!blob_path.exists(), "blob object should be deleted");
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[test]
+    fn native_file_object_delete_rejects_manifest_objects() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-storage-delete-manifest-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        let object =
+            StorageObjectId::native_file(StorageObjectKind::Manifest, root.join("MANIFEST"));
+
+        let backend = NativeFileBackend::new();
+        let error = backend
+            .delete_object_blocking(object)
+            .expect_err("manifest objects use manifest publish");
+        assert!(matches!(error, Error::InvalidOptions { .. }));
+    }
+
+    #[test]
     fn memory_storage_backend_exposes_async_read_shape() {
         let backend = MemoryStorageBackend::new();
         let capabilities = backend.capabilities();
@@ -1153,6 +1260,7 @@ mod tests {
         assert!(read_only.supports(StorageCapability::RandomRead));
         assert!(read_only.supports(StorageCapability::ObjectListing));
         assert!(!read_only.supports(StorageCapability::ObjectWrite));
+        assert!(!read_only.supports(StorageCapability::ObjectDelete));
         assert!(matches!(
             read_only.require(StorageCapability::Append),
             Err(Error::UnsupportedBackend { feature: "append" })

@@ -1208,3 +1208,27 @@ backend object write boundary.
   transaction, cleanup behavior, and storage format remain unchanged.
 - Focused storage/blob/table/persistent tests, formatting, clippy, and diff
   checks pass.
+
+### Phase 58: Native-File Object Delete Backend
+
+**Status**: Complete
+
+**Goal**: Route table and blob cleanup deletion through the storage backend
+object delete operation.
+
+**Entry Condition**: Phase 57 complete and table/blob object creation already
+routes through backend-owned object write paths.
+
+**Acceptance Gate**:
+
+- Native-file backend reports object delete capability.
+- Native-file backend exposes an idempotent object delete operation for table
+  and blob objects.
+- Generic object delete still rejects manifest objects so manifest publish
+  remains the only manifest update path.
+- Pending obsolete table cleanup, pending obsolete blob cleanup, and failed
+  flush/compaction output cleanup use the backend delete operation while
+  preserving snapshot and manifest safety checks.
+- Public API behavior, SSTable/blob formats, MVCC, manifest, WAL, compaction,
+  transaction, and storage format remain unchanged.
+- Focused storage/persistent tests, formatting, clippy, and diff checks pass.

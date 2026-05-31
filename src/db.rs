@@ -31,6 +31,10 @@ use crate::{
     recovery,
     snapshot::{Snapshot, SnapshotTracker},
     stats::{BlobReadMetrics, DbStats, LevelStats},
+    storage::{
+        BlockingStorageObjectDeleteBackend, NativeFileBackend, StorageCapability, StorageObjectId,
+        StorageObjectKind, StorageReadBackend,
+    },
     table::{self, Table},
     transaction::{Transaction, TransactionOptions},
     types::{CommitInfo, KeyRange, Sequence, Value},
@@ -3086,11 +3090,7 @@ fn cleanup_pending_obsolete_blob_files(
     }
 
     for file_id in &pending_file_ids {
-        match fs::remove_file(blob::blob_path(db_path, *file_id)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(Error::Io(error)),
-        }
+        delete_storage_object(StorageObjectKind::Blob, &blob::blob_path(db_path, *file_id))?;
     }
 
     manifest
@@ -3101,11 +3101,10 @@ fn cleanup_pending_obsolete_blob_files(
 
 fn remove_table_files(db_path: &Path, table_ids: &[table::TableId]) -> Result<()> {
     for table_id in table_ids {
-        match fs::remove_file(table::table_path(db_path, *table_id)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(Error::Io(error)),
-        }
+        delete_storage_object(
+            StorageObjectKind::Table,
+            &table::table_path(db_path, *table_id),
+        )?;
     }
 
     Ok(())
@@ -3113,14 +3112,21 @@ fn remove_table_files(db_path: &Path, table_ids: &[table::TableId]) -> Result<()
 
 fn remove_blob_files(db_path: &Path, table_ids: &[table::TableId]) -> Result<()> {
     for table_id in table_ids {
-        match fs::remove_file(blob::blob_path(db_path, table_id.get())) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(Error::Io(error)),
-        }
+        delete_storage_object(
+            StorageObjectKind::Blob,
+            &blob::blob_path(db_path, table_id.get()),
+        )?;
     }
 
     Ok(())
+}
+
+fn delete_storage_object(kind: StorageObjectKind, path: &Path) -> Result<()> {
+    let backend = NativeFileBackend::new();
+    backend
+        .capabilities()
+        .require(StorageCapability::ObjectDelete)?;
+    backend.delete_object_blocking(StorageObjectId::native_file(kind, path))
 }
 
 fn remove_storage_files(db_path: &Path, table_ids: &[table::TableId]) -> Result<()> {
