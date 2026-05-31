@@ -1,19 +1,21 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use crate::{
     blob,
     error::{Error, Result},
     manifest::ManifestState,
-    options::FailOnCorruptionPolicy,
+    options::{DurabilityMode, FailOnCorruptionPolicy},
     storage::{
-        BlockingStorageDirectorySyncBackend, BlockingStorageWriterLeaseBackend, NativeFileBackend,
-        NativeFileWriterLease, StorageCapability, StorageDirectoryId, StorageObjectId,
-        StorageObjectKind, StorageReadBackend,
+        BlockingStorageDirectorySyncBackend, BlockingStorageObjectWriteBackend,
+        BlockingStorageWriterLeaseBackend, NativeFileBackend, NativeFileWriterLease,
+        StorageCapability, StorageDirectoryId, StorageObjectId, StorageObjectKind,
+        StorageReadBackend,
     },
     table::{self, TableId},
     wal,
@@ -307,12 +309,16 @@ fn storage_file_name(path: &Path) -> Result<String> {
 
 fn write_recovery_report(db_path: &Path, report: &RecoveryReport) -> Result<()> {
     let path = recovery_report_path(db_path);
-    let tmp_path = path.with_extension("tmp");
-    let mut file = File::create(&tmp_path)?;
-    file.write_all(encode_report(report).as_bytes())?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(tmp_path, &path)?;
+    let bytes: Arc<[u8]> = Arc::from(encode_report(report).into_bytes());
+    let backend = NativeFileBackend::new();
+    backend
+        .capabilities()
+        .require(StorageCapability::ObjectWrite)?;
+    backend.write_object_blocking(
+        StorageObjectId::native_file(StorageObjectKind::RecoveryReport, &path),
+        bytes,
+        DurabilityMode::SyncAll,
+    )?;
     sync_recovery_report_parent_directory_after_rename(&path)?;
 
     Ok(())

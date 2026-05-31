@@ -1375,3 +1375,26 @@ already route through backend operations.
   compaction, recovery policy, and cleanup semantics remain unchanged.
 - Focused storage/WAL/recovery/persistent tests, formatting, clippy, and diff
   checks pass.
+
+### Phase 65: Native-File Recovery Report Write Backend
+
+**Status**: Complete
+
+**Goal**: Route recovery report publish through storage backend object write
+and directory-sync operations.
+
+**Entry Condition**: Phase 64 complete and object writes plus directory sync
+already route through backend operations.
+
+**Acceptance Gate**:
+
+- Storage object kinds include recovery report objects.
+- Recovery report publish uses backend object write while preserving
+  `RECOVERY_REPORT.tmp`.
+- Recovery report publish uses backend directory sync after the rename.
+- Manifest publish remains reserved for manifest objects.
+- Public API behavior, recovery report format, safe temporary file policy, WAL,
+  manifest, table/blob formats, MVCC, compaction, and cleanup semantics remain
+  unchanged.
+- Focused storage/recovery/persistent tests, formatting, clippy, and diff
+  checks pass.

@@ -21,6 +21,7 @@ use crate::{
 pub(crate) enum StorageObjectKind {
     Blob,
     Manifest,
+    RecoveryReport,
     Table,
     Wal,
     WriterLease,
@@ -31,6 +32,7 @@ impl StorageObjectKind {
         match self {
             Self::Blob => "blob",
             Self::Manifest => "manifest",
+            Self::RecoveryReport => "recovery report",
             Self::Table => "table",
             Self::Wal => "WAL",
             Self::WriterLease => "writer lease",
@@ -1527,6 +1529,40 @@ mod tests {
         assert!(
             !path.with_extension("tmp").exists(),
             "successful blob write should leave only the final object"
+        );
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[test]
+    fn native_file_backend_writes_recovery_report_object() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-storage-write-recovery-report-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        let path = root.join("RECOVERY_REPORT");
+        let tmp_path = path.with_extension("tmp");
+        let object = StorageObjectId::native_file(StorageObjectKind::RecoveryReport, &path);
+
+        NativeFileBackend::new()
+            .write_object_blocking(
+                object.clone(),
+                Arc::from(&b"recovery report"[..]),
+                DurabilityMode::SyncAll,
+            )
+            .expect("recovery report object writes");
+
+        assert_eq!(
+            std::fs::read(object.path()).expect("recovery report object reads"),
+            b"recovery report"
+        );
+        assert!(
+            !tmp_path.exists(),
+            "successful recovery report write should leave only the final object"
         );
 
         std::fs::remove_dir_all(root).expect("test dir removes");

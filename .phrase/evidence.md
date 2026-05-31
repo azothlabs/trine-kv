@@ -5467,3 +5467,43 @@ Record only evidence that can change planning or durable decisions.
 - Route recovery report write through storage backend object write plus
   directory-sync operations, or route WAL replay reads through a backend
   optional-read operation.
+
+## 2026-05-31: Native-File Recovery Report Write Backend
+
+### Observation
+
+- Recovery report parent-directory sync already routed through the backend.
+- `write_recovery_report` still created `RECOVERY_REPORT.tmp`, wrote report
+  bytes, synced the file, and renamed it directly from `recovery.rs`.
+- The existing object write path already uses `path.with_extension("tmp")`,
+  which preserves `RECOVERY_REPORT.tmp` for a final `RECOVERY_REPORT` path.
+
+### Interpretation
+
+- Recovery report publish can use the generic object write backend without
+  changing its safe temporary file contract.
+- Manifest objects should remain excluded from generic object writes so
+  manifest publish stays the only manifest update path.
+
+### Verification
+
+- Added `StorageObjectKind::RecoveryReport`.
+- Native-file object write now covers recovery report objects and still rejects
+  manifest objects.
+- `write_recovery_report` now writes report bytes through
+  `StorageObjectWriteBackend`.
+- Recovery report publish still syncs the parent directory through
+  `StorageDirectorySyncBackend`.
+- The temporary file remains `RECOVERY_REPORT.tmp`.
+- `cargo test storage --lib`
+- `cargo test recovery --all-targets`
+
+### Remaining Blockers
+
+- Public async API, async runtime selection, WAL replay optional-read routing,
+  and production in-memory object routing remain later phases.
+
+### Recommended Next Action
+
+- Route WAL replay reads through a backend optional-read operation so WAL append,
+  rewrite, and replay all depend on storage backend operations.
