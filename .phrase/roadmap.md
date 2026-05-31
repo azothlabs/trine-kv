@@ -1596,3 +1596,25 @@ represented by the commit tracker.
   tracker, MVCC, WAL/table/blob/manifest formats, compaction, and recovery
   behavior remain unchanged.
 - Focused async tests, formatting, clippy, full tests, and diff checks pass.
+
+### Phase 75: Runtime Boundary For Background Execution
+
+**Status**: Complete
+
+**Goal**: Introduce the minimal runtime boundary needed before accepted writes
+can move to owned async execution.
+
+**Entry Condition**: Phase 74 complete and current async write cancellation
+behavior is covered by tests.
+
+**Acceptance Gate**:
+
+- Runtime options and capabilities are public and default to native-thread
+  behavior.
+- Background maintenance worker spawning goes through the runtime boundary.
+- Persistent writable open rejects background workers when the selected runtime
+  has no background-thread capability.
+- Existing default background worker behavior remains unchanged.
+- Writer coordinator, commit tracker, WAL/table/blob/manifest formats, MVCC,
+  compaction, recovery, cleanup, and public API behavior remain unchanged.
+- Focused runtime tests, formatting, clippy, full tests, and diff checks pass.

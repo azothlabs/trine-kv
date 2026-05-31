@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::{codec::CodecId, prefix::PrefixExtractor};
+use crate::{codec::CodecId, prefix::PrefixExtractor, runtime::RuntimeOptions};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageMode {
@@ -107,6 +107,7 @@ pub struct DbOptions {
     pub max_l0_files: usize,
     pub block_cache_bytes: usize,
     pub background_worker_count: usize,
+    pub runtime: RuntimeOptions,
     pub fail_on_corruption: FailOnCorruptionPolicy,
     pub blob_gc_enabled: bool,
     pub blob_gc_discardable_ratio: BlobGcRatio,
@@ -175,6 +176,7 @@ impl Default for DbOptions {
             max_l0_files: 8,
             block_cache_bytes: Self::DEFAULT_BLOCK_CACHE_BYTES,
             background_worker_count: 1,
+            runtime: RuntimeOptions::default(),
             fail_on_corruption: FailOnCorruptionPolicy::FailClosed,
             blob_gc_enabled: true,
             blob_gc_discardable_ratio: BlobGcRatio::HALF,

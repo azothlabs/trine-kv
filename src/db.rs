@@ -6,7 +6,6 @@ use std::{
         Arc, Condvar, Mutex, RwLock, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
-    thread,
     time::Duration,
 };
 
@@ -28,6 +27,7 @@ use crate::{
     },
     point_value::PointValue,
     recovery,
+    runtime::{self, Runtime, RuntimeTask},
     snapshot::{Snapshot, SnapshotTracker},
     stats::{BlobReadMetrics, DbStats, LevelStats},
     storage::{
@@ -75,8 +75,9 @@ pub(crate) struct DbInner {
     blob_gc_output_bytes: AtomicU64,
     blob_gc_discarded_bytes: AtomicU64,
     blob_reads: Arc<BlobReadMetrics>,
+    runtime: Runtime,
     maintenance: Arc<MaintenanceCoordinator>,
-    background_workers: Mutex<Vec<thread::JoinHandle<()>>>,
+    background_workers: Mutex<Vec<RuntimeTask>>,
 }
 
 #[derive(Debug)]
@@ -582,17 +583,16 @@ fn range_end_is_before_start(end: &Bound<Vec<u8>>, start: &Bound<Vec<u8>>) -> bo
 
 fn shutdown_background_workers(
     maintenance: &Arc<MaintenanceCoordinator>,
-    workers: &Mutex<Vec<thread::JoinHandle<()>>>,
+    workers: &Mutex<Vec<RuntimeTask>>,
 ) {
     maintenance.shutdown();
     let workers = workers
         .lock()
         .map(|mut workers| std::mem::take(&mut *workers))
         .unwrap_or_default();
-    let current_thread = thread::current().id();
 
     for worker in workers {
-        if worker.thread().id() == current_thread {
+        if worker.is_current_thread() {
             continue;
         }
         let _ = worker.join();
@@ -665,6 +665,7 @@ impl Db {
         options.storage_mode = StorageMode::InMemory;
         validate_options(&options)?;
         let block_cache_bytes = options.block_cache_bytes;
+        let runtime = Runtime::new(options.runtime);
         let default_bucket = Arc::new(LsmTree::new(
             options.default_bucket_options.clone(),
             Vec::new(),
@@ -696,6 +697,7 @@ impl Db {
                 blob_gc_output_bytes: AtomicU64::new(0),
                 blob_gc_discarded_bytes: AtomicU64::new(0),
                 blob_reads: Arc::new(BlobReadMetrics::default()),
+                runtime,
                 maintenance: Arc::new(MaintenanceCoordinator::new()),
                 background_workers: Mutex::new(Vec::new()),
             }),
@@ -705,6 +707,7 @@ impl Db {
 
     fn open_persistent_with_options(options: DbOptions) -> Result<Self> {
         validate_options(&options)?;
+        let runtime = Runtime::new(options.runtime);
         let block_cache_bytes = options.block_cache_bytes;
         let StorageMode::Persistent { path } = &options.storage_mode else {
             return Err(Error::invalid_options("persistent open requires a path"));
@@ -784,6 +787,7 @@ impl Db {
                 blob_gc_output_bytes: AtomicU64::new(0),
                 blob_gc_discarded_bytes: AtomicU64::new(0),
                 blob_reads: Arc::new(BlobReadMetrics::default()),
+                runtime,
                 maintenance: Arc::new(MaintenanceCoordinator::new()),
                 background_workers: Mutex::new(Vec::new()),
             }),
@@ -1381,10 +1385,11 @@ impl Db {
         for worker_index in 0..self.inner.options.background_worker_count {
             let inner = Arc::downgrade(&self.inner);
             let maintenance = Arc::clone(&self.inner.maintenance);
-            let worker = thread::Builder::new()
-                .name(format!("trine-kv-maintenance-{worker_index}"))
-                .spawn(move || background_worker_loop(&inner, &maintenance))
-                .map_err(Error::Io)?;
+            let worker =
+                self.inner.runtime.spawn_background(
+                    format!("trine-kv-maintenance-{worker_index}"),
+                    move || background_worker_loop(&inner, &maintenance),
+                )?;
             self.inner
                 .background_workers
                 .lock()
@@ -1399,6 +1404,7 @@ impl Db {
     fn background_workers_enabled(&self) -> bool {
         !self.inner.options.read_only
             && self.inner.options.background_worker_count != 0
+            && self.inner.runtime.capabilities().background_threads
             && matches!(
                 self.inner.options.storage_mode,
                 StorageMode::Persistent { .. }
@@ -2876,6 +2882,12 @@ impl Db {
 }
 
 fn validate_options(options: &DbOptions) -> Result<()> {
+    runtime::validate_runtime_options(
+        options.runtime,
+        &options.storage_mode,
+        options.read_only,
+        options.background_worker_count,
+    )?;
     validate_bucket_options(&options.default_bucket_options)?;
     if options.write_buffer_bytes == 0 {
         return Err(Error::invalid_options("write buffer must be non-zero"));

@@ -28,6 +28,7 @@ pub mod point_value;
 pub mod prefix;
 mod range_tombstone;
 pub mod recovery;
+pub mod runtime;
 pub mod search;
 pub mod snapshot;
 pub mod stats;
@@ -52,6 +53,7 @@ pub use options::{
 pub use point_value::PointValue;
 pub use prefix::PrefixExtractor;
 pub use recovery::RecoveryReport;
+pub use runtime::{RuntimeCapabilities, RuntimeMode, RuntimeOptions};
 pub use snapshot::Snapshot;
 pub use stats::DbStats;
 pub use transaction::{Transaction, TransactionOptions};

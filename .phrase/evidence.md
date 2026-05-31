@@ -5913,3 +5913,54 @@ Record only evidence that can change planning or durable decisions.
 
 - Define the runtime boundary before moving accepted writes to owned async
   execution.
+
+## 2026-05-31: Runtime Boundary For Background Execution
+
+### Observation
+
+- Background maintenance worker spawning lived directly in database core logic
+  through native thread creation.
+- The async-first protocol requires a runtime boundary before accepted writes
+  can move to owned async execution.
+- WASM-ready targets need a way to select a runtime mode that does not pretend
+  background threads exist.
+
+### Interpretation
+
+- A minimal runtime boundary should start with the behavior the engine already
+  uses: background execution for maintenance.
+- The default runtime must preserve current native-thread behavior.
+- Runtime capability checks should reject unsupported background worker
+  requests during option validation instead of failing later during open.
+
+### Verification
+
+- Added public `RuntimeMode`, `RuntimeOptions`, and `RuntimeCapabilities`.
+- Added crate-internal `Runtime` and `RuntimeTask` handles.
+- Added `DbOptions.runtime` with native-thread defaults.
+- Routed background maintenance worker spawning through `Runtime`.
+- Added runtime validation so persistent writable opens reject background
+  workers when the selected runtime lacks background-thread capability.
+- Added tests for runtime capability shape and rejected background worker
+  configuration.
+- `cargo fmt --check`
+- `cargo test runtime --lib`
+- `cargo test persistent_background_workers_flush_and_compact_pressure --test
+  persistent_wal`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan outside the repository instruction file
+
+### Remaining Blockers
+
+- The runtime boundary does not yet expose async task spawn, cancellation
+  tokens, shutdown joins, timers, queues, or target-specific blocking policy.
+- Accepted writes still run in the caller-polled future.
+- True multi-writer execution still needs writer-local deltas, WAL partitioning,
+  and a publish barrier.
+
+### Recommended Next Action
+
+- Extend the runtime boundary only with the next required primitive, then move
+  accepted write execution behind that primitive.
