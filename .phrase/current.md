@@ -6,58 +6,59 @@ Complete
 
 ## Goal
 
-Make accepted write state and the durable publish boundary explicit before
-changing the writer coordinator shape.
+Add a bounded native blocking task scheduler so runtime-owned async work does
+not create an unbounded thread per accepted write.
 
 ## Scope
 
-- Add a named publish barrier around the current serialized durable commit
-  publication boundary.
-- Split write acceptance/preflight state from publish-time routing, sequence
-  assignment, WAL append, memtable delta publication, and visibility marking.
-- Keep accepted write state local to the executing writer task until it enters
-  the publish barrier.
-- Preserve existing blocking and async write behavior.
-- Preserve commit tracker, WAL/table/blob/manifest formats, MVCC, compaction,
-  recovery, cleanup, and storage behavior.
+- Add an internal bounded blocking task pool for native runtime mode.
+- Keep long-lived background maintenance workers on dedicated background
+  threads.
+- Route accepted async writes through the bounded blocking adapter instead of
+  spawning one thread per accepted write.
+- Preserve inline runtime behavior.
+- Preserve existing public async API, blocking API, publish barrier, commit
+  tracker, WAL/table/blob/manifest formats, MVCC, compaction, recovery,
+  cleanup, and storage behavior.
 
 ## Out Of Scope
 
-- Removing the serialized publish boundary.
+- Adding true async file I/O.
+- Adding a public executor dependency.
+- Adding public runtime tuning options.
+- Removing the serialized publish barrier.
 - Adding WAL shards or writer-local deltas.
-- Adding channels or an external async executor dependency.
-- Changing runtime-owned async write execution.
 - Changing transaction conflict rules.
 - Changing persistent native-file blocking behavior.
 - Changing public storage formats or recovery protocol.
 
 ## Acceptance Gate
 
-- Roadmap records this as the writer-local accepted state and publish barrier
-  phase.
-- `DbInner` has a named publish barrier instead of an anonymous writer mutex.
-- Write acceptance/preflight returns an explicit writer-local state.
-- Publish-time routing and commit visibility run under the named publish
-  barrier.
-- Blocking and async write behavior remains unchanged.
-- Focused write/concurrency tests, formatting, clippy, full tests,
+- Roadmap records this as the bounded runtime blocking scheduler phase.
+- Native runtime mode has a bounded blocking task pool.
+- Blocking adapter submissions return a recoverable error when the queue is
+  full or shutting down.
+- Async writes use the blocking adapter after first poll.
+- Inline runtime async writes still complete without background threads.
+- Focused runtime/async tests, formatting, clippy, full tests,
   `git diff --check`, and forbidden-term scan pass.
-- Evidence records remaining blockers for WAL partitioning and writer-local
-  deltas.
+- Evidence records remaining async blockers.
 
 ## Active Task Slice
 
 ```text
-task310 [x] goal:start writer-local publish barrier slice | scope:current roadmap | verify:manual
-task311 [x] goal:add named publish barrier around current serialized publish boundary | scope:src/db.rs | verify:focused tests
-task312 [x] goal:split accepted write preflight from publish-time local state | scope:src/db/commit.rs | verify:unit tests
-task313 [x] goal:preserve blocking and async write behavior | scope:tests | verify:focused tests
-task314 [x] goal:run verification gate | scope:workspace | verify:fmt clippy tests diff
-task315 [x] goal:record evidence and commit | scope:.phrase/evidence.md current roadmap | verify:git status
+task316 [x] goal:start bounded runtime scheduler slice | scope:current roadmap | verify:manual
+task317 [x] goal:add native bounded blocking task pool | scope:src/runtime.rs | verify:runtime tests
+task318 [x] goal:route accepted async writes through blocking adapter | scope:src/db/commit.rs | verify:async tests
+task319 [x] goal:preserve inline runtime and background worker behavior | scope:runtime/db tests | verify:focused tests
+task320 [x] goal:run verification gate | scope:workspace | verify:fmt clippy tests diff
+task321 [x] goal:record evidence and commit | scope:.phrase/evidence.md current roadmap | verify:git status
 ```
 
 ## Known Blockers
 
+- True async file I/O is not implemented.
+- Runtime tuning options are still internal.
 - True multi-writer execution still needs writer-local deltas and WAL
   partitioning.
 - Native-file storage remains blocking behind native-thread runtime execution.
@@ -83,13 +84,28 @@ task315 [x] goal:record evidence and commit | scope:.phrase/evidence.md current 
   run under the publish barrier.
 - Focused tests cover preflight without publication and direct writer-local
   state publication under the publish barrier.
-- Verification passed: `cargo fmt --check`, `cargo clippy --all-targets
-  --all-features -- -D warnings`, `cargo test accepted_write --lib`,
-  `cargo test writer_local_state --lib`, `cargo test --test async_api`,
-  `cargo test --all-targets --all-features`, `git diff --check`, and
-  forbidden-term scan outside the repository instruction file.
+- Phase 79 evidence recommends defining writer-local delta collection before
+  WAL partitioning.
+- Async remaining-work review identified the bounded runtime task scheduler as
+  the next async foundation before true async read/write I/O.
+- Native runtime mode now owns a lazy bounded blocking task pool with a fixed
+  worker count and bounded queue.
+- Blocking task submission returns `RuntimeBusy` when the queue is full and
+  `Closed` when the pool is shutting down.
+- Accepted async writes now enter the bounded blocking adapter after first poll
+  instead of creating one thread per accepted write.
+- Long-lived maintenance workers still use dedicated background tasks.
+- Inline runtime async writes still run to completion without background
+  threads.
+- Verification passed: `cargo fmt --check`,
+  `cargo clippy --all-targets --all-features -- -D warnings`,
+  `cargo test --test async_api`, and
+  `cargo test --all-targets --all-features`.
+- `git diff --check` passed.
+- Forbidden-term scan passed outside the repository instruction file.
 
 ## Next Recommendation
 
-- Commit this slice, then choose whether the next phase introduces writer-local
-  deltas or WAL partitioning.
+- Move to the next async foundation: define the storage async boundary so
+  native-file I/O, memory mode, and future non-threaded backends can share one
+  API shape before public executor integration or WASM backend work.

@@ -259,19 +259,16 @@ impl WriteFuture {
 
     fn start(db: &Db, request: WriteRequest, context: &mut Context<'_>) -> WriteStart {
         let (accepted_write, waiter) = AcceptedWrite::accept(request);
-        if db.inner.runtime.capabilities().background_threads() {
+        if db.inner.runtime.capabilities().blocking_adapter() {
             if let Err(error) = waiter.register_waker(context) {
                 return WriteStart::Ready(Err(error));
             }
             let task_db = db.clone();
-            let spawn_result =
-                db.inner
-                    .runtime
-                    .spawn_background("trine-kv-write".to_owned(), move || {
-                        accepted_write.execute(&task_db);
-                    });
+            let spawn_result = db.inner.runtime.spawn_blocking(move || {
+                accepted_write.execute(&task_db);
+            });
             return match spawn_result {
-                Ok(_task) => WriteStart::Pending(waiter),
+                Ok(()) => WriteStart::Pending(waiter),
                 Err(error) => WriteStart::Ready(Err(error)),
             };
         }

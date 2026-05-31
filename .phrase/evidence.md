@@ -6185,3 +6185,63 @@ Record only evidence that can change planning or durable decisions.
 
 - Define writer-local delta collection and validation before changing WAL
   partitioning.
+
+## 2026-05-31: Bounded Runtime Blocking Scheduler
+
+### Observation
+
+- Phase 78 made accepted async writes runtime-owned after first poll, but native
+  runtime execution still created one OS thread per accepted write.
+- Long-lived maintenance work and short-lived blocking write work had no
+  separate scheduling boundary.
+- Inline runtime remained useful for tests and non-threaded execution, so the
+  scheduler could not become a hard dependency of async writes.
+
+### Interpretation
+
+- Runtime-owned async writes need a bounded native blocking adapter before true
+  async file I/O work; otherwise backpressure is delegated to the operating
+  system thread scheduler.
+- Long-lived background maintenance workers should stay dedicated, while
+  short-lived blocking tasks should enter a bounded queue.
+- Queue saturation and shutdown must be visible recoverable errors, not hidden
+  stalls.
+
+### Verification
+
+- Added a lazy native blocking task pool owned by `Runtime`.
+- Added bounded task submission with fixed worker count, fixed queue depth,
+  worker wakeup, shutdown signaling, and panic containment around individual
+  tasks.
+- Added `Runtime::spawn_blocking` for short-lived runtime-owned blocking work.
+- Added `Error::RuntimeBusy` for bounded scheduler saturation and poisoned
+  runtime queues.
+- Routed accepted async writes through `spawn_blocking` after first poll.
+- Preserved inline runtime behavior by keeping inline async writes on the
+  caller poll path.
+- Preserved dedicated `spawn_background` workers for long-lived maintenance
+  tasks.
+- Added tests covering bounded worker execution, full queue rejection, inline
+  adapter rejection, and async write compatibility.
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --test async_api`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan outside the repository instruction file
+
+### Remaining Blockers
+
+- Native-file storage calls are still blocking behind the runtime boundary.
+- Runtime worker and queue limits are internal defaults rather than public
+  configuration.
+- Async reads, async maintenance, and future non-threaded backends still need a
+  shared storage async boundary.
+- True multi-writer execution still needs writer-local deltas and WAL
+  partitioning before the publish barrier can be narrowed further.
+
+### Recommended Next Action
+
+- Define the storage async boundary next, keeping native-file I/O, memory mode,
+  and future non-threaded backends on one API shape before public executor or
+  backend-specific work.

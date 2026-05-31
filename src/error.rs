@@ -15,6 +15,7 @@ pub enum Error {
     Conflict { message: String },
     ReadOnly,
     Closed,
+    RuntimeBusy { message: String },
     BucketMissing { name: String },
     InvalidOptions { message: String },
     Unsupported { feature: &'static str },
@@ -44,6 +45,13 @@ impl Error {
             message: message.into(),
         }
     }
+
+    #[must_use]
+    pub fn runtime_busy(message: impl Into<String>) -> Self {
+        Self::RuntimeBusy {
+            message: message.into(),
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -59,6 +67,7 @@ impl fmt::Display for Error {
             Self::Conflict { message } => write!(formatter, "transaction conflict: {message}"),
             Self::ReadOnly => formatter.write_str("database is read-only"),
             Self::Closed => formatter.write_str("database is closed"),
+            Self::RuntimeBusy { message } => write!(formatter, "runtime busy: {message}"),
             Self::BucketMissing { name } => write!(formatter, "bucket is missing: {name}"),
             Self::InvalidOptions { message } => write!(formatter, "invalid options: {message}"),
             Self::Unsupported { feature } => write!(formatter, "unsupported feature: {feature}"),

@@ -1711,3 +1711,29 @@ Trine-owned runtime execution after first poll.
   cleanup, and public API behavior remain unchanged.
 - Focused write/concurrency tests, formatting, clippy, full tests, and diff
   checks pass.
+
+### Phase 80: Bounded Runtime Blocking Scheduler
+
+**Status**: Complete
+
+**Goal**: Add a bounded native blocking task scheduler so runtime-owned async
+work does not create an unbounded thread per accepted write.
+
+**Entry Condition**: Phase 79 complete and async accepted writes already run
+behind Trine's runtime boundary after first poll.
+
+**Acceptance Gate**:
+
+- Native runtime mode owns a bounded blocking task pool.
+- Blocking adapter submissions return a recoverable error when the task queue is
+  full or shutting down.
+- Accepted async writes use the bounded blocking adapter instead of spawning one
+  thread per write.
+- Long-lived background maintenance workers remain on dedicated background
+  threads.
+- Inline runtime async writes still complete without background threads.
+- Public async API, blocking API, publish barrier, commit tracker,
+  WAL/table/blob/manifest formats, MVCC, compaction, recovery, cleanup, and
+  storage behavior remain unchanged.
+- Focused runtime/async tests, formatting, clippy, full tests, and diff checks
+  pass.
