@@ -1504,3 +1504,27 @@ backend operations are already available.
   policies remain unchanged.
 - Focused storage/recovery tests, formatting, clippy, full tests, and diff
   checks pass.
+
+### Phase 71: Public Async Compatibility API
+
+**Status**: Complete
+
+**Goal**: Add the first public async compatibility surface for database and
+bucket open/read/write helpers without breaking the existing blocking API.
+
+**Entry Condition**: Phase 70 complete and internal storage operations already
+have async-shaped futures plus blocking adapters.
+
+**Acceptance Gate**:
+
+- `Db` exposes async compatibility methods for open, point read/write/delete,
+  batch write, persist, flush, compaction, and close.
+- `Bucket` exposes async compatibility methods for point read/write/delete and
+  basic range/prefix iterator construction.
+- The compatibility surface does not choose a concrete runtime and does not
+  claim native-file storage is non-blocking.
+- A focused memory-mode async smoke test passes without an external runtime
+  crate.
+- Existing blocking API behavior remains unchanged.
+- Focused async API tests, formatting, clippy, full tests, and diff checks
+  pass.

@@ -359,6 +359,87 @@ impl Bucket {
     }
 }
 
+/// Additive async compatibility methods for bucket callers.
+#[allow(clippy::unused_async)]
+impl Bucket {
+    pub async fn get_async(&self, key: &[u8]) -> Result<Option<Value>> {
+        self.get(key)
+    }
+
+    pub async fn get_at_async(&self, snapshot: &Snapshot, key: &[u8]) -> Result<Option<Value>> {
+        self.get_at(snapshot, key)
+    }
+
+    pub async fn put_async(&self, key: impl Into<Vec<u8>>, value: impl Into<Value>) -> Result<()> {
+        self.put(key, value)
+    }
+
+    pub async fn put_with_options_async(
+        &self,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Value>,
+        options: WriteOptions,
+    ) -> Result<CommitInfo> {
+        self.put_with_options(key, value, options)
+    }
+
+    pub async fn delete_async(&self, key: impl Into<Vec<u8>>) -> Result<()> {
+        self.delete(key)
+    }
+
+    pub async fn delete_with_options_async(
+        &self,
+        key: impl Into<Vec<u8>>,
+        options: WriteOptions,
+    ) -> Result<CommitInfo> {
+        self.delete_with_options(key, options)
+    }
+
+    pub async fn delete_range_async(&self, range: KeyRange) -> Result<()> {
+        self.delete_range(range)
+    }
+
+    pub async fn delete_range_with_options_async(
+        &self,
+        range: KeyRange,
+        options: WriteOptions,
+    ) -> Result<CommitInfo> {
+        self.delete_range_with_options(range, options)
+    }
+
+    pub async fn range_async(&self, range: &KeyRange) -> Result<Iter> {
+        self.range(range)
+    }
+
+    pub async fn range_lazy_async(&self, range: &KeyRange) -> Result<LazyIter> {
+        self.range_lazy(range)
+    }
+
+    pub async fn range_reverse_async(&self, range: &KeyRange) -> Result<Iter> {
+        self.range_reverse(range)
+    }
+
+    pub async fn range_lazy_reverse_async(&self, range: &KeyRange) -> Result<LazyIter> {
+        self.range_lazy_reverse(range)
+    }
+
+    pub async fn prefix_async(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
+        self.prefix(prefix)
+    }
+
+    pub async fn prefix_lazy_async(&self, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
+        self.prefix_lazy(prefix)
+    }
+
+    pub async fn prefix_reverse_async(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
+        self.prefix_reverse(prefix)
+    }
+
+    pub async fn prefix_lazy_reverse_async(&self, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
+        self.prefix_lazy_reverse(prefix)
+    }
+}
+
 impl BucketReader<'_> {
     pub(crate) fn new(
         db: Db,

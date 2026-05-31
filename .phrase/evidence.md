@@ -5725,3 +5725,48 @@ Record only evidence that can change planning or durable decisions.
 
 - Commit the slice, then reassess the next production boundary from fresh
   evidence instead of old assumptions.
+
+## 2026-05-31: Public Async Compatibility API
+
+### Observation
+
+- The accepted async-first protocol requires public async database and bucket
+  APIs.
+- The current public database and bucket APIs were blocking-only.
+- Internal storage backend operations already use async-shaped futures plus
+  blocking adapters.
+
+### Interpretation
+
+- A first public async compatibility surface can be additive and runtime-free
+  while preserving existing blocking callers.
+- This compatibility surface should not claim native-file storage is
+  non-blocking; runtime selection, async cursor advancement, and
+  cancellation-safe writes remain separate implementation phases.
+
+### Verification
+
+- Added async compatibility methods for `Db` open helpers, default-bucket point
+  operations, batch writes, iterator construction, persistence, flush,
+  compaction, and close.
+- Added async compatibility methods for `Bucket` point operations and iterator
+  construction.
+- Added `memory_async_compatibility_surface_smoke`, which polls the async API
+  without an external runtime crate.
+- `cargo fmt --check`
+- `cargo test memory_async_compatibility_surface_smoke --test async_api`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan
+
+### Remaining Blockers
+
+- Async runtime selection, non-blocking native-file execution, async cursor
+  advancement, cancellation-safe write acceptance, and production in-memory
+  object routing remain later phases.
+
+### Recommended Next Action
+
+- Commit the slice, then reassess whether the next async-first step should be
+  cursor advancement or cancellation-safe write acceptance.

@@ -6,89 +6,86 @@ Complete
 
 ## Goal
 
-Route recovery safe temporary file scanning/deletion and referenced blob
-existence checks through storage backend operations.
+Introduce the first public async compatibility surface for opening databases
+and common point/write operations while preserving the existing blocking API.
 
 ## Scope
 
-- Add a backend operation for listing regular files in a native-file directory.
-- Route recovery safe temporary file scanning through backend directory
-  listing.
-- Route recovery safe temporary file repair deletion through backend object
-  deletion.
-- Route referenced blob existence checks through backend object open.
-- Preserve missing-directory behavior for safe temporary file scanning.
+- Add async compatibility methods for database open helpers.
+- Add async compatibility methods for default-bucket point reads, writes,
+  deletes, batch writes, persistence, flush, compaction, and close.
+- Add async compatibility methods for bucket point reads, writes, deletes, and
+  basic range/prefix iterator construction.
+- Keep existing blocking methods unchanged.
 - Preserve WAL/table/blob/manifest formats, recovery policy, MVCC visibility,
-  compaction behavior, stats behavior, cleanup behavior, and public API
-  behavior.
+  compaction behavior, stats behavior, cleanup behavior, and storage behavior.
 
 ## Out Of Scope
 
 - Choosing a concrete async runtime crate.
-- Introducing or renaming public async APIs.
 - Moving production in-memory object routing into backend operations.
-- Changing recovery policy for unreferenced formal table/blob files.
-- Changing recovery report format.
+- Renaming existing blocking methods or changing `Db::open`'s current return
+  type in this compatibility slice.
+- Making native-file storage non-blocking.
+- Converting cursors so `next` itself is async.
+- Changing write-path concurrency or cancellation semantics.
 
 ## Acceptance Gate
 
-- Roadmap records the recovery directory-list backend phase at phase
-  granularity.
-- Current phase records the recovery policy boundaries and out-of-scope items.
-- Native-file backend reports directory-list capability.
-- Native-file backend exposes async and blocking directory-file listing.
-- Safe temporary file scanning uses backend directory listing.
-- Safe temporary file deletion uses backend object deletion.
-- Referenced blob existence checks use backend object open.
-- Existing fail-closed and repair-safe-temporary recovery behavior remains the
-  same.
-- `cargo fmt --check`, focused storage/recovery tests, clippy,
+- Roadmap records the async compatibility API phase at phase granularity.
+- Current phase records that this is an additive compatibility surface, not a
+  runtime or non-blocking storage migration.
+- `Db` exposes async compatibility methods for open, point read/write/delete,
+  batch write, persist, flush, compaction, and close.
+- `Bucket` exposes async compatibility methods for point read/write/delete and
+  iterator construction.
+- A focused memory-mode async smoke test passes without requiring an external
+  runtime crate.
+- Existing blocking API tests continue to pass.
+- `cargo fmt --check`, focused async API tests, clippy,
   `cargo test --all-targets --all-features`, `git diff --check`, and
   forbidden-term scan pass.
-- Evidence records remaining direct native-file operations after the slice.
+- Evidence records remaining async-first blockers after the slice.
 
 ## Active Task Slice
 
 ```text
-task264 [x] goal:start recovery directory-list backend slice | scope:current roadmap | verify:manual
-task265 [x] goal:add directory-file listing operation | scope:src/storage.rs | verify:storage tests
-task266 [x] goal:route recovery temp scan/delete and blob existence checks | scope:src/recovery.rs | verify:persistent recovery tests
-task267 [x] goal:run verification gate | scope:workspace | verify:fmt clippy tests diff
-task268 [x] goal:record evidence and next step | scope:.phrase/evidence.md current roadmap | verify:git diff
+task269 [x] goal:start async compatibility API slice | scope:current roadmap | verify:manual
+task270 [x] goal:add Db async compatibility methods | scope:src/db.rs | verify:async smoke test
+task271 [x] goal:add Bucket async compatibility methods | scope:src/bucket.rs | verify:async smoke test
+task272 [x] goal:run verification gate | scope:workspace | verify:fmt clippy tests diff
+task273 [x] goal:record evidence and next step | scope:.phrase/evidence.md current roadmap | verify:git diff
 ```
 
 ## Known Blockers
 
-- None identified for this recovery directory-list slice.
-- Public async API, async runtime selection, and production in-memory object
-  routing remain later phases.
+- None identified for this async compatibility slice.
+- Async runtime selection, non-blocking native-file execution, async cursor
+  advancement, cancellation-safe write acceptance, and production in-memory
+  object routing remain later phases.
 
 ## Evidence
 
-- Recovery safe temporary file scan still uses direct native directory reads.
-- Repair-safe-temporary recovery still deletes safe temporary files directly.
-- Referenced blob existence checks still use direct native path inspection.
-- Existing storage object delete and random-read operations are sufficient for
-  deletion and existence checks.
-- A directory-file listing operation is the missing backend boundary for
-  recovery scan.
-- Native-file storage now reports `StorageCapability::DirectoryListing`.
-- Native-file storage now exposes async and blocking directory-file listing for
-  regular files.
-- Recovery safe temporary file scanning now uses backend directory listing.
-- Repair-safe-temporary recovery now deletes temporary objects through backend
-  object deletion.
-- Referenced blob existence checks now use backend object open.
-- Focused verification passed: `cargo test storage --lib` and
-  `cargo test persistent_recovery --test persistent_wal`.
+- The async-first protocol requires async public database and bucket APIs.
+- Current public database and bucket APIs are blocking-only.
+- Storage backend operations already expose internal async-shaped futures plus
+  blocking adapters.
+- A first public compatibility layer can be additive and runtime-free while
+  preserving the existing blocking API.
+- `Db` now exposes async compatibility methods for open helpers, default-bucket
+  point operations, batch writes, iterator construction, persistence, flush,
+  compaction, and close.
+- `Bucket` now exposes async compatibility methods for point operations and
+  iterator construction.
+- The compatibility surface does not choose a runtime and does not claim
+  native-file storage is non-blocking.
+- Focused verification passed: `cargo test
+  memory_async_compatibility_surface_smoke --test async_api`.
 - Full verification passed: `cargo fmt --check`, `cargo clippy
   --all-targets --all-features -- -D warnings`, `cargo test --all-targets
   --all-features`, `git diff --check`, and forbidden-term scan.
-- Direct native-file operation audit outside storage/durability now shows
-  remaining matches as test setup/cleanup or method names rather than
-  production recovery/stats file operations.
 
 ## Next Recommendation
 
-- Commit this slice, then reassess the next production boundary from fresh
-  evidence.
+- Commit this slice, then reassess async cursor advancement and
+  cancellation-safe writes.
