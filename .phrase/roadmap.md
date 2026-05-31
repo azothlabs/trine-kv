@@ -1232,3 +1232,26 @@ routes through backend-owned object write paths.
 - Public API behavior, SSTable/blob formats, MVCC, manifest, WAL, compaction,
   transaction, and storage format remain unchanged.
 - Focused storage/persistent tests, formatting, clippy, and diff checks pass.
+
+### Phase 59: Native-File Blob Object Read Backend
+
+**Status**: Complete
+
+**Goal**: Route blob file reads through the storage backend random-read
+operation.
+
+**Entry Condition**: Phase 58 complete and table/blob creation plus cleanup
+deletion already route through backend-owned object operations.
+
+**Acceptance Gate**:
+
+- Blob full-file reads use the storage backend read object while preserving
+  full validation behavior.
+- Blob properties reads use the storage backend read object while preserving
+  properties-only execution shape.
+- Indexed blob record reads use the storage backend read object while
+  preserving target-record-only execution shape.
+- Blob format checks, checksums, corrupt/missing blob errors, blob GC,
+  recovery, compaction, public API behavior, MVCC, WAL, manifest, and storage
+  formats remain unchanged.
+- Focused blob/persistent tests, formatting, clippy, and diff checks pass.

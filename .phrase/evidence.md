@@ -5151,3 +5151,60 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Route blob reads or blob listing through storage backend operations next.
+
+## 2026-05-31: Native-File Blob Object Read Backend
+
+### Observation
+
+- Table output writes, blob output writes, and table/blob cleanup deletes now
+  route through backend object operations.
+- Blob value reads, full blob validation, properties reads, indexed reads,
+  recovery checks, blob GC, and stale-byte stats still opened native files
+  directly.
+- `StorageReadBackend` already exposes object open, length, and exact random
+  read operations that match the blob module's current read needs.
+
+### Interpretation
+
+- Blob reads can move behind the storage boundary without changing blob format
+  ownership: storage returns object bytes, and `src/blob.rs` keeps header,
+  footer, checksum, properties, and record validation.
+- Properties reads should keep their existing shape by reading only header,
+  footer, and properties bytes.
+- Indexed record reads should keep their existing shape by reading only the
+  header plus target record frame/body.
+
+### Verification
+
+- `read_blob_file` now opens the blob object through `NativeFileBackend` and
+  reads full bytes through `StorageReadObject`.
+- `read_blob_file_properties` now opens the blob object through
+  `NativeFileBackend` and reads header/footer/properties through
+  `StorageReadObject`.
+- `read_record_for_index` and raw blob value reads now open blob objects
+  through `NativeFileBackend` and read exact offsets through
+  `StorageReadObject`.
+- Added `backend_written_blob_reads_full_properties_and_indexed_values`.
+- Existing properties-only and target-record-only tests still pass.
+- Direct native file read calls are gone from `src/blob.rs`; remaining
+  `read_exact` matches are the in-memory blob decode cursor.
+- `cargo test blob --lib`
+- `cargo test persistent_flush_writes_blob_index_file_and_reopen_reads_large_values --test persistent_wal`
+- `cargo test persistent_blob_values_survive_flush_reopen_and_compaction --test persistent_wal`
+- `cargo test persistent_blob --test persistent_wal`
+- `cargo test persistent_reopen_fails_on_corrupt_referenced_blob_file --test persistent_wal`
+- `cargo test persistent_reopen_fails_when_referenced_blob_file_is_missing --test persistent_wal`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+
+### Remaining Blockers
+
+- Public async API, async runtime selection, WAL append, blob listing, writer
+  lease handling, parent-directory sync routing, and production in-memory object
+  routing remain later phases.
+
+### Recommended Next Action
+
+- Route blob listing through backend object listing so blob discovery and blob
+  reads share the same storage boundary.

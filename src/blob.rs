@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeSet,
-    fs::{self, File},
-    io::{Read, Seek, SeekFrom},
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -12,8 +11,9 @@ use crate::{
     internal_key::{InternalKey, ValueKind},
     options::DurabilityMode,
     storage::{
-        BlockingStorageObjectWriteBackend, NativeFileBackend, StorageCapability, StorageObjectId,
-        StorageObjectKind, StorageReadBackend,
+        BlockingStorageObjectWriteBackend, BlockingStorageReadBackend, BlockingStorageReadObject,
+        NativeFileBackend, StorageCapability, StorageObjectId, StorageObjectKind,
+        StorageReadBackend,
     },
     types::Sequence,
 };
@@ -271,16 +271,14 @@ pub(crate) fn read_value_for_internal_key(
             let len = usize::try_from(*len).map_err(|_| Error::Corruption {
                 message: "blob length exceeds usize".to_owned(),
             })?;
-            let mut file =
-                File::open(blob_path(db_path, *file_id)).map_err(|error| Error::Corruption {
-                    message: format!("referenced blob file cannot be opened: {error}"),
-                })?;
-            file.seek(SeekFrom::Start(*offset))?;
             let mut bytes = vec![0_u8; len];
-            file.read_exact(&mut bytes)
-                .map_err(|error| Error::Corruption {
-                    message: format!("referenced blob bytes cannot be read: {error}"),
-                })?;
+            let object = open_blob_read_object(db_path, *file_id)?;
+            read_blob_exact_at(
+                &object,
+                *offset,
+                &mut bytes,
+                "referenced blob bytes cannot be read",
+            )?;
             if checksum(&bytes) != *expected_checksum {
                 return Err(Error::Corruption {
                     message: "blob checksum mismatch".to_owned(),
@@ -302,27 +300,21 @@ pub(crate) fn read_blob_file_properties(
 ) -> Result<BlobFileProperties> {
     // GC candidate selection needs byte estimates, not value payloads. Recovery
     // still uses `read_blob_file` so every referenced record is fully checked.
-    let mut file = File::open(blob_path(db_path, file_id)).map_err(|error| Error::Corruption {
-        message: format!("referenced blob file cannot be opened: {error}"),
-    })?;
-    let file_len = file
-        .metadata()
-        .map_err(|error| Error::Corruption {
-            message: format!("referenced blob file metadata cannot be read: {error}"),
-        })?
-        .len();
+    let object = open_blob_read_object(db_path, file_id)?;
+    let file_len = blob_object_len(&object, "referenced blob file metadata cannot be read")?;
     if file_len < (BLOB_HEADER_LEN + BLOB_FOOTER_LEN) as u64 {
         return Err(invalid_blob("file is too short"));
     }
 
-    validate_indexed_blob_header(&mut file, file_id)?;
+    validate_indexed_blob_header(&object, file_id)?;
     let footer_start = file_len - BLOB_FOOTER_LEN as u64;
-    file.seek(SeekFrom::Start(footer_start))?;
     let mut footer = [0_u8; BLOB_FOOTER_LEN];
-    file.read_exact(&mut footer)
-        .map_err(|error| Error::Corruption {
-            message: format!("referenced blob footer cannot be read: {error}"),
-        })?;
+    read_blob_exact_at(
+        &object,
+        footer_start,
+        &mut footer,
+        "referenced blob footer cannot be read",
+    )?;
     let (properties_offset, properties_len) = decode_footer(&footer)?;
     let properties_end =
         checked_blob_offset_add(properties_offset, properties_len, "blob properties bounds")?;
@@ -330,25 +322,26 @@ pub(crate) fn read_blob_file_properties(
         return Err(invalid_blob("properties bounds are outside the blob file"));
     }
 
-    file.seek(SeekFrom::Start(properties_offset))?;
     let mut properties_bytes = vec![0_u8; u64_to_usize(properties_len, "blob properties length")?];
-    file.read_exact(&mut properties_bytes)
-        .map_err(|error| Error::Corruption {
-            message: format!("referenced blob properties cannot be read: {error}"),
-        })?;
+    read_blob_exact_at(
+        &object,
+        properties_offset,
+        &mut properties_bytes,
+        "referenced blob properties cannot be read",
+    )?;
     decode_properties(&properties_bytes)
 }
 
 pub(crate) fn read_blob_file(db_path: &Path, file_id: u64) -> Result<BlobFile> {
-    let mut bytes = Vec::new();
-    File::open(blob_path(db_path, file_id))
-        .map_err(|error| Error::Corruption {
-            message: format!("referenced blob file cannot be opened: {error}"),
-        })?
-        .read_to_end(&mut bytes)
-        .map_err(|error| Error::Corruption {
-            message: format!("referenced blob file cannot be read: {error}"),
-        })?;
+    let object = open_blob_read_object(db_path, file_id)?;
+    let file_len = blob_object_len(&object, "referenced blob file metadata cannot be read")?;
+    let mut bytes = vec![0_u8; u64_to_usize(file_len, "blob file length")?];
+    read_blob_exact_at(
+        &object,
+        0,
+        &mut bytes,
+        "referenced blob file cannot be read",
+    )?;
     let blob_file = decode_blob_file(&bytes)?;
     if blob_file.header.file_id != file_id {
         return Err(Error::Corruption {
@@ -388,6 +381,42 @@ pub(crate) fn write_blob_file(
 
 fn blob_storage_object(path: &Path) -> StorageObjectId {
     StorageObjectId::native_file(StorageObjectKind::Blob, path)
+}
+
+fn open_blob_read_object(
+    db_path: &Path,
+    file_id: u64,
+) -> Result<<NativeFileBackend as StorageReadBackend>::ReadObject> {
+    let path = blob_path(db_path, file_id);
+    let backend = blob_storage_backend();
+    backend
+        .capabilities()
+        .require(StorageCapability::RandomRead)?;
+    backend.open_read_blocking(blob_storage_object(&path))
+}
+
+fn blob_object_len(object: &impl BlockingStorageReadObject, context: &'static str) -> Result<u64> {
+    object
+        .len_blocking()
+        .map_err(|error| blob_read_error(context, &error))
+}
+
+fn read_blob_exact_at(
+    object: &impl BlockingStorageReadObject,
+    offset: u64,
+    bytes: &mut [u8],
+    context: &'static str,
+) -> Result<()> {
+    let offset = u64_to_usize(offset, "blob read offset")?;
+    object
+        .read_exact_at_blocking(offset, bytes)
+        .map_err(|error| blob_read_error(context, &error))
+}
+
+fn blob_read_error(context: &'static str, error: &Error) -> Error {
+    Error::Corruption {
+        message: format!("{context}: {error}"),
+    }
 }
 
 fn blob_storage_backend() -> NativeFileBackend {
@@ -510,18 +539,10 @@ pub(crate) fn read_record_for_index(
     index: &BlobIndex,
     expected_internal_key: Option<&InternalKey>,
 ) -> Result<BlobFileRecord> {
-    let mut file =
-        File::open(blob_path(db_path, index.file_id)).map_err(|error| Error::Corruption {
-            message: format!("referenced blob file cannot be opened: {error}"),
-        })?;
-    let file_len = file
-        .metadata()
-        .map_err(|error| Error::Corruption {
-            message: format!("referenced blob file metadata cannot be read: {error}"),
-        })?
-        .len();
-    validate_indexed_blob_header(&mut file, index.file_id)?;
-    let record = read_indexed_blob_record(&mut file, file_len, index)?;
+    let object = open_blob_read_object(db_path, index.file_id)?;
+    let file_len = blob_object_len(&object, "referenced blob file metadata cannot be read")?;
+    validate_indexed_blob_header(&object, index.file_id)?;
+    let record = read_indexed_blob_record(&object, file_len, index)?;
 
     if record.index != *index {
         return Err(Error::Corruption {
@@ -536,13 +557,17 @@ pub(crate) fn read_record_for_index(
     Ok(record)
 }
 
-fn validate_indexed_blob_header(file: &mut File, expected_file_id: u64) -> Result<()> {
-    file.seek(SeekFrom::Start(0))?;
+fn validate_indexed_blob_header(
+    object: &impl BlockingStorageReadObject,
+    expected_file_id: u64,
+) -> Result<()> {
     let mut header_bytes = [0_u8; BLOB_HEADER_LEN];
-    file.read_exact(&mut header_bytes)
-        .map_err(|error| Error::Corruption {
-            message: format!("referenced blob header cannot be read: {error}"),
-        })?;
+    read_blob_exact_at(
+        object,
+        0,
+        &mut header_bytes,
+        "referenced blob header cannot be read",
+    )?;
     let header = decode_header(&header_bytes)?;
     if header.file_id != expected_file_id {
         return Err(Error::Corruption {
@@ -556,7 +581,7 @@ fn validate_indexed_blob_header(file: &mut File, expected_file_id: u64) -> Resul
 }
 
 fn read_indexed_blob_record(
-    file: &mut File,
+    object: &impl BlockingStorageReadObject,
     file_len: u64,
     index: &BlobIndex,
 ) -> Result<BlobFileRecord> {
@@ -573,12 +598,13 @@ fn read_indexed_blob_record(
         return Err(invalid_blob("blob index frame is outside the blob file"));
     }
 
-    file.seek(SeekFrom::Start(index.offset))?;
     let mut frame = [0_u8; MIN_BLOB_RECORD_FRAME_BYTES];
-    file.read_exact(&mut frame)
-        .map_err(|error| Error::Corruption {
-            message: format!("referenced blob record frame cannot be read: {error}"),
-        })?;
+    read_blob_exact_at(
+        object,
+        index.offset,
+        &mut frame,
+        "referenced blob record frame cannot be read",
+    )?;
     let body_len = read_u64_at(&frame, 0)?;
     let record_checksum = read_u32_at(&frame, 8)?;
     let body_end = checked_blob_offset_add(frame_end, body_len, "blob record body bounds")?;
@@ -587,10 +613,12 @@ fn read_indexed_blob_record(
     }
 
     let mut body = vec![0_u8; u64_to_usize(body_len, "blob record length")?];
-    file.read_exact(&mut body)
-        .map_err(|error| Error::Corruption {
-            message: format!("referenced blob record body cannot be read: {error}"),
-        })?;
+    read_blob_exact_at(
+        object,
+        frame_end,
+        &mut body,
+        "referenced blob record body cannot be read",
+    )?;
     if checksum(&body) != record_checksum {
         return Err(Error::Corruption {
             message: "blob record checksum mismatch".to_owned(),
@@ -1286,6 +1314,31 @@ mod tests {
                 .header,
             header
         );
+
+        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn backend_written_blob_reads_full_properties_and_indexed_values() {
+        let temp = temp_blob_dir("backend-read-object");
+        let header = BlobFileHeader::new(16, Sequence::new(2), 8, CodecId::None);
+        let records = vec![
+            blob_record("key-a", 2, 0, b"value-a".to_vec(), CodecId::None),
+            blob_record("key-b", 2, 1, b"value-b".to_vec(), CodecId::FastLz4Block),
+        ];
+
+        let indexes =
+            super::write_blob_file(&temp, 16, header, &records).expect("blob file writes");
+        let blob_file = super::read_blob_file(&temp, 16).expect("full blob file reads");
+        let properties = super::read_blob_file_properties(&temp, 16).expect("blob properties read");
+        let indexed_value =
+            read_indexed_value(&temp, &indexes[1], None).expect("indexed blob value reads");
+
+        assert_eq!(blob_file.header, header);
+        assert_eq!(blob_file.records[0].record, records[0]);
+        assert_eq!(blob_file.records[1].record, records[1]);
+        assert_eq!(properties, blob_file.properties);
+        assert_eq!(indexed_value, b"value-b");
 
         std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
