@@ -55,7 +55,7 @@ pub struct Db {
 pub(crate) struct DbInner {
     options: DbOptions,
     user_handles: AtomicUsize,
-    last_sequence: AtomicU64,
+    commit_tracker: CommitTracker,
     closed: AtomicBool,
     writer: Mutex<()>,
     process_lock: Mutex<Option<recovery::ProcessLock>>,
@@ -77,6 +77,131 @@ pub(crate) struct DbInner {
     blob_reads: Arc<BlobReadMetrics>,
     maintenance: Arc<MaintenanceCoordinator>,
     background_workers: Mutex<Vec<thread::JoinHandle<()>>>,
+}
+
+#[derive(Debug)]
+pub(super) struct CommitTracker {
+    last_reserved_sequence: AtomicU64,
+    visible_sequence: AtomicU64,
+    slots: Mutex<BTreeMap<u64, CommitSlotState>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CommitSlot {
+    sequence: Sequence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitSlotState {
+    Open,
+    Visible,
+    Skipped,
+}
+
+impl CommitTracker {
+    fn new(visible_sequence: Sequence) -> Self {
+        Self {
+            last_reserved_sequence: AtomicU64::new(visible_sequence.get()),
+            visible_sequence: AtomicU64::new(visible_sequence.get()),
+            slots: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    #[must_use]
+    fn visible_sequence(&self) -> Sequence {
+        Sequence::new(self.visible_sequence.load(Ordering::Acquire))
+    }
+
+    fn reset_visible_boundary(&self, visible_sequence: Sequence) -> Result<()> {
+        let mut slots = self
+            .slots
+            .lock()
+            .map_err(|_| lock_poisoned("commit tracker slots"))?;
+        slots.clear();
+        self.visible_sequence
+            .store(visible_sequence.get(), Ordering::Release);
+        self.last_reserved_sequence
+            .store(visible_sequence.get(), Ordering::Release);
+        Ok(())
+    }
+
+    pub(super) fn reserve_slot(&self) -> Result<CommitSlot> {
+        let reserved = self
+            .last_reserved_sequence
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| Error::Corruption {
+                message: "sequence counter overflow".to_owned(),
+            })?
+            .checked_add(1)
+            .ok_or_else(|| Error::Corruption {
+                message: "sequence counter overflow".to_owned(),
+            })?;
+        let mut slots = self
+            .slots
+            .lock()
+            .map_err(|_| lock_poisoned("commit tracker slots"))?;
+        if slots.insert(reserved, CommitSlotState::Open).is_some() {
+            return Err(Error::Corruption {
+                message: format!("commit slot {reserved} was reserved twice"),
+            });
+        }
+        Ok(CommitSlot {
+            sequence: Sequence::new(reserved),
+        })
+    }
+
+    pub(super) fn mark_visible(&self, slot: CommitSlot) -> Result<()> {
+        self.mark_terminal(slot, CommitSlotState::Visible)
+    }
+
+    pub(super) fn mark_skipped(&self, slot: CommitSlot) -> Result<()> {
+        self.mark_terminal(slot, CommitSlotState::Skipped)
+    }
+
+    fn mark_terminal(&self, slot: CommitSlot, terminal_state: CommitSlotState) -> Result<()> {
+        let mut slots = self
+            .slots
+            .lock()
+            .map_err(|_| lock_poisoned("commit tracker slots"))?;
+        let state = slots
+            .get_mut(&slot.sequence.get())
+            .ok_or_else(|| Error::Corruption {
+                message: format!("commit slot {} is missing", slot.sequence.get()),
+            })?;
+        match *state {
+            CommitSlotState::Open => {
+                *state = terminal_state;
+                self.advance_visible_sequence(&mut slots);
+                Ok(())
+            }
+            CommitSlotState::Visible | CommitSlotState::Skipped => Err(Error::Corruption {
+                message: format!("commit slot {} is already terminal", slot.sequence.get()),
+            }),
+        }
+    }
+
+    fn advance_visible_sequence(&self, slots: &mut BTreeMap<u64, CommitSlotState>) {
+        let mut visible = self.visible_sequence.load(Ordering::Acquire);
+        while let Some(next) = visible.checked_add(1) {
+            match slots.get(&next).copied() {
+                Some(CommitSlotState::Visible | CommitSlotState::Skipped) => {
+                    slots.remove(&next);
+                    visible = next;
+                    self.visible_sequence.store(visible, Ordering::Release);
+                }
+                Some(CommitSlotState::Open) | None => break,
+            }
+        }
+    }
+}
+
+impl CommitSlot {
+    #[must_use]
+    pub(super) const fn sequence(self) -> Sequence {
+        self.sequence
+    }
 }
 
 struct NamedFlushInput {
@@ -551,7 +676,7 @@ impl Db {
             inner: Arc::new(DbInner {
                 options,
                 user_handles: AtomicUsize::new(1),
-                last_sequence: AtomicU64::new(Sequence::ZERO.get()),
+                commit_tracker: CommitTracker::new(Sequence::ZERO),
                 closed: AtomicBool::new(false),
                 writer: Mutex::new(()),
                 process_lock: Mutex::new(None),
@@ -639,7 +764,7 @@ impl Db {
             inner: Arc::new(DbInner {
                 options,
                 user_handles: AtomicUsize::new(1),
-                last_sequence: AtomicU64::new(Sequence::ZERO.get()),
+                commit_tracker: CommitTracker::new(Sequence::ZERO),
                 closed: AtomicBool::new(false),
                 writer: Mutex::new(()),
                 process_lock: Mutex::new(process_lock),
@@ -1213,7 +1338,7 @@ impl Db {
 
     #[must_use]
     pub fn last_committed_sequence(&self) -> Sequence {
-        Sequence::new(self.inner.last_sequence.load(Ordering::Acquire))
+        self.inner.commit_tracker.visible_sequence()
     }
 
     fn oldest_active_snapshot_sequence(&self) -> Sequence {

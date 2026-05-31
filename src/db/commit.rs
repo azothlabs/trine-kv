@@ -1,4 +1,4 @@
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::Arc;
 
 use crate::{
     error::{Error, Result},
@@ -73,12 +73,6 @@ impl Db {
             return Ok(CommitInfo::new(self.last_committed_sequence()));
         }
 
-        let sequence = self
-            .last_committed_sequence()
-            .next()
-            .ok_or_else(|| Error::Corruption {
-                message: "sequence counter overflow".to_owned(),
-            })?;
         let states = self.resolve_batch_buckets(&operations)?;
 
         let indexed_operations = operations
@@ -99,20 +93,30 @@ impl Db {
 
         let durability =
             effective_durability(self.inner.options.durability, write_options.durability);
-        self.append_wal(sequence, &wal_operations, durability)?;
+        let slot = self.inner.commit_tracker.reserve_slot()?;
+        let sequence = slot.sequence();
+        if let Err(error) = self.append_wal(sequence, &wal_operations, durability) {
+            self.inner.commit_tracker.mark_skipped(slot)?;
+            return Err(error);
+        }
 
         let touched_states = unique_lsm_trees(
             indexed_operations
                 .iter()
                 .map(|(_, _, state)| Arc::clone(state)),
         );
+        let mut delta_publication_started = false;
         for (batch_index, operation, state) in indexed_operations {
-            state.apply_operation(operation, sequence, batch_index)?;
+            if let Err(error) = state.apply_operation(operation, sequence, batch_index) {
+                if !delta_publication_started {
+                    self.inner.commit_tracker.mark_skipped(slot)?;
+                }
+                return Err(error);
+            }
+            delta_publication_started = true;
         }
 
-        self.inner
-            .last_sequence
-            .store(sequence.get(), Ordering::Release);
+        self.inner.commit_tracker.mark_visible(slot)?;
         if self.freeze_large_active_memtables_after_commit_locked(sequence, &touched_states)? {
             self.request_background_flush();
         }
@@ -200,8 +204,8 @@ impl Db {
         }
 
         self.inner
-            .last_sequence
-            .store(last_committed.get(), Ordering::Release);
+            .commit_tracker
+            .reset_visible_boundary(last_committed)?;
         Ok(())
     }
 }
@@ -239,6 +243,8 @@ const fn durability_rank(mode: DurabilityMode) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use crate::{db::CommitTracker, types::Sequence};
+
     use super::{DurabilityMode, effective_durability};
 
     #[test]
@@ -251,5 +257,35 @@ mod tests {
             effective_durability(DurabilityMode::SyncAll, DurabilityMode::Buffered),
             DurabilityMode::SyncAll
         );
+    }
+
+    #[test]
+    fn commit_tracker_waits_for_prior_terminal_slot() {
+        let tracker = CommitTracker::new(Sequence::ZERO);
+
+        let first = tracker.reserve_slot().expect("reserve first slot");
+        let second = tracker.reserve_slot().expect("reserve second slot");
+        assert_eq!(first.sequence(), Sequence::new(1));
+        assert_eq!(second.sequence(), Sequence::new(2));
+
+        tracker.mark_visible(second).expect("mark second visible");
+        assert_eq!(tracker.visible_sequence(), Sequence::ZERO);
+
+        tracker.mark_skipped(first).expect("mark first skipped");
+        assert_eq!(tracker.visible_sequence(), Sequence::new(2));
+
+        let third = tracker.reserve_slot().expect("reserve third slot");
+        assert_eq!(third.sequence(), Sequence::new(3));
+    }
+
+    #[test]
+    fn commit_tracker_rejects_second_terminal_transition() {
+        let tracker = CommitTracker::new(Sequence::ZERO);
+        let slot = tracker.reserve_slot().expect("reserve slot");
+
+        tracker.mark_visible(slot).expect("mark slot visible");
+
+        assert!(tracker.mark_skipped(slot).is_err());
+        assert_eq!(tracker.visible_sequence(), Sequence::new(1));
     }
 }

@@ -5812,3 +5812,56 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Reassess cancellation-safe write acceptance as the next async-first step.
+
+## 2026-05-31: Commit Tracker State Machine
+
+### Observation
+
+- The async-first protocol requires an accepted write to reach a terminal state
+  even when a future is later cancelled.
+- The current write path used a single raw sequence atomic as both the public
+  read boundary and the successful write marker.
+- The current writer coordinator still serializes sequence assignment and
+  memtable updates, but it did not name commit acceptance or skipped slots.
+
+### Interpretation
+
+- A commit tracker can be introduced behind the existing writer coordinator
+  without changing storage formats or public API shape.
+- Explicit `Open`, `Visible`, and `Skipped` states create the boundary needed
+  for later cancellation-safe async writes and future multi-writer publish
+  work.
+- Accepted failures before delta publication may be skipped. Once publication
+  starts, the code must not advance the read boundary through a failed partial
+  publish.
+
+### Verification
+
+- Added `CommitTracker`, `CommitSlot`, and commit slot states.
+- `Db::last_committed_sequence` now reads the tracker boundary instead of a raw
+  sequence atomic.
+- The write path now reserves a slot, appends WAL, publishes deltas, and marks
+  the slot visible.
+- WAL append failure after slot reservation marks the slot skipped.
+- Replay now resets the tracker boundary to the recovered WAL replay result.
+- Added tests for out-of-order terminal slots and repeated terminal
+  transitions.
+- `cargo fmt --check`
+- `cargo test commit_tracker --lib`
+- `cargo test memory_async_compatibility_surface_smoke --test async_api`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan outside the repository instruction file
+
+### Remaining Blockers
+
+- True multi-writer execution still needs writer-local deltas, WAL partitioning,
+  and a publish barrier.
+- Async write methods are still compatibility wrappers; cancellation-safe
+  internal execution is the next write-side protocol step.
+
+### Recommended Next Action
+
+- Continue with cancellation-safe async write execution on top of the explicit
+  commit tracker.

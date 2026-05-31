@@ -1550,3 +1550,26 @@ methods already exist for `Db` and `Bucket`.
   through async cursor methods without an external runtime crate.
 - Focused async API tests, formatting, clippy, full tests, and diff checks
   pass.
+
+### Phase 73: Commit Tracker State Machine
+
+**Status**: Complete
+
+**Goal**: Put explicit accepted-write terminal states behind the current writer
+coordinator before deeper async cancellation and multi-writer work.
+
+**Entry Condition**: Phase 72 complete and public async compatibility methods
+exist for point writes, batches, and cursor advancement.
+
+**Acceptance Gate**:
+
+- Commit slots have explicit `Open`, `Visible`, and `Skipped` states.
+- Successful writes reserve a slot, append WAL, publish deltas, and mark the
+  slot visible.
+- Accepted failures before delta publication mark the slot skipped.
+- The public read boundary advances through the commit tracker.
+- WAL replay resets the tracker to the recovered durable boundary.
+- The existing writer coordinator, WAL/table/blob/manifest formats, MVCC read
+  behavior, and public API shapes remain unchanged.
+- Focused commit-tracker tests, formatting, clippy, full tests, and diff checks
+  pass.
