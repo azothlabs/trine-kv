@@ -9,7 +9,7 @@ use std::{
 use crate::{
     error::{Error, Result},
     lsm::LsmTree,
-    options::{DurabilityMode, WriteOptions},
+    options::{DurabilityMode, StorageMode, WriteOptions},
     transaction::TransactionReadSet,
     types::{CommitInfo, Sequence},
     wal::WalBatch,
@@ -592,8 +592,26 @@ impl Db {
         }
 
         let mut delta_publication_started = false;
+        let publish_in_memory_deltas =
+            matches!(self.inner.options.storage_mode, StorageMode::InMemory);
         for delta in prepared.deltas {
             debug_assert!(!delta.bucket.is_empty());
+            if publish_in_memory_deltas {
+                let delta_operations = delta
+                    .operations
+                    .iter()
+                    .map(|operation| (operation.operation.clone(), operation.batch_index));
+                if let Err(error) = delta
+                    .state
+                    .publish_delta_operations(delta_operations, sequence)
+                {
+                    if !delta_publication_started {
+                        self.inner.commit_tracker.mark_skipped(slot)?;
+                    }
+                    return Err(error);
+                }
+                delta_publication_started = true;
+            }
             for operation in delta.operations {
                 if let Err(error) = delta.state.apply_operation(
                     operation.operation,
@@ -1061,5 +1079,11 @@ mod tests {
             db.get(b"k").expect("read committed key"),
             Some(b"v".to_vec())
         );
+        let state = db.bucket_state("default").expect("default bucket state");
+        let (delta_count, point_delta_count, range_tombstone_count) =
+            state.delta_debug_counts().expect("delta counts");
+        assert_eq!(delta_count, 1);
+        assert_eq!(point_delta_count, 1);
+        assert_eq!(range_tombstone_count, 0);
     }
 }

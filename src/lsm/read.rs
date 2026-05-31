@@ -20,6 +20,7 @@ use crate::{
 
 use super::{
     LsmVersion,
+    delta::DeltaSnapshot,
     tree::{ImmutableMemtable, LsmTree, RangeTombstone, lock_poisoned},
 };
 
@@ -32,13 +33,42 @@ struct PointRecordCandidate {
 #[derive(Debug, Clone)]
 pub(crate) struct LsmPointReadSnapshot {
     version: Arc<LsmVersion>,
+    delta_snapshot: DeltaSnapshot,
     active_memtable: Arc<Memtable>,
     active_range_tombstones: Vec<RangeTombstone>,
     immutable_memtables: Vec<ImmutableMemtable>,
 }
 
 impl LsmTree {
-    pub(crate) fn point_read_snapshot(&self) -> Result<LsmPointReadSnapshot> {
+    pub(crate) fn point_read_snapshot(
+        &self,
+        read_sequence: Sequence,
+    ) -> Result<LsmPointReadSnapshot> {
+        let delta_snapshot = if self.delta_mirror_covers(read_sequence) {
+            DeltaSnapshot::default()
+        } else {
+            self.delta_snapshot()?
+        };
+        self.point_read_snapshot_with_deltas(delta_snapshot)
+    }
+
+    fn point_read_snapshot_for_key(
+        &self,
+        key: &[u8],
+        read_sequence: Sequence,
+    ) -> Result<LsmPointReadSnapshot> {
+        let delta_snapshot = if self.delta_mirror_covers(read_sequence) {
+            DeltaSnapshot::default()
+        } else {
+            self.delta_snapshot_for_key(key)?
+        };
+        self.point_read_snapshot_with_deltas(delta_snapshot)
+    }
+
+    fn point_read_snapshot_with_deltas(
+        &self,
+        delta_snapshot: DeltaSnapshot,
+    ) -> Result<LsmPointReadSnapshot> {
         // Capture memtable sources before the version. Flush publishes the new
         // table version before removing the immutable memtable, so this order
         // can see a duplicate source but cannot miss a committed record.
@@ -67,6 +97,7 @@ impl LsmTree {
 
         Ok(LsmPointReadSnapshot {
             version,
+            delta_snapshot,
             active_memtable,
             active_range_tombstones,
             immutable_memtables,
@@ -94,7 +125,7 @@ impl LsmTree {
         block_cache: Option<&cache::BlockCache>,
         blob_reads: Option<&BlobReadMetrics>,
     ) -> Result<Option<PointValue>> {
-        let snapshot = self.point_read_snapshot()?;
+        let snapshot = self.point_read_snapshot_for_key(key, read_sequence)?;
         self.read_visible_point_value_in_snapshot(
             &snapshot,
             key,
@@ -194,8 +225,25 @@ impl LsmTree {
         }
     }
 
-    pub(crate) fn memtable_range_tombstones(&self) -> Result<RangeTombstoneIndex<RangeTombstone>> {
+    pub(crate) fn memtable_range_tombstones_for_read_sequence(
+        &self,
+        read_sequence: Sequence,
+    ) -> Result<RangeTombstoneIndex<RangeTombstone>> {
+        self.memtable_range_tombstones_with_deltas(!self.delta_mirror_covers(read_sequence))
+    }
+
+    fn memtable_range_tombstones_with_deltas(
+        &self,
+        include_deltas: bool,
+    ) -> Result<RangeTombstoneIndex<RangeTombstone>> {
         let mut tombstones = Vec::new();
+
+        if include_deltas {
+            let delta_snapshot = self.delta_snapshot()?;
+            for delta in delta_snapshot.deltas() {
+                tombstones.extend(delta.range_tombstones.iter().cloned());
+            }
+        }
 
         if self.range_tombstone_bytes.load(Ordering::Acquire) != 0 {
             let active_tombstones = self
@@ -242,6 +290,20 @@ impl LsmTree {
                 read_sequence,
             )?;
         }
+        for delta in snapshot.delta_snapshot.deltas() {
+            if candidate
+                .as_ref()
+                .is_some_and(|current| delta.sequence <= current.internal_key.sequence())
+            {
+                continue;
+            }
+            keep_newest_visible_memtable_point_candidate(
+                &mut candidate,
+                &delta.memtable,
+                key,
+                read_sequence,
+            )?;
+        }
 
         Ok(candidate)
     }
@@ -250,7 +312,11 @@ impl LsmTree {
 fn memtable_range_tombstones_in_snapshot(
     snapshot: &LsmPointReadSnapshot,
 ) -> RangeTombstoneIndex<RangeTombstone> {
-    let mut tombstones = snapshot.active_range_tombstones.clone();
+    let mut tombstones = Vec::new();
+    for delta in snapshot.delta_snapshot.deltas() {
+        tombstones.extend(delta.range_tombstones.iter().cloned());
+    }
+    tombstones.extend(snapshot.active_range_tombstones.clone());
     for immutable in &snapshot.immutable_memtables {
         tombstones.extend(immutable.range_tombstones.iter().cloned());
     }

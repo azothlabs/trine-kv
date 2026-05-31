@@ -22,7 +22,7 @@ impl LsmTree {
         // A point read is invalidated by either a newer point record for that
         // user key or a newer range tombstone covering it.
         let version = self.current_version()?;
-        for (internal_key, _) in self.collect_point_key_records(&version, key)? {
+        for (internal_key, _) in self.collect_point_key_records(&version, key, read_sequence)? {
             if internal_key.sequence() > read_sequence {
                 return Ok(true);
             }
@@ -39,7 +39,7 @@ impl LsmTree {
         // A range read is invalidated by any newer point record inside the
         // range or any newer range tombstone whose bounds overlap the read.
         let version = self.current_version()?;
-        for (internal_key, _) in self.collect_range_point_records(&version, range)? {
+        for (internal_key, _) in self.collect_range_point_records(&version, range, read_sequence)? {
             if internal_key.sequence() > read_sequence {
                 return Ok(true);
             }
@@ -52,6 +52,7 @@ impl LsmTree {
         &self,
         version: &LsmVersion,
         key: &[u8],
+        read_sequence: Sequence,
     ) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
         let active_memtable = self
             .active_memtable
@@ -59,6 +60,12 @@ impl LsmTree {
             .map_err(|_| lock_poisoned("active memtable"))?
             .clone();
         let mut records = collect_memtable_point_records(&active_memtable, key)?;
+        if !self.delta_mirror_covers(read_sequence) {
+            let delta_snapshot = self.delta_snapshot_for_key(key)?;
+            for delta in delta_snapshot.deltas() {
+                records.extend(collect_memtable_point_records(&delta.memtable, key)?);
+            }
+        }
 
         let immutable_memtables = self
             .immutable_memtables
@@ -86,6 +93,7 @@ impl LsmTree {
         &self,
         version: &LsmVersion,
         range: &KeyRange,
+        read_sequence: Sequence,
     ) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
         let active_memtable = self
             .active_memtable
@@ -93,6 +101,12 @@ impl LsmTree {
             .map_err(|_| lock_poisoned("active memtable"))?
             .clone();
         let mut records = collect_memtable_range_records(&active_memtable, range)?;
+        if !self.delta_mirror_covers(read_sequence) {
+            let delta_snapshot = self.delta_snapshot()?;
+            for delta in delta_snapshot.deltas() {
+                records.extend(collect_memtable_range_records(&delta.memtable, range)?);
+            }
+        }
 
         let immutable_memtables = self
             .immutable_memtables
@@ -126,7 +140,8 @@ impl LsmTree {
         key: &[u8],
         read_sequence: Sequence,
     ) -> Result<bool> {
-        let memtable_tombstones = self.memtable_range_tombstones()?;
+        let memtable_tombstones =
+            self.memtable_range_tombstones_for_read_sequence(read_sequence)?;
         if memtable_tombstones
             .covering_key(key)
             .any(|tombstone| tombstone.sequence > read_sequence)
@@ -153,7 +168,8 @@ impl LsmTree {
         range: &KeyRange,
         read_sequence: Sequence,
     ) -> Result<bool> {
-        let memtable_tombstones = self.memtable_range_tombstones()?;
+        let memtable_tombstones =
+            self.memtable_range_tombstones_for_read_sequence(read_sequence)?;
         if memtable_tombstones
             .overlapping_range(range)
             .any(|tombstone| tombstone.sequence > read_sequence)

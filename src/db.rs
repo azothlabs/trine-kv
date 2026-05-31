@@ -1597,7 +1597,7 @@ impl Db {
         let read_sequence = snapshot.read_sequence();
         let read_pin =
             (!snapshot.is_pinned()).then(|| self.inner.snapshots.pinned_snapshot(read_sequence));
-        let read_snapshot = state.point_read_snapshot()?;
+        let read_snapshot = state.point_read_snapshot(read_sequence)?;
         Ok(BucketReader::new(
             self.clone(),
             Arc::clone(state),
@@ -1619,7 +1619,12 @@ impl Db {
 
         let state = self.bucket_state(bucket)?;
         let selector = ScanSelector::Range(range.clone());
-        let scan = state.scan(&selector, direction, Some(&self.inner.block_cache))?;
+        let scan = state.scan(
+            &selector,
+            direction,
+            read_sequence,
+            Some(&self.inner.block_cache),
+        )?;
         let db_path = self.persistent_path().map(Path::to_path_buf);
 
         Ok(Iter::from_sources(
@@ -1645,7 +1650,12 @@ impl Db {
 
         let state = self.bucket_state(bucket)?;
         let selector = ScanSelector::Range(range.clone());
-        let scan = state.scan(&selector, direction, Some(&self.inner.block_cache))?;
+        let scan = state.scan(
+            &selector,
+            direction,
+            read_sequence,
+            Some(&self.inner.block_cache),
+        )?;
         let db_path = self.persistent_path().map(Path::to_path_buf);
 
         Ok(LazyIter::from_sources(
@@ -1671,7 +1681,12 @@ impl Db {
 
         let state = self.bucket_state(bucket)?;
         let selector = ScanSelector::Prefix(prefix.to_vec());
-        let scan = state.scan(&selector, direction, Some(&self.inner.block_cache))?;
+        let scan = state.scan(
+            &selector,
+            direction,
+            read_sequence,
+            Some(&self.inner.block_cache),
+        )?;
         let db_path = self.persistent_path().map(Path::to_path_buf);
 
         Ok(Iter::from_sources(
@@ -1697,7 +1712,12 @@ impl Db {
 
         let state = self.bucket_state(bucket)?;
         let selector = ScanSelector::Prefix(prefix.to_vec());
-        let scan = state.scan(&selector, direction, Some(&self.inner.block_cache))?;
+        let scan = state.scan(
+            &selector,
+            direction,
+            read_sequence,
+            Some(&self.inner.block_cache),
+        )?;
         let db_path = self.persistent_path().map(Path::to_path_buf);
 
         Ok(LazyIter::from_sources(

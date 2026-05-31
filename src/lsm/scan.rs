@@ -24,12 +24,20 @@ impl LsmTree {
         &self,
         selector: &ScanSelector,
         direction: Direction,
+        read_sequence: crate::types::Sequence,
         block_cache: Option<&Arc<cache::BlockCache>>,
     ) -> Result<LsmScan> {
         let version = self.current_version()?;
+        let include_deltas = !self.delta_mirror_covers(read_sequence);
         Ok(LsmScan {
-            range_tombstones: self.scan_range_tombstones(&version, selector)?,
-            sources: self.scan_sources(&version, selector, direction, block_cache)?,
+            range_tombstones: self.scan_range_tombstones(&version, selector, read_sequence)?,
+            sources: self.scan_sources(
+                &version,
+                selector,
+                direction,
+                include_deltas,
+                block_cache,
+            )?,
         })
     }
 
@@ -38,19 +46,35 @@ impl LsmTree {
         version: &LsmVersion,
         selector: &ScanSelector,
         direction: Direction,
+        include_deltas: bool,
         block_cache: Option<&Arc<cache::BlockCache>>,
     ) -> Result<Vec<RecordSource>> {
+        let mut sources = Vec::new();
+        if include_deltas {
+            let delta_snapshot = self.delta_snapshot()?;
+            for delta in delta_snapshot.deltas() {
+                if delta.estimated_bytes == 0 || delta.memtable.estimated_bytes() == 0 {
+                    continue;
+                }
+                sources.push(RecordSource::memtable(
+                    Arc::clone(&delta.memtable),
+                    selector.clone(),
+                    direction,
+                ));
+            }
+        }
+
         let active_memtable = self
             .active_memtable
             .read()
             .map_err(|_| lock_poisoned("active memtable"))?
             .clone();
 
-        let mut sources = vec![RecordSource::memtable(
+        sources.push(RecordSource::memtable(
             active_memtable,
             selector.clone(),
             direction,
-        )];
+        ));
         let immutable_memtables = self
             .immutable_memtables
             .read()
@@ -85,9 +109,11 @@ impl LsmTree {
         &self,
         version: &LsmVersion,
         selector: &ScanSelector,
+        read_sequence: crate::types::Sequence,
     ) -> Result<Vec<ScanRangeTombstone>> {
         let range = selector_query_range(selector);
-        let memtable_tombstones = self.memtable_range_tombstones()?;
+        let memtable_tombstones =
+            self.memtable_range_tombstones_for_read_sequence(read_sequence)?;
         let mut tombstones = memtable_tombstones
             .overlapping_range(&range)
             .cloned()

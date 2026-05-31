@@ -67,6 +67,7 @@ impl LsmTree {
             }
         }
 
+        self.mark_delta_mirror_sequence(sequence);
         Ok(())
     }
 

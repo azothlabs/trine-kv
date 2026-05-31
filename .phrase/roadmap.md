@@ -2040,3 +2040,27 @@ post-tracker write-path slice.
   unchanged.
 - Focused commit/write/async tests, formatting, clippy, full tests, and diff
   checks pass.
+
+### Phase 93: In-Memory Key-Sharded Delta Heads
+
+**Status**: Complete
+
+**Goal**: Publish in-memory writes into bucket-local key-sharded delta heads
+and make read paths include those deltas while preserving existing public
+behavior.
+
+**Entry Condition**: Phase 92 complete and writer-local prepared commit data is
+available before publish-time memtable mutation.
+
+**Acceptance Gate**:
+
+- In-memory writes publish immutable delta data into bucket-local key shards.
+- Point reads, range/prefix scans, and transaction conflict checks include
+  in-memory delta heads under existing MVCC and range tombstone rules.
+- The current active-memtable publication path remains as a compatibility
+  mirror for freeze/stats behavior in this phase.
+- Public async/blocking API, storage formats, MVCC, recovery contract, commit
+  tracker, compaction behavior, and WAL/table/blob/manifest formats remain
+  unchanged.
+- Focused commit/MVCC/iteration/transaction/async tests, formatting, clippy,
+  full tests, and diff checks pass.

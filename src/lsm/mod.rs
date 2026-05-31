@@ -1,5 +1,6 @@
 mod compact;
 mod conflict;
+mod delta;
 mod flush;
 mod read;
 mod scan;

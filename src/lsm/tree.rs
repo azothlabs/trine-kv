@@ -12,7 +12,7 @@ use crate::{
     types::{KeyRange, Sequence},
 };
 
-use super::LsmVersion;
+use super::{LsmVersion, delta::DeltaShardSet};
 
 #[derive(Debug)]
 pub(crate) struct LsmTree {
@@ -20,6 +20,8 @@ pub(crate) struct LsmTree {
     pub(crate) active_memtable: RwLock<Arc<Memtable>>,
     pub(crate) range_tombstones: RwLock<Vec<RangeTombstone>>,
     pub(crate) range_tombstone_bytes: AtomicU64,
+    pub(crate) delta_shards: DeltaShardSet,
+    pub(crate) delta_mirror_sequence: AtomicU64,
     pub(crate) immutable_memtables: RwLock<Vec<ImmutableMemtable>>,
     pub(crate) immutable_memtable_count: AtomicUsize,
     pub(crate) current_version: RwLock<Arc<LsmVersion>>,
@@ -33,6 +35,8 @@ impl LsmTree {
             active_memtable: RwLock::new(Arc::new(Memtable::default())),
             range_tombstones: RwLock::new(Vec::new()),
             range_tombstone_bytes: AtomicU64::new(0),
+            delta_shards: DeltaShardSet::new(),
+            delta_mirror_sequence: AtomicU64::new(Sequence::ZERO.get()),
             immutable_memtables: RwLock::new(Vec::new()),
             immutable_memtable_count: AtomicUsize::new(0),
             current_version: RwLock::new(current_version),

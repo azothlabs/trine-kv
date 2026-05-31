@@ -6978,3 +6978,62 @@ Record only evidence that can change planning or durable decisions.
 - Continue with in-memory key-sharded delta heads before WAL shard front doors,
   because prepared commit data now exists but publication still writes directly
   into active memtables under the publish barrier.
+
+## Phase 93: In-Memory Key-Sharded Delta Heads
+
+### Observation
+
+- Phase 92 prepared commit data made it possible to publish immutable write
+  data before the existing active-memtable mutation step.
+- The foreground write-path protocol lists key-sharded delta heads as the next
+  staged write-path slice.
+- Active/immutable memtables still own current freeze and stats behavior, so
+  removing the active memtable in the same phase would expand the slice into
+  scheduling and accounting work.
+
+### Interpretation
+
+- The safe next step was to add in-memory delta heads as a read-integrated
+  publication target while keeping active-memtable publication as a
+  compatibility mirror.
+- Point reads and scans must not blindly enumerate mirrored deltas when the
+  active/immutable memtables already cover the read sequence.
+
+### Change
+
+- Added fixed bucket-local delta shards to `LsmTree`.
+- In-memory commits publish immutable delta data into delta shards before
+  active-memtable mirror writes and before marking the sequence visible.
+- Point reads can read delta-only point records and range tombstones, and range
+  scans can consume delta-only sources.
+- Range/prefix scan sources and transaction conflict checks include deltas only
+  when the active/immutable mirror does not already cover the read sequence.
+- Added delta-only LSM tests for point records and range tombstones.
+
+### Verification
+
+- `cargo test delta --lib`
+- `cargo test --test in_memory_mvcc`
+- `cargo test --test in_memory_iteration`
+- `cargo test --test in_memory_transaction`
+- `cargo test --test async_api`
+- `cargo test persistent_write_buffer --test persistent_wal`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --check`
+- `cargo test --all-targets --all-features`
+
+### Remaining Blockers
+
+- Active-memtable publication remains as a compatibility mirror for freeze and
+  stats behavior.
+- Delta heads do not yet have epoch sealing, merge, retirement, or read
+  amplification budgets.
+- Persistent commits still use the single WAL writer.
+- The publish barrier still serializes WAL append, delta publication,
+  active-memtable mirror writes, visible marking, and freeze.
+
+### Recommended Next Action
+
+- Add delta epoch sealing/merge or equivalent in-memory accounting before
+  removing the active-memtable mirror. WAL shard front doors should remain a
+  later persistent write phase.
