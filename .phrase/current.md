@@ -6,15 +6,16 @@ Complete
 
 ## Goal
 
-Route manifest publish through the storage backend contract.
+Route manifest reads through the storage backend contract.
 
 ## Scope
 
-- Add an internal manifest publish backend operation.
-- Implement native-file manifest publish through the backend operation.
-- Route `ManifestStore` publish through the backend operation.
-- Keep manifest encoding, checksum, version, and state transition rules
-  unchanged.
+- Add an internal current-manifest read backend operation.
+- Implement native-file current-manifest reads through the backend operation.
+- Route `ManifestStore::open_or_create` and `read_manifest` through the backend
+  operation.
+- Keep manifest encoding, checksum, version, optional missing-manifest handling,
+  and state transition rules unchanged.
 - Keep block cache behavior, stats, cache keys, and SSTable format unchanged.
 - Keep SSTable, WAL, manifest, blob, compaction, transaction, and public API
   behavior unchanged.
@@ -26,8 +27,8 @@ Route manifest publish through the storage backend contract.
 - Introducing an extent allocator or disk-space reuse layer.
 - Changing SSTable block format, codec ids, checksums, footer layout, or cache
   key semantics.
-- Moving table writes, WAL append, blob reads, or file cleanup to the new
-  adapter in this slice.
+- Moving table writes, WAL append, blob reads, object listing, or file cleanup
+  to the new adapter in this slice.
 - Defining or routing full write, lease, cleanup, runtime, or public async API
   traits in this slice.
 - Reworking in-memory DB flush behavior or making memory mode create SSTable
@@ -37,13 +38,12 @@ Route manifest publish through the storage backend contract.
 
 ## Acceptance Gate
 
-- Native-file storage backend reports atomic manifest publish and strict sync
-  capabilities honestly.
-- Native-file backend exposes a manifest publish operation that writes the
-  manifest bytes, syncs them, atomically publishes the path, and syncs the
-  parent directory for strict publish.
-- `ManifestStore` uses the backend manifest publish operation and does not
-  advance in-memory state when backend publish fails.
+- Native-file backend exposes a current-manifest read operation that returns
+  `None` for a missing manifest and bytes for an existing manifest.
+- `ManifestStore::open_or_create` uses the backend read operation to choose
+  existing state, create-if-missing state, or empty non-created state.
+- Public `read_manifest` uses the backend read operation and reports a missing
+  manifest as an error.
 - Persistent table open/header/footer/startup metadata reads still go through a
   native-file storage object and adapter keyed by a storage object id.
 - Persistent table checked-block reads continue to go through the same adapter.
@@ -57,35 +57,35 @@ Route manifest publish through the storage backend contract.
 ## Active Task Slice
 
 ```text
-task197 [x] goal:start manifest publish backend slice | scope:current roadmap protocol | verify:manual
-task198 [x] goal:add native-file manifest publish operation | scope:src/storage.rs | verify:storage tests
-task199 [x] goal:route manifest publish through backend | scope:src/manifest.rs | verify:manifest tests
-task200 [x] goal:record evidence and next step | scope:.phrase/evidence.md current roadmap | verify:git diff
+task201 [x] goal:start manifest read backend slice | scope:current roadmap protocol | verify:manual
+task202 [x] goal:add native-file current-manifest read operation | scope:src/storage.rs | verify:storage tests
+task203 [x] goal:route manifest open/read through backend | scope:src/manifest.rs | verify:manifest tests
+task204 [x] goal:record evidence and next step | scope:.phrase/evidence.md current roadmap | verify:git diff
 ```
 
 ## Known Blockers
 
-- None identified for this manifest publish backend slice.
+- None identified for this manifest read backend slice.
 - Public async API, async runtime selection, table writes, manifest, WAL, blob
-  files, lease handling, cleanup, manifest read/recovery routing, and
-  production in-memory table-object routing remain later phases.
+  files, lease handling, cleanup, object listing, and production in-memory
+  table-object routing remain later phases.
 
 ## Evidence
 
-- Phase 51 added capability checks and typed unsupported backend/durability
-  errors.
-- Phase 52 proved the read contract can serve volatile memory storage objects.
-- The async-first protocol says manifest publish is a backend operation, not an
-  engine-level rename.
-- Existing `ManifestStore` already keeps in-memory state unchanged until file
-  publish succeeds; this slice preserves that rule while moving the publish
-  operation behind native-file backend capability checks.
-- `src/storage.rs` now has `StorageManifestPublishBackend` and
-  `BlockingStorageManifestPublishBackend`.
-- `NativeFileBackend` now reports atomic manifest publish plus strict sync
-  capabilities and publishes manifest bytes through its backend operation.
-- `src/manifest.rs` keeps manifest byte encoding local but delegates final
-  publish to `NativeFileBackend`.
+- Phase 53 routed manifest publish through the native-file storage backend.
+- The async-first protocol also says recovery reads the current manifest
+  through the storage backend contract.
+- Existing `ManifestStore::open_or_create` has a three-way decision:
+  read existing manifest, create a missing manifest when allowed, or use empty
+  state when missing and not creating. This slice preserves that behavior while
+  routing the read through the backend.
+- `src/storage.rs` now has `StorageManifestReadBackend` and
+  `BlockingStorageManifestReadBackend`.
+- `NativeFileBackend` now reads the current manifest object and returns `None`
+  only for a missing native-file manifest.
+- `src/manifest.rs` routes `ManifestStore::open_or_create` and
+  `read_manifest` through the backend read operation while keeping decode logic
+  unchanged.
 - Verification passed: `cargo test storage --lib`, `cargo test manifest --lib`,
   `cargo test table --lib`, `cargo test block --all-targets`,
   `cargo test persistent --all-targets`, `cargo clippy --all-targets
@@ -94,5 +94,5 @@ task200 [x] goal:record evidence and next step | scope:.phrase/evidence.md curre
 
 ## Next Recommendation
 
-- Route manifest read/listing or table write output through storage backend
-  operations.
+- After manifest reads land, route object listing or table write output through
+  storage backend operations.

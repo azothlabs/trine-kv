@@ -4880,3 +4880,55 @@ Record only evidence that can change planning or durable decisions.
 
 - Route manifest read/listing or table write output through storage backend
   operations.
+
+## 2026-05-31: Native-File Manifest Read Backend
+
+### Observation
+
+- Manifest publish now routes through the native-file storage backend, but
+  current-manifest reads still entered through direct manifest-layer file
+  checks and reads.
+- The async-first storage protocol says recovery reads the current manifest
+  through the same backend contract.
+- `ManifestStore::open_or_create` already distinguishes existing manifest,
+  missing-and-create, and missing-without-create cases.
+
+### Interpretation
+
+- The next safe slice is the paired current-manifest read operation, not broad
+  object listing or table output writes.
+- The backend should report missing manifest as `None`; manifest decoding and
+  create-if-missing decisions remain owned by `ManifestStore`.
+
+### Verification
+
+- Added `StorageManifestReadBackend` and
+  `BlockingStorageManifestReadBackend` in `src/storage.rs`.
+- `NativeFileBackend` now reads current manifest bytes and returns `None` only
+  for `NotFound`.
+- `ManifestStore::open_or_create` now uses the backend read operation to choose
+  between decode, create, and empty state.
+- Public `read_manifest` now uses the backend read operation and reports a
+  missing manifest as an IO error.
+- Manifest decoding and publish bytes remain unchanged.
+- `cargo test storage --lib`
+- `cargo test manifest --lib`
+- `cargo test table --lib`
+- `cargo test block --all-targets`
+- `cargo test persistent --all-targets`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --check`
+- `git diff --check`
+- Forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, `README.md`, `CHANGELOG.md`, and `Cargo.toml`
+
+### Remaining Blockers
+
+- None for the native-file manifest read backend slice.
+- Object listing, table output writes, WAL append, blob files, cleanup, writer
+  lease handling, public async API, runtime selection, and production in-memory
+  table-object routing remain later slices.
+
+### Recommended Next Action
+
+- Route object listing or table write output through storage backend operations.

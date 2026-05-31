@@ -1111,3 +1111,25 @@ async storage protocol.
   unchanged.
 - Focused storage/manifest/persistent tests, formatting, clippy, and diff
   checks pass.
+
+### Phase 54: Native-File Manifest Read Backend
+
+**Status**: Complete
+
+**Goal**: Route current-manifest reads through the native-file storage backend
+operation.
+
+**Entry Condition**: Phase 53 complete and user asks to continue following the
+async storage protocol.
+
+**Acceptance Gate**:
+
+- Native-file backend exposes a current-manifest read operation that returns
+  `None` for a missing manifest and bytes for an existing manifest.
+- `ManifestStore::open_or_create` and `read_manifest` use the backend read
+  operation while preserving manifest decode and create-if-missing behavior.
+- Public API behavior, SSTable format, MVCC, WAL, blob, compaction,
+  transaction, table read/write behavior, and manifest byte format remain
+  unchanged.
+- Focused storage/manifest/persistent tests, formatting, clippy, and diff
+  checks pass.

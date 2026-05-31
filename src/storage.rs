@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, File},
     future::Future,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex, MutexGuard},
@@ -223,6 +223,17 @@ where
     fn open_read_blocking(&self, object: StorageObjectId) -> Result<Self::ReadObject>;
 }
 
+pub(crate) trait StorageManifestReadBackend: StorageReadBackend {
+    fn read_current_manifest(
+        &self,
+        object: StorageObjectId,
+    ) -> StorageFuture<'_, Option<Arc<[u8]>>>;
+}
+
+pub(crate) trait BlockingStorageManifestReadBackend: StorageManifestReadBackend {
+    fn read_current_manifest_blocking(&self, object: StorageObjectId) -> Result<Option<Arc<[u8]>>>;
+}
+
 pub(crate) trait StorageManifestPublishBackend: StorageReadBackend {
     fn publish_manifest(
         &self,
@@ -393,6 +404,21 @@ impl BlockingStorageReadBackend for NativeFileBackend {
     }
 }
 
+impl StorageManifestReadBackend for NativeFileBackend {
+    fn read_current_manifest(
+        &self,
+        object: StorageObjectId,
+    ) -> StorageFuture<'_, Option<Arc<[u8]>>> {
+        Box::pin(async move { read_current_manifest_from_native_file(&object) })
+    }
+}
+
+impl BlockingStorageManifestReadBackend for NativeFileBackend {
+    fn read_current_manifest_blocking(&self, object: StorageObjectId) -> Result<Option<Arc<[u8]>>> {
+        poll_ready_storage_future(self.read_current_manifest(object))
+    }
+}
+
 impl StorageManifestPublishBackend for NativeFileBackend {
     fn publish_manifest(
         &self,
@@ -550,6 +576,20 @@ fn read_exact_at_native_file(file: &mut File, offset: usize, bytes: &mut [u8]) -
     Ok(())
 }
 
+fn read_current_manifest_from_native_file(object: &StorageObjectId) -> Result<Option<Arc<[u8]>>> {
+    if object.kind() != StorageObjectKind::Manifest {
+        return Err(Error::invalid_options(
+            "current manifest read requires a manifest storage object",
+        ));
+    }
+
+    match fs::read(object.path()) {
+        Ok(bytes) => Ok(Some(Arc::from(bytes))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn publish_manifest_to_native_file(
     object: &StorageObjectId,
     bytes: &[u8],
@@ -698,6 +738,44 @@ mod tests {
             std::fs::read(object.path()).expect("manifest reads"),
             b"second"
         );
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[test]
+    fn native_file_backend_reads_current_manifest() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-storage-manifest-read-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("test dir creates");
+
+        let backend = NativeFileBackend::new();
+        let object =
+            StorageObjectId::native_file(StorageObjectKind::Manifest, root.join("MANIFEST"));
+        assert!(
+            backend
+                .read_current_manifest_blocking(object.clone())
+                .expect("missing manifest read succeeds")
+                .is_none()
+        );
+
+        backend
+            .publish_manifest_blocking(
+                object.clone(),
+                Arc::from(&b"manifest bytes"[..]),
+                DurabilityMode::SyncAll,
+            )
+            .expect("manifest publishes");
+        let bytes = backend
+            .read_current_manifest_blocking(object)
+            .expect("manifest reads")
+            .expect("manifest exists");
+        assert_eq!(&*bytes, b"manifest bytes");
 
         std::fs::remove_dir_all(root).expect("test dir removes");
     }

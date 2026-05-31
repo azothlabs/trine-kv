@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeMap,
-    fs::File,
-    io::Read,
+    io,
     path::{Path, PathBuf},
 };
 
@@ -15,8 +14,8 @@ use crate::{
     },
     prefix::PrefixExtractor,
     storage::{
-        BlockingStorageManifestPublishBackend, NativeFileBackend, StorageObjectId,
-        StorageObjectKind,
+        BlockingStorageManifestPublishBackend, BlockingStorageManifestReadBackend,
+        NativeFileBackend, StorageObjectId, StorageObjectKind,
     },
     table::{TableBlobReference, TableId, TableLevel, TableProperties},
     types::Sequence,
@@ -125,8 +124,8 @@ pub struct ManifestStore {
 impl ManifestStore {
     pub fn open_or_create(path: impl Into<PathBuf>, create_if_missing: bool) -> Result<Self> {
         let path = path.into();
-        let state = if path.exists() {
-            read_manifest(&path)?
+        let state = if let Some(bytes) = read_manifest_bytes(&path)? {
+            decode_manifest(&bytes)?
         } else if create_if_missing {
             let state = ManifestState::empty();
             publish_manifest(&path, &state)?;
@@ -312,9 +311,19 @@ pub fn manifest_path(db_path: &Path) -> PathBuf {
 }
 
 pub fn read_manifest(path: &Path) -> Result<ManifestState> {
-    let mut bytes = Vec::new();
-    File::open(path)?.read_to_end(&mut bytes)?;
+    let bytes = read_manifest_bytes(path)?.ok_or_else(|| {
+        Error::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("manifest {} not found", path.display()),
+        ))
+    })?;
     decode_manifest(&bytes)
+}
+
+fn read_manifest_bytes(path: &Path) -> Result<Option<std::sync::Arc<[u8]>>> {
+    let backend = NativeFileBackend::new();
+    let object = manifest_storage_object(path);
+    backend.read_current_manifest_blocking(object)
 }
 
 fn publish_manifest(path: &Path, state: &ManifestState) -> Result<()> {
@@ -331,8 +340,12 @@ fn publish_manifest(path: &Path, state: &ManifestState) -> Result<()> {
     bytes.extend_from_slice(&payload);
 
     let backend = NativeFileBackend::new();
-    let object = StorageObjectId::native_file(StorageObjectKind::Manifest, path);
+    let object = manifest_storage_object(path);
     backend.publish_manifest_blocking(object, bytes.into(), DurabilityMode::SyncAll)
+}
+
+fn manifest_storage_object(path: &Path) -> StorageObjectId {
+    StorageObjectId::native_file(StorageObjectKind::Manifest, path)
 }
 
 fn encode_state(state: &ManifestState) -> Result<Vec<u8>> {
