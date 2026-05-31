@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, VecDeque},
+    future::Future,
     sync::{
         Arc, RwLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -121,6 +122,30 @@ impl BlockCache {
         }
     }
 
+    pub(crate) async fn get_or_insert_data_block_with_async<F, Fut>(
+        &self,
+        key: BlockCacheKey,
+        load: F,
+    ) -> Result<Arc<DecodedDataBlock>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<DecodedDataBlock>>,
+    {
+        let value = self
+            .get_or_insert_value_with_async(key, || async {
+                let block = Arc::new(load().await?);
+                Ok((
+                    CacheValue::DataBlock(Arc::clone(&block)),
+                    block.estimated_bytes(),
+                ))
+            })
+            .await?;
+        match value {
+            CacheValue::DataBlock(block) => Ok(block),
+            CacheValue::IndexPartition(_) => Err(cache_value_kind_mismatch(key)),
+        }
+    }
+
     pub(crate) fn get_or_insert_index_partition_with(
         &self,
         key: BlockCacheKey,
@@ -169,6 +194,55 @@ impl BlockCache {
         }
 
         let (loaded, loaded_bytes) = load()?;
+        let loaded_bytes = loaded_bytes.max(1);
+        let Ok(mut state) = shard.write() else {
+            self.misses.increment();
+            return Ok(loaded);
+        };
+        if let Some(entry) = state.entries.get(&key) {
+            let value = entry.value.clone();
+            state.promote(key);
+            self.hits.increment();
+            return Ok(value);
+        }
+
+        self.misses.increment();
+        if loaded_bytes <= self.capacity_bytes {
+            state.insert(key, loaded_bytes, loaded.clone());
+            state.evict_to(self.shard_capacity_bytes);
+        }
+
+        Ok(loaded)
+    }
+
+    async fn get_or_insert_value_with_async<F, Fut>(
+        &self,
+        key: BlockCacheKey,
+        load: F,
+    ) -> Result<CacheValue>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(CacheValue, u64)>>,
+    {
+        if self.capacity_bytes == 0 {
+            self.misses.increment();
+            return load().await.map(|(value, _)| value);
+        }
+
+        let shard = &self.shards[block_cache_shard_index(key)];
+        if let Ok(state) = shard.read() {
+            if let Some(entry) = state.entries.get(&key) {
+                let value = entry.value.clone();
+                drop(state);
+                if let Ok(mut state) = shard.try_write() {
+                    state.promote(key);
+                }
+                self.hits.increment();
+                return Ok(value);
+            }
+        }
+
+        let (loaded, loaded_bytes) = load().await?;
         let loaded_bytes = loaded_bytes.max(1);
         let Ok(mut state) = shard.write() else {
             self.misses.increment();

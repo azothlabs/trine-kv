@@ -6797,3 +6797,67 @@ Record only evidence that can change planning or durable decisions.
 - Start the async table block-load phase by making the async table cursor load
   data blocks through an awaited owned-read completion while preserving the
   current synchronous iterator path.
+
+## Phase 90: Async Table Block-Load Completion
+
+### Observation
+
+- Phase 89 routed async range/prefix cursor advancement down to
+  `TablePointCursor::ensure_current_block_async`, but that hook still called the
+  synchronous table data-block loader.
+- The block cache only accepted synchronous miss loaders, so async cursor block
+  loads could not await storage completion without either bypassing cache or
+  holding a cache lock across work.
+- Persistent tables loaded through `Db` already carry cached
+  `NativeFileObject`s, and those objects expose `read_exact_at_owned` as an
+  async storage read completion.
+
+### Interpretation
+
+- The cache needs an async miss-loader shape that checks for hits before await,
+  performs the miss load outside cache locks, then races safely with other
+  insertions before publishing the loaded block.
+- The async table cursor can use this cache path and await
+  `StorageReadObject::read_exact_at_owned` for cached native table files.
+- Synchronous iterators should keep using the existing `load_data_block` path.
+
+### Change
+
+- Added `BlockCache::get_or_insert_data_block_with_async` and an internal async
+  value-loader helper.
+- Added `Table::load_data_block_async` and routed
+  `TablePointCursor::ensure_current_block_async` through it.
+- Added async table-block helpers that decode from
+  `StorageReadObject::read_exact_at_owned` when a cached `NativeFileObject` is
+  available, with the existing synchronous fallback for standalone no-file
+  helper paths.
+- Kept synchronous `Table::load_data_block` and synchronous iterator
+  advancement unchanged.
+
+### Verification
+
+- `cargo test --test async_api`
+- `cargo test cache --lib`
+- `cargo test table --lib`
+- `cargo test storage --lib`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --check`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan passed outside the repository instruction file.
+
+### Remaining Blockers
+
+- Native-file async reads still use the bounded blocking adapter rather than
+  platform-native async file I/O.
+- Table header/footer metadata and index metadata reads still use borrowed
+  synchronous reads.
+- Runtime tuning options are still internal.
+- True multi-writer execution still needs writer-local deltas and WAL
+  partitioning.
+
+### Recommended Next Action
+
+- Decide whether the next phase should finish table metadata async-read
+  coverage or switch to the multi-writer line. If continuing the read path, move
+  table header/footer and index metadata reads to owned/awaited completions.

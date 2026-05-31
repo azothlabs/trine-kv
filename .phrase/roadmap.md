@@ -1969,3 +1969,25 @@ synchronous block decode through the runtime queue.
   scheduling remain unchanged.
 - Focused async/table tests, formatting, clippy, full tests, and diff checks
   pass.
+
+### Phase 90: Async Table Block-Load Completion
+
+**Status**: Complete
+
+**Goal**: Make async table cursor data-block loads await owned storage read
+completion while preserving the synchronous iterator path.
+
+**Entry Condition**: Phase 89 complete and async cursor advancement reaches a
+dedicated table block-load hook.
+
+**Acceptance Gate**:
+
+- Data-block cache misses can be loaded through an async loader without holding
+  block-cache locks across await.
+- Async table cursor block loading uses `StorageReadObject::read_exact_at_owned`
+  when a cached native table file is available.
+- Synchronous table block loading and synchronous iterators remain unchanged.
+- Storage formats, MVCC, recovery contract, public async/blocking API, publish
+  barrier, commit tracker, and compaction behavior remain unchanged.
+- Focused async/table/cache tests, formatting, clippy, full tests, and diff
+  checks pass.

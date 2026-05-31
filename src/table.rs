@@ -31,7 +31,7 @@ use crate::{
         BlockingStorageObjectListBackend, BlockingStorageObjectWriteBackend,
         BlockingStorageReadBackend, BlockingStorageReadObject, NativeFileBackend, NativeFileObject,
         NativeFileReadSource, StorageCapability, StorageObjectId, StorageObjectKind,
-        StorageObjectListRequest, StorageReadBackend, StorageReadSource,
+        StorageObjectListRequest, StorageReadBackend, StorageReadObject, StorageReadSource,
     },
     types::{KeyRange, Sequence},
 };
@@ -1621,6 +1621,66 @@ impl Table {
         }
     }
 
+    async fn load_data_block_async(
+        &self,
+        block_index: usize,
+        block_cache: Option<&BlockCache>,
+    ) -> Result<Arc<DecodedDataBlock>> {
+        if let Some(records) = &self.point_records {
+            let records = self.with_data_block_metadata(block_index, None, |block| {
+                records
+                    .get(block.record_range.clone())
+                    .ok_or_else(|| invalid_table("data block record range outside table"))
+                    .map(<[_]>::to_vec)
+            })?;
+            return DecodedDataBlock::from_records(&records).map(Arc::new);
+        }
+
+        let entry = self.with_data_block_metadata(block_index, block_cache, |block| {
+            Ok(DataBlockIndexEntry {
+                smallest_internal_key: block.smallest_internal_key.clone(),
+                largest_internal_key: block.largest_internal_key.clone(),
+                block: block.block,
+                point_key_filter: block.point_key_filter.clone(),
+                prefix_filter: block.prefix_filter.clone(),
+            })
+        })?;
+        let Some(path) = &self.path else {
+            return Err(Error::Corruption {
+                message: "table data block has no file path".to_owned(),
+            });
+        };
+        let key = BlockCacheKey::new(self.properties.id, block_index);
+        if let Some(block_cache) = block_cache {
+            let path = path.clone();
+            let file = self.file.as_ref().map(Arc::clone);
+            let payload_len = self.payload_len;
+            let codec = self.properties.codec;
+            block_cache
+                .get_or_insert_data_block_with_async(key, move || async move {
+                    read_data_block_from_file_async(
+                        &path,
+                        file.as_deref(),
+                        payload_len,
+                        codec,
+                        &entry,
+                    )
+                    .await
+                })
+                .await
+        } else {
+            read_data_block_from_file_async(
+                path,
+                self.file.as_deref(),
+                self.payload_len,
+                self.properties.codec,
+                &entry,
+            )
+            .await
+            .map(Arc::new)
+        }
+    }
+
     fn first_block_for_key(
         &self,
         key: &[u8],
@@ -2247,9 +2307,6 @@ impl TablePointCursor {
         Ok(())
     }
 
-    // Future read-path phases can await owned storage completion here. This
-    // phase deliberately preserves synchronous table block loading.
-    #[allow(clippy::unused_async)]
     async fn ensure_current_block_async(&mut self, block_index: usize) -> Result<()> {
         if self
             .current_block
@@ -2261,7 +2318,8 @@ impl TablePointCursor {
 
         let block = self
             .table
-            .load_data_block(block_index, self.block_cache.as_deref())?;
+            .load_data_block_async(block_index, self.block_cache.as_deref())
+            .await?;
         if let ScanSelector::Prefix(prefix) = &self.selector {
             if self.table.with_data_block_metadata(
                 block_index,
@@ -3900,6 +3958,21 @@ fn read_data_block_from_file(
     read_data_block_from_source(&source, payload_len, expected_codec, entry)
 }
 
+async fn read_data_block_from_file_async(
+    path: &Path,
+    file: Option<&NativeFileObject>,
+    payload_len: usize,
+    expected_codec: CodecId,
+    entry: &DataBlockIndexEntry,
+) -> Result<DecodedDataBlock> {
+    if let Some(file) = file {
+        return read_data_block_from_storage_object_async(file, payload_len, expected_codec, entry)
+            .await;
+    }
+
+    read_data_block_from_file(path, None, payload_len, expected_codec, entry)
+}
+
 fn read_data_block_from_source(
     source: &impl BlockReadSource,
     payload_len: usize,
@@ -3912,6 +3985,40 @@ fn read_data_block_from_source(
     validate_decoded_data_block_entry(entry, &decoded)?;
     validate_decoded_data_block_filters(entry, &decoded)?;
     Ok(decoded)
+}
+
+async fn read_data_block_from_storage_object_async(
+    object: &impl StorageReadObject,
+    payload_len: usize,
+    expected_codec: CodecId,
+    entry: &DataBlockIndexEntry,
+) -> Result<DecodedDataBlock> {
+    let (actual_codec, payload) =
+        read_checked_block_from_storage_object_async(object, payload_len, entry.block).await?;
+    validate_block_codec(actual_codec, expected_codec, TableSection::DataBlocks)?;
+    let decoded = decode_data_block(payload)?;
+    validate_decoded_data_block_entry(entry, &decoded)?;
+    validate_decoded_data_block_filters(entry, &decoded)?;
+    Ok(decoded)
+}
+
+async fn read_checked_block_from_storage_object_async(
+    object: &impl StorageReadObject,
+    payload_len: usize,
+    block: BlockHandle,
+) -> Result<(CodecId, Vec<u8>)> {
+    let (start, end) = block_bounds(block)?;
+    if end > payload_len {
+        return Err(invalid_table("block outside table payload"));
+    }
+
+    let source_offset = HEADER_LEN
+        .checked_add(start)
+        .ok_or_else(|| invalid_table("block file offset overflow"))?;
+    let block_bytes = object
+        .read_exact_at_owned(source_offset, end - start)
+        .await?;
+    BlockManager::decode_checked(block_bytes.as_slice())
 }
 
 fn validate_block_codec(actual: CodecId, expected: CodecId, section: TableSection) -> Result<()> {
