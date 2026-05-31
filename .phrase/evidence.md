@@ -4988,3 +4988,60 @@ Record only evidence that can change planning or durable decisions.
 
 - Route table output writes through storage backend operations next; deletion
   routing should follow once backend-owned table object creation is in place.
+
+## 2026-05-31: Native-File Table Object Write Backend
+
+### Observation
+
+- Table file id discovery now routes through the native-file storage backend,
+  but `write_table` still created table output files directly with native file
+  calls.
+- `write_table` already owns a complete encoded table byte buffer before it
+  writes anything to storage.
+- Existing flush/compaction callers batch parent-directory sync after one or
+  more table/blob renames and before manifest publish.
+
+### Interpretation
+
+- Complete table object write is the next safe backend operation: it moves table
+  file creation behind the backend without changing table bytes, manifest
+  publish, WAL replay, blob behavior, cleanup policy, or public API behavior.
+- Parent-directory sync batching must remain outside the table-object write
+  operation for now, because callers intentionally amortize it across multiple
+  output files.
+
+### Verification
+
+- Added an internal object write capability plus `StorageObjectWriteBackend` and
+  `BlockingStorageObjectWriteBackend` in `src/storage.rs`.
+- `NativeFileBackend` now writes table objects by creating the parent directory,
+  writing a temporary file, syncing the file, and renaming to the final object
+  path.
+- Generic object write rejects manifest storage objects so manifest publish
+  remains the only manifest update path.
+- `write_table` now sends encoded table bytes through the backend write
+  operation and then reopens through the existing read backend path.
+- Added focused storage and table coverage for backend table object writes and
+  temporary-file cleanup after successful table writes.
+- `cargo test storage --lib`
+- `cargo test table --lib`
+- `cargo test block --all-targets`
+- `cargo test persistent --all-targets`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --check`
+- `git diff --check`
+- Forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, `README.md`, `CHANGELOG.md`, and `Cargo.toml`
+
+### Remaining Blockers
+
+- None for the native-file table object write slice.
+- Deletion routing, blob file writes, WAL append, writer lease handling, public
+  async API, runtime selection, async cursor advancement, WASM memory checks,
+  parent-directory sync routing, and production in-memory table-object routing
+  remain later slices.
+
+### Recommended Next Action
+
+- Route deletion cleanup through storage backend operations next, because table
+  output creation and table object discovery now both have backend-owned paths.

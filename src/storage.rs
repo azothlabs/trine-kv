@@ -106,6 +106,7 @@ pub(crate) enum StorageCapability {
     Persistent,
     RandomRead,
     ObjectListing,
+    ObjectWrite,
     Append,
     AtomicManifestPublish,
     WriterLease,
@@ -124,6 +125,7 @@ impl StorageCapability {
             Self::Persistent => "persistent storage",
             Self::RandomRead => "random read",
             Self::ObjectListing => "object listing",
+            Self::ObjectWrite => "object write",
             Self::Append => "append",
             Self::AtomicManifestPublish => "atomic manifest publish",
             Self::WriterLease => "writer lease",
@@ -142,15 +144,16 @@ impl StorageCapability {
             Self::Persistent => 1 << 1,
             Self::RandomRead => 1 << 2,
             Self::ObjectListing => 1 << 3,
-            Self::Append => 1 << 4,
-            Self::AtomicManifestPublish => 1 << 5,
-            Self::WriterLease => 1 << 6,
-            Self::Flush => 1 << 7,
-            Self::StrictDataSync => 1 << 8,
-            Self::StrictMetadataSync => 1 << 9,
-            Self::BackgroundThreads => 1 << 10,
-            Self::AsyncTasks => 1 << 11,
-            Self::CooperativeTasks => 1 << 12,
+            Self::ObjectWrite => 1 << 4,
+            Self::Append => 1 << 5,
+            Self::AtomicManifestPublish => 1 << 6,
+            Self::WriterLease => 1 << 7,
+            Self::Flush => 1 << 8,
+            Self::StrictDataSync => 1 << 9,
+            Self::StrictMetadataSync => 1 << 10,
+            Self::BackgroundThreads => 1 << 11,
+            Self::AsyncTasks => 1 << 12,
+            Self::CooperativeTasks => 1 << 13,
         }
     }
 }
@@ -174,6 +177,7 @@ impl StorageCapabilities {
 
     pub(crate) const fn native_file() -> Self {
         Self::native_file_read()
+            .with(StorageCapability::ObjectWrite)
             .with(StorageCapability::AtomicManifestPublish)
             .with(StorageCapability::Flush)
             .with(StorageCapability::StrictDataSync)
@@ -285,6 +289,24 @@ pub(crate) trait BlockingStorageManifestPublishBackend:
     StorageManifestPublishBackend
 {
     fn publish_manifest_blocking(
+        &self,
+        object: StorageObjectId,
+        bytes: Arc<[u8]>,
+        durability: DurabilityMode,
+    ) -> Result<()>;
+}
+
+pub(crate) trait StorageObjectWriteBackend: StorageReadBackend {
+    fn write_object(
+        &self,
+        object: StorageObjectId,
+        bytes: Arc<[u8]>,
+        durability: DurabilityMode,
+    ) -> StorageFuture<'_, ()>;
+}
+
+pub(crate) trait BlockingStorageObjectWriteBackend: StorageObjectWriteBackend {
+    fn write_object_blocking(
         &self,
         object: StorageObjectId,
         bytes: Arc<[u8]>,
@@ -493,6 +515,28 @@ impl BlockingStorageManifestPublishBackend for NativeFileBackend {
     }
 }
 
+impl StorageObjectWriteBackend for NativeFileBackend {
+    fn write_object(
+        &self,
+        object: StorageObjectId,
+        bytes: Arc<[u8]>,
+        durability: DurabilityMode,
+    ) -> StorageFuture<'_, ()> {
+        Box::pin(async move { write_native_file_object(&object, &bytes, durability) })
+    }
+}
+
+impl BlockingStorageObjectWriteBackend for NativeFileBackend {
+    fn write_object_blocking(
+        &self,
+        object: StorageObjectId,
+        bytes: Arc<[u8]>,
+        durability: DurabilityMode,
+    ) -> Result<()> {
+        poll_ready_storage_future(self.write_object(object, bytes, durability))
+    }
+}
+
 impl StorageObjectListBackend for NativeFileBackend {
     fn list_objects(
         &self,
@@ -685,6 +729,37 @@ fn native_file_matches_list_request(request: &StorageObjectListRequest, path: &P
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
     })
+}
+
+fn write_native_file_object(
+    object: &StorageObjectId,
+    bytes: &[u8],
+    durability: DurabilityMode,
+) -> Result<()> {
+    if object.kind() == StorageObjectKind::Manifest {
+        return Err(Error::invalid_options(
+            "manifest storage objects must use manifest publish",
+        ));
+    }
+
+    let capabilities = StorageCapabilities::native_file();
+    capabilities.require(StorageCapability::ObjectWrite)?;
+    capabilities.require_durability(durability)?;
+
+    let path = object.path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let tmp_path = path.with_extension("tmp");
+    {
+        let mut file = File::create(&tmp_path)?;
+        file.write_all(bytes)?;
+        sync_native_file_for_durability(&file, durability)?;
+    }
+    fs::rename(tmp_path, path)?;
+
+    Ok(())
 }
 
 fn publish_manifest_to_native_file(
@@ -935,6 +1010,67 @@ mod tests {
     }
 
     #[test]
+    fn native_file_backend_writes_table_object() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-storage-write-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        let path = root.join("table-00000000000000000007.trinet");
+        let object = StorageObjectId::native_file(StorageObjectKind::Table, &path);
+
+        let backend = NativeFileBackend::new();
+        let capabilities = backend.capabilities();
+        capabilities
+            .require(StorageCapability::ObjectWrite)
+            .expect("native-file backend supports object writes");
+        capabilities
+            .require_durability(DurabilityMode::SyncAll)
+            .expect("native-file backend supports strict object sync");
+        backend
+            .write_object_blocking(
+                object.clone(),
+                Arc::from(&b"table bytes"[..]),
+                DurabilityMode::SyncAll,
+            )
+            .expect("table object writes");
+
+        assert_eq!(
+            std::fs::read(object.path()).expect("table object reads"),
+            b"table bytes"
+        );
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "successful table write should leave only the final object"
+        );
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[test]
+    fn native_file_object_write_rejects_manifest_objects() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-storage-write-manifest-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        let object =
+            StorageObjectId::native_file(StorageObjectKind::Manifest, root.join("MANIFEST"));
+
+        let backend = NativeFileBackend::new();
+        let error = backend
+            .write_object_blocking(object, Arc::from(&b"manifest"[..]), DurabilityMode::SyncAll)
+            .expect_err("manifest objects use manifest publish");
+        assert!(matches!(error, Error::InvalidOptions { .. }));
+    }
+
+    #[test]
     fn memory_storage_backend_exposes_async_read_shape() {
         let backend = MemoryStorageBackend::new();
         let capabilities = backend.capabilities();
@@ -976,6 +1112,7 @@ mod tests {
         assert!(read_only.supports(StorageCapability::Persistent));
         assert!(read_only.supports(StorageCapability::RandomRead));
         assert!(read_only.supports(StorageCapability::ObjectListing));
+        assert!(!read_only.supports(StorageCapability::ObjectWrite));
         assert!(matches!(
             read_only.require(StorageCapability::Append),
             Err(Error::UnsupportedBackend { feature: "append" })

@@ -1159,3 +1159,28 @@ the active implementation guide.
   remain unchanged.
 - Focused storage/table/persistent tests, formatting, clippy, and diff checks
   pass.
+
+### Phase 56: Native-File Table Object Write Backend
+
+**Status**: Complete
+
+**Goal**: Route table output-file creation through the storage backend object
+write operation.
+
+**Entry Condition**: Phase 55 complete and table object discovery already routes
+through the backend boundary.
+
+**Acceptance Gate**:
+
+- Native-file backend reports object write capability before table output writes
+  use that operation.
+- Native-file backend exposes a complete-object write operation for table
+  objects.
+- Table output writes use the backend operation while preserving table bytes,
+  temporary-file naming, file sync, final rename, and reopen behavior.
+- Parent-directory sync batching remains owned by existing flush/compaction
+  callers and still occurs before manifest publish.
+- Public API behavior, SSTable format, MVCC, manifest, WAL, blob, compaction,
+  transaction, cleanup behavior, and storage format remain unchanged.
+- Focused storage/table/persistent tests, formatting, clippy, and diff checks
+  pass.

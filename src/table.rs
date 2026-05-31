@@ -1,7 +1,5 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File},
-    io::Write,
     mem::size_of,
     ops::{Bound, Range},
     path::{Path, PathBuf},
@@ -23,17 +21,17 @@ use crate::{
         Direction, ForwardKeyState, RecordGroup, ReverseKeyState, ScanRecord, ScanSelector,
         prefix_successor, sort_group_records,
     },
-    options::{FilterPolicy, IndexSearchPolicy, PrefixFilterPolicy},
+    options::{DurabilityMode, FilterPolicy, IndexSearchPolicy, PrefixFilterPolicy},
     point_value::PointValueSource,
     prefix::PrefixExtractor,
     range_tombstone::{self, RangeTombstoneIndex, RangeTombstoneLike},
     search,
     stats::{FilterStats, ReadPathStats},
     storage::{
-        BlockingStorageObjectListBackend, BlockingStorageReadBackend, BlockingStorageReadObject,
-        NativeFileBackend, NativeFileObject, NativeFileReadSource, StorageCapability,
-        StorageObjectId, StorageObjectKind, StorageObjectListRequest, StorageReadBackend,
-        StorageReadSource,
+        BlockingStorageObjectListBackend, BlockingStorageObjectWriteBackend,
+        BlockingStorageReadBackend, BlockingStorageReadObject, NativeFileBackend, NativeFileObject,
+        NativeFileReadSource, StorageCapability, StorageObjectId, StorageObjectKind,
+        StorageObjectListRequest, StorageReadBackend, StorageReadSource,
     },
     types::{KeyRange, Sequence},
 };
@@ -2560,17 +2558,16 @@ pub(crate) fn write_table(
     bytes.extend_from_slice(&payload_checksum.to_le_bytes());
     bytes.extend_from_slice(&payload);
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let tmp_path = path.with_extension("tmp");
-    {
-        let mut file = File::create(&tmp_path)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-    }
-    fs::rename(tmp_path, path)?;
+    let backend = table_storage_backend();
+    backend
+        .capabilities()
+        .require(StorageCapability::ObjectWrite)?;
+    let object = table_storage_object(path);
+    backend.write_object_blocking(
+        object,
+        Arc::from(bytes.into_boxed_slice()),
+        DurabilityMode::SyncAll,
+    )?;
 
     read_table(path)
 }
@@ -4848,6 +4845,40 @@ mod tests {
         assert_eq!(
             ids.iter().copied().collect::<Vec<_>>(),
             vec![TableId(2), TableId(4)]
+        );
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[test]
+    fn write_table_creates_final_object_without_leftover_tmp() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-write-table-object-{}-{}",
+            std::process::id(),
+            table_time_suffix()
+        ));
+        let table_id = TableId(9);
+        let path = table_path(&root, table_id);
+        let records = vec![(
+            InternalKey::new(b"key".to_vec(), Sequence::new(1), ValueKind::Put, 0),
+            Some(ValueRef::Inline(b"value".to_vec())),
+        )];
+
+        let table = write_table(
+            &path,
+            table_id,
+            TableLevel::ZERO,
+            &test_table_options(CodecId::None, false),
+            &records,
+            &[],
+        )
+        .expect("table writes");
+
+        assert_eq!(table.properties().id, table_id);
+        assert!(path.exists(), "final table object should exist");
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "successful table write should leave no temporary file"
         );
 
         std::fs::remove_dir_all(root).expect("test dir removes");
