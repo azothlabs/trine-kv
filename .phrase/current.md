@@ -6,73 +6,68 @@ Complete
 
 ## Goal
 
-Route recovery startup checks and safe temporary file repair through explicit
-native-file backend boundaries while preserving standalone helper behavior and
-fail-closed recovery semantics.
+Introduce an owned block-read seam so table/blob block decode reads through an
+owned, `Arc`-backed completion (`StorageReadBuffer`) instead of a borrowed
+`&mut [u8]`, decoupling read completion from decode without changing scheduling
+for today's synchronous callers.
 
 ## Scope
 
-- Add internal `with_backend` entry points for recovery process-lock acquire,
-  safe temporary file scan/repair/report, missing referenced blob checks,
-  invalid referenced blob checks, and unreferenced table/blob scans.
-- Add a backend-taking blob validation helper for recovery validation.
-- Route persistent `Db` open-time recovery checks through the DB-owned native
-  backend.
-- Preserve no-runtime behavior for standalone recovery helpers and tests.
-- Preserve existing fail-closed recovery behavior and borrowed blocking
-  table/blob decode paths.
+- Add `read_exact_at_owned` to the `BlockReadSource` trait with a borrowed
+  fallback default that copies into an owned buffer.
+- Route `BlockManager::read_checked_from_source` and
+  `read_checked_at_source_offset` through the owned read completion before
+  decode.
+- Add `StorageReadBuffer::from_vec` and `as_slice` accessors so decode can run
+  on the owned buffer.
+- Override `read_exact_at_owned` in `StorageReadSource` and
+  `NativeFileReadSource` to use the storage object's owned blocking read.
+- Add focused block tests covering the owned default fallback and owned-seam
+  decode for both block read entry points.
 - Preserve existing public async API, blocking API, publish barrier, commit
   tracker, WAL/table/blob/manifest formats, MVCC, compaction, recovery,
   cleanup, and storage behavior.
 
 ## Out Of Scope
 
-- Adding true async file I/O.
-- Adding a public executor dependency.
-- Adding public runtime tuning options.
-- Converting table/blob/block decode call sites to async advancement.
-- Changing public recovery report read helper behavior.
-- Removing standalone no-runtime table/blob helper wrappers.
-- Removing standalone no-runtime recovery helper wrappers.
-- Removing the serialized publish barrier.
-- Adding WAL shards or writer-local deltas.
-- Changing transaction conflict rules.
-- Changing persistent native-file blocking behavior.
+- Adding true async block decode or cursor advancement.
+- Coupling synchronous decode callers to the runtime blocking queue.
+- Converting table header/footer metadata reads to the owned seam.
+- Adding a public executor dependency or public runtime tuning options.
 - Changing public storage formats or recovery protocol.
+- Removing standalone no-runtime table/blob/recovery helper wrappers.
 
 ## Acceptance Gate
 
-- Roadmap records this as the recovery backend-boundary migration phase.
-- Recovery module exposes crate-internal `with_backend` helpers for process
-  lock acquisition, safe temporary file repair, referenced blob validation, and
-  unreferenced formal file scanning.
-- Persistent `Db` open-time recovery checks use the DB-owned native backend.
-- Blob module exposes a backend-taking full-file validation helper for
-  recovery.
-- Standalone recovery wrappers still construct no-runtime native backends.
-- Blocking storage adapters remain direct synchronous paths.
-- Existing borrowed blocking read paths remain unchanged for current decode
-  code.
-- Focused DB/storage tests, formatting, clippy, full tests,
-  `git diff --check`, and forbidden-term scan pass.
+- Roadmap records this as the owned block-read seam phase.
+- `BlockReadSource` exposes `read_exact_at_owned` returning a
+  `StorageReadBuffer`, with a borrowed fallback default.
+- Both block decode entry points read owned buffers before decode.
+- Native-file sources override the owned read to use the object's owned
+  blocking read; synchronous callers remain decoupled from the runtime queue.
+- Borrowed `read_exact_at` remains available for non-block reads.
+- Focused block tests, formatting, clippy, full tests, `git diff --check`, and
+  forbidden-term scan pass.
 - Evidence records remaining async blockers.
 
 ## Active Task Slice
 
 ```text
-task352 [x] goal:start recovery backend-boundary migration slice | scope:current roadmap | verify:manual
-task353 [x] goal:add recovery with_backend helpers while preserving standalone wrappers | scope:src/recovery.rs | verify:recovery tests
-task354 [x] goal:add backend-taking blob validation helper | scope:src/blob.rs | verify:recovery tests
-task355 [x] goal:route persistent open recovery checks through DB-owned backend | scope:src/db.rs | verify:persistent recovery tests
-task356 [x] goal:preserve recovery semantics and decode behavior | scope:src/recovery.rs src/db.rs | verify:full tests
-task357 [x] goal:record evidence and commit | scope:.phrase/evidence.md current roadmap | verify:git status
+task358 [x] goal:add StorageReadBuffer owned accessors | scope:src/storage.rs | verify:build
+task359 [x] goal:add owned BlockReadSource path and route both decode entry points | scope:src/block.rs | verify:block tests
+task360 [x] goal:override owned read in native sources | scope:src/storage.rs | verify:storage tests
+task361 [x] goal:add focused owned-seam block tests | scope:src/block.rs | verify:block tests
+task362 [x] goal:record evidence and commit | scope:.phrase/evidence.md current roadmap | verify:git status
 ```
 
 ## Known Blockers
 
 - True async file I/O is not implemented.
 - Runtime tuning options are still internal.
-- Table/blob decode paths still use blocking native-file calls.
+- Block decode now reads owned completions but still runs synchronously on the
+  calling thread; it does not yet await through the runtime owned-read boundary.
+- Table header/footer metadata reads still use the borrowed `read_exact_at`
+  path.
 - Range and prefix cursor advancement still expose async compatibility wrappers
   over synchronous iterator advancement.
 - True multi-writer execution still needs writer-local deltas and WAL
@@ -220,8 +215,31 @@ task357 [x] goal:record evidence and commit | scope:.phrase/evidence.md current 
   `cargo clippy --all-targets --all-features -- -D warnings`,
   `cargo test recovery --lib`, `cargo test --lib`, and
   `cargo test --all-targets --all-features`.
+- `BlockReadSource` now exposes `read_exact_at_owned`, returning an
+  `Arc`-backed `StorageReadBuffer`, with a borrowed fallback default for
+  generic sources.
+- `BlockManager::read_checked_from_source` and `read_checked_at_source_offset`
+  now read owned completions before decode; the offset-addressed path reads the
+  header and the full block as two owned reads.
+- `StorageReadSource` and `NativeFileReadSource` override the owned read to use
+  the storage object's owned blocking read, so the seam exists without coupling
+  synchronous decode callers to the runtime blocking queue (consistent with the
+  Phase 83 rule that synchronous callers stay off the queue).
+- Added focused block tests: owned default-fallback equivalence, and owned-seam
+  decode for both block read entry points.
+- Table header/footer metadata reads were intentionally left on the borrowed
+  path.
+- Verification passed: `cargo fmt --check`,
+  `cargo clippy --all-targets --all-features -- -D warnings`,
+  `cargo test block --lib`, `cargo test storage --lib`,
+  `cargo test table --lib`, and `cargo test --all-targets --all-features`.
+- `git diff --check` passed. Forbidden-term scan passed outside the repository
+  instruction file.
 
 ## Next Recommendation
 
-- Define the measured table/blob decode async-read phase, including cursor
-  advancement shape and recovery validation constraints.
+- The owned read seam is now the single choke point for block decode reads. The
+  next phase should measure (trace/benchmark) block-decode read latency under a
+  runtime to decide whether to drive decode through the async
+  `read_exact_at_owned` boundary, and define the cursor advancement shape that
+  would let an async caller await the owned completion before decode.

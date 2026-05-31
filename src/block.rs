@@ -1,6 +1,7 @@
 use crate::{
     codec::{self, CodecId},
     error::{Error, Result},
+    storage::StorageReadBuffer,
 };
 
 const BLOCK_HEADER_LEN: usize = 13;
@@ -16,6 +17,19 @@ pub(crate) struct BlockManager;
 
 pub(crate) trait BlockReadSource {
     fn read_exact_at(&self, offset: usize, bytes: &mut [u8]) -> Result<()>;
+
+    /// Reads `len` bytes at `offset` into an owned, `Arc`-backed completion that
+    /// is decoupled from the borrowed-buffer path. Block decode reads through
+    /// this seam so the read completion no longer borrows the decode call frame,
+    /// which is the precondition for driving decode through the runtime's
+    /// owned-read boundary in a later phase. The default fills a heap buffer via
+    /// the borrowed path; native-file sources override it to use the storage
+    /// object's owned blocking read.
+    fn read_exact_at_owned(&self, offset: usize, len: usize) -> Result<StorageReadBuffer> {
+        let mut bytes = vec![0_u8; len];
+        self.read_exact_at(offset, &mut bytes)?;
+        Ok(StorageReadBuffer::from_vec(offset, bytes))
+    }
 }
 
 impl BlockManager {
@@ -100,9 +114,8 @@ impl BlockManager {
         let source_offset = payload_base_offset
             .checked_add(start)
             .ok_or_else(|| invalid_table("block file offset overflow"))?;
-        let mut block_bytes = vec![0_u8; end - start];
-        source.read_exact_at(source_offset, &mut block_bytes)?;
-        Self::decode_checked(&block_bytes)
+        let block_bytes = source.read_exact_at_owned(source_offset, end - start)?;
+        Self::decode_checked(block_bytes.as_slice())
     }
 
     pub(crate) fn read_checked_at_source_offset(
@@ -117,25 +130,16 @@ impl BlockManager {
         let source_offset = payload_base_offset
             .checked_add(offset)
             .ok_or_else(|| invalid_table("block file offset overflow"))?;
-        let mut header = [0_u8; BLOCK_HEADER_LEN];
-        source.read_exact_at(source_offset, &mut header)?;
-        let len = checked_block_len(&header)?;
+        let header = source.read_exact_at_owned(source_offset, BLOCK_HEADER_LEN)?;
+        let len = checked_block_len(header.as_slice())?;
         let end = offset
             .checked_add(len)
             .ok_or_else(|| invalid_table("block offset overflow"))?;
         if end > payload_len {
             return Err(invalid_table("block outside table payload"));
         }
-        let mut block_bytes = Vec::with_capacity(len);
-        block_bytes.extend_from_slice(&header);
-        block_bytes.resize(len, 0);
-        source.read_exact_at(
-            source_offset
-                .checked_add(BLOCK_HEADER_LEN)
-                .ok_or_else(|| invalid_table("block file offset overflow"))?,
-            &mut block_bytes[BLOCK_HEADER_LEN..],
-        )?;
-        let (codec, decoded) = Self::decode_checked(&block_bytes)?;
+        let block_bytes = source.read_exact_at_owned(source_offset, len)?;
+        let (codec, decoded) = Self::decode_checked(block_bytes.as_slice())?;
         Ok((
             BlockHandle {
                 offset: usize_to_u64(offset, "block offset")?,
@@ -226,5 +230,73 @@ fn usize_to_u64(value: usize, field: &'static str) -> Result<u64> {
 fn invalid_table(message: &'static str) -> Error {
     Error::InvalidFormat {
         message: format!("invalid table: {message}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Slice-backed source that exercises the default (borrowed-fallback) owned
+    /// read seam: it only implements the borrowed read, so `read_exact_at_owned`
+    /// runs the trait default that copies into an owned buffer.
+    struct SliceSource<'a> {
+        bytes: &'a [u8],
+    }
+
+    impl BlockReadSource for SliceSource<'_> {
+        fn read_exact_at(&self, offset: usize, bytes: &mut [u8]) -> Result<()> {
+            let end = offset
+                .checked_add(bytes.len())
+                .ok_or_else(|| invalid_table("read offset overflow"))?;
+            let slice = self
+                .bytes
+                .get(offset..end)
+                .ok_or_else(|| invalid_table("read past end"))?;
+            bytes.copy_from_slice(slice);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn owned_default_fallback_matches_borrowed_read() {
+        let payload = b"trine block decode owned seam".to_vec();
+        let source = SliceSource { bytes: &payload };
+
+        let owned = source.read_exact_at_owned(4, 5).expect("owned read");
+        assert_eq!(owned.offset(), 4);
+        assert_eq!(owned.as_slice(), &payload[4..9]);
+    }
+
+    #[test]
+    fn read_checked_from_source_decodes_through_owned_seam() {
+        let mut payload = Vec::new();
+        let block_payload = b"checked block body";
+        let handle = BlockManager::append_checked(&mut payload, CodecId::None, block_payload)
+            .expect("append block");
+        let source = SliceSource { bytes: &payload };
+
+        let (codec, decoded) =
+            BlockManager::read_checked_from_source(payload.len(), 0, handle, &source)
+                .expect("read checked block");
+        assert_eq!(codec, CodecId::None);
+        assert_eq!(decoded, block_payload);
+    }
+
+    #[test]
+    fn read_checked_at_source_offset_decodes_through_owned_seam() {
+        let mut payload = Vec::new();
+        let block_payload = b"offset addressed block";
+        let handle = BlockManager::append_checked(&mut payload, CodecId::None, block_payload)
+            .expect("append block");
+        let source = SliceSource { bytes: &payload };
+
+        let offset = usize::try_from(handle.offset).expect("offset fits usize");
+        let (read_handle, codec, decoded) =
+            BlockManager::read_checked_at_source_offset(payload.len(), 0, offset, &source)
+                .expect("read checked block at offset");
+        assert_eq!(read_handle, handle);
+        assert_eq!(codec, CodecId::None);
+        assert_eq!(decoded, block_payload);
     }
 }

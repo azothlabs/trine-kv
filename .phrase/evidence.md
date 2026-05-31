@@ -6603,3 +6603,64 @@ Record only evidence that can change planning or durable decisions.
 
 - Define the measured table/blob decode async-read phase, including cursor
   advancement shape and recovery validation constraints.
+
+## Phase 87: Owned Block-Read Seam For Decode
+
+### Observation
+
+- `BlockReadSource` previously exposed only a synchronous borrowed read
+  (`read_exact_at(&self, offset, &mut [u8])`); both `StorageReadSource` and
+  `NativeFileReadSource` called `read_exact_at_blocking`, so all block decode
+  bypassed the owned-read infrastructure built in Phases 81–86.
+- `NativeFileObject::read_exact_at_owned_blocking` deliberately reads
+  synchronously and does not enter the runtime blocking queue, matching the
+  Phase 83 rule that synchronous callers stay decoupled from queue state.
+
+### Interpretation
+
+- The single missing seam was an owned read on `BlockReadSource`. Adding it and
+  routing the two `BlockManager` decode entry points through it gives block
+  decode an `Arc`-backed completion decoupled from the decode call frame,
+  without changing scheduling for today's synchronous callers.
+
+### Change
+
+- Added `BlockReadSource::read_exact_at_owned` returning a `StorageReadBuffer`,
+  with a borrowed fallback default for generic sources.
+- Routed `BlockManager::read_checked_from_source` and
+  `read_checked_at_source_offset` through owned completions before decode; the
+  offset-addressed path reads the header and the full block as two owned reads.
+- Added `StorageReadBuffer::from_vec` and `as_slice`.
+- Overrode the owned read in `StorageReadSource` and `NativeFileReadSource` to
+  use the object's owned blocking read.
+- Added focused block tests: owned default-fallback equivalence and owned-seam
+  decode for both block read entry points.
+- Left table header/footer metadata reads on the borrowed path.
+
+### Verification
+
+- `cargo build`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test block --lib`
+- `cargo test storage --lib`
+- `cargo test table --lib`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan passed outside the repository instruction file.
+
+### Remaining Blockers
+
+- Block decode reads owned completions but still runs synchronously on the
+  calling thread; it does not yet await through the runtime owned-read boundary.
+- Table header/footer metadata reads still use the borrowed read path.
+- True async file I/O is not implemented.
+- True multi-writer execution still needs writer-local deltas and WAL
+  partitioning.
+
+### Recommended Next Action
+
+- Measure (trace/benchmark) block-decode read latency under a runtime to decide
+  whether to drive decode through the async `read_exact_at_owned` boundary, and
+  define the cursor advancement shape that lets an async caller await the owned
+  completion before decode.

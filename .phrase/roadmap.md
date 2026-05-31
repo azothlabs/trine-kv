@@ -1893,3 +1893,31 @@ explicit native storage backends.
   tracker, WAL/table/blob/manifest formats, MVCC, compaction, and cleanup
   behavior remain unchanged.
 - Focused recovery tests, formatting, clippy, full tests, and diff checks pass.
+
+### Phase 87: Owned Block-Read Seam For Decode
+
+**Status**: Complete
+
+**Goal**: Make table/blob block decode read through an owned, `Arc`-backed
+completion (`StorageReadBuffer`) instead of a borrowed `&mut [u8]`, decoupling
+read completion from decode as the precondition for a later async decode phase,
+without changing scheduling for synchronous decode callers.
+
+**Entry Condition**: Phase 86 complete and the owned storage read completion
+(`read_exact_at_owned` / `StorageReadBuffer`) and bounded blocking adapter
+already exist from Phases 81–86.
+
+**Acceptance Gate**:
+
+- `BlockReadSource` exposes `read_exact_at_owned` returning a
+  `StorageReadBuffer`, with a borrowed fallback default for generic sources.
+- `BlockManager::read_checked_from_source` and `read_checked_at_source_offset`
+  read owned completions before decode.
+- `StorageReadSource` and `NativeFileReadSource` override the owned read to use
+  the storage object's owned blocking read; synchronous decode callers stay
+  decoupled from the runtime blocking queue.
+- Borrowed `read_exact_at` remains available for non-block (header/footer)
+  reads.
+- Storage formats, MVCC, recovery contract, public async/blocking API, publish
+  barrier, commit tracker, and compaction behavior remain unchanged.
+- Focused block tests, formatting, clippy, full tests, and diff checks pass.

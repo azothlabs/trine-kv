@@ -158,8 +158,18 @@ impl StorageReadBuffer {
         Self { offset, bytes }
     }
 
+    /// Wraps an owned byte vector as a read completion. Used by block decode
+    /// fallbacks that read into a heap buffer before handing it to the decoder.
+    pub(crate) fn from_vec(offset: usize, bytes: Vec<u8>) -> Self {
+        Self::new(offset, Arc::from(bytes))
+    }
+
     pub(crate) const fn offset(&self) -> usize {
         self.offset
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.bytes
     }
 
     pub(crate) fn into_bytes(self) -> Arc<[u8]> {
@@ -1220,6 +1230,10 @@ where
     fn read_exact_at(&self, offset: usize, bytes: &mut [u8]) -> Result<()> {
         self.object.read_exact_at_blocking(offset, bytes)
     }
+
+    fn read_exact_at_owned(&self, offset: usize, len: usize) -> Result<StorageReadBuffer> {
+        self.object.read_exact_at_owned_blocking(offset, len)
+    }
 }
 
 pub(crate) struct NativeFileReadSource<'src, H> {
@@ -1243,6 +1257,14 @@ where
         }
 
         read_exact_from_native_file(&self.object, offset, bytes)
+    }
+
+    fn read_exact_at_owned(&self, offset: usize, len: usize) -> Result<StorageReadBuffer> {
+        if let Some(cached) = self.cached {
+            return cached.read_exact_at_owned_blocking(offset, len);
+        }
+
+        read_exact_at_native_file_owned(&self.object, offset, len)
     }
 }
 
