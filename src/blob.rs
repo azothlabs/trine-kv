@@ -139,6 +139,7 @@ pub fn blob_path(db_path: &Path, file_id: u64) -> PathBuf {
     db_path.join(format!("blob-{file_id:020}.{BLOB_FILE_EXTENSION}",))
 }
 
+#[allow(dead_code)]
 pub(crate) fn list_blob_file_ids(db_path: &Path) -> Result<BTreeSet<u64>> {
     let backend = blob_storage_backend();
     list_blob_file_ids_with_backend(&backend, db_path)
@@ -332,8 +333,18 @@ pub(crate) fn read_value_for_internal_key_with_backend(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn validate_blob_file(db_path: &Path, file_id: u64) -> Result<BlobFileProperties> {
     let blob_file = read_blob_file(db_path, file_id)?;
+    Ok(blob_file.properties)
+}
+
+pub(crate) fn validate_blob_file_with_backend(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+    file_id: u64,
+) -> Result<BlobFileProperties> {
+    let blob_file = read_blob_file_with_backend(backend, db_path, file_id)?;
     Ok(blob_file.properties)
 }
 

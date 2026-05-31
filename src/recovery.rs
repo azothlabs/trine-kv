@@ -31,8 +31,16 @@ pub(crate) struct ProcessLock {
 }
 
 impl ProcessLock {
+    #[allow(dead_code)]
     pub(crate) fn acquire(db_path: &Path) -> Result<Self> {
         let backend = NativeFileBackend::new();
+        Self::acquire_with_backend(&backend, db_path)
+    }
+
+    pub(crate) fn acquire_with_backend(
+        backend: &NativeFileBackend,
+        db_path: &Path,
+    ) -> Result<Self> {
         backend
             .capabilities()
             .require(StorageCapability::WriterLease)?;
@@ -78,11 +86,21 @@ pub fn read_recovery_report(db_path: &Path) -> Result<RecoveryReport> {
     decode_report(&text)
 }
 
+#[allow(dead_code)]
 pub(crate) fn repair_safe_temporary_files(
     db_path: &Path,
     policy: FailOnCorruptionPolicy,
 ) -> Result<Option<RecoveryReport>> {
-    let temporary_files = safe_temporary_files(db_path)?;
+    let backend = NativeFileBackend::new();
+    repair_safe_temporary_files_with_backend(&backend, db_path, policy)
+}
+
+pub(crate) fn repair_safe_temporary_files_with_backend(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+    policy: FailOnCorruptionPolicy,
+) -> Result<Option<RecoveryReport>> {
+    let temporary_files = safe_temporary_files_with_backend(backend, db_path)?;
     if temporary_files.is_empty() {
         return Ok(None);
     }
@@ -99,26 +117,46 @@ pub(crate) fn repair_safe_temporary_files(
     }
 
     for temporary_file in &temporary_files {
-        delete_safe_temporary_file(&temporary_file.path)?;
+        delete_safe_temporary_file_with_backend(backend, &temporary_file.path)?;
     }
 
     let report = RecoveryReport {
         repaired_temporary_files: temporary_files.into_iter().map(|file| file.name).collect(),
     };
-    write_recovery_report(db_path, &report)?;
+    write_recovery_report_with_backend(backend, db_path, &report)?;
 
     Ok(Some(report))
 }
 
+#[allow(dead_code)]
 pub(crate) fn fail_on_unreferenced_storage_files(
+    db_path: &Path,
+    referenced_table_ids: &BTreeSet<TableId>,
+    referenced_blob_ids: &BTreeSet<u64>,
+) -> Result<()> {
+    let backend = NativeFileBackend::new();
+    fail_on_unreferenced_storage_files_with_backend(
+        &backend,
+        db_path,
+        referenced_table_ids,
+        referenced_blob_ids,
+    )
+}
+
+pub(crate) fn fail_on_unreferenced_storage_files_with_backend(
+    backend: &NativeFileBackend,
     db_path: &Path,
     referenced_table_ids: &BTreeSet<TableId>,
     referenced_blob_ids: &BTreeSet<u64>,
 ) -> Result<()> {
     // Formal table/blob files are stronger evidence than safe tmp files. Do
     // not delete them during startup; report them so the operator can decide.
-    let unreferenced_files =
-        unreferenced_storage_files(db_path, referenced_table_ids, referenced_blob_ids)?;
+    let unreferenced_files = unreferenced_storage_files_with_backend(
+        backend,
+        db_path,
+        referenced_table_ids,
+        referenced_blob_ids,
+    )?;
     if unreferenced_files.is_empty() {
         return Ok(());
     }
@@ -131,7 +169,17 @@ pub(crate) fn fail_on_unreferenced_storage_files(
     })
 }
 
+#[allow(dead_code)]
 pub(crate) fn fail_on_missing_referenced_blob_files(
+    db_path: &Path,
+    referenced_blob_ids: &BTreeSet<u64>,
+) -> Result<()> {
+    let backend = NativeFileBackend::new();
+    fail_on_missing_referenced_blob_files_with_backend(&backend, db_path, referenced_blob_ids)
+}
+
+pub(crate) fn fail_on_missing_referenced_blob_files_with_backend(
+    backend: &NativeFileBackend,
     db_path: &Path,
     referenced_blob_ids: &BTreeSet<u64>,
 ) -> Result<()> {
@@ -140,7 +188,7 @@ pub(crate) fn fail_on_missing_referenced_blob_files(
         .copied()
         .filter_map(|blob_id| {
             let path = blob::blob_path(db_path, blob_id);
-            (!storage_object_exists(StorageObjectKind::Blob, &path))
+            (!storage_object_exists_with_backend(backend, StorageObjectKind::Blob, &path))
                 .then(|| storage_file_name(&path))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -157,7 +205,17 @@ pub(crate) fn fail_on_missing_referenced_blob_files(
     })
 }
 
+#[allow(dead_code)]
 pub(crate) fn fail_on_invalid_referenced_blob_files(
+    db_path: &Path,
+    manifest: &ManifestState,
+) -> Result<()> {
+    let backend = NativeFileBackend::new();
+    fail_on_invalid_referenced_blob_files_with_backend(&backend, db_path, manifest)
+}
+
+pub(crate) fn fail_on_invalid_referenced_blob_files_with_backend(
+    backend: &NativeFileBackend,
     db_path: &Path,
     manifest: &ManifestState,
 ) -> Result<()> {
@@ -172,7 +230,10 @@ pub(crate) fn fail_on_invalid_referenced_blob_files(
         .collect::<BTreeSet<_>>();
     let mut blob_properties = BTreeMap::new();
     for blob_id in referenced_blob_ids {
-        blob_properties.insert(blob_id, blob::validate_blob_file(db_path, blob_id)?);
+        blob_properties.insert(
+            blob_id,
+            blob::validate_blob_file_with_backend(backend, db_path, blob_id)?,
+        );
     }
 
     for (bucket, tables) in manifest.tables() {
@@ -239,8 +300,10 @@ struct TemporaryFile {
     path: PathBuf,
 }
 
-fn safe_temporary_files(db_path: &Path) -> Result<Vec<TemporaryFile>> {
-    let backend = NativeFileBackend::new();
+fn safe_temporary_files_with_backend(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+) -> Result<Vec<TemporaryFile>> {
     backend
         .capabilities()
         .require(StorageCapability::DirectoryListing)?;
@@ -265,8 +328,7 @@ fn safe_temporary_files(db_path: &Path) -> Result<Vec<TemporaryFile>> {
     Ok(files)
 }
 
-fn delete_safe_temporary_file(path: &Path) -> Result<()> {
-    let backend = NativeFileBackend::new();
+fn delete_safe_temporary_file_with_backend(backend: &NativeFileBackend, path: &Path) -> Result<()> {
     backend
         .capabilities()
         .require(StorageCapability::ObjectDelete)?;
@@ -276,8 +338,11 @@ fn delete_safe_temporary_file(path: &Path) -> Result<()> {
     ))
 }
 
-fn storage_object_exists(kind: StorageObjectKind, path: &Path) -> bool {
-    let backend = NativeFileBackend::new();
+fn storage_object_exists_with_backend(
+    backend: &NativeFileBackend,
+    kind: StorageObjectKind,
+    path: &Path,
+) -> bool {
     if backend
         .capabilities()
         .require(StorageCapability::RandomRead)
@@ -308,20 +373,21 @@ fn has_tmp_extension(name: &str) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("tmp"))
 }
 
-fn unreferenced_storage_files(
+fn unreferenced_storage_files_with_backend(
+    backend: &NativeFileBackend,
     db_path: &Path,
     referenced_table_ids: &BTreeSet<TableId>,
     referenced_blob_ids: &BTreeSet<u64>,
 ) -> Result<Vec<String>> {
     let mut files = Vec::new();
 
-    for table_id in table::list_table_file_ids(db_path)? {
+    for table_id in table::list_table_file_ids_with_backend(backend, db_path)? {
         if !referenced_table_ids.contains(&table_id) {
             files.push(storage_file_name(&table::table_path(db_path, table_id))?);
         }
     }
 
-    for blob_id in blob::list_blob_file_ids(db_path)? {
+    for blob_id in blob::list_blob_file_ids_with_backend(backend, db_path)? {
         if !referenced_blob_ids.contains(&blob_id) {
             files.push(storage_file_name(&blob::blob_path(db_path, blob_id))?);
         }
@@ -340,10 +406,13 @@ fn storage_file_name(path: &Path) -> Result<String> {
         })
 }
 
-fn write_recovery_report(db_path: &Path, report: &RecoveryReport) -> Result<()> {
+fn write_recovery_report_with_backend(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+    report: &RecoveryReport,
+) -> Result<()> {
     let path = recovery_report_path(db_path);
     let bytes: Arc<[u8]> = Arc::from(encode_report(report).into_bytes());
-    let backend = NativeFileBackend::new();
     backend
         .capabilities()
         .require(StorageCapability::ObjectWrite)?;
@@ -352,7 +421,7 @@ fn write_recovery_report(db_path: &Path, report: &RecoveryReport) -> Result<()> 
         bytes,
         DurabilityMode::SyncAll,
     )?;
-    sync_recovery_report_parent_directory_after_rename(&path)?;
+    sync_recovery_report_parent_directory_after_rename_with_backend(backend, &path)?;
 
     Ok(())
 }
@@ -376,11 +445,13 @@ fn recovery_report_storage_object(path: &Path) -> StorageObjectId {
     StorageObjectId::native_file(StorageObjectKind::RecoveryReport, path)
 }
 
-fn sync_recovery_report_parent_directory_after_rename(path: &Path) -> Result<()> {
+fn sync_recovery_report_parent_directory_after_rename_with_backend(
+    backend: &NativeFileBackend,
+    path: &Path,
+) -> Result<()> {
     let Some(parent) = StorageDirectoryId::native_file_parent_of(path) else {
         return Ok(());
     };
-    let backend = NativeFileBackend::new();
     backend
         .capabilities()
         .require(StorageCapability::DirectorySync)?;
@@ -433,7 +504,11 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{RecoveryReport, decode_report, encode_report, read_recovery_report};
+    use super::{
+        RecoveryReport, decode_report, encode_report, read_recovery_report,
+        repair_safe_temporary_files_with_backend,
+    };
+    use crate::{options::FailOnCorruptionPolicy, storage::NativeFileBackend};
 
     #[test]
     fn recovery_report_round_trips_repaired_files() {
@@ -466,5 +541,41 @@ mod tests {
             error,
             crate::Error::Io(ref io_error) if io_error.kind() == io::ErrorKind::NotFound
         ));
+    }
+
+    #[test]
+    fn backend_repair_safe_temporary_files_writes_report() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-recovery-backend-repair-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("test dir creates");
+        let temporary_path = root.join("MANIFEST.tmp");
+        std::fs::write(&temporary_path, b"temporary manifest").expect("temporary file writes");
+
+        let backend = NativeFileBackend::new();
+        let report = repair_safe_temporary_files_with_backend(
+            &backend,
+            &root,
+            FailOnCorruptionPolicy::RepairSafeTemporaryFiles,
+        )
+        .expect("backend repair succeeds")
+        .expect("repair report exists");
+
+        assert_eq!(
+            report.repaired_temporary_files(),
+            &["MANIFEST.tmp".to_owned()]
+        );
+        assert!(!temporary_path.exists());
+        assert_eq!(
+            read_recovery_report(&root).expect("recovery report reads"),
+            report
+        );
+
+        std::fs::remove_dir_all(root).expect("cleanup test dir");
     }
 }

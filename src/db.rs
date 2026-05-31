@@ -766,17 +766,8 @@ impl Db {
             return Err(Error::invalid_options("database path does not exist"));
         }
 
-        let process_lock = if options.read_only {
-            None
-        } else {
-            Some(recovery::ProcessLock::acquire(path)?)
-        };
-
-        if options.read_only {
-            recovery::repair_safe_temporary_files(path, FailOnCorruptionPolicy::FailClosed)?;
-        } else {
-            recovery::repair_safe_temporary_files(path, options.fail_on_corruption)?;
-        }
+        let process_lock = acquire_persistent_process_lock(&native_storage, path, &options)?;
+        repair_safe_temporary_files_for_open(&native_storage, path, &options)?;
 
         let manifest_path = manifest::manifest_path(path);
         let mut manifest = ManifestStore::open_or_create_with_backend(
@@ -786,17 +777,9 @@ impl Db {
         )?;
         ensure_default_bucket_in_manifest(&mut manifest, &options)?;
         let replay_floor = manifest.state().wal_replay_floor();
-        let referenced_blob_ids = referenced_blob_file_ids_from_manifest(manifest.state());
-        let allowed_blob_ids = allowed_blob_file_ids_from_manifest(manifest.state());
         let mut buckets = buckets_from_manifest(&native_storage, path, manifest.state())?;
         ensure_default_bucket_loaded(&mut buckets, &options)?;
-        recovery::fail_on_missing_referenced_blob_files(path, &referenced_blob_ids)?;
-        recovery::fail_on_invalid_referenced_blob_files(path, manifest.state())?;
-        recovery::fail_on_unreferenced_storage_files(
-            path,
-            &referenced_table_file_ids(manifest.state()),
-            &allowed_blob_ids,
-        )?;
+        run_persistent_recovery_checks(&native_storage, path, manifest.state())?;
 
         let wal_path = wal::wal_path(path);
         let batches =
@@ -3044,6 +3027,52 @@ fn background_worker_loop(
             Err(error) => maintenance.record_error(&error),
         }
     }
+}
+
+fn acquire_persistent_process_lock(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+    options: &DbOptions,
+) -> Result<Option<recovery::ProcessLock>> {
+    if options.read_only {
+        return Ok(None);
+    }
+    recovery::ProcessLock::acquire_with_backend(backend, db_path).map(Some)
+}
+
+fn repair_safe_temporary_files_for_open(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+    options: &DbOptions,
+) -> Result<()> {
+    let policy = if options.read_only {
+        FailOnCorruptionPolicy::FailClosed
+    } else {
+        options.fail_on_corruption
+    };
+    recovery::repair_safe_temporary_files_with_backend(backend, db_path, policy)?;
+    Ok(())
+}
+
+fn run_persistent_recovery_checks(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+    manifest: &ManifestState,
+) -> Result<()> {
+    let referenced_blob_ids = referenced_blob_file_ids_from_manifest(manifest);
+    let allowed_blob_ids = allowed_blob_file_ids_from_manifest(manifest);
+    recovery::fail_on_missing_referenced_blob_files_with_backend(
+        backend,
+        db_path,
+        &referenced_blob_ids,
+    )?;
+    recovery::fail_on_invalid_referenced_blob_files_with_backend(backend, db_path, manifest)?;
+    recovery::fail_on_unreferenced_storage_files_with_backend(
+        backend,
+        db_path,
+        &referenced_table_file_ids(manifest),
+        &allowed_blob_ids,
+    )
 }
 
 fn buckets_from_manifest(

@@ -1868,3 +1868,28 @@ runtime-enabled native-file backend.
   storage behavior remain unchanged.
 - Focused DB/table/blob tests, formatting, clippy, full tests, and diff checks
   pass.
+
+### Phase 86: Recovery Native Storage Backend Boundary
+
+**Status**: Complete
+
+**Goal**: Route persistent database recovery startup checks through the
+DB-owned native-file backend while preserving standalone recovery helper
+behavior and fail-closed semantics.
+
+**Entry Condition**: Phase 85 complete and persistent table/blob helpers accept
+explicit native storage backends.
+
+**Acceptance Gate**:
+
+- Recovery module exposes crate-internal backend-taking helpers for process
+  lock acquisition, safe temporary file repair, referenced blob validation, and
+  unreferenced formal file scanning.
+- Blob module exposes a backend-taking full-file validation helper for recovery.
+- Persistent `Db` open-time recovery checks use the DB-owned native backend.
+- Standalone recovery wrappers still construct no-runtime native backends.
+- Recovery report format, fail-closed behavior, storage formats, borrowed block
+  decode semantics, public async API, blocking API, publish barrier, commit
+  tracker, WAL/table/blob/manifest formats, MVCC, compaction, and cleanup
+  behavior remain unchanged.
+- Focused recovery tests, formatting, clippy, full tests, and diff checks pass.

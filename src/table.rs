@@ -2433,6 +2433,7 @@ pub fn table_path(db_path: &Path, table_id: TableId) -> PathBuf {
     ))
 }
 
+#[allow(dead_code)]
 pub(crate) fn list_table_file_ids(db_path: &Path) -> Result<BTreeSet<TableId>> {
     let backend = table_storage_backend();
     list_table_file_ids_with_backend(&backend, db_path)

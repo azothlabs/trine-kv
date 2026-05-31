@@ -6548,3 +6548,58 @@ Record only evidence that can change planning or durable decisions.
 
 - Migrate standalone recovery scanning onto the explicit storage backend
   boundary or define the measured table/blob decode async-read phase.
+
+## 2026-05-31: Recovery Native Storage Backend Boundary
+
+### Observation
+
+- Phase 85 moved DB-owned table/blob helper calls onto the DB-owned native
+  backend, but persistent open-time recovery checks still constructed
+  no-runtime native backends for process lock acquisition, safe temporary file
+  repair, referenced blob validation, and unreferenced formal file scanning.
+- Recovery full-blob validation depended on the standalone blob validation
+  wrapper.
+- Recovery report reads are a public standalone helper and do not have a
+  DB-owned backend available.
+
+### Interpretation
+
+- Persistent recovery startup checks should use the same native backend as the
+  rest of persistent `Db` open, so runtime-enabled storage behavior is not
+  bypassed during recovery.
+- Standalone recovery wrappers should stay available as no-runtime wrappers
+  over backend-taking helpers.
+- Recovery report format, fail-closed behavior, and full blob validation should
+  remain unchanged.
+
+### Verification
+
+- Added backend-taking recovery helpers for process lock acquisition, safe
+  temporary file repair/report, missing referenced blob checks, invalid
+  referenced blob checks, and unreferenced table/blob file scans.
+- Added backend-taking blob full-file validation for recovery.
+- Routed persistent `Db` open-time process lock, temporary file repair,
+  referenced blob checks, and unreferenced formal file scans through the
+  DB-owned native backend.
+- Preserved standalone no-runtime recovery wrappers.
+- Added a focused recovery unit test proving backend-taking safe temporary file
+  repair deletes the temporary file and writes a readable recovery report.
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test recovery --lib`
+- `cargo test --lib`
+- `cargo test --all-targets --all-features`
+
+### Remaining Blockers
+
+- Table/blob block reads and cursor advancement still use synchronous
+  advancement paths.
+- True async file I/O is not implemented.
+- Runtime worker and queue limits remain internal defaults.
+- True multi-writer execution still needs writer-local deltas and WAL
+  partitioning before the publish barrier can be narrowed further.
+
+### Recommended Next Action
+
+- Define the measured table/blob decode async-read phase, including cursor
+  advancement shape and recovery validation constraints.

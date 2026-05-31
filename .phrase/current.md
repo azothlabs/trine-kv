@@ -6,21 +6,21 @@ Complete
 
 ## Goal
 
-Route DB-owned table/blob helper calls through the persistent DB native-file
-backend while preserving standalone helper behavior and current decode
-semantics.
+Route recovery startup checks and safe temporary file repair through explicit
+native-file backend boundaries while preserving standalone helper behavior and
+fail-closed recovery semantics.
 
 ## Scope
 
-- Add internal `with_backend` entry points for table file listing, table write,
-  table metadata read, blob file listing, blob write, blob large-value rewrite,
-  blob inline rewrite, and blob metadata/value reads.
-- Route persistent `Db` flush, compaction, blob GC, recovery-open table load,
-  stats, and blob candidate reads through the DB-owned native backend.
-- Preserve no-runtime behavior for standalone table/blob module helpers and
-  tests.
-- Preserve existing borrowed blocking read paths for current table/blob decode
-  code and standalone table/blob helpers.
+- Add internal `with_backend` entry points for recovery process-lock acquire,
+  safe temporary file scan/repair/report, missing referenced blob checks,
+  invalid referenced blob checks, and unreferenced table/blob scans.
+- Add a backend-taking blob validation helper for recovery validation.
+- Route persistent `Db` open-time recovery checks through the DB-owned native
+  backend.
+- Preserve no-runtime behavior for standalone recovery helpers and tests.
+- Preserve existing fail-closed recovery behavior and borrowed blocking
+  table/blob decode paths.
 - Preserve existing public async API, blocking API, publish barrier, commit
   tracker, WAL/table/blob/manifest formats, MVCC, compaction, recovery,
   cleanup, and storage behavior.
@@ -31,8 +31,9 @@ semantics.
 - Adding a public executor dependency.
 - Adding public runtime tuning options.
 - Converting table/blob/block decode call sites to async advancement.
-- Migrating standalone recovery scanning to a runtime-enabled backend.
+- Changing public recovery report read helper behavior.
 - Removing standalone no-runtime table/blob helper wrappers.
+- Removing standalone no-runtime recovery helper wrappers.
 - Removing the serialized publish barrier.
 - Adding WAL shards or writer-local deltas.
 - Changing transaction conflict rules.
@@ -41,15 +42,14 @@ semantics.
 
 ## Acceptance Gate
 
-- Roadmap records this as the DB-owned table/blob native storage helper
-  migration phase.
-- Table module exposes crate-internal `with_backend` helpers for list, write,
-  and read paths used by `Db`.
-- Blob module exposes crate-internal `with_backend` helpers for list, write,
-  large-value rewrite, inline rewrite, metadata, and value-read paths used by
-  `Db`.
-- Persistent `Db` table/blob file operations use the DB-owned native backend.
-- Standalone table/blob wrappers still construct no-runtime native backends.
+- Roadmap records this as the recovery backend-boundary migration phase.
+- Recovery module exposes crate-internal `with_backend` helpers for process
+  lock acquisition, safe temporary file repair, referenced blob validation, and
+  unreferenced formal file scanning.
+- Persistent `Db` open-time recovery checks use the DB-owned native backend.
+- Blob module exposes a backend-taking full-file validation helper for
+  recovery.
+- Standalone recovery wrappers still construct no-runtime native backends.
 - Blocking storage adapters remain direct synchronous paths.
 - Existing borrowed blocking read paths remain unchanged for current decode
   code.
@@ -60,12 +60,12 @@ semantics.
 ## Active Task Slice
 
 ```text
-task346 [x] goal:start DB-owned table/blob helper migration slice | scope:current roadmap | verify:manual
-task347 [x] goal:add table with_backend helpers while preserving standalone wrappers | scope:src/table.rs | verify:table tests
-task348 [x] goal:add blob with_backend helpers while preserving standalone wrappers | scope:src/blob.rs | verify:blob tests
-task349 [x] goal:route DB table/blob helper calls through DB-owned backend | scope:src/db.rs | verify:persistent tests
-task350 [x] goal:preserve recovery scanning and decode behavior | scope:src/recovery.rs src/table.rs src/blob.rs | verify:full tests
-task351 [x] goal:record evidence and commit | scope:.phrase/evidence.md current roadmap | verify:git status
+task352 [x] goal:start recovery backend-boundary migration slice | scope:current roadmap | verify:manual
+task353 [x] goal:add recovery with_backend helpers while preserving standalone wrappers | scope:src/recovery.rs | verify:recovery tests
+task354 [x] goal:add backend-taking blob validation helper | scope:src/blob.rs | verify:recovery tests
+task355 [x] goal:route persistent open recovery checks through DB-owned backend | scope:src/db.rs | verify:persistent recovery tests
+task356 [x] goal:preserve recovery semantics and decode behavior | scope:src/recovery.rs src/db.rs | verify:full tests
+task357 [x] goal:record evidence and commit | scope:.phrase/evidence.md current roadmap | verify:git status
 ```
 
 ## Known Blockers
@@ -77,9 +77,9 @@ task351 [x] goal:record evidence and commit | scope:.phrase/evidence.md current 
   over synchronous iterator advancement.
 - True multi-writer execution still needs writer-local deltas and WAL
   partitioning.
-- Standalone recovery scanning still constructs no-runtime native-file backends.
 - Database read decode paths still use blocking table/blob readers.
 - True async table/blob decode is not implemented.
+- Public recovery report reads remain standalone no-runtime helpers by design.
 
 ## Evidence
 
@@ -203,8 +203,25 @@ task351 [x] goal:record evidence and commit | scope:.phrase/evidence.md current 
 - Verification passed: `cargo fmt --check`,
   `cargo clippy --all-targets --all-features -- -D warnings`,
   `cargo test --lib`, and `cargo test --all-targets --all-features`.
+- Recovery now exposes backend-taking process-lock acquire, safe temporary
+  repair/report, missing referenced blob checks, invalid referenced blob checks,
+  and unreferenced table/blob scan helpers.
+- Blob validation now has a backend-taking full-file validation helper used by
+  recovery.
+- Persistent `Db` open-time recovery paths now use the DB-owned native-file
+  backend for process lock acquisition, safe temporary repair, referenced blob
+  validation, and unreferenced formal file scanning.
+- Standalone recovery wrappers preserve no-runtime behavior by constructing
+  their own native backend.
+- Added a focused recovery unit test for backend-taking safe temporary file
+  repair and recovery report write/read.
+- Existing table/blob block decode still uses blocking native-file reads.
+- Verification passed: `cargo fmt --check`,
+  `cargo clippy --all-targets --all-features -- -D warnings`,
+  `cargo test recovery --lib`, `cargo test --lib`, and
+  `cargo test --all-targets --all-features`.
 
 ## Next Recommendation
 
-- Migrate standalone recovery scanning onto the explicit storage backend
-  boundary or define the measured table/blob decode async-read phase.
+- Define the measured table/blob decode async-read phase, including cursor
+  advancement shape and recovery validation constraints.
