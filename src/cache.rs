@@ -164,6 +164,30 @@ impl BlockCache {
         }
     }
 
+    pub(crate) async fn get_or_insert_index_partition_with_async<F, Fut>(
+        &self,
+        key: BlockCacheKey,
+        load: F,
+    ) -> Result<Arc<Vec<TableDataBlock>>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Vec<TableDataBlock>>>,
+    {
+        let value = self
+            .get_or_insert_value_with_async(key, || async {
+                let partition = Arc::new(load().await?);
+                Ok((
+                    CacheValue::IndexPartition(Arc::clone(&partition)),
+                    estimate_index_partition_bytes(&partition),
+                ))
+            })
+            .await?;
+        match value {
+            CacheValue::IndexPartition(partition) => Ok(partition),
+            CacheValue::DataBlock(_) => Err(cache_value_kind_mismatch(key)),
+        }
+    }
+
     fn get_or_insert_value_with(
         &self,
         key: BlockCacheKey,

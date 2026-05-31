@@ -1482,6 +1482,36 @@ impl Table {
         read(block)
     }
 
+    async fn with_data_block_metadata_async<R>(
+        &self,
+        block_index: usize,
+        block_cache: Option<&BlockCache>,
+        read: impl FnOnce(&TableDataBlock) -> Result<R>,
+    ) -> Result<R> {
+        if let Some(blocks) = &self.data_blocks {
+            let block = blocks
+                .get(block_index)
+                .ok_or_else(|| invalid_table("data block index outside table"))?;
+            return read(block);
+        }
+
+        let partition_index = self.index_partition_index_for_block(block_index)?;
+        let partition = self
+            .load_index_partition_async(partition_index, block_cache)
+            .await?;
+        let partition_entry = self
+            .index_partitions
+            .get(partition_index)
+            .ok_or_else(|| invalid_table("index partition outside table"))?;
+        let local_index = block_index
+            .checked_sub(partition_entry.first_data_block_index)
+            .ok_or_else(|| invalid_table("data block index before partition"))?;
+        let block = partition
+            .get(local_index)
+            .ok_or_else(|| invalid_table("data block index outside partition"))?;
+        read(block)
+    }
+
     fn load_index_partition(
         &self,
         partition_index: usize,
@@ -1539,6 +1569,74 @@ impl Table {
         }
 
         Ok(partition)
+    }
+
+    async fn load_index_partition_async(
+        &self,
+        partition_index: usize,
+        block_cache: Option<&BlockCache>,
+    ) -> Result<Arc<Vec<TableDataBlock>>> {
+        if let Ok(guard) = self.index_partition_cache.read() {
+            if let Some(partition) = guard.get(&partition_index) {
+                return Ok(Arc::clone(partition));
+            }
+        }
+
+        let partition = if should_pin_read_metadata(self.properties.level) {
+            Arc::new(self.read_index_partition_async(partition_index).await?)
+        } else if let Some(block_cache) = block_cache {
+            let key = BlockCacheKey::with_kind(
+                CacheKind::IndexBlock,
+                self.properties.id,
+                partition_index,
+            );
+            block_cache
+                .get_or_insert_index_partition_with_async(key, || async {
+                    self.read_index_partition_async(partition_index).await
+                })
+                .await?
+        } else {
+            Arc::new(self.read_index_partition_async(partition_index).await?)
+        };
+
+        if should_pin_read_metadata(self.properties.level) {
+            let mut guard = self
+                .index_partition_cache
+                .write()
+                .map_err(|_| Error::Corruption {
+                    message: "table index partition cache lock poisoned".to_owned(),
+                })?;
+            let cached = guard
+                .entry(partition_index)
+                .or_insert_with(|| Arc::clone(&partition));
+            return Ok(Arc::clone(cached));
+        }
+
+        Ok(partition)
+    }
+
+    async fn read_index_partition_async(
+        &self,
+        partition_index: usize,
+    ) -> Result<Vec<TableDataBlock>> {
+        let partition_entry = self
+            .index_partitions
+            .get(partition_index)
+            .ok_or_else(|| invalid_table("index partition outside table"))?;
+        let Some(path) = &self.path else {
+            return Err(Error::Corruption {
+                message: "table index partition has no file path".to_owned(),
+            });
+        };
+        read_index_partition_from_file_async(
+            path,
+            self.file.as_deref(),
+            self.payload_len,
+            self.footer.data_blocks,
+            self.properties.codec,
+            partition_entry,
+        )
+        .await
     }
 
     fn index_partition_index_for_block(&self, block_index: usize) -> Result<usize> {
@@ -1636,15 +1734,17 @@ impl Table {
             return DecodedDataBlock::from_records(&records).map(Arc::new);
         }
 
-        let entry = self.with_data_block_metadata(block_index, block_cache, |block| {
-            Ok(DataBlockIndexEntry {
-                smallest_internal_key: block.smallest_internal_key.clone(),
-                largest_internal_key: block.largest_internal_key.clone(),
-                block: block.block,
-                point_key_filter: block.point_key_filter.clone(),
-                prefix_filter: block.prefix_filter.clone(),
+        let entry = self
+            .with_data_block_metadata_async(block_index, block_cache, |block| {
+                Ok(DataBlockIndexEntry {
+                    smallest_internal_key: block.smallest_internal_key.clone(),
+                    largest_internal_key: block.largest_internal_key.clone(),
+                    block: block.block,
+                    point_key_filter: block.point_key_filter.clone(),
+                    prefix_filter: block.prefix_filter.clone(),
+                })
             })
-        })?;
+            .await?;
         let Some(path) = &self.path else {
             return Err(Error::Corruption {
                 message: "table data block has no file path".to_owned(),
@@ -2034,7 +2134,7 @@ impl TablePointCursor {
             let Some(block_index) = self.block_index else {
                 return Ok(None);
             };
-            match self.forward_block_state(block_index)? {
+            match self.forward_block_state_async(block_index).await? {
                 CursorBlockState::Scan => {}
                 CursorBlockState::Skip => {
                     self.move_to_next_block();
@@ -2121,7 +2221,7 @@ impl TablePointCursor {
             let Some(block_index) = self.block_index else {
                 return Ok(None);
             };
-            match self.reverse_block_state(block_index)? {
+            match self.reverse_block_state_async(block_index).await? {
                 CursorBlockState::Scan => {}
                 CursorBlockState::Skip => {
                     self.move_to_previous_block();
@@ -2206,6 +2306,50 @@ impl TablePointCursor {
             )
     }
 
+    async fn forward_block_state_async(&self, block_index: usize) -> Result<CursorBlockState> {
+        self.table
+            .with_data_block_metadata_async(block_index, self.block_cache.as_deref(), |block| {
+                match &self.selector {
+                    ScanSelector::Range(range) => {
+                        if key_is_after_end(block.smallest_internal_key.user_key(), &range.end) {
+                            Ok(CursorBlockState::Done)
+                        } else if block.overlaps_range(range) {
+                            Ok(CursorBlockState::Scan)
+                        } else {
+                            Ok(CursorBlockState::Skip)
+                        }
+                    }
+                    ScanSelector::Prefix(prefix) => {
+                        if !block.prefix_bounds_may_overlap(prefix) {
+                            if block.largest_internal_key.user_key() < prefix.as_slice() {
+                                Ok(CursorBlockState::Skip)
+                            } else {
+                                Ok(CursorBlockState::Done)
+                            }
+                        } else if self
+                            .current_block
+                            .as_ref()
+                            .is_some_and(|(current_index, _)| *current_index == block_index)
+                        {
+                            Ok(CursorBlockState::Scan)
+                        } else {
+                            let (allowed, _) = self.table.block_prefix_filter_allows(
+                                block,
+                                prefix,
+                                &self.prefix_extractor,
+                            );
+                            if allowed {
+                                Ok(CursorBlockState::Scan)
+                            } else {
+                                Ok(CursorBlockState::Skip)
+                            }
+                        }
+                    }
+                }
+            })
+            .await
+    }
+
     fn reverse_block_state(&self, block_index: usize) -> Result<CursorBlockState> {
         self.table
             .with_data_block_metadata(
@@ -2248,6 +2392,49 @@ impl TablePointCursor {
                     }
                 },
             )
+    }
+
+    async fn reverse_block_state_async(&self, block_index: usize) -> Result<CursorBlockState> {
+        self.table
+            .with_data_block_metadata_async(block_index, self.block_cache.as_deref(), |block| {
+                match &self.selector {
+                    ScanSelector::Range(range) => {
+                        if key_is_before_start(block.largest_internal_key.user_key(), &range.start)
+                        {
+                            Ok(CursorBlockState::Done)
+                        } else if block.overlaps_range(range) {
+                            Ok(CursorBlockState::Scan)
+                        } else {
+                            Ok(CursorBlockState::Skip)
+                        }
+                    }
+                    ScanSelector::Prefix(prefix) => {
+                        if block.largest_internal_key.user_key() < prefix.as_slice() {
+                            Ok(CursorBlockState::Done)
+                        } else if !block.prefix_bounds_may_overlap(prefix) {
+                            Ok(CursorBlockState::Skip)
+                        } else if self
+                            .current_block
+                            .as_ref()
+                            .is_some_and(|(current_index, _)| *current_index == block_index)
+                        {
+                            Ok(CursorBlockState::Scan)
+                        } else {
+                            let (allowed, _) = self.table.block_prefix_filter_allows(
+                                block,
+                                prefix,
+                                &self.prefix_extractor,
+                            );
+                            if allowed {
+                                Ok(CursorBlockState::Scan)
+                            } else {
+                                Ok(CursorBlockState::Skip)
+                            }
+                        }
+                    }
+                }
+            })
+            .await
     }
 
     fn move_to_next_block(&mut self) {
@@ -2321,15 +2508,19 @@ impl TablePointCursor {
             .load_data_block_async(block_index, self.block_cache.as_deref())
             .await?;
         if let ScanSelector::Prefix(prefix) = &self.selector {
-            if self.table.with_data_block_metadata(
-                block_index,
-                self.block_cache.as_deref(),
-                |table_block| {
-                    Ok(table_block
-                        .prefix_filter_result(prefix, &self.prefix_extractor)
-                        .is_some())
-                },
-            )? && !data_block_has_prefix(&block, prefix, self.policy)?
+            if self
+                .table
+                .with_data_block_metadata_async(
+                    block_index,
+                    self.block_cache.as_deref(),
+                    |table_block| {
+                        Ok(table_block
+                            .prefix_filter_result(prefix, &self.prefix_extractor)
+                            .is_some())
+                    },
+                )
+                .await?
+                && !data_block_has_prefix(&block, prefix, self.policy)?
             {
                 self.table.filter_stats.record_block_prefix_false_positive();
             }
@@ -3008,6 +3199,53 @@ fn read_index_partition_from_source(
     partition: &IndexPartitionEntry,
 ) -> Result<Vec<TableDataBlock>> {
     let (codec, payload) = read_checked_block_from_source(source, payload_len, partition.block)?;
+    validate_block_codec(codec, expected_codec, TableSection::Indexes)?;
+    let entries = decode_index_block(&payload)?;
+    validate_index_partition(partition, &entries, data_blocks_section)?;
+    entries
+        .into_iter()
+        .map(TableDataBlock::from_index_entry)
+        .collect()
+}
+
+async fn read_index_partition_from_file_async(
+    path: &Path,
+    file: Option<&NativeFileObject>,
+    payload_len: usize,
+    data_blocks_section: SectionHandle,
+    expected_codec: CodecId,
+    partition: &IndexPartitionEntry,
+) -> Result<Vec<TableDataBlock>> {
+    if let Some(file) = file {
+        return read_index_partition_from_storage_object_async(
+            file,
+            payload_len,
+            data_blocks_section,
+            expected_codec,
+            partition,
+        )
+        .await;
+    }
+
+    let source = table_read_source(path, None);
+    read_index_partition_from_source(
+        &source,
+        payload_len,
+        data_blocks_section,
+        expected_codec,
+        partition,
+    )
+}
+
+async fn read_index_partition_from_storage_object_async(
+    object: &impl StorageReadObject,
+    payload_len: usize,
+    data_blocks_section: SectionHandle,
+    expected_codec: CodecId,
+    partition: &IndexPartitionEntry,
+) -> Result<Vec<TableDataBlock>> {
+    let (codec, payload) =
+        read_checked_block_from_storage_object_async(object, payload_len, partition.block).await?;
     validate_block_codec(codec, expected_codec, TableSection::Indexes)?;
     let entries = decode_index_block(&payload)?;
     validate_index_partition(partition, &entries, data_blocks_section)?;

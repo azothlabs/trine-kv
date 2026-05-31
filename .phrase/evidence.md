@@ -6861,3 +6861,61 @@ Record only evidence that can change planning or durable decisions.
 - Decide whether the next phase should finish table metadata async-read
   coverage or switch to the multi-writer line. If continuing the read path, move
   table header/footer and index metadata reads to owned/awaited completions.
+
+## Phase 91: Async Table Metadata Reads
+
+### Observation
+
+- Phase 90 made async table cursor data-block body loads await owned storage
+  read completion, but async block-state decisions and index partition misses
+  still used synchronous metadata reads.
+- The block cache had an async miss-loader path for data blocks, but not for
+  index partitions.
+- `TablePointCursor` needs data-block metadata before deciding whether to scan,
+  skip, or stop at a block.
+
+### Interpretation
+
+- Async cursor advancement should use async metadata lookup for block-state
+  decisions, data-block entry lookup, and prefix false-positive validation.
+- The async cache loader must preserve the same no-lock-across-load rule as the
+  synchronous cache path.
+- Synchronous iterators and standalone helper paths should stay on the existing
+  synchronous metadata path.
+
+### Change
+
+- Added `BlockCache::get_or_insert_index_partition_with_async`.
+- Added async data-block metadata lookup, async index partition loading, and
+  async index partition decoding from `StorageReadObject::read_exact_at_owned`.
+- Routed async table cursor forward/reverse block-state checks, async
+  data-block load metadata, and async prefix false-positive validation through
+  the async metadata path.
+- Kept synchronous metadata reads and synchronous iterators unchanged.
+
+### Verification
+
+- `cargo test --test async_api`
+- `cargo test cache --lib`
+- `cargo test table --lib`
+- `cargo test storage --lib`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --check`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan passed outside the repository instruction file.
+
+### Remaining Blockers
+
+- Native-file async reads still use the bounded blocking adapter rather than
+  platform-native async file I/O.
+- Table open header/footer reads still use synchronous borrowed reads.
+- Runtime tuning options are still internal.
+- True multi-writer execution still needs writer-local deltas and WAL
+  partitioning.
+
+### Recommended Next Action
+
+- Move to writer-local deltas before WAL partitioning. The async read cursor
+  path now has awaited owned-read completions for both data-block metadata and
+  data-block body reads; table open metadata can remain a smaller follow-up.

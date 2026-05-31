@@ -1991,3 +1991,25 @@ dedicated table block-load hook.
   barrier, commit tracker, and compaction behavior remain unchanged.
 - Focused async/table/cache tests, formatting, clippy, full tests, and diff
   checks pass.
+
+### Phase 91: Async Table Metadata Reads
+
+**Status**: Complete
+
+**Goal**: Route async table cursor metadata reads for block decisions and index
+partition misses through awaited owned storage read completions.
+
+**Entry Condition**: Phase 90 complete and async data-block body loads already
+await owned read completion.
+
+**Acceptance Gate**:
+
+- Data-block metadata lookup has an async path for table cursors.
+- Index partition cache misses can be loaded through an async cache loader.
+- Async index partition reads use `StorageReadObject::read_exact_at_owned`
+  when a cached native table file is available.
+- Synchronous metadata reads and synchronous iterators remain unchanged.
+- Storage formats, MVCC, recovery contract, public async/blocking API, publish
+  barrier, commit tracker, and compaction behavior remain unchanged.
+- Focused async/table/cache tests, formatting, clippy, full tests, and diff
+  checks pass.
