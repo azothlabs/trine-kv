@@ -1277,3 +1277,27 @@ through backend read/write/delete operations.
   compaction, and storage formats remain unchanged.
 - Focused blob/recovery/persistent tests, formatting, clippy, and diff checks
   pass.
+
+### Phase 61: Native-File WAL Append Backend
+
+**Status**: Complete
+
+**Goal**: Route WAL append and WAL persist through the storage backend append
+operation.
+
+**Entry Condition**: Phase 60 complete and table/blob object lifecycle
+operations already route through backend operations.
+
+**Acceptance Gate**:
+
+- Native-file backend reports append capability.
+- Native-file backend exposes a WAL append object that can append bytes and
+  persist by requested durability mode.
+- Non-WAL objects are rejected by the append path.
+- `WalWriter` uses the backend append object while preserving WAL frame bytes,
+  replay, torn-tail handling, checksum failure behavior, and commit visibility
+  ordering.
+- WAL rewrite-after-flush, manifest publish, table/blob formats, MVCC,
+  compaction, recovery policy, and public API behavior remain unchanged.
+- Focused storage/WAL/persistent tests, formatting, clippy, and diff checks
+  pass.

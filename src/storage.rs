@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     future::Future,
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -21,6 +21,7 @@ pub(crate) enum StorageObjectKind {
     Blob,
     Manifest,
     Table,
+    Wal,
 }
 
 impl StorageObjectKind {
@@ -29,6 +30,7 @@ impl StorageObjectKind {
             Self::Blob => "blob",
             Self::Manifest => "manifest",
             Self::Table => "table",
+            Self::Wal => "WAL",
         }
     }
 }
@@ -184,6 +186,7 @@ impl StorageCapabilities {
         Self::native_file_read()
             .with(StorageCapability::ObjectWrite)
             .with(StorageCapability::ObjectDelete)
+            .with(StorageCapability::Append)
             .with(StorageCapability::AtomicManifestPublish)
             .with(StorageCapability::Flush)
             .with(StorageCapability::StrictDataSync)
@@ -269,6 +272,35 @@ where
     Self::ReadObject: BlockingStorageReadObject,
 {
     fn open_read_blocking(&self, object: StorageObjectId) -> Result<Self::ReadObject>;
+}
+
+pub(crate) trait StorageAppendObject: Send {
+    fn append<'op>(
+        &'op mut self,
+        bytes: &'op [u8],
+        durability: DurabilityMode,
+    ) -> StorageFuture<'op, ()>;
+
+    fn persist(&mut self, durability: DurabilityMode) -> StorageFuture<'_, ()>;
+}
+
+pub(crate) trait BlockingStorageAppendObject: StorageAppendObject {
+    fn append_blocking(&mut self, bytes: &[u8], durability: DurabilityMode) -> Result<()>;
+
+    fn persist_blocking(&mut self, durability: DurabilityMode) -> Result<()>;
+}
+
+pub(crate) trait StorageAppendBackend: StorageReadBackend {
+    type AppendObject: StorageAppendObject;
+
+    fn open_append(&self, object: StorageObjectId) -> StorageFuture<'_, Self::AppendObject>;
+}
+
+pub(crate) trait BlockingStorageAppendBackend: StorageAppendBackend
+where
+    Self::AppendObject: BlockingStorageAppendObject,
+{
+    fn open_append_blocking(&self, object: StorageObjectId) -> Result<Self::AppendObject>;
 }
 
 pub(crate) trait StorageManifestReadBackend: StorageReadBackend {
@@ -492,6 +524,20 @@ impl BlockingStorageReadBackend for NativeFileBackend {
     }
 }
 
+impl StorageAppendBackend for NativeFileBackend {
+    type AppendObject = NativeFileAppendObject;
+
+    fn open_append(&self, object: StorageObjectId) -> StorageFuture<'_, Self::AppendObject> {
+        Box::pin(async move { NativeFileAppendObject::open(&object) })
+    }
+}
+
+impl BlockingStorageAppendBackend for NativeFileBackend {
+    fn open_append_blocking(&self, object: StorageObjectId) -> Result<Self::AppendObject> {
+        poll_ready_storage_future(self.open_append(object))
+    }
+}
+
 impl StorageManifestReadBackend for NativeFileBackend {
     fn read_current_manifest(
         &self,
@@ -645,6 +691,42 @@ impl BlockingStorageReadObject for NativeFileObject {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct NativeFileAppendObject {
+    file: File,
+}
+
+impl NativeFileAppendObject {
+    fn open(object: &StorageObjectId) -> Result<Self> {
+        let file = open_native_append_file(object)?;
+        Ok(Self { file })
+    }
+}
+
+impl StorageAppendObject for NativeFileAppendObject {
+    fn append<'op>(
+        &'op mut self,
+        bytes: &'op [u8],
+        durability: DurabilityMode,
+    ) -> StorageFuture<'op, ()> {
+        Box::pin(async move { append_native_file_object(&mut self.file, bytes, durability) })
+    }
+
+    fn persist(&mut self, durability: DurabilityMode) -> StorageFuture<'_, ()> {
+        Box::pin(async move { persist_native_append_file(&mut self.file, durability) })
+    }
+}
+
+impl BlockingStorageAppendObject for NativeFileAppendObject {
+    fn append_blocking(&mut self, bytes: &[u8], durability: DurabilityMode) -> Result<()> {
+        poll_ready_storage_future(StorageAppendObject::append(self, bytes, durability))
+    }
+
+    fn persist_blocking(&mut self, durability: DurabilityMode) -> Result<()> {
+        poll_ready_storage_future(StorageAppendObject::persist(self, durability))
+    }
+}
+
 pub(crate) struct StorageReadSource<'src, H> {
     object: &'src H,
 }
@@ -714,6 +796,61 @@ fn read_exact_at_native_file(file: &mut File, offset: usize, bytes: &mut [u8]) -
     )?))?;
     file.read_exact(bytes)?;
     Ok(())
+}
+
+fn open_native_append_file(object: &StorageObjectId) -> Result<File> {
+    if object.kind() != StorageObjectKind::Wal {
+        return Err(Error::invalid_options(
+            "append storage objects must use WAL object kind",
+        ));
+    }
+
+    let capabilities = StorageCapabilities::native_file();
+    capabilities.require(StorageCapability::Append)?;
+
+    if let Some(parent) = object.path().parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(object.path())
+        .map_err(Error::from)
+}
+
+fn append_native_file_object(
+    file: &mut File,
+    bytes: &[u8],
+    durability: DurabilityMode,
+) -> Result<()> {
+    let capabilities = StorageCapabilities::native_file();
+    capabilities.require(StorageCapability::Append)?;
+    capabilities.require_durability(durability)?;
+
+    file.write_all(bytes)?;
+    persist_native_append_file(file, durability)
+}
+
+fn persist_native_append_file(file: &mut File, durability: DurabilityMode) -> Result<()> {
+    let capabilities = StorageCapabilities::native_file();
+    capabilities.require_durability(durability)?;
+
+    match durability {
+        DurabilityMode::Buffered => Ok(()),
+        DurabilityMode::Flush => {
+            file.flush()?;
+            Ok(())
+        }
+        DurabilityMode::SyncData => {
+            file.sync_data()?;
+            Ok(())
+        }
+        DurabilityMode::SyncAll => {
+            file.sync_all()?;
+            Ok(())
+        }
+    }
 }
 
 fn read_current_manifest_from_native_file(object: &StorageObjectId) -> Result<Option<Arc<[u8]>>> {
@@ -1218,6 +1355,64 @@ mod tests {
     }
 
     #[test]
+    fn native_file_backend_appends_wal_object_with_capabilities() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-storage-append-wal-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        let object = StorageObjectId::native_file(StorageObjectKind::Wal, root.join("trine.wal"));
+
+        let backend = NativeFileBackend::new();
+        backend
+            .capabilities()
+            .require(StorageCapability::Append)
+            .expect("native-file backend supports append");
+        let mut append = backend
+            .open_append_blocking(object.clone())
+            .expect("WAL append object opens");
+
+        append
+            .append_blocking(b"first", DurabilityMode::Buffered)
+            .expect("first WAL bytes append");
+        append
+            .append_blocking(b"second", DurabilityMode::Flush)
+            .expect("second WAL bytes append");
+        append
+            .persist_blocking(DurabilityMode::SyncData)
+            .expect("WAL append object persists");
+
+        assert_eq!(
+            std::fs::read(object.path()).expect("WAL object reads"),
+            b"firstsecond"
+        );
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[test]
+    fn native_file_append_rejects_non_wal_objects() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-storage-append-table-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        let object =
+            StorageObjectId::native_file(StorageObjectKind::Table, root.join("table.trinet"));
+
+        let error = NativeFileBackend::new()
+            .open_append_blocking(object)
+            .expect_err("only WAL objects use append");
+        assert!(matches!(error, Error::InvalidOptions { .. }));
+    }
+
+    #[test]
     fn memory_storage_backend_exposes_async_read_shape() {
         let backend = MemoryStorageBackend::new();
         let capabilities = backend.capabilities();
@@ -1261,6 +1456,7 @@ mod tests {
         assert!(read_only.supports(StorageCapability::ObjectListing));
         assert!(!read_only.supports(StorageCapability::ObjectWrite));
         assert!(!read_only.supports(StorageCapability::ObjectDelete));
+        assert!(!read_only.supports(StorageCapability::Append));
         assert!(matches!(
             read_only.require(StorageCapability::Append),
             Err(Error::UnsupportedBackend { feature: "append" })

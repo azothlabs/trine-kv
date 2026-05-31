@@ -5256,3 +5256,58 @@ Record only evidence that can change planning or durable decisions.
 - Reassess remaining direct native-file operations and choose between WAL
   append, writer lease handling, or parent-directory sync routing as the next
   storage-boundary slice.
+
+## 2026-05-31: Native-File WAL Append Backend
+
+### Observation
+
+- Table/blob object lifecycle operations now route through backend operations.
+- The primary persistent write path still appended WAL records through a direct
+  native file handle inside `WalWriter`.
+- Existing commit ordering already wrote the WAL before applying operations to
+  memtables and publishing `last_sequence`.
+
+### Interpretation
+
+- WAL append is the next correct storage-boundary slice because it is the first
+  side-effecting operation on the persistent commit path.
+- The change should move physical append and durability persist into storage
+  without changing WAL frame bytes, replay, or commit visibility ordering.
+- WAL rewrite-after-flush should remain out of scope for this slice because it
+  is an atomic replacement maintenance path, not the commit append path.
+
+### Verification
+
+- Added `StorageObjectKind::Wal`.
+- Added `StorageAppendBackend`, `BlockingStorageAppendBackend`,
+  `StorageAppendObject`, and `BlockingStorageAppendObject`.
+- Native-file backend now reports append capability.
+- Native-file backend opens WAL append objects, appends bytes, and persists
+  according to `Buffered`, `Flush`, `SyncData`, and `SyncAll`.
+- Native-file append rejects non-WAL objects.
+- `WalWriter::open_append`, `append_batch`, `persist`, and `reopen_append` now
+  use the backend append object.
+- WAL frame encoding remains unchanged; `write_batch_frame` now reuses the
+  frame encoder used by the backend append path.
+- `cargo test storage --lib`
+- `cargo test wal --lib`
+- `cargo test persistent_wal_replays_point_and_range_batches --test persistent_wal`
+- `cargo test persistent_wal_ignores_torn_final_record --test persistent_wal`
+- `cargo test persistent_wal_checksum_corruption_fails_closed --test persistent_wal`
+- `cargo test persistent_flush_writes_table_and_reopen_can_skip_wal --test persistent_wal`
+- `cargo test persistent_immutable_pressure_flushes_before_next_write_and_keeps_new_wal_batch --test persistent_wal`
+- `cargo test persistent_wal --test persistent_wal`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+
+### Remaining Blockers
+
+- Public async API, async runtime selection, writer lease handling,
+  parent-directory sync routing, WAL rewrite routing, and production in-memory
+  object routing remain later phases.
+
+### Recommended Next Action
+
+- Route writer lease acquisition/release through the storage backend so
+  persistent writable open no longer owns native lock-file behavior directly.

@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Write},
     ops::Bound,
     path::{Path, PathBuf},
@@ -9,6 +9,11 @@ use crate::{
     durability::sync_parent_dir_after_rename,
     error::{Error, Result},
     options::DurabilityMode,
+    storage::{
+        BlockingStorageAppendBackend, BlockingStorageAppendObject, NativeFileAppendObject,
+        NativeFileBackend, StorageCapability, StorageObjectId, StorageObjectKind,
+        StorageReadBackend,
+    },
     types::{KeyRange, Sequence},
     write_batch::BatchOperation,
 };
@@ -44,18 +49,14 @@ pub struct WalBatch {
 
 #[derive(Debug)]
 pub struct WalWriter {
-    file: File,
+    append: NativeFileAppendObject,
 }
 
 impl WalWriter {
     pub fn open_append(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .map_err(Error::from)?;
-
-        Ok(Self { file })
+        Ok(Self {
+            append: open_wal_append_object(path)?,
+        })
     }
 
     pub fn append_batch(
@@ -64,28 +65,16 @@ impl WalWriter {
         operations: &[BatchOperation],
         durability: DurabilityMode,
     ) -> Result<()> {
-        write_batch_frame(&mut self.file, sequence, operations)?;
-        self.persist(durability)?;
-
-        Ok(())
+        let frame = encode_batch_frame(sequence, operations)?;
+        self.append.append_blocking(&frame, durability)
     }
 
     pub fn persist(&mut self, durability: DurabilityMode) -> Result<()> {
-        match durability {
-            DurabilityMode::Buffered => {}
-            DurabilityMode::Flush => self.file.flush()?,
-            DurabilityMode::SyncData => self.file.sync_data()?,
-            DurabilityMode::SyncAll => self.file.sync_all()?,
-        }
-        Ok(())
+        self.append.persist_blocking(durability)
     }
 
     pub fn reopen_append(&mut self, path: &Path) -> Result<()> {
-        self.file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .map_err(Error::from)?;
+        self.append = open_wal_append_object(path)?;
         Ok(())
     }
 }
@@ -133,25 +122,42 @@ fn wal_rewrite_tmp_path(path: &Path) -> PathBuf {
     path.with_file_name(WAL_REWRITE_TMP_FILE_NAME)
 }
 
+fn open_wal_append_object(path: &Path) -> Result<NativeFileAppendObject> {
+    let backend = NativeFileBackend::new();
+    backend.capabilities().require(StorageCapability::Append)?;
+    backend.open_append_blocking(wal_storage_object(path))
+}
+
+fn wal_storage_object(path: &Path) -> StorageObjectId {
+    StorageObjectId::native_file(StorageObjectKind::Wal, path)
+}
+
 fn write_batch_frame(
     file: &mut File,
     sequence: Sequence,
     operations: &[BatchOperation],
 ) -> Result<()> {
+    let frame = encode_batch_frame(sequence, operations)?;
+    file.write_all(&frame)?;
+    Ok(())
+}
+
+fn encode_batch_frame(sequence: Sequence, operations: &[BatchOperation]) -> Result<Vec<u8>> {
     let payload = encode_payload(sequence, operations)?;
     let payload_checksum = checksum(&payload);
     let payload_len = u32::try_from(payload.len())
         .map_err(|_| Error::invalid_options("WAL payload exceeds u32::MAX bytes"))?;
     let header_checksum = header_checksum(payload_len, payload_checksum);
 
-    file.write_all(&WAL_MAGIC.to_le_bytes())?;
-    file.write_all(&WAL_FORMAT_VERSION.to_le_bytes())?;
-    file.write_all(&payload_len.to_le_bytes())?;
-    file.write_all(&header_checksum.to_le_bytes())?;
-    file.write_all(&payload_checksum.to_le_bytes())?;
-    file.write_all(&payload)?;
+    let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
+    frame.extend_from_slice(&WAL_MAGIC.to_le_bytes());
+    frame.extend_from_slice(&WAL_FORMAT_VERSION.to_le_bytes());
+    frame.extend_from_slice(&payload_len.to_le_bytes());
+    frame.extend_from_slice(&header_checksum.to_le_bytes());
+    frame.extend_from_slice(&payload_checksum.to_le_bytes());
+    frame.extend_from_slice(&payload);
 
-    Ok(())
+    Ok(frame)
 }
 
 fn encode_payload(sequence: Sequence, operations: &[BatchOperation]) -> Result<Vec<u8>> {
