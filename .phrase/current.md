@@ -6,34 +6,41 @@ Complete
 
 ## Goal
 
-Move table open, length, header, footer, and startup metadata reads behind the
-native-file storage adapter.
+Add explicit storage capability and unsupported-capability error types.
 
 ## Scope
 
-- Add an opened native-file storage object that owns the shared file handle.
-- Route `read_table` open, header read, file length check, footer read,
-  properties read, top-level index read, pinned filter read, and pinned index
-  metadata reads through the storage adapter.
-- Keep block cache behavior, stats, and cache keys unchanged.
+- Add an internal storage capability vocabulary for backend guarantees.
+- Add capability checking helpers for storage operations and durability modes.
+- Add typed unsupported backend and unsupported durability errors.
+- Route the existing table random-read requirement through the typed
+  capability helper.
+- Keep block cache behavior, stats, cache keys, and SSTable format unchanged.
 - Keep SSTable, WAL, manifest, blob, compaction, transaction, and public API
   behavior unchanged.
 
 ## Out Of Scope
 
 - Choosing a concrete async runtime crate.
-- Introducing async APIs or async storage traits.
+- Introducing public async APIs.
 - Introducing an extent allocator or disk-space reuse layer.
 - Changing SSTable block format, codec ids, checksums, footer layout, or cache
   key semantics.
 - Moving table writes, manifest publish, WAL append, blob reads, or file cleanup
   to the new adapter in this slice.
+- Defining or routing full write, manifest publish, lease, cleanup, or runtime
+  traits in this slice.
 - Moving MVCC visibility, table version lifetime, compaction planning, manifest
   publish, blob GC, or public API behavior.
 
 ## Acceptance Gate
 
-- Persistent table open/header/footer/startup metadata reads go through a
+- Internal storage capability types cover current read guarantees and named
+  later write/publish/durability guarantees.
+- Unsupported backend capability and unsupported durability errors are explicit
+  variants.
+- Current table random-read capability check uses the typed helper.
+- Persistent table open/header/footer/startup metadata reads still go through a
   native-file storage object and adapter keyed by a storage object id.
 - Persistent table checked-block reads continue to go through the same adapter.
 - Existing table read/write behavior and storage format remain unchanged.
@@ -45,36 +52,40 @@ native-file storage adapter.
 ## Active Task Slice
 
 ```text
-task181 [x] goal:start table-open storage boundary slice | scope:current roadmap | verify:manual
-task182 [x] goal:add opened native-file storage object | scope:src/storage.rs | verify:focused tests
-task183 [x] goal:route table open/header/footer/metadata reads through adapter | scope:src/table.rs | verify:table tests
-task184 [x] goal:record evidence and next step | scope:.phrase/evidence.md current roadmap | verify:git diff
+task189 [x] goal:start storage capability/error slice | scope:current roadmap protocol | verify:manual
+task190 [x] goal:add capability and unsupported error types | scope:src/storage.rs src/error.rs src/options.rs | verify:focused tests
+task191 [x] goal:use typed capability check in table read path | scope:src/table.rs | verify:table tests
+task192 [x] goal:record evidence and next step | scope:.phrase/evidence.md current roadmap | verify:git diff
 ```
 
 ## Known Blockers
 
-- None for this table-open storage boundary slice.
-- Async storage traits and public async API remain later phases.
+- None for this storage capability/error slice.
+- Public async API, async runtime selection, table writes, manifest, WAL, blob
+  files, lease handling, and cleanup remain later phases.
 
 ## Evidence
 
-- Previous phase added a table storage object id plus
-  `NativeFileReadSource`, but `read_table` still directly opened native files
-  and read header/footer/metadata bytes.
-- That direct path is now the main remaining native-file dependency in table
-  reads before async backend traits can replace the adapter.
-- `src/storage.rs` now owns `NativeFileObject`, which opens a storage object,
-  reports its length, and serves locked random reads.
-- `read_table` now opens a table storage object and reads header, footer,
-  properties, top-level index, pinned filters, pinned index metadata, lazy
-  index partitions, range tombstones, and data blocks through
-  `NativeFileReadSource`.
-- Verification passed: `cargo test table --lib`, `cargo test block
-  --all-targets`, `cargo test persistent --all-targets`, `cargo clippy
-  --all-targets --all-features -- -D warnings`, `cargo fmt --check`,
-  `git diff --check`, and forbidden-term scan.
+- Phase 50 defined the first async read trait shape and native-file blocking
+  adapter.
+- The async-first protocol requires honest backend capabilities and typed
+  unsupported durability/capability errors before write/publish routing.
+- The current native-file read backend only needs to claim persistent random
+  read in this slice; write and publish capabilities should be named but not
+  claimed yet.
+- `src/storage.rs` now defines `StorageCapability` and `StorageCapabilities`,
+  including current read capability and later write, publish, durability,
+  lease, background, and runtime capability names.
+- `src/error.rs` now has explicit `UnsupportedBackend` and
+  `UnsupportedDurability` variants.
+- `src/table.rs` now requires `StorageCapability::RandomRead` through the
+  typed capability helper before opening a table read object.
+- Verification passed: `cargo test storage --lib`, `cargo test table --lib`,
+  `cargo test block --all-targets`, `cargo test persistent --all-targets`,
+  `cargo clippy --all-targets --all-features -- -D warnings`,
+  `cargo fmt --check`, `git diff --check`, and forbidden-term scan.
 
 ## Next Recommendation
 
-- Define the first async storage trait shape next; keep public async API
-  migration and table-write routing as separate slices.
+- Route memory mode through the same async read contract, or add write/publish
+  trait methods behind the capability checks.

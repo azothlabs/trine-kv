@@ -1022,3 +1022,46 @@ backend boundary before async storage work.
 - SSTable format, public API, cache semantics, MVCC, manifest, blob,
   compaction, transaction, and cleanup behavior remain unchanged.
 - Focused table/persistent tests, formatting, clippy, and diff checks pass.
+
+### Phase 50: Async Storage Read Trait Shape
+
+**Status**: Complete
+
+**Goal**: Define the first internal async storage read trait shape without
+changing public APIs or storage formats.
+
+**Entry Condition**: Phase 49 complete and user asks to continue after the
+table read storage boundary lands.
+
+**Acceptance Gate**:
+
+- Internal async read backend/object traits exist for storage object open,
+  object length, and random reads without choosing a concrete async runtime.
+- Native-file storage implements the async trait shape and a blocking adapter
+  for the current synchronous table read path.
+- Persistent table read behavior, SSTable format, block cache semantics, MVCC,
+  manifest, WAL, blob, compaction, transaction, and public API behavior remain
+  unchanged.
+- Focused table/persistent tests, formatting, clippy, and diff checks pass.
+
+### Phase 51: Storage Capability And Error Types
+
+**Status**: Complete
+
+**Goal**: Add explicit storage capability checks and typed unsupported errors
+before routing write or manifest operations through the backend.
+
+**Entry Condition**: Phase 50 complete and user asks to continue storage
+backend migration.
+
+**Acceptance Gate**:
+
+- Internal storage capability types name current read guarantees and later
+  write, publish, durability, lease, cleanup, background, and runtime
+  guarantees.
+- Unsupported backend capability and unsupported durability errors are explicit
+  typed variants.
+- Current table random-read requirement uses the capability helper.
+- Public API behavior, SSTable format, MVCC, manifest, WAL, blob, compaction,
+  transaction, and cleanup behavior remain unchanged.
+- Focused table/persistent tests, formatting, clippy, and diff checks pass.

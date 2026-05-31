@@ -29,7 +29,11 @@ use crate::{
     range_tombstone::{self, RangeTombstoneIndex, RangeTombstoneLike},
     search,
     stats::{FilterStats, ReadPathStats},
-    storage::{NativeFileObject, NativeFileReadSource, StorageObjectId, StorageObjectKind},
+    storage::{
+        BlockingStorageReadBackend, BlockingStorageReadObject, NativeFileBackend, NativeFileObject,
+        NativeFileReadSource, StorageCapability, StorageObjectId, StorageObjectKind,
+        StorageReadBackend, StorageReadObject,
+    },
     types::{KeyRange, Sequence},
 };
 
@@ -2570,9 +2574,16 @@ pub(crate) fn write_table(
 }
 
 pub(crate) fn read_table(path: &Path) -> Result<Table> {
+    let backend = table_storage_backend();
+    backend
+        .capabilities()
+        .require(StorageCapability::RandomRead)?;
     let object = table_storage_object(path);
-    let table_file = Arc::new(NativeFileObject::open(object)?);
-    let source = NativeFileReadSource::new(table_file.object().clone(), Some(table_file.as_ref()));
+    let table_file = Arc::new(backend.open_read_blocking(object)?);
+    let source = NativeFileReadSource::new(
+        StorageReadObject::object(table_file.as_ref()).clone(),
+        Some(table_file.as_ref()),
+    );
 
     let header = read_table_header(path, &source)?;
     let magic = read_u32_at(&header, 0)?;
@@ -2588,7 +2599,7 @@ pub(crate) fn read_table(path: &Path) -> Result<Table> {
             message: format!("unsupported table version {version}"),
         });
     }
-    let file_len = table_file.len()?;
+    let file_len = table_file.len_blocking()?;
     let expected_len = usize_to_u64(
         HEADER_LEN
             .checked_add(payload_len)
@@ -2669,6 +2680,10 @@ fn table_read_source<'src>(
 
 fn table_storage_object(path: &Path) -> StorageObjectId {
     StorageObjectId::native_file(StorageObjectKind::Table, path)
+}
+
+fn table_storage_backend() -> NativeFileBackend {
+    NativeFileBackend::new()
 }
 
 fn read_pinned_table_filters(
@@ -5192,8 +5207,9 @@ mod tests {
         let mut file_bytes = vec![0_u8; HEADER_LEN];
         file_bytes.extend_from_slice(&payload);
         std::fs::write(&path, file_bytes).expect("test table file writes");
-        let table_file =
-            NativeFileObject::open(table_storage_object(&path)).expect("test table file opens");
+        let table_file = table_storage_backend()
+            .open_read_blocking(table_storage_object(&path))
+            .expect("test table file opens");
         let missing_path = path.with_extension("missing");
 
         let (codec, decoded) =

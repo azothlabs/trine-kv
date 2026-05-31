@@ -1,5 +1,7 @@
 use std::{error, fmt, io};
 
+use crate::options::DurabilityMode;
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
@@ -16,12 +18,24 @@ pub enum Error {
     BucketMissing { name: String },
     InvalidOptions { message: String },
     Unsupported { feature: &'static str },
+    UnsupportedBackend { feature: &'static str },
+    UnsupportedDurability { requested: DurabilityMode },
 }
 
 impl Error {
     #[must_use]
     pub const fn unsupported(feature: &'static str) -> Self {
         Self::Unsupported { feature }
+    }
+
+    #[must_use]
+    pub const fn unsupported_backend(feature: &'static str) -> Self {
+        Self::UnsupportedBackend { feature }
+    }
+
+    #[must_use]
+    pub const fn unsupported_durability(requested: DurabilityMode) -> Self {
+        Self::UnsupportedDurability { requested }
     }
 
     #[must_use]
@@ -48,6 +62,16 @@ impl fmt::Display for Error {
             Self::BucketMissing { name } => write!(formatter, "bucket is missing: {name}"),
             Self::InvalidOptions { message } => write!(formatter, "invalid options: {message}"),
             Self::Unsupported { feature } => write!(formatter, "unsupported feature: {feature}"),
+            Self::UnsupportedBackend { feature } => {
+                write!(formatter, "unsupported storage backend feature: {feature}")
+            }
+            Self::UnsupportedDurability { requested } => {
+                write!(
+                    formatter,
+                    "unsupported durability mode: {}",
+                    requested.as_str()
+                )
+            }
         }
     }
 }

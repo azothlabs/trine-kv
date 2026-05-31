@@ -4656,3 +4656,117 @@ Record only evidence that can change planning or durable decisions.
 
 - Define the first async storage trait shape next, keeping public async API
   migration and table-write routing as separate phases.
+
+## 2026-05-31: Async Storage Read Trait Shape
+
+### Observation
+
+- The persistent table read path now uses a storage object and native-file read
+  adapter, but the adapter was still only a synchronous byte-read boundary.
+- The async-first protocol requires storage operations to be database-level
+  async operations, while CPU-only table and block validation should stay
+  synchronous.
+- Public async API migration, table writes, manifest publish, WAL, blob files,
+  cleanup, lease handling, and runtime selection are larger slices than the
+  first read trait shape.
+
+### Interpretation
+
+- The smallest useful next step is an internal async read trait shape for
+  storage object open, object length, and random reads.
+- Native-file storage can implement that shape with immediately-completing
+  futures and expose a blocking compatibility adapter for the current
+  synchronous table path.
+- Write, manifest, durability, lease, cleanup, and runtime capabilities should
+  remain separate so this slice does not silently change storage semantics.
+
+### Verification
+
+- Added `StorageReadBackend`, `StorageReadObject`, blocking compatibility
+  traits, `StorageReadCapabilities`, and `NativeFileBackend` in
+  `src/storage.rs`.
+- Implemented native-file async read futures without adding an async runtime
+  dependency.
+- Made native-file blocking compatibility poll only immediately-ready futures;
+  a pending future reports unsupported runtime behavior instead of blocking on
+  an unknown executor.
+- Routed table read opening through `NativeFileBackend`'s blocking adapter while
+  preserving existing table read behavior through `NativeFileReadSource`.
+- Added a focused storage test for async open, object length, and random read
+  shape.
+- `cargo test storage --lib`
+- `cargo test table --lib`
+- `cargo test block --all-targets`
+- `cargo test persistent --all-targets`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --check`
+- `git diff --check`
+- Forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, `README.md`, `CHANGELOG.md`, and `Cargo.toml`
+
+### Remaining Blockers
+
+- None for the async storage read trait shape.
+- Public async API, memory backend routing, table writes, manifest publish, WAL,
+  blob files, cleanup, durability capability errors, writer lease handling, and
+  runtime selection remain later slices.
+
+### Recommended Next Action
+
+- Add explicit capability/error types for write/publish operations, or route
+  memory mode through the same async read contract.
+
+## 2026-05-31: Storage Capability And Error Types
+
+### Observation
+
+- The async storage read trait shape existed, but backend guarantees were still
+  represented by a narrow read-only capability struct.
+- The async-first protocol requires honest capability reporting before storage
+  operations such as writes, manifest publish, strict durability, writer lease,
+  background work, and runtime support are routed through a backend.
+- The public error enum did not yet have explicit `UnsupportedBackend` or
+  `UnsupportedDurability` variants, even though the protocol names those
+  failure modes.
+
+### Interpretation
+
+- Adding the capability vocabulary and typed unsupported errors is the right
+  next slice before routing write or manifest operations, because unsupported
+  guarantees must fail explicitly instead of becoming ad hoc option errors.
+- The current native-file read backend should only claim persistent random read
+  in this slice; write, publish, durability, lease, and cleanup capabilities
+  should be named but not claimed until those operations are routed.
+
+### Verification
+
+- Added `StorageCapability` and `StorageCapabilities` in `src/storage.rs`.
+- Added capability helpers for backend features and durability modes.
+- Added `UnsupportedBackend` and `UnsupportedDurability` variants in
+  `src/error.rs`.
+- Added `DurabilityMode::as_str` for error display.
+- Routed the table read path's random-read requirement through
+  `StorageCapabilities::require`.
+- Added focused storage tests for unsupported backend capability and unsupported
+  durability errors.
+- `cargo test storage --lib`
+- `cargo test table --lib`
+- `cargo test block --all-targets`
+- `cargo test persistent --all-targets`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --check`
+- `git diff --check`
+- Forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, `README.md`, `CHANGELOG.md`, and `Cargo.toml`
+
+### Remaining Blockers
+
+- None for the capability/error type slice.
+- Public async API, memory backend routing, table writes, manifest publish, WAL,
+  blob files, cleanup, writer lease handling, and runtime selection remain
+  later slices.
+
+### Recommended Next Action
+
+- Route memory mode through the same async read contract, or add write/publish
+  trait methods behind the capability checks.

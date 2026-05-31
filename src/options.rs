@@ -23,6 +23,17 @@ pub enum DurabilityMode {
     SyncAll,
 }
 
+impl DurabilityMode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Buffered => "buffered",
+            Self::Flush => "flush",
+            Self::SyncData => "sync-data",
+            Self::SyncAll => "sync-all",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CompressionProfile {
     None,
