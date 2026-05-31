@@ -4824,3 +4824,59 @@ Record only evidence that can change planning or durable decisions.
 
 - Add write/publish trait methods behind capability checks, starting with a
   small native-file table write or manifest publish adapter slice.
+
+## 2026-05-31: Native-File Manifest Publish Backend
+
+### Observation
+
+- The async-first storage protocol says manifest publish is a backend operation,
+  not an engine-level rename.
+- `ManifestStore` already preserved the correct state rule: in-memory manifest
+  state advances only after durable file publish succeeds.
+- Native-file backend capabilities named atomic manifest publish and strict sync
+  support, but manifest publish still performed direct file creation, sync,
+  rename, and parent-directory sync in `src/manifest.rs`.
+
+### Interpretation
+
+- The next safe slice is moving only the final manifest publish operation behind
+  the native-file backend while leaving manifest encoding and recovery reads in
+  place.
+- Native-file backend can honestly claim atomic manifest publish and strict sync
+  for this operation because it writes bytes, syncs the file, renames, and
+  syncs the parent directory for strict publish.
+
+### Verification
+
+- Added `StorageManifestPublishBackend` and
+  `BlockingStorageManifestPublishBackend` in `src/storage.rs`.
+- Added `StorageObjectKind::Manifest`.
+- `NativeFileBackend` now reports atomic manifest publish, flush, strict data
+  sync, and strict metadata sync capabilities.
+- `NativeFileBackend` publishes manifest bytes with the existing temporary-file,
+  file sync, rename, and parent-directory sync behavior for `SyncAll`.
+- `ManifestStore` now delegates final manifest publish to the native-file
+  backend while keeping manifest encoding unchanged.
+- Existing `manifest_state_stays_put_when_publish_fails` still passes.
+- `cargo test storage --lib`
+- `cargo test manifest --lib`
+- `cargo test table --lib`
+- `cargo test block --all-targets`
+- `cargo test persistent --all-targets`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --check`
+- `git diff --check`
+- Forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, `README.md`, `CHANGELOG.md`, and `Cargo.toml`
+
+### Remaining Blockers
+
+- None for the native-file manifest publish backend slice.
+- Manifest reads/listing, table output writes, WAL append, blob files, cleanup,
+  writer lease handling, public async API, runtime selection, and production
+  in-memory table-object routing remain later slices.
+
+### Recommended Next Action
+
+- Route manifest read/listing or table write output through storage backend
+  operations.

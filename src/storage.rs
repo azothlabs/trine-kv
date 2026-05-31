@@ -1,8 +1,8 @@
 use std::{
     collections::BTreeMap,
-    fs::File,
+    fs::{self, File},
     future::Future,
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex, MutexGuard},
@@ -11,18 +11,21 @@ use std::{
 
 use crate::{
     block::BlockReadSource,
+    durability::sync_parent_dir_after_rename,
     error::{Error, Result},
     options::DurabilityMode,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum StorageObjectKind {
+    Manifest,
     Table,
 }
 
 impl StorageObjectKind {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::Manifest => "manifest",
             Self::Table => "table",
         }
     }
@@ -59,7 +62,8 @@ impl StorageObjectId {
     }
 }
 
-pub(crate) type StorageReadFuture<'op, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'op>>;
+pub(crate) type StorageFuture<'op, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'op>>;
+pub(crate) type StorageReadFuture<'op, T> = StorageFuture<'op, T>;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +132,14 @@ impl StorageCapabilities {
         Self::empty()
             .with(StorageCapability::Persistent)
             .with(StorageCapability::RandomRead)
+    }
+
+    pub(crate) const fn native_file() -> Self {
+        Self::native_file_read()
+            .with(StorageCapability::AtomicManifestPublish)
+            .with(StorageCapability::Flush)
+            .with(StorageCapability::StrictDataSync)
+            .with(StorageCapability::StrictMetadataSync)
     }
 
     pub(crate) const fn memory_read() -> Self {
@@ -209,6 +221,26 @@ where
     Self::ReadObject: BlockingStorageReadObject,
 {
     fn open_read_blocking(&self, object: StorageObjectId) -> Result<Self::ReadObject>;
+}
+
+pub(crate) trait StorageManifestPublishBackend: StorageReadBackend {
+    fn publish_manifest(
+        &self,
+        object: StorageObjectId,
+        bytes: Arc<[u8]>,
+        durability: DurabilityMode,
+    ) -> StorageFuture<'_, ()>;
+}
+
+pub(crate) trait BlockingStorageManifestPublishBackend:
+    StorageManifestPublishBackend
+{
+    fn publish_manifest_blocking(
+        &self,
+        object: StorageObjectId,
+        bytes: Arc<[u8]>,
+        durability: DurabilityMode,
+    ) -> Result<()>;
 }
 
 #[allow(dead_code)]
@@ -347,7 +379,7 @@ impl StorageReadBackend for NativeFileBackend {
     type ReadObject = NativeFileObject;
 
     fn capabilities(&self) -> StorageCapabilities {
-        StorageCapabilities::native_file_read()
+        StorageCapabilities::native_file()
     }
 
     fn open_read(&self, object: StorageObjectId) -> StorageReadFuture<'_, Self::ReadObject> {
@@ -358,6 +390,28 @@ impl StorageReadBackend for NativeFileBackend {
 impl BlockingStorageReadBackend for NativeFileBackend {
     fn open_read_blocking(&self, object: StorageObjectId) -> Result<Self::ReadObject> {
         poll_ready_storage_future(self.open_read(object))
+    }
+}
+
+impl StorageManifestPublishBackend for NativeFileBackend {
+    fn publish_manifest(
+        &self,
+        object: StorageObjectId,
+        bytes: Arc<[u8]>,
+        durability: DurabilityMode,
+    ) -> StorageFuture<'_, ()> {
+        Box::pin(async move { publish_manifest_to_native_file(&object, &bytes, durability) })
+    }
+}
+
+impl BlockingStorageManifestPublishBackend for NativeFileBackend {
+    fn publish_manifest_blocking(
+        &self,
+        object: StorageObjectId,
+        bytes: Arc<[u8]>,
+        durability: DurabilityMode,
+    ) -> Result<()> {
+        poll_ready_storage_future(self.publish_manifest(object, bytes, durability))
     }
 }
 
@@ -496,6 +550,50 @@ fn read_exact_at_native_file(file: &mut File, offset: usize, bytes: &mut [u8]) -
     Ok(())
 }
 
+fn publish_manifest_to_native_file(
+    object: &StorageObjectId,
+    bytes: &[u8],
+    durability: DurabilityMode,
+) -> Result<()> {
+    if object.kind() != StorageObjectKind::Manifest {
+        return Err(Error::invalid_options(
+            "manifest publish requires a manifest storage object",
+        ));
+    }
+
+    let capabilities = StorageCapabilities::native_file();
+    capabilities.require(StorageCapability::AtomicManifestPublish)?;
+    capabilities.require_durability(durability)?;
+
+    let path = object.path();
+    let tmp_path = path.with_extension("tmp");
+    {
+        let mut file = File::create(&tmp_path)?;
+        file.write_all(bytes)?;
+        sync_native_file_for_durability(&file, durability)?;
+    }
+    fs::rename(tmp_path, path)?;
+    if durability == DurabilityMode::SyncAll {
+        sync_parent_dir_after_rename(path)?;
+    }
+
+    Ok(())
+}
+
+fn sync_native_file_for_durability(file: &File, durability: DurabilityMode) -> Result<()> {
+    match durability {
+        DurabilityMode::Buffered => Ok(()),
+        DurabilityMode::Flush | DurabilityMode::SyncData => {
+            file.sync_data()?;
+            Ok(())
+        }
+        DurabilityMode::SyncAll => {
+            file.sync_all()?;
+            Ok(())
+        }
+    }
+}
+
 fn poll_ready_storage_future<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
     let waker = Waker::noop();
     let mut context = Context::from_waker(waker);
@@ -552,6 +650,56 @@ mod tests {
         assert_eq!(&bytes, b"cde");
 
         std::fs::remove_file(path).expect("test file removes");
+    }
+
+    #[test]
+    fn native_file_backend_publishes_manifest_with_capabilities() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-storage-manifest-publish-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("test dir creates");
+
+        let backend = NativeFileBackend::new();
+        let capabilities = backend.capabilities();
+        capabilities
+            .require(StorageCapability::AtomicManifestPublish)
+            .expect("native-file backend supports manifest publish");
+        capabilities
+            .require_durability(DurabilityMode::SyncAll)
+            .expect("native-file backend supports strict publish sync");
+
+        let object =
+            StorageObjectId::native_file(StorageObjectKind::Manifest, root.join("MANIFEST"));
+        backend
+            .publish_manifest_blocking(
+                object.clone(),
+                Arc::from(&b"first"[..]),
+                DurabilityMode::SyncAll,
+            )
+            .expect("manifest publishes");
+        assert_eq!(
+            std::fs::read(object.path()).expect("manifest reads"),
+            b"first"
+        );
+
+        backend
+            .publish_manifest_blocking(
+                object.clone(),
+                Arc::from(&b"second"[..]),
+                DurabilityMode::SyncAll,
+            )
+            .expect("manifest republishes");
+        assert_eq!(
+            std::fs::read(object.path()).expect("manifest reads"),
+            b"second"
+        );
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
     }
 
     #[test]

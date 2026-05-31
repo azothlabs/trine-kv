@@ -1,20 +1,23 @@
 use std::{
     collections::BTreeMap,
-    fs::{self, File},
-    io::{Read, Write},
+    fs::File,
+    io::Read,
     path::{Path, PathBuf},
 };
 
 use crate::{
     codec::CodecId,
-    durability::sync_parent_dir_after_rename,
     error::{Error, Result},
     internal_key::{InternalKey, ValueKind},
     options::{
-        BlobLevelMergePolicy, BucketOptions, CompressionProfile, FilterPolicy, IndexSearchPolicy,
-        PrefixFilterPolicy,
+        BlobLevelMergePolicy, BucketOptions, CompressionProfile, DurabilityMode, FilterPolicy,
+        IndexSearchPolicy, PrefixFilterPolicy,
     },
     prefix::PrefixExtractor,
+    storage::{
+        BlockingStorageManifestPublishBackend, NativeFileBackend, StorageObjectId,
+        StorageObjectKind,
+    },
     table::{TableBlobReference, TableId, TableLevel, TableProperties},
     types::Sequence,
 };
@@ -327,16 +330,9 @@ fn publish_manifest(path: &Path, state: &ManifestState) -> Result<()> {
     bytes.extend_from_slice(&payload_checksum.to_le_bytes());
     bytes.extend_from_slice(&payload);
 
-    let tmp_path = path.with_extension("tmp");
-    {
-        let mut file = File::create(&tmp_path)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-    }
-    fs::rename(tmp_path, path)?;
-    sync_parent_dir_after_rename(path)?;
-
-    Ok(())
+    let backend = NativeFileBackend::new();
+    let object = StorageObjectId::native_file(StorageObjectKind::Manifest, path);
+    backend.publish_manifest_blocking(object, bytes.into(), DurabilityMode::SyncAll)
 }
 
 fn encode_state(state: &ManifestState) -> Result<Vec<u8>> {

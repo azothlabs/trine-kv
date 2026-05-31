@@ -1087,3 +1087,27 @@ backend migration.
 - Public API behavior, SSTable format, MVCC, manifest, WAL, blob, compaction,
   transaction, and production in-memory DB behavior remain unchanged.
 - Focused storage/table tests, formatting, clippy, and diff checks pass.
+
+### Phase 53: Native-File Manifest Publish Backend
+
+**Status**: Complete
+
+**Goal**: Route manifest publish through the native-file storage backend
+operation before broader write-path or public async migration.
+
+**Entry Condition**: Phase 52 complete and user asks to continue following the
+async storage protocol.
+
+**Acceptance Gate**:
+
+- Native-file backend reports atomic manifest publish and strict sync
+  capabilities honestly.
+- Native-file backend exposes a manifest publish operation that preserves the
+  current manifest byte format and atomic publish behavior.
+- `ManifestStore` publishes through the backend operation and still keeps
+  in-memory state unchanged if publish fails.
+- Public API behavior, SSTable format, MVCC, WAL, blob, compaction,
+  transaction, manifest recovery, and table read/write behavior remain
+  unchanged.
+- Focused storage/manifest/persistent tests, formatting, clippy, and diff
+  checks pass.
