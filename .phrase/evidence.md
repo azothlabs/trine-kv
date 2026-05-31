@@ -6128,3 +6128,60 @@ Record only evidence that can change planning or durable decisions.
 
 - Choose the next concurrency phase around writer-local accepted state and the
   publish barrier before changing WAL partitioning.
+
+## 2026-05-31: Writer-Local Accepted State And Publish Barrier
+
+### Observation
+
+- Runtime-owned async writes now run inside Trine-owned work after first poll,
+  but durable commit publication was still described by an anonymous writer
+  mutex.
+- Commit preflight, transaction validation, bucket routing, sequence assignment,
+  WAL append, memtable delta publication, and visibility marking lived in one
+  long commit function.
+- Flush, compaction, close, and public flush freezing depended on the same
+  serialized publication boundary.
+
+### Interpretation
+
+- The current serialized boundary is still required for correctness, but it
+  should be named as a publish barrier so later phases can replace or narrow it
+  intentionally.
+- Accepted write preflight can produce writer-local state without changing
+  visible data.
+- Publish-time transaction validation and sequence/WAL/delta visibility should
+  remain under the named barrier until writer-local deltas and WAL partitioning
+  have their own protocols.
+
+### Verification
+
+- Replaced the anonymous `writer` mutex in `DbInner` with `PublishBarrier`.
+- Routed commit publication, flush publication, compaction publication, public
+  flush freezing, and close idle waiting through `PublishBarrier::enter`.
+- Split commit execution into accepted preflight, writer-local state, publish
+  under barrier, and post-publish flush request handling.
+- Added explicit `AcceptedWriteState`, `WriterLocalWriteState`,
+  `RoutedWriteOperation`, and `PublishedWrite` structures.
+- Added focused tests proving accepted write preflight does not publish visible
+  data and writer-local state publishes under the publish barrier.
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test accepted_write --lib`
+- `cargo test writer_local_state --lib`
+- `cargo test --test async_api`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan outside the repository instruction file
+
+### Remaining Blockers
+
+- The publish barrier is still serialized.
+- True multi-writer execution still needs writer-local deltas, WAL partitioning,
+  and a publish barrier protocol that can install completed deltas without one
+  full commit-wide mutex.
+- Native-file storage remains blocking behind native-thread runtime execution.
+
+### Recommended Next Action
+
+- Define writer-local delta collection and validation before changing WAL
+  partitioning.

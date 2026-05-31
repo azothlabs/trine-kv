@@ -3,7 +3,7 @@ use std::{
     ops::Bound,
     path::Path,
     sync::{
-        Arc, Condvar, Mutex, RwLock, Weak,
+        Arc, Condvar, Mutex, MutexGuard, RwLock, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -57,7 +57,7 @@ pub(crate) struct DbInner {
     user_handles: AtomicUsize,
     commit_tracker: CommitTracker,
     closed: AtomicBool,
-    writer: Mutex<()>,
+    publish_barrier: PublishBarrier,
     process_lock: Mutex<Option<recovery::ProcessLock>>,
     buckets: RwLock<BTreeMap<String, Arc<LsmTree>>>,
     snapshots: Arc<SnapshotTracker>,
@@ -91,6 +91,16 @@ pub(super) struct CommitTracker {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct CommitSlot {
     sequence: Sequence,
+}
+
+#[derive(Debug)]
+pub(super) struct PublishBarrier {
+    lock: Mutex<()>,
+}
+
+#[derive(Debug)]
+pub(super) struct PublishBarrierGuard<'barrier> {
+    _guard: MutexGuard<'barrier, ()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,6 +206,21 @@ impl CommitTracker {
                 Some(CommitSlotState::Open) | None => break,
             }
         }
+    }
+}
+
+impl PublishBarrier {
+    fn new() -> Self {
+        Self {
+            lock: Mutex::new(()),
+        }
+    }
+
+    pub(super) fn enter(&self) -> Result<PublishBarrierGuard<'_>> {
+        self.lock
+            .lock()
+            .map(|guard| PublishBarrierGuard { _guard: guard })
+            .map_err(|_| lock_poisoned("publish barrier"))
     }
 }
 
@@ -690,7 +715,7 @@ impl Db {
                 user_handles: AtomicUsize::new(1),
                 commit_tracker: CommitTracker::new(Sequence::ZERO),
                 closed: AtomicBool::new(false),
-                writer: Mutex::new(()),
+                publish_barrier: PublishBarrier::new(),
                 process_lock: Mutex::new(None),
                 buckets: RwLock::new(buckets),
                 snapshots: Arc::new(SnapshotTracker::default()),
@@ -781,7 +806,7 @@ impl Db {
                 user_handles: AtomicUsize::new(1),
                 commit_tracker: CommitTracker::new(Sequence::ZERO),
                 closed: AtomicBool::new(false),
-                writer: Mutex::new(()),
+                publish_barrier: PublishBarrier::new(),
                 process_lock: Mutex::new(process_lock),
                 buckets: RwLock::new(buckets),
                 snapshots: Arc::new(SnapshotTracker::default()),
@@ -1371,10 +1396,10 @@ impl Db {
             &self.inner.runtime_shutdown,
             &self.inner.background_workers,
         );
-        // The directory lock is released only after the writer coordinator is
+        // The directory lock is released only after the publish barrier is
         // idle. Otherwise a second process could open while this one is still
         // publishing files for a commit, flush, or compaction.
-        let Ok(_writer) = self.inner.writer.lock() else {
+        let Ok(_publish) = self.inner.publish_barrier.enter() else {
             return;
         };
         if let Some(db_path) = self.persistent_path().map(Path::to_path_buf) {
@@ -1822,11 +1847,7 @@ impl Db {
         };
 
         if freeze_active {
-            let _writer = self
-                .inner
-                .writer
-                .lock()
-                .map_err(|_| lock_poisoned("writer coordinator"))?;
+            let _publish = self.inner.publish_barrier.enter()?;
             self.freeze_all_active_memtables(self.last_committed_sequence())?;
         }
 
@@ -1834,7 +1855,7 @@ impl Db {
         self.write_flush_inputs(db_path, &flush_inputs)
     }
 
-    fn freeze_large_active_memtables_after_commit_locked(
+    fn freeze_large_active_memtables_after_commit_under_barrier(
         &self,
         sequence: Sequence,
         states: &[Arc<LsmTree>],
@@ -1854,14 +1875,10 @@ impl Db {
     }
 
     fn freeze_public_flush_target(&self) -> Result<Sequence> {
-        // Capture the public flush boundary while the writer coordinator is
+        // Capture the public flush boundary while the publish barrier is
         // held. Later concurrent commits may fill the new active memtable, but
         // `flush()` only waits for data committed before this sequence.
-        let _writer = self
-            .inner
-            .writer
-            .lock()
-            .map_err(|_| lock_poisoned("writer coordinator"))?;
+        let _publish = self.inner.publish_barrier.enter()?;
         let target_sequence = self.last_committed_sequence();
         self.freeze_all_active_memtables(target_sequence)?;
 
@@ -1955,11 +1972,7 @@ impl Db {
         }
 
         {
-            let _writer = self
-                .inner
-                .writer
-                .lock()
-                .map_err(|_| lock_poisoned("writer coordinator"))?;
+            let _publish = self.inner.publish_barrier.enter()?;
             if let Err(error) = self.publish_flushed_tables(&written_tables, flush_sequence) {
                 let _ = remove_storage_files(db_path, &written_table_ids);
                 return Err(error);
@@ -2139,11 +2152,7 @@ impl Db {
             }
         }
 
-        let _writer = self
-            .inner
-            .writer
-            .lock()
-            .map_err(|_| lock_poisoned("writer coordinator"))?;
+        let _publish = self.inner.publish_barrier.enter()?;
         if let Err(error) = self.validate_compacted_tables(&written_tables) {
             let _ = remove_storage_files(db_path, &written_table_ids);
             if is_level_layout_compaction_error(&error) {

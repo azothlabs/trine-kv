@@ -1687,3 +1687,27 @@ exist.
   compaction, recovery, cleanup, and public API behavior remain unchanged.
 - Focused async/write/runtime tests, formatting, clippy, full tests, and diff
   checks pass.
+
+### Phase 79: Writer-Local Accepted State And Publish Barrier
+
+**Status**: Complete
+
+**Goal**: Make accepted write state and the durable publish boundary explicit
+before changing the writer coordinator shape.
+
+**Entry Condition**: Phase 78 complete and accepted async writes run under
+Trine-owned runtime execution after first poll.
+
+**Acceptance Gate**:
+
+- `DbInner` has a named publish barrier instead of an anonymous writer mutex.
+- Write acceptance/preflight returns an explicit writer-local state before
+  entering the publish barrier.
+- Publish-time routing, transaction validation, sequence assignment, WAL
+  append, memtable delta publication, visibility marking, and post-commit
+  freeze remain serialized by the named publish barrier.
+- Blocking and async write behavior remains unchanged.
+- Commit tracker, WAL/table/blob/manifest formats, MVCC, compaction, recovery,
+  cleanup, and public API behavior remain unchanged.
+- Focused write/concurrency tests, formatting, clippy, full tests, and diff
+  checks pass.

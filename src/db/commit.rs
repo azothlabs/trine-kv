@@ -15,13 +15,39 @@ use crate::{
     write_batch::{BatchOperation, WriteBatch},
 };
 
-use super::{Db, lock_poisoned, validate_batch_len};
+use super::{Db, PublishBarrierGuard, lock_poisoned, validate_batch_len};
 
 #[derive(Debug)]
 struct WriteRequest {
     operations: Vec<BatchOperation>,
     write_options: WriteOptions,
     transaction_reads: Option<TransactionReads>,
+}
+
+#[derive(Debug)]
+enum AcceptedWriteState {
+    Noop(CommitInfo),
+    Pending(WriterLocalWriteState),
+}
+
+#[derive(Debug)]
+struct WriterLocalWriteState {
+    operations: Vec<BatchOperation>,
+    write_options: WriteOptions,
+    transaction_reads: Option<TransactionReads>,
+}
+
+#[derive(Debug)]
+struct RoutedWriteOperation {
+    batch_index: u32,
+    operation: BatchOperation,
+    state: Arc<LsmTree>,
+}
+
+#[derive(Debug)]
+struct PublishedWrite {
+    commit_info: CommitInfo,
+    request_flush: bool,
 }
 
 #[derive(Debug)]
@@ -88,6 +114,29 @@ impl WriteRequest {
                 read_sequence,
                 read_set,
             }),
+        }
+    }
+}
+
+impl WriterLocalWriteState {
+    fn new(
+        operations: Vec<BatchOperation>,
+        write_options: WriteOptions,
+        transaction_reads: Option<TransactionReads>,
+    ) -> Self {
+        Self {
+            operations,
+            write_options,
+            transaction_reads,
+        }
+    }
+}
+
+impl PublishedWrite {
+    const fn new(commit_info: CommitInfo, request_flush: bool) -> Self {
+        Self {
+            commit_info,
+            request_flush,
         }
     }
 }
@@ -317,6 +366,11 @@ impl Db {
     }
 
     fn commit_write_request(&self, request: WriteRequest) -> Result<CommitInfo> {
+        let accepted_state = self.accept_write_request(request)?;
+        self.publish_accepted_write_state(accepted_state)
+    }
+
+    fn accept_write_request(&self, request: WriteRequest) -> Result<AcceptedWriteState> {
         let WriteRequest {
             operations,
             write_options,
@@ -325,7 +379,9 @@ impl Db {
         self.ensure_open()?;
 
         if operations.is_empty() && transaction_reads.is_none() {
-            return Ok(CommitInfo::new(self.last_committed_sequence()));
+            return Ok(AcceptedWriteState::Noop(CommitInfo::new(
+                self.last_committed_sequence(),
+            )));
         }
 
         if self.inner.options.read_only && !operations.is_empty() {
@@ -333,24 +389,53 @@ impl Db {
         }
         self.take_background_maintenance_error()?;
 
-        // Check every batch-wide precondition before taking the writer lock or
-        // touching memtables, so a rejected batch cannot leave partial state.
+        // Check every batch-wide precondition before entering the publish
+        // barrier or touching memtables, so a rejected batch cannot leave
+        // partial state.
         validate_batch_len(operations.len())?;
         if !operations.is_empty() {
             self.apply_write_backpressure()?;
         }
 
-        // The writer lock serializes commit sequence assignment and memtable
-        // updates. Reads only take bucket/table read locks and do not enter
-        // this coordinator.
-        let _writer = self
-            .inner
-            .writer
-            .lock()
-            .map_err(|_| lock_poisoned("writer coordinator"))?;
+        Ok(AcceptedWriteState::Pending(WriterLocalWriteState::new(
+            operations,
+            write_options,
+            transaction_reads,
+        )))
+    }
 
-        // Read validation and writes share one commit slot. Once validation
-        // succeeds, no other writer can sneak in before this batch lands.
+    fn publish_accepted_write_state(
+        &self,
+        accepted_state: AcceptedWriteState,
+    ) -> Result<CommitInfo> {
+        match accepted_state {
+            AcceptedWriteState::Noop(commit_info) => Ok(commit_info),
+            AcceptedWriteState::Pending(writer_state) => {
+                let publish = self.inner.publish_barrier.enter()?;
+                let published =
+                    self.publish_writer_local_state_under_barrier(writer_state, &publish)?;
+                if published.request_flush {
+                    self.request_background_flush();
+                }
+                Ok(published.commit_info)
+            }
+        }
+    }
+
+    fn publish_writer_local_state_under_barrier(
+        &self,
+        writer_state: WriterLocalWriteState,
+        _publish: &PublishBarrierGuard<'_>,
+    ) -> Result<PublishedWrite> {
+        let WriterLocalWriteState {
+            operations,
+            write_options,
+            transaction_reads,
+        } = writer_state;
+
+        // Read validation, sequence assignment, WAL append, and delta
+        // publication share one publish slot. Once validation succeeds, no
+        // other writer can publish before this accepted state lands.
         if let Some(TransactionReads {
             read_sequence,
             read_set,
@@ -359,25 +444,16 @@ impl Db {
             self.validate_transaction_reads(read_sequence, &read_set)?;
         }
         if operations.is_empty() {
-            return Ok(CommitInfo::new(self.last_committed_sequence()));
+            return Ok(PublishedWrite::new(
+                CommitInfo::new(self.last_committed_sequence()),
+                false,
+            ));
         }
 
-        let states = self.resolve_batch_buckets(&operations)?;
-
-        let indexed_operations = operations
-            .into_iter()
-            .zip(states)
-            .enumerate()
-            .map(|(batch_index, (operation, state))| {
-                let batch_index = u32::try_from(batch_index).map_err(|_| {
-                    Error::invalid_options("write batch operation count exceeds u32::MAX")
-                })?;
-                Ok((batch_index, operation, state))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let wal_operations = indexed_operations
+        let routed_operations = self.route_writer_local_operations(operations)?;
+        let wal_operations = routed_operations
             .iter()
-            .map(|(_, operation, _)| operation.clone())
+            .map(|routed| routed.operation.clone())
             .collect::<Vec<_>>();
 
         let durability =
@@ -390,13 +466,17 @@ impl Db {
         }
 
         let touched_states = unique_lsm_trees(
-            indexed_operations
+            routed_operations
                 .iter()
-                .map(|(_, _, state)| Arc::clone(state)),
+                .map(|routed| Arc::clone(&routed.state)),
         );
         let mut delta_publication_started = false;
-        for (batch_index, operation, state) in indexed_operations {
-            if let Err(error) = state.apply_operation(operation, sequence, batch_index) {
+        for routed in routed_operations {
+            if let Err(error) =
+                routed
+                    .state
+                    .apply_operation(routed.operation, sequence, routed.batch_index)
+            {
                 if !delta_publication_started {
                     self.inner.commit_tracker.mark_skipped(slot)?;
                 }
@@ -406,10 +486,34 @@ impl Db {
         }
 
         self.inner.commit_tracker.mark_visible(slot)?;
-        if self.freeze_large_active_memtables_after_commit_locked(sequence, &touched_states)? {
-            self.request_background_flush();
-        }
-        Ok(CommitInfo::new(sequence))
+        let request_flush = self
+            .freeze_large_active_memtables_after_commit_under_barrier(sequence, &touched_states)?;
+        Ok(PublishedWrite::new(
+            CommitInfo::new(sequence),
+            request_flush,
+        ))
+    }
+
+    fn route_writer_local_operations(
+        &self,
+        operations: Vec<BatchOperation>,
+    ) -> Result<Vec<RoutedWriteOperation>> {
+        let states = self.resolve_batch_buckets(&operations)?;
+        operations
+            .into_iter()
+            .zip(states)
+            .enumerate()
+            .map(|(batch_index, (operation, state))| {
+                let batch_index = u32::try_from(batch_index).map_err(|_| {
+                    Error::invalid_options("write batch operation count exceeds u32::MAX")
+                })?;
+                Ok(RoutedWriteOperation {
+                    batch_index,
+                    operation,
+                    state,
+                })
+            })
+            .collect()
     }
 
     fn validate_transaction_reads(
@@ -532,6 +636,8 @@ const fn durability_rank(mode: DurabilityMode) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::{
         Db, WriteBatch,
         db::CommitTracker,
@@ -540,7 +646,9 @@ mod tests {
         types::Sequence,
     };
 
-    use super::{AcceptedWrite, DurabilityMode, WriteRequest, effective_durability};
+    use super::{
+        AcceptedWrite, AcceptedWriteState, DurabilityMode, WriteRequest, effective_durability,
+    };
 
     #[test]
     fn database_durability_is_a_write_floor() {
@@ -617,5 +725,69 @@ mod tests {
 
         assert!(matches!(error, Error::ReadOnly));
         assert_eq!(db.get(b"k").expect("read missing key"), None);
+    }
+
+    #[test]
+    fn accepted_write_preflight_creates_writer_local_state_without_publication() {
+        let db = Db::open_memory().expect("memory db opens");
+        db.bucket("events").expect("named bucket opens");
+        let mut batch = WriteBatch::new();
+        batch.put(b"default".to_vec(), b"v1".to_vec());
+        batch
+            .put_bucket("events", b"event".to_vec(), b"v2".to_vec())
+            .expect("stage named bucket write");
+        let request = WriteRequest::batch(batch, WriteOptions::default());
+
+        let accepted_state = db
+            .accept_write_request(request)
+            .expect("write request is accepted");
+        let AcceptedWriteState::Pending(writer_state) = accepted_state else {
+            panic!("non-empty write must produce writer-local state");
+        };
+
+        assert_eq!(writer_state.operations.len(), 2);
+        assert!(writer_state.transaction_reads.is_none());
+        assert_eq!(db.last_committed_sequence(), Sequence::ZERO);
+        assert_eq!(db.get(b"default").expect("preflight is not visible"), None);
+
+        let routed = db
+            .route_writer_local_operations(writer_state.operations)
+            .expect("route writer-local operations");
+        assert_eq!(routed[0].batch_index, 0);
+        assert_eq!(routed[0].operation.bucket(), "default");
+        assert_eq!(routed[1].batch_index, 1);
+        assert_eq!(routed[1].operation.bucket(), "events");
+        assert!(!Arc::ptr_eq(&routed[0].state, &routed[1].state));
+    }
+
+    #[test]
+    fn writer_local_state_publishes_under_publish_barrier() {
+        let db = Db::open_memory().expect("memory db opens");
+        let mut batch = WriteBatch::new();
+        batch.put(b"k".to_vec(), b"v".to_vec());
+        let request = WriteRequest::batch(batch, WriteOptions::default());
+        let accepted_state = db
+            .accept_write_request(request)
+            .expect("write request is accepted");
+        let AcceptedWriteState::Pending(writer_state) = accepted_state else {
+            panic!("non-empty write must produce writer-local state");
+        };
+
+        let publish = db
+            .inner
+            .publish_barrier
+            .enter()
+            .expect("enter publish barrier");
+        let published = db
+            .publish_writer_local_state_under_barrier(writer_state, &publish)
+            .expect("publish writer-local state");
+
+        assert!(!published.request_flush);
+        assert_eq!(published.commit_info.sequence(), Sequence::new(1));
+        assert_eq!(db.last_committed_sequence(), Sequence::new(1));
+        assert_eq!(
+            db.get(b"k").expect("read committed key"),
+            Some(b"v".to_vec())
+        );
     }
 }
