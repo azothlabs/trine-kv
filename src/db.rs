@@ -2806,7 +2806,9 @@ impl Db {
     }
 
     pub async fn put_async(&self, key: impl Into<Vec<u8>>, value: impl Into<Value>) -> Result<()> {
-        self.put(key, value)
+        self.put_with_options_async(key, value, WriteOptions::default())
+            .await
+            .map(|_| ())
     }
 
     pub async fn put_with_options_async(
@@ -2815,11 +2817,15 @@ impl Db {
         value: impl Into<Value>,
         options: WriteOptions,
     ) -> Result<CommitInfo> {
-        self.put_with_options(key, value, options)
+        let mut batch = crate::WriteBatch::new();
+        batch.put(key, value);
+        self.write_async(batch, options).await
     }
 
     pub async fn delete_async(&self, key: impl Into<Vec<u8>>) -> Result<()> {
-        self.delete(key)
+        self.delete_with_options_async(key, WriteOptions::default())
+            .await
+            .map(|_| ())
     }
 
     pub async fn delete_with_options_async(
@@ -2827,11 +2833,15 @@ impl Db {
         key: impl Into<Vec<u8>>,
         options: WriteOptions,
     ) -> Result<CommitInfo> {
-        self.delete_with_options(key, options)
+        let mut batch = crate::WriteBatch::new();
+        batch.delete(key);
+        self.write_async(batch, options).await
     }
 
     pub async fn delete_range_async(&self, range: KeyRange) -> Result<()> {
-        self.delete_range(range)
+        self.delete_range_with_options_async(range, WriteOptions::default())
+            .await
+            .map(|_| ())
     }
 
     pub async fn delete_range_with_options_async(
@@ -2839,15 +2849,9 @@ impl Db {
         range: KeyRange,
         options: WriteOptions,
     ) -> Result<CommitInfo> {
-        self.delete_range_with_options(range, options)
-    }
-
-    pub async fn write_async(
-        &self,
-        batch: crate::WriteBatch,
-        options: WriteOptions,
-    ) -> Result<CommitInfo> {
-        self.write(batch, options)
+        let mut batch = crate::WriteBatch::new();
+        batch.delete_range(range);
+        self.write_async(batch, options).await
     }
 
     pub async fn range_async(&self, range: &KeyRange) -> Result<Iter> {

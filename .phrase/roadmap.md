@@ -1662,3 +1662,28 @@ primitives exist.
   compaction, recovery, cleanup, and public API behavior remain unchanged.
 - Focused write/async tests, formatting, clippy, full tests, and diff checks
   pass.
+
+### Phase 78: Runtime-Owned Write Execution
+
+**Status**: Complete
+
+**Goal**: Move accepted async writes behind the runtime boundary while
+preserving cancellation-before-poll and terminal-after-acceptance behavior.
+
+**Entry Condition**: Phase 77 complete and owned write request/completion types
+exist.
+
+**Acceptance Gate**:
+
+- Async batch, default-bucket, named-bucket, and transaction writes create an
+  accepted write and hand execution to the runtime after the first poll.
+- Dropping an unpolled async write future has no side effect.
+- Dropping a polled accepted write future does not cancel the internal commit in
+  native-thread runtime mode.
+- Inline runtime mode still completes async writes without background-thread
+  capability.
+- Blocking write and transaction commit behavior remains unchanged.
+- Writer coordinator, commit tracker, WAL/table/blob/manifest formats, MVCC,
+  compaction, recovery, cleanup, and public API behavior remain unchanged.
+- Focused async/write/runtime tests, formatting, clippy, full tests, and diff
+  checks pass.

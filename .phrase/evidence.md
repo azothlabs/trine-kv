@@ -6070,3 +6070,61 @@ Record only evidence that can change planning or durable decisions.
 
 - Move accepted write execution behind the runtime boundary while preserving the
   cancellation-before-poll and terminal-after-acceptance tests.
+
+## 2026-05-31: Runtime-Owned Write Execution
+
+### Observation
+
+- Async write compatibility methods previously ran commit work on the caller's
+  poll stack after the future was first polled.
+- Phase 77 created owned write requests and completion waiters, but execution
+  still stayed inline.
+- Runtime mode already reported whether native background threads were
+  available.
+
+### Interpretation
+
+- The async write boundary can accept work on first poll and then let native
+  runtime execution own the commit to completion.
+- The unpolled future rule remains the cancellation boundary: before first poll
+  there is no accepted write; after first poll, the accepted write is internal
+  database work.
+- Inline runtime mode should keep a synchronous compatibility path without
+  pretending it has background-thread capability.
+
+### Verification
+
+- Added an internal `WriteFuture` with explicit start, waiting, and done states.
+- Added waker storage to `WriteCompletion` so runtime-owned writes can wake the
+  polling future when the commit result lands.
+- `Db::write_async` now returns the internal write future instead of an inline
+  async wrapper.
+- Native-thread runtime mode spawns accepted writes through the runtime
+  boundary.
+- Inline runtime mode executes accepted writes through the same completion
+  path without background threads.
+- Default-bucket, named-bucket, batch, and transaction async writes route
+  through the owned write execution boundary.
+- Added tests proving unpolled write futures have no side effect, polled
+  accepted native writes keep running after the future is dropped, inline
+  runtime writes complete, and ordinary async terminal commits remain visible.
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test accepted_write --lib`
+- `cargo test --test async_api`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan outside the repository instruction file
+
+### Remaining Blockers
+
+- Accepted writes are runtime-owned after first poll, but the write coordinator
+  still serializes durable commit publication.
+- True multi-writer execution still needs writer-local deltas, WAL partitioning,
+  and a publish barrier.
+- Native-file storage remains blocking behind native-thread runtime execution.
+
+### Recommended Next Action
+
+- Choose the next concurrency phase around writer-local accepted state and the
+  publish barrier before changing WAL partitioning.

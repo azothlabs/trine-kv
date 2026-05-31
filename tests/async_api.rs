@@ -2,33 +2,69 @@ use std::{
     future::Future,
     sync::Arc,
     task::{Context, Poll, Wake, Waker},
+    thread,
+    time::{Duration, Instant},
 };
 
 use trine_kv::{
-    Db, DbOptions, DurabilityMode, Iter, KeyRange, KeyValue, LazyIter, Sequence,
+    Db, DbOptions, DurabilityMode, Iter, KeyRange, KeyValue, LazyIter, RuntimeOptions, Sequence,
     TransactionOptions, WriteBatch, WriteOptions,
 };
 
-fn block_on_ready<T>(future: impl Future<Output = T>) -> T {
-    struct NoopWake;
+struct ThreadWake {
+    thread: thread::Thread,
+}
 
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
+impl Wake for ThreadWake {
+    fn wake(self: Arc<Self>) {
+        self.thread.unpark();
     }
 
-    let waker = Waker::from(Arc::new(NoopWake));
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.thread.unpark();
+    }
+}
+
+fn current_thread_waker() -> Waker {
+    Waker::from(Arc::new(ThreadWake {
+        thread: thread::current(),
+    }))
+}
+
+fn block_on<T>(future: impl Future<Output = T>) -> T {
+    let waker = current_thread_waker();
     let mut context = Context::from_waker(&waker);
     let mut future = std::pin::pin!(future);
-    match Future::poll(future.as_mut(), &mut context) {
-        Poll::Ready(value) => value,
-        Poll::Pending => panic!("async compatibility future unexpectedly pending"),
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match Future::poll(future.as_mut(), &mut context) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => {
+                assert!(
+                    Instant::now() < deadline,
+                    "async compatibility future did not complete"
+                );
+                thread::park_timeout(Duration::from_millis(10));
+            }
+        }
     }
+}
+
+fn wait_until(mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if condition() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    panic!("condition did not become true before timeout");
 }
 
 fn collect_async(mut iter: Iter) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut rows = Vec::new();
     while let Some(KeyValue { key, value }) =
-        block_on_ready(iter.next_async()).expect("async iterator item is readable")
+        block_on(iter.next_async()).expect("async iterator item is readable")
     {
         rows.push((key, value));
     }
@@ -38,9 +74,9 @@ fn collect_async(mut iter: Iter) -> Vec<(Vec<u8>, Vec<u8>)> {
 fn collect_lazy_async(mut iter: LazyIter) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut rows = Vec::new();
     while let Some(item) =
-        block_on_ready(iter.next_async()).expect("async lazy iterator item is readable")
+        block_on(iter.next_async()).expect("async lazy iterator item is readable")
     {
-        let value = block_on_ready(item.value.read_async()).expect("lazy value reads");
+        let value = block_on(item.value.read_async()).expect("lazy value reads");
         rows.push((item.key, value));
     }
     rows
@@ -48,95 +84,92 @@ fn collect_lazy_async(mut iter: LazyIter) -> Vec<(Vec<u8>, Vec<u8>)> {
 
 #[test]
 fn memory_async_compatibility_surface_smoke() {
-    let db = block_on_ready(Db::open_async(DbOptions::memory())).expect("memory db opens");
+    let db = block_on(Db::open_async(DbOptions::memory())).expect("memory db opens");
 
-    block_on_ready(db.put_async(b"a".to_vec(), b"one".to_vec())).expect("put through async API");
+    block_on(db.put_async(b"a".to_vec(), b"one".to_vec())).expect("put through async API");
     assert_eq!(
-        block_on_ready(db.get_async(b"a")).expect("get through async API"),
+        block_on(db.get_async(b"a")).expect("get through async API"),
         Some(b"one".to_vec())
     );
 
     let mut batch = WriteBatch::new();
     batch.put(b"b".to_vec(), b"two".to_vec());
-    let commit =
-        block_on_ready(db.write_async(batch, WriteOptions::default())).expect("batch writes");
+    let commit = block_on(db.write_async(batch, WriteOptions::default())).expect("batch writes");
     assert_eq!(commit.sequence(), db.last_committed_sequence());
 
     let default_rows =
-        collect_async(block_on_ready(db.prefix_async(b"b".to_vec())).expect("prefix opens"));
+        collect_async(block_on(db.prefix_async(b"b".to_vec())).expect("prefix opens"));
     assert_eq!(default_rows, vec![(b"b".to_vec(), b"two".to_vec())]);
     assert_eq!(
-        collect_lazy_async(
-            block_on_ready(db.prefix_lazy_async(b"b".to_vec())).expect("prefix opens")
-        ),
+        collect_lazy_async(block_on(db.prefix_lazy_async(b"b".to_vec())).expect("prefix opens")),
         vec![(b"b".to_vec(), b"two".to_vec())]
     );
 
-    let events = block_on_ready(db.bucket_async("events")).expect("bucket opens");
-    block_on_ready(events.put_async(b"e1".to_vec(), b"event".to_vec()))
+    let events = block_on(db.bucket_async("events")).expect("bucket opens");
+    block_on(events.put_async(b"e1".to_vec(), b"event".to_vec()))
         .expect("bucket put through async API");
     assert_eq!(
-        block_on_ready(events.get_async(b"e1")).expect("bucket get through async API"),
+        block_on(events.get_async(b"e1")).expect("bucket get through async API"),
         Some(b"event".to_vec())
     );
     assert_eq!(
-        collect_async(block_on_ready(events.range_async(&KeyRange::all())).expect("range opens")),
+        collect_async(block_on(events.range_async(&KeyRange::all())).expect("range opens")),
         vec![(b"e1".to_vec(), b"event".to_vec())]
     );
     let mut lazy_events =
-        block_on_ready(events.range_lazy_async(&KeyRange::all())).expect("lazy range opens");
-    let lazy_event = block_on_ready(lazy_events.next_async())
+        block_on(events.range_lazy_async(&KeyRange::all())).expect("lazy range opens");
+    let lazy_event = block_on(lazy_events.next_async())
         .expect("lazy event advances")
         .expect("lazy event exists");
-    let lazy_event = block_on_ready(lazy_event.into_key_value_async())
+    let lazy_event = block_on(lazy_event.into_key_value_async())
         .expect("lazy event converts into owned key/value");
     assert_eq!(lazy_event.key, b"e1".to_vec());
     assert_eq!(lazy_event.value, b"event".to_vec());
     assert!(
-        block_on_ready(lazy_events.next_async())
+        block_on(lazy_events.next_async())
             .expect("lazy event iterator finishes")
             .is_none()
     );
 
     let mut txn = db.transaction(TransactionOptions::default());
     assert_eq!(
-        block_on_ready(txn.get_async(b"b")).expect("transaction async point read"),
+        block_on(txn.get_async(b"b")).expect("transaction async point read"),
         Some(b"two".to_vec())
     );
-    block_on_ready(txn.read_range_async(KeyRange::all())).expect("transaction async range read");
+    block_on(txn.read_range_async(KeyRange::all())).expect("transaction async range read");
     txn.put(b"c".to_vec(), b"three".to_vec());
-    let txn_commit = block_on_ready(txn.commit_async()).expect("transaction async commit");
+    let txn_commit = block_on(txn.commit_async()).expect("transaction async commit");
     assert_eq!(txn_commit.sequence(), db.last_committed_sequence());
     assert_eq!(
-        block_on_ready(db.get_async(b"c")).expect("transaction write reads"),
+        block_on(db.get_async(b"c")).expect("transaction write reads"),
         Some(b"three".to_vec())
     );
 
     let mut named_txn = db.transaction(TransactionOptions::default());
     assert_eq!(
-        block_on_ready(named_txn.get_bucket_async("events", b"e1"))
+        block_on(named_txn.get_bucket_async("events", b"e1"))
             .expect("named transaction async point read"),
         Some(b"event".to_vec())
     );
     named_txn
         .put_bucket("events", b"e2".to_vec(), b"event-two".to_vec())
         .expect("named transaction stages write");
-    block_on_ready(named_txn.commit_async()).expect("named transaction async commit");
+    block_on(named_txn.commit_async()).expect("named transaction async commit");
     assert_eq!(
-        block_on_ready(events.get_async(b"e2")).expect("named transaction write reads"),
+        block_on(events.get_async(b"e2")).expect("named transaction write reads"),
         Some(b"event-two".to_vec())
     );
 
-    block_on_ready(db.delete_async(b"a".to_vec())).expect("delete through async API");
+    block_on(db.delete_async(b"a".to_vec())).expect("delete through async API");
     assert_eq!(
-        block_on_ready(db.get_async(b"a")).expect("deleted key reads"),
+        block_on(db.get_async(b"a")).expect("deleted key reads"),
         None
     );
 
-    block_on_ready(db.persist_async(DurabilityMode::Buffered)).expect("memory persist is accepted");
-    block_on_ready(db.flush_async()).expect("memory flush is accepted");
-    block_on_ready(db.compact_range_async(KeyRange::all())).expect("memory compact is accepted");
-    block_on_ready(db.close_async());
+    block_on(db.persist_async(DurabilityMode::Buffered)).expect("memory persist is accepted");
+    block_on(db.flush_async()).expect("memory flush is accepted");
+    block_on(db.compact_range_async(KeyRange::all())).expect("memory compact is accepted");
+    block_on(db.close_async());
 }
 
 #[test]
@@ -159,12 +192,58 @@ fn polled_async_write_future_reaches_visible_terminal_commit() {
     let mut batch = WriteBatch::new();
     batch.put(b"accepted".to_vec(), b"value".to_vec());
 
-    let commit = block_on_ready(db.write_async(batch, WriteOptions::default()))
-        .expect("async write commits");
+    let commit =
+        block_on(db.write_async(batch, WriteOptions::default())).expect("async write commits");
 
     assert_eq!(commit.sequence(), db.last_committed_sequence());
     assert_eq!(
         db.get(b"accepted").expect("read after accepted future"),
+        Some(b"value".to_vec())
+    );
+}
+
+#[test]
+fn dropping_polled_async_write_future_does_not_cancel_accepted_native_write() {
+    let db = Db::open_memory().expect("memory db opens");
+    let mut batch = WriteBatch::new();
+    batch.put(b"accepted-after-drop".to_vec(), b"value".to_vec());
+
+    let mut write = Box::pin(db.write_async(batch, WriteOptions::default()));
+    let waker = current_thread_waker();
+    let mut context = Context::from_waker(&waker);
+    assert!(matches!(
+        Future::poll(write.as_mut(), &mut context),
+        Poll::Pending
+    ));
+    drop(write);
+
+    wait_until(|| {
+        db.get(b"accepted-after-drop")
+            .expect("read after accepted future drop")
+            .is_some()
+    });
+    assert_eq!(
+        db.get(b"accepted-after-drop")
+            .expect("read accepted key after dropped future"),
+        Some(b"value".to_vec())
+    );
+    assert_eq!(db.last_committed_sequence(), Sequence::new(1));
+}
+
+#[test]
+fn inline_runtime_async_write_completes_without_background_threads() {
+    let mut options = DbOptions::memory();
+    options.runtime = RuntimeOptions::inline();
+    let db = Db::memory(options).expect("inline runtime memory db opens");
+    let mut batch = WriteBatch::new();
+    batch.put(b"inline".to_vec(), b"value".to_vec());
+
+    let commit = block_on(db.write_async(batch, WriteOptions::default()))
+        .expect("inline runtime async write commits");
+
+    assert_eq!(commit.sequence(), Sequence::new(1));
+    assert_eq!(
+        db.get(b"inline").expect("read inline runtime write"),
         Some(b"value".to_vec())
     );
 }

@@ -201,6 +201,18 @@ impl Transaction {
     }
 
     pub async fn commit_async(self) -> Result<CommitInfo> {
-        self.commit()
+        let read_set = TransactionReadSet {
+            point_reads: self.point_reads,
+            range_reads: self.range_reads,
+        };
+
+        self.db
+            .commit_transaction_async(
+                self.read_sequence,
+                read_set,
+                self.writes,
+                self.options.write_options,
+            )
+            .await
     }
 }

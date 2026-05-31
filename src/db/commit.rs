@@ -1,4 +1,9 @@
-use std::sync::{Arc, Condvar, Mutex};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Condvar, Mutex},
+    task::{Context, Poll, Waker},
+};
 
 use crate::{
     error::{Error, Result},
@@ -40,6 +45,25 @@ struct WriteWaiter {
 struct WriteCompletion {
     result: Mutex<Option<Result<CommitInfo>>>,
     ready: Condvar,
+    waker: Mutex<Option<Waker>>,
+}
+
+#[derive(Debug)]
+struct WriteFuture {
+    state: WriteFutureState,
+}
+
+#[derive(Debug)]
+enum WriteFutureState {
+    Start { db: Db, request: WriteRequest },
+    Waiting { waiter: WriteWaiter },
+    Done,
+}
+
+#[derive(Debug)]
+enum WriteStart {
+    Ready(Result<CommitInfo>),
+    Pending(WriteWaiter),
 }
 
 impl WriteRequest {
@@ -91,16 +115,27 @@ impl WriteCompletion {
         Self {
             result: Mutex::new(None),
             ready: Condvar::new(),
+            waker: Mutex::new(None),
         }
     }
 
     fn complete(&self, result: Result<CommitInfo>) {
-        let mut slot = match self.result.lock() {
-            Ok(slot) => slot,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *slot = Some(result);
+        {
+            let mut slot = match self.result.lock() {
+                Ok(slot) => slot,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *slot = Some(result);
+        }
         self.ready.notify_all();
+
+        let waker = match self.waker.lock() {
+            Ok(mut waker) => waker.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 }
 
@@ -122,11 +157,123 @@ impl WriteWaiter {
                 .map_err(|_| lock_poisoned("write completion"))?;
         }
     }
+
+    fn poll_result(&self, context: &mut Context<'_>) -> Poll<Result<CommitInfo>> {
+        match self.take_result() {
+            Ok(Some(result)) => return Poll::Ready(result),
+            Ok(None) => {}
+            Err(error) => return Poll::Ready(Err(error)),
+        }
+
+        if let Err(error) = self.register_waker(context) {
+            return Poll::Ready(Err(error));
+        }
+
+        match self.take_result() {
+            Ok(Some(result)) => Poll::Ready(result),
+            Ok(None) => Poll::Pending,
+            Err(error) => Poll::Ready(Err(error)),
+        }
+    }
+
+    fn register_waker(&self, context: &Context<'_>) -> Result<()> {
+        let mut waker = self
+            .completion
+            .waker
+            .lock()
+            .map_err(|_| lock_poisoned("write completion waker"))?;
+        let replace = match waker.as_ref() {
+            Some(registered) => !registered.will_wake(context.waker()),
+            None => true,
+        };
+        if replace {
+            *waker = Some(context.waker().clone());
+        }
+        Ok(())
+    }
+
+    fn take_result(&self) -> Result<Option<Result<CommitInfo>>> {
+        self.completion
+            .result
+            .lock()
+            .map(|mut result| result.take())
+            .map_err(|_| lock_poisoned("write completion"))
+    }
+}
+
+impl WriteFuture {
+    fn new(db: Db, request: WriteRequest) -> Self {
+        Self {
+            state: WriteFutureState::Start { db, request },
+        }
+    }
+
+    fn start(db: &Db, request: WriteRequest, context: &mut Context<'_>) -> WriteStart {
+        let (accepted_write, waiter) = AcceptedWrite::accept(request);
+        if db.inner.runtime.capabilities().background_threads() {
+            if let Err(error) = waiter.register_waker(context) {
+                return WriteStart::Ready(Err(error));
+            }
+            let task_db = db.clone();
+            let spawn_result =
+                db.inner
+                    .runtime
+                    .spawn_background("trine-kv-write".to_owned(), move || {
+                        accepted_write.execute(&task_db);
+                    });
+            return match spawn_result {
+                Ok(_task) => WriteStart::Pending(waiter),
+                Err(error) => WriteStart::Ready(Err(error)),
+            };
+        }
+
+        accepted_write.execute(db);
+        match waiter.poll_result(context) {
+            Poll::Ready(result) => WriteStart::Ready(result),
+            Poll::Pending => WriteStart::Pending(waiter),
+        }
+    }
+}
+
+impl Future for WriteFuture {
+    type Output = Result<CommitInfo>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let state = std::mem::replace(&mut self.state, WriteFutureState::Done);
+        match state {
+            WriteFutureState::Start { db, request } => match Self::start(&db, request, context) {
+                WriteStart::Ready(result) => Poll::Ready(result),
+                WriteStart::Pending(waiter) => {
+                    self.state = WriteFutureState::Waiting { waiter };
+                    Poll::Pending
+                }
+            },
+            WriteFutureState::Waiting { waiter } => match waiter.poll_result(context) {
+                Poll::Ready(result) => Poll::Ready(result),
+                Poll::Pending => {
+                    self.state = WriteFutureState::Waiting { waiter };
+                    Poll::Pending
+                }
+            },
+            WriteFutureState::Done => {
+                panic!("write future polled after completion");
+            }
+        }
+    }
 }
 
 impl Db {
     pub fn write(&self, batch: WriteBatch, options: WriteOptions) -> Result<CommitInfo> {
         self.run_accepted_write(WriteRequest::batch(batch, options))
+    }
+
+    #[must_use = "write futures do nothing unless polled"]
+    pub fn write_async(
+        &self,
+        batch: WriteBatch,
+        options: WriteOptions,
+    ) -> impl Future<Output = Result<CommitInfo>> + Send + 'static {
+        self.run_accepted_write_async(WriteRequest::batch(batch, options))
     }
 
     pub(crate) fn commit_transaction(
@@ -144,10 +291,29 @@ impl Db {
         ))
     }
 
+    pub(crate) fn commit_transaction_async(
+        &self,
+        read_sequence: Sequence,
+        read_set: TransactionReadSet,
+        batch: WriteBatch,
+        write_options: WriteOptions,
+    ) -> impl Future<Output = Result<CommitInfo>> + Send + 'static {
+        self.run_accepted_write_async(WriteRequest::transaction(
+            read_sequence,
+            read_set,
+            batch,
+            write_options,
+        ))
+    }
+
     fn run_accepted_write(&self, request: WriteRequest) -> Result<CommitInfo> {
         let (accepted_write, waiter) = AcceptedWrite::accept(request);
         accepted_write.execute(self);
         waiter.wait()
+    }
+
+    fn run_accepted_write_async(&self, request: WriteRequest) -> WriteFuture {
+        WriteFuture::new(self.clone(), request)
     }
 
     fn commit_write_request(&self, request: WriteRequest) -> Result<CommitInfo> {

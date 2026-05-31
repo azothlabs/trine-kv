@@ -371,7 +371,9 @@ impl Bucket {
     }
 
     pub async fn put_async(&self, key: impl Into<Vec<u8>>, value: impl Into<Value>) -> Result<()> {
-        self.put(key, value)
+        self.put_with_options_async(key, value, WriteOptions::default())
+            .await
+            .map(|_| ())
     }
 
     pub async fn put_with_options_async(
@@ -380,11 +382,19 @@ impl Bucket {
         value: impl Into<Value>,
         options: WriteOptions,
     ) -> Result<CommitInfo> {
-        self.put_with_options(key, value, options)
+        let mut batch = WriteBatch::new();
+        if self.name.as_str() == DEFAULT_BUCKET_NAME {
+            batch.put(key, value);
+        } else {
+            batch.put_bucket(self.name.as_str(), key, value)?;
+        }
+        self.db.write_async(batch, options).await
     }
 
     pub async fn delete_async(&self, key: impl Into<Vec<u8>>) -> Result<()> {
-        self.delete(key)
+        self.delete_with_options_async(key, WriteOptions::default())
+            .await
+            .map(|_| ())
     }
 
     pub async fn delete_with_options_async(
@@ -392,11 +402,19 @@ impl Bucket {
         key: impl Into<Vec<u8>>,
         options: WriteOptions,
     ) -> Result<CommitInfo> {
-        self.delete_with_options(key, options)
+        let mut batch = WriteBatch::new();
+        if self.name.as_str() == DEFAULT_BUCKET_NAME {
+            batch.delete(key);
+        } else {
+            batch.delete_bucket(self.name.as_str(), key)?;
+        }
+        self.db.write_async(batch, options).await
     }
 
     pub async fn delete_range_async(&self, range: KeyRange) -> Result<()> {
-        self.delete_range(range)
+        self.delete_range_with_options_async(range, WriteOptions::default())
+            .await
+            .map(|_| ())
     }
 
     pub async fn delete_range_with_options_async(
@@ -404,7 +422,13 @@ impl Bucket {
         range: KeyRange,
         options: WriteOptions,
     ) -> Result<CommitInfo> {
-        self.delete_range_with_options(range, options)
+        let mut batch = WriteBatch::new();
+        if self.name.as_str() == DEFAULT_BUCKET_NAME {
+            batch.delete_range(range);
+        } else {
+            batch.delete_range_bucket(self.name.as_str(), range)?;
+        }
+        self.db.write_async(batch, options).await
     }
 
     pub async fn range_async(&self, range: &KeyRange) -> Result<Iter> {
