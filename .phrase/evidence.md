@@ -6492,3 +6492,59 @@ Record only evidence that can change planning or durable decisions.
 - Migrate table/blob standalone helpers or recovery scanning in a separate
   measured phase, keeping table/blob decode semantics explicit until a
   dedicated read-path phase changes them.
+
+## 2026-05-31: DB-Owned Table/Blob Native Storage Helpers
+
+### Observation
+
+- Phase 84 attached persistent `Db` to a runtime-enabled native-file backend,
+  but DB-owned table and blob helpers still built no-runtime native backends at
+  flush, compaction, blob GC, open-time table load, and stats call sites.
+- Table/blob helper functions also mixed standalone no-runtime construction
+  with the actual file operation, making later backend migration less explicit.
+- Table/blob block decode still depends on borrowed blocking reads.
+
+### Interpretation
+
+- DB call sites should pass their owned native backend into table/blob helper
+  functions instead of letting helpers create ad-hoc backends.
+- Standalone wrappers are still useful for focused module tests and future
+  tooling, but should be narrow wrappers over the backend-taking helpers.
+- Recovery scanning and table/blob decode should remain separate phases because
+  they touch failure handling and read advancement shape.
+
+### Verification
+
+- Added backend-taking table helpers for table file listing, table writes, and
+  table metadata reads.
+- Added backend-taking blob helpers for blob file listing, blob writes,
+  large-value rewrite, inline rewrite, metadata reads, full blob reads, and
+  indexed record reads.
+- Routed persistent `Db` flush writes, compaction outputs, blob GC file writes,
+  blob GC candidate reads, blob GC indexed value reads, blob GC replacement
+  table writes, open-time table loading, and blob stats through the DB-owned
+  native backend.
+- Preserved standalone no-runtime table/blob wrappers and covered them with
+  focused table/blob unit tests.
+- Expanded the persistent DB runtime-storage test so flush writes a separated
+  blob value and reads it back after flush.
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --lib`
+- `cargo test --all-targets --all-features`
+
+### Remaining Blockers
+
+- Standalone recovery scanning still constructs no-runtime native-file
+  backends.
+- Table/blob block reads and cursor advancement still use synchronous
+  advancement paths.
+- True async file I/O is not implemented.
+- Runtime worker and queue limits remain internal defaults.
+- True multi-writer execution still needs writer-local deltas and WAL
+  partitioning before the publish barrier can be narrowed further.
+
+### Recommended Next Action
+
+- Migrate standalone recovery scanning onto the explicit storage backend
+  boundary or define the measured table/blob decode async-read phase.

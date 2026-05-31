@@ -1840,3 +1840,31 @@ execute through a runtime-enabled backend.
   storage behavior remain unchanged.
 - Focused DB/storage tests, formatting, clippy, full tests, and diff checks
   pass.
+
+### Phase 85: DB-Owned Table/Blob Native Storage Helpers
+
+**Status**: Complete
+
+**Goal**: Route persistent database table/blob helper calls through the
+DB-owned native-file backend while preserving standalone helper behavior and
+current decode semantics.
+
+**Entry Condition**: Phase 84 complete and persistent `DbInner` owns a
+runtime-enabled native-file backend.
+
+**Acceptance Gate**:
+
+- Table module exposes crate-internal backend-taking helpers for list, write,
+  and read paths used by `Db`.
+- Blob module exposes crate-internal backend-taking helpers for list, write,
+  large-value rewrite, inline rewrite, metadata, and indexed value-read paths
+  used by `Db`.
+- Persistent `Db` flush, compaction, blob GC, open-time table load, stats, and
+  blob candidate reads use the DB-owned native backend.
+- Standalone table/blob wrappers still construct no-runtime native backends.
+- Recovery scanning and borrowed block decode semantics remain unchanged.
+- Public async API, blocking API, publish barrier, commit tracker,
+  WAL/table/blob/manifest formats, MVCC, compaction, recovery, cleanup, and
+  storage behavior remain unchanged.
+- Focused DB/table/blob tests, formatting, clippy, full tests, and diff checks
+  pass.

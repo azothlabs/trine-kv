@@ -140,8 +140,15 @@ pub fn blob_path(db_path: &Path, file_id: u64) -> PathBuf {
 }
 
 pub(crate) fn list_blob_file_ids(db_path: &Path) -> Result<BTreeSet<u64>> {
-    let mut file_ids = BTreeSet::new();
     let backend = blob_storage_backend();
+    list_blob_file_ids_with_backend(&backend, db_path)
+}
+
+pub(crate) fn list_blob_file_ids_with_backend(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+) -> Result<BTreeSet<u64>> {
+    let mut file_ids = BTreeSet::new();
     backend
         .capabilities()
         .require(StorageCapability::ObjectListing)?;
@@ -172,7 +179,20 @@ fn blob_file_id_from_path(path: &Path) -> Result<Option<u64>> {
         })
 }
 
+#[allow(dead_code)]
 pub(crate) fn write_large_values(
+    db_path: &Path,
+    file_id: u64,
+    threshold: usize,
+    compression: CodecId,
+    records: &[(InternalKey, Option<ValueRef>)],
+) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
+    let backend = blob_storage_backend();
+    write_large_values_with_backend(&backend, db_path, file_id, threshold, compression, records)
+}
+
+pub(crate) fn write_large_values_with_backend(
+    backend: &NativeFileBackend,
     db_path: &Path,
     file_id: u64,
     threshold: usize,
@@ -206,7 +226,7 @@ pub(crate) fn write_large_values(
         .unwrap_or(Sequence::ZERO);
     let threshold_bytes = usize_to_u64(threshold, "blob threshold")?;
     let header = BlobFileHeader::new(file_id, creation_sequence, threshold_bytes, compression);
-    let indexes = write_blob_file(db_path, file_id, header, &blob_records)?;
+    let indexes = write_blob_file_with_backend(backend, db_path, file_id, header, &blob_records)?;
     let mut index_iter = indexes.into_iter();
 
     let mut rewritten = Vec::with_capacity(records.len());
@@ -232,7 +252,17 @@ pub(crate) fn write_large_values(
     Ok(rewritten)
 }
 
+#[allow(dead_code)]
 pub(crate) fn inline_blob_values(
+    db_path: &Path,
+    records: &[(InternalKey, Option<ValueRef>)],
+) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
+    let backend = blob_storage_backend();
+    inline_blob_values_with_backend(&backend, db_path, records)
+}
+
+pub(crate) fn inline_blob_values_with_backend(
+    backend: &NativeFileBackend,
     db_path: &Path,
     records: &[(InternalKey, Option<ValueRef>)],
 ) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
@@ -241,7 +271,8 @@ pub(crate) fn inline_blob_values(
         let value = match value {
             Some(ValueRef::Inline(bytes)) => Some(ValueRef::Inline(bytes.clone())),
             Some(value @ (ValueRef::BlobIndex(_) | ValueRef::Blob { .. })) => {
-                Some(ValueRef::Inline(read_value_for_internal_key(
+                Some(ValueRef::Inline(read_value_for_internal_key_with_backend(
+                    backend,
                     db_path,
                     value,
                     Some(internal_key),
@@ -259,9 +290,21 @@ pub(crate) fn read_value_for_internal_key(
     value: &ValueRef,
     expected_internal_key: Option<&InternalKey>,
 ) -> Result<Vec<u8>> {
+    let backend = blob_storage_backend();
+    read_value_for_internal_key_with_backend(&backend, db_path, value, expected_internal_key)
+}
+
+pub(crate) fn read_value_for_internal_key_with_backend(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+    value: &ValueRef,
+    expected_internal_key: Option<&InternalKey>,
+) -> Result<Vec<u8>> {
     match value {
         ValueRef::Inline(bytes) => Ok(bytes.clone()),
-        ValueRef::BlobIndex(index) => read_indexed_value(db_path, index, expected_internal_key),
+        ValueRef::BlobIndex(index) => {
+            read_indexed_value_with_backend(backend, db_path, index, expected_internal_key)
+        }
         ValueRef::Blob {
             file_id,
             offset,
@@ -272,7 +315,7 @@ pub(crate) fn read_value_for_internal_key(
                 message: "blob length exceeds usize".to_owned(),
             })?;
             let mut bytes = vec![0_u8; len];
-            let object = open_blob_read_object(db_path, *file_id)?;
+            let object = open_blob_read_object_with_backend(backend, db_path, *file_id)?;
             read_blob_exact_at(
                 &object,
                 *offset,
@@ -294,13 +337,23 @@ pub(crate) fn validate_blob_file(db_path: &Path, file_id: u64) -> Result<BlobFil
     Ok(blob_file.properties)
 }
 
+#[allow(dead_code)]
 pub(crate) fn read_blob_file_properties(
+    db_path: &Path,
+    file_id: u64,
+) -> Result<BlobFileProperties> {
+    let backend = blob_storage_backend();
+    read_blob_file_properties_with_backend(&backend, db_path, file_id)
+}
+
+pub(crate) fn read_blob_file_properties_with_backend(
+    backend: &NativeFileBackend,
     db_path: &Path,
     file_id: u64,
 ) -> Result<BlobFileProperties> {
     // GC candidate selection needs byte estimates, not value payloads. Recovery
     // still uses `read_blob_file` so every referenced record is fully checked.
-    let object = open_blob_read_object(db_path, file_id)?;
+    let object = open_blob_read_object_with_backend(backend, db_path, file_id)?;
     let file_len = blob_object_len(&object, "referenced blob file metadata cannot be read")?;
     if file_len < (BLOB_HEADER_LEN + BLOB_FOOTER_LEN) as u64 {
         return Err(invalid_blob("file is too short"));
@@ -333,7 +386,16 @@ pub(crate) fn read_blob_file_properties(
 }
 
 pub(crate) fn read_blob_file(db_path: &Path, file_id: u64) -> Result<BlobFile> {
-    let object = open_blob_read_object(db_path, file_id)?;
+    let backend = blob_storage_backend();
+    read_blob_file_with_backend(&backend, db_path, file_id)
+}
+
+pub(crate) fn read_blob_file_with_backend(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+    file_id: u64,
+) -> Result<BlobFile> {
+    let object = open_blob_read_object_with_backend(backend, db_path, file_id)?;
     let file_len = blob_object_len(&object, "referenced blob file metadata cannot be read")?;
     let mut bytes = vec![0_u8; u64_to_usize(file_len, "blob file length")?];
     read_blob_exact_at(
@@ -354,7 +416,19 @@ pub(crate) fn read_blob_file(db_path: &Path, file_id: u64) -> Result<BlobFile> {
     Ok(blob_file)
 }
 
+#[allow(dead_code)]
 pub(crate) fn write_blob_file(
+    db_path: &Path,
+    file_id: u64,
+    header: BlobFileHeader,
+    records: &[BlobRecord],
+) -> Result<Vec<BlobIndex>> {
+    let backend = blob_storage_backend();
+    write_blob_file_with_backend(&backend, db_path, file_id, header, records)
+}
+
+pub(crate) fn write_blob_file_with_backend(
+    backend: &NativeFileBackend,
     db_path: &Path,
     file_id: u64,
     header: BlobFileHeader,
@@ -367,7 +441,6 @@ pub(crate) fn write_blob_file(
     }
     let (blob_bytes, indexes) = encode_blob_file(header, records)?;
     let path = blob_path(db_path, file_id);
-    let backend = blob_storage_backend();
     backend
         .capabilities()
         .require(StorageCapability::ObjectWrite)?;
@@ -383,12 +456,12 @@ fn blob_storage_object(path: &Path) -> StorageObjectId {
     StorageObjectId::native_file(StorageObjectKind::Blob, path)
 }
 
-fn open_blob_read_object(
+fn open_blob_read_object_with_backend(
+    backend: &NativeFileBackend,
     db_path: &Path,
     file_id: u64,
 ) -> Result<<NativeFileBackend as StorageReadBackend>::ReadObject> {
     let path = blob_path(db_path, file_id);
-    let backend = blob_storage_backend();
     backend
         .capabilities()
         .require(StorageCapability::RandomRead)?;
@@ -522,24 +595,46 @@ pub fn decode_blob_file(bytes: &[u8]) -> Result<BlobFile> {
     })
 }
 
+#[allow(dead_code)]
 fn read_indexed_value(
     db_path: &Path,
     index: &BlobIndex,
     expected_internal_key: Option<&InternalKey>,
 ) -> Result<Vec<u8>> {
+    let backend = blob_storage_backend();
+    read_indexed_value_with_backend(&backend, db_path, index, expected_internal_key)
+}
+
+fn read_indexed_value_with_backend(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+    index: &BlobIndex,
+    expected_internal_key: Option<&InternalKey>,
+) -> Result<Vec<u8>> {
     Ok(
-        read_record_for_index(db_path, index, expected_internal_key)?
+        read_record_for_index_with_backend(backend, db_path, index, expected_internal_key)?
             .record
             .value,
     )
 }
 
+#[allow(dead_code)]
 pub(crate) fn read_record_for_index(
     db_path: &Path,
     index: &BlobIndex,
     expected_internal_key: Option<&InternalKey>,
 ) -> Result<BlobFileRecord> {
-    let object = open_blob_read_object(db_path, index.file_id)?;
+    let backend = blob_storage_backend();
+    read_record_for_index_with_backend(&backend, db_path, index, expected_internal_key)
+}
+
+pub(crate) fn read_record_for_index_with_backend(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+    index: &BlobIndex,
+    expected_internal_key: Option<&InternalKey>,
+) -> Result<BlobFileRecord> {
+    let object = open_blob_read_object_with_backend(backend, db_path, index.file_id)?;
     let file_len = blob_object_len(&object, "referenced blob file metadata cannot be read")?;
     validate_indexed_blob_header(&object, index.file_id)?;
     let record = read_indexed_blob_record(&object, file_len, index)?;
@@ -1066,7 +1161,8 @@ mod tests {
 
     use crate::{
         blob::{
-            BlobFileHeader, BlobRecord, decode_blob_file, encode_blob_file, read_indexed_value,
+            BlobFileHeader, BlobRecord, ValueRef, decode_blob_file, encode_blob_file,
+            inline_blob_values, read_indexed_value, read_record_for_index, write_large_values,
         },
         codec::CodecId,
         internal_key::{InternalKey, ValueKind},
@@ -1259,6 +1355,32 @@ mod tests {
         let value = read_indexed_value(&temp, &indexes[0], None)
             .expect("targeted indexed read skips unrelated corrupt record");
         assert_eq!(value, b"value-a");
+
+        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn standalone_large_value_wrappers_round_trip() {
+        let temp = temp_blob_dir("standalone-large-value-wrappers");
+        let internal_key = InternalKey::new(b"key".to_vec(), Sequence::new(3), ValueKind::Put, 0);
+        let records = vec![(
+            internal_key.clone(),
+            Some(ValueRef::Inline(
+                b"value-through-standalone-wrapper".to_vec(),
+            )),
+        )];
+
+        let rewritten =
+            write_large_values(&temp, 21, 4, CodecId::None, &records).expect("large value writes");
+        let Some(ValueRef::BlobIndex(index)) = rewritten[0].1.as_ref() else {
+            panic!("large value should be written as a blob index");
+        };
+        let record = read_record_for_index(&temp, index, Some(&internal_key))
+            .expect("standalone record read works");
+        assert_eq!(record.record.value, b"value-through-standalone-wrapper");
+
+        let inlined = inline_blob_values(&temp, &rewritten).expect("blob value inlines");
+        assert_eq!(inlined, records);
 
         std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }

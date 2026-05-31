@@ -2435,6 +2435,13 @@ pub fn table_path(db_path: &Path, table_id: TableId) -> PathBuf {
 
 pub(crate) fn list_table_file_ids(db_path: &Path) -> Result<BTreeSet<TableId>> {
     let backend = table_storage_backend();
+    list_table_file_ids_with_backend(&backend, db_path)
+}
+
+pub(crate) fn list_table_file_ids_with_backend(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+) -> Result<BTreeSet<TableId>> {
     backend
         .capabilities()
         .require(StorageCapability::ObjectListing)?;
@@ -2470,7 +2477,29 @@ pub(crate) fn list_table_file_ids(db_path: &Path) -> Result<BTreeSet<TableId>> {
     Ok(table_ids)
 }
 
+#[allow(dead_code)]
 pub(crate) fn write_table(
+    path: &Path,
+    table_id: TableId,
+    level: TableLevel,
+    options: &TableWriteOptions,
+    point_records: &[(InternalKey, Option<ValueRef>)],
+    range_tombstones: &[TableRangeTombstone],
+) -> Result<Table> {
+    let backend = table_storage_backend();
+    write_table_with_backend(
+        &backend,
+        path,
+        table_id,
+        level,
+        options,
+        point_records,
+        range_tombstones,
+    )
+}
+
+pub(crate) fn write_table_with_backend(
+    backend: &NativeFileBackend,
     path: &Path,
     table_id: TableId,
     level: TableLevel,
@@ -2493,11 +2522,12 @@ pub(crate) fn write_table(
     let point_records = if options.rewrite_blob_indexes {
         // Level Merge keeps the same MVCC records but gives retained large
         // values a fresh blob layout beside the output table.
-        crate::blob::inline_blob_values(db_path, &point_records)?
+        crate::blob::inline_blob_values_with_backend(backend, db_path, &point_records)?
     } else {
         point_records
     };
-    let point_records = crate::blob::write_large_values(
+    let point_records = crate::blob::write_large_values_with_backend(
+        backend,
         db_path,
         table_id.get(),
         options.blob_threshold_bytes,
@@ -2558,7 +2588,6 @@ pub(crate) fn write_table(
     bytes.extend_from_slice(&payload_checksum.to_le_bytes());
     bytes.extend_from_slice(&payload);
 
-    let backend = table_storage_backend();
     backend
         .capabilities()
         .require(StorageCapability::ObjectWrite)?;
@@ -2569,11 +2598,16 @@ pub(crate) fn write_table(
         DurabilityMode::SyncAll,
     )?;
 
-    read_table(path)
+    read_table_with_backend(backend, path)
 }
 
+#[allow(dead_code)]
 pub(crate) fn read_table(path: &Path) -> Result<Table> {
     let backend = table_storage_backend();
+    read_table_with_backend(&backend, path)
+}
+
+pub(crate) fn read_table_with_backend(backend: &NativeFileBackend, path: &Path) -> Result<Table> {
     backend
         .capabilities()
         .require(StorageCapability::RandomRead)?;
@@ -4880,6 +4914,8 @@ mod tests {
             !path.with_extension("tmp").exists(),
             "successful table write should leave no temporary file"
         );
+        let reopened = read_table(&path).expect("standalone table read works");
+        assert_eq!(reopened.properties().id, table_id);
 
         std::fs::remove_dir_all(root).expect("test dir removes");
     }

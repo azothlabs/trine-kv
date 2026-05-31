@@ -6,17 +6,19 @@ Complete
 
 ## Goal
 
-Attach persistent database construction and DB-owned storage helpers to a
-runtime-enabled native-file backend while keeping existing blocking decode paths
-explicit.
+Route DB-owned table/blob helper calls through the persistent DB native-file
+backend while preserving standalone helper behavior and current decode
+semantics.
 
 ## Scope
 
-- Add a persistent native-file backend field to `DbInner` and construct it with
-  the database runtime.
-- Route DB-owned directory create/sync, object cleanup deletes, manifest store,
-  WAL read/rewrite, and WAL append construction through that backend.
-- Preserve no-runtime behavior for standalone module helpers and tests.
+- Add internal `with_backend` entry points for table file listing, table write,
+  table metadata read, blob file listing, blob write, blob large-value rewrite,
+  blob inline rewrite, and blob metadata/value reads.
+- Route persistent `Db` flush, compaction, blob GC, recovery-open table load,
+  stats, and blob candidate reads through the DB-owned native backend.
+- Preserve no-runtime behavior for standalone table/blob module helpers and
+  tests.
 - Preserve existing borrowed blocking read paths for current table/blob decode
   code and standalone table/blob helpers.
 - Preserve existing public async API, blocking API, publish barrier, commit
@@ -30,7 +32,7 @@ explicit.
 - Adding public runtime tuning options.
 - Converting table/blob/block decode call sites to async advancement.
 - Migrating standalone recovery scanning to a runtime-enabled backend.
-- Migrating table/blob module standalone helpers to runtime-enabled backends.
+- Removing standalone no-runtime table/blob helper wrappers.
 - Removing the serialized publish barrier.
 - Adding WAL shards or writer-local deltas.
 - Changing transaction conflict rules.
@@ -39,15 +41,15 @@ explicit.
 
 ## Acceptance Gate
 
-- Roadmap records this as the persistent DB runtime-enabled native storage
+- Roadmap records this as the DB-owned table/blob native storage helper
   migration phase.
-- Persistent `DbInner` owns a runtime-enabled native-file backend.
-- Persistent manifest store creation and manifest publish use the DB-owned
-  native backend.
-- Persistent WAL read/rewrite and WAL append construction use the DB-owned
-  native backend.
-- DB-owned directory create/sync and cleanup deletes use the DB-owned native
-  backend.
+- Table module exposes crate-internal `with_backend` helpers for list, write,
+  and read paths used by `Db`.
+- Blob module exposes crate-internal `with_backend` helpers for list, write,
+  large-value rewrite, inline rewrite, metadata, and value-read paths used by
+  `Db`.
+- Persistent `Db` table/blob file operations use the DB-owned native backend.
+- Standalone table/blob wrappers still construct no-runtime native backends.
 - Blocking storage adapters remain direct synchronous paths.
 - Existing borrowed blocking read paths remain unchanged for current decode
   code.
@@ -58,12 +60,12 @@ explicit.
 ## Active Task Slice
 
 ```text
-task340 [x] goal:start persistent DB runtime-enabled storage backend slice | scope:current roadmap | verify:manual
-task341 [x] goal:add DB-owned native storage backend constructed with runtime | scope:src/db.rs | verify:db tests
-task342 [x] goal:route manifest store and WAL construction through DB backend | scope:src/manifest.rs src/wal.rs src/db.rs | verify:db tests
-task343 [x] goal:route DB-owned directory sync/create and cleanup deletes through DB backend | scope:src/db.rs | verify:persistent tests
-task344 [x] goal:preserve standalone no-runtime helpers and decode paths | scope:src/table.rs src/blob.rs src/recovery.rs | verify:full tests
-task345 [x] goal:record evidence and commit | scope:.phrase/evidence.md current roadmap | verify:git status
+task346 [x] goal:start DB-owned table/blob helper migration slice | scope:current roadmap | verify:manual
+task347 [x] goal:add table with_backend helpers while preserving standalone wrappers | scope:src/table.rs | verify:table tests
+task348 [x] goal:add blob with_backend helpers while preserving standalone wrappers | scope:src/blob.rs | verify:blob tests
+task349 [x] goal:route DB table/blob helper calls through DB-owned backend | scope:src/db.rs | verify:persistent tests
+task350 [x] goal:preserve recovery scanning and decode behavior | scope:src/recovery.rs src/table.rs src/blob.rs | verify:full tests
+task351 [x] goal:record evidence and commit | scope:.phrase/evidence.md current roadmap | verify:git status
 ```
 
 ## Known Blockers
@@ -76,9 +78,8 @@ task345 [x] goal:record evidence and commit | scope:.phrase/evidence.md current 
 - True multi-writer execution still needs writer-local deltas and WAL
   partitioning.
 - Standalone recovery scanning still constructs no-runtime native-file backends.
-- Table/blob standalone helpers still construct no-runtime native-file
-  backends.
 - Database read decode paths still use blocking table/blob readers.
+- True async table/blob decode is not implemented.
 
 ## Evidence
 
@@ -188,8 +189,22 @@ task345 [x] goal:record evidence and commit | scope:.phrase/evidence.md current 
   `cargo test --lib`, and `cargo test --all-targets --all-features`.
 - `git diff --check` passed.
 - Forbidden-term scan passed outside the repository instruction file.
+- Table helpers now expose crate-internal `with_backend` paths for table file
+  listing, writes, and metadata reads while preserving no-runtime wrappers.
+- Blob helpers now expose crate-internal `with_backend` paths for blob file
+  listing, blob writes, large-value rewrite, inline rewrite, metadata reads,
+  and indexed value reads while preserving no-runtime wrappers.
+- Persistent `Db` flush, compaction output build, blob GC rewrite/candidate
+  reads, reopen table loading, and stale/obsolete blob stats now use the
+  DB-owned native-file backend.
+- Standalone table/blob no-runtime wrappers are covered by focused unit tests.
+- Recovery validation still uses standalone no-runtime scanning helpers.
+- Existing table/blob block decode still uses blocking native-file reads.
+- Verification passed: `cargo fmt --check`,
+  `cargo clippy --all-targets --all-features -- -D warnings`,
+  `cargo test --lib`, and `cargo test --all-targets --all-features`.
 
 ## Next Recommendation
 
-- Finish this slice, then migrate table/blob standalone helpers or recovery
-  scanning in a separate measured phase.
+- Migrate standalone recovery scanning onto the explicit storage backend
+  boundary or define the measured table/blob decode async-read phase.

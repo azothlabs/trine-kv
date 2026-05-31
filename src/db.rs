@@ -788,7 +788,7 @@ impl Db {
         let replay_floor = manifest.state().wal_replay_floor();
         let referenced_blob_ids = referenced_blob_file_ids_from_manifest(manifest.state());
         let allowed_blob_ids = allowed_blob_file_ids_from_manifest(manifest.state());
-        let mut buckets = buckets_from_manifest(path, manifest.state())?;
+        let mut buckets = buckets_from_manifest(&native_storage, path, manifest.state())?;
         ensure_default_bucket_loaded(&mut buckets, &options)?;
         recovery::fail_on_missing_referenced_blob_files(path, &referenced_blob_ids)?;
         recovery::fail_on_invalid_referenced_blob_files(path, manifest.state())?;
@@ -1966,7 +1966,8 @@ impl Db {
         for input in flush_inputs {
             let table_path = table::table_path(db_path, input.input.table_id);
             written_table_ids.push(input.input.table_id);
-            let table = match table::write_table(
+            let table = match table::write_table_with_backend(
+                &self.inner.native_storage,
                 &table_path,
                 input.input.table_id,
                 input.input.table_level,
@@ -2272,7 +2273,8 @@ impl Db {
 
                 let table_path = table::table_path(db_path, table_id);
                 written_table_ids.push(table_id);
-                let table = match table::write_table(
+                let table = match table::write_table_with_backend(
+                    &self.inner.native_storage,
                     &table_path,
                     table_id,
                     input.input.table_level,
@@ -2342,18 +2344,20 @@ impl Db {
             .iter()
             .map(|table| table.input_table_id)
             .collect::<Vec<_>>();
-        let indexes =
-            match blob::write_blob_file(db_path, plan.new_blob_file_id, header, &blob_records) {
-                Ok(indexes) => indexes,
-                Err(error) => {
-                    let _ = remove_storage_files(
-                        &self.inner.native_storage,
-                        db_path,
-                        &written_table_ids,
-                    );
-                    return Err(error);
-                }
-            };
+        let indexes = match blob::write_blob_file_with_backend(
+            &self.inner.native_storage,
+            db_path,
+            plan.new_blob_file_id,
+            header,
+            &blob_records,
+        ) {
+            Ok(indexes) => indexes,
+            Err(error) => {
+                let _ =
+                    remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
+                return Err(error);
+            }
+        };
 
         let mut tables = plan.tables;
         let output_bytes = match apply_blob_gc_indexes(&mut tables, plan.records, indexes) {
@@ -2364,14 +2368,18 @@ impl Db {
                 return Err(error);
             }
         };
-        let outputs = match write_blob_gc_replacement_tables(db_path, tables) {
-            Ok(outputs) => outputs,
-            Err(error) => {
-                let _ =
-                    remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
-                return Err(error);
-            }
-        };
+        let outputs =
+            match write_blob_gc_replacement_tables(&self.inner.native_storage, db_path, tables) {
+                Ok(outputs) => outputs,
+                Err(error) => {
+                    let _ = remove_storage_files(
+                        &self.inner.native_storage,
+                        db_path,
+                        &written_table_ids,
+                    );
+                    return Err(error);
+                }
+            };
 
         if let Err(error) =
             sync_storage_directory_after_renames(&self.inner.native_storage, db_path)
@@ -2443,7 +2451,8 @@ impl Db {
                     if !candidate_file_ids.contains(&index.file_id) {
                         continue;
                     }
-                    let blob_record = blob::read_record_for_index(
+                    let blob_record = blob::read_record_for_index_with_backend(
+                        &self.inner.native_storage,
                         db_path,
                         index,
                         Some(&point_record.internal_key),
@@ -2488,7 +2497,11 @@ impl Db {
         let mut candidates = Vec::new();
 
         for (file_id, live_bytes) in live_bytes_by_file {
-            let properties = blob::read_blob_file_properties(db_path, file_id)?;
+            let properties = blob::read_blob_file_properties_with_backend(
+                &self.inner.native_storage,
+                db_path,
+                file_id,
+            )?;
             let total_bytes = properties.encoded_bytes;
             if total_bytes < self.inner.options.blob_gc_min_file_bytes {
                 continue;
@@ -3034,6 +3047,7 @@ fn background_worker_loop(
 }
 
 fn buckets_from_manifest(
+    backend: &NativeFileBackend,
     db_path: &Path,
     manifest: &ManifestState,
 ) -> Result<BTreeMap<String, Arc<LsmTree>>> {
@@ -3044,7 +3058,8 @@ fn buckets_from_manifest(
         let mut tables = Vec::new();
         for properties in manifest.tables().get(name).into_iter().flatten() {
             let table_path = table::table_path(db_path, properties.id);
-            let table = table::read_table(&table_path)?.with_manifest_properties(properties)?;
+            let table = table::read_table_with_backend(backend, &table_path)?
+                .with_manifest_properties(properties)?;
             tables.push(Arc::new(table));
         }
 
@@ -3106,7 +3121,9 @@ fn add_obsolete_blob_stats(
     stats: &mut DbStats,
 ) {
     for (file_id, live_bytes) in live_blob_bytes_by_file {
-        let Ok(properties) = blob::read_blob_file_properties(db_path, *file_id) else {
+        let Ok(properties) =
+            blob::read_blob_file_properties_with_backend(backend, db_path, *file_id)
+        else {
             continue;
         };
         if properties.encoded_bytes > *live_bytes {
@@ -3117,7 +3134,7 @@ fn add_obsolete_blob_stats(
         }
     }
 
-    let Ok(blob_file_ids) = blob::list_blob_file_ids(db_path) else {
+    let Ok(blob_file_ids) = blob::list_blob_file_ids_with_backend(backend, db_path) else {
         return;
     };
 
@@ -3318,6 +3335,7 @@ fn apply_blob_gc_indexes(
 }
 
 fn write_blob_gc_replacement_tables(
+    backend: &NativeFileBackend,
     db_path: &Path,
     tables: Vec<BlobGcRewriteTable>,
 ) -> Result<Vec<NamedCompactionOutput>> {
@@ -3329,7 +3347,8 @@ fn write_blob_gc_replacement_tables(
             .iter()
             .map(|record| (record.internal_key.clone(), record.value.clone()))
             .collect::<Vec<_>>();
-        let table = Arc::new(table::write_table(
+        let table = Arc::new(table::write_table_with_backend(
+            backend,
             &table_path,
             rewrite_table.output_table_id,
             rewrite_table.level,
@@ -3627,18 +3646,24 @@ mod tests {
         let path = temp_db_path("persistent-runtime-native-storage");
         let mut options = DbOptions::persistent(&path);
         options.background_worker_count = 0;
+        options.default_bucket_options =
+            options.default_bucket_options.with_blob_threshold_bytes(4);
         let db = Db::open(options).expect("persistent db opens");
 
         let capabilities = db.inner.native_storage.capabilities();
         assert!(capabilities.supports(StorageCapability::AsyncTasks));
         assert!(capabilities.supports(StorageCapability::BackgroundThreads));
 
-        db.put(b"key", b"value").expect("write");
+        let value = b"value-stored-through-blob".to_vec();
+        db.put(b"key", value.clone()).expect("write");
         db.flush().expect("flush through db-owned native storage");
         assert_eq!(
             db.get(b"key").expect("read after flush"),
-            Some(b"value".to_vec())
+            Some(value.clone())
         );
+        let stats = db.stats();
+        assert_eq!(stats.live_blob_files, 1);
+        assert!(stats.live_blob_bytes >= value.len() as u64);
 
         drop(db);
         fs::remove_dir_all(path).expect("cleanup test db");
