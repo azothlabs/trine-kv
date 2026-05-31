@@ -1184,3 +1184,27 @@ through the backend boundary.
   transaction, cleanup behavior, and storage format remain unchanged.
 - Focused storage/table/persistent tests, formatting, clippy, and diff checks
   pass.
+
+### Phase 57: Native-File Blob Object Write Backend
+
+**Status**: Complete
+
+**Goal**: Route blob file creation through the storage backend object write
+operation.
+
+**Entry Condition**: Phase 56 complete and table output writes already use the
+backend object write boundary.
+
+**Acceptance Gate**:
+
+- Storage object kinds include blob objects.
+- Native-file backend can write blob objects through the generic object write
+  operation while still rejecting manifest objects.
+- `write_blob_file` uses the backend write operation while preserving blob
+  bytes, temporary-file naming, file sync, final rename, and returned indexes.
+- Parent-directory sync batching remains owned by existing flush/compaction
+  callers and still occurs before manifest publish.
+- Public API behavior, SSTable format, MVCC, manifest, WAL, compaction,
+  transaction, cleanup behavior, and storage format remain unchanged.
+- Focused storage/blob/table/persistent tests, formatting, clippy, and diff
+  checks pass.

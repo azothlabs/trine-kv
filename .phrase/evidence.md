@@ -1909,6 +1909,8 @@ Record only evidence that can change planning or durable decisions.
 - `cargo fmt --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan over changed Rust and `.phrase` files.
 - `cargo run --example quickstart`
 - `cargo run --example user_store`
 - `cargo run --example event_index`
@@ -5045,3 +5047,56 @@ Record only evidence that can change planning or durable decisions.
 
 - Route deletion cleanup through storage backend operations next, because table
   output creation and table object discovery now both have backend-owned paths.
+
+## 2026-05-31: Native-File Blob Object Write Backend
+
+### Observation
+
+- Phase 56 routed table output-file creation through the backend object write
+  operation.
+- Blob file creation still used direct native-file writes even though it has the
+  same complete-object write shape: encode bytes, write a temporary file, sync
+  the file, and rename to the final blob path.
+- Blob file creation is a narrow storage-boundary slice because blob read paths,
+  blob listing, cleanup deletion, manifest publish, WAL, MVCC, compaction, and
+  public API behavior can remain unchanged.
+
+### Interpretation
+
+- Blob file creation should use the same storage object write boundary as table
+  output creation.
+- Adding `StorageObjectKind::Blob` prepares the backend model for later blob
+  listing, blob reads, and cleanup routing without changing storage format.
+- Parent-directory sync batching should stay with existing flush/compaction
+  callers so this slice does not change publish durability ordering.
+
+### Verification
+
+- Read `.phrase/decision.md`, `.phrase/roadmap.md`, `.phrase/current.md`, and
+  the async/foreground write-path protocols already linked by the v1 spec.
+- Read `.rust-skills/AGENTS.md`, `m07-concurrency`, `m10-performance`,
+  `m04-zero-cost`, `m06-error-handling`, `m01-ownership`, and
+  `coding-guidelines`.
+- Added `StorageObjectKind::Blob`.
+- Added native-file backend coverage for blob object writes.
+- Routed `write_blob_file` through `StorageObjectWriteBackend`.
+- Added blob coverage proving successful blob writes leave the final object and
+  no temporary file.
+- `cargo test storage --lib`
+- `cargo test blob --lib`
+- `cargo test table --lib`
+- `cargo test persistent --all-targets`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+
+### Remaining Blockers
+
+- Public async API, async runtime selection, WAL append, blob reads, blob
+  listing, lease handling, cleanup deletion routing, parent-directory sync
+  routing, and production in-memory object routing remain later phases.
+
+### Recommended Next Action
+
+- Route cleanup deletion or blob read/list operations through storage backend
+  operations as the next narrow storage-boundary slice.

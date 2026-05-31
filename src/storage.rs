@@ -18,6 +18,7 @@ use crate::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum StorageObjectKind {
+    Blob,
     Manifest,
     Table,
 }
@@ -25,6 +26,7 @@ pub(crate) enum StorageObjectKind {
 impl StorageObjectKind {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::Blob => "blob",
             Self::Manifest => "manifest",
             Self::Table => "table",
         }
@@ -1045,6 +1047,44 @@ mod tests {
         assert!(
             !path.with_extension("tmp").exists(),
             "successful table write should leave only the final object"
+        );
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[test]
+    fn native_file_backend_writes_blob_object() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-storage-write-blob-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        let path = root.join("blob-00000000000000000007.trineb");
+        let object = StorageObjectId::native_file(StorageObjectKind::Blob, &path);
+
+        let backend = NativeFileBackend::new();
+        let capabilities = backend.capabilities();
+        capabilities
+            .require(StorageCapability::ObjectWrite)
+            .expect("native-file backend supports object writes");
+        backend
+            .write_object_blocking(
+                object.clone(),
+                Arc::from(&b"blob bytes"[..]),
+                DurabilityMode::SyncAll,
+            )
+            .expect("blob object writes");
+
+        assert_eq!(
+            std::fs::read(object.path()).expect("blob object reads"),
+            b"blob bytes"
+        );
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "successful blob write should leave only the final object"
         );
 
         std::fs::remove_dir_all(root).expect("test dir removes");

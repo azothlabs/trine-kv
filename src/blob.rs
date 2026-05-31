@@ -1,14 +1,20 @@
 use std::{
     collections::BTreeSet,
     fs::{self, File},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use crate::{
     codec::{self, CodecId},
     error::{Error, Result},
     internal_key::{InternalKey, ValueKind},
+    options::DurabilityMode,
+    storage::{
+        BlockingStorageObjectWriteBackend, NativeFileBackend, StorageCapability, StorageObjectId,
+        StorageObjectKind, StorageReadBackend,
+    },
     types::Sequence,
 };
 
@@ -368,16 +374,24 @@ pub(crate) fn write_blob_file(
     }
     let (blob_bytes, indexes) = encode_blob_file(header, records)?;
     let path = blob_path(db_path, file_id);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp_path = path.with_extension("tmp");
-    let mut file = File::create(&tmp_path)?;
-    file.write_all(&blob_bytes)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(tmp_path, &path)?;
+    let backend = blob_storage_backend();
+    backend
+        .capabilities()
+        .require(StorageCapability::ObjectWrite)?;
+    backend.write_object_blocking(
+        blob_storage_object(&path),
+        Arc::from(blob_bytes.into_boxed_slice()),
+        DurabilityMode::SyncAll,
+    )?;
     Ok(indexes)
+}
+
+fn blob_storage_object(path: &Path) -> StorageObjectId {
+    StorageObjectId::native_file(StorageObjectKind::Blob, path)
+}
+
+fn blob_storage_backend() -> NativeFileBackend {
+    NativeFileBackend::new()
 }
 
 pub fn encode_blob_file(
@@ -1245,6 +1259,32 @@ mod tests {
         assert!(
             super::read_blob_file(&temp, 14).is_err(),
             "full validation should still decode and verify blob records"
+        );
+
+        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn write_blob_file_creates_final_object_without_leftover_tmp() {
+        let temp = temp_blob_dir("write-object");
+        let header = BlobFileHeader::new(15, Sequence::new(1), 8, CodecId::None);
+        let record = blob_record("key", 1, 0, b"value".to_vec(), CodecId::None);
+
+        let indexes =
+            super::write_blob_file(&temp, 15, header, &[record]).expect("blob file writes");
+
+        let path = super::blob_path(&temp, 15);
+        assert_eq!(indexes.len(), 1);
+        assert!(path.exists(), "final blob object should exist");
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "successful blob write should leave no temporary file"
+        );
+        assert_eq!(
+            super::read_blob_file(&temp, 15)
+                .expect("written blob file reads")
+                .header,
+            header
         );
 
         std::fs::remove_dir_all(temp).expect("cleanup temp dir");
