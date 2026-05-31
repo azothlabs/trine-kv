@@ -119,22 +119,35 @@ impl Default for ManifestState {
 pub struct ManifestStore {
     path: PathBuf,
     state: ManifestState,
+    native_storage: NativeFileBackend,
 }
 
 impl ManifestStore {
     pub fn open_or_create(path: impl Into<PathBuf>, create_if_missing: bool) -> Result<Self> {
+        Self::open_or_create_with_backend(path, create_if_missing, NativeFileBackend::new())
+    }
+
+    pub(crate) fn open_or_create_with_backend(
+        path: impl Into<PathBuf>,
+        create_if_missing: bool,
+        native_storage: NativeFileBackend,
+    ) -> Result<Self> {
         let path = path.into();
-        let state = if let Some(bytes) = read_manifest_bytes(&path)? {
+        let state = if let Some(bytes) = read_manifest_bytes_with_backend(&native_storage, &path)? {
             decode_manifest(&bytes)?
         } else if create_if_missing {
             let state = ManifestState::empty();
-            publish_manifest(&path, &state)?;
+            publish_manifest_with_backend(&native_storage, &path, &state)?;
             state
         } else {
             ManifestState::empty()
         };
 
-        Ok(Self { path, state })
+        Ok(Self {
+            path,
+            state,
+            native_storage,
+        })
     }
 
     #[must_use]
@@ -299,7 +312,7 @@ impl ManifestStore {
         // state unchanged until the file publish succeeds, so a failed create,
         // flush, or compaction cannot make later operations believe an edit was
         // committed when the on-disk manifest never advanced.
-        publish_manifest(&self.path, &next_state)?;
+        publish_manifest_with_backend(&self.native_storage, &self.path, &next_state)?;
         self.state = next_state;
         Ok(())
     }
@@ -322,11 +335,22 @@ pub fn read_manifest(path: &Path) -> Result<ManifestState> {
 
 fn read_manifest_bytes(path: &Path) -> Result<Option<std::sync::Arc<[u8]>>> {
     let backend = NativeFileBackend::new();
+    read_manifest_bytes_with_backend(&backend, path)
+}
+
+fn read_manifest_bytes_with_backend(
+    backend: &NativeFileBackend,
+    path: &Path,
+) -> Result<Option<std::sync::Arc<[u8]>>> {
     let object = manifest_storage_object(path);
     backend.read_current_manifest_blocking(object)
 }
 
-fn publish_manifest(path: &Path, state: &ManifestState) -> Result<()> {
+fn publish_manifest_with_backend(
+    backend: &NativeFileBackend,
+    path: &Path,
+    state: &ManifestState,
+) -> Result<()> {
     let payload = encode_state(state)?;
     let payload_len = u32::try_from(payload.len())
         .map_err(|_| Error::invalid_options("manifest payload exceeds u32::MAX"))?;
@@ -339,7 +363,6 @@ fn publish_manifest(path: &Path, state: &ManifestState) -> Result<()> {
     bytes.extend_from_slice(&payload_checksum.to_le_bytes());
     bytes.extend_from_slice(&payload);
 
-    let backend = NativeFileBackend::new();
     let object = manifest_storage_object(path);
     backend.publish_manifest_blocking(object, bytes.into(), DurabilityMode::SyncAll)
 }

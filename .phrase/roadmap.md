@@ -1811,3 +1811,32 @@ runtime-owned blocking work.
   WAL/table/blob/manifest formats, MVCC, compaction, recovery, cleanup, and
   storage behavior remain unchanged.
 - Focused storage tests, formatting, clippy, full tests, and diff checks pass.
+
+### Phase 84: Persistent DB Runtime-Enabled Native Storage
+
+**Status**: Complete
+
+**Goal**: Attach persistent database construction and DB-owned storage helpers
+to a runtime-enabled native-file backend while keeping existing blocking decode
+paths explicit.
+
+**Entry Condition**: Phase 83 complete and native-file owned operations can
+execute through a runtime-enabled backend.
+
+**Acceptance Gate**:
+
+- Persistent `DbInner` owns a native-file backend constructed with the database
+  runtime.
+- Persistent manifest store creation and publish operations use the DB-owned
+  native backend.
+- Persistent WAL read/rewrite and append construction use the DB-owned native
+  backend.
+- DB-owned directory create/sync and cleanup deletes use the DB-owned native
+  backend.
+- Standalone table/blob/recovery helpers and borrowed blocking decode paths
+  remain unchanged.
+- Public async API, blocking API, publish barrier, commit tracker,
+  WAL/table/blob/manifest formats, MVCC, compaction, recovery, cleanup, and
+  storage behavior remain unchanged.
+- Focused DB/storage tests, formatting, clippy, full tests, and diff checks
+  pass.

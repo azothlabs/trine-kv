@@ -75,6 +75,7 @@ pub(crate) struct DbInner {
     blob_gc_output_bytes: AtomicU64,
     blob_gc_discarded_bytes: AtomicU64,
     blob_reads: Arc<BlobReadMetrics>,
+    native_storage: NativeFileBackend,
     runtime: Runtime,
     runtime_shutdown: CancellationToken,
     maintenance: Arc<MaintenanceCoordinator>,
@@ -637,11 +638,13 @@ impl Drop for DbInner {
             &self.background_workers,
         );
         let _ = cleanup_pending_obsolete_table_files(
+            &self.native_storage,
             persistent_path_from_options(&self.options),
             &self.snapshots,
             &self.pending_obsolete_table_ids,
         );
         let _ = cleanup_pending_obsolete_blob_files(
+            &self.native_storage,
             persistent_path_from_options(&self.options),
             &self.snapshots,
             self.manifest.as_ref(),
@@ -733,6 +736,7 @@ impl Db {
                 blob_gc_output_bytes: AtomicU64::new(0),
                 blob_gc_discarded_bytes: AtomicU64::new(0),
                 blob_reads: Arc::new(BlobReadMetrics::default()),
+                native_storage: NativeFileBackend::new(),
                 runtime,
                 runtime_shutdown: CancellationToken::new(),
                 maintenance: Arc::new(MaintenanceCoordinator::new()),
@@ -745,6 +749,7 @@ impl Db {
     fn open_persistent_with_options(options: DbOptions) -> Result<Self> {
         validate_options(&options)?;
         let runtime = Runtime::new(options.runtime);
+        let native_storage = NativeFileBackend::with_runtime(runtime.clone());
         let block_cache_bytes = options.block_cache_bytes;
         let StorageMode::Persistent { path } = &options.storage_mode else {
             return Err(Error::invalid_options("persistent open requires a path"));
@@ -756,7 +761,7 @@ impl Db {
                 return Err(Error::invalid_options("database path is not a directory"));
             }
         } else if options.create_if_missing && !options.read_only {
-            create_storage_directory_all(path)?;
+            create_storage_directory_all(&native_storage, path)?;
         } else {
             return Err(Error::invalid_options("database path does not exist"));
         }
@@ -774,9 +779,10 @@ impl Db {
         }
 
         let manifest_path = manifest::manifest_path(path);
-        let mut manifest = ManifestStore::open_or_create(
+        let mut manifest = ManifestStore::open_or_create_with_backend(
             manifest_path,
             options.create_if_missing && !options.read_only,
+            native_storage.clone(),
         )?;
         ensure_default_bucket_in_manifest(&mut manifest, &options)?;
         let replay_floor = manifest.state().wal_replay_floor();
@@ -793,11 +799,15 @@ impl Db {
         )?;
 
         let wal_path = wal::wal_path(path);
-        let batches = wal::read_batches_after(&wal_path, replay_floor)?;
+        let batches =
+            wal::read_batches_after_with_backend(&native_storage, &wal_path, replay_floor)?;
         let wal = if options.read_only {
             None
         } else {
-            Some(Mutex::new(WalWriter::open_append(&wal_path)?))
+            Some(Mutex::new(WalWriter::open_append_with_backend(
+                &native_storage,
+                &wal_path,
+            )?))
         };
 
         let db = Self {
@@ -824,6 +834,7 @@ impl Db {
                 blob_gc_output_bytes: AtomicU64::new(0),
                 blob_gc_discarded_bytes: AtomicU64::new(0),
                 blob_reads: Arc::new(BlobReadMetrics::default()),
+                native_storage,
                 runtime,
                 runtime_shutdown: CancellationToken::new(),
                 maintenance: Arc::new(MaintenanceCoordinator::new()),
@@ -1337,8 +1348,9 @@ impl Db {
                 });
                 for table in tables {
                     let properties = table.properties();
-                    let table_bytes = persistent_path
-                        .map_or(0, |db_path| table_file_bytes(db_path, properties.id));
+                    let table_bytes = persistent_path.map_or(0, |db_path| {
+                        table_file_bytes(&self.inner.native_storage, db_path, properties.id)
+                    });
                     stats.filters.saturating_add_assign(table.filter_stats());
                     stats
                         .read_path
@@ -1367,7 +1379,12 @@ impl Db {
         stats.live_blob_files = live_blob_bytes_by_file.len();
         stats.live_blob_bytes = live_blob_bytes_by_file.values().copied().sum();
         if let Some(db_path) = persistent_path {
-            add_obsolete_blob_stats(db_path, &live_blob_bytes_by_file, &mut stats);
+            add_obsolete_blob_stats(
+                &self.inner.native_storage,
+                db_path,
+                &live_blob_bytes_by_file,
+                &mut stats,
+            );
         }
 
         stats
@@ -1959,22 +1976,29 @@ impl Db {
             ) {
                 Ok(table) => table,
                 Err(error) => {
-                    let _ = remove_storage_files(db_path, &written_table_ids);
+                    let _ = remove_storage_files(
+                        &self.inner.native_storage,
+                        db_path,
+                        &written_table_ids,
+                    );
                     return Err(error);
                 }
             };
             written_tables.push((input.bucket.clone(), Arc::new(table)));
         }
 
-        if let Err(error) = sync_storage_directory_after_renames(db_path) {
-            let _ = remove_storage_files(db_path, &written_table_ids);
+        if let Err(error) =
+            sync_storage_directory_after_renames(&self.inner.native_storage, db_path)
+        {
+            let _ = remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
             return Err(error);
         }
 
         {
             let _publish = self.inner.publish_barrier.enter()?;
             if let Err(error) = self.publish_flushed_tables(&written_tables, flush_sequence) {
-                let _ = remove_storage_files(db_path, &written_table_ids);
+                let _ =
+                    remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
                 return Err(error);
             }
             Self::install_flushed_tables(flush_inputs, written_tables)?;
@@ -2146,22 +2170,25 @@ impl Db {
             self.obsolete_blob_ids_for_compaction(&compaction_inputs, &written_tables)?;
 
         if !written_table_ids.is_empty() {
-            if let Err(error) = sync_storage_directory_after_renames(db_path) {
-                let _ = remove_storage_files(db_path, &written_table_ids);
+            if let Err(error) =
+                sync_storage_directory_after_renames(&self.inner.native_storage, db_path)
+            {
+                let _ =
+                    remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
                 return Err(error);
             }
         }
 
         let _publish = self.inner.publish_barrier.enter()?;
         if let Err(error) = self.validate_compacted_tables(&written_tables) {
-            let _ = remove_storage_files(db_path, &written_table_ids);
+            let _ = remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
             if is_level_layout_compaction_error(&error) {
                 return Ok(MaintenanceRunOutcome::NoWork);
             }
             return Err(error);
         }
         if let Err(error) = self.publish_compacted_tables(&written_tables, &obsolete_blob_ids) {
-            let _ = remove_storage_files(db_path, &written_table_ids);
+            let _ = remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
             return Err(error);
         }
 
@@ -2213,7 +2240,11 @@ impl Db {
             ) {
                 Ok(payloads) => payloads,
                 Err(error) => {
-                    let _ = remove_storage_files(db_path, &written_table_ids);
+                    let _ = remove_storage_files(
+                        &self.inner.native_storage,
+                        db_path,
+                        &written_table_ids,
+                    );
                     return Err(error);
                 }
             };
@@ -2229,7 +2260,11 @@ impl Db {
                 next_table_id = if let Some(table_id) = next_table_id.next() {
                     table_id
                 } else {
-                    let _ = remove_storage_files(db_path, &written_table_ids);
+                    let _ = remove_storage_files(
+                        &self.inner.native_storage,
+                        db_path,
+                        &written_table_ids,
+                    );
                     return Err(Error::Corruption {
                         message: "table id counter overflow".to_owned(),
                     });
@@ -2247,7 +2282,11 @@ impl Db {
                 ) {
                     Ok(table) => table,
                     Err(error) => {
-                        let _ = remove_storage_files(db_path, &written_table_ids);
+                        let _ = remove_storage_files(
+                            &self.inner.native_storage,
+                            db_path,
+                            &written_table_ids,
+                        );
                         return Err(error);
                     }
                 };
@@ -2307,7 +2346,11 @@ impl Db {
             match blob::write_blob_file(db_path, plan.new_blob_file_id, header, &blob_records) {
                 Ok(indexes) => indexes,
                 Err(error) => {
-                    let _ = remove_storage_files(db_path, &written_table_ids);
+                    let _ = remove_storage_files(
+                        &self.inner.native_storage,
+                        db_path,
+                        &written_table_ids,
+                    );
                     return Err(error);
                 }
             };
@@ -2316,25 +2359,29 @@ impl Db {
         let output_bytes = match apply_blob_gc_indexes(&mut tables, plan.records, indexes) {
             Ok(output_bytes) => output_bytes,
             Err(error) => {
-                let _ = remove_storage_files(db_path, &written_table_ids);
+                let _ =
+                    remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
                 return Err(error);
             }
         };
         let outputs = match write_blob_gc_replacement_tables(db_path, tables) {
             Ok(outputs) => outputs,
             Err(error) => {
-                let _ = remove_storage_files(db_path, &written_table_ids);
+                let _ =
+                    remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
                 return Err(error);
             }
         };
 
-        if let Err(error) = sync_storage_directory_after_renames(db_path) {
-            let _ = remove_storage_files(db_path, &written_table_ids);
+        if let Err(error) =
+            sync_storage_directory_after_renames(&self.inner.native_storage, db_path)
+        {
+            let _ = remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
             return Err(error);
         }
 
         if let Err(error) = self.publish_compacted_tables(&outputs, &obsolete_blob_ids) {
-            let _ = remove_storage_files(db_path, &written_table_ids);
+            let _ = remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
             return Err(error);
         }
 
@@ -2547,8 +2594,12 @@ impl Db {
         let wal_path = wal::wal_path(db_path);
         let mut writer = wal.lock().map_err(|_| lock_poisoned("WAL writer"))?;
         writer.persist(DurabilityMode::SyncAll)?;
-        wal::rewrite_batches_after(&wal_path, replay_floor)?;
-        writer.reopen_append(&wal_path)
+        wal::rewrite_batches_after_with_backend(
+            &self.inner.native_storage,
+            &wal_path,
+            replay_floor,
+        )?;
+        writer.reopen_append_with_backend(&self.inner.native_storage, &wal_path)
     }
 
     fn install_flushed_tables(
@@ -2607,6 +2658,7 @@ impl Db {
 
     fn cleanup_pending_obsolete_blob_files(&self, db_path: &Path) -> Result<()> {
         cleanup_pending_obsolete_blob_files(
+            &self.inner.native_storage,
             Some(db_path),
             &self.inner.snapshots,
             self.inner.manifest.as_ref(),
@@ -2684,6 +2736,7 @@ impl Db {
 
     fn cleanup_pending_obsolete_table_files(&self, db_path: &Path) -> Result<()> {
         cleanup_pending_obsolete_table_files(
+            &self.inner.native_storage,
             Some(db_path),
             &self.inner.snapshots,
             &self.inner.pending_obsolete_table_ids,
@@ -2739,11 +2792,11 @@ impl Db {
     ) {
         let input_bytes = input_table_ids
             .iter()
-            .map(|table_id| table_file_bytes(db_path, *table_id))
+            .map(|table_id| table_file_bytes(&self.inner.native_storage, db_path, *table_id))
             .sum::<u64>();
         let output_bytes = output_table_ids
             .iter()
-            .map(|table_id| table_file_bytes(db_path, *table_id))
+            .map(|table_id| table_file_bytes(&self.inner.native_storage, db_path, *table_id))
             .sum::<u64>();
 
         self.inner
@@ -3038,14 +3091,16 @@ fn ensure_default_bucket_loaded(
     Ok(())
 }
 
-fn table_file_bytes(db_path: &Path, table_id: table::TableId) -> u64 {
+fn table_file_bytes(backend: &NativeFileBackend, db_path: &Path, table_id: table::TableId) -> u64 {
     storage_object_file_bytes(
+        backend,
         StorageObjectKind::Table,
         &table::table_path(db_path, table_id),
     )
 }
 
 fn add_obsolete_blob_stats(
+    backend: &NativeFileBackend,
     db_path: &Path,
     live_blob_bytes_by_file: &BTreeMap<u64, u64>,
     stats: &mut DbStats,
@@ -3071,16 +3126,22 @@ fn add_obsolete_blob_stats(
             continue;
         }
         stats.obsolete_blob_files += 1;
-        let bytes =
-            storage_object_file_bytes(StorageObjectKind::Blob, &blob::blob_path(db_path, file_id));
+        let bytes = storage_object_file_bytes(
+            backend,
+            StorageObjectKind::Blob,
+            &blob::blob_path(db_path, file_id),
+        );
         stats.obsolete_blob_bytes = stats.obsolete_blob_bytes.saturating_add(bytes);
         stats.stale_blob_files = stats.stale_blob_files.saturating_add(1);
         stats.stale_blob_bytes = stats.stale_blob_bytes.saturating_add(bytes);
     }
 }
 
-fn storage_object_file_bytes(kind: StorageObjectKind, path: &Path) -> u64 {
-    let backend = NativeFileBackend::new();
+fn storage_object_file_bytes(
+    backend: &NativeFileBackend,
+    kind: StorageObjectKind,
+    path: &Path,
+) -> u64 {
     if backend
         .capabilities()
         .require(StorageCapability::RandomRead)
@@ -3360,6 +3421,7 @@ fn persistent_path_from_options(options: &DbOptions) -> Option<&Path> {
 }
 
 fn cleanup_pending_obsolete_table_files(
+    backend: &NativeFileBackend,
     db_path: Option<&Path>,
     snapshots: &SnapshotTracker,
     pending_table_ids: &Mutex<BTreeSet<table::TableId>>,
@@ -3381,7 +3443,7 @@ fn cleanup_pending_obsolete_table_files(
         pending.iter().copied().collect::<Vec<_>>()
     };
 
-    remove_table_files(db_path, &table_ids)?;
+    remove_table_files(backend, db_path, &table_ids)?;
 
     let mut pending = pending_table_ids
         .lock()
@@ -3394,6 +3456,7 @@ fn cleanup_pending_obsolete_table_files(
 }
 
 fn cleanup_pending_obsolete_blob_files(
+    backend: &NativeFileBackend,
     db_path: Option<&Path>,
     snapshots: &SnapshotTracker,
     manifest: Option<&Mutex<ManifestStore>>,
@@ -3429,7 +3492,11 @@ fn cleanup_pending_obsolete_blob_files(
     }
 
     for file_id in &pending_file_ids {
-        delete_storage_object(StorageObjectKind::Blob, &blob::blob_path(db_path, *file_id))?;
+        delete_storage_object(
+            backend,
+            StorageObjectKind::Blob,
+            &blob::blob_path(db_path, *file_id),
+        )?;
     }
 
     manifest
@@ -3438,9 +3505,14 @@ fn cleanup_pending_obsolete_blob_files(
         .clear_pending_blob_deletions(&pending_file_ids)
 }
 
-fn remove_table_files(db_path: &Path, table_ids: &[table::TableId]) -> Result<()> {
+fn remove_table_files(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+    table_ids: &[table::TableId],
+) -> Result<()> {
     for table_id in table_ids {
         delete_storage_object(
+            backend,
             StorageObjectKind::Table,
             &table::table_path(db_path, *table_id),
         )?;
@@ -3449,9 +3521,14 @@ fn remove_table_files(db_path: &Path, table_ids: &[table::TableId]) -> Result<()
     Ok(())
 }
 
-fn remove_blob_files(db_path: &Path, table_ids: &[table::TableId]) -> Result<()> {
+fn remove_blob_files(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+    table_ids: &[table::TableId],
+) -> Result<()> {
     for table_id in table_ids {
         delete_storage_object(
+            backend,
             StorageObjectKind::Blob,
             &blob::blob_path(db_path, table_id.get()),
         )?;
@@ -3460,36 +3537,41 @@ fn remove_blob_files(db_path: &Path, table_ids: &[table::TableId]) -> Result<()>
     Ok(())
 }
 
-fn delete_storage_object(kind: StorageObjectKind, path: &Path) -> Result<()> {
-    let backend = NativeFileBackend::new();
+fn delete_storage_object(
+    backend: &NativeFileBackend,
+    kind: StorageObjectKind,
+    path: &Path,
+) -> Result<()> {
     backend
         .capabilities()
         .require(StorageCapability::ObjectDelete)?;
     backend.delete_object_blocking(StorageObjectId::native_file(kind, path))
 }
 
-fn sync_storage_directory_after_renames(path: &Path) -> Result<()> {
-    let backend = NativeFileBackend::new();
+fn sync_storage_directory_after_renames(backend: &NativeFileBackend, path: &Path) -> Result<()> {
     backend
         .capabilities()
         .require(StorageCapability::DirectorySync)?;
     backend.sync_directory_after_renames_blocking(StorageDirectoryId::native_file(path))
 }
 
-fn create_storage_directory_all(path: &Path) -> Result<()> {
-    let backend = NativeFileBackend::new();
+fn create_storage_directory_all(backend: &NativeFileBackend, path: &Path) -> Result<()> {
     backend
         .capabilities()
         .require(StorageCapability::DirectoryCreate)?;
     backend.create_directory_all_blocking(StorageDirectoryId::native_file(path))
 }
 
-fn remove_storage_files(db_path: &Path, table_ids: &[table::TableId]) -> Result<()> {
+fn remove_storage_files(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+    table_ids: &[table::TableId],
+) -> Result<()> {
     // A table write uses the table id as the blob file id for large values.
     // Before manifest publish succeeds, both files are unpublished output and
     // can be removed together after a failed flush or compaction attempt.
-    remove_table_files(db_path, table_ids)?;
-    remove_blob_files(db_path, table_ids)
+    remove_table_files(backend, db_path, table_ids)?;
+    remove_blob_files(backend, db_path, table_ids)
 }
 
 #[cfg(test)]
@@ -3506,7 +3588,10 @@ mod tests {
         record_maintenance_success, shutdown_background_workers,
     };
     use crate::{
-        bucket::DEFAULT_BUCKET_NAME, options::DbOptions, runtime::CancellationToken,
+        bucket::DEFAULT_BUCKET_NAME,
+        options::DbOptions,
+        runtime::CancellationToken,
+        storage::{StorageCapability, StorageReadBackend},
         types::KeyRange,
     };
 
@@ -3535,6 +3620,28 @@ mod tests {
         shutdown_background_workers(&maintenance, &runtime_shutdown, &workers);
 
         assert!(runtime_shutdown.is_cancelled());
+    }
+
+    #[test]
+    fn persistent_open_attaches_runtime_enabled_native_storage_backend() {
+        let path = temp_db_path("persistent-runtime-native-storage");
+        let mut options = DbOptions::persistent(&path);
+        options.background_worker_count = 0;
+        let db = Db::open(options).expect("persistent db opens");
+
+        let capabilities = db.inner.native_storage.capabilities();
+        assert!(capabilities.supports(StorageCapability::AsyncTasks));
+        assert!(capabilities.supports(StorageCapability::BackgroundThreads));
+
+        db.put(b"key", b"value").expect("write");
+        db.flush().expect("flush through db-owned native storage");
+        assert_eq!(
+            db.get(b"key").expect("read after flush"),
+            Some(b"value".to_vec())
+        );
+
+        drop(db);
+        fs::remove_dir_all(path).expect("cleanup test db");
     }
 
     #[test]

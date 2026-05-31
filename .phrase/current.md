@@ -6,22 +6,19 @@ Complete
 
 ## Goal
 
-Route native-file owned storage writes, append operations, manifest publish,
-and object listing through the bounded runtime blocking adapter when a
-runtime-enabled backend is used.
+Attach persistent database construction and DB-owned storage helpers to a
+runtime-enabled native-file backend while keeping existing blocking decode paths
+explicit.
 
 ## Scope
 
-- Route native-file object writes and deletes through the runtime boundary when
-  the backend has a native runtime.
-- Route native-file WAL rewrite, manifest read/publish, and object listing
-  through the runtime boundary when the backend has a native runtime.
-- Route native-file append-object open, append, and persist through the runtime
-  boundary when the backend/object has a native runtime.
-- Preserve direct blocking adapters for synchronous callers.
-- Preserve inline/no-runtime storage behavior.
+- Add a persistent native-file backend field to `DbInner` and construct it with
+  the database runtime.
+- Route DB-owned directory create/sync, object cleanup deletes, manifest store,
+  WAL read/rewrite, and WAL append construction through that backend.
+- Preserve no-runtime behavior for standalone module helpers and tests.
 - Preserve existing borrowed blocking read paths for current table/blob decode
-  code.
+  code and standalone table/blob helpers.
 - Preserve existing public async API, blocking API, publish barrier, commit
   tracker, WAL/table/blob/manifest formats, MVCC, compaction, recovery,
   cleanup, and storage behavior.
@@ -32,7 +29,8 @@ runtime-enabled backend is used.
 - Adding a public executor dependency.
 - Adding public runtime tuning options.
 - Converting table/blob/block decode call sites to async advancement.
-- Migrating database call sites to runtime-enabled native-file backends.
+- Migrating standalone recovery scanning to a runtime-enabled backend.
+- Migrating table/blob module standalone helpers to runtime-enabled backends.
 - Removing the serialized publish barrier.
 - Adding WAL shards or writer-local deltas.
 - Changing transaction conflict rules.
@@ -41,30 +39,31 @@ runtime-enabled backend is used.
 
 ## Acceptance Gate
 
-- Roadmap records this as the native-file runtime-owned storage mutation phase.
-- Runtime-enabled native-file object writes/deletes execute through the bounded
-  blocking adapter.
-- Runtime-enabled native-file WAL rewrite, manifest read/publish, directory
-  operations, and object listing execute through the bounded blocking adapter.
-- Runtime-enabled native-file append-object open, append, and persist execute
-  through the bounded blocking adapter.
+- Roadmap records this as the persistent DB runtime-enabled native storage
+  migration phase.
+- Persistent `DbInner` owns a runtime-enabled native-file backend.
+- Persistent manifest store creation and manifest publish use the DB-owned
+  native backend.
+- Persistent WAL read/rewrite and WAL append construction use the DB-owned
+  native backend.
+- DB-owned directory create/sync and cleanup deletes use the DB-owned native
+  backend.
 - Blocking storage adapters remain direct synchronous paths.
-- Inline/no-runtime storage operations remain immediately pollable.
 - Existing borrowed blocking read paths remain unchanged for current decode
   code.
-- Focused runtime/storage tests, formatting, clippy, full tests,
+- Focused DB/storage tests, formatting, clippy, full tests,
   `git diff --check`, and forbidden-term scan pass.
 - Evidence records remaining async blockers.
 
 ## Active Task Slice
 
 ```text
-task334 [x] goal:start native-file runtime-owned storage mutation slice | scope:current roadmap | verify:manual
-task335 [x] goal:route object write/delete and listing through runtime | scope:src/storage.rs | verify:storage tests
-task336 [x] goal:route manifest read/publish, WAL rewrite, and directory ops through runtime | scope:src/storage.rs | verify:storage tests
-task337 [x] goal:route append open/append/persist through runtime | scope:src/storage.rs | verify:storage tests
-task338 [x] goal:preserve direct blocking adapters and no-runtime behavior | scope:src/storage.rs | verify:storage tests full tests
-task339 [x] goal:record evidence and commit | scope:.phrase/evidence.md current roadmap | verify:git status
+task340 [x] goal:start persistent DB runtime-enabled storage backend slice | scope:current roadmap | verify:manual
+task341 [x] goal:add DB-owned native storage backend constructed with runtime | scope:src/db.rs | verify:db tests
+task342 [x] goal:route manifest store and WAL construction through DB backend | scope:src/manifest.rs src/wal.rs src/db.rs | verify:db tests
+task343 [x] goal:route DB-owned directory sync/create and cleanup deletes through DB backend | scope:src/db.rs | verify:persistent tests
+task344 [x] goal:preserve standalone no-runtime helpers and decode paths | scope:src/table.rs src/blob.rs src/recovery.rs | verify:full tests
+task345 [x] goal:record evidence and commit | scope:.phrase/evidence.md current roadmap | verify:git status
 ```
 
 ## Known Blockers
@@ -76,7 +75,10 @@ task339 [x] goal:record evidence and commit | scope:.phrase/evidence.md current 
   over synchronous iterator advancement.
 - True multi-writer execution still needs writer-local deltas and WAL
   partitioning.
-- Database call sites still mostly construct no-runtime native-file backends.
+- Standalone recovery scanning still constructs no-runtime native-file backends.
+- Table/blob standalone helpers still construct no-runtime native-file
+  backends.
+- Database read decode paths still use blocking table/blob readers.
 
 ## Evidence
 
@@ -170,8 +172,24 @@ task339 [x] goal:record evidence and commit | scope:.phrase/evidence.md current 
   `cargo test --all-targets --all-features`.
 - `git diff --check` passed.
 - Forbidden-term scan passed outside the repository instruction file.
+- Persistent `DbInner` now owns a native-file backend constructed with the
+  database runtime.
+- Persistent open routes manifest store creation, WAL replay reads, and WAL
+  append construction through the DB-owned native backend.
+- Flush cleanup, compaction cleanup, blob cleanup, directory sync, directory
+  create, WAL rewrite/reopen, stats file length reads, and drop-time cleanup
+  now use the DB-owned native backend.
+- Standalone manifest/WAL helpers preserve no-runtime behavior by constructing
+  their own native backend.
+- Standalone table/blob/recovery helpers and borrowed blocking decode paths
+  were not migrated in this phase.
+- Verification passed: `cargo fmt --check`,
+  `cargo clippy --all-targets --all-features -- -D warnings`,
+  `cargo test --lib`, and `cargo test --all-targets --all-features`.
+- `git diff --check` passed.
+- Forbidden-term scan passed outside the repository instruction file.
 
 ## Next Recommendation
 
-- Migrate database construction paths to runtime-enabled native-file backends
-  in small groups, while keeping current borrowed block decode paths explicit.
+- Finish this slice, then migrate table/blob standalone helpers or recovery
+  scanning in a separate measured phase.

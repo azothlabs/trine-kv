@@ -53,8 +53,16 @@ pub struct WalWriter {
 
 impl WalWriter {
     pub fn open_append(path: &Path) -> Result<Self> {
+        let backend = NativeFileBackend::new();
+        Self::open_append_with_backend(&backend, path)
+    }
+
+    pub(crate) fn open_append_with_backend(
+        backend: &NativeFileBackend,
+        path: &Path,
+    ) -> Result<Self> {
         Ok(Self {
-            append: open_wal_append_object(path)?,
+            append: open_wal_append_object_with_backend(backend, path)?,
         })
     }
 
@@ -73,7 +81,16 @@ impl WalWriter {
     }
 
     pub fn reopen_append(&mut self, path: &Path) -> Result<()> {
-        self.append = open_wal_append_object(path)?;
+        let backend = NativeFileBackend::new();
+        self.reopen_append_with_backend(&backend, path)
+    }
+
+    pub(crate) fn reopen_append_with_backend(
+        &mut self,
+        backend: &NativeFileBackend,
+        path: &Path,
+    ) -> Result<()> {
+        self.append = open_wal_append_object_with_backend(backend, path)?;
         Ok(())
     }
 }
@@ -88,16 +105,34 @@ pub fn read_batches(path: &Path) -> Result<Vec<WalBatch>> {
 }
 
 pub fn read_batches_after(path: &Path, replay_floor: Sequence) -> Result<Vec<WalBatch>> {
-    let Some(bytes) = read_wal_object(path)? else {
+    let backend = NativeFileBackend::new();
+    read_batches_after_with_backend(&backend, path, replay_floor)
+}
+
+pub(crate) fn read_batches_after_with_backend(
+    backend: &NativeFileBackend,
+    path: &Path,
+    replay_floor: Sequence,
+) -> Result<Vec<WalBatch>> {
+    let Some(bytes) = read_wal_object_with_backend(backend, path)? else {
         return Ok(Vec::new());
     };
     decode_frames_after(bytes.as_ref(), replay_floor)
 }
 
 pub fn rewrite_batches_after(path: &Path, replay_floor: Sequence) -> Result<()> {
-    let batches = read_batches_after(path, replay_floor)?;
+    let backend = NativeFileBackend::new();
+    rewrite_batches_after_with_backend(&backend, path, replay_floor)
+}
+
+pub(crate) fn rewrite_batches_after_with_backend(
+    backend: &NativeFileBackend,
+    path: &Path,
+    replay_floor: Sequence,
+) -> Result<()> {
+    let batches = read_batches_after_with_backend(backend, path, replay_floor)?;
     let bytes = encode_batches_after(&batches, replay_floor)?;
-    rewrite_wal_object(path, bytes.into())?;
+    rewrite_wal_object_with_backend(backend, path, bytes.into())?;
 
     Ok(())
 }
@@ -106,22 +141,29 @@ fn wal_rewrite_tmp_path(path: &Path) -> PathBuf {
     path.with_file_name(WAL_REWRITE_TMP_FILE_NAME)
 }
 
-fn open_wal_append_object(path: &Path) -> Result<NativeFileAppendObject> {
-    let backend = NativeFileBackend::new();
+fn open_wal_append_object_with_backend(
+    backend: &NativeFileBackend,
+    path: &Path,
+) -> Result<NativeFileAppendObject> {
     backend.capabilities().require(StorageCapability::Append)?;
     backend.open_append_blocking(wal_storage_object(path))
 }
 
-fn read_wal_object(path: &Path) -> Result<Option<Arc<[u8]>>> {
-    let backend = NativeFileBackend::new();
+fn read_wal_object_with_backend(
+    backend: &NativeFileBackend,
+    path: &Path,
+) -> Result<Option<Arc<[u8]>>> {
     backend
         .capabilities()
         .require(StorageCapability::ObjectRead)?;
     backend.read_object_bytes_blocking(wal_storage_object(path))
 }
 
-fn rewrite_wal_object(path: &Path, bytes: Arc<[u8]>) -> Result<()> {
-    let backend = NativeFileBackend::new();
+fn rewrite_wal_object_with_backend(
+    backend: &NativeFileBackend,
+    path: &Path,
+    bytes: Arc<[u8]>,
+) -> Result<()> {
     backend
         .capabilities()
         .require(StorageCapability::AtomicWalRewrite)?;

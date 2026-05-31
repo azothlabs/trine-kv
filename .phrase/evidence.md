@@ -6429,3 +6429,66 @@ Record only evidence that can change planning or durable decisions.
 - Migrate database construction paths to runtime-enabled native-file backends in
   small groups, preserving the existing borrowed block decode path until a
   dedicated read-path phase changes it.
+
+## 2026-05-31: Persistent DB Runtime-Enabled Native Storage
+
+### Observation
+
+- Phase 83 made runtime-enabled native-file backends capable of routing owned
+  storage operations through the bounded blocking adapter, but persistent `Db`
+  construction still built ad-hoc no-runtime native backends for DB-owned
+  manifest, WAL, directory, cleanup, and stats helper paths.
+- Standalone table/blob/recovery helpers still own their own no-runtime backend
+  construction, and table/blob decode still uses borrowed blocking reads.
+
+### Interpretation
+
+- Persistent `Db` needs one native storage backend tied to the database runtime
+  before later async call-site migration can be done without scattering runtime
+  construction through modules.
+- Manifest and WAL can accept a backend boundary without changing storage
+  formats or public APIs.
+- Table/blob/recovery helper migration should stay separate because those paths
+  include read decode and recovery scanning behavior.
+
+### Verification
+
+- Added a DB-owned native-file backend to `DbInner`, constructed with the
+  database runtime for persistent opens.
+- Routed persistent manifest store creation and publish through the DB-owned
+  native backend.
+- Routed persistent WAL replay reads, WAL append construction, WAL rewrite, and
+  WAL append reopen through the DB-owned native backend.
+- Routed DB-owned directory create/sync, failed-output cleanup deletes,
+  drop-time cleanup, and stats file length reads through the DB-owned native
+  backend.
+- Preserved standalone no-runtime manifest/WAL helpers.
+- Preserved standalone table/blob/recovery helpers and borrowed blocking decode
+  paths.
+- Added a focused DB test proving persistent opens attach a runtime-enabled
+  native backend and still flush/read correctly.
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --lib`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan outside the repository instruction file
+
+### Remaining Blockers
+
+- Standalone table/blob helpers still construct no-runtime native-file
+  backends.
+- Standalone recovery scanning still constructs no-runtime native-file
+  backends.
+- Table/blob block reads and cursor advancement still use synchronous
+  advancement paths.
+- True async file I/O is not implemented.
+- Runtime worker and queue limits remain internal defaults.
+- True multi-writer execution still needs writer-local deltas and WAL
+  partitioning before the publish barrier can be narrowed further.
+
+### Recommended Next Action
+
+- Migrate table/blob standalone helpers or recovery scanning in a separate
+  measured phase, keeping table/blob decode semantics explicit until a
+  dedicated read-path phase changes them.
