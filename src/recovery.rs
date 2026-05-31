@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs, io,
+    io,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -11,10 +11,12 @@ use crate::{
     manifest::ManifestState,
     options::{DurabilityMode, FailOnCorruptionPolicy},
     storage::{
-        BlockingStorageDirectorySyncBackend, BlockingStorageObjectReadBackend,
-        BlockingStorageObjectWriteBackend, BlockingStorageWriterLeaseBackend, NativeFileBackend,
-        NativeFileWriterLease, StorageCapability, StorageDirectoryId, StorageObjectId,
-        StorageObjectKind, StorageReadBackend,
+        BlockingStorageDirectoryListBackend, BlockingStorageDirectorySyncBackend,
+        BlockingStorageObjectDeleteBackend, BlockingStorageObjectReadBackend,
+        BlockingStorageObjectWriteBackend, BlockingStorageReadBackend,
+        BlockingStorageWriterLeaseBackend, NativeFileBackend, NativeFileWriterLease,
+        StorageCapability, StorageDirectoryId, StorageObjectId, StorageObjectKind,
+        StorageReadBackend,
     },
     table::{self, TableId},
     wal,
@@ -97,7 +99,7 @@ pub(crate) fn repair_safe_temporary_files(
     }
 
     for temporary_file in &temporary_files {
-        fs::remove_file(&temporary_file.path)?;
+        delete_safe_temporary_file(&temporary_file.path)?;
     }
 
     let report = RecoveryReport {
@@ -138,7 +140,8 @@ pub(crate) fn fail_on_missing_referenced_blob_files(
         .copied()
         .filter_map(|blob_id| {
             let path = blob::blob_path(db_path, blob_id);
-            (!path.is_file()).then(|| storage_file_name(&path))
+            (!storage_object_exists(StorageObjectKind::Blob, &path))
+                .then(|| storage_file_name(&path))
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -237,30 +240,55 @@ struct TemporaryFile {
 }
 
 fn safe_temporary_files(db_path: &Path) -> Result<Vec<TemporaryFile>> {
-    if !db_path.exists() {
-        return Ok(Vec::new());
-    }
+    let backend = NativeFileBackend::new();
+    backend
+        .capabilities()
+        .require(StorageCapability::DirectoryListing)?;
+    let directory_files = match backend
+        .list_directory_files_blocking(StorageDirectoryId::native_file(db_path))
+    {
+        Ok(files) => files,
+        Err(Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
 
     let mut files = Vec::new();
-    for entry in fs::read_dir(db_path)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if is_safe_temporary_file(name) {
-            files.push(TemporaryFile {
-                name: name.to_owned(),
-                path,
-            });
+    for directory_file in directory_files {
+        let path = directory_file.path().to_path_buf();
+        let name = storage_file_name(&path)?;
+        if is_safe_temporary_file(&name) {
+            files.push(TemporaryFile { name, path });
         }
     }
     files.sort_by(|left, right| left.name.cmp(&right.name));
 
     Ok(files)
+}
+
+fn delete_safe_temporary_file(path: &Path) -> Result<()> {
+    let backend = NativeFileBackend::new();
+    backend
+        .capabilities()
+        .require(StorageCapability::ObjectDelete)?;
+    backend.delete_object_blocking(StorageObjectId::native_file(
+        StorageObjectKind::Temporary,
+        path,
+    ))
+}
+
+fn storage_object_exists(kind: StorageObjectKind, path: &Path) -> bool {
+    let backend = NativeFileBackend::new();
+    if backend
+        .capabilities()
+        .require(StorageCapability::RandomRead)
+        .is_err()
+    {
+        return false;
+    }
+
+    backend
+        .open_read_blocking(StorageObjectId::native_file(kind, path))
+        .is_ok()
 }
 
 fn is_safe_temporary_file(name: &str) -> bool {

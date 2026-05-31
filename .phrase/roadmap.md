@@ -1482,3 +1482,25 @@ available as storage backend operations.
   MVCC, compaction, and cleanup semantics remain unchanged.
 - Focused stats/persistent tests, formatting, clippy, full tests, and diff
   checks pass.
+
+### Phase 70: Recovery Directory-File Listing Backend
+
+**Status**: Complete
+
+**Goal**: Route recovery safe temporary file scanning/deletion and referenced
+blob existence checks through storage backend operations.
+
+**Entry Condition**: Phase 69 complete and object delete plus random-read
+backend operations are already available.
+
+**Acceptance Gate**:
+
+- Native-file backend reports directory-file listing capability.
+- Native-file backend exposes directory-file listing for regular files.
+- Recovery safe temporary file scanning uses backend directory listing.
+- Recovery safe temporary file repair deletion uses backend object deletion.
+- Referenced blob existence checks use backend object open.
+- Recovery fail-closed, repair-safe-temporary, and unreferenced formal file
+  policies remain unchanged.
+- Focused storage/recovery tests, formatting, clippy, full tests, and diff
+  checks pass.

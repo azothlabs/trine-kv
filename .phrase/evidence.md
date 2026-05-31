@@ -5671,3 +5671,57 @@ Record only evidence that can change planning or durable decisions.
 - Reassess whether safe temporary file repair should get explicit backend
   directory-list/delete operations, because it still performs native directory
   listing and file deletion directly.
+
+## 2026-05-31: Recovery Directory-File Listing Backend
+
+### Observation
+
+- Recovery safe temporary file scanning still used direct native directory
+  reads.
+- Repair-safe-temporary recovery still deleted safe temporary files directly.
+- Referenced blob existence checks still inspected native paths directly.
+- Existing backend operations already covered object deletion and object open,
+  but not regular-file directory listing.
+
+### Interpretation
+
+- Directory-file listing is a storage backend capability because it names a
+  filesystem operation without embedding recovery's safe temporary file rules
+  in the storage layer.
+- Safe temporary file deletion can reuse object deletion with a dedicated
+  temporary object kind.
+- Referenced blob existence can use backend object open while keeping the old
+  fail-closed recovery behavior.
+
+### Verification
+
+- Added `StorageCapability::DirectoryListing`.
+- Added `StorageDirectoryFile`, `StorageDirectoryListBackend`, and
+  `BlockingStorageDirectoryListBackend`.
+- Native-file storage now lists regular files in a directory through the
+  backend operation.
+- Recovery safe temporary file scanning now uses backend directory listing.
+- Repair-safe-temporary recovery now deletes temporary objects through backend
+  object deletion.
+- Referenced blob existence checks now use backend object open.
+- Added `native_file_backend_lists_directory_files`.
+- `cargo fmt --check`
+- `cargo test storage --lib`
+- `cargo test persistent_recovery --test persistent_wal`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan
+- Direct native-file operation audit outside storage/durability shows remaining
+  matches as test setup/cleanup or method names rather than production
+  recovery/stats file operations.
+
+### Remaining Blockers
+
+- Public async API, async runtime selection, and production in-memory object
+  routing remain later phases.
+
+### Recommended Next Action
+
+- Commit the slice, then reassess the next production boundary from fresh
+  evidence instead of old assumptions.

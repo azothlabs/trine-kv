@@ -6,38 +6,43 @@ Complete
 
 ## Goal
 
-Route persistent statistics object-length reads through the storage backend
-random-read operation.
+Route recovery safe temporary file scanning/deletion and referenced blob
+existence checks through storage backend operations.
 
 ## Scope
 
-- Replace production `fs::metadata(...).len()` usage in stats and compaction
-  byte accounting with backend object-open plus object length.
-- Preserve the existing fail-open stats behavior: missing or unreadable files
-  contribute zero bytes instead of failing `Db::stats`.
-- Reuse existing storage read capabilities instead of adding a new backend
-  trait for this small slice.
+- Add a backend operation for listing regular files in a native-file directory.
+- Route recovery safe temporary file scanning through backend directory
+  listing.
+- Route recovery safe temporary file repair deletion through backend object
+  deletion.
+- Route referenced blob existence checks through backend object open.
+- Preserve missing-directory behavior for safe temporary file scanning.
 - Preserve WAL/table/blob/manifest formats, recovery policy, MVCC visibility,
-  compaction behavior, cleanup behavior, and public API behavior.
+  compaction behavior, stats behavior, cleanup behavior, and public API
+  behavior.
 
 ## Out Of Scope
 
-- Routing safe temporary file listing/deletion.
-- Routing table/blob object listing that is already backend-owned.
 - Choosing a concrete async runtime crate.
 - Introducing or renaming public async APIs.
 - Moving production in-memory object routing into backend operations.
+- Changing recovery policy for unreferenced formal table/blob files.
+- Changing recovery report format.
 
 ## Acceptance Gate
 
-- Roadmap records the stats object-length backend phase at phase granularity.
-- Current phase records the stats fail-open behavior and out-of-scope items.
-- Table stats byte accounting opens table objects through the storage backend.
-- Obsolete blob stats byte accounting opens blob objects through the storage
-  backend.
-- Existing stats tests still prove table bytes, compaction bytes, and obsolete
-  blob bytes are reported.
-- `cargo fmt --check`, focused stats/persistent tests, clippy,
+- Roadmap records the recovery directory-list backend phase at phase
+  granularity.
+- Current phase records the recovery policy boundaries and out-of-scope items.
+- Native-file backend reports directory-list capability.
+- Native-file backend exposes async and blocking directory-file listing.
+- Safe temporary file scanning uses backend directory listing.
+- Safe temporary file deletion uses backend object deletion.
+- Referenced blob existence checks use backend object open.
+- Existing fail-closed and repair-safe-temporary recovery behavior remains the
+  same.
+- `cargo fmt --check`, focused storage/recovery tests, clippy,
   `cargo test --all-targets --all-features`, `git diff --check`, and
   forbidden-term scan pass.
 - Evidence records remaining direct native-file operations after the slice.
@@ -45,39 +50,45 @@ random-read operation.
 ## Active Task Slice
 
 ```text
-task260 [x] goal:start stats object-length backend slice | scope:current roadmap | verify:manual
-task261 [x] goal:route stats length reads through storage backend | scope:src/db.rs | verify:persistent stats tests
-task262 [x] goal:run verification gate | scope:workspace | verify:fmt clippy tests diff
-task263 [x] goal:record evidence and next step | scope:.phrase/evidence.md current roadmap | verify:git diff
+task264 [x] goal:start recovery directory-list backend slice | scope:current roadmap | verify:manual
+task265 [x] goal:add directory-file listing operation | scope:src/storage.rs | verify:storage tests
+task266 [x] goal:route recovery temp scan/delete and blob existence checks | scope:src/recovery.rs | verify:persistent recovery tests
+task267 [x] goal:run verification gate | scope:workspace | verify:fmt clippy tests diff
+task268 [x] goal:record evidence and next step | scope:.phrase/evidence.md current roadmap | verify:git diff
 ```
 
 ## Known Blockers
 
-- None identified for this stats length slice.
-- Safe temporary file listing/deletion, public async API, async runtime
-  selection, and production in-memory object routing remain later phases.
+- None identified for this recovery directory-list slice.
+- Public async API, async runtime selection, and production in-memory object
+  routing remain later phases.
 
 ## Evidence
 
-- Stats table-byte accounting still used direct `fs::metadata` for table files.
-- Obsolete blob-byte accounting still used direct `fs::metadata` for blob files.
-- The existing storage read backend already exposes native-file open and object
-  length operations.
-- Existing persistent stats coverage checks table bytes, compaction bytes, and
-  obsolete blob bytes.
-- `table_file_bytes` now opens table storage objects through
-  `NativeFileBackend` and reads object length.
-- Obsolete blob byte stats now open blob storage objects through
-  `NativeFileBackend` and read object length.
-- Existing fail-open stats behavior is preserved: unreadable objects contribute
-  zero bytes.
-- Verification passed: `cargo fmt --check`, `cargo test storage --lib`,
-  `cargo test persistent_stats_report_tables_blobs_and_compactions --test
-  persistent_wal`, `cargo clippy --all-targets --all-features -- -D
-  warnings`, `cargo test --all-targets --all-features`, `git diff --check`,
-  and forbidden-term scan.
+- Recovery safe temporary file scan still uses direct native directory reads.
+- Repair-safe-temporary recovery still deletes safe temporary files directly.
+- Referenced blob existence checks still use direct native path inspection.
+- Existing storage object delete and random-read operations are sufficient for
+  deletion and existence checks.
+- A directory-file listing operation is the missing backend boundary for
+  recovery scan.
+- Native-file storage now reports `StorageCapability::DirectoryListing`.
+- Native-file storage now exposes async and blocking directory-file listing for
+  regular files.
+- Recovery safe temporary file scanning now uses backend directory listing.
+- Repair-safe-temporary recovery now deletes temporary objects through backend
+  object deletion.
+- Referenced blob existence checks now use backend object open.
+- Focused verification passed: `cargo test storage --lib` and
+  `cargo test persistent_recovery --test persistent_wal`.
+- Full verification passed: `cargo fmt --check`, `cargo clippy
+  --all-targets --all-features -- -D warnings`, `cargo test --all-targets
+  --all-features`, `git diff --check`, and forbidden-term scan.
+- Direct native-file operation audit outside storage/durability now shows
+  remaining matches as test setup/cleanup or method names rather than
+  production recovery/stats file operations.
 
 ## Next Recommendation
 
-- Reassess whether safe temporary file repair should get explicit backend
-  directory-list/delete operations.
+- Commit this slice, then reassess the next production boundary from fresh
+  evidence.

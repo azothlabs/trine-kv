@@ -23,6 +23,7 @@ pub(crate) enum StorageObjectKind {
     Manifest,
     RecoveryReport,
     Table,
+    Temporary,
     Wal,
     WriterLease,
 }
@@ -34,6 +35,7 @@ impl StorageObjectKind {
             Self::Manifest => "manifest",
             Self::RecoveryReport => "recovery report",
             Self::Table => "table",
+            Self::Temporary => "temporary",
             Self::Wal => "WAL",
             Self::WriterLease => "writer lease",
         }
@@ -92,6 +94,21 @@ impl StorageDirectoryId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct StorageDirectoryFile {
+    path: PathBuf,
+}
+
+impl StorageDirectoryFile {
+    pub(crate) fn native_file(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageObjectListRequest {
     kind: StorageObjectKind,
@@ -142,6 +159,7 @@ pub(crate) enum StorageCapability {
     Append,
     AtomicWalRewrite,
     DirectoryCreate,
+    DirectoryListing,
     DirectorySync,
     AtomicManifestPublish,
     WriterLease,
@@ -166,6 +184,7 @@ impl StorageCapability {
             Self::Append => "append",
             Self::AtomicWalRewrite => "atomic WAL rewrite",
             Self::DirectoryCreate => "directory create",
+            Self::DirectoryListing => "directory listing",
             Self::DirectorySync => "directory sync",
             Self::AtomicManifestPublish => "atomic manifest publish",
             Self::WriterLease => "writer lease",
@@ -190,15 +209,16 @@ impl StorageCapability {
             Self::Append => 1 << 7,
             Self::AtomicWalRewrite => 1 << 8,
             Self::DirectoryCreate => 1 << 9,
-            Self::DirectorySync => 1 << 10,
-            Self::AtomicManifestPublish => 1 << 11,
-            Self::WriterLease => 1 << 12,
-            Self::Flush => 1 << 13,
-            Self::StrictDataSync => 1 << 14,
-            Self::StrictMetadataSync => 1 << 15,
-            Self::BackgroundThreads => 1 << 16,
-            Self::AsyncTasks => 1 << 17,
-            Self::CooperativeTasks => 1 << 18,
+            Self::DirectoryListing => 1 << 10,
+            Self::DirectorySync => 1 << 11,
+            Self::AtomicManifestPublish => 1 << 12,
+            Self::WriterLease => 1 << 13,
+            Self::Flush => 1 << 14,
+            Self::StrictDataSync => 1 << 15,
+            Self::StrictMetadataSync => 1 << 16,
+            Self::BackgroundThreads => 1 << 17,
+            Self::AsyncTasks => 1 << 18,
+            Self::CooperativeTasks => 1 << 19,
         }
     }
 }
@@ -219,6 +239,7 @@ impl StorageCapabilities {
             .with(StorageCapability::RandomRead)
             .with(StorageCapability::ObjectRead)
             .with(StorageCapability::ObjectListing)
+            .with(StorageCapability::DirectoryListing)
     }
 
     pub(crate) const fn native_file() -> Self {
@@ -394,6 +415,20 @@ pub(crate) trait BlockingStorageDirectoryCreateBackend:
     StorageDirectoryCreateBackend
 {
     fn create_directory_all_blocking(&self, directory: StorageDirectoryId) -> Result<()>;
+}
+
+pub(crate) trait StorageDirectoryListBackend: StorageReadBackend {
+    fn list_directory_files(
+        &self,
+        directory: StorageDirectoryId,
+    ) -> StorageFuture<'_, Vec<StorageDirectoryFile>>;
+}
+
+pub(crate) trait BlockingStorageDirectoryListBackend: StorageDirectoryListBackend {
+    fn list_directory_files_blocking(
+        &self,
+        directory: StorageDirectoryId,
+    ) -> Result<Vec<StorageDirectoryFile>>;
 }
 
 pub(crate) trait StorageDirectorySyncBackend: StorageReadBackend {
@@ -717,6 +752,24 @@ impl StorageDirectoryCreateBackend for NativeFileBackend {
 impl BlockingStorageDirectoryCreateBackend for NativeFileBackend {
     fn create_directory_all_blocking(&self, directory: StorageDirectoryId) -> Result<()> {
         poll_ready_storage_future(self.create_directory_all(directory))
+    }
+}
+
+impl StorageDirectoryListBackend for NativeFileBackend {
+    fn list_directory_files(
+        &self,
+        directory: StorageDirectoryId,
+    ) -> StorageFuture<'_, Vec<StorageDirectoryFile>> {
+        Box::pin(async move { list_native_file_directory_files(&directory) })
+    }
+}
+
+impl BlockingStorageDirectoryListBackend for NativeFileBackend {
+    fn list_directory_files_blocking(
+        &self,
+        directory: StorageDirectoryId,
+    ) -> Result<Vec<StorageDirectoryFile>> {
+        poll_ready_storage_future(self.list_directory_files(directory))
     }
 }
 
@@ -1186,6 +1239,25 @@ fn create_native_file_directory_all(directory: &StorageDirectoryId) -> Result<()
     fs::create_dir_all(directory.path()).map_err(Error::from)
 }
 
+fn list_native_file_directory_files(
+    directory: &StorageDirectoryId,
+) -> Result<Vec<StorageDirectoryFile>> {
+    let capabilities = StorageCapabilities::native_file_read();
+    capabilities.require(StorageCapability::DirectoryListing)?;
+
+    let mut files = Vec::new();
+    for entry in fs::read_dir(directory.path())? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        files.push(StorageDirectoryFile::native_file(entry.path()));
+    }
+
+    files.sort_unstable();
+    Ok(files)
+}
+
 fn sync_native_file_directory_after_renames(directory: &StorageDirectoryId) -> Result<()> {
     let capabilities = StorageCapabilities::native_file();
     capabilities.require(StorageCapability::DirectorySync)?;
@@ -1248,10 +1320,22 @@ fn write_native_file_object(
     bytes: &[u8],
     durability: DurabilityMode,
 ) -> Result<()> {
-    if object.kind() == StorageObjectKind::Manifest {
-        return Err(Error::invalid_options(
-            "manifest storage objects must use manifest publish",
-        ));
+    match object.kind() {
+        StorageObjectKind::Manifest => {
+            return Err(Error::invalid_options(
+                "manifest storage objects must use manifest publish",
+            ));
+        }
+        StorageObjectKind::Temporary => {
+            return Err(Error::invalid_options(
+                "temporary storage objects must use their owning publish operation",
+            ));
+        }
+        StorageObjectKind::Blob
+        | StorageObjectKind::RecoveryReport
+        | StorageObjectKind::Table
+        | StorageObjectKind::Wal
+        | StorageObjectKind::WriterLease => {}
     }
 
     let capabilities = StorageCapabilities::native_file();
@@ -1984,6 +2068,44 @@ mod tests {
     }
 
     #[test]
+    fn native_file_backend_lists_directory_files() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-storage-directory-list-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("test dir creates");
+        std::fs::write(root.join("MANIFEST.tmp"), b"manifest").expect("manifest tmp writes");
+        std::fs::write(root.join("trine.wal.tmp"), b"wal").expect("wal tmp writes");
+        std::fs::create_dir(root.join("nested")).expect("nested dir creates");
+
+        let backend = NativeFileBackend::new();
+        backend
+            .capabilities()
+            .require(StorageCapability::DirectoryListing)
+            .expect("native-file backend supports directory listing");
+        let files = backend
+            .list_directory_files_blocking(StorageDirectoryId::native_file(&root))
+            .expect("directory files list");
+        let names = files
+            .iter()
+            .map(|file| {
+                file.path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("file name is UTF-8")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["MANIFEST.tmp", "trine.wal.tmp"]);
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[test]
     fn native_file_backend_syncs_directory_after_renames() {
         let root = std::env::temp_dir().join(format!(
             "trine-kv-storage-directory-sync-{}-{}",
@@ -2082,6 +2204,7 @@ mod tests {
         assert!(read_only.supports(StorageCapability::RandomRead));
         assert!(read_only.supports(StorageCapability::ObjectRead));
         assert!(read_only.supports(StorageCapability::ObjectListing));
+        assert!(read_only.supports(StorageCapability::DirectoryListing));
         assert!(!read_only.supports(StorageCapability::ObjectWrite));
         assert!(!read_only.supports(StorageCapability::ObjectDelete));
         assert!(!read_only.supports(StorageCapability::Append));
