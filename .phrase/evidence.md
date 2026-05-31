@@ -5416,3 +5416,54 @@ Record only evidence that can change planning or durable decisions.
 
 - Route WAL rewrite maintenance through storage backend operations so the
   append path and rewrite-after-flush path share the same storage boundary.
+
+## 2026-05-31: Native-File WAL Rewrite Backend
+
+### Observation
+
+- WAL append and persist already used backend append operations.
+- WAL rewrite-after-flush still created `trine.wal.tmp`, wrote frames, synced
+  the temp file, renamed it over `trine.wal`, and synced the parent directory
+  from `wal.rs`.
+- Recovery recognizes `trine.wal.tmp` as a safe temporary file.
+
+### Interpretation
+
+- WAL rewrite is a storage publish operation with a WAL-specific temporary file
+  protocol.
+- The backend operation should take both final and temporary WAL objects so
+  `wal.rs` keeps ownership of the WAL rewrite file name while native-file
+  storage owns physical write, sync, rename, and metadata sync.
+- Generic table/blob object writes should not be reused here because their
+  temporary-name convention differs from the WAL recovery contract.
+
+### Verification
+
+- Added `StorageCapability::AtomicWalRewrite`.
+- Added `StorageWalRewriteBackend` and
+  `BlockingStorageWalRewriteBackend`.
+- Native-file backend now rewrites WAL objects with explicit final and
+  temporary WAL object ids.
+- Native-file WAL rewrite rejects non-WAL objects, identical final/temp paths,
+  and temporary paths outside the final WAL parent directory.
+- `rewrite_batches_after` now builds replacement WAL bytes and calls the
+  backend rewrite operation.
+- The rewrite temporary file remains `trine.wal.tmp`.
+- `cargo test storage --lib`
+- `cargo test wal --lib`
+- `cargo test persistent_flush_writes_table_and_reopen_can_skip_wal --test persistent_wal`
+- `cargo test persistent_immutable_pressure_flushes_before_next_write_and_keeps_new_wal_batch --test persistent_wal`
+- `cargo test persistent_wal --test persistent_wal`
+- `cargo test persistent_recovery_repairs_safe_temporary_files_and_writes_report --test persistent_wal`
+
+### Remaining Blockers
+
+- Public async API, async runtime selection, WAL replay optional-read routing,
+  recovery-report write routing, and production in-memory object routing remain
+  later phases.
+
+### Recommended Next Action
+
+- Route recovery report write through storage backend object write plus
+  directory-sync operations, or route WAL replay reads through a backend
+  optional-read operation.

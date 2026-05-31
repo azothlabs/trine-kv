@@ -1351,3 +1351,27 @@ backend operations.
   recovery policy, and storage format remain unchanged.
 - Focused storage/recovery/WAL/persistent tests, formatting, clippy, and diff
   checks pass.
+
+### Phase 64: Native-File WAL Rewrite Backend
+
+**Status**: Complete
+
+**Goal**: Route WAL rewrite-after-flush through the storage backend while
+preserving the existing WAL rewrite temporary file protocol.
+
+**Entry Condition**: Phase 63 complete and both WAL append plus directory sync
+already route through backend operations.
+
+**Acceptance Gate**:
+
+- Native-file backend reports atomic WAL rewrite capability.
+- Native-file backend exposes a WAL rewrite operation with an explicit
+  temporary WAL object.
+- WAL rewrite keeps using `trine.wal.tmp` so recovery still recognizes safe
+  rewrite leftovers.
+- `rewrite_batches_after` uses the backend operation while preserving WAL frame
+  bytes, replay filtering, checksum behavior, and writer reopen behavior.
+- Public API behavior, WAL format, manifest, table/blob formats, MVCC,
+  compaction, recovery policy, and cleanup semantics remain unchanged.
+- Focused storage/WAL/recovery/persistent tests, formatting, clippy, and diff
+  checks pass.

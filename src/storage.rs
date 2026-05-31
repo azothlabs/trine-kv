@@ -137,6 +137,7 @@ pub(crate) enum StorageCapability {
     ObjectWrite,
     ObjectDelete,
     Append,
+    AtomicWalRewrite,
     DirectorySync,
     AtomicManifestPublish,
     WriterLease,
@@ -158,6 +159,7 @@ impl StorageCapability {
             Self::ObjectWrite => "object write",
             Self::ObjectDelete => "object delete",
             Self::Append => "append",
+            Self::AtomicWalRewrite => "atomic WAL rewrite",
             Self::DirectorySync => "directory sync",
             Self::AtomicManifestPublish => "atomic manifest publish",
             Self::WriterLease => "writer lease",
@@ -179,15 +181,16 @@ impl StorageCapability {
             Self::ObjectWrite => 1 << 4,
             Self::ObjectDelete => 1 << 5,
             Self::Append => 1 << 6,
-            Self::DirectorySync => 1 << 7,
-            Self::AtomicManifestPublish => 1 << 8,
-            Self::WriterLease => 1 << 9,
-            Self::Flush => 1 << 10,
-            Self::StrictDataSync => 1 << 11,
-            Self::StrictMetadataSync => 1 << 12,
-            Self::BackgroundThreads => 1 << 13,
-            Self::AsyncTasks => 1 << 14,
-            Self::CooperativeTasks => 1 << 15,
+            Self::AtomicWalRewrite => 1 << 7,
+            Self::DirectorySync => 1 << 8,
+            Self::AtomicManifestPublish => 1 << 9,
+            Self::WriterLease => 1 << 10,
+            Self::Flush => 1 << 11,
+            Self::StrictDataSync => 1 << 12,
+            Self::StrictMetadataSync => 1 << 13,
+            Self::BackgroundThreads => 1 << 14,
+            Self::AsyncTasks => 1 << 15,
+            Self::CooperativeTasks => 1 << 16,
         }
     }
 }
@@ -214,6 +217,7 @@ impl StorageCapabilities {
             .with(StorageCapability::ObjectWrite)
             .with(StorageCapability::ObjectDelete)
             .with(StorageCapability::Append)
+            .with(StorageCapability::AtomicWalRewrite)
             .with(StorageCapability::DirectorySync)
             .with(StorageCapability::AtomicManifestPublish)
             .with(StorageCapability::WriterLease)
@@ -330,6 +334,26 @@ where
     Self::AppendObject: BlockingStorageAppendObject,
 {
     fn open_append_blocking(&self, object: StorageObjectId) -> Result<Self::AppendObject>;
+}
+
+pub(crate) trait StorageWalRewriteBackend: StorageReadBackend {
+    fn rewrite_wal(
+        &self,
+        object: StorageObjectId,
+        temporary_object: StorageObjectId,
+        bytes: Arc<[u8]>,
+        durability: DurabilityMode,
+    ) -> StorageFuture<'_, ()>;
+}
+
+pub(crate) trait BlockingStorageWalRewriteBackend: StorageWalRewriteBackend {
+    fn rewrite_wal_blocking(
+        &self,
+        object: StorageObjectId,
+        temporary_object: StorageObjectId,
+        bytes: Arc<[u8]>,
+        durability: DurabilityMode,
+    ) -> Result<()>;
 }
 
 pub(crate) trait StorageWriterLeaseBackend: StorageReadBackend {
@@ -583,6 +607,32 @@ impl StorageAppendBackend for NativeFileBackend {
 impl BlockingStorageAppendBackend for NativeFileBackend {
     fn open_append_blocking(&self, object: StorageObjectId) -> Result<Self::AppendObject> {
         poll_ready_storage_future(self.open_append(object))
+    }
+}
+
+impl StorageWalRewriteBackend for NativeFileBackend {
+    fn rewrite_wal(
+        &self,
+        object: StorageObjectId,
+        temporary_object: StorageObjectId,
+        bytes: Arc<[u8]>,
+        durability: DurabilityMode,
+    ) -> StorageFuture<'_, ()> {
+        Box::pin(
+            async move { rewrite_native_file_wal(&object, &temporary_object, &bytes, durability) },
+        )
+    }
+}
+
+impl BlockingStorageWalRewriteBackend for NativeFileBackend {
+    fn rewrite_wal_blocking(
+        &self,
+        object: StorageObjectId,
+        temporary_object: StorageObjectId,
+        bytes: Arc<[u8]>,
+        durability: DurabilityMode,
+    ) -> Result<()> {
+        poll_ready_storage_future(self.rewrite_wal(object, temporary_object, bytes, durability))
     }
 }
 
@@ -963,6 +1013,52 @@ fn persist_native_append_file(file: &mut File, durability: DurabilityMode) -> Re
             Ok(())
         }
     }
+}
+
+fn rewrite_native_file_wal(
+    object: &StorageObjectId,
+    temporary_object: &StorageObjectId,
+    bytes: &[u8],
+    durability: DurabilityMode,
+) -> Result<()> {
+    if object.kind() != StorageObjectKind::Wal || temporary_object.kind() != StorageObjectKind::Wal
+    {
+        return Err(Error::invalid_options(
+            "WAL rewrite requires WAL storage objects",
+        ));
+    }
+
+    let capabilities = StorageCapabilities::native_file();
+    capabilities.require(StorageCapability::AtomicWalRewrite)?;
+    capabilities.require_durability(durability)?;
+
+    let path = object.path();
+    let tmp_path = temporary_object.path();
+    if path == tmp_path {
+        return Err(Error::invalid_options(
+            "WAL rewrite temporary object must differ from final object",
+        ));
+    }
+    if path.parent() != tmp_path.parent() {
+        return Err(Error::invalid_options(
+            "WAL rewrite temporary object must share the final object's parent directory",
+        ));
+    }
+    if let Some(parent) = tmp_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    {
+        let mut file = File::create(tmp_path)?;
+        file.write_all(bytes)?;
+        sync_native_file_for_durability(&file, durability)?;
+    }
+    fs::rename(tmp_path, path)?;
+    if durability == DurabilityMode::SyncAll {
+        sync_native_file_parent_directory_after_rename(path)?;
+    }
+
+    Ok(())
 }
 
 fn acquire_native_file_writer_lease(object: &StorageObjectId) -> Result<File> {
@@ -1581,6 +1677,66 @@ mod tests {
     }
 
     #[test]
+    fn native_file_backend_rewrites_wal_with_explicit_temporary_object() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-storage-wal-rewrite-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("test dir creates");
+        let wal_path = root.join("trine.wal");
+        let tmp_path = root.join("trine.wal.tmp");
+        std::fs::write(&wal_path, b"old wal").expect("old WAL writes");
+
+        let backend = NativeFileBackend::new();
+        backend
+            .capabilities()
+            .require(StorageCapability::AtomicWalRewrite)
+            .expect("native-file backend supports WAL rewrite");
+        backend
+            .rewrite_wal_blocking(
+                StorageObjectId::native_file(StorageObjectKind::Wal, &wal_path),
+                StorageObjectId::native_file(StorageObjectKind::Wal, &tmp_path),
+                Arc::from(&b"new wal"[..]),
+                DurabilityMode::SyncAll,
+            )
+            .expect("WAL rewrites");
+
+        assert_eq!(std::fs::read(&wal_path).expect("WAL reads"), b"new wal");
+        assert!(
+            !tmp_path.exists(),
+            "successful WAL rewrite should remove the explicit temporary object"
+        );
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[test]
+    fn native_file_wal_rewrite_rejects_non_wal_objects() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-storage-wal-rewrite-kind-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        let backend = NativeFileBackend::new();
+        let error = backend
+            .rewrite_wal_blocking(
+                StorageObjectId::native_file(StorageObjectKind::Table, root.join("table.trinet")),
+                StorageObjectId::native_file(StorageObjectKind::Wal, root.join("trine.wal.tmp")),
+                Arc::from(&b"bytes"[..]),
+                DurabilityMode::SyncAll,
+            )
+            .expect_err("WAL rewrite only accepts WAL objects");
+        assert!(matches!(error, Error::InvalidOptions { .. }));
+    }
+
+    #[test]
     fn native_file_backend_acquires_and_releases_writer_lease() {
         let root = std::env::temp_dir().join(format!(
             "trine-kv-storage-writer-lease-{}-{}",
@@ -1726,6 +1882,7 @@ mod tests {
         assert!(!read_only.supports(StorageCapability::ObjectWrite));
         assert!(!read_only.supports(StorageCapability::ObjectDelete));
         assert!(!read_only.supports(StorageCapability::Append));
+        assert!(!read_only.supports(StorageCapability::AtomicWalRewrite));
         assert!(!read_only.supports(StorageCapability::DirectorySync));
         assert!(!read_only.supports(StorageCapability::WriterLease));
         assert!(matches!(

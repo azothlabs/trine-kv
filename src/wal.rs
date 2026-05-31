@@ -1,8 +1,9 @@
 use std::{
     fs::{self, File},
-    io::{Read, Write},
+    io::Read,
     ops::Bound,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use crate::{
@@ -10,9 +11,8 @@ use crate::{
     options::DurabilityMode,
     storage::{
         BlockingStorageAppendBackend, BlockingStorageAppendObject,
-        BlockingStorageDirectorySyncBackend, NativeFileAppendObject, NativeFileBackend,
-        StorageCapability, StorageDirectoryId, StorageObjectId, StorageObjectKind,
-        StorageReadBackend,
+        BlockingStorageWalRewriteBackend, NativeFileAppendObject, NativeFileBackend,
+        StorageCapability, StorageObjectId, StorageObjectKind, StorageReadBackend,
     },
     types::{KeyRange, Sequence},
     write_batch::BatchOperation,
@@ -100,16 +100,8 @@ pub fn read_batches_after(path: &Path, replay_floor: Sequence) -> Result<Vec<Wal
 
 pub fn rewrite_batches_after(path: &Path, replay_floor: Sequence) -> Result<()> {
     let batches = read_batches_after(path, replay_floor)?;
-    let tmp_path = wal_rewrite_tmp_path(path);
-    {
-        let mut file = File::create(&tmp_path)?;
-        for batch in batches.iter().filter(|batch| batch.sequence > replay_floor) {
-            write_batch_frame(&mut file, batch.sequence, &batch.operations)?;
-        }
-        file.sync_all()?;
-    }
-    fs::rename(&tmp_path, path)?;
-    sync_wal_parent_directory_after_rename(path)?;
+    let bytes = encode_batches_after(&batches, replay_floor)?;
+    rewrite_wal_object(path, bytes.into())?;
 
     Ok(())
 }
@@ -128,29 +120,29 @@ fn open_wal_append_object(path: &Path) -> Result<NativeFileAppendObject> {
     backend.open_append_blocking(wal_storage_object(path))
 }
 
-fn sync_wal_parent_directory_after_rename(path: &Path) -> Result<()> {
-    let Some(parent) = StorageDirectoryId::native_file_parent_of(path) else {
-        return Ok(());
-    };
+fn rewrite_wal_object(path: &Path, bytes: Arc<[u8]>) -> Result<()> {
     let backend = NativeFileBackend::new();
     backend
         .capabilities()
-        .require(StorageCapability::DirectorySync)?;
-    backend.sync_directory_after_renames_blocking(parent)
+        .require(StorageCapability::AtomicWalRewrite)?;
+    backend.rewrite_wal_blocking(
+        wal_storage_object(path),
+        wal_storage_object(&wal_rewrite_tmp_path(path)),
+        bytes,
+        DurabilityMode::SyncAll,
+    )
 }
 
 fn wal_storage_object(path: &Path) -> StorageObjectId {
     StorageObjectId::native_file(StorageObjectKind::Wal, path)
 }
 
-fn write_batch_frame(
-    file: &mut File,
-    sequence: Sequence,
-    operations: &[BatchOperation],
-) -> Result<()> {
-    let frame = encode_batch_frame(sequence, operations)?;
-    file.write_all(&frame)?;
-    Ok(())
+fn encode_batches_after(batches: &[WalBatch], replay_floor: Sequence) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    for batch in batches.iter().filter(|batch| batch.sequence > replay_floor) {
+        bytes.extend_from_slice(&encode_batch_frame(batch.sequence, &batch.operations)?);
+    }
+    Ok(bytes)
 }
 
 fn encode_batch_frame(sequence: Sequence, operations: &[BatchOperation]) -> Result<Vec<u8>> {
