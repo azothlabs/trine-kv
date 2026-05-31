@@ -1,4 +1,10 @@
-use std::thread;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+};
 
 use crate::{
     error::{Error, Result},
@@ -19,10 +25,14 @@ pub struct RuntimeOptions {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeCapabilities {
-    pub background_threads: bool,
-    pub cooperative_tasks: bool,
-    pub blocking_adapter: bool,
+    flags: u8,
 }
+
+const BACKGROUND_THREADS: u8 = 1 << 0;
+const COOPERATIVE_TASKS: u8 = 1 << 1;
+const BLOCKING_ADAPTER: u8 = 1 << 2;
+const CANCELLATION_TOKENS: u8 = 1 << 3;
+const TASK_JOIN: u8 = 1 << 4;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Runtime {
@@ -32,6 +42,11 @@ pub(crate) struct Runtime {
 #[derive(Debug)]
 pub(crate) enum RuntimeTask {
     NativeThread(thread::JoinHandle<()>),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken {
+    cancelled: Arc<AtomicBool>,
 }
 
 impl RuntimeOptions {
@@ -52,16 +67,16 @@ impl RuntimeOptions {
     #[must_use]
     pub const fn capabilities(self) -> RuntimeCapabilities {
         match self.mode {
-            RuntimeMode::NativeThreads => RuntimeCapabilities {
-                background_threads: true,
-                cooperative_tasks: true,
-                blocking_adapter: true,
-            },
-            RuntimeMode::Inline => RuntimeCapabilities {
-                background_threads: false,
-                cooperative_tasks: true,
-                blocking_adapter: false,
-            },
+            RuntimeMode::NativeThreads => RuntimeCapabilities::new(
+                BACKGROUND_THREADS
+                    | COOPERATIVE_TASKS
+                    | BLOCKING_ADAPTER
+                    | CANCELLATION_TOKENS
+                    | TASK_JOIN,
+            ),
+            RuntimeMode::Inline => {
+                RuntimeCapabilities::new(COOPERATIVE_TASKS | CANCELLATION_TOKENS)
+            }
         }
     }
 }
@@ -69,6 +84,57 @@ impl RuntimeOptions {
 impl Default for RuntimeOptions {
     fn default() -> Self {
         Self::native_threads()
+    }
+}
+
+impl CancellationToken {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+impl RuntimeCapabilities {
+    const fn new(flags: u8) -> Self {
+        Self { flags }
+    }
+
+    #[must_use]
+    pub const fn background_threads(self) -> bool {
+        self.has(BACKGROUND_THREADS)
+    }
+
+    #[must_use]
+    pub const fn cooperative_tasks(self) -> bool {
+        self.has(COOPERATIVE_TASKS)
+    }
+
+    #[must_use]
+    pub const fn blocking_adapter(self) -> bool {
+        self.has(BLOCKING_ADAPTER)
+    }
+
+    #[must_use]
+    pub const fn cancellation_tokens(self) -> bool {
+        self.has(CANCELLATION_TOKENS)
+    }
+
+    #[must_use]
+    pub const fn task_join(self) -> bool {
+        self.has(TASK_JOIN)
+    }
+
+    const fn has(self, flag: u8) -> bool {
+        self.flags & flag != 0
     }
 }
 
@@ -120,7 +186,7 @@ pub(crate) fn validate_runtime_options(
     let persistent_background_workers = matches!(storage_mode, StorageMode::Persistent { .. })
         && !read_only
         && background_worker_count != 0;
-    if persistent_background_workers && !runtime.capabilities().background_threads {
+    if persistent_background_workers && !runtime.capabilities().background_threads() {
         return Err(Error::invalid_options(
             "background workers require runtime background threads",
         ));
@@ -131,17 +197,67 @@ pub(crate) fn validate_runtime_options(
 
 #[cfg(test)]
 mod tests {
-    use crate::{Db, DbOptions, Error, runtime::RuntimeOptions};
+    use std::{sync::mpsc, thread, time::Duration};
+
+    use crate::{
+        Db, DbOptions, Error,
+        runtime::{CancellationToken, Runtime, RuntimeOptions},
+    };
 
     #[test]
     fn runtime_capabilities_follow_selected_mode() {
-        assert!(
-            RuntimeOptions::native_threads()
-                .capabilities()
-                .background_threads
-        );
-        assert!(!RuntimeOptions::inline().capabilities().background_threads);
-        assert!(RuntimeOptions::inline().capabilities().cooperative_tasks);
+        let native = RuntimeOptions::native_threads().capabilities();
+        assert!(native.background_threads());
+        assert!(native.cancellation_tokens());
+        assert!(native.task_join());
+        assert!(native.blocking_adapter());
+
+        let inline = RuntimeOptions::inline().capabilities();
+        assert!(!inline.background_threads());
+        assert!(inline.cooperative_tasks());
+        assert!(inline.cancellation_tokens());
+        assert!(!inline.blocking_adapter());
+        assert!(!inline.task_join());
+    }
+
+    #[test]
+    fn cancellation_token_clones_share_state() {
+        let token = CancellationToken::new();
+        let clone = token.clone();
+
+        assert!(!token.is_cancelled());
+        clone.cancel();
+
+        assert!(token.is_cancelled());
+        assert!(clone.is_cancelled());
+    }
+
+    #[test]
+    fn native_background_task_observes_cancellation_and_joins() {
+        let runtime = Runtime::new(RuntimeOptions::native_threads());
+        let token = CancellationToken::new();
+        let worker_token = token.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let task = runtime
+            .spawn_background("trine-kv-runtime-cancel-test".to_owned(), move || {
+                started_tx.send(()).expect("report worker start");
+                while !worker_token.is_cancelled() {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                done_tx.send(()).expect("report worker done");
+            })
+            .expect("spawn background task");
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker starts");
+        token.cancel();
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker observes cancellation");
+        task.join().expect("worker joins");
     }
 
     #[test]

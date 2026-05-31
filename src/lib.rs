@@ -53,7 +53,7 @@ pub use options::{
 pub use point_value::PointValue;
 pub use prefix::PrefixExtractor;
 pub use recovery::RecoveryReport;
-pub use runtime::{RuntimeCapabilities, RuntimeMode, RuntimeOptions};
+pub use runtime::{CancellationToken, RuntimeCapabilities, RuntimeMode, RuntimeOptions};
 pub use snapshot::Snapshot;
 pub use stats::DbStats;
 pub use transaction::{Transaction, TransactionOptions};

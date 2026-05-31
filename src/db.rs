@@ -27,7 +27,7 @@ use crate::{
     },
     point_value::PointValue,
     recovery,
-    runtime::{self, Runtime, RuntimeTask},
+    runtime::{self, CancellationToken, Runtime, RuntimeTask},
     snapshot::{Snapshot, SnapshotTracker},
     stats::{BlobReadMetrics, DbStats, LevelStats},
     storage::{
@@ -76,6 +76,7 @@ pub(crate) struct DbInner {
     blob_gc_discarded_bytes: AtomicU64,
     blob_reads: Arc<BlobReadMetrics>,
     runtime: Runtime,
+    runtime_shutdown: CancellationToken,
     maintenance: Arc<MaintenanceCoordinator>,
     background_workers: Mutex<Vec<RuntimeTask>>,
 }
@@ -583,8 +584,10 @@ fn range_end_is_before_start(end: &Bound<Vec<u8>>, start: &Bound<Vec<u8>>) -> bo
 
 fn shutdown_background_workers(
     maintenance: &Arc<MaintenanceCoordinator>,
+    runtime_shutdown: &CancellationToken,
     workers: &Mutex<Vec<RuntimeTask>>,
 ) {
+    runtime_shutdown.cancel();
     maintenance.shutdown();
     let workers = workers
         .lock()
@@ -603,7 +606,11 @@ fn shutdown_background_workers(
 impl Drop for DbInner {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::Release);
-        shutdown_background_workers(&self.maintenance, &self.background_workers);
+        shutdown_background_workers(
+            &self.maintenance,
+            &self.runtime_shutdown,
+            &self.background_workers,
+        );
         let _ = cleanup_pending_obsolete_table_files(
             persistent_path_from_options(&self.options),
             &self.snapshots,
@@ -636,7 +643,11 @@ impl Drop for Db {
         }
         if self.inner.user_handles.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.inner.closed.store(true, Ordering::Release);
-            shutdown_background_workers(&self.inner.maintenance, &self.inner.background_workers);
+            shutdown_background_workers(
+                &self.inner.maintenance,
+                &self.inner.runtime_shutdown,
+                &self.inner.background_workers,
+            );
         }
     }
 }
@@ -698,6 +709,7 @@ impl Db {
                 blob_gc_discarded_bytes: AtomicU64::new(0),
                 blob_reads: Arc::new(BlobReadMetrics::default()),
                 runtime,
+                runtime_shutdown: CancellationToken::new(),
                 maintenance: Arc::new(MaintenanceCoordinator::new()),
                 background_workers: Mutex::new(Vec::new()),
             }),
@@ -788,6 +800,7 @@ impl Db {
                 blob_gc_discarded_bytes: AtomicU64::new(0),
                 blob_reads: Arc::new(BlobReadMetrics::default()),
                 runtime,
+                runtime_shutdown: CancellationToken::new(),
                 maintenance: Arc::new(MaintenanceCoordinator::new()),
                 background_workers: Mutex::new(Vec::new()),
             }),
@@ -1353,7 +1366,11 @@ impl Db {
 
     pub fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
-        shutdown_background_workers(&self.inner.maintenance, &self.inner.background_workers);
+        shutdown_background_workers(
+            &self.inner.maintenance,
+            &self.inner.runtime_shutdown,
+            &self.inner.background_workers,
+        );
         // The directory lock is released only after the writer coordinator is
         // idle. Otherwise a second process could open while this one is still
         // publishing files for a commit, flush, or compaction.
@@ -1385,10 +1402,11 @@ impl Db {
         for worker_index in 0..self.inner.options.background_worker_count {
             let inner = Arc::downgrade(&self.inner);
             let maintenance = Arc::clone(&self.inner.maintenance);
+            let runtime_shutdown = self.inner.runtime_shutdown.clone();
             let worker =
                 self.inner.runtime.spawn_background(
                     format!("trine-kv-maintenance-{worker_index}"),
-                    move || background_worker_loop(&inner, &maintenance),
+                    move || background_worker_loop(&inner, &maintenance, &runtime_shutdown),
                 )?;
             self.inner
                 .background_workers
@@ -1404,7 +1422,7 @@ impl Db {
     fn background_workers_enabled(&self) -> bool {
         !self.inner.options.read_only
             && self.inner.options.background_worker_count != 0
-            && self.inner.runtime.capabilities().background_threads
+            && self.inner.runtime.capabilities().background_threads()
             && matches!(
                 self.inner.options.storage_mode,
                 StorageMode::Persistent { .. }
@@ -2921,12 +2939,19 @@ fn validate_options(options: &DbOptions) -> Result<()> {
     Ok(())
 }
 
-fn background_worker_loop(inner: &Weak<DbInner>, maintenance: &MaintenanceCoordinator) {
+fn background_worker_loop(
+    inner: &Weak<DbInner>,
+    maintenance: &MaintenanceCoordinator,
+    runtime_shutdown: &CancellationToken,
+) {
     while let Some(request) = maintenance.wait_for_request() {
+        if runtime_shutdown.is_cancelled() {
+            break;
+        }
         let Some(inner) = inner.upgrade() else {
             break;
         };
-        if inner.closed.load(Ordering::Acquire) {
+        if inner.closed.load(Ordering::Acquire) || runtime_shutdown.is_cancelled() {
             break;
         }
 
@@ -3458,16 +3483,19 @@ fn remove_storage_files(db_path: &Path, table_ids: &[table::TableId]) -> Result<
 mod tests {
     use std::{
         fs,
-        sync::{Arc, mpsc},
+        sync::{Arc, Mutex, mpsc},
         thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use super::{
         CompactionReservation, Db, Error, MaintenanceCoordinator, compaction_reservations_conflict,
-        record_maintenance_success,
+        record_maintenance_success, shutdown_background_workers,
     };
-    use crate::{bucket::DEFAULT_BUCKET_NAME, options::DbOptions, types::KeyRange};
+    use crate::{
+        bucket::DEFAULT_BUCKET_NAME, options::DbOptions, runtime::CancellationToken,
+        types::KeyRange,
+    };
 
     #[test]
     fn maintenance_success_does_not_clear_unreported_error() {
@@ -3483,6 +3511,17 @@ mod tests {
             .expect("unreported background error remains visible");
         assert!(error.contains("publish failed"));
         assert!(coordinator.take_error().is_none());
+    }
+
+    #[test]
+    fn background_shutdown_cancels_runtime_token() {
+        let maintenance = Arc::new(MaintenanceCoordinator::new());
+        let runtime_shutdown = CancellationToken::new();
+        let workers = Mutex::new(Vec::new());
+
+        shutdown_background_workers(&maintenance, &runtime_shutdown, &workers);
+
+        assert!(runtime_shutdown.is_cancelled());
     }
 
     #[test]

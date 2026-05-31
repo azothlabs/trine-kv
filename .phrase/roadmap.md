@@ -1618,3 +1618,25 @@ behavior is covered by tests.
 - Writer coordinator, commit tracker, WAL/table/blob/manifest formats, MVCC,
   compaction, recovery, cleanup, and public API behavior remain unchanged.
 - Focused runtime tests, formatting, clippy, full tests, and diff checks pass.
+
+### Phase 76: Runtime Cancellation And Task Join Primitives
+
+**Status**: Complete
+
+**Goal**: Add the runtime cancellation and task-join primitives needed before
+accepted writes can move to owned task execution.
+
+**Entry Condition**: Phase 75 complete and background worker spawning already
+routes through the runtime boundary.
+
+**Acceptance Gate**:
+
+- Runtime exposes cancellation token and task-join capabilities.
+- Cancellation token clones share state and are test-covered.
+- Native-thread background tasks can observe cancellation and join in tests.
+- Database background worker shutdown cancels the runtime token.
+- Existing default background worker behavior remains unchanged.
+- Writer coordinator, commit tracker, WAL/table/blob/manifest formats, MVCC,
+  compaction, recovery, cleanup, and public API behavior remain unchanged.
+- Focused runtime/background tests, formatting, clippy, full tests, and diff
+  checks pass.

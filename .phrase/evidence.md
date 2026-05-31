@@ -5964,3 +5964,58 @@ Record only evidence that can change planning or durable decisions.
 
 - Extend the runtime boundary only with the next required primitive, then move
   accepted write execution behind that primitive.
+
+## 2026-05-31: Runtime Cancellation And Task Join Primitives
+
+### Observation
+
+- Runtime-owned background task spawning existed, but there was no shared
+  cancellation token.
+- Background worker shutdown already woke waiting workers through the
+  maintenance coordinator.
+- Runtime capability reporting used public boolean fields and would continue to
+  grow as runtime features were added.
+
+### Interpretation
+
+- Cancellation can be added as a small atomic token without changing
+  maintenance scheduling semantics.
+- Database shutdown should cancel the runtime token and still wake workers
+  through the maintenance coordinator so sleeping workers are not stranded.
+- Runtime capabilities should be queried through methods backed by private flags
+  instead of adding more public boolean fields.
+
+### Verification
+
+- Added public cloneable `CancellationToken`.
+- Added runtime capability queries for cancellation tokens and task join.
+- Refactored `RuntimeCapabilities` to private flags with public query methods.
+- Added focused tests for shared cancellation token state and native background
+  task cancellation plus join.
+- `DbInner` now stores a runtime shutdown token.
+- Background worker shutdown cancels the runtime token before waking workers.
+- Background maintenance workers observe the runtime token after wakeup and
+  before maintenance work starts.
+- Added a focused database test proving background shutdown cancels the runtime
+  token.
+- `cargo fmt --check`
+- `cargo test runtime --lib`
+- `cargo test persistent_background_workers_flush_and_compact_pressure --test
+  persistent_wal`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan outside the repository instruction file
+
+### Remaining Blockers
+
+- Accepted writes still run in the caller-polled future.
+- Owned async commit execution still needs an owned write request/task shape and
+  waiter result delivery.
+- True multi-writer execution still needs writer-local deltas, WAL partitioning,
+  and a publish barrier.
+
+### Recommended Next Action
+
+- Define the owned write request/task shape on top of the runtime cancellation
+  and commit tracker boundaries.
