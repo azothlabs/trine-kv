@@ -141,6 +141,7 @@ pub(crate) enum StorageCapability {
     ObjectDelete,
     Append,
     AtomicWalRewrite,
+    DirectoryCreate,
     DirectorySync,
     AtomicManifestPublish,
     WriterLease,
@@ -164,6 +165,7 @@ impl StorageCapability {
             Self::ObjectDelete => "object delete",
             Self::Append => "append",
             Self::AtomicWalRewrite => "atomic WAL rewrite",
+            Self::DirectoryCreate => "directory create",
             Self::DirectorySync => "directory sync",
             Self::AtomicManifestPublish => "atomic manifest publish",
             Self::WriterLease => "writer lease",
@@ -187,15 +189,16 @@ impl StorageCapability {
             Self::ObjectDelete => 1 << 6,
             Self::Append => 1 << 7,
             Self::AtomicWalRewrite => 1 << 8,
-            Self::DirectorySync => 1 << 9,
-            Self::AtomicManifestPublish => 1 << 10,
-            Self::WriterLease => 1 << 11,
-            Self::Flush => 1 << 12,
-            Self::StrictDataSync => 1 << 13,
-            Self::StrictMetadataSync => 1 << 14,
-            Self::BackgroundThreads => 1 << 15,
-            Self::AsyncTasks => 1 << 16,
-            Self::CooperativeTasks => 1 << 17,
+            Self::DirectoryCreate => 1 << 9,
+            Self::DirectorySync => 1 << 10,
+            Self::AtomicManifestPublish => 1 << 11,
+            Self::WriterLease => 1 << 12,
+            Self::Flush => 1 << 13,
+            Self::StrictDataSync => 1 << 14,
+            Self::StrictMetadataSync => 1 << 15,
+            Self::BackgroundThreads => 1 << 16,
+            Self::AsyncTasks => 1 << 17,
+            Self::CooperativeTasks => 1 << 18,
         }
     }
 }
@@ -224,6 +227,7 @@ impl StorageCapabilities {
             .with(StorageCapability::ObjectDelete)
             .with(StorageCapability::Append)
             .with(StorageCapability::AtomicWalRewrite)
+            .with(StorageCapability::DirectoryCreate)
             .with(StorageCapability::DirectorySync)
             .with(StorageCapability::AtomicManifestPublish)
             .with(StorageCapability::WriterLease)
@@ -380,6 +384,16 @@ pub(crate) trait StorageWriterLeaseBackend: StorageReadBackend {
 
 pub(crate) trait BlockingStorageWriterLeaseBackend: StorageWriterLeaseBackend {
     fn acquire_writer_lease_blocking(&self, object: StorageObjectId) -> Result<Self::WriterLease>;
+}
+
+pub(crate) trait StorageDirectoryCreateBackend: StorageReadBackend {
+    fn create_directory_all(&self, directory: StorageDirectoryId) -> StorageFuture<'_, ()>;
+}
+
+pub(crate) trait BlockingStorageDirectoryCreateBackend:
+    StorageDirectoryCreateBackend
+{
+    fn create_directory_all_blocking(&self, directory: StorageDirectoryId) -> Result<()>;
 }
 
 pub(crate) trait StorageDirectorySyncBackend: StorageReadBackend {
@@ -691,6 +705,18 @@ impl StorageWriterLeaseBackend for NativeFileBackend {
 impl BlockingStorageWriterLeaseBackend for NativeFileBackend {
     fn acquire_writer_lease_blocking(&self, object: StorageObjectId) -> Result<Self::WriterLease> {
         poll_ready_storage_future(self.acquire_writer_lease(object))
+    }
+}
+
+impl StorageDirectoryCreateBackend for NativeFileBackend {
+    fn create_directory_all(&self, directory: StorageDirectoryId) -> StorageFuture<'_, ()> {
+        Box::pin(async move { create_native_file_directory_all(&directory) })
+    }
+}
+
+impl BlockingStorageDirectoryCreateBackend for NativeFileBackend {
+    fn create_directory_all_blocking(&self, directory: StorageDirectoryId) -> Result<()> {
+        poll_ready_storage_future(self.create_directory_all(directory))
     }
 }
 
@@ -1151,6 +1177,13 @@ fn write_native_file_writer_lease_owner(file: &mut File, owner: &str) -> Result<
     file.write_all(owner.as_bytes())?;
     file.sync_all()?;
     Ok(())
+}
+
+fn create_native_file_directory_all(directory: &StorageDirectoryId) -> Result<()> {
+    let capabilities = StorageCapabilities::native_file();
+    capabilities.require(StorageCapability::DirectoryCreate)?;
+
+    fs::create_dir_all(directory.path()).map_err(Error::from)
 }
 
 fn sync_native_file_directory_after_renames(directory: &StorageDirectoryId) -> Result<()> {
@@ -1925,6 +1958,32 @@ mod tests {
     }
 
     #[test]
+    fn native_file_backend_creates_directory_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-storage-directory-create-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        let nested = root.join("db").join("nested");
+
+        let backend = NativeFileBackend::new();
+        backend
+            .capabilities()
+            .require(StorageCapability::DirectoryCreate)
+            .expect("native-file backend supports directory create");
+        backend
+            .create_directory_all_blocking(StorageDirectoryId::native_file(&nested))
+            .expect("directory tree creates");
+
+        assert!(nested.is_dir(), "nested directory should exist");
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[test]
     fn native_file_backend_syncs_directory_after_renames() {
         let root = std::env::temp_dir().join(format!(
             "trine-kv-storage-directory-sync-{}-{}",
@@ -2027,6 +2086,7 @@ mod tests {
         assert!(!read_only.supports(StorageCapability::ObjectDelete));
         assert!(!read_only.supports(StorageCapability::Append));
         assert!(!read_only.supports(StorageCapability::AtomicWalRewrite));
+        assert!(!read_only.supports(StorageCapability::DirectoryCreate));
         assert!(!read_only.supports(StorageCapability::DirectorySync));
         assert!(!read_only.supports(StorageCapability::WriterLease));
         assert!(matches!(

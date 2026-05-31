@@ -5585,3 +5585,44 @@ Record only evidence that can change planning or durable decisions.
 - Reassess remaining direct native-file operations and route only the ones that
   are part of production storage semantics rather than test setup or local
   statistics.
+
+## 2026-05-31: Native-File Directory Create Backend
+
+### Observation
+
+- Persistent create-if-missing created the database directory via
+  `wal::ensure_parent_dir`.
+- The helper lived in the WAL module even though directory creation is a storage
+  backend responsibility, not WAL framing behavior.
+- Read-only opens already fail before directory creation when the database path
+  is missing.
+
+### Interpretation
+
+- Directory creation should be a backend operation next to directory sync.
+- Moving it out of WAL clarifies the persistent open protocol without changing
+  path validation or read-only behavior.
+
+### Verification
+
+- Added `StorageCapability::DirectoryCreate`.
+- Added `StorageDirectoryCreateBackend` and
+  `BlockingStorageDirectoryCreateBackend`.
+- Native-file backend now creates directory trees through the backend
+  operation.
+- Persistent create-if-missing now uses backend directory creation.
+- Removed the WAL-module directory creation helper.
+- `cargo test storage --lib`
+- `cargo test persistent_api_helpers_cover_open_options_and_bucket_writes --test persistent_wal`
+
+### Remaining Blockers
+
+- Safe temporary file listing/deletion, stats metadata reads, public async API,
+  async runtime selection, and production in-memory object routing remain later
+  phases.
+
+### Recommended Next Action
+
+- Reassess whether safe temporary file repair should become a backend
+  operation, because it still performs native directory listing and file
+  deletion directly.

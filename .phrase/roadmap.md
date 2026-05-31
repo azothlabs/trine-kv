@@ -1441,3 +1441,24 @@ native-file storage.
 - Public API behavior, recovery repair policy, WAL, manifest, table/blob
   formats, MVCC, compaction, and cleanup semantics remain unchanged.
 - Focused recovery/persistent tests, formatting, clippy, and diff checks pass.
+
+### Phase 68: Native-File Directory Create Backend
+
+**Status**: Complete
+
+**Goal**: Route persistent database directory creation through storage backend
+operations.
+
+**Entry Condition**: Phase 67 complete and native-file directory ids are already
+used for backend directory sync.
+
+**Acceptance Gate**:
+
+- Native-file backend reports directory-create capability.
+- Native-file backend exposes a directory-create operation.
+- Persistent create-if-missing uses backend directory creation.
+- Read-only missing database path still fails without creating directories.
+- Public API behavior, recovery policy, WAL, manifest, table/blob formats,
+  MVCC, compaction, stats, and cleanup semantics remain unchanged.
+- Focused storage/persistent/recovery tests, formatting, clippy, and diff
+  checks pass.

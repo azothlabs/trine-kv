@@ -1,5 +1,4 @@
 use std::{
-    fs,
     ops::Bound,
     path::{Path, PathBuf},
     sync::Arc,
@@ -101,10 +100,6 @@ pub fn rewrite_batches_after(path: &Path, replay_floor: Sequence) -> Result<()> 
     rewrite_wal_object(path, bytes.into())?;
 
     Ok(())
-}
-
-pub fn ensure_parent_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path).map_err(Error::from)
 }
 
 fn wal_rewrite_tmp_path(path: &Path) -> PathBuf {

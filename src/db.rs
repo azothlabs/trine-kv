@@ -32,9 +32,9 @@ use crate::{
     snapshot::{Snapshot, SnapshotTracker},
     stats::{BlobReadMetrics, DbStats, LevelStats},
     storage::{
-        BlockingStorageDirectorySyncBackend, BlockingStorageObjectDeleteBackend, NativeFileBackend,
-        StorageCapability, StorageDirectoryId, StorageObjectId, StorageObjectKind,
-        StorageReadBackend,
+        BlockingStorageDirectoryCreateBackend, BlockingStorageDirectorySyncBackend,
+        BlockingStorageObjectDeleteBackend, NativeFileBackend, StorageCapability,
+        StorageDirectoryId, StorageObjectId, StorageObjectKind, StorageReadBackend,
     },
     table::{self, Table},
     transaction::{Transaction, TransactionOptions},
@@ -591,7 +591,7 @@ impl Db {
                 return Err(Error::invalid_options("database path is not a directory"));
             }
         } else if options.create_if_missing && !options.read_only {
-            wal::ensure_parent_dir(path)?;
+            create_storage_directory_all(path)?;
         } else {
             return Err(Error::invalid_options("database path does not exist"));
         }
@@ -3136,6 +3136,14 @@ fn sync_storage_directory_after_renames(path: &Path) -> Result<()> {
         .capabilities()
         .require(StorageCapability::DirectorySync)?;
     backend.sync_directory_after_renames_blocking(StorageDirectoryId::native_file(path))
+}
+
+fn create_storage_directory_all(path: &Path) -> Result<()> {
+    let backend = NativeFileBackend::new();
+    backend
+        .capabilities()
+        .require(StorageCapability::DirectoryCreate)?;
+    backend.create_directory_all_blocking(StorageDirectoryId::native_file(path))
 }
 
 fn remove_storage_files(db_path: &Path, table_ids: &[table::TableId]) -> Result<()> {
