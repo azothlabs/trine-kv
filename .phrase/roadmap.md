@@ -1301,3 +1301,27 @@ operations already route through backend operations.
   compaction, recovery policy, and public API behavior remain unchanged.
 - Focused storage/WAL/persistent tests, formatting, clippy, and diff checks
   pass.
+
+### Phase 62: Native-File Writer Lease Backend
+
+**Status**: Complete
+
+**Goal**: Route persistent writer lease acquisition and release through the
+storage backend writer-lease operation.
+
+**Entry Condition**: Phase 61 complete and the persistent commit append path
+already routes through storage backend operations.
+
+**Acceptance Gate**:
+
+- Native-file backend reports writer lease capability.
+- Native-file backend exposes a writer-lease operation that preserves the
+  existing `LOCK` marker behavior.
+- Existing lease markers fail closed until an operator removes them.
+- Lease release removes only a marker still owned by the releasing handle.
+- Persistent writable open uses the backend writer-lease operation.
+- Read-only open still avoids writer lease acquisition.
+- Recovery, WAL, manifest, table/blob formats, MVCC, compaction, and public API
+  behavior remain unchanged.
+- Focused storage/writer-lock/persistent tests, formatting, clippy, and diff
+  checks pass.

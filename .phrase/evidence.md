@@ -5311,3 +5311,56 @@ Record only evidence that can change planning or durable decisions.
 
 - Route writer lease acquisition/release through the storage backend so
   persistent writable open no longer owns native lock-file behavior directly.
+
+## 2026-05-31: Native-File Writer Lease Backend
+
+### Observation
+
+- WAL append now routes through backend append operations.
+- Persistent writable open still acquired the native `LOCK` marker directly in
+  `recovery::ProcessLock`.
+- Existing tests already define the required semantics: held locks fail closed,
+  stale lock files remain for operator review, read-only opens do not take the
+  writer lock, and close/drop releases the owned marker.
+
+### Interpretation
+
+- Writer lease acquisition is the next storage-boundary slice because writable
+  persistent open must depend on backend capability instead of native lock-file
+  assumptions.
+- The native-file implementation should preserve the current lock marker
+  behavior exactly and only move the physical acquire/release into storage.
+- Keeping `recovery::ProcessLock` as a thin wrapper avoids changing DB lifetime
+  and close ordering.
+
+### Verification
+
+- Added `StorageObjectKind::WriterLease`.
+- Added `StorageWriterLeaseBackend` and
+  `BlockingStorageWriterLeaseBackend`.
+- Native-file backend now reports writer lease capability.
+- Native-file writer leases create the existing `LOCK` marker, write and sync
+  owner text, fail closed if the marker already exists, and remove only the
+  marker still owned by the releasing handle.
+- `recovery::ProcessLock` now wraps `NativeFileWriterLease` instead of opening
+  native files directly.
+- Added storage coverage for acquire/release, held lease failure, and changed
+  marker preservation.
+- Existing persistent writer-lock and read-only lock tests still pass.
+- `cargo test storage --lib`
+- `cargo test persistent_writer_open --test persistent_wal`
+- `cargo test persistent_read_only_open_does_not_take_writer_lock --test persistent_wal`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+
+### Remaining Blockers
+
+- Public async API, async runtime selection, parent-directory sync routing, WAL
+  rewrite routing, and production in-memory object routing remain later phases.
+
+### Recommended Next Action
+
+- Route parent-directory sync through the storage backend so native-file atomic
+  publish durability no longer calls the durability helper directly from engine
+  modules.

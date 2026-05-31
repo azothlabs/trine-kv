@@ -7,6 +7,7 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex, MutexGuard},
     task::{Context, Poll, Waker},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -22,6 +23,7 @@ pub(crate) enum StorageObjectKind {
     Manifest,
     Table,
     Wal,
+    WriterLease,
 }
 
 impl StorageObjectKind {
@@ -31,6 +33,7 @@ impl StorageObjectKind {
             Self::Manifest => "manifest",
             Self::Table => "table",
             Self::Wal => "WAL",
+            Self::WriterLease => "writer lease",
         }
     }
 }
@@ -188,6 +191,7 @@ impl StorageCapabilities {
             .with(StorageCapability::ObjectDelete)
             .with(StorageCapability::Append)
             .with(StorageCapability::AtomicManifestPublish)
+            .with(StorageCapability::WriterLease)
             .with(StorageCapability::Flush)
             .with(StorageCapability::StrictDataSync)
             .with(StorageCapability::StrictMetadataSync)
@@ -301,6 +305,17 @@ where
     Self::AppendObject: BlockingStorageAppendObject,
 {
     fn open_append_blocking(&self, object: StorageObjectId) -> Result<Self::AppendObject>;
+}
+
+pub(crate) trait StorageWriterLeaseBackend: StorageReadBackend {
+    type WriterLease: Send;
+
+    fn acquire_writer_lease(&self, object: StorageObjectId)
+    -> StorageFuture<'_, Self::WriterLease>;
+}
+
+pub(crate) trait BlockingStorageWriterLeaseBackend: StorageWriterLeaseBackend {
+    fn acquire_writer_lease_blocking(&self, object: StorageObjectId) -> Result<Self::WriterLease>;
 }
 
 pub(crate) trait StorageManifestReadBackend: StorageReadBackend {
@@ -538,6 +553,23 @@ impl BlockingStorageAppendBackend for NativeFileBackend {
     }
 }
 
+impl StorageWriterLeaseBackend for NativeFileBackend {
+    type WriterLease = NativeFileWriterLease;
+
+    fn acquire_writer_lease(
+        &self,
+        object: StorageObjectId,
+    ) -> StorageFuture<'_, Self::WriterLease> {
+        Box::pin(async move { NativeFileWriterLease::acquire(object) })
+    }
+}
+
+impl BlockingStorageWriterLeaseBackend for NativeFileBackend {
+    fn acquire_writer_lease_blocking(&self, object: StorageObjectId) -> Result<Self::WriterLease> {
+        poll_ready_storage_future(self.acquire_writer_lease(object))
+    }
+}
+
 impl StorageManifestReadBackend for NativeFileBackend {
     fn read_current_manifest(
         &self,
@@ -727,6 +759,41 @@ impl BlockingStorageAppendObject for NativeFileAppendObject {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct NativeFileWriterLease {
+    object: StorageObjectId,
+    owner: String,
+    file: Option<File>,
+}
+
+impl NativeFileWriterLease {
+    fn acquire(object: StorageObjectId) -> Result<Self> {
+        let mut file = acquire_native_file_writer_lease(&object)?;
+        let owner = writer_lease_owner_text();
+        if let Err(error) = write_native_file_writer_lease_owner(&mut file, &owner) {
+            let _ = fs::remove_file(object.path());
+            return Err(error);
+        }
+
+        Ok(Self {
+            object,
+            owner,
+            file: Some(file),
+        })
+    }
+}
+
+impl Drop for NativeFileWriterLease {
+    fn drop(&mut self) {
+        let should_remove = fs::read_to_string(self.object.path())
+            .is_ok_and(|contents| contents.as_str() == self.owner.as_str());
+        drop(self.file.take());
+        if should_remove {
+            let _ = fs::remove_file(self.object.path());
+        }
+    }
+}
+
 pub(crate) struct StorageReadSource<'src, H> {
     object: &'src H,
 }
@@ -851,6 +918,46 @@ fn persist_native_append_file(file: &mut File, durability: DurabilityMode) -> Re
             Ok(())
         }
     }
+}
+
+fn acquire_native_file_writer_lease(object: &StorageObjectId) -> Result<File> {
+    if object.kind() != StorageObjectKind::WriterLease {
+        return Err(Error::invalid_options(
+            "writer lease requires a writer lease storage object",
+        ));
+    }
+
+    let capabilities = StorageCapabilities::native_file();
+    capabilities.require(StorageCapability::WriterLease)?;
+
+    if let Some(parent) = object.path().parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(object.path())
+    {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(Error::Corruption {
+            message: format!("database lock is already held: {}", object.path().display()),
+        }),
+        Err(error) => Err(Error::Io(error)),
+    }
+}
+
+fn writer_lease_owner_text() -> String {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    format!("pid={}\nnonce={nonce}\n", std::process::id())
+}
+
+fn write_native_file_writer_lease_owner(file: &mut File, owner: &str) -> Result<()> {
+    file.write_all(owner.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn read_current_manifest_from_native_file(object: &StorageObjectId) -> Result<Option<Arc<[u8]>>> {
@@ -1413,6 +1520,70 @@ mod tests {
     }
 
     #[test]
+    fn native_file_backend_acquires_and_releases_writer_lease() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-storage-writer-lease-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        let object =
+            StorageObjectId::native_file(StorageObjectKind::WriterLease, root.join("LOCK"));
+
+        let backend = NativeFileBackend::new();
+        backend
+            .capabilities()
+            .require(StorageCapability::WriterLease)
+            .expect("native-file backend supports writer leases");
+        let lease = backend
+            .acquire_writer_lease_blocking(object.clone())
+            .expect("writer lease acquires");
+        assert!(object.path().exists(), "writer lease marker should exist");
+
+        let error = backend
+            .acquire_writer_lease_blocking(object.clone())
+            .expect_err("existing writer lease fails closed");
+        assert!(error.to_string().contains("database lock is already held"));
+
+        drop(lease);
+        assert!(
+            !object.path().exists(),
+            "dropping owned writer lease should remove marker"
+        );
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[test]
+    fn native_file_writer_lease_does_not_remove_changed_marker() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-storage-writer-lease-changed-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        let object =
+            StorageObjectId::native_file(StorageObjectKind::WriterLease, root.join("LOCK"));
+        let lease = NativeFileBackend::new()
+            .acquire_writer_lease_blocking(object.clone())
+            .expect("writer lease acquires");
+        std::fs::write(object.path(), b"pid=other\nnonce=other\n").expect("lease marker changes");
+
+        drop(lease);
+
+        assert_eq!(
+            std::fs::read(object.path()).expect("changed lease marker remains"),
+            b"pid=other\nnonce=other\n"
+        );
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[test]
     fn memory_storage_backend_exposes_async_read_shape() {
         let backend = MemoryStorageBackend::new();
         let capabilities = backend.capabilities();
@@ -1457,6 +1628,7 @@ mod tests {
         assert!(!read_only.supports(StorageCapability::ObjectWrite));
         assert!(!read_only.supports(StorageCapability::ObjectDelete));
         assert!(!read_only.supports(StorageCapability::Append));
+        assert!(!read_only.supports(StorageCapability::WriterLease));
         assert!(matches!(
             read_only.require(StorageCapability::Append),
             Err(Error::UnsupportedBackend { feature: "append" })

@@ -1,9 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File, OpenOptions},
-    io::{ErrorKind, Read, Write},
+    fs::{self, File},
+    io::{Read, Write},
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -12,6 +11,10 @@ use crate::{
     error::{Error, Result},
     manifest::ManifestState,
     options::FailOnCorruptionPolicy,
+    storage::{
+        BlockingStorageWriterLeaseBackend, NativeFileBackend, NativeFileWriterLease,
+        StorageCapability, StorageObjectId, StorageObjectKind, StorageReadBackend,
+    },
     table::{self, TableId},
     wal,
 };
@@ -21,52 +24,20 @@ pub(crate) const PROCESS_LOCK_FILE_NAME: &str = "LOCK";
 
 #[derive(Debug)]
 pub(crate) struct ProcessLock {
-    path: PathBuf,
-    owner: String,
-    file: Option<File>,
+    _lease: NativeFileWriterLease,
 }
 
 impl ProcessLock {
     pub(crate) fn acquire(db_path: &Path) -> Result<Self> {
-        let path = db_path.join(PROCESS_LOCK_FILE_NAME);
-        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                // Existing lock files are not safe recovery leftovers. They may
-                // mark a live writer or a stale crash marker, so startup fails
-                // closed until an operator removes the file deliberately.
-                return Err(Error::Corruption {
-                    message: format!("database lock is already held: {}", path.display()),
-                });
-            }
-            Err(error) => return Err(Error::Io(error)),
-        };
-
-        let owner = lock_owner_text();
-        if let Err(error) = write_lock_owner(&mut file, &owner) {
-            let _ = fs::remove_file(&path);
-            return Err(error);
-        }
-
-        Ok(Self {
-            path,
-            owner,
-            file: Some(file),
-        })
-    }
-}
-
-impl Drop for ProcessLock {
-    fn drop(&mut self) {
-        // Do not blindly remove a path named LOCK. If an operator deleted this
-        // file and another process created a new one, this handle no longer
-        // owns the on-disk marker.
-        let should_remove = fs::read_to_string(&self.path)
-            .is_ok_and(|contents| contents.as_str() == self.owner.as_str());
-        drop(self.file.take());
-        if should_remove {
-            let _ = fs::remove_file(&self.path);
-        }
+        let backend = NativeFileBackend::new();
+        backend
+            .capabilities()
+            .require(StorageCapability::WriterLease)?;
+        let lease = backend.acquire_writer_lease_blocking(StorageObjectId::native_file(
+            StorageObjectKind::WriterLease,
+            db_path.join(PROCESS_LOCK_FILE_NAME),
+        ))?;
+        Ok(Self { _lease: lease })
     }
 }
 
@@ -294,19 +265,6 @@ fn is_safe_temporary_file(name: &str) -> bool {
         || name == wal::WAL_REWRITE_TMP_FILE_NAME
         || (name.starts_with("table-") && has_tmp_extension(name))
         || (name.starts_with("blob-") && has_tmp_extension(name))
-}
-
-fn lock_owner_text() -> String {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    format!("pid={}\nnonce={nonce}\n", std::process::id())
-}
-
-fn write_lock_owner(file: &mut File, owner: &str) -> Result<()> {
-    file.write_all(owner.as_bytes())?;
-    file.sync_all()?;
-    Ok(())
 }
 
 fn has_tmp_extension(name: &str) -> bool {
