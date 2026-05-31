@@ -921,7 +921,7 @@ and maintenance can remain single-owner.
 
 ### Phase 45: Async-First Portable Storage And WASM Spec
 
-**Status**: Active
+**Status**: Complete
 
 **Goal**: Make the v1 spec async-first at the public API and storage boundary,
 with portable backend capabilities and WASM readiness defined before
@@ -944,3 +944,81 @@ assumptions as the wrong long-term architecture for cross-platform storage.
 - Current phase and evidence record scope, out-of-scope, verification, and
   remaining blockers.
 - No Rust behavior changes are made in this spec phase.
+
+### Phase 46: Block Manager Extraction
+
+**Status**: Complete
+
+**Goal**: Centralize table block content lifecycle before async storage
+implementation.
+
+**Entry Condition**: Phase 45 complete and user identifies block content
+lifecycle as the better first implementation boundary before async storage.
+
+**Acceptance Gate**:
+
+- Checked block encoding, decoding, compression, checksum verification, and
+  content read helpers move behind a focused internal Block Manager module.
+- SSTable format, public API, MVCC, manifest, blob, compaction, transaction,
+  and cache semantics remain unchanged.
+- Existing block cache behavior and stats remain intact.
+- Focused table/persistent tests, formatting, and diff checks pass.
+
+### Phase 47: Block Read Source Boundary
+
+**Status**: Complete
+
+**Goal**: Make checked-block reads depend on a named read-source boundary before
+the first storage backend implementation slice.
+
+**Entry Condition**: Phase 46 complete and user asks to continue toward async
+storage migration.
+
+**Acceptance Gate**:
+
+- `BlockManager` reads checked blocks through a named synchronous read-source
+  boundary instead of ad hoc closures.
+- The native-file table read path remains the only concrete persistent read
+  source in this slice.
+- SSTable format, public API, cache semantics, MVCC, manifest, blob,
+  compaction, and transaction behavior remain unchanged.
+- Focused table/persistent tests, formatting, clippy, and diff checks pass.
+
+### Phase 48: Native-File Storage Read Adapter
+
+**Status**: Complete
+
+**Goal**: Put persistent table block reads behind database-level storage object
+ids and a native-file read adapter.
+
+**Entry Condition**: Phase 47 complete and user asks to implement the first
+concrete storage backend slice.
+
+**Acceptance Gate**:
+
+- Internal storage object kind/id types exist for database storage objects.
+- Persistent table checked-block reads use a native-file read adapter keyed by
+  a storage object id.
+- SSTable format, public API, cache semantics, MVCC, manifest, blob,
+  compaction, transaction, and cleanup behavior remain unchanged.
+- Focused table/persistent tests, formatting, clippy, and diff checks pass.
+
+### Phase 49: Table Open Storage Boundary
+
+**Status**: Complete
+
+**Goal**: Move persistent table open and startup metadata reads behind the
+native-file storage adapter.
+
+**Entry Condition**: Phase 48 complete and user asks to finish the storage
+backend boundary before async storage work.
+
+**Acceptance Gate**:
+
+- Persistent table open, file length, header, footer, properties, top-level
+  index, pinned filters, and pinned index metadata reads use a native-file
+  storage object and adapter keyed by a storage object id.
+- Persistent table checked-block reads continue to use the same adapter.
+- SSTable format, public API, cache semantics, MVCC, manifest, blob,
+  compaction, transaction, and cleanup behavior remain unchanged.
+- Focused table/persistent tests, formatting, clippy, and diff checks pass.

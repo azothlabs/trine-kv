@@ -8,6 +8,7 @@
 #![allow(clippy::missing_errors_doc, clippy::module_name_repetitions)]
 
 pub mod blob;
+mod block;
 pub mod bucket;
 pub mod cache;
 pub mod codec;
@@ -30,6 +31,7 @@ pub mod recovery;
 pub mod search;
 pub mod snapshot;
 pub mod stats;
+mod storage;
 pub mod table;
 pub mod transaction;
 pub mod types;

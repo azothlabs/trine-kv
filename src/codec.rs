@@ -14,6 +14,23 @@ impl CodecId {
             Self::FastLz4Block => "fast-lz4-block",
         }
     }
+
+    pub(crate) const fn tag(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::FastLz4Block => 1,
+        }
+    }
+
+    pub(crate) fn from_tag(tag: u8) -> Result<Self> {
+        match tag {
+            0 => Ok(Self::None),
+            1 => Ok(Self::FastLz4Block),
+            tag => Err(Error::UnsupportedFormat {
+                message: format!("unknown table codec {tag}"),
+            }),
+        }
+    }
 }
 
 pub trait BlockCodec: Send + Sync {

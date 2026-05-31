@@ -4465,3 +4465,194 @@ Record only evidence that can change planning or durable decisions.
 - Review and accept the async-first portable storage protocol.
 - Start with an async primary API compatibility slice before changing storage
   backend internals.
+
+## 2026-05-31: Block Manager Extraction Before Async Storage
+
+### Observation
+
+- User clarified that Block Manager should own block content lifecycle: write,
+  read, compression, checksum verification, and cache coordination.
+- The existing implementation already had those responsibilities, but checked
+  block encoding/decoding and checked block reads lived inside `table.rs`.
+- `table.rs` also owned data/index/filter/tombstone table semantics, making
+  direct async storage migration likely to spread storage waiting boundaries
+  through table-format code.
+
+### Interpretation
+
+- Block Manager is a better first implementation slice before async storage
+  because later backend reads can enter through a single checked-block content
+  layer.
+- Extent allocation remains out of scope because Trine's current persistent
+  model is immutable SSTable/blob objects plus manifest-controlled lifetime.
+- The extraction should not change public API, SSTable format, cache semantics,
+  MVCC, manifest, compaction, transaction, or blob GC behavior.
+
+### Verification
+
+- Read `.phrase/decision.md`, `.phrase/roadmap.md`, `.phrase/current.md`, and
+  Rust skills for routing, coding guidelines, and safe refactoring.
+- Added `src/block.rs` with `BlockHandle`, `BlockManager`, checked block
+  append/encode/decode, checksum, bounds checks, and source-backed checked block
+  reads.
+- Updated `src/table.rs` to call `BlockManager` for checked block lifecycle
+  while keeping table section layout and table-level semantics in `table.rs`.
+- Moved codec tag conversion onto `CodecId` so table and block code share the
+  same table-format codec ids.
+- `cargo test table --lib`
+- `cargo test block --all-targets`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `git diff --check`
+- Forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, `README.md`, `CHANGELOG.md`, and `Cargo.toml`
+
+### Remaining Blockers
+
+- None for the Block Manager extraction.
+
+### Recommended Next Action
+
+- Start async storage migration by replacing the checked-block read source
+  behind `BlockManager` before changing the public async API shape.
+
+## 2026-05-31: Block Read Source Boundary
+
+### Observation
+
+- After Block Manager extraction, source-backed checked block reads still
+  accepted ad hoc closures from `table.rs`.
+- The closures preserved behavior, but they did not give later storage backend
+  work a named boundary to replace.
+- The current persistent table path already has a concrete read source: table
+  path plus optional cached table file handle.
+
+### Interpretation
+
+- A small synchronous `BlockReadSource` boundary is the right next slice before
+  introducing async storage traits.
+- The boundary should sit below checked block validation and above native-file
+  reads, so later backend work can replace byte reads without touching checksum,
+  codec, or table block semantics.
+- Public async API and async trait design remain later work.
+
+### Verification
+
+- Added `BlockReadSource` in `src/block.rs`.
+- Updated `BlockManager` source-backed checked block reads to call
+  `read_exact_at` through `BlockReadSource` instead of accepting closures.
+- Added `TableBlockReadSource` in `src/table.rs` over the existing table path
+  and optional cached `TableFile` handle.
+- `cargo test table --lib`
+- `cargo test block --all-targets`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `git diff --check`
+
+### Remaining Blockers
+
+- None for this boundary slice.
+
+### Recommended Next Action
+
+- Introduce database-level storage object identifiers and a native-file backend
+  adapter behind table reads, still without changing public async API shape.
+
+## 2026-05-31: Native-File Storage Read Adapter
+
+### Observation
+
+- `BlockReadSource` gave `BlockManager` a named byte-read dependency, but
+  `table.rs` still directly described the native-file source shape.
+- Persistent table block reads have a concrete database object identity: a
+  table object at a native path, optionally backed by a cached file handle.
+- Other storage objects are not yet routed through this boundary, so adding all
+  object kinds now would be premature.
+
+### Interpretation
+
+- The next useful storage slice is a native-file read adapter keyed by a table
+  storage object id.
+- This keeps checked-block validation independent from native files while
+  preserving current synchronous behavior.
+- Async storage traits and public async API migration should remain separate
+  later phases.
+
+### Verification
+
+- Added `src/storage.rs` with `StorageObjectKind`, `StorageObjectId`,
+  `NativeFileReadHandle`, and `NativeFileReadSource`.
+- Routed persistent table checked-block reads through `NativeFileReadSource`.
+- Kept cached table file handle reuse by implementing `NativeFileReadHandle`
+  for `TableFile`.
+- Scoped `StorageObjectKind` to `Table` in this slice because no other object
+  kind is routed through the adapter yet.
+- `cargo test table --lib`
+- `cargo test block --all-targets`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `git diff --check`
+- Forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, `README.md`, `CHANGELOG.md`, and `Cargo.toml`
+
+### Remaining Blockers
+
+- None for the native-file table read adapter.
+
+### Recommended Next Action
+
+- Extend the storage adapter boundary to table open/metadata reads, or define
+  the first async storage trait shape while keeping public async API migration
+  as a separate phase.
+
+## 2026-05-31: Table Open Storage Boundary
+
+### Observation
+
+- After persistent table checked-block reads moved behind
+  `NativeFileReadSource`, `read_table` still directly opened native files,
+  read the table header, checked file length, sought to the footer, and loaded
+  startup metadata from a local `File`.
+- Those direct reads were the main remaining native-file dependency in the
+  persistent table read path.
+
+### Interpretation
+
+- Table opening should use the same storage object id and native-file adapter
+  as later block reads, otherwise future backend migration would still need to
+  split table startup reads from lazy block reads.
+- It is still too early to move table writes, manifest publish, WAL append,
+  blob reads, cleanup, or public async APIs in the same slice.
+
+### Verification
+
+- Added `NativeFileObject` in `src/storage.rs` to own an opened storage object,
+  report object length, and serve locked random reads.
+- Updated `NativeFileReadHandle` so cached opened objects serve reads through
+  their own storage object state while fallback reads still use
+  `StorageObjectId`.
+- Updated `read_table` so open, header, file length, footer, properties,
+  top-level index, pinned filters, and pinned index metadata all read through
+  `NativeFileReadSource`.
+- Updated lazy range tombstone, index partition, and data block reads to build
+  the same storage read source instead of direct native-file helpers.
+- Replaced the table-local cached file wrapper with `NativeFileObject`.
+- `cargo test table --lib`
+- `cargo test block --all-targets`
+- `cargo test persistent --all-targets`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --check`
+- `git diff --check`
+- Forbidden-term scan over `.phrase`, `src`, `tests`, `benches`, `examples`,
+  `docs`, `README.md`, `CHANGELOG.md`, and `Cargo.toml`
+
+### Remaining Blockers
+
+- None for the persistent table read boundary.
+- Table writes, manifest, WAL, blob files, cleanup, async traits, and public
+  async API migration remain later slices.
+
+### Recommended Next Action
+
+- Define the first async storage trait shape next, keeping public async API
+  migration and table-write routing as separate phases.

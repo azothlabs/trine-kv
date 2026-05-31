@@ -2,90 +2,79 @@
 
 ## Status
 
-Active
+Complete
 
 ## Goal
 
-Define the async-first public API and portable storage boundary before changing
-open, read, write, cursor, durability, runtime, or backend implementation.
+Move table open, length, header, footer, and startup metadata reads behind the
+native-file storage adapter.
 
 ## Scope
 
-- Specify the primary async `Db`, `Bucket`, `Transaction`, and cursor API.
-- Specify the native blocking API as an adapter over the async engine.
-- Specify storage backend capabilities and typed unsupported-capability errors.
-- Specify manifest publish as a backend protocol operation.
-- Specify durability mapping through backend capabilities.
-- Specify cancellation rules for async write and maintenance futures.
-- Specify WASM readiness constraints for memory, WASI, and browser-style
-  backends.
-- Link the new protocol from the v1 protocol, decision framework, and roadmap.
-- Record the implementation relationship between async-first storage work and
-  the no-global-lock foreground write path.
+- Add an opened native-file storage object that owns the shared file handle.
+- Route `read_table` open, header read, file length check, footer read,
+  properties read, top-level index read, pinned filter read, and pinned index
+  metadata reads through the storage adapter.
+- Keep block cache behavior, stats, and cache keys unchanged.
+- Keep SSTable, WAL, manifest, blob, compaction, transaction, and public API
+  behavior unchanged.
 
 ## Out Of Scope
 
-- Rust behavior changes in this phase.
 - Choosing a concrete async runtime crate.
-- Implementing WASI or browser persistence in this phase.
-- Promising identical durability strength on every platform.
-- Making CPU-only LSM search, decode, MVCC, or merge logic async.
-- Changing SSTable, WAL, manifest, blob, compaction, or transaction semantics
-  beyond the API/storage boundary rules recorded here.
-- Implementing async API migration and no-global-lock write-path changes in one
-  slice.
+- Introducing async APIs or async storage traits.
+- Introducing an extent allocator or disk-space reuse layer.
+- Changing SSTable block format, codec ids, checksums, footer layout, or cache
+  key semantics.
+- Moving table writes, manifest publish, WAL append, blob reads, or file cleanup
+  to the new adapter in this slice.
+- Moving MVCC visibility, table version lifetime, compaction planning, manifest
+  publish, blob GC, or public API behavior.
 
 ## Acceptance Gate
 
-- `.phrase/protocol/async-first-portable-storage-and-wasm.md` exists and
-  covers async API shape, blocking adapter, storage capabilities, manifest
-  publish, durability mapping, cancellation, background work, backend families,
-  recovery, observability, tests, and staging.
-- `.phrase/protocol/trine-kv-v1-spec.md` links to the new protocol and updates
-  API/storage/durability/cursor/error/test/benchmark language.
-- `.phrase/decision.md` records async-first storage and WASM readiness as
-  durable boundaries.
-- `.phrase/roadmap.md` records Phase 45 and marks Phase 44 complete.
-- The async-first and foreground write-path protocols both state the staged
-  implementation relationship.
-- Markdown/spec checks pass where applicable.
+- Persistent table open/header/footer/startup metadata reads go through a
+  native-file storage object and adapter keyed by a storage object id.
+- Persistent table checked-block reads continue to go through the same adapter.
+- Existing table read/write behavior and storage format remain unchanged.
+- Existing persistent/table/block-cache tests pass.
+- `cargo fmt --check`, focused Rust tests, clippy, and `git diff --check`
+  pass.
+- Evidence records how this adapter prepares storage backend migration.
 
 ## Active Task Slice
 
 ```text
-task163 [x] goal:read current decision context | scope:.phrase decision/roadmap/current | verify:manual
-task164 [x] goal:inspect v1 API/storage/durability sections | scope:v1 protocol | verify:manual
-task165 [x] goal:write async-first portable storage protocol | scope:.phrase/protocol | verify:markdown review
-task166 [x] goal:link durable source-of-truth docs | scope:v1 protocol decision roadmap current | verify:git diff
-task167 [x] goal:close evidence and checks | scope:.phrase/evidence.md changed docs | verify:git diff --check and scans
-task168 [x] goal:record async/write-path implementation relationship | scope:async protocol lock-free protocol v1 current evidence | verify:git diff
+task181 [x] goal:start table-open storage boundary slice | scope:current roadmap | verify:manual
+task182 [x] goal:add opened native-file storage object | scope:src/storage.rs | verify:focused tests
+task183 [x] goal:route table open/header/footer/metadata reads through adapter | scope:src/table.rs | verify:table tests
+task184 [x] goal:record evidence and next step | scope:.phrase/evidence.md current roadmap | verify:git diff
 ```
 
 ## Known Blockers
 
-- No Rust implementation has started for this phase.
-- The exact async runtime boundary and trait signatures still need code-level
-  design during implementation.
-- WASI and browser persistent backends require separate capability probes and
-  fixtures before they can be accepted.
-- Existing synchronous public API code will need a staged compatibility plan.
-- Async API/storage migration and no-global-lock write-path changes must stay
-  as separate implementation slices even though they share the final design.
+- None for this table-open storage boundary slice.
+- Async storage traits and public async API remain later phases.
 
 ## Evidence
 
-- Current decision framework, roadmap, current phase, and v1 protocol were read.
-- The v1 API shape was still synchronous at the persistent database boundary.
-- Persistent storage language assumed native local files in places that should
-  be backend capabilities.
-- Async-first storage is required for future WASM support because persistent
-  browser-style storage cannot safely depend on blocking calls.
-- Async-first storage and no-global-lock writes are co-designed, but the first
-  implementation must isolate API/storage/cancellation changes from commit
-  visibility, WAL sharding, and delta publication changes.
+- Previous phase added a table storage object id plus
+  `NativeFileReadSource`, but `read_table` still directly opened native files
+  and read header/footer/metadata bytes.
+- That direct path is now the main remaining native-file dependency in table
+  reads before async backend traits can replace the adapter.
+- `src/storage.rs` now owns `NativeFileObject`, which opens a storage object,
+  reports its length, and serves locked random reads.
+- `read_table` now opens a table storage object and reads header, footer,
+  properties, top-level index, pinned filters, pinned index metadata, lazy
+  index partitions, range tombstones, and data blocks through
+  `NativeFileReadSource`.
+- Verification passed: `cargo test table --lib`, `cargo test block
+  --all-targets`, `cargo test persistent --all-targets`, `cargo clippy
+  --all-targets --all-features -- -D warnings`, `cargo fmt --check`,
+  `git diff --check`, and forbidden-term scan.
 
 ## Next Recommendation
 
-- Review and accept the async-first portable storage protocol, then implement a
-  first compatibility slice that introduces async primary handles while keeping
-  the current native behavior reachable through a blocking adapter.
+- Define the first async storage trait shape next; keep public async API
+  migration and table-write routing as separate slices.

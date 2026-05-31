@@ -1,20 +1,21 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::{Read, Seek, SeekFrom, Write},
+    io::Write,
     mem::size_of,
     ops::{Bound, Range},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, RwLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
 use crate::{
     blob::{BlobIndex, ValueRef},
+    block::{BlockHandle, BlockManager, BlockReadSource, block_bounds, checksum},
     cache::{BlockCache, BlockCacheKey, CacheKind},
-    codec::{self, CodecId},
+    codec::CodecId,
     error::{Error, Result},
     filter::{PointKeyFilter, PrefixFilter},
     internal_key::{InternalKey, ValueKind},
@@ -28,6 +29,7 @@ use crate::{
     range_tombstone::{self, RangeTombstoneIndex, RangeTombstoneLike},
     search,
     stats::{FilterStats, ReadPathStats},
+    storage::{NativeFileObject, NativeFileReadSource, StorageObjectId, StorageObjectKind},
     types::{KeyRange, Sequence},
 };
 
@@ -37,7 +39,6 @@ const TABLE_VERSION: u16 = 5;
 const HEADER_LEN: usize = 14;
 const FOOTER_MAGIC: u32 = 0x5452_5446;
 const FOOTER_LEN: usize = 90;
-const BLOCK_HEADER_LEN: usize = 13;
 const DATA_BLOCK_RESTART_INTERVAL: usize = 16;
 const INDEX_PARTITION_TARGET_ENTRIES: usize = 128;
 const PINNED_READ_METADATA_MAX_LEVEL: u32 = 1;
@@ -203,37 +204,6 @@ impl SectionHandle {
             offset: usize_to_u64(start, "section offset")?,
             len: usize_to_u64(end.saturating_sub(start), "section length")?,
         })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BlockHandle {
-    offset: u64,
-    len: u64,
-}
-
-#[derive(Debug)]
-struct TableFile {
-    file: Mutex<File>,
-}
-
-impl TableFile {
-    const fn new(file: File) -> Self {
-        Self {
-            file: Mutex::new(file),
-        }
-    }
-
-    fn read_exact_at(&self, path: &Path, offset: usize, bytes: &mut [u8]) -> Result<()> {
-        let mut file = self.file.lock().map_err(|_| Error::Corruption {
-            message: format!("referenced table {} handle lock poisoned", path.display()),
-        })?;
-        file.seek(SeekFrom::Start(usize_to_u64(
-            offset,
-            "table file read offset",
-        )?))?;
-        file.read_exact(bytes)?;
-        Ok(())
     }
 }
 
@@ -944,7 +914,7 @@ impl RangeTombstoneLike for TableRangeTombstone {
 #[derive(Debug, Clone)]
 pub(crate) struct Table {
     path: Option<PathBuf>,
-    file: Option<Arc<TableFile>>,
+    file: Option<Arc<NativeFileObject>>,
     payload_len: usize,
     footer: TableFooter,
     properties: TableProperties,
@@ -1530,9 +1500,9 @@ impl Table {
                 .index_partitions
                 .get(partition_index)
                 .ok_or_else(|| invalid_table("index partition outside table"))?;
-            read_index_partition_from_file(
-                path,
-                self.file.as_deref(),
+            let source = table_read_source(path, self.file.as_deref());
+            read_index_partition_from_source(
+                &source,
                 self.payload_len,
                 self.footer.data_blocks,
                 self.properties.codec,
@@ -2600,20 +2570,11 @@ pub(crate) fn write_table(
 }
 
 pub(crate) fn read_table(path: &Path) -> Result<Table> {
-    let mut file = File::open(path).map_err(|error| Error::Corruption {
-        message: format!(
-            "referenced table {} cannot be opened: {error}",
-            path.display()
-        ),
-    })?;
-    let mut header = [0_u8; HEADER_LEN];
-    file.read_exact(&mut header)
-        .map_err(|error| Error::Corruption {
-            message: format!(
-                "referenced table {} header cannot be read: {error}",
-                path.display()
-            ),
-        })?;
+    let object = table_storage_object(path);
+    let table_file = Arc::new(NativeFileObject::open(object)?);
+    let source = NativeFileReadSource::new(table_file.object().clone(), Some(table_file.as_ref()));
+
+    let header = read_table_header(path, &source)?;
     let magic = read_u32_at(&header, 0)?;
     let version = read_u16_at(&header, 4)?;
     let payload_len = read_u32_at(&header, 6)? as usize;
@@ -2627,7 +2588,7 @@ pub(crate) fn read_table(path: &Path) -> Result<Table> {
             message: format!("unsupported table version {version}"),
         });
     }
-    let file_len = file.metadata()?.len();
+    let file_len = table_file.len()?;
     let expected_len = usize_to_u64(
         HEADER_LEN
             .checked_add(payload_len)
@@ -2640,46 +2601,32 @@ pub(crate) fn read_table(path: &Path) -> Result<Table> {
         });
     }
 
-    let footer = read_footer_from_file(&mut file, payload_len)?;
+    let footer = read_footer_from_source(&source, payload_len)?;
     validate_footer_sections_by_len(payload_len, &footer)?;
 
-    let table_file = Arc::new(TableFile::new(file));
-
-    let (properties_codec, properties_payload) = read_single_block_section_from_file(
-        path,
-        Some(table_file.as_ref()),
-        payload_len,
-        footer.properties,
-    )?;
+    let (properties_codec, properties_payload) =
+        read_single_block_section_from_source(&source, payload_len, footer.properties)?;
     let properties = decode_properties_block(&properties_payload)?;
     validate_block_codec(properties_codec, properties.codec, TableSection::Properties)?;
 
-    let (top_level_block, index_codec, index_payload) = read_first_block_in_section_from_file(
-        path,
-        Some(table_file.as_ref()),
-        payload_len,
-        footer.indexes,
-    )?;
+    let (top_level_block, index_codec, index_payload) =
+        read_first_block_in_section_from_source(&source, payload_len, footer.indexes)?;
     validate_index_top_level_codec(index_codec, properties.codec)?;
     let index_partitions = decode_index_top_level(&index_payload)?;
     let data_block_count =
         validate_index_top_level(top_level_block, &index_partitions, footer.indexes)?;
-    let (point_key_filter, prefix_filter) = read_pinned_table_filters(
-        path,
-        Some(table_file.as_ref()),
-        payload_len,
-        footer.filters,
-        &properties,
-    )?;
+    let (point_key_filter, prefix_filter) =
+        read_pinned_table_filters(&source, payload_len, footer.filters, &properties)?;
     let index_partition_cache = Arc::new(RwLock::new(read_pinned_index_partitions(
-        path,
-        Some(table_file.as_ref()),
+        &source,
         payload_len,
         footer.data_blocks,
         &index_partitions,
         properties.codec,
         properties.level,
     )?));
+    drop(source);
+
     Ok(Table {
         path: Some(path.to_path_buf()),
         file: Some(table_file),
@@ -2700,9 +2647,32 @@ pub(crate) fn read_table(path: &Path) -> Result<Table> {
     })
 }
 
-fn read_pinned_table_filters(
+fn read_table_header(path: &Path, source: &impl BlockReadSource) -> Result<[u8; HEADER_LEN]> {
+    let mut header = [0_u8; HEADER_LEN];
+    source
+        .read_exact_at(0, &mut header)
+        .map_err(|error| Error::Corruption {
+            message: format!(
+                "referenced table {} header cannot be read: {error}",
+                path.display()
+            ),
+        })?;
+    Ok(header)
+}
+
+fn table_read_source<'src>(
     path: &Path,
-    file: Option<&TableFile>,
+    file: Option<&'src NativeFileObject>,
+) -> NativeFileReadSource<'src, NativeFileObject> {
+    NativeFileReadSource::new(table_storage_object(path), file)
+}
+
+fn table_storage_object(path: &Path) -> StorageObjectId {
+    StorageObjectId::native_file(StorageObjectKind::Table, path)
+}
+
+fn read_pinned_table_filters(
+    source: &impl BlockReadSource,
     payload_len: usize,
     filter_section: SectionHandle,
     properties: &TableProperties,
@@ -2712,14 +2682,13 @@ fn read_pinned_table_filters(
     }
 
     let (filter_codec, filter_payload) =
-        read_single_block_section_from_file(path, file, payload_len, filter_section)?;
+        read_single_block_section_from_source(source, payload_len, filter_section)?;
     validate_block_codec(filter_codec, properties.codec, TableSection::Filters)?;
     decode_filter_block(&filter_payload)
 }
 
 fn read_pinned_index_partitions(
-    path: &Path,
-    file: Option<&TableFile>,
+    source: &impl BlockReadSource,
     payload_len: usize,
     data_blocks_section: SectionHandle,
     partitions: &[IndexPartitionEntry],
@@ -2732,9 +2701,8 @@ fn read_pinned_index_partitions(
     }
 
     for (partition_index, partition) in partitions.iter().enumerate() {
-        let entries = read_index_partition_from_file(
-            path,
-            file,
+        let entries = read_index_partition_from_source(
+            source,
             payload_len,
             data_blocks_section,
             expected_codec,
@@ -2745,15 +2713,14 @@ fn read_pinned_index_partitions(
     Ok(pinned)
 }
 
-fn read_index_partition_from_file(
-    path: &Path,
-    file: Option<&TableFile>,
+fn read_index_partition_from_source(
+    source: &impl BlockReadSource,
     payload_len: usize,
     data_blocks_section: SectionHandle,
     expected_codec: CodecId,
     partition: &IndexPartitionEntry,
 ) -> Result<Vec<TableDataBlock>> {
-    let (codec, payload) = read_checked_block_from_file(path, file, payload_len, partition.block)?;
+    let (codec, payload) = read_checked_block_from_source(source, payload_len, partition.block)?;
     validate_block_codec(codec, expected_codec, TableSection::Indexes)?;
     let entries = decode_index_block(&payload)?;
     validate_index_partition(partition, &entries, data_blocks_section)?;
@@ -3178,7 +3145,7 @@ fn append_data_blocks(
             .get(data_block.record_range.clone())
             .ok_or_else(|| invalid_table("data block record range outside table"))?;
         let block_payload = encode_data_block(records)?;
-        let block = append_checked_block(bytes, codec, &block_payload)?;
+        let block = BlockManager::append_checked(bytes, codec, &block_payload)?;
         index_entries.push(DataBlockIndexEntry {
             smallest_internal_key: data_block.smallest_internal_key.clone(),
             largest_internal_key: data_block.largest_internal_key.clone(),
@@ -3205,7 +3172,7 @@ fn append_index_section(
         .enumerate()
         .map(|(partition_index, entries)| {
             let payload = encode_index_block(entries)?;
-            let block = encode_checked_block(codec, &payload)?;
+            let block = BlockManager::encode_checked(codec, &payload)?;
             let first_data_block_index = partition_index * INDEX_PARTITION_TARGET_ENTRIES;
             let first = entries
                 .first()
@@ -3233,7 +3200,8 @@ fn append_index_section(
             Ok(partition)
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut top_level = encode_checked_block(CodecId::None, &encode_index_top_level(&partitions)?)?;
+    let mut top_level =
+        BlockManager::encode_checked(CodecId::None, &encode_index_top_level(&partitions)?)?;
     let mut next_offset = section_start
         .checked_add(top_level.len())
         .ok_or_else(|| invalid_table("index section offset overflow"))?;
@@ -3246,7 +3214,7 @@ fn append_index_section(
     // The top-level partition index stores absolute offsets for the following
     // partition blocks. Keep it uncompressed so its byte length is stable after
     // those offsets are filled in; partition blocks still use the table codec.
-    top_level = encode_checked_block(CodecId::None, &encode_index_top_level(&partitions)?)?;
+    top_level = BlockManager::encode_checked(CodecId::None, &encode_index_top_level(&partitions)?)?;
     bytes.extend_from_slice(&top_level);
     for (_, block) in partition_payloads {
         bytes.extend_from_slice(&block);
@@ -3261,40 +3229,8 @@ fn append_single_block_section(
     block_payload: &[u8],
 ) -> Result<SectionHandle> {
     let section_start = bytes.len();
-    append_checked_block(bytes, codec, block_payload)?;
+    BlockManager::append_checked(bytes, codec, block_payload)?;
     SectionHandle::from_span(section_start, bytes.len())
-}
-
-fn append_checked_block(
-    bytes: &mut Vec<u8>,
-    codec: CodecId,
-    block_payload: &[u8],
-) -> Result<BlockHandle> {
-    let section_start = bytes.len();
-    let block = encode_checked_block(codec, block_payload)?;
-    bytes.extend_from_slice(&block);
-
-    Ok(BlockHandle {
-        offset: usize_to_u64(section_start, "block offset")?,
-        len: usize_to_u64(bytes.len() - section_start, "block length")?,
-    })
-}
-
-fn encode_checked_block(codec: CodecId, block_payload: &[u8]) -> Result<Vec<u8>> {
-    let encoded = codec::encode_block(codec, block_payload)?;
-    let mut bytes = Vec::with_capacity(BLOCK_HEADER_LEN + encoded.len());
-    put_codec(&mut bytes, codec);
-    put_u32(
-        &mut bytes,
-        usize_to_u32(block_payload.len(), "block payload length")?,
-    );
-    put_u32(
-        &mut bytes,
-        usize_to_u32(encoded.len(), "encoded block length")?,
-    );
-    put_u32(&mut bytes, checksum(&encoded));
-    bytes.extend_from_slice(&encoded);
-    Ok(bytes)
 }
 
 fn encode_data_block(records: &[TablePointRecord]) -> Result<Vec<u8>> {
@@ -3458,19 +3394,18 @@ fn read_footer(payload: &[u8]) -> Result<TableFooter> {
     read_footer_bytes(&payload[footer_start..])
 }
 
-fn read_footer_from_file(file: &mut File, payload_len: usize) -> Result<TableFooter> {
+fn read_footer_from_source(
+    source: &impl BlockReadSource,
+    payload_len: usize,
+) -> Result<TableFooter> {
     if payload_len < FOOTER_LEN {
         return Err(invalid_table("short footer"));
     }
     let footer_start = HEADER_LEN
         .checked_add(payload_len - FOOTER_LEN)
         .ok_or_else(|| invalid_table("footer offset overflow"))?;
-    file.seek(SeekFrom::Start(usize_to_u64(
-        footer_start,
-        "footer file offset",
-    )?))?;
     let mut footer = [0_u8; FOOTER_LEN];
-    file.read_exact(&mut footer)?;
+    source.read_exact_at(footer_start, &mut footer)?;
     read_footer_bytes(&footer)
 }
 
@@ -3612,7 +3547,16 @@ fn read_first_block_in_section(
 
 fn read_single_block_section_from_file(
     path: &Path,
-    file: Option<&TableFile>,
+    file: Option<&NativeFileObject>,
+    payload_len: usize,
+    section: SectionHandle,
+) -> Result<(CodecId, Vec<u8>)> {
+    let source = table_read_source(path, file);
+    read_single_block_section_from_source(&source, payload_len, section)
+}
+
+fn read_single_block_section_from_source(
+    source: &impl BlockReadSource,
     payload_len: usize,
     section: SectionHandle,
 ) -> Result<(CodecId, Vec<u8>)> {
@@ -3638,12 +3582,11 @@ fn read_single_block_section_from_file(
             message: "section block length mismatch".to_owned(),
         });
     }
-    read_checked_block_from_file(path, file, payload_len, block)
+    read_checked_block_from_source(source, payload_len, block)
 }
 
-fn read_first_block_in_section_from_file(
-    path: &Path,
-    file: Option<&TableFile>,
+fn read_first_block_in_section_from_source(
+    source: &impl BlockReadSource,
     payload_len: usize,
     section: SectionHandle,
 ) -> Result<(BlockHandle, CodecId, Vec<u8>)> {
@@ -3660,7 +3603,7 @@ fn read_first_block_in_section_from_file(
         });
     }
     let (block, codec, decoded) =
-        read_checked_block_at_file_offset(path, file, payload_len, section_start)?;
+        read_checked_block_at_source_offset(source, payload_len, section_start)?;
     let (_, block_end) = block_bounds(block)?;
     if block_end > section_end {
         return Err(Error::Corruption {
@@ -3672,11 +3615,7 @@ fn read_first_block_in_section_from_file(
 
 #[cfg(test)]
 fn read_checked_block(payload: &[u8], block: BlockHandle) -> Result<(CodecId, Vec<u8>)> {
-    let (start, end) = block_bounds(block)?;
-    let block_bytes = payload
-        .get(start..end)
-        .ok_or_else(|| invalid_table("block outside table payload"))?;
-    read_checked_block_bytes(block_bytes)
+    BlockManager::read_checked(payload, block)
 }
 
 #[cfg(test)]
@@ -3684,156 +3623,59 @@ fn read_checked_block_at_payload_offset(
     payload: &[u8],
     offset: usize,
 ) -> Result<(BlockHandle, CodecId, Vec<u8>)> {
-    let header = payload
-        .get(offset..offset + BLOCK_HEADER_LEN)
-        .ok_or_else(|| invalid_table("short block header"))?;
-    let encoded_len = read_u32_at(header, 5)? as usize;
-    let len = BLOCK_HEADER_LEN
-        .checked_add(encoded_len)
-        .ok_or_else(|| invalid_table("block length overflow"))?;
-    let end = offset
-        .checked_add(len)
-        .ok_or_else(|| invalid_table("block offset overflow"))?;
-    let block = BlockHandle {
-        offset: usize_to_u64(offset, "block offset")?,
-        len: usize_to_u64(len, "block length")?,
-    };
-    let block_bytes = payload
-        .get(offset..end)
-        .ok_or_else(|| invalid_table("block outside table payload"))?;
-    let (codec, decoded) = read_checked_block_bytes(block_bytes)?;
-    Ok((block, codec, decoded))
+    BlockManager::read_checked_at_payload_offset(payload, offset)
 }
 
+#[cfg(test)]
 fn read_checked_block_from_file(
     path: &Path,
-    file: Option<&TableFile>,
+    file: Option<&NativeFileObject>,
     payload_len: usize,
     block: BlockHandle,
 ) -> Result<(CodecId, Vec<u8>)> {
-    let (start, end) = block_bounds(block)?;
-    if end > payload_len {
-        return Err(invalid_table("block outside table payload"));
-    }
-
-    let file_offset = HEADER_LEN
-        .checked_add(start)
-        .ok_or_else(|| invalid_table("block file offset overflow"))?;
-    let mut block_bytes = vec![0_u8; end - start];
-    read_exact_from_table_file(path, file, file_offset, &mut block_bytes)?;
-    read_checked_block_bytes(&block_bytes)
+    let source = table_read_source(path, file);
+    read_checked_block_from_source(&source, payload_len, block)
 }
 
-fn read_checked_block_at_file_offset(
-    path: &Path,
-    file: Option<&TableFile>,
+fn read_checked_block_from_source(
+    source: &impl BlockReadSource,
+    payload_len: usize,
+    block: BlockHandle,
+) -> Result<(CodecId, Vec<u8>)> {
+    BlockManager::read_checked_from_source(payload_len, HEADER_LEN, block, source)
+}
+
+fn read_checked_block_at_source_offset(
+    source: &impl BlockReadSource,
     payload_len: usize,
     offset: usize,
 ) -> Result<(BlockHandle, CodecId, Vec<u8>)> {
-    if offset >= payload_len {
-        return Err(invalid_table("block outside table payload"));
-    }
-    let file_offset = HEADER_LEN
-        .checked_add(offset)
-        .ok_or_else(|| invalid_table("block file offset overflow"))?;
-    let mut header = [0_u8; BLOCK_HEADER_LEN];
-    read_exact_from_table_file(path, file, file_offset, &mut header)?;
-    let encoded_len = read_u32_at(&header, 5)? as usize;
-    let len = BLOCK_HEADER_LEN
-        .checked_add(encoded_len)
-        .ok_or_else(|| invalid_table("block length overflow"))?;
-    let end = offset
-        .checked_add(len)
-        .ok_or_else(|| invalid_table("block offset overflow"))?;
-    if end > payload_len {
-        return Err(invalid_table("block outside table payload"));
-    }
-    let mut block_bytes = Vec::with_capacity(len);
-    block_bytes.extend_from_slice(&header);
-    block_bytes.resize(len, 0);
-    read_exact_from_table_file(
-        path,
-        file,
-        file_offset + BLOCK_HEADER_LEN,
-        &mut block_bytes[BLOCK_HEADER_LEN..],
-    )?;
-    let (codec, decoded) = read_checked_block_bytes(&block_bytes)?;
-    Ok((
-        BlockHandle {
-            offset: usize_to_u64(offset, "block offset")?,
-            len: usize_to_u64(len, "block length")?,
-        },
-        codec,
-        decoded,
-    ))
+    BlockManager::read_checked_at_source_offset(payload_len, HEADER_LEN, offset, source)
 }
 
 fn read_data_block_from_file(
     path: &Path,
-    file: Option<&TableFile>,
+    file: Option<&NativeFileObject>,
     payload_len: usize,
     expected_codec: CodecId,
     entry: &DataBlockIndexEntry,
 ) -> Result<DecodedDataBlock> {
-    let (actual_codec, payload) =
-        read_checked_block_from_file(path, file, payload_len, entry.block)?;
+    let source = table_read_source(path, file);
+    read_data_block_from_source(&source, payload_len, expected_codec, entry)
+}
+
+fn read_data_block_from_source(
+    source: &impl BlockReadSource,
+    payload_len: usize,
+    expected_codec: CodecId,
+    entry: &DataBlockIndexEntry,
+) -> Result<DecodedDataBlock> {
+    let (actual_codec, payload) = read_checked_block_from_source(source, payload_len, entry.block)?;
     validate_block_codec(actual_codec, expected_codec, TableSection::DataBlocks)?;
     let decoded = decode_data_block(payload)?;
     validate_decoded_data_block_entry(entry, &decoded)?;
     validate_decoded_data_block_filters(entry, &decoded)?;
     Ok(decoded)
-}
-
-fn read_exact_from_table_file(
-    path: &Path,
-    file: Option<&TableFile>,
-    offset: usize,
-    bytes: &mut [u8],
-) -> Result<()> {
-    if let Some(file) = file {
-        return file.read_exact_at(path, offset, bytes);
-    }
-
-    let mut file = File::open(path).map_err(|error| Error::Corruption {
-        message: format!(
-            "referenced table {} cannot be opened: {error}",
-            path.display()
-        ),
-    })?;
-    file.seek(SeekFrom::Start(usize_to_u64(
-        offset,
-        "table file read offset",
-    )?))?;
-    file.read_exact(bytes)?;
-    Ok(())
-}
-
-fn read_checked_block_bytes(block_bytes: &[u8]) -> Result<(CodecId, Vec<u8>)> {
-    if block_bytes.len() < BLOCK_HEADER_LEN {
-        return Err(invalid_table("short block header"));
-    }
-
-    let codec = codec_from_tag(block_bytes[0])?;
-    let uncompressed_len = read_u32_at(block_bytes, 1)? as usize;
-    let encoded_len = read_u32_at(block_bytes, 5)? as usize;
-    let expected_checksum = read_u32_at(block_bytes, 9)?;
-    if block_bytes.len() != BLOCK_HEADER_LEN + encoded_len {
-        return Err(Error::Corruption {
-            message: "block length mismatch".to_owned(),
-        });
-    }
-
-    let encoded = &block_bytes[BLOCK_HEADER_LEN..];
-    if checksum(encoded) != expected_checksum {
-        return Err(Error::Corruption {
-            message: "block checksum mismatch".to_owned(),
-        });
-    }
-
-    Ok((
-        codec,
-        codec::decode_block(codec, encoded, uncompressed_len)?,
-    ))
 }
 
 fn validate_block_codec(actual: CodecId, expected: CodecId, section: TableSection) -> Result<()> {
@@ -4570,23 +4412,11 @@ fn put_blob_index(bytes: &mut Vec<u8>, index: BlobIndex) {
 }
 
 fn put_codec(bytes: &mut Vec<u8>, codec: CodecId) {
-    put_u8(
-        bytes,
-        match codec {
-            CodecId::None => 0,
-            CodecId::FastLz4Block => 1,
-        },
-    );
+    put_u8(bytes, codec.tag());
 }
 
 fn codec_from_tag(tag: u8) -> Result<CodecId> {
-    match tag {
-        0 => Ok(CodecId::None),
-        1 => Ok(CodecId::FastLz4Block),
-        tag => Err(Error::UnsupportedFormat {
-            message: format!("unknown table codec {tag}"),
-        }),
-    }
+    CodecId::from_tag(tag)
 }
 
 fn put_bound(bytes: &mut Vec<u8>, bound: &Bound<Vec<u8>>) -> Result<()> {
@@ -4694,10 +4524,6 @@ fn section_bounds(handle: SectionHandle) -> Result<(usize, usize)> {
     bounds(handle.offset, handle.len)
 }
 
-fn block_bounds(handle: BlockHandle) -> Result<(usize, usize)> {
-    bounds(handle.offset, handle.len)
-}
-
 fn bounds(offset: u64, len: u64) -> Result<(usize, usize)> {
     let start = usize::try_from(offset).map_err(|_| invalid_table("offset exceeds usize"))?;
     let len = usize::try_from(len).map_err(|_| invalid_table("length exceeds usize"))?;
@@ -4738,15 +4564,6 @@ fn read_u32_at(bytes: &[u8], offset: usize) -> Result<u32> {
         .get(offset..offset + 4)
         .ok_or_else(|| invalid_table("short u32"))?;
     Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
-}
-
-fn checksum(bytes: &[u8]) -> u32 {
-    let mut hash = 0x811c_9dc5_u32;
-    for byte in bytes {
-        hash ^= u32::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    hash
 }
 
 fn user_key_hash(bytes: &[u8]) -> u64 {
@@ -5365,7 +5182,7 @@ mod tests {
     #[test]
     fn block_read_uses_cached_file_handle() {
         let mut payload = Vec::new();
-        let block = append_checked_block(&mut payload, CodecId::None, b"cached block")
+        let block = BlockManager::append_checked(&mut payload, CodecId::None, b"cached block")
             .expect("checked block appends");
         let path = std::env::temp_dir().join(format!(
             "trine-kv-cached-table-handle-{}-{}.trinet",
@@ -5375,8 +5192,8 @@ mod tests {
         let mut file_bytes = vec![0_u8; HEADER_LEN];
         file_bytes.extend_from_slice(&payload);
         std::fs::write(&path, file_bytes).expect("test table file writes");
-        let file = std::fs::File::open(&path).expect("test table file opens");
-        let table_file = TableFile::new(file);
+        let table_file =
+            NativeFileObject::open(table_storage_object(&path)).expect("test table file opens");
         let missing_path = path.with_extension("missing");
 
         let (codec, decoded) =
