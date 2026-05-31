@@ -1573,3 +1573,26 @@ exist for point writes, batches, and cursor advancement.
   behavior, and public API shapes remain unchanged.
 - Focused commit-tracker tests, formatting, clippy, full tests, and diff checks
   pass.
+
+### Phase 74: Async Transaction Compatibility And Write Cancellation Tests
+
+**Status**: Complete
+
+**Goal**: Add the missing async transaction compatibility surface and lock down
+the current async write cancellation behavior before introducing an owned
+runtime execution boundary.
+
+**Entry Condition**: Phase 73 complete and commit acceptance/terminal state is
+represented by the commit tracker.
+
+**Acceptance Gate**:
+
+- `Transaction` exposes async compatibility methods for point reads, range
+  reads, and commit.
+- Async API tests cover transaction async reads and commit.
+- Dropping an unpolled async write future has no side effect.
+- Polling an async write future reaches a visible terminal commit.
+- The current no-runtime compatibility model, writer coordinator, commit
+  tracker, MVCC, WAL/table/blob/manifest formats, compaction, and recovery
+  behavior remain unchanged.
+- Focused async tests, formatting, clippy, full tests, and diff checks pass.

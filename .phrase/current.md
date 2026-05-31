@@ -6,89 +6,80 @@ Complete
 
 ## Goal
 
-Introduce an explicit commit tracker behind the current writer coordinator so
-write acceptance, terminal commit state, and read-boundary advancement are named
-protocol steps instead of an ad-hoc sequence store.
+Complete the async transaction compatibility surface and codify current async
+write cancellation behavior on top of the explicit commit tracker.
 
 ## Scope
 
-- Add a commit slot tracker with `Open`, `Visible`, and `Skipped` terminal
-  transitions.
-- Route successful write sequence publication through the tracker.
-- Mark pre-publication failures as skipped after a sequence slot has been
-  accepted.
-- Reinitialize the tracker from WAL replay state during persistent open.
-- Add focused tests for slot advancement over skipped and visible states.
-- Preserve the existing writer coordinator, WAL format, table/blob formats,
-  bucket routing, MVCC read behavior, compaction behavior, stats behavior, and
-  public blocking/async compatibility API names.
+- Add async compatibility methods for transaction point reads, range reads, and
+  commit.
+- Extend async API tests to exercise transaction read tracking and commit.
+- Add a focused cancellation-before-acceptance test for an unpolled async write
+  future.
+- Add a focused accepted-write test proving the current async write future
+  reaches a visible terminal commit when polled.
+- Preserve the current no-runtime async compatibility model, writer
+  coordinator, commit tracker behavior, WAL/table/blob/manifest formats, MVCC,
+  compaction, recovery, cleanup, and storage behavior.
 
 ## Out Of Scope
 
+- Selecting a concrete async runtime.
+- Spawning accepted writes onto an owned runtime task.
 - Removing the writer coordinator mutex.
-- Introducing WAL shards.
-- Moving foreground writes to writer-local deltas.
-- Changing transaction validation policy.
-- Changing native-file blocking behavior.
-- Adding a concrete async runtime dependency.
-- Changing table, blob, manifest, or WAL on-disk formats.
+- Introducing WAL shards or writer-local deltas.
+- Changing transaction conflict rules.
+- Changing persistent native-file blocking behavior.
 
 ## Acceptance Gate
 
-- Roadmap records this as the commit-tracker phase.
-- Current phase states the affected write path and the preserved coordinator
-  boundary.
-- Commit slots have explicit `Open`, `Visible`, and `Skipped` states.
-- The public read boundary is advanced by commit tracker transitions.
-- WAL replay resets the tracker to the recovered durable boundary.
-- Failed accepted writes before delta publication mark their slot skipped.
-- Successful writes mark their slot visible only after deltas are published.
-- Focused commit-tracker tests cover skipped and visible advancement.
-- `cargo fmt --check`, focused tests, clippy, full tests, `git diff --check`,
-  and forbidden-term scan pass.
-- Evidence records remaining work for true lock-free writer-local deltas and
-  cancellation-safe async write execution.
+- Roadmap records this as the async transaction and cancellation test phase.
+- Transaction exposes async compatibility methods for reads and commit.
+- Async API smoke covers transaction async reads and commit.
+- Dropping an unpolled async write future has no write side effect.
+- Polling an async write future reaches a visible terminal commit.
+- `cargo fmt --check`, focused async API tests, clippy, full tests,
+  `git diff --check`, and forbidden-term scan pass.
+- Evidence records that true owned async commit execution still waits on the
+  runtime boundary.
 
 ## Active Task Slice
 
 ```text
-task279 [x] goal:start commit tracker slice | scope:current roadmap | verify:manual
-task280 [x] goal:add commit slot tracker state machine | scope:src/db.rs | verify:unit tests
-task281 [x] goal:route write/replay sequence publication through tracker | scope:src/db/commit.rs | verify:write/recovery tests
-task282 [x] goal:run verification gate | scope:workspace | verify:fmt clippy tests diff
-task283 [x] goal:record evidence and commit | scope:.phrase/evidence.md current roadmap | verify:git status
+task284 [x] goal:start async transaction/cancellation slice | scope:current roadmap | verify:manual
+task285 [x] goal:add transaction async compatibility methods | scope:src/transaction.rs | verify:async smoke test
+task286 [x] goal:add write cancellation behavior tests | scope:tests/async_api.rs | verify:focused tests
+task287 [x] goal:run verification gate | scope:workspace | verify:fmt clippy tests diff
+task288 [x] goal:record evidence and commit | scope:.phrase/evidence.md current roadmap | verify:git status
 ```
 
 ## Known Blockers
 
-- None for this protocol slice.
-- True multi-writer execution still requires writer-local deltas, WAL
-  partitioning, and a publish barrier after this tracker exists.
+- None for the compatibility/test slice.
+- Owned async commit execution still requires a runtime boundary with spawn,
+  cancellation token, shutdown join, and target-specific blocking policy.
 
 ## Evidence
 
-- The async-first protocol requires accepted writes to reach a terminal state
-  even if a future is cancelled after acceptance.
-- The current write path uses one writer mutex and a single `last_sequence`
-  atomic, which hides commit acceptance and terminal state behind an unnamed
-  store.
-- Adding the tracker behind the existing writer coordinator gives later
-  async/cancellation work a concrete protocol boundary without changing storage
-  formats or public read semantics.
-- `CommitTracker` now owns sequence reservation, `Open -> Visible`, and
-  `Open -> Skipped` transitions.
-- `Db::last_committed_sequence` now reads the tracker boundary instead of a raw
-  sequence atomic.
-- The write path reserves a slot after validation/routing, appends WAL, applies
-  deltas, and marks the slot visible after successful publication.
-- WAL replay resets the tracker boundary to the recovered replay result.
-- Verification passed: `cargo fmt --check`, `cargo test commit_tracker --lib`,
-  `cargo test memory_async_compatibility_surface_smoke --test async_api`,
+- The async-first protocol lists transaction reads and commit in the async API
+  shape.
+- Current transaction methods are blocking-only.
+- Current async write methods contain no await points, so dropping before poll
+  must be a no-op and polling must complete the commit synchronously to a
+  terminal state.
+- `Transaction` now exposes async compatibility methods for point reads, range
+  reads, and commit.
+- The async API smoke test now covers default-bucket and named-bucket
+  transaction async reads and commit.
+- Focused tests now prove that dropping an unpolled async write future leaves no
+  write side effect, and polling an async write future reaches a visible
+  terminal commit.
+- Verification passed: `cargo fmt --check`, `cargo test --test async_api`,
   `cargo clippy --all-targets --all-features -- -D warnings`, and
   `cargo test --all-targets --all-features`, `git diff --check`, and the
   forbidden-term scan outside the repository instruction file.
 
 ## Next Recommendation
 
-- Commit this slice, then continue toward cancellation-safe async write
-  execution on top of the explicit commit states.
+- Commit this slice, then continue toward an explicit runtime boundary before
+  moving accepted writes to owned async execution.

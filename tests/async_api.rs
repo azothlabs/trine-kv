@@ -5,7 +5,8 @@ use std::{
 };
 
 use trine_kv::{
-    Db, DbOptions, DurabilityMode, Iter, KeyRange, KeyValue, LazyIter, WriteBatch, WriteOptions,
+    Db, DbOptions, DurabilityMode, Iter, KeyRange, KeyValue, LazyIter, Sequence,
+    TransactionOptions, WriteBatch, WriteOptions,
 };
 
 fn block_on_ready<T>(future: impl Future<Output = T>) -> T {
@@ -97,6 +98,35 @@ fn memory_async_compatibility_surface_smoke() {
             .is_none()
     );
 
+    let mut txn = db.transaction(TransactionOptions::default());
+    assert_eq!(
+        block_on_ready(txn.get_async(b"b")).expect("transaction async point read"),
+        Some(b"two".to_vec())
+    );
+    block_on_ready(txn.read_range_async(KeyRange::all())).expect("transaction async range read");
+    txn.put(b"c".to_vec(), b"three".to_vec());
+    let txn_commit = block_on_ready(txn.commit_async()).expect("transaction async commit");
+    assert_eq!(txn_commit.sequence(), db.last_committed_sequence());
+    assert_eq!(
+        block_on_ready(db.get_async(b"c")).expect("transaction write reads"),
+        Some(b"three".to_vec())
+    );
+
+    let mut named_txn = db.transaction(TransactionOptions::default());
+    assert_eq!(
+        block_on_ready(named_txn.get_bucket_async("events", b"e1"))
+            .expect("named transaction async point read"),
+        Some(b"event".to_vec())
+    );
+    named_txn
+        .put_bucket("events", b"e2".to_vec(), b"event-two".to_vec())
+        .expect("named transaction stages write");
+    block_on_ready(named_txn.commit_async()).expect("named transaction async commit");
+    assert_eq!(
+        block_on_ready(events.get_async(b"e2")).expect("named transaction write reads"),
+        Some(b"event-two".to_vec())
+    );
+
     block_on_ready(db.delete_async(b"a".to_vec())).expect("delete through async API");
     assert_eq!(
         block_on_ready(db.get_async(b"a")).expect("deleted key reads"),
@@ -107,4 +137,34 @@ fn memory_async_compatibility_surface_smoke() {
     block_on_ready(db.flush_async()).expect("memory flush is accepted");
     block_on_ready(db.compact_range_async(KeyRange::all())).expect("memory compact is accepted");
     block_on_ready(db.close_async());
+}
+
+#[test]
+fn dropping_unpolled_async_write_future_has_no_side_effect() {
+    let db = Db::open_memory().expect("memory db opens");
+
+    let write = db.put_async(b"cancelled".to_vec(), b"value".to_vec());
+    drop(write);
+
+    assert_eq!(
+        db.get(b"cancelled").expect("read after dropped future"),
+        None
+    );
+    assert_eq!(db.last_committed_sequence(), Sequence::ZERO);
+}
+
+#[test]
+fn polled_async_write_future_reaches_visible_terminal_commit() {
+    let db = Db::open_memory().expect("memory db opens");
+    let mut batch = WriteBatch::new();
+    batch.put(b"accepted".to_vec(), b"value".to_vec());
+
+    let commit = block_on_ready(db.write_async(batch, WriteOptions::default()))
+        .expect("async write commits");
+
+    assert_eq!(commit.sequence(), db.last_committed_sequence());
+    assert_eq!(
+        db.get(b"accepted").expect("read after accepted future"),
+        Some(b"value".to_vec())
+    );
 }

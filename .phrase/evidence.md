@@ -5865,3 +5865,51 @@ Record only evidence that can change planning or durable decisions.
 
 - Continue with cancellation-safe async write execution on top of the explicit
   commit tracker.
+
+## 2026-05-31: Async Transaction Compatibility And Write Cancellation Tests
+
+### Observation
+
+- The async-first protocol lists transaction reads and transaction commit in the
+  public async shape.
+- Transaction reads and commit were still blocking-only.
+- Current async write methods have no await points, so cancellation behavior is
+  determined by whether the future has been polled.
+
+### Interpretation
+
+- Transaction async compatibility can be additive and runtime-free, matching the
+  rest of the current async surface.
+- Dropping an unpolled write future must remain a no-op.
+- Polling the current write future runs the side-effecting commit synchronously
+  to completion, so the accepted write reaches a visible terminal commit.
+- Moving accepted writes to owned async execution still requires an explicit
+  runtime boundary.
+
+### Verification
+
+- Added transaction async compatibility methods for default-bucket and
+  named-bucket point reads, range reads, and commit.
+- Extended the async API smoke test to cover transaction async reads and commit.
+- Added a test proving an unpolled async write future has no write side effect.
+- Added a test proving a polled async write future reaches a visible terminal
+  commit.
+- `cargo fmt --check`
+- `cargo test --test async_api`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan outside the repository instruction file
+
+### Remaining Blockers
+
+- Async write methods are still no-runtime compatibility methods.
+- Owned async commit execution requires a runtime boundary with spawn,
+  cancellation token, shutdown join, and target-specific blocking policy.
+- True multi-writer execution still needs writer-local deltas, WAL partitioning,
+  and a publish barrier.
+
+### Recommended Next Action
+
+- Define the runtime boundary before moving accepted writes to owned async
+  execution.

@@ -172,3 +172,35 @@ impl Transaction {
         )
     }
 }
+
+/// Additive async compatibility methods for transaction callers.
+#[allow(clippy::unused_async)]
+impl Transaction {
+    pub async fn get_async(&mut self, key: &[u8]) -> Result<Option<Value>> {
+        self.get(key)
+    }
+
+    pub async fn get_bucket_async(
+        &mut self,
+        bucket: impl Into<String>,
+        key: &[u8],
+    ) -> Result<Option<Value>> {
+        self.get_bucket(bucket, key)
+    }
+
+    pub async fn read_range_async(&mut self, range: KeyRange) -> Result<()> {
+        self.read_range(range)
+    }
+
+    pub async fn read_range_bucket_async(
+        &mut self,
+        bucket: impl Into<String>,
+        range: KeyRange,
+    ) -> Result<()> {
+        self.read_range_bucket(bucket, range)
+    }
+
+    pub async fn commit_async(self) -> Result<CommitInfo> {
+        self.commit()
+    }
+}
