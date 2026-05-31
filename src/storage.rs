@@ -15,6 +15,7 @@ use crate::{
     durability::{sync_dir_after_renames, sync_parent_dir_after_rename},
     error::{Error, Result},
     options::DurabilityMode,
+    runtime::Runtime,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -691,12 +692,21 @@ impl BlockingStorageReadObject for MemoryStorageObject {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct NativeFileBackend;
+#[derive(Debug, Default, Clone)]
+pub(crate) struct NativeFileBackend {
+    runtime: Option<Runtime>,
+}
 
 impl NativeFileBackend {
     pub(crate) const fn new() -> Self {
-        Self
+        Self { runtime: None }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_runtime(runtime: Runtime) -> Self {
+        Self {
+            runtime: Some(runtime),
+        }
     }
 }
 
@@ -704,11 +714,23 @@ impl StorageReadBackend for NativeFileBackend {
     type ReadObject = NativeFileObject;
 
     fn capabilities(&self) -> StorageCapabilities {
-        StorageCapabilities::native_file()
+        let capabilities = StorageCapabilities::native_file();
+        if self
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.capabilities().blocking_adapter())
+        {
+            capabilities
+                .with(StorageCapability::AsyncTasks)
+                .with(StorageCapability::BackgroundThreads)
+        } else {
+            capabilities
+        }
     }
 
     fn open_read(&self, object: StorageObjectId) -> StorageReadFuture<'_, Self::ReadObject> {
-        Box::pin(async move { NativeFileObject::open(object) })
+        let runtime = self.runtime.clone();
+        Box::pin(async move { NativeFileObject::open(object, runtime) })
     }
 }
 
@@ -720,13 +742,23 @@ impl BlockingStorageReadBackend for NativeFileBackend {
 
 impl StorageObjectReadBackend for NativeFileBackend {
     fn read_object_bytes(&self, object: StorageObjectId) -> StorageFuture<'_, Option<Arc<[u8]>>> {
-        Box::pin(async move { read_native_file_object_bytes(&object) })
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            if let Some(runtime) = runtime {
+                if runtime.capabilities().blocking_adapter() {
+                    return runtime
+                        .spawn_blocking_result(move || read_native_file_object_bytes(&object))?
+                        .await;
+                }
+            }
+            read_native_file_object_bytes(&object)
+        })
     }
 }
 
 impl BlockingStorageObjectReadBackend for NativeFileBackend {
     fn read_object_bytes_blocking(&self, object: StorageObjectId) -> Result<Option<Arc<[u8]>>> {
-        poll_ready_storage_future(self.read_object_bytes(object))
+        read_native_file_object_bytes(&object)
     }
 }
 
@@ -922,14 +954,16 @@ impl BlockingStorageObjectListBackend for NativeFileBackend {
 pub(crate) struct NativeFileObject {
     object: StorageObjectId,
     file: Mutex<File>,
+    runtime: Option<Runtime>,
 }
 
 impl NativeFileObject {
-    fn open(object: StorageObjectId) -> Result<Self> {
+    fn open(object: StorageObjectId, runtime: Option<Runtime>) -> Result<Self> {
         let file = open_native_file(&object)?;
         Ok(Self {
             object,
             file: Mutex::new(file),
+            runtime,
         })
     }
 
@@ -941,6 +975,12 @@ impl NativeFileObject {
     fn read_exact_at_offset(&self, offset: usize, bytes: &mut [u8]) -> Result<()> {
         let mut file = self.lock_file()?;
         read_exact_at_native_file(&mut file, offset, bytes)
+    }
+
+    fn read_exact_at_offset_owned(&self, offset: usize, len: usize) -> Result<StorageReadBuffer> {
+        let mut bytes = allocate_read_buffer(len)?;
+        self.read_exact_at_offset(offset, &mut bytes)?;
+        Ok(StorageReadBuffer::new(offset, Arc::from(bytes)))
     }
 
     fn lock_file(&self) -> Result<MutexGuard<'_, File>> {
@@ -970,6 +1010,26 @@ impl StorageReadObject for NativeFileObject {
     ) -> StorageReadFuture<'op, ()> {
         Box::pin(async move { self.read_exact_at_offset(offset, bytes) })
     }
+
+    fn read_exact_at_owned(
+        &self,
+        offset: usize,
+        len: usize,
+    ) -> StorageReadFuture<'_, StorageReadBuffer> {
+        if let Some(runtime) = self.runtime.clone() {
+            if runtime.capabilities().blocking_adapter() {
+                let object = self.object.clone();
+                return Box::pin(async move {
+                    runtime
+                        .spawn_blocking_result(move || {
+                            read_exact_at_native_file_owned(&object, offset, len)
+                        })?
+                        .await
+                });
+            }
+        }
+        Box::pin(async move { self.read_exact_at_offset_owned(offset, len) })
+    }
 }
 
 impl BlockingStorageReadObject for NativeFileObject {
@@ -979,6 +1039,10 @@ impl BlockingStorageReadObject for NativeFileObject {
 
     fn read_exact_at_blocking(&self, offset: usize, bytes: &mut [u8]) -> Result<()> {
         poll_ready_storage_future(StorageReadObject::read_exact_at(self, offset, bytes))
+    }
+
+    fn read_exact_at_owned_blocking(&self, offset: usize, len: usize) -> Result<StorageReadBuffer> {
+        self.read_exact_at_offset_owned(offset, len)
     }
 }
 
@@ -1105,6 +1169,16 @@ fn read_exact_from_native_file(
     file.read_exact_at_blocking(offset, bytes)
 }
 
+fn read_exact_at_native_file_owned(
+    object: &StorageObjectId,
+    offset: usize,
+    len: usize,
+) -> Result<StorageReadBuffer> {
+    let mut bytes = allocate_read_buffer(len)?;
+    read_exact_from_native_file(object, offset, &mut bytes)?;
+    Ok(StorageReadBuffer::new(offset, Arc::from(bytes)))
+}
+
 fn open_native_file(object: &StorageObjectId) -> Result<File> {
     File::open(object.path()).map_err(|error| Error::Corruption {
         message: format!(
@@ -1136,6 +1210,7 @@ fn read_native_file_object_bytes(object: &StorageObjectId) -> Result<Option<Arc<
     let object = NativeFileObject {
         object: object.clone(),
         file: Mutex::new(file),
+        runtime: None,
     };
     let len = u64_to_usize(object.len_blocking()?, "storage object length")?;
     let buffer = object.read_exact_at_owned_blocking(0, len)?;
@@ -1505,9 +1580,63 @@ fn u64_to_usize(value: u64, field: &'static str) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        future::Future,
+        sync::{Arc, mpsc},
+        task::{Context, Poll, Wake, Waker},
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
 
     use super::*;
+    use crate::runtime::{Runtime, RuntimeOptions};
+
+    struct ThreadWaker {
+        thread: thread::Thread,
+    }
+
+    impl Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.thread.unpark();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.thread.unpark();
+        }
+    }
+
+    fn test_waker() -> Waker {
+        Waker::from(Arc::new(ThreadWaker {
+            thread: thread::current(),
+        }))
+    }
+
+    fn block_on_test_future<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
+        let waker = test_waker();
+        let mut context = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(result) => return result,
+                Poll::Pending => thread::park_timeout(Duration::from_secs(1)),
+            }
+        }
+    }
+
+    fn hold_runtime_blocking_worker(runtime: &Runtime) -> mpsc::Sender<()> {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        runtime
+            .spawn_blocking(move || {
+                started_tx.send(()).expect("report blocking worker start");
+                release_rx.recv().expect("wait for release");
+            })
+            .expect("spawn worker holder");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker holder starts");
+        release_tx
+    }
 
     #[test]
     fn native_file_backend_exposes_async_read_shape() {
@@ -1555,6 +1684,118 @@ mod tests {
             .expect("blocking owned range reads");
         assert_eq!(owned_blocking.offset(), 3);
         assert_eq!(&*owned_blocking.into_bytes(), b"de");
+
+        std::fs::remove_file(path).expect("test file removes");
+    }
+
+    #[test]
+    fn runtime_enabled_native_file_owned_read_uses_blocking_adapter() {
+        let path = std::env::temp_dir().join(format!(
+            "trine-kv-runtime-storage-read-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"abcdef").expect("test file writes");
+
+        let runtime = Runtime::with_blocking_limits(RuntimeOptions::native_threads(), 1, 2);
+        let release = hold_runtime_blocking_worker(&runtime);
+        let backend = NativeFileBackend::with_runtime(runtime);
+        assert!(
+            backend
+                .capabilities()
+                .supports(StorageCapability::AsyncTasks)
+        );
+        assert!(
+            backend
+                .capabilities()
+                .supports(StorageCapability::BackgroundThreads)
+        );
+
+        let object_id = StorageObjectId::native_file(StorageObjectKind::Table, &path);
+        let object = poll_ready_storage_future(backend.open_read(object_id))
+            .expect("runtime-backed object opens");
+        let mut read = StorageReadObject::read_exact_at_owned(&object, 1, 4);
+        let waker = test_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(
+            matches!(read.as_mut().poll(&mut context), Poll::Pending),
+            "owned read should wait behind the occupied blocking worker"
+        );
+
+        release.send(()).expect("release blocking worker");
+        let buffer = block_on_test_future(read).expect("runtime owned read completes");
+        assert_eq!(buffer.offset(), 1);
+        assert_eq!(&*buffer.into_bytes(), b"bcde");
+
+        std::fs::remove_file(path).expect("test file removes");
+    }
+
+    #[test]
+    fn runtime_enabled_native_file_object_read_uses_blocking_adapter() {
+        let path = std::env::temp_dir().join(format!(
+            "trine-kv-runtime-object-read-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"whole object").expect("test file writes");
+
+        let runtime = Runtime::with_blocking_limits(RuntimeOptions::native_threads(), 1, 2);
+        let release = hold_runtime_blocking_worker(&runtime);
+        let backend = NativeFileBackend::with_runtime(runtime);
+        let object_id = StorageObjectId::native_file(StorageObjectKind::Table, &path);
+
+        let mut read = backend.read_object_bytes(object_id);
+        let waker = test_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(
+            matches!(read.as_mut().poll(&mut context), Poll::Pending),
+            "whole-object read should wait behind the occupied blocking worker"
+        );
+
+        release.send(()).expect("release blocking worker");
+        let bytes = block_on_test_future(read)
+            .expect("runtime object read completes")
+            .expect("object exists");
+        assert_eq!(&*bytes, b"whole object");
+
+        std::fs::remove_file(path).expect("test file removes");
+    }
+
+    #[test]
+    fn inline_runtime_native_file_owned_read_remains_ready() {
+        let path = std::env::temp_dir().join(format!(
+            "trine-kv-inline-runtime-storage-read-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"abcdef").expect("test file writes");
+
+        let runtime = Runtime::new(RuntimeOptions::inline());
+        let backend = NativeFileBackend::with_runtime(runtime);
+        assert!(
+            !backend
+                .capabilities()
+                .supports(StorageCapability::AsyncTasks)
+        );
+
+        let object_id = StorageObjectId::native_file(StorageObjectKind::Table, &path);
+        let object = poll_ready_storage_future(backend.open_read(object_id))
+            .expect("inline runtime object opens");
+        let buffer =
+            poll_ready_storage_future(StorageReadObject::read_exact_at_owned(&object, 2, 3))
+                .expect("inline runtime owned read is ready");
+
+        assert_eq!(buffer.offset(), 2);
+        assert_eq!(&*buffer.into_bytes(), b"cde");
 
         std::fs::remove_file(path).expect("test file removes");
     }

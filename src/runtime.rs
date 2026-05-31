@@ -1,11 +1,14 @@
 use std::{
     collections::VecDeque,
     fmt,
+    future::Future,
     panic::{self, AssertUnwindSafe},
+    pin::Pin,
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    task::{Context, Poll, Waker},
     thread,
 };
 
@@ -53,9 +56,18 @@ pub(crate) enum RuntimeTask {
     NativeThread(thread::JoinHandle<()>),
 }
 
+pub(crate) struct BlockingResultFuture<T> {
+    state: Arc<Mutex<BlockingResultState<T>>>,
+}
+
 struct BlockingTaskPool {
     state: Arc<BlockingTaskPoolState>,
     workers: Mutex<BlockingWorkers>,
+}
+
+struct BlockingResultState<T> {
+    result: Option<Result<T>>,
+    waker: Option<Waker>,
 }
 
 struct BlockingTaskPoolState {
@@ -180,7 +192,7 @@ impl Runtime {
         )
     }
 
-    fn with_blocking_limits(
+    pub(crate) fn with_blocking_limits(
         options: RuntimeOptions,
         blocking_worker_count: usize,
         blocking_queue_depth: usize,
@@ -223,6 +235,55 @@ impl Runtime {
             return Err(Error::unsupported("runtime blocking adapter"));
         };
         pool.submit(Box::new(task))
+    }
+
+    pub(crate) fn spawn_blocking_result<T>(
+        &self,
+        task: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Result<BlockingResultFuture<T>>
+    where
+        T: Send + 'static,
+    {
+        let state = Arc::new(Mutex::new(BlockingResultState {
+            result: None,
+            waker: None,
+        }));
+        let task_state = Arc::clone(&state);
+        self.spawn_blocking(move || {
+            let result = panic::catch_unwind(AssertUnwindSafe(task))
+                .unwrap_or_else(|_| Err(Error::runtime_busy("blocking task panicked")));
+            if let Ok(mut state) = task_state.lock() {
+                state.result = Some(result);
+                if let Some(waker) = state.waker.take() {
+                    waker.wake();
+                }
+            }
+        })?;
+        Ok(BlockingResultFuture { state })
+    }
+}
+
+impl<T> fmt::Debug for BlockingResultFuture<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("BlockingResultFuture").finish()
+    }
+}
+
+impl<T> Future for BlockingResultFuture<T> {
+    type Output = Result<T>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let Ok(mut state) = self.state.lock() else {
+            return Poll::Ready(Err(Error::runtime_busy(
+                "blocking result state is poisoned",
+            )));
+        };
+        if let Some(result) = state.result.take() {
+            Poll::Ready(result)
+        } else {
+            state.waker = Some(context.waker().clone());
+            Poll::Pending
+        }
     }
 }
 
@@ -389,12 +450,46 @@ pub(crate) fn validate_runtime_options(
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::mpsc, thread, time::Duration};
+    use std::{
+        future::Future,
+        sync::{Arc, mpsc},
+        task::{Context, Poll, Wake, Waker},
+        thread,
+        time::Duration,
+    };
 
     use crate::{
-        Db, DbOptions, Error,
+        Db, DbOptions, Error, Result,
         runtime::{CancellationToken, Runtime, RuntimeOptions},
     };
+
+    struct ThreadWaker {
+        thread: thread::Thread,
+    }
+
+    impl Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.thread.unpark();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.thread.unpark();
+        }
+    }
+
+    fn block_on_test_future<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
+        let waker = Waker::from(Arc::new(ThreadWaker {
+            thread: thread::current(),
+        }));
+        let mut context = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(result) => return result,
+                Poll::Pending => thread::park_timeout(Duration::from_secs(1)),
+            }
+        }
+    }
 
     #[test]
     fn runtime_capabilities_follow_selected_mode() {
@@ -469,6 +564,23 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("blocking task completes")
             .expect("blocking worker has a name");
+        assert!(worker_name.starts_with("trine-kv-blocking-"));
+    }
+
+    #[test]
+    fn native_blocking_result_future_completes_on_bounded_worker() {
+        let runtime = Runtime::with_blocking_limits(RuntimeOptions::native_threads(), 1, 2);
+        let future = runtime
+            .spawn_blocking_result(|| {
+                thread::current()
+                    .name()
+                    .map(str::to_owned)
+                    .ok_or_else(|| Error::runtime_busy("blocking worker is unnamed"))
+            })
+            .expect("spawn blocking result task");
+
+        let worker_name = block_on_test_future(future).expect("blocking result completes");
+
         assert!(worker_name.starts_with("trine-kv-blocking-"));
     }
 

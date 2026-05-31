@@ -1761,3 +1761,27 @@ bounded scheduler.
   WAL/table/blob/manifest formats, MVCC, compaction, recovery, cleanup, and
   storage behavior remain unchanged.
 - Focused storage tests, formatting, clippy, full tests, and diff checks pass.
+
+### Phase 82: Native-File Runtime-Owned Storage Reads
+
+**Status**: Complete
+
+**Goal**: Route native-file owned storage reads through the bounded runtime
+blocking adapter when a runtime-enabled backend is used.
+
+**Entry Condition**: Phase 81 complete and owned storage read completions exist.
+
+**Acceptance Gate**:
+
+- Runtime exposes a result-bearing bounded blocking future.
+- Native-file backends can be constructed with a runtime boundary.
+- Runtime-enabled native-file whole-object reads and owned read-buffer reads
+  execute through the bounded blocking adapter.
+- Inline/no-runtime storage reads remain immediately pollable.
+- Existing borrowed blocking read paths remain unchanged for current table/blob
+  decode code.
+- Public async API, blocking API, publish barrier, commit tracker,
+  WAL/table/blob/manifest formats, MVCC, compaction, recovery, cleanup, and
+  storage behavior remain unchanged.
+- Focused runtime/storage tests, formatting, clippy, full tests, and diff
+  checks pass.

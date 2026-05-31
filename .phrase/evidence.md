@@ -6302,3 +6302,69 @@ Record only evidence that can change planning or durable decisions.
 - Route native-file owned storage requests through the bounded runtime blocking
   adapter without changing table/blob decode semantics, then convert cursor
   advancement in a later measured phase.
+
+## 2026-05-31: Native-File Runtime-Owned Storage Reads
+
+### Observation
+
+- Phase 81 introduced owned storage read completions, but native-file owned
+  reads still executed blocking file I/O on the polling thread.
+- The bounded runtime blocking scheduler could already execute short-lived
+  work, but it had no result-bearing future for storage operations.
+- Table/blob block decode still uses borrowed blocking reads; changing that
+  together with runtime-owned storage reads would blur two different read-path
+  changes.
+
+### Interpretation
+
+- Native-file owned reads need a result-bearing blocking future before they can
+  move behind the runtime boundary.
+- Runtime-enabled storage backends should advertise async/background task
+  capability only when their runtime can actually submit blocking work.
+- Borrowed table/blob reads should remain unchanged until cursor advancement is
+  converted in a separate measured phase.
+
+### Verification
+
+- Added `Runtime::spawn_blocking_result` for bounded blocking work that returns
+  a typed `Result<T>` through a future.
+- Added panic containment for result-bearing blocking tasks so caller futures
+  reach a terminal error instead of waiting forever.
+- Added `NativeFileBackend::with_runtime` and stored the runtime boundary in
+  opened native-file read objects.
+- Runtime-enabled native-file whole-object reads now submit through the bounded
+  blocking adapter.
+- Runtime-enabled native-file owned read-buffer operations now submit through
+  the bounded blocking adapter.
+- Inline runtime and no-runtime native-file owned reads remain immediately
+  pollable.
+- Existing borrowed blocking read methods and `BlockReadSource` call sites were
+  preserved for table/blob decode.
+- Added tests proving result-bearing blocking futures complete on bounded
+  workers, runtime-enabled native-file owned reads wait behind an occupied
+  blocking worker, whole-object reads use the same path, and inline runtime
+  owned reads remain ready.
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test runtime --lib`
+- `cargo test storage --lib`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan outside the repository instruction file
+
+### Remaining Blockers
+
+- Storage writes, append, manifest publish, and object listing still need owned
+  runtime-submittable request/completion wrappers.
+- Current database call sites mostly construct no-runtime native-file backends,
+  so production persistent paths still need staged migration onto
+  runtime-enabled backends.
+- Table/blob block reads and cursor advancement still use synchronous
+  advancement paths.
+- Runtime worker and queue limits remain internal defaults.
+
+### Recommended Next Action
+
+- Add owned runtime-submittable wrappers for storage writes, append, manifest
+  publish, and object listing before migrating database call sites onto
+  runtime-enabled storage backends.
