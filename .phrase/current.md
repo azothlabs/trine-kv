@@ -6,77 +6,79 @@ Complete
 
 ## Goal
 
-Route recovery report publish through storage backend operations.
+Route WAL replay reads through a storage backend optional object-read operation.
 
 ## Scope
 
-- Add a recovery-report storage object kind.
-- Route recovery report bytes through the existing native-file object write
-  operation.
-- Keep the existing `RECOVERY_REPORT.tmp` temporary file name.
-- Keep parent-directory sync behind the storage backend directory-sync
-  operation.
-- Preserve recovery report text format, repair policy, safe temporary file
-  classification, WAL/table/blob/manifest formats, MVCC visibility, compaction,
-  and public API behavior.
+- Add a backend operation for reading complete object bytes where absence is a
+  normal result.
+- Implement the operation for native-file and in-memory storage backends.
+- Route `read_batches_after` through the backend operation.
+- Keep a missing WAL equivalent to an empty replay.
+- Preserve WAL frame bytes, replay floor filtering, checksum behavior,
+  torn-tail handling, WAL rewrite, WAL append, recovery policy, and public API
+  behavior.
 
 ## Out Of Scope
 
 - Choosing a concrete async runtime crate.
 - Introducing or renaming public async APIs.
-- Changing recovery report text format.
-- Changing safe temporary file policy.
-- Changing WAL replay reads into a backend optional-read operation.
+- Changing WAL record format.
+- Changing table/blob/manifest read paths to use the new operation.
 - Moving production in-memory object routing into backend operations.
 
 ## Acceptance Gate
 
-- Roadmap records the recovery report write backend phase at phase granularity.
+- Roadmap records the WAL replay read backend phase at phase granularity.
 - Current phase records the storage operation boundary and out-of-scope items.
-- Storage object kinds include recovery report objects.
-- Native-file object write supports recovery report objects while still
-  rejecting manifest objects.
-- `write_recovery_report` uses storage object write and backend directory sync.
-- The temporary file remains `RECOVERY_REPORT.tmp`.
-- Existing recovery report, recovery repair, storage, and persistent recovery
-  tests pass.
+- Native-file and in-memory backends report object-read capability.
+- Native-file optional object read returns `None` for missing files and bytes
+  for existing files.
+- In-memory optional object read returns `None` for missing objects and bytes
+  for existing objects.
+- `read_batches_after` no longer uses direct native-file read/open/existence
+  checks.
+- Existing WAL replay, WAL corruption, storage, recovery, and persistent tests
+  pass.
 - `cargo fmt --check`, focused Rust tests, clippy,
   `cargo test --all-targets --all-features`, `git diff --check`, and
   forbidden-term scan pass.
-- Evidence records which direct native-file recovery writes remain.
+- Evidence records the remaining storage-boundary work.
 
 ## Active Task Slice
 
 ```text
-task245 [x] goal:start recovery report write backend slice | scope:current roadmap | verify:manual
-task246 [x] goal:add recovery report storage object kind | scope:src/storage.rs | verify:storage tests
-task247 [x] goal:route write_recovery_report through storage backend | scope:src/recovery.rs | verify:recovery tests
-task248 [x] goal:record evidence and next step | scope:.phrase/evidence.md current roadmap | verify:git diff
+task249 [x] goal:start WAL replay read backend slice | scope:current roadmap | verify:manual
+task250 [x] goal:add optional object read backend operation | scope:src/storage.rs | verify:storage tests
+task251 [x] goal:route WAL replay reads through backend | scope:src/wal.rs | verify:WAL/persistent tests
+task252 [x] goal:record evidence and next step | scope:.phrase/evidence.md current roadmap | verify:git diff
 ```
 
 ## Known Blockers
 
-- None identified for this recovery report write slice.
-- Public async API, async runtime selection, WAL replay optional-read routing,
-  and production in-memory object routing remain later phases.
+- None identified for this WAL replay read slice.
+- Public async API, async runtime selection, and production in-memory object
+  routing remain later phases.
 
 ## Evidence
 
-- Phase 63 routed recovery report parent-directory sync through the backend.
-- `write_recovery_report` still creates `RECOVERY_REPORT.tmp`, writes report
-  bytes, syncs the file, and renames it directly in `recovery.rs`.
-- `StorageObjectWriteBackend` already preserves the same temp naming for a
-  final path named `RECOVERY_REPORT`.
-- `StorageObjectKind::RecoveryReport` now names recovery report objects.
-- Native-file object write can write recovery report objects while manifest
-  objects remain reserved for manifest publish.
-- `write_recovery_report` now encodes report text and delegates temp write,
-  file sync, and rename to backend object write, then uses backend directory
-  sync for the parent directory.
-- Verification passed: `cargo test storage --lib` and
-  `cargo test recovery --all-targets`.
+- WAL append, WAL rewrite, directory sync, writer lease, table/blob object
+  lifecycle, recovery report write, and manifest publish already route through
+  backend operations.
+- `read_batches_after` still uses `path.exists`, `File::open`, and
+  `read_to_end` directly.
+- A missing WAL is normal for an empty or fully flushed persistent database.
+- `StorageObjectReadBackend` and `BlockingStorageObjectReadBackend` now expose
+  optional whole-object reads.
+- Native-file and in-memory storage backends now report `StorageCapability::ObjectRead`.
+- Native-file optional object read returns `None` for missing files.
+- In-memory optional object read returns `None` for missing objects.
+- `read_batches_after` now reads WAL bytes through the backend and keeps missing
+  WAL equivalent to an empty replay.
+- Verification passed: `cargo test storage --lib`, `cargo test wal --lib`,
+  focused persistent WAL and flush tests.
 
 ## Next Recommendation
 
-- Route WAL replay reads through a backend optional-read operation or continue
-  production in-memory object routing.
+- Reassess remaining direct native-file operations and choose the next
+  production backend-boundary slice from evidence.

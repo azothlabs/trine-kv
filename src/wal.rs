@@ -1,6 +1,5 @@
 use std::{
-    fs::{self, File},
-    io::Read,
+    fs,
     ops::Bound,
     path::{Path, PathBuf},
     sync::Arc,
@@ -11,8 +10,9 @@ use crate::{
     options::DurabilityMode,
     storage::{
         BlockingStorageAppendBackend, BlockingStorageAppendObject,
-        BlockingStorageWalRewriteBackend, NativeFileAppendObject, NativeFileBackend,
-        StorageCapability, StorageObjectId, StorageObjectKind, StorageReadBackend,
+        BlockingStorageObjectReadBackend, BlockingStorageWalRewriteBackend, NativeFileAppendObject,
+        NativeFileBackend, StorageCapability, StorageObjectId, StorageObjectKind,
+        StorageReadBackend,
     },
     types::{KeyRange, Sequence},
     write_batch::BatchOperation,
@@ -89,13 +89,10 @@ pub fn read_batches(path: &Path) -> Result<Vec<WalBatch>> {
 }
 
 pub fn read_batches_after(path: &Path, replay_floor: Sequence) -> Result<Vec<WalBatch>> {
-    if !path.exists() {
+    let Some(bytes) = read_wal_object(path)? else {
         return Ok(Vec::new());
-    }
-
-    let mut bytes = Vec::new();
-    File::open(path)?.read_to_end(&mut bytes)?;
-    decode_frames_after(&bytes, replay_floor)
+    };
+    decode_frames_after(bytes.as_ref(), replay_floor)
 }
 
 pub fn rewrite_batches_after(path: &Path, replay_floor: Sequence) -> Result<()> {
@@ -118,6 +115,14 @@ fn open_wal_append_object(path: &Path) -> Result<NativeFileAppendObject> {
     let backend = NativeFileBackend::new();
     backend.capabilities().require(StorageCapability::Append)?;
     backend.open_append_blocking(wal_storage_object(path))
+}
+
+fn read_wal_object(path: &Path) -> Result<Option<Arc<[u8]>>> {
+    let backend = NativeFileBackend::new();
+    backend
+        .capabilities()
+        .require(StorageCapability::ObjectRead)?;
+    backend.read_object_bytes_blocking(wal_storage_object(path))
 }
 
 fn rewrite_wal_object(path: &Path, bytes: Arc<[u8]>) -> Result<()> {

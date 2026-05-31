@@ -5507,3 +5507,46 @@ Record only evidence that can change planning or durable decisions.
 
 - Route WAL replay reads through a backend optional-read operation so WAL append,
   rewrite, and replay all depend on storage backend operations.
+
+## 2026-05-31: WAL Replay Optional Object Read Backend
+
+### Observation
+
+- WAL append and rewrite already routed through backend operations.
+- WAL replay still used direct path existence checks plus native file open and
+  full-file reads from `wal.rs`.
+- Missing WAL files are normal for empty or fully flushed persistent databases.
+
+### Interpretation
+
+- WAL replay needs a storage operation where absence is an ordinary result, not
+  a corruption error.
+- A generic optional whole-object read is a better backend boundary than a
+  WAL-only replay read because it names the storage behavior without changing
+  table/blob/manifest read paths in this slice.
+
+### Verification
+
+- Added `StorageCapability::ObjectRead`.
+- Added `StorageObjectReadBackend` and
+  `BlockingStorageObjectReadBackend`.
+- Native-file storage reports object-read capability and returns `None` for
+  missing files.
+- In-memory storage reports object-read capability and returns `None` for
+  missing objects.
+- `read_batches_after` now reads WAL bytes through the backend operation.
+- Missing WAL still produces an empty replay.
+- `cargo test storage --lib`
+- `cargo test wal --lib`
+- `cargo test persistent_wal --test persistent_wal`
+- `cargo test persistent_flush_writes_table_and_reopen_can_skip_wal --test persistent_wal`
+
+### Remaining Blockers
+
+- Public async API, async runtime selection, and production in-memory object
+  routing remain later phases.
+
+### Recommended Next Action
+
+- Reassess remaining direct native-file operations and continue with the next
+  storage-boundary slice only if evidence shows it is not already backend-owned.

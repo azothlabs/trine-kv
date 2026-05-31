@@ -1398,3 +1398,27 @@ already route through backend operations.
   unchanged.
 - Focused storage/recovery/persistent tests, formatting, clippy, and diff
   checks pass.
+
+### Phase 66: WAL Replay Optional Object Read Backend
+
+**Status**: Complete
+
+**Goal**: Route WAL replay reads through a backend operation that treats a
+missing WAL as a normal empty replay.
+
+**Entry Condition**: Phase 65 complete and WAL append/rewrite plus recovery
+report publish already route through backend operations.
+
+**Acceptance Gate**:
+
+- Native-file and in-memory backends report optional object-read capability.
+- Native-file optional object read returns bytes for existing objects and
+  `None` for missing objects.
+- In-memory optional object read returns bytes for existing objects and `None`
+  for missing objects.
+- `read_batches_after` uses the backend operation while preserving WAL replay,
+  torn-tail, checksum, and replay-floor behavior.
+- Public API behavior, WAL format, recovery policy, manifest, table/blob
+  formats, MVCC, compaction, and cleanup semantics remain unchanged.
+- Focused storage/WAL/recovery/persistent tests, formatting, clippy, and diff
+  checks pass.

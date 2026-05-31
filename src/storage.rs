@@ -135,6 +135,7 @@ pub(crate) enum StorageCapability {
     Volatile,
     Persistent,
     RandomRead,
+    ObjectRead,
     ObjectListing,
     ObjectWrite,
     ObjectDelete,
@@ -157,6 +158,7 @@ impl StorageCapability {
             Self::Volatile => "volatile storage",
             Self::Persistent => "persistent storage",
             Self::RandomRead => "random read",
+            Self::ObjectRead => "object read",
             Self::ObjectListing => "object listing",
             Self::ObjectWrite => "object write",
             Self::ObjectDelete => "object delete",
@@ -179,20 +181,21 @@ impl StorageCapability {
             Self::Volatile => 1 << 0,
             Self::Persistent => 1 << 1,
             Self::RandomRead => 1 << 2,
-            Self::ObjectListing => 1 << 3,
-            Self::ObjectWrite => 1 << 4,
-            Self::ObjectDelete => 1 << 5,
-            Self::Append => 1 << 6,
-            Self::AtomicWalRewrite => 1 << 7,
-            Self::DirectorySync => 1 << 8,
-            Self::AtomicManifestPublish => 1 << 9,
-            Self::WriterLease => 1 << 10,
-            Self::Flush => 1 << 11,
-            Self::StrictDataSync => 1 << 12,
-            Self::StrictMetadataSync => 1 << 13,
-            Self::BackgroundThreads => 1 << 14,
-            Self::AsyncTasks => 1 << 15,
-            Self::CooperativeTasks => 1 << 16,
+            Self::ObjectRead => 1 << 3,
+            Self::ObjectListing => 1 << 4,
+            Self::ObjectWrite => 1 << 5,
+            Self::ObjectDelete => 1 << 6,
+            Self::Append => 1 << 7,
+            Self::AtomicWalRewrite => 1 << 8,
+            Self::DirectorySync => 1 << 9,
+            Self::AtomicManifestPublish => 1 << 10,
+            Self::WriterLease => 1 << 11,
+            Self::Flush => 1 << 12,
+            Self::StrictDataSync => 1 << 13,
+            Self::StrictMetadataSync => 1 << 14,
+            Self::BackgroundThreads => 1 << 15,
+            Self::AsyncTasks => 1 << 16,
+            Self::CooperativeTasks => 1 << 17,
         }
     }
 }
@@ -211,6 +214,7 @@ impl StorageCapabilities {
         Self::empty()
             .with(StorageCapability::Persistent)
             .with(StorageCapability::RandomRead)
+            .with(StorageCapability::ObjectRead)
             .with(StorageCapability::ObjectListing)
     }
 
@@ -232,6 +236,7 @@ impl StorageCapabilities {
         Self::empty()
             .with(StorageCapability::Volatile)
             .with(StorageCapability::RandomRead)
+            .with(StorageCapability::ObjectRead)
     }
 
     pub(crate) const fn with(self, capability: StorageCapability) -> Self {
@@ -307,6 +312,14 @@ where
     Self::ReadObject: BlockingStorageReadObject,
 {
     fn open_read_blocking(&self, object: StorageObjectId) -> Result<Self::ReadObject>;
+}
+
+pub(crate) trait StorageObjectReadBackend: StorageReadBackend {
+    fn read_object_bytes(&self, object: StorageObjectId) -> StorageFuture<'_, Option<Arc<[u8]>>>;
+}
+
+pub(crate) trait BlockingStorageObjectReadBackend: StorageObjectReadBackend {
+    fn read_object_bytes_blocking(&self, object: StorageObjectId) -> Result<Option<Arc<[u8]>>>;
 }
 
 pub(crate) trait StorageAppendObject: Send {
@@ -471,10 +484,7 @@ impl MemoryStorageBackend {
     }
 
     fn object_bytes(&self, object: &StorageObjectId) -> Result<Arc<[u8]>> {
-        let objects = self.lock_objects()?;
-        objects
-            .get(object)
-            .cloned()
+        self.optional_object_bytes(object)?
             .ok_or_else(|| Error::Corruption {
                 message: format!(
                     "referenced memory {} {} cannot be opened",
@@ -482,6 +492,11 @@ impl MemoryStorageBackend {
                     object.path().display()
                 ),
             })
+    }
+
+    fn optional_object_bytes(&self, object: &StorageObjectId) -> Result<Option<Arc<[u8]>>> {
+        let objects = self.lock_objects()?;
+        Ok(objects.get(object).cloned())
     }
 
     fn lock_objects(&self) -> Result<MutexGuard<'_, BTreeMap<StorageObjectId, Arc<[u8]>>>> {
@@ -509,6 +524,18 @@ impl StorageReadBackend for MemoryStorageBackend {
 impl BlockingStorageReadBackend for MemoryStorageBackend {
     fn open_read_blocking(&self, object: StorageObjectId) -> Result<Self::ReadObject> {
         poll_ready_storage_future(self.open_read(object))
+    }
+}
+
+impl StorageObjectReadBackend for MemoryStorageBackend {
+    fn read_object_bytes(&self, object: StorageObjectId) -> StorageFuture<'_, Option<Arc<[u8]>>> {
+        Box::pin(async move { self.optional_object_bytes(&object) })
+    }
+}
+
+impl BlockingStorageObjectReadBackend for MemoryStorageBackend {
+    fn read_object_bytes_blocking(&self, object: StorageObjectId) -> Result<Option<Arc<[u8]>>> {
+        poll_ready_storage_future(self.read_object_bytes(object))
     }
 }
 
@@ -595,6 +622,18 @@ impl StorageReadBackend for NativeFileBackend {
 impl BlockingStorageReadBackend for NativeFileBackend {
     fn open_read_blocking(&self, object: StorageObjectId) -> Result<Self::ReadObject> {
         poll_ready_storage_future(self.open_read(object))
+    }
+}
+
+impl StorageObjectReadBackend for NativeFileBackend {
+    fn read_object_bytes(&self, object: StorageObjectId) -> StorageFuture<'_, Option<Arc<[u8]>>> {
+        Box::pin(async move { read_native_file_object_bytes(&object) })
+    }
+}
+
+impl BlockingStorageObjectReadBackend for NativeFileBackend {
+    fn read_object_bytes_blocking(&self, object: StorageObjectId) -> Result<Option<Arc<[u8]>>> {
+        poll_ready_storage_future(self.read_object_bytes(object))
     }
 }
 
@@ -962,6 +1001,17 @@ fn read_exact_at_native_file(file: &mut File, offset: usize, bytes: &mut [u8]) -
     Ok(())
 }
 
+fn read_native_file_object_bytes(object: &StorageObjectId) -> Result<Option<Arc<[u8]>>> {
+    let capabilities = StorageCapabilities::native_file_read();
+    capabilities.require(StorageCapability::ObjectRead)?;
+
+    match fs::read(object.path()) {
+        Ok(bytes) => Ok(Some(Arc::from(bytes))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Error::Io(error)),
+    }
+}
+
 fn open_native_append_file(object: &StorageObjectId) -> Result<File> {
     if object.kind() != StorageObjectKind::Wal {
         return Err(Error::invalid_options(
@@ -1308,6 +1358,44 @@ mod tests {
         assert_eq!(&bytes, b"cde");
 
         std::fs::remove_file(path).expect("test file removes");
+    }
+
+    #[test]
+    fn native_file_backend_reads_optional_object_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-storage-object-read-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("test dir creates");
+        let path = root.join("trine.wal");
+        std::fs::write(&path, b"wal bytes").expect("WAL writes");
+
+        let backend = NativeFileBackend::new();
+        backend
+            .capabilities()
+            .require(StorageCapability::ObjectRead)
+            .expect("native-file backend supports whole-object reads");
+        let object = StorageObjectId::native_file(StorageObjectKind::Wal, &path);
+        let bytes = backend
+            .read_object_bytes_blocking(object)
+            .expect("object read succeeds")
+            .expect("object exists");
+        assert_eq!(&*bytes, b"wal bytes");
+
+        let missing =
+            StorageObjectId::native_file(StorageObjectKind::Wal, root.join("missing.wal"));
+        assert!(
+            backend
+                .read_object_bytes_blocking(missing)
+                .expect("missing object read succeeds")
+                .is_none()
+        );
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
     }
 
     #[test]
@@ -1879,6 +1967,7 @@ mod tests {
         let capabilities = backend.capabilities();
         assert!(capabilities.supports(StorageCapability::Volatile));
         assert!(capabilities.supports(StorageCapability::RandomRead));
+        assert!(capabilities.supports(StorageCapability::ObjectRead));
         assert!(!capabilities.supports(StorageCapability::Persistent));
         assert!(matches!(
             capabilities.require(StorageCapability::Persistent),
@@ -1907,6 +1996,24 @@ mod tests {
         poll_ready_storage_future(StorageReadObject::read_exact_at(&object, 1, &mut bytes))
             .expect("range reads");
         assert_eq!(&bytes, b"bcd");
+
+        let full = backend
+            .read_object_bytes_blocking(StorageObjectId::memory(
+                StorageObjectKind::Table,
+                "table-7",
+            ))
+            .expect("memory object read succeeds")
+            .expect("memory object exists");
+        assert_eq!(&*full, b"abcdef");
+        assert!(
+            backend
+                .read_object_bytes_blocking(StorageObjectId::memory(
+                    StorageObjectKind::Table,
+                    "missing-table",
+                ))
+                .expect("missing memory object read succeeds")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1914,6 +2021,7 @@ mod tests {
         let read_only = StorageCapabilities::native_file_read();
         assert!(read_only.supports(StorageCapability::Persistent));
         assert!(read_only.supports(StorageCapability::RandomRead));
+        assert!(read_only.supports(StorageCapability::ObjectRead));
         assert!(read_only.supports(StorageCapability::ObjectListing));
         assert!(!read_only.supports(StorageCapability::ObjectWrite));
         assert!(!read_only.supports(StorageCapability::ObjectDelete));
