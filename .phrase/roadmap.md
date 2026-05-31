@@ -1921,3 +1921,26 @@ already exist from Phases 81–86.
 - Storage formats, MVCC, recovery contract, public async/blocking API, publish
   barrier, commit tracker, and compaction behavior remain unchanged.
 - Focused block tests, formatting, clippy, full tests, and diff checks pass.
+
+### Phase 88: Measured Block-Decode Runtime Reads
+
+**Status**: Complete
+
+**Goal**: Measure table block-decode read cost under Trine runtime modes before
+changing cursor advancement or decode scheduling.
+
+**Entry Condition**: Phase 87 complete and table/blob block decode reads route
+through the owned `StorageReadBuffer` seam while synchronous callers remain off
+the runtime blocking queue.
+
+**Acceptance Gate**:
+
+- The v1 benchmark emits native-thread and inline runtime rows for
+  cache-disabled persistent table point reads.
+- The new benchmark rows assert that table data-block reads and disabled-cache
+  misses occurred, so the timing row is tied to real decode work.
+- Existing public async/blocking API, storage formats, MVCC, recovery contract,
+  publish barrier, commit tracker, compaction behavior, and decode scheduling
+  remain unchanged.
+- Benchmark output, focused tests, formatting, clippy, full tests, and diff
+  checks pass.

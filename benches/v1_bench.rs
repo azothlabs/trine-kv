@@ -7,8 +7,8 @@ use std::{
 
 use trine_kv::{
     BlobGcRatio, BlobLevelMergePolicy, BucketOptions, Db, DbOptions, FilterPolicy,
-    IndexSearchPolicy, KeyRange, PrefixExtractor, PrefixFilterPolicy, TransactionOptions,
-    WriteBatch, WriteOptions,
+    IndexSearchPolicy, KeyRange, PrefixExtractor, PrefixFilterPolicy, RuntimeOptions,
+    TransactionOptions, WriteBatch, WriteOptions,
     codec::{BlockCodec, FastLz4BlockCodec, NoneCodec},
     search,
 };
@@ -48,6 +48,7 @@ fn main() {
     results.push(bench_blob_level_merge());
     results.push(bench_block_cache_warm_read());
     results.push(bench_cold_table_read());
+    results.extend(bench_runtime_block_decode_reads());
     results.extend(bench_index_seek_policies());
     results.push(bench_long_shared_prefix_get());
     results.extend(bench_iterator_advance_to());
@@ -560,6 +561,80 @@ fn bench_cold_table_read() -> BenchResult {
         cleanup_dir(&dir);
         checksum
     })
+}
+
+fn bench_runtime_block_decode_reads() -> Vec<BenchResult> {
+    vec![
+        bench_runtime_block_decode_read(
+            "native runtime block decode read",
+            "native-runtime-block-decode",
+            RuntimeOptions::native_threads(),
+        ),
+        bench_runtime_block_decode_read(
+            "inline runtime block decode read",
+            "inline-runtime-block-decode",
+            RuntimeOptions::inline(),
+        ),
+    ]
+}
+
+fn bench_runtime_block_decode_read(
+    name: &'static str,
+    dir_name: &str,
+    runtime: RuntimeOptions,
+) -> BenchResult {
+    let dir = temp_dir(dir_name);
+    let mut options = DbOptions::persistent(&dir);
+    options.runtime = runtime;
+    options.block_cache_bytes = 0;
+    if !runtime.capabilities().background_threads() {
+        options.background_worker_count = 0;
+    }
+    options.default_bucket_options = BucketOptions {
+        block_bytes: 512,
+        ..BucketOptions::default()
+    };
+    let db = Db::open(options).expect("persistent db opens");
+    let bucket = db.default_bucket().expect("bucket opens");
+    for index in 0..ROWS {
+        bucket.put(key(index), value(index)).expect("put succeeds");
+    }
+    db.flush().expect("flush succeeds");
+
+    let result = measure(name, OPS, || {
+        let mut checksum = 0_u64;
+        let mut seed = 0xa51c_f00d_u64;
+        for _ in 0..OPS {
+            seed = xorshift(seed);
+            let index = seed_index(seed, ROWS);
+            checksum = checksum.saturating_add(
+                bucket
+                    .get(&key(index))
+                    .expect("get succeeds")
+                    .map_or(0, |value| value.len() as u64),
+            );
+        }
+
+        let stats = db.stats();
+        assert!(
+            stats.read_path.point_data_block_reads >= OPS as u64,
+            "benchmark must exercise table data-block reads"
+        );
+        assert_eq!(
+            stats.block_cache_hits, 0,
+            "benchmark disables the block cache to force decode reads"
+        );
+        assert!(
+            stats.block_cache_misses >= OPS as u64,
+            "benchmark must miss the disabled cache before loading blocks"
+        );
+        checksum
+            .saturating_add(stats.read_path.point_data_block_reads)
+            .saturating_add(stats.block_cache_misses)
+    });
+    drop(db);
+    cleanup_dir(&dir);
+    result
 }
 
 fn bench_index_seek_policies() -> Vec<BenchResult> {

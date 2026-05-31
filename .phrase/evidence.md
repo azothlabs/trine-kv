@@ -6664,3 +6664,73 @@ Record only evidence that can change planning or durable decisions.
   whether to drive decode through the async `read_exact_at_owned` boundary, and
   define the cursor advancement shape that lets an async caller await the owned
   completion before decode.
+
+## Phase 88: Measured Block-Decode Runtime Reads
+
+### Observation
+
+- Phase 87 created the owned block-read seam, but the synchronous table read
+  path still decodes on the caller thread.
+- Existing v1 benchmarks covered warm cache and cold table reads, but did not
+  isolate cache-disabled block decode reads across runtime modes.
+- A first inline-runtime benchmark attempt failed option validation because
+  persistent writable opens require background worker support when
+  `background_worker_count` is non-zero.
+
+### Interpretation
+
+- Inline runtime measurements must explicitly set `background_worker_count = 0`
+  to be a valid persistent writable configuration.
+- Cache-disabled table point reads with small table blocks give a useful local
+  read-path signal: every measured point read must miss the disabled block
+  cache and load/decode a table data block.
+- Release benchmark output shows native-thread and inline runtime block-decode
+  rows are close enough that the next async slice should focus on cursor
+  advancement shape, not on forcing synchronous block decode through the
+  runtime queue.
+
+### Change
+
+- Added `native runtime block decode read` and
+  `inline runtime block decode read` rows to `benches/v1_bench.rs`.
+- The new rows use persistent databases, 512-byte table blocks, disabled block
+  cache, and randomized point reads.
+- The benchmark asserts `point_data_block_reads >= OPS`, zero cache hits, and
+  disabled-cache misses before reporting the row.
+- Inline runtime benchmark options set `background_worker_count = 0` when the
+  selected runtime lacks background thread capability.
+
+### Verification
+
+- `cargo bench --bench v1_bench` printed:
+  `native runtime block decode read,2048,6153,332805,44359`
+  and `inline runtime block decode read,2048,6225,328995,44359`.
+- `cargo test --all-targets --all-features` also ran the benchmark binary in
+  debug/test profile and printed:
+  `native runtime block decode read,2048,58524,34993,44359`
+  and `inline runtime block decode read,2048,59226,34579,44359`.
+- `cargo test block --lib`
+- `cargo test storage --lib`
+- `cargo test table --lib`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan passed outside the repository instruction file.
+
+### Remaining Blockers
+
+- Block decode reads owned completions but still runs synchronously on the
+  calling thread.
+- Range and prefix cursor advancement still expose async compatibility wrappers
+  over synchronous iterator advancement.
+- Table header/footer metadata reads still use the borrowed read path.
+- True async file I/O is not implemented.
+- True multi-writer execution still needs writer-local deltas and WAL
+  partitioning.
+
+### Recommended Next Action
+
+- Start the async cursor advancement phase by adding an explicit awaitable
+  advancement shape for async range and prefix callers, while preserving the
+  current synchronous iterator path.
