@@ -5550,3 +5550,38 @@ Record only evidence that can change planning or durable decisions.
 
 - Reassess remaining direct native-file operations and continue with the next
   storage-boundary slice only if evidence shows it is not already backend-owned.
+
+## 2026-05-31: Native-File Recovery Report Read Backend
+
+### Observation
+
+- Recovery report writes already route through backend object write.
+- Optional whole-object reads are available on the native-file backend.
+- `read_recovery_report` still used direct native file open and string reads.
+
+### Interpretation
+
+- Public recovery report reads can use the same backend optional object-read
+  operation as WAL replay.
+- Missing report behavior must stay an I/O `NotFound` error because callers may
+  distinguish missing reports from malformed reports.
+
+### Verification
+
+- `read_recovery_report` now reads bytes through `StorageObjectReadBackend`.
+- Missing recovery report files still return I/O `NotFound`.
+- Invalid UTF-8 still returns I/O `InvalidData` before text-format decode.
+- Added `read_recovery_report_missing_file_returns_not_found`.
+- `cargo test recovery --all-targets`
+
+### Remaining Blockers
+
+- Directory creation, safe temporary file listing/deletion, stats metadata
+  reads, public async API, async runtime selection, and production in-memory
+  object routing remain later phases.
+
+### Recommended Next Action
+
+- Reassess remaining direct native-file operations and route only the ones that
+  are part of production storage semantics rather than test setup or local
+  statistics.

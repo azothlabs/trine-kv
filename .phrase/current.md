@@ -6,79 +6,65 @@ Complete
 
 ## Goal
 
-Route WAL replay reads through a storage backend optional object-read operation.
+Route recovery report reads through the storage backend optional object-read
+operation.
 
 ## Scope
 
-- Add a backend operation for reading complete object bytes where absence is a
-  normal result.
-- Implement the operation for native-file and in-memory storage backends.
-- Route `read_batches_after` through the backend operation.
-- Keep a missing WAL equivalent to an empty replay.
-- Preserve WAL frame bytes, replay floor filtering, checksum behavior,
-  torn-tail handling, WAL rewrite, WAL append, recovery policy, and public API
-  behavior.
+- Route `read_recovery_report` through backend optional object read.
+- Keep missing recovery report behavior as a `NotFound` I/O error.
+- Preserve recovery report text format, UTF-8 error behavior, repair policy,
+  safe temporary file classification, WAL/table/blob/manifest formats, MVCC
+  visibility, compaction, and public API behavior.
 
 ## Out Of Scope
 
 - Choosing a concrete async runtime crate.
 - Introducing or renaming public async APIs.
-- Changing WAL record format.
-- Changing table/blob/manifest read paths to use the new operation.
+- Changing recovery report text format.
+- Changing safe temporary file listing/deletion behavior.
+- Changing directory creation or stats metadata reads.
 - Moving production in-memory object routing into backend operations.
 
 ## Acceptance Gate
 
-- Roadmap records the WAL replay read backend phase at phase granularity.
+- Roadmap records the recovery report read backend phase at phase granularity.
 - Current phase records the storage operation boundary and out-of-scope items.
-- Native-file and in-memory backends report object-read capability.
-- Native-file optional object read returns `None` for missing files and bytes
-  for existing files.
-- In-memory optional object read returns `None` for missing objects and bytes
-  for existing objects.
-- `read_batches_after` no longer uses direct native-file read/open/existence
-  checks.
-- Existing WAL replay, WAL corruption, storage, recovery, and persistent tests
-  pass.
+- `read_recovery_report` uses storage object read instead of direct file open.
+- Missing recovery reports still return `NotFound`.
+- Recovery report decode and repair tests pass.
 - `cargo fmt --check`, focused Rust tests, clippy,
   `cargo test --all-targets --all-features`, `git diff --check`, and
   forbidden-term scan pass.
-- Evidence records the remaining storage-boundary work.
+- Evidence records remaining direct native-file operations after the slice.
 
 ## Active Task Slice
 
 ```text
-task249 [x] goal:start WAL replay read backend slice | scope:current roadmap | verify:manual
-task250 [x] goal:add optional object read backend operation | scope:src/storage.rs | verify:storage tests
-task251 [x] goal:route WAL replay reads through backend | scope:src/wal.rs | verify:WAL/persistent tests
-task252 [x] goal:record evidence and next step | scope:.phrase/evidence.md current roadmap | verify:git diff
+task253 [x] goal:start recovery report read backend slice | scope:current roadmap | verify:manual
+task254 [x] goal:route read_recovery_report through backend | scope:src/recovery.rs | verify:recovery tests
+task255 [x] goal:record evidence and next step | scope:.phrase/evidence.md current roadmap | verify:git diff
 ```
 
 ## Known Blockers
 
-- None identified for this WAL replay read slice.
-- Public async API, async runtime selection, and production in-memory object
-  routing remain later phases.
+- None identified for this recovery report read slice.
+- Public async API, async runtime selection, directory creation backend routing,
+  safe temporary file listing/deletion routing, stats metadata routing, and
+  production in-memory object routing remain later phases.
 
 ## Evidence
 
-- WAL append, WAL rewrite, directory sync, writer lease, table/blob object
-  lifecycle, recovery report write, and manifest publish already route through
-  backend operations.
-- `read_batches_after` still uses `path.exists`, `File::open`, and
-  `read_to_end` directly.
-- A missing WAL is normal for an empty or fully flushed persistent database.
-- `StorageObjectReadBackend` and `BlockingStorageObjectReadBackend` now expose
-  optional whole-object reads.
-- Native-file and in-memory storage backends now report `StorageCapability::ObjectRead`.
-- Native-file optional object read returns `None` for missing files.
-- In-memory optional object read returns `None` for missing objects.
-- `read_batches_after` now reads WAL bytes through the backend and keeps missing
-  WAL equivalent to an empty replay.
-- Verification passed: `cargo test storage --lib`, `cargo test wal --lib`,
-  focused persistent WAL and flush tests.
+- Phase 65 routed recovery report writes through backend object write.
+- Phase 66 added optional whole-object reads and routed WAL replay through that
+  operation.
+- `read_recovery_report` still opens and reads the report file directly.
+- `read_recovery_report` now reads through `StorageObjectReadBackend`.
+- Missing recovery reports still return an I/O `NotFound` error.
+- Invalid UTF-8 still returns an I/O `InvalidData` error before report decode.
+- Verification passed: `cargo test recovery --all-targets`.
 
 ## Next Recommendation
 
-- Reassess remaining direct native-file operations and choose the next
-  production backend-boundary slice from evidence.
+- Reassess remaining direct native-file operations and choose whether directory
+  creation, safe temporary file repair, or stats metadata should be routed next.

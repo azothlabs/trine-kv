@@ -1422,3 +1422,22 @@ report publish already route through backend operations.
   formats, MVCC, compaction, and cleanup semantics remain unchanged.
 - Focused storage/WAL/recovery/persistent tests, formatting, clippy, and diff
   checks pass.
+
+### Phase 67: Native-File Recovery Report Read Backend
+
+**Status**: Complete
+
+**Goal**: Route public recovery report reads through backend optional object
+read.
+
+**Entry Condition**: Phase 66 complete and optional object read is available for
+native-file storage.
+
+**Acceptance Gate**:
+
+- `read_recovery_report` reads through the storage backend.
+- Missing recovery reports still return a `NotFound` I/O error.
+- Recovery report text format and decode behavior remain unchanged.
+- Public API behavior, recovery repair policy, WAL, manifest, table/blob
+  formats, MVCC, compaction, and cleanup semantics remain unchanged.
+- Focused recovery/persistent tests, formatting, clippy, and diff checks pass.

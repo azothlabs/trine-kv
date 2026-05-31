@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File},
-    io::Read,
+    fs, io,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -12,10 +11,10 @@ use crate::{
     manifest::ManifestState,
     options::{DurabilityMode, FailOnCorruptionPolicy},
     storage::{
-        BlockingStorageDirectorySyncBackend, BlockingStorageObjectWriteBackend,
-        BlockingStorageWriterLeaseBackend, NativeFileBackend, NativeFileWriterLease,
-        StorageCapability, StorageDirectoryId, StorageObjectId, StorageObjectKind,
-        StorageReadBackend,
+        BlockingStorageDirectorySyncBackend, BlockingStorageObjectReadBackend,
+        BlockingStorageObjectWriteBackend, BlockingStorageWriterLeaseBackend, NativeFileBackend,
+        NativeFileWriterLease, StorageCapability, StorageDirectoryId, StorageObjectId,
+        StorageObjectKind, StorageReadBackend,
     },
     table::{self, TableId},
     wal,
@@ -66,8 +65,14 @@ pub fn recovery_report_path(db_path: &Path) -> PathBuf {
 }
 
 pub fn read_recovery_report(db_path: &Path) -> Result<RecoveryReport> {
-    let mut text = String::new();
-    File::open(recovery_report_path(db_path))?.read_to_string(&mut text)?;
+    let path = recovery_report_path(db_path);
+    let bytes = read_recovery_report_bytes(&path)?;
+    let text = String::from_utf8(bytes.to_vec()).map_err(|error| {
+        Error::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("recovery report is not valid UTF-8: {error}"),
+        ))
+    })?;
     decode_report(&text)
 }
 
@@ -315,13 +320,32 @@ fn write_recovery_report(db_path: &Path, report: &RecoveryReport) -> Result<()> 
         .capabilities()
         .require(StorageCapability::ObjectWrite)?;
     backend.write_object_blocking(
-        StorageObjectId::native_file(StorageObjectKind::RecoveryReport, &path),
+        recovery_report_storage_object(&path),
         bytes,
         DurabilityMode::SyncAll,
     )?;
     sync_recovery_report_parent_directory_after_rename(&path)?;
 
     Ok(())
+}
+
+fn read_recovery_report_bytes(path: &Path) -> Result<Arc<[u8]>> {
+    let backend = NativeFileBackend::new();
+    backend
+        .capabilities()
+        .require(StorageCapability::ObjectRead)?;
+    backend
+        .read_object_bytes_blocking(recovery_report_storage_object(path))?
+        .ok_or_else(|| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("recovery report {} not found", path.display()),
+            ))
+        })
+}
+
+fn recovery_report_storage_object(path: &Path) -> StorageObjectId {
+    StorageObjectId::native_file(StorageObjectKind::RecoveryReport, path)
 }
 
 fn sync_recovery_report_parent_directory_after_rename(path: &Path) -> Result<()> {
@@ -376,7 +400,12 @@ fn decode_report(text: &str) -> Result<RecoveryReport> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RecoveryReport, decode_report, encode_report};
+    use std::{
+        io,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::{RecoveryReport, decode_report, encode_report, read_recovery_report};
 
     #[test]
     fn recovery_report_round_trips_repaired_files() {
@@ -391,5 +420,23 @@ mod tests {
             decode_report(&encode_report(&report)).expect("report decodes"),
             report
         );
+    }
+
+    #[test]
+    fn read_recovery_report_missing_file_returns_not_found() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-recovery-report-missing-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+
+        let error = read_recovery_report(&root).expect_err("missing report is not found");
+        assert!(matches!(
+            error,
+            crate::Error::Io(ref io_error) if io_error.kind() == io::ErrorKind::NotFound
+        ));
     }
 }
