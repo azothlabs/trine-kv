@@ -9,7 +9,7 @@ use std::{
 };
 
 use trine_kv::{
-    BucketOptions, Db, DbOptions, DurabilityMode, Iter, KeyRange, KeyValue, LazyIter,
+    BucketOptions, Db, DbOptions, DurabilityMode, Error, Iter, KeyRange, KeyValue, LazyIter,
     RuntimeOptions, Sequence, TransactionOptions, WriteBatch, WriteOptions, wal,
 };
 
@@ -251,6 +251,44 @@ fn persistent_async_range_and_prefix_advance_flushed_tables() {
         "async table reads should expose native-file blocking adapter tasks"
     );
     drop(db);
+    cleanup_dir(&path);
+}
+
+#[test]
+fn persistent_open_async_replays_wal() {
+    let path = temp_db_path("persistent-open-replay");
+    let mut options = DbOptions::persistent(&path).with_durability(DurabilityMode::Flush);
+    options.background_worker_count = 0;
+
+    {
+        let db = block_on(Db::open_async(options.clone())).expect("persistent async open");
+        block_on(db.put_with_options_async(
+            b"wal-key".to_vec(),
+            b"wal-value".to_vec(),
+            WriteOptions::flush(),
+        ))
+        .expect("async write appends WAL");
+    }
+
+    let reopened = block_on(Db::open_async(options)).expect("persistent async reopen replays WAL");
+    assert_eq!(
+        block_on(reopened.get_async(b"wal-key")).expect("async get after replay"),
+        Some(b"wal-value".to_vec())
+    );
+    cleanup_dir(&path);
+}
+
+#[test]
+fn persistent_open_async_rejects_inline_runtime() {
+    let path = temp_db_path("persistent-open-inline-runtime");
+    let mut options = DbOptions::persistent(&path);
+    options.runtime = RuntimeOptions::inline();
+    options.background_worker_count = 0;
+
+    let error =
+        block_on(Db::open_async(options)).expect_err("persistent async open needs wait support");
+
+    assert!(matches!(error, Error::Unsupported { .. }));
     cleanup_dir(&path);
 }
 

@@ -8898,3 +8898,72 @@ Record only evidence that can change planning or durable decisions.
 
 - Commit this pre-release polish, then choose whether the in-browser fixture is
   a pre-tag requirement or post-candidate hardening.
+
+## Phase 130: Async Contract Closure
+
+### Observation
+
+- The async-first protocol says persistent database operations are primary async
+  API surface, with blocking native APIs as adapters.
+- Fresh code review found native `Db::open_async`, `Db::open_persistent_async`,
+  and `Db::open_read_only_async` still delegated to blocking open paths even
+  after browser async persistence work had landed.
+- Native persistent table loading used async table reads but still eagerly read
+  blob values on open; browser needs that fallback, but native can leave blob
+  values on the normal lazy read path.
+
+### Interpretation
+
+- The release-polish phase was premature for a production-grade claim because
+  a core native async contract was still compatibility-shaped.
+- The smallest safe closure slice is persistent async open/recovery first:
+  lease, manifest, recovery checks, table load, and WAL replay are the earliest
+  observable wait boundaries.
+- Inline native runtime should not be accepted for persistent async open while
+  storage waits require a blocking adapter.
+
+### Change
+
+- Added async writer lease acquisition for persistent process locks.
+- Routed native persistent `Db::open_async` through async storage-trait calls
+  for directory creation, writer lease, safe temporary repair, manifest
+  open/create, table loading, recovery checks, and WAL recovery stream reads.
+- Shared the final native persistent database construction between blocking and
+  async open paths so they install the same engine state after their different
+  loading steps.
+- Made `Db::open_persistent_async` and `Db::open_read_only_async` call
+  `Db::open_async`.
+- Made persistent async open reject inline runtime options with typed
+  `Unsupported` error instead of running blocking storage waits inline.
+- Kept browser open behavior unchanged, while letting browser open keep the
+  blob-value inline fallback it currently needs.
+- Added focused tests for persistent async WAL replay and inline runtime
+  rejection.
+
+### Verification
+
+- `cargo fmt`
+- `cargo test --test async_api`
+- `cargo check`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo check --target wasm32-unknown-unknown --lib`
+- `cargo check --target wasm32-wasip1 --lib`
+- `cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings`
+
+### Remaining Blockers
+
+- WASI host persistent `Db::open_async` still delegates to blocking `Db::open`.
+- Native `get_async`, snapshot reads, range/prefix scans, `persist_async`,
+  `flush_async`, compaction, maintenance, and close still call blocking public
+  methods.
+- Native persistent async open still has synchronous path metadata checks and
+  synchronous cleanup/background-worker startup after recovery loading.
+- Browser runtime persistence still lacks an in-browser fixture.
+
+### Recommended Next Action
+
+- Convert the next native async wait boundary, starting with either point/range
+  reads if table/blob I/O is the highest user-visible gap, or flush/maintenance
+  if foreground write-pressure behavior needs the stricter async guarantee.

@@ -3057,3 +3057,35 @@ polish flow.
 - Commit the pre-release polish, rerun the standard package commands without
   `--allow-dirty`, then decide whether to add the in-browser persistence
   fixture before tagging or keep it as post-candidate hardening.
+
+### Phase 130: Async Contract Closure
+
+**Status**: In Progress
+
+**Goal**: Close the gap between the async-first protocol and the implemented
+public API before making release-quality claims.
+
+**Entry Condition**: User review identifies that prior async planning was not
+fully reflected in the native public API surface.
+
+**Acceptance Gate**:
+
+- Native persistent async open and recovery enter through async storage
+  operations rather than delegating to blocking `Db::open`.
+- Public async methods that can wait either use primary async paths or have
+  recorded blockers with focused tests.
+- Blocking native APIs are kept as adapter surface and do not define persistent
+  engine semantics.
+- Native, WASI, and browser target verification passes.
+
+**Major Out Of Scope**:
+
+- Storage format, MVCC, WAL, manifest, table, compaction, transaction, or blob
+  semantic changes.
+- Release publishing or tagging.
+- Browser fixture automation unless it becomes the selected async blocker.
+
+### Recommended Next Action
+
+- Convert the next native async wait boundary after the persistent open/recovery
+  slice, then re-evaluate whether reads/scans or maintenance should close next.

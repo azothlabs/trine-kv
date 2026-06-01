@@ -18,6 +18,7 @@ use crate::{
         StorageCapability, StorageDirectoryId, StorageDirectoryListBackend,
         StorageObjectDeleteBackend, StorageObjectId, StorageObjectKind, StorageObjectListBackend,
         StorageObjectReadBackend, StorageObjectWriteBackend, StorageReadBackend,
+        StorageWriterLeaseBackend,
     },
     table::{self, TableId},
     wal,
@@ -49,6 +50,22 @@ impl ProcessLock {
             StorageObjectKind::WriterLease,
             db_path.join(PROCESS_LOCK_FILE_NAME),
         ))?;
+        Ok(Self { _lease: lease })
+    }
+
+    pub(crate) async fn acquire_with_backend_async(
+        backend: &NativeFileBackend,
+        db_path: &Path,
+    ) -> Result<Self> {
+        backend
+            .capabilities()
+            .require(StorageCapability::WriterLease)?;
+        let lease = backend
+            .acquire_writer_lease(StorageObjectId::native_file(
+                StorageObjectKind::WriterLease,
+                db_path.join(PROCESS_LOCK_FILE_NAME),
+            ))
+            .await?;
         Ok(Self { _lease: lease })
     }
 }

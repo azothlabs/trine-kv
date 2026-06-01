@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io,
     ops::Bound,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, MutexGuard, RwLock, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -34,14 +34,14 @@ use crate::{
     storage::{
         BlockingStorageDirectoryCreateBackend, BlockingStorageDirectorySyncBackend,
         BlockingStorageObjectDeleteBackend, BlockingStorageReadBackend, BlockingStorageReadObject,
-        NativeFileBackend, StorageCapability, StorageDirectoryId, StorageDirectoryListBackend,
-        StorageManifestReadBackend, StorageObjectId, StorageObjectKind, StorageObjectListBackend,
-        StorageObjectReadBackend, StorageReadBackend,
+        NativeFileBackend, StorageCapability, StorageDirectoryCreateBackend, StorageDirectoryId,
+        StorageDirectoryListBackend, StorageManifestReadBackend, StorageObjectId,
+        StorageObjectKind, StorageObjectListBackend, StorageObjectReadBackend, StorageReadBackend,
     },
     table::{self, Table},
     transaction::{Transaction, TransactionOptions},
     types::{CommitInfo, KeyRange, Sequence, Value},
-    wal::{self, WalFrontDoor},
+    wal::{self, WalBatch, WalFrontDoor},
     write_batch::BatchOperation,
 };
 
@@ -208,6 +208,20 @@ pub(crate) struct DbInner {
     runtime_shutdown: CancellationToken,
     maintenance: Arc<MaintenanceCoordinator>,
     background_workers: Mutex<Vec<RuntimeTask>>,
+}
+
+#[derive(Debug)]
+struct PersistentOpenParts {
+    options: DbOptions,
+    runtime: Runtime,
+    native_storage: NativeFileBackend,
+    process_lock: Option<recovery::ProcessLock>,
+    buckets: BTreeMap<String, Arc<LsmTree>>,
+    manifest: ManifestStore,
+    wal: Option<WalFrontDoor>,
+    batches: Vec<WalBatch>,
+    replay_floor: Sequence,
+    db_path_for_cleanup: PathBuf,
 }
 
 #[derive(Debug)]
@@ -962,7 +976,8 @@ impl Db {
         let replay_floor = manifest.state().wal_replay_floor();
 
         run_persistent_recovery_checks_async(&storage, db_path, manifest.state()).await?;
-        let mut buckets = buckets_from_manifest_async(&storage, db_path, manifest.state()).await?;
+        let mut buckets =
+            buckets_from_manifest_async(&storage, db_path, manifest.state(), true).await?;
         ensure_default_bucket_loaded(&mut buckets, &options)?;
 
         let wal_streams =
@@ -1146,7 +1161,6 @@ impl Db {
         validate_options(&options)?;
         let runtime = Runtime::new(options.runtime);
         let native_storage = NativeFileBackend::with_runtime(runtime.clone());
-        let block_cache_bytes = options.block_cache_bytes;
         let Some(path) = persistent_path_from_options(&options) else {
             return Err(Error::invalid_options("persistent open requires a path"));
         };
@@ -1190,6 +1204,112 @@ impl Db {
                 wal::DEFAULT_WAL_SHARD_COUNT,
             )?)
         };
+
+        Self::from_persistent_open_parts(PersistentOpenParts {
+            options,
+            runtime,
+            native_storage,
+            process_lock,
+            buckets,
+            manifest,
+            wal,
+            batches,
+            replay_floor,
+            db_path_for_cleanup,
+        })
+    }
+
+    async fn open_persistent_with_options_async(options: DbOptions) -> Result<Self> {
+        validate_options(&options)?;
+        if !options.runtime.capabilities().blocking_adapter() {
+            return Err(Error::unsupported("runtime blocking adapter"));
+        }
+
+        let runtime = Runtime::new(options.runtime);
+        let native_storage = NativeFileBackend::with_runtime(runtime.clone());
+        let Some(path) = persistent_path_from_options(&options) else {
+            return Err(Error::invalid_options("persistent open requires a path"));
+        };
+        let db_path_for_cleanup = path.to_path_buf();
+        let path = db_path_for_cleanup.as_path();
+
+        if path.exists() {
+            if !path.is_dir() {
+                return Err(Error::invalid_options("database path is not a directory"));
+            }
+        } else if options.create_if_missing && !options.read_only {
+            create_storage_directory_all_async(&native_storage, path).await?;
+        } else {
+            return Err(Error::invalid_options("database path does not exist"));
+        }
+
+        let process_lock =
+            acquire_persistent_process_lock_async(&native_storage, path, &options).await?;
+        repair_safe_temporary_files_for_open_async(&native_storage, path, &options).await?;
+
+        let manifest_path = manifest::manifest_path(path);
+        let mut manifest = ManifestStore::open_or_create_with_backend_async(
+            manifest_path,
+            options.create_if_missing && !options.read_only,
+            native_storage.clone(),
+        )
+        .await?;
+        ensure_default_bucket_in_manifest_async(&mut manifest, &options).await?;
+        let replay_floor = manifest.state().wal_replay_floor();
+        let mut buckets =
+            buckets_from_manifest_async(&native_storage, path, manifest.state(), false).await?;
+        ensure_default_bucket_loaded(&mut buckets, &options)?;
+        run_persistent_recovery_checks_async(&native_storage, path, manifest.state()).await?;
+
+        let wal_streams = wal::read_recovery_streams_after_with_backend_async(
+            &native_storage,
+            path,
+            replay_floor,
+        )
+        .await?;
+        let batches = wal::merge_batch_streams_by_sequence(wal_streams)?;
+        let wal = if options.read_only {
+            None
+        } else {
+            Some(WalFrontDoor::open_sharded_with_backend(
+                &native_storage,
+                path,
+                wal::DEFAULT_WAL_SHARD_COUNT,
+            )?)
+        };
+
+        Self::from_persistent_open_parts(PersistentOpenParts {
+            options,
+            runtime,
+            native_storage,
+            process_lock,
+            buckets,
+            manifest,
+            wal,
+            batches,
+            replay_floor,
+            db_path_for_cleanup,
+        })
+    }
+
+    #[cfg_attr(
+        all(target_arch = "wasm32", target_os = "unknown"),
+        allow(clippy::arc_with_non_send_sync)
+    )]
+    fn from_persistent_open_parts(parts: PersistentOpenParts) -> Result<Self> {
+        let PersistentOpenParts {
+            options,
+            runtime,
+            native_storage,
+            process_lock,
+            buckets,
+            manifest,
+            wal,
+            batches,
+            replay_floor,
+            db_path_for_cleanup,
+        } = parts;
+        let block_cache_bytes = options.block_cache_bytes;
 
         let db = Self {
             inner: Arc::new(DbInner {
@@ -4707,10 +4827,16 @@ impl Db {
 impl Db {
     pub async fn open_async(options: DbOptions) -> Result<Self> {
         match &options.storage_mode {
+            StorageMode::InMemory => Self::memory(options),
+            StorageMode::Persistent { .. } => {
+                Self::open_persistent_with_options_async(options).await
+            }
             StorageMode::HostPersistent {
                 backend: HostStorageBackend::Browser,
             } => Self::open_browser_persistent_with_options_async(options).await,
-            _ => Self::open(options),
+            StorageMode::HostPersistent {
+                backend: HostStorageBackend::Wasi { .. },
+            } => Self::open(options),
         }
     }
 
@@ -4719,11 +4845,11 @@ impl Db {
     }
 
     pub async fn open_persistent_async(path: impl Into<std::path::PathBuf>) -> Result<Self> {
-        Self::open_persistent(path)
+        Self::open_async(DbOptions::persistent(path)).await
     }
 
     pub async fn open_read_only_async(path: impl Into<std::path::PathBuf>) -> Result<Self> {
-        Self::open_read_only(path)
+        Self::open_async(DbOptions::persistent_read_only(path)).await
     }
 
     pub async fn memory_async(options: DbOptions) -> Result<Self> {
@@ -5020,6 +5146,19 @@ fn acquire_persistent_process_lock(
     recovery::ProcessLock::acquire_with_backend(backend, db_path).map(Some)
 }
 
+async fn acquire_persistent_process_lock_async(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+    options: &DbOptions,
+) -> Result<Option<recovery::ProcessLock>> {
+    if options.read_only {
+        return Ok(None);
+    }
+    recovery::ProcessLock::acquire_with_backend_async(backend, db_path)
+        .await
+        .map(Some)
+}
+
 fn repair_safe_temporary_files_for_open(
     backend: &NativeFileBackend,
     db_path: &Path,
@@ -5031,6 +5170,20 @@ fn repair_safe_temporary_files_for_open(
         options.fail_on_corruption
     };
     recovery::repair_safe_temporary_files_with_backend(backend, db_path, policy)?;
+    Ok(())
+}
+
+async fn repair_safe_temporary_files_for_open_async(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+    options: &DbOptions,
+) -> Result<()> {
+    let policy = if options.read_only {
+        FailOnCorruptionPolicy::FailClosed
+    } else {
+        options.fail_on_corruption
+    };
+    recovery::repair_safe_temporary_files_with_backend_async(backend, db_path, policy).await?;
     Ok(())
 }
 
@@ -5123,9 +5276,10 @@ async fn buckets_from_manifest_async<B>(
     backend: &B,
     db_path: &Path,
     manifest: &ManifestState,
+    inline_blob_values: bool,
 ) -> Result<BTreeMap<String, Arc<LsmTree>>>
 where
-    B: StorageReadBackend,
+    B: StorageReadBackend + StorageObjectReadBackend,
 {
     let mut buckets = BTreeMap::new();
 
@@ -5134,11 +5288,13 @@ where
         let mut tables = Vec::new();
         for properties in manifest.tables().get(name).into_iter().flatten() {
             let table_path = table::table_path(db_path, properties.id);
-            let table = table::read_table_with_backend_async(backend, &table_path)
+            let mut table = table::read_table_with_backend_async(backend, &table_path)
                 .await?
                 .with_manifest_properties(properties)?;
-            let table =
-                table::inline_blob_values_with_backend_async(backend, db_path, table).await?;
+            if inline_blob_values {
+                table =
+                    table::inline_blob_values_with_backend_async(backend, db_path, table).await?;
+            }
             tables.push(Arc::new(table));
         }
 
@@ -5692,6 +5848,18 @@ fn create_storage_directory_all(backend: &NativeFileBackend, path: &Path) -> Res
         .capabilities()
         .require(StorageCapability::DirectoryCreate)?;
     backend.create_directory_all_blocking(StorageDirectoryId::native_file(path))
+}
+
+async fn create_storage_directory_all_async(
+    backend: &NativeFileBackend,
+    path: &Path,
+) -> Result<()> {
+    backend
+        .capabilities()
+        .require(StorageCapability::DirectoryCreate)?;
+    backend
+        .create_directory_all(StorageDirectoryId::native_file(path))
+        .await
 }
 
 fn remove_storage_files(
