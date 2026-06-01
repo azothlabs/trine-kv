@@ -27,7 +27,7 @@ Initial packaged release candidate for the embedded LSM MVCC engine.
 - Native platform I/O capability reporting, fallback observability, bounded
   blocking adapter stats, and cooperative maintenance budgets.
 - Explicit WASI persistent options for host-preopened filesystems on WASI
-  targets.
+  targets, including `Db::open_async` through the host storage boundary.
 - Browser persistent options backed by the async browser storage path on
   `wasm32-unknown-unknown`, including writable async open, Web Locks writer
   lease, WAL-backed async writes, async bucket creation, and async maintenance.

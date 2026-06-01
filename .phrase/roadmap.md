@@ -3087,6 +3087,6 @@ fully reflected in the native public API surface.
 
 ### Recommended Next Action
 
-- Resolve the WASI host persistent async-open blocker next, then decide whether
-  the remaining maintenance/WAL ownership work must move from native runtime
-  task wrappers to primary async internals before release-quality claims.
+- Decide whether the remaining maintenance/WAL ownership work must move from
+  native runtime task wrappers to primary async internals before release-quality
+  claims, or explicitly document that boundary for the current release.

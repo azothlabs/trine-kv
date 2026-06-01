@@ -53,8 +53,10 @@ Native persistent databases use local files and the durability modes above.
 Host-selected persistent backends expose only the durability they can honestly
 provide:
 
-- WASI persistence uses the host-preopened filesystem path on WASI targets and
-  rejects `SyncData` and `SyncAll` until strict host sync guarantees are proven.
+- WASI persistence uses the host-preopened filesystem path on WASI targets,
+  supports `Db::open_async` through that host boundary, and rejects `SyncData`
+  and `SyncAll` until strict host sync guarantees are proven. Current WASI file
+  work completes inline and does not advertise platform async I/O.
 - Browser persistence is async-only on `wasm32-unknown-unknown`. It accepts
   `Buffered` and `Flush`, rejects `SyncData` and `SyncAll`, acquires a Web
   Locks writer lease for writable open, and uses WAL-backed async writes.

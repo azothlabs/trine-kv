@@ -8954,6 +8954,11 @@ Record only evidence that can change planning or durable decisions.
   failures are observable.
 - Added focused tests for persistent async lazy blob reads and native
   maintenance wrapper task submission.
+- Routed WASI host persistent `Db::open_async` to the async storage-trait
+  persistent open path on WASI targets instead of delegating to blocking
+  `Db::open`; non-WASI targets still return `UnsupportedBackend`.
+- Updated usage, durability, README, and changelog text so WASI async open is
+  described as host-boundary inline work rather than platform async I/O.
 
 ### Verification
 
@@ -8971,17 +8976,19 @@ Record only evidence that can change planning or durable decisions.
 
 ### Remaining Blockers
 
-- WASI host persistent `Db::open_async` still delegates to blocking `Db::open`.
 - Native async maintenance wrappers now leave the caller thread through runtime
   blocking tasks, but they are not a primary async maintenance/WAL engine.
 - Native `persist_async` still reaches the synchronous WAL front door inside
   the runtime task boundary.
+- WASI async open still has inline host filesystem completion rather than a
+  true platform async I/O backend.
 - Native persistent async open still has synchronous path metadata checks and
   synchronous cleanup/background-worker startup after recovery loading.
 - Browser runtime persistence still lacks an in-browser fixture.
 
 ### Recommended Next Action
 
-- Resolve WASI host persistent async open or explicitly narrow that target's
-  persistent async contract, then decide whether maintenance/WAL ownership must
-  move to primary async internals before release-quality claims.
+- Decide whether maintenance/WAL ownership must move to primary async internals
+  before release-quality claims, or document the native runtime task boundary as
+  the release compatibility layer and keep true async maintenance as follow-up
+  hardening.

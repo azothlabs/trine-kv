@@ -47,8 +47,9 @@ Release packaging notes live in [docs/release.md](docs/release.md).
 - Live stats report table, cache, filter, blob read, blob byte, and blob GC
   counters.
 - Explicit WASI and browser persistent options. WASI uses a host-preopened
-  filesystem path on WASI targets. Browser persistence uses the async API and
-  the browser persistent backend on `wasm32-unknown-unknown`.
+  filesystem path on WASI targets and supports `Db::open_async` through the
+  host storage boundary. Browser persistence uses the async API and the browser
+  persistent backend on `wasm32-unknown-unknown`.
 
 ## Install
 
@@ -150,6 +151,9 @@ cargo bench --bench v1_bench
 - `SyncAll` is the strongest WAL commit mode, subject to platform filesystem
   behavior.
 - WASI and browser persistent backends do not claim `SyncData` or `SyncAll`.
+- WASI persistent `Db::open_async` uses the host-preopened filesystem on WASI
+  targets; current WASI file work completes inline and does not advertise
+  platform async I/O.
 - Browser persistence is async-only: use `Db::open_async` plus async mutation
   and maintenance methods. Synchronous browser persistent open, mutation, and
   maintenance APIs return typed unsupported errors.

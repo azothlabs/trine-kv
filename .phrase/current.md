@@ -48,13 +48,12 @@ removing compatibility wrappers that still call blocking APIs.
 task546 [x] goal:route native persistent open_async through async storage path | scope:src/db.rs src/recovery.rs tests/async_api.rs | verify:cargo test --test async_api; cargo clippy --all-targets --all-features -- -D warnings; WASM target checks
 task547 [x] goal:convert native point/range async read wait boundaries | scope:src/db.rs src/bucket.rs src/transaction.rs src/iterator.rs src/lsm src/table.rs src/point_value.rs tests/async_api.rs | verify:cargo test --test async_api; cargo test --all-targets --all-features; WASM target checks
 task548 [x] goal:route native async maintenance wrappers through runtime blocking task boundary | scope:src/db.rs tests/async_api.rs | verify:cargo test --test async_api; cargo clippy --all-targets --all-features -- -D warnings
-task549 [ ] goal:resolve WASI async open and primary async maintenance/WAL ownership blockers | scope:src/db.rs src/wal.rs src/manifest.rs | verify:focused async tests plus native/WASM gates
+task549 [x] goal:route WASI host persistent open_async away from blocking Db::open | scope:src/db.rs README.md docs/usage.md docs/durability.md CHANGELOG.md | verify:cargo test --lib; cargo test --all-targets --all-features; WASM target checks
+task550 [ ] goal:decide and implement primary async maintenance/WAL ownership boundary | scope:src/db.rs src/db/commit.rs src/wal.rs src/manifest.rs | verify:focused async tests plus native/WASM gates
 ```
 
 ## Known Residuals
 
-- `Db::open_async` for WASI host persistence still delegates to blocking
-  `Db::open`.
 - Native persistent async open still uses synchronous path metadata checks and
   synchronous cleanup/background-worker startup after recovery has loaded.
 - Native `persist_async`, `flush_async`, compaction, maintenance, and
@@ -82,6 +81,9 @@ task549 [ ] goal:resolve WASI async open and primary async maintenance/WAL owner
   transaction reads, range scans, prefix scans, and lazy blob value reads now
   await async table/blob storage helpers instead of delegating to blocking
   public reads.
+- WASI host persistent `Db::open_async` now enters the same async
+  storage-trait persistent open path on WASI targets instead of delegating to
+  blocking `Db::open`; non-WASI targets still return `UnsupportedBackend`.
 - Native async maintenance wrappers now run their synchronous engine work on
   runtime blocking tasks when a persistent native backend is present.
 - Focused async tests cover persistent lazy blob reads and native maintenance
@@ -91,6 +93,6 @@ task549 [ ] goal:resolve WASI async open and primary async maintenance/WAL owner
 
 ## Next Recommendation
 
-- Resolve the WASI host persistent async-open blocker, then decide whether the
-  remaining maintenance/WAL ownership work must become primary async internals
-  before release-quality claims.
+- Decide whether the remaining maintenance/WAL ownership work must become
+  primary async internals before release-quality claims, or whether the native
+  runtime task boundary is the documented compatibility layer for this release.

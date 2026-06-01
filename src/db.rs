@@ -901,6 +901,39 @@ impl Db {
         }
     }
 
+    #[cfg_attr(not(target_os = "wasi"), allow(clippy::unused_async))]
+    async fn open_wasi_persistent_with_options_async(options: DbOptions) -> Result<Self> {
+        let StorageMode::HostPersistent {
+            backend: HostStorageBackend::Wasi { path },
+        } = &options.storage_mode
+        else {
+            return Err(Error::invalid_options(
+                "WASI persistent open requires a path",
+            ));
+        };
+        let path = path.clone();
+        if path.as_os_str().is_empty() {
+            return Err(Error::invalid_options(
+                "WASI persistent path must be non-empty",
+            ));
+        }
+
+        #[cfg(target_os = "wasi")]
+        {
+            Self::validate_wasi_persistent_options(&options)?;
+            Self::open_persistent_with_options_async_inner(options, false).await
+        }
+
+        #[cfg(not(target_os = "wasi"))]
+        {
+            let _ = path;
+            drop(options);
+            Err(Error::unsupported_backend(
+                "WASI persistent storage backend",
+            ))
+        }
+    }
+
     #[cfg(target_os = "wasi")]
     fn validate_wasi_persistent_options(options: &DbOptions) -> Result<()> {
         if options.runtime.mode != runtime::RuntimeMode::Inline {
@@ -1221,8 +1254,15 @@ impl Db {
     }
 
     async fn open_persistent_with_options_async(options: DbOptions) -> Result<Self> {
+        Self::open_persistent_with_options_async_inner(options, true).await
+    }
+
+    async fn open_persistent_with_options_async_inner(
+        options: DbOptions,
+        require_wait_support: bool,
+    ) -> Result<Self> {
         validate_options(&options)?;
-        if !options.runtime.capabilities().blocking_adapter() {
+        if require_wait_support && !options.runtime.capabilities().blocking_adapter() {
             return Err(Error::unsupported("runtime blocking adapter"));
         }
 
@@ -5094,7 +5134,7 @@ impl Db {
             } => Self::open_browser_persistent_with_options_async(options).await,
             StorageMode::HostPersistent {
                 backend: HostStorageBackend::Wasi { .. },
-            } => Self::open(options),
+            } => Self::open_wasi_persistent_with_options_async(options).await,
         }
     }
 
@@ -6371,6 +6411,17 @@ mod tests {
         assert!(wasi_error.to_string().contains("WASI persistent"));
     }
 
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn wasi_persistent_open_async_requires_wasi_target() {
+        let path = temp_db_path("wasi-persistent-async-host-unsupported");
+        let error = block_on_test_future(Db::open_async(DbOptions::wasi_persistent(&path)))
+            .expect_err("WASI async open requires WASI target");
+
+        assert!(matches!(error, Error::UnsupportedBackend { .. }));
+        assert!(error.to_string().contains("WASI persistent"));
+    }
+
     #[cfg(target_os = "wasi")]
     #[test]
     fn wasi_persistent_backend_uses_host_filesystem() {
@@ -6389,6 +6440,27 @@ mod tests {
         drop(db);
 
         fs::remove_dir_all(path).expect("cleanup WASI test db");
+    }
+
+    #[cfg(target_os = "wasi")]
+    #[test]
+    fn wasi_persistent_open_async_uses_host_filesystem() {
+        let path = temp_db_path("wasi-persistent-async-host");
+        let db = block_on_test_future(Db::open_async(DbOptions::wasi_persistent(&path)))
+            .expect("WASI async db opens");
+        db.put(b"key", b"value").expect("WASI write succeeds");
+        db.flush().expect("WASI flush succeeds");
+        drop(db);
+
+        let db = block_on_test_future(Db::open_async(DbOptions::wasi_persistent_read_only(&path)))
+            .expect("WASI async read-only db reopens");
+        assert_eq!(
+            db.get(b"key").expect("WASI read succeeds"),
+            Some(b"value".to_vec())
+        );
+        drop(db);
+
+        fs::remove_dir_all(path).expect("cleanup WASI async test db");
     }
 
     #[test]

@@ -115,11 +115,13 @@ threads:
 
 ```rust
 let wasi = Db::open(DbOptions::wasi_persistent("./trine-data"));
+let wasi_async = Db::open_async(DbOptions::wasi_persistent("./trine-data")).await?;
 ```
 
 Strict sync durability is not claimed for WASI yet; `SyncData` and `SyncAll`
 return `UnsupportedDurability`. On non-WASI targets, the same option returns
-`UnsupportedBackend`.
+`UnsupportedBackend`. Current WASI file work completes inline through the host
+filesystem boundary, so it does not report `PlatformAsyncIo`.
 
 Browser persistence is async-only on `wasm32-unknown-unknown`. Use
 `Db::open_async` and the async mutation and maintenance APIs:
