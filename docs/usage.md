@@ -121,15 +121,28 @@ Strict sync durability is not claimed for WASI yet; `SyncData` and `SyncAll`
 return `UnsupportedDurability`. On non-WASI targets, the same option returns
 `UnsupportedBackend`.
 
-Browser persistence is still only an explicit unsupported host boundary:
+Browser persistence is async-only on `wasm32-unknown-unknown`. Use
+`Db::open_async` and the async mutation and maintenance APIs:
 
 ```rust
-let browser = Db::open(DbOptions::browser_persistent());
-assert!(browser.is_err());
+let db = Db::open_async(DbOptions::browser_persistent()).await?;
+db.put_async(b"user:001".to_vec(), b"Ada".to_vec()).await?;
+db.flush_async().await?;
 ```
 
-It will remain unsupported until its persistent adapter, reliable writer lease,
-durability mapping, and cooperative maintenance contracts are implemented.
+The browser persistent backend uses browser storage APIs behind Trine's storage
+traits. Writable open acquires a Web Locks writer lease, replays WAL, and uses
+WAL-backed async writes. Browser storage accepts `Buffered` and `Flush`;
+`SyncData` and `SyncAll` return `UnsupportedDurability`. Synchronous browser
+persistent open, synchronous mutation, synchronous bucket creation, and
+synchronous maintenance return typed unsupported errors. On non-browser targets,
+browser persistent async open returns `UnsupportedBackend`.
+
+Read-only browser open is also async:
+
+```rust
+let db = Db::open_async(DbOptions::browser_persistent_read_only()).await?;
+```
 
 `Db`, `Bucket`, and `Snapshot` are cheap handles. `Db` writes to the built-in
 default bucket. A named `Bucket` keeps its database open, so release bucket
@@ -481,6 +494,18 @@ Each unit is still published atomically; when the budget is exhausted, the next
 call resumes by planning from the current manifest and in-memory versions.
 Use `compact_range_with_budget(range, budget)` when a host wants only compaction
 work for a key range.
+
+Browser persistent databases use the async maintenance variants:
+
+```rust
+let outcome = db
+    .run_maintenance_with_budget_async(MaintenanceBudget::default())
+    .await?;
+```
+
+If browser write pressure cannot be relieved inside the write preflight, the
+write returns `RuntimeBusy`; call async maintenance from the host scheduler and
+retry the write.
 
 Persistent writable databases start one background maintenance worker by
 default. Set `DbOptions::background_worker_count = 0` when a test or embedding

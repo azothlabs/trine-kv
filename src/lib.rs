@@ -3,7 +3,7 @@
 //! The v1 API exposes a built-in default bucket for direct `Db` reads and
 //! writes, optional named buckets, atomic write batches, snapshots, optimistic
 //! transactions, range/prefix iteration, WAL recovery, `SSTable`
-//! flush/compaction, and live stats.
+//! flush/compaction, async host-storage entry points, and live stats.
 
 #![allow(clippy::missing_errors_doc, clippy::module_name_repetitions)]
 

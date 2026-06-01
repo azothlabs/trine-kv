@@ -26,6 +26,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1.85.0
         with:
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown, wasm32-wasip1
 
       - name: Format
         run: cargo fmt --check
@@ -35,6 +36,14 @@ jobs:
 
       - name: Test
         run: cargo test --all-targets --all-features
+
+      - name: Check host targets
+        run: |
+          cargo check --target wasm32-unknown-unknown --lib
+          cargo check --target wasm32-wasip1 --lib
+
+      - name: Lint browser target
+        run: cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings
 
       - name: Run examples
         run: |

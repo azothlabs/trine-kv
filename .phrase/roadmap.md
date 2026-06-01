@@ -3024,3 +3024,36 @@ by native-only manifest, recovery, and WAL front-door dependencies.
 ### Recommended Next Action
 
 - Add an in-browser persistence fixture and use it to catch host API regressions.
+
+### Phase 129: Pre-Release Polish And Verification
+
+**Status**: Complete
+
+**Goal**: Prepare the current crate state for a publishable release candidate by
+aligning release-facing docs, changelog, CI/publish gates, package content, and
+local verification with the completed async host storage work.
+
+**Entry Condition**: Phase 128 complete and user asks to enter the pre-release
+polish flow.
+
+**Acceptance Gate**:
+
+- README, usage docs, durability notes, release checklist, and changelog state
+  the current native, WASI, and browser persistence boundaries honestly.
+- CI and publish workflows cover native release gates plus WASI/browser target
+  compilation.
+- Package content is verified to exclude repository-only workflow files.
+- Local release verification passes or any remaining blocker is recorded with a
+  concrete next action.
+
+**Major Out Of Scope**:
+
+- Publishing to crates.io or creating a release tag.
+- Changing database behavior, public API, or storage formats.
+- Adding the in-browser persistence fixture.
+
+### Recommended Next Action
+
+- Commit the pre-release polish, rerun the standard package commands without
+  `--allow-dirty`, then decide whether to add the in-browser persistence
+  fixture before tagging or keep it as post-candidate hardening.

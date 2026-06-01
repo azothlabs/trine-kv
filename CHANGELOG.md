@@ -2,7 +2,7 @@
 
 All public crate releases use Semantic Versioning.
 
-## 0.1.0 - 2026-05-26
+## 0.1.0 - 2026-06-01
 
 Initial packaged release candidate for the embedded LSM MVCC engine.
 
@@ -22,6 +22,15 @@ Initial packaged release candidate for the embedded LSM MVCC engine.
 - Read-only open, safe temporary file repair policy, durability notes, usage
   guide, quickstart examples, integration examples, release checklist, and
   benchmark baselines.
+- Async-compatible database, bucket, iterator, value, transaction, flush,
+  compaction, and maintenance APIs.
+- Native platform I/O capability reporting, fallback observability, bounded
+  blocking adapter stats, and cooperative maintenance budgets.
+- Explicit WASI persistent options for host-preopened filesystems on WASI
+  targets.
+- Browser persistent options backed by the async browser storage path on
+  `wasm32-unknown-unknown`, including writable async open, Web Locks writer
+  lease, WAL-backed async writes, async bucket creation, and async maintenance.
 
 ### Hardened
 
@@ -32,3 +41,7 @@ Initial packaged release candidate for the embedded LSM MVCC engine.
 - Failed flush/compaction publish removes unpublished table/blob output files.
 - Recovery validates referenced table/blob files and fails closed on missing or
   corrupt storage files.
+- Browser synchronous mutation and maintenance paths return typed unsupported
+  errors instead of bypassing async storage guarantees.
+- Browser async writes and maintenance own side-effecting work after acceptance,
+  so caller future cancellation only drops the waiter.

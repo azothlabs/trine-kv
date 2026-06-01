@@ -33,6 +33,8 @@ Release packaging notes live in [docs/release.md](docs/release.md).
 - Persistent mode with WAL replay, manifest recovery, directory locking,
   default background maintenance, backpressure, flush, compaction, and
   read-only open.
+- Async open/read/write/scan/transaction/maintenance entry points for hosts
+  that need to drive storage cooperatively.
 - Block-based SSTables with partitioned index/filter blocks, data-block hash
   lookup for point reads, high-priority metadata caching, compression, and
   linear/binary/auto index seek policies.
@@ -44,6 +46,9 @@ Release packaging notes live in [docs/release.md](docs/release.md).
   files and delays old-file deletion while a read can still reach them.
 - Live stats report table, cache, filter, blob read, blob byte, and blob GC
   counters.
+- Explicit WASI and browser persistent options. WASI uses a host-preopened
+  filesystem path on WASI targets. Browser persistence uses the async API and
+  the browser persistent backend on `wasm32-unknown-unknown`.
 
 ## Install
 
@@ -144,6 +149,10 @@ cargo bench --bench v1_bench
 - Persistent mode uses a single local database directory.
 - `SyncAll` is the strongest WAL commit mode, subject to platform filesystem
   behavior.
+- WASI and browser persistent backends do not claim `SyncData` or `SyncAll`.
+- Browser persistence is async-only: use `Db::open_async` plus async mutation
+  and maintenance methods. Synchronous browser persistent open, mutation, and
+  maintenance APIs return typed unsupported errors.
 - Read-only open is for inspecting a stable directory state; v1 does not define
   live multi-process reads against an active writer.
 - Repair is intentionally narrow and only removes known safe temporary files

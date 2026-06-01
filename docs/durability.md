@@ -47,6 +47,22 @@ selected at open time. With default options this floor is `Buffered`.
 `Db::persist(mode)` applies the same persistence request to the WAL. It does not
 force a memtable flush, run compaction, or rewrite already published tables.
 
+## Host Persistent Backends
+
+Native persistent databases use local files and the durability modes above.
+Host-selected persistent backends expose only the durability they can honestly
+provide:
+
+- WASI persistence uses the host-preopened filesystem path on WASI targets and
+  rejects `SyncData` and `SyncAll` until strict host sync guarantees are proven.
+- Browser persistence is async-only on `wasm32-unknown-unknown`. It accepts
+  `Buffered` and `Flush`, rejects `SyncData` and `SyncAll`, acquires a Web
+  Locks writer lease for writable open, and uses WAL-backed async writes.
+
+Synchronous browser persistent open, mutation, bucket creation, and maintenance
+APIs return typed unsupported errors. Browser callers should use `Db::open_async`
+and the async write, bucket, flush, compaction, and maintenance methods.
+
 ## Commit Ordering
 
 The writer coordinator serializes commit sequence assignment and memtable
@@ -157,6 +173,13 @@ Compaction must preserve:
 Persistent writable databases start one background maintenance worker by
 default. `DbOptions::background_worker_count = 0` keeps maintenance fully
 manual, and read-only or in-memory opens do not start workers.
+
+WASI and browser persistent options default to inline runtime execution with no
+background worker threads. Browser persistent maintenance is exposed through
+async flush, compaction, and budgeted maintenance methods so hosts can run work
+from their scheduler. If browser write pressure cannot await maintenance inside
+write preflight, the write returns `RuntimeBusy` until the caller runs async
+maintenance and retries.
 
 Automatic compaction may run after flush when L0 file pressure exceeds
 `DbOptions::max_l0_files`. Automatic L0 compaction can choose a local

@@ -44,6 +44,9 @@ Run this gate before tagging or publishing:
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
+cargo check --target wasm32-unknown-unknown --lib
+cargo check --target wasm32-wasip1 --lib
+cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings
 cargo run --example quickstart
 cargo run --example user_store
 cargo run --example event_index
@@ -70,6 +73,9 @@ The package list should not include `.github/`, `.phrase/`, `.rust-skills/`,
 - `cargo fmt --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --all-targets --all-features`
+- `cargo check --target wasm32-unknown-unknown --lib`
+- `cargo check --target wasm32-wasip1 --lib`
+- `cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings`
 - `cargo run --example quickstart`
 - `cargo run --example user_store`
 - `cargo run --example event_index`

@@ -8837,3 +8837,64 @@ Record only evidence that can change planning or durable decisions.
 
 - Add an in-browser persistence fixture and then optimize browser read
   granularity only if measurements justify it.
+
+## Phase 129: Pre-Release Polish And Verification
+
+### Observation
+
+- Release-facing docs still described browser persistence as unsupported even
+  after Phase 128 completed writable browser async open, WAL-backed async
+  writes, and async maintenance.
+- The release checklist and GitHub workflows ran the native release gate but did
+  not yet check the WASI and browser target compilation gates added during the
+  async host-storage work.
+- `cargo package --list` correctly refused to run without `--allow-dirty`
+  because this phase's files were still uncommitted.
+
+### Interpretation
+
+- The release candidate needed documentation and workflow alignment, not engine
+  behavior changes.
+- Package verification before commit can use `--allow-dirty` to validate the
+  current working tree; after commit, the standard release commands should run
+  without that flag.
+
+### Change
+
+- Updated README, usage docs, durability notes, release checklist, changelog,
+  and crate-level docs for async APIs, WASI persistence, browser async
+  persistence, durability limits, and browser maintenance pressure behavior.
+- Added `wasm32-unknown-unknown` and `wasm32-wasip1` target checks plus browser
+  target clippy to CI and publish workflows.
+- Moved the current phase and roadmap to pre-release polish and marked the
+  phase complete after verification.
+
+### Verification
+
+- `cargo fmt --check`
+- `git diff --check`
+- forbidden-term scan excluding local agent instructions
+- `cargo check --target wasm32-unknown-unknown --lib`
+- `cargo check --target wasm32-wasip1 --lib`
+- `cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo run --example quickstart`
+- `cargo run --example user_store`
+- `cargo run --example event_index`
+- `cargo package --list --allow-dirty`
+- `cargo package --locked --allow-dirty`
+- `cargo publish --dry-run --locked --allow-dirty`
+
+### Remaining Blockers
+
+- No release-polish code or package blocker remains.
+- Standard package commands without `--allow-dirty` should be rerun after the
+  pre-release polish commit.
+- An in-browser persistence fixture remains useful follow-up evidence, but it
+  is not required for this release-polish phase.
+
+### Recommended Next Action
+
+- Commit this pre-release polish, then choose whether the in-browser fixture is
+  a pre-tag requirement or post-candidate hardening.
