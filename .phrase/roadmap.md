@@ -2795,3 +2795,34 @@ by backend integration rather than basic target compilation.
 
 - Replace one persistent subsystem at a time with async storage operations
   before wiring IndexedDB/OPFS.
+
+### Phase 122: Async Manifest Storage Boundary
+
+**Status**: Complete
+
+**Goal**: Move manifest read/publish/open/create onto async storage-trait
+helpers while preserving existing synchronous manifest behavior.
+
+**Entry Condition**: Phase 121 complete and browser persistence remains blocked
+by blocking persistent subsystems.
+
+**Acceptance Gate**:
+
+- Manifest read has an async storage-trait helper.
+- Manifest publish has an async storage-trait helper.
+- `ManifestStore` can open/create through the async manifest helpers.
+- At least one manifest edit can publish through the async helper without
+  advancing in-memory state before durable publish succeeds.
+- Existing synchronous manifest behavior remains unchanged.
+- Final verification gate passes.
+
+**Major Out Of Scope**:
+
+- IndexedDB or OPFS implementation.
+- Browser writer lease protocol.
+- Async WAL, table, blob, recovery, cleanup, or full persistent database open.
+- Changing manifest format or durability semantics.
+
+### Recommended Next Action
+
+- Convert the next persistent subsystem along the open/recovery path.

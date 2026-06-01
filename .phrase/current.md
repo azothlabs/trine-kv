@@ -6,97 +6,91 @@ Complete
 
 ## Goal
 
-Prepare the storage backend boundary for a real browser persistent backend by
-allowing browser-only storage futures and objects to be thread-local while
-keeping native and WASI storage implementations thread-safe.
+Move the manifest subsystem onto a true async storage boundary so browser
+persistence has an async metadata read/publish path before the wider persistent
+engine is converted.
 
 ## Scope
 
-- Phase 121: browser storage thread-bound boundary.
+- Phase 122: async manifest storage boundary.
 
 ## Out Of Scope
 
 - IndexedDB or OPFS implementation.
 - Browser writer lease protocol.
-- Atomic browser manifest publish.
-- Replacing persistent database open, WAL, table, blob, recovery, or cleanup
-  paths with async storage calls.
-- Changing storage formats, durability semantics, MVCC behavior, or public data
-  model behavior.
+- Async WAL, table, blob, recovery, cleanup, or full persistent database open.
+- Replacing the synchronous manifest call sites in `Db::open` yet.
+- Changing manifest format, durability semantics, recovery semantics, or bucket
+  behavior.
 
 ## Backend Boundary Receipt
 
-- Trine operation names: storage futures, read objects, read backends, append
-  objects, writer leases, and the existing manifest/WAL/table/blob/recovery
-  storage traits.
-- Owned interface: `StorageFuture`, `StorageReadFuture`,
-  `StorageReadObject`, `StorageReadBackend`, `StorageAppendObject`, and
-  `StorageWriterLeaseBackend::WriterLease`.
-- Chosen backend: no new browser backend in this slice. Native and WASI keep
-  `Send`/`Sync` storage bounds; `wasm32-unknown-unknown` may use thread-local
-  storage futures and objects.
-- Known backend limits: browser persistence still lacks an IndexedDB/OPFS
-  adapter, writer lease, atomic manifest publish, and async persistent open path.
-- Leak-check scope: storage API names, docs, protocol, and error boundaries
-  must keep Trine-owned terminology and must not expose implementation-library
-  names as the public abstraction.
-- Verification gate: native checks, WASI checks, browser library check, tests,
-  formatting, clippy, diff check, forbidden-term scan, project-name scan, and
-  backend-name leakage scan.
+- Trine operation names: manifest read, manifest publish, manifest open/create,
+  and manifest bucket creation.
+- Owned interface: `StorageManifestReadBackend`,
+  `StorageManifestPublishBackend`, `StorageFuture`, `ManifestStore`, and
+  manifest storage object ids.
+- Chosen backend: no new browser backend in this slice. Native manifest storage
+  gains async read/publish helpers over the existing storage traits; browser
+  will later provide the same trait boundary.
+- Known backend limits: browser persistence still lacks IndexedDB/OPFS,
+  writer lease, atomic manifest publish proof, async WAL/table/blob/recovery
+  paths, and async persistent open wiring.
+- Leak-check scope: manifest APIs/docs/protocol must keep Trine-owned names and
+  must not expose implementation-library names as the abstraction.
+- Verification gate: native checks, WASI checks, browser checks, focused
+  manifest tests, full tests, formatting, clippy, diff check, forbidden-term
+  scan, project-name scan, and backend-name leakage scan.
 
 ## Acceptance Gate
 
-- `StorageFuture` remains `Send` on native and WASI targets.
-- `StorageFuture` does not require `Send` on `wasm32-unknown-unknown`.
-- Storage object/backend trait bounds keep `Send`/`Sync` on native and WASI.
-- Storage object/backend trait bounds allow thread-local browser
-  implementations on `wasm32-unknown-unknown`.
-- Existing native, WASI, and browser target checks keep passing.
-- Evidence records that this only removes a boundary blocker; browser
-  persistence itself remains unsupported until the async engine path and backend
-  are implemented.
+- Manifest read has an async storage-trait helper.
+- Manifest publish has an async storage-trait helper.
+- `ManifestStore` can open/create through the async manifest helpers.
+- At least one manifest edit can publish through the async helper without
+  advancing in-memory state before durable publish succeeds.
+- Existing synchronous manifest behavior remains unchanged.
+- Evidence records that this is only the manifest boundary, not a complete
+  browser persistent backend.
 
 ## Active Task Slice
 
 ```text
-task507 [x] goal:conditionalize storage future send bound | scope:src/storage.rs | verify:cargo check targets
-task508 [x] goal:conditionalize storage trait thread bounds | scope:src/storage.rs | verify:cargo check targets
-task509 [x] goal:update browser persistence evidence | scope:.phrase docs | verify:docs diff
-task510 [x] goal:commit Phase 121 | scope:git | verify:git commit
+task511 [x] goal:add async manifest read/publish helpers | scope:src/manifest.rs | verify:manifest tests
+task512 [x] goal:add async ManifestStore open/create and bucket publish | scope:src/manifest.rs | verify:manifest tests
+task513 [x] goal:update async manifest evidence | scope:.phrase protocol | verify:docs diff
+task514 [x] goal:commit Phase 122 | scope:git | verify:git commit
 ```
 
 ## Known Blockers
 
+- Current persistent database open still calls synchronous manifest helpers.
+- WAL, table, blob, recovery, and cleanup paths still rely on blocking storage
+  adapters around `NativeFileBackend`.
 - Browser persistence still requires a true async browser object store, reliable
-  writer lease, atomic manifest publish, and an async persistent open path.
-- Current persistent database open, WAL, manifest, table, blob, recovery, and
-  cleanup paths still call blocking storage adapters around `NativeFileBackend`;
-  that cannot be used as a real browser persistent backend on the browser main
-  thread.
+  writer lease, atomic manifest publish, and async persistent open path.
 
 ## Evidence
 
-- Prior verification: `wasm32-unknown-unknown` library compilation passes, so
-  the browser blocker is backend integration and persistent-engine async wiring,
-  not basic target compilation.
-- Change: `StorageFuture` is non-`Send` only on `wasm32-unknown-unknown`, while
-  native and WASI keep `Send`; storage read/backend/append/lease bounds now use
-  target-aware internal marker traits.
-- Browser compile proof: a `wasm32-unknown-unknown`-only storage object using
-  `Rc<Cell<_>>` implements `StorageReadObject`, proving browser storage handles
-  no longer need to be `Send`/`Sync`.
-- Audit: persistent paths still reference `NativeFileBackend` and
-  `BlockingStorage*` APIs across `db`, `wal`, `manifest`, `table`, `blob`, and
-  `recovery`.
-- Verification: `cargo check`, `cargo check --target wasm32-wasip2 --lib`,
-  `cargo check --target wasm32-wasip2 --tests`, `cargo check --target
-  wasm32-unknown-unknown --lib`, `cargo check --target wasm32-unknown-unknown
-  --tests`, `cargo test --all-targets --all-features`, `cargo clippy
-  --all-targets --all-features -- -D warnings`, `cargo fmt --check`, `git diff
-  --check`, forbidden-term scan excluding local agent instructions, and diff
-  backend-name leakage scan pass.
+- Prior Phase 121 evidence: browser storage futures and object handles may be
+  thread-local on `wasm32-unknown-unknown`, while native and WASI keep
+  thread-safe storage bounds.
+- Persistent path audit still points at manifest as one of the blocking
+  subsystems that must be converted before browser persistence can be real.
+- Change: manifest read/publish now have async storage-trait helpers, and
+  `ManifestStore` can open/create and create a bucket through the async manifest
+  path.
+- Failure behavior: async bucket publish keeps the in-memory manifest unchanged
+  when durable publish fails, matching the synchronous path.
+- Verification: `cargo test manifest::tests`, `cargo check`, `cargo check
+  --target wasm32-wasip2 --lib`, `cargo check --target wasm32-wasip2 --tests`,
+  `cargo check --target wasm32-unknown-unknown --lib`, `cargo check --target
+  wasm32-unknown-unknown --tests`, `cargo test --all-targets --all-features`,
+  `cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt
+  --check`, `git diff --check`, forbidden-term scan excluding local agent
+  instructions, project-name diff scan, and backend-name diff scan pass.
 
 ## Next Recommendation
 
-- Start the next browser persistence slice by replacing one persistent subsystem
-  at a time with async storage operations before wiring IndexedDB/OPFS.
+- Start the next browser persistence slice by converting the next persistent
+  subsystem along the open/recovery path.

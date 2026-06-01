@@ -191,6 +191,10 @@ Rules:
 - the engine calls `publish_manifest`;
 - a backend chooses how to make the new manifest current;
 - recovery reads the current manifest through the same backend contract;
+- manifest read and publish must be available through async storage-trait calls
+  before browser persistence is wired;
+- in-memory manifest state advances only after the async or sync publish
+  operation succeeds;
 - native-file implementations may use temporary files and atomic replacement;
 - non-file implementations may use a transactional host storage update;
 - if a backend cannot provide atomic manifest publish, persistent writable open

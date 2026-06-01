@@ -8417,3 +8417,58 @@ Record only evidence that can change planning or durable decisions.
 
 - Commit Phase 121, then replace one persistent subsystem at a time with async
   storage operations before wiring IndexedDB/OPFS.
+
+## Phase 122: Async Manifest Storage Boundary
+
+### Observation
+
+- Manifest read and publish were still exposed only through synchronous
+  `ManifestStore` helpers and blocking native storage wrappers.
+- The storage traits already had async manifest read/publish operations, so the
+  missing piece was a manifest-level async path that preserves publish ordering.
+
+### Interpretation
+
+- Manifest is the right first persistent subsystem to convert because database
+  open and recovery both start from the current manifest.
+- This still does not make browser persistence real: `Db::open`, WAL, table,
+  blob, recovery, and cleanup paths continue to need async conversion.
+
+### Change
+
+- Added async manifest read and publish helpers over
+  `StorageManifestReadBackend` and `StorageManifestPublishBackend`.
+- Added async `ManifestStore` open/create and bucket creation paths.
+- Shared manifest byte encoding between sync and async publish paths.
+- Added focused tests for async manifest round trip and publish-failure state
+  preservation.
+- Updated the async protocol and current phase evidence.
+
+### Verification
+
+- `cargo test manifest::tests`
+- `cargo check`
+- `cargo check --target wasm32-wasip2 --lib`
+- `cargo check --target wasm32-wasip2 --tests`
+- `cargo check --target wasm32-unknown-unknown --lib`
+- `cargo check --target wasm32-unknown-unknown --tests`
+- `cargo test --all-targets --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --check`
+- `git diff --check`
+- forbidden-term scan excluding local agent instructions
+- project-name diff scan
+- backend-name diff scan
+
+### Remaining Blockers
+
+- Persistent database open still calls synchronous manifest helpers.
+- WAL, table, blob, recovery, and cleanup paths still rely on blocking storage
+  adapters around `NativeFileBackend`.
+- Browser persistence still needs IndexedDB/OPFS, writer lease, and atomic
+  manifest publish proof.
+
+### Recommended Next Action
+
+- Commit Phase 122, then convert the next persistent subsystem along the
+  open/recovery path.

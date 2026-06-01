@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     io,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use crate::{
@@ -15,7 +16,8 @@ use crate::{
     prefix::PrefixExtractor,
     storage::{
         BlockingStorageManifestPublishBackend, BlockingStorageManifestReadBackend,
-        NativeFileBackend, StorageObjectId, StorageObjectKind,
+        NativeFileBackend, StorageManifestPublishBackend, StorageManifestReadBackend,
+        StorageObjectId, StorageObjectKind,
     },
     table::{TableBlobReference, TableId, TableLevel, TableProperties},
     types::Sequence,
@@ -150,6 +152,32 @@ impl ManifestStore {
         })
     }
 
+    #[allow(dead_code)]
+    pub(crate) async fn open_or_create_with_backend_async(
+        path: impl Into<PathBuf>,
+        create_if_missing: bool,
+        native_storage: NativeFileBackend,
+    ) -> Result<Self> {
+        let path = path.into();
+        let state = if let Some(bytes) =
+            read_manifest_bytes_with_backend_async(&native_storage, &path).await?
+        {
+            decode_manifest(&bytes)?
+        } else if create_if_missing {
+            let state = ManifestState::empty();
+            publish_manifest_with_backend_async(&native_storage, &path, &state).await?;
+            state
+        } else {
+            ManifestState::empty()
+        };
+
+        Ok(Self {
+            path,
+            state,
+            native_storage,
+        })
+    }
+
     #[must_use]
     pub const fn state(&self) -> &ManifestState {
         &self.state
@@ -169,6 +197,27 @@ impl ManifestStore {
         next_state.buckets.insert(name.clone(), options);
         next_state.tables.entry(name).or_default();
         self.publish_next_state(next_state)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn create_bucket_async(
+        &mut self,
+        name: String,
+        options: BucketOptions,
+    ) -> Result<()> {
+        if let Some(existing) = self.state.buckets.get(&name) {
+            if existing == &options {
+                return Ok(());
+            }
+            return Err(Error::invalid_options(
+                "existing bucket options do not match requested options",
+            ));
+        }
+
+        let mut next_state = self.state.clone();
+        next_state.buckets.insert(name.clone(), options);
+        next_state.tables.entry(name).or_default();
+        self.publish_next_state_async(next_state).await
     }
 
     pub fn update_bucket_options(&mut self, name: &str, options: BucketOptions) -> Result<()> {
@@ -309,10 +358,16 @@ impl ManifestStore {
 
     fn publish_next_state(&mut self, next_state: ManifestState) -> Result<()> {
         // Manifest publish is the durable cutover point. Keep the in-memory
-        // state unchanged until the file publish succeeds, so a failed create,
+        // state unchanged until storage publish succeeds, so a failed create,
         // flush, or compaction cannot make later operations believe an edit was
-        // committed when the on-disk manifest never advanced.
+        // committed when the durable manifest never advanced.
         publish_manifest_with_backend(&self.native_storage, &self.path, &next_state)?;
+        self.state = next_state;
+        Ok(())
+    }
+
+    async fn publish_next_state_async(&mut self, next_state: ManifestState) -> Result<()> {
+        publish_manifest_with_backend_async(&self.native_storage, &self.path, &next_state).await?;
         self.state = next_state;
         Ok(())
     }
@@ -333,7 +388,7 @@ pub fn read_manifest(path: &Path) -> Result<ManifestState> {
     decode_manifest(&bytes)
 }
 
-fn read_manifest_bytes(path: &Path) -> Result<Option<std::sync::Arc<[u8]>>> {
+fn read_manifest_bytes(path: &Path) -> Result<Option<Arc<[u8]>>> {
     let backend = NativeFileBackend::new();
     read_manifest_bytes_with_backend(&backend, path)
 }
@@ -341,9 +396,20 @@ fn read_manifest_bytes(path: &Path) -> Result<Option<std::sync::Arc<[u8]>>> {
 fn read_manifest_bytes_with_backend(
     backend: &NativeFileBackend,
     path: &Path,
-) -> Result<Option<std::sync::Arc<[u8]>>> {
+) -> Result<Option<Arc<[u8]>>> {
     let object = manifest_storage_object(path);
     backend.read_current_manifest_blocking(object)
+}
+
+async fn read_manifest_bytes_with_backend_async<B>(
+    backend: &B,
+    path: &Path,
+) -> Result<Option<Arc<[u8]>>>
+where
+    B: StorageManifestReadBackend,
+{
+    let object = manifest_storage_object(path);
+    backend.read_current_manifest(object).await
 }
 
 fn publish_manifest_with_backend(
@@ -351,6 +417,27 @@ fn publish_manifest_with_backend(
     path: &Path,
     state: &ManifestState,
 ) -> Result<()> {
+    let bytes = encode_manifest_bytes(state)?;
+    let object = manifest_storage_object(path);
+    backend.publish_manifest_blocking(object, bytes, DurabilityMode::SyncAll)
+}
+
+async fn publish_manifest_with_backend_async<B>(
+    backend: &B,
+    path: &Path,
+    state: &ManifestState,
+) -> Result<()>
+where
+    B: StorageManifestPublishBackend,
+{
+    let bytes = encode_manifest_bytes(state)?;
+    let object = manifest_storage_object(path);
+    backend
+        .publish_manifest(object, bytes, DurabilityMode::SyncAll)
+        .await
+}
+
+fn encode_manifest_bytes(state: &ManifestState) -> Result<Arc<[u8]>> {
     let payload = encode_state(state)?;
     let payload_len = u32::try_from(payload.len())
         .map_err(|_| Error::invalid_options("manifest payload exceeds u32::MAX"))?;
@@ -363,8 +450,7 @@ fn publish_manifest_with_backend(
     bytes.extend_from_slice(&payload_checksum.to_le_bytes());
     bytes.extend_from_slice(&payload);
 
-    let object = manifest_storage_object(path);
-    backend.publish_manifest_blocking(object, bytes.into(), DurabilityMode::SyncAll)
+    Ok(bytes.into())
 }
 
 fn manifest_storage_object(path: &Path) -> StorageObjectId {
@@ -1003,7 +1089,9 @@ impl<'payload> Cursor<'payload> {
 mod tests {
     use std::{
         fs,
+        future::Future,
         path::PathBuf,
+        task::{Context, Poll, Waker},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1014,6 +1102,7 @@ mod tests {
             IndexSearchPolicy, PrefixFilterPolicy,
         },
         prefix::PrefixExtractor,
+        storage::NativeFileBackend,
     };
 
     #[test]
@@ -1145,6 +1234,67 @@ mod tests {
             !store.state().buckets().contains_key("users"),
             "failed publish must not advance in-memory manifest state"
         );
+    }
+
+    #[test]
+    fn async_manifest_open_create_and_bucket_publish_round_trip() {
+        let dir = temp_manifest_dir("async-round-trip");
+        fs::create_dir_all(&dir).expect("create manifest test dir");
+        let path = manifest_path(&dir);
+        let mut store = poll_ready(ManifestStore::open_or_create_with_backend_async(
+            path.clone(),
+            true,
+            NativeFileBackend::new(),
+        ))
+        .expect("manifest opens through async helper");
+
+        poll_ready(store.create_bucket_async("users".to_owned(), BucketOptions::default()))
+            .expect("bucket publishes through async helper");
+
+        let reopened = poll_ready(ManifestStore::open_or_create_with_backend_async(
+            path,
+            false,
+            NativeFileBackend::new(),
+        ))
+        .expect("manifest reopens through async helper");
+        assert!(reopened.state().buckets().contains_key("users"));
+        assert!(reopened.state().tables().contains_key("users"));
+    }
+
+    #[test]
+    fn async_manifest_publish_failure_does_not_advance_state() {
+        let dir = temp_manifest_dir("async-publish-fails");
+        fs::create_dir_all(&dir).expect("create manifest test dir");
+        let path = manifest_path(&dir);
+        let mut store = poll_ready(ManifestStore::open_or_create_with_backend_async(
+            path,
+            true,
+            NativeFileBackend::new(),
+        ))
+        .expect("manifest opens through async helper");
+
+        fs::remove_dir_all(&dir).expect("remove manifest parent to force publish failure");
+        let error =
+            poll_ready(store.create_bucket_async("users".to_owned(), BucketOptions::default()))
+                .expect_err("publish should fail");
+        assert!(
+            error.to_string().contains("io error"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !store.state().buckets().contains_key("users"),
+            "failed publish must not advance in-memory manifest state"
+        );
+    }
+
+    fn poll_ready<T>(future: impl Future<Output = crate::Result<T>>) -> crate::Result<T> {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut future = std::pin::pin!(future);
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(result) => result,
+            Poll::Pending => panic!("manifest storage future unexpectedly pending"),
+        }
     }
 
     fn temp_manifest_dir(name: &str) -> PathBuf {
