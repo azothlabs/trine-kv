@@ -155,8 +155,37 @@ impl StorageObjectListRequest {
     }
 }
 
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub(crate) type StorageFuture<'op, T> = Pin<Box<dyn Future<Output = Result<T>> + 'op>>;
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) type StorageFuture<'op, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'op>>;
+
 pub(crate) type StorageReadFuture<'op, T> = StorageFuture<'op, T>;
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub(crate) trait StorageThreadBound {}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+impl<T: ?Sized> StorageThreadBound for T {}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) trait StorageThreadBound: Send {}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl<T: Send + ?Sized> StorageThreadBound for T {}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub(crate) trait StorageSharedBound {}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+impl<T: ?Sized> StorageSharedBound for T {}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) trait StorageSharedBound: Send + Sync {}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl<T: Send + Sync + ?Sized> StorageSharedBound for T {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageReadBuffer {
@@ -361,7 +390,7 @@ impl StorageCapabilities {
     }
 }
 
-pub(crate) trait StorageReadObject: Send + Sync {
+pub(crate) trait StorageReadObject: StorageSharedBound {
     #[allow(dead_code)]
     fn object(&self) -> &StorageObjectId;
 
@@ -396,7 +425,7 @@ pub(crate) trait BlockingStorageReadObject: StorageReadObject {
     }
 }
 
-pub(crate) trait StorageReadBackend: Send + Sync {
+pub(crate) trait StorageReadBackend: StorageSharedBound {
     type ReadObject: StorageReadObject;
 
     fn capabilities(&self) -> StorageCapabilities;
@@ -419,7 +448,7 @@ pub(crate) trait BlockingStorageObjectReadBackend: StorageObjectReadBackend {
     fn read_object_bytes_blocking(&self, object: StorageObjectId) -> Result<Option<Arc<[u8]>>>;
 }
 
-pub(crate) trait StorageAppendObject: Send {
+pub(crate) trait StorageAppendObject: StorageThreadBound {
     fn append<'op>(
         &'op mut self,
         bytes: &'op [u8],
@@ -477,7 +506,7 @@ pub(crate) trait BlockingStorageWalRewriteBackend: StorageWalRewriteBackend {
 }
 
 pub(crate) trait StorageWriterLeaseBackend: StorageReadBackend {
-    type WriterLease: Send;
+    type WriterLease: StorageThreadBound;
 
     fn acquire_writer_lease(&self, object: StorageObjectId)
     -> StorageFuture<'_, Self::WriterLease>;
@@ -2837,6 +2866,55 @@ fn usize_to_u64(value: usize, field: &'static str) -> Result<u64> {
 fn u64_to_usize(value: u64, field: &'static str) -> Result<usize> {
     usize::try_from(value)
         .map_err(|_| Error::invalid_options(format!("{field} exceeds usize::MAX")))
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[allow(dead_code)]
+mod browser_storage_bound_check {
+    use std::{cell::Cell, rc::Rc};
+
+    use super::*;
+
+    struct LocalReadObject {
+        object: StorageObjectId,
+        byte: Rc<Cell<u8>>,
+    }
+
+    impl LocalReadObject {
+        fn new() -> Self {
+            Self {
+                object: StorageObjectId::memory(StorageObjectKind::Temporary, "local"),
+                byte: Rc::new(Cell::new(0)),
+            }
+        }
+    }
+
+    impl StorageReadObject for LocalReadObject {
+        fn object(&self) -> &StorageObjectId {
+            &self.object
+        }
+
+        fn len(&self) -> StorageReadFuture<'_, u64> {
+            let byte = Rc::clone(&self.byte);
+            Box::pin(async move { Ok(u64::from(byte.get())) })
+        }
+
+        fn read_exact_at<'op>(
+            &'op self,
+            _offset: usize,
+            bytes: &'op mut [u8],
+        ) -> StorageReadFuture<'op, ()> {
+            let byte = Rc::clone(&self.byte);
+            Box::pin(async move {
+                bytes.fill(byte.get());
+                Ok(())
+            })
+        }
+    }
+
+    fn accepts_thread_local_read_object() -> LocalReadObject {
+        LocalReadObject::new()
+    }
 }
 
 #[cfg(test)]

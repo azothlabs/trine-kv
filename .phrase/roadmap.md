@@ -2762,3 +2762,36 @@ browser/WASM readiness blocker.
 
 - Start a browser persistence phase by removing blocking persistent storage
   calls from the engine path before wiring IndexedDB/OPFS.
+
+### Phase 121: Browser Storage Thread-Bound Boundary
+
+**Status**: Complete
+
+**Goal**: Allow browser storage backends to use thread-local futures and object
+handles while preserving thread-safe native and WASI storage bounds.
+
+**Entry Condition**: Phase 120 complete and browser persistence remains blocked
+by backend integration rather than basic target compilation.
+
+**Acceptance Gate**:
+
+- `StorageFuture` remains `Send` on native and WASI targets.
+- `StorageFuture` does not require `Send` on `wasm32-unknown-unknown`.
+- Storage object/backend trait bounds keep `Send`/`Sync` on native and WASI.
+- Storage object/backend trait bounds allow thread-local browser
+  implementations on `wasm32-unknown-unknown`.
+- Browser target compilation proves a non-`Send`/`Sync` storage object can
+  implement the storage read boundary.
+- Final verification gate passes.
+
+**Major Out Of Scope**:
+
+- IndexedDB or OPFS implementation.
+- Browser writer lease protocol.
+- Atomic browser manifest publish.
+- Async-only persistent engine conversion.
+
+### Recommended Next Action
+
+- Replace one persistent subsystem at a time with async storage operations
+  before wiring IndexedDB/OPFS.

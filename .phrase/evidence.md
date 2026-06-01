@@ -8363,3 +8363,57 @@ Record only evidence that can change planning or durable decisions.
 
 - Start a browser persistence phase whose first slice removes blocking
   persistent storage calls from the engine path before wiring IndexedDB/OPFS.
+
+## Phase 121: Browser Storage Thread-Bound Boundary
+
+### Observation
+
+- Browser storage handles and callbacks can be tied to the browser event loop and
+  may not be `Send`/`Sync`.
+- Before this phase, `StorageFuture`, `StorageReadObject`, `StorageReadBackend`,
+  `StorageAppendObject`, and `StorageWriterLeaseBackend::WriterLease` required
+  thread-safe bounds on every target.
+- `wasm32-unknown-unknown` checks passed before implementation, but that only
+  proved the library compiled without a browser persistent adapter.
+
+### Interpretation
+
+- A real browser backend needs thread-local storage futures and object handles
+  at the storage boundary while preserving thread-safe native and WASI behavior.
+- This removes a backend-boundary blocker only. Browser persistence is still not
+  implemented until the engine stops depending on blocking persistent paths and
+  a browser adapter exists.
+
+### Change
+
+- Made `StorageFuture` non-`Send` only on `wasm32-unknown-unknown`.
+- Replaced unconditional storage `Send`/`Sync` supertraits with target-aware
+  internal marker traits.
+- Added a browser-target compile proof showing a storage read object backed by
+  `Rc<Cell<_>>` can implement `StorageReadObject`.
+- Updated the async protocol and current phase evidence.
+
+### Verification
+
+- `cargo check`
+- `cargo check --target wasm32-wasip2 --lib`
+- `cargo check --target wasm32-wasip2 --tests`
+- `cargo check --target wasm32-unknown-unknown --lib`
+- `cargo check --target wasm32-unknown-unknown --tests`
+- `cargo test --all-targets --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --check`
+- `git diff --check`
+- forbidden-term scan excluding local agent instructions
+- diff backend-name leakage scan
+
+### Remaining Blockers
+
+- Browser persistence still needs async persistent open, async WAL, async
+  manifest publish/read, async table/blob reads and writes, async cleanup,
+  browser writer lease, and browser atomic manifest publish.
+
+### Recommended Next Action
+
+- Commit Phase 121, then replace one persistent subsystem at a time with async
+  storage operations before wiring IndexedDB/OPFS.

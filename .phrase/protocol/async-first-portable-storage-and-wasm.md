@@ -211,6 +211,10 @@ Rules:
 - if no reliable writer lease exists, persistent writable open fails;
 - background maintenance must support cooperative execution;
 - compaction, flush, and cleanup must be resumable across small work budgets;
+- storage futures and storage object/backend trait bounds remain thread-safe on
+  native and WASI targets, but `wasm32-unknown-unknown` browser storage backends
+  may use thread-local futures and objects because browser storage handles are
+  often tied to the main event loop;
 - no core protocol may rely on memory mapping, OS page size, process locks,
   direct I/O, or native endian behavior.
 
@@ -437,6 +441,8 @@ Rules:
 - durability strength is capability-reported and may be weaker than native
   strict sync;
 - background maintenance must be cooperative and budgeted;
+- storage futures and object handles may be thread-local on
+  `wasm32-unknown-unknown`;
 - public APIs must never block the browser main thread.
 
 ## 10. Recovery Requirements

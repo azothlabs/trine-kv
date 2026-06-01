@@ -6,43 +6,63 @@ Complete
 
 ## Goal
 
-Add resumable maintenance work budgets so hosts can advance flush and compaction
-in bounded atomic units, and classify the remaining browser persistent backend
-work without pretending an unsupported storage path is complete.
+Prepare the storage backend boundary for a real browser persistent backend by
+allowing browser-only storage futures and objects to be thread-local while
+keeping native and WASI storage implementations thread-safe.
 
 ## Scope
 
-- Phase 120: resumable compaction and maintenance work budgets.
+- Phase 121: browser storage thread-bound boundary.
 
 ## Out Of Scope
 
-- Browser persistent storage implementation.
-- Splitting one compaction output publish across multiple manifests.
-- Changing WAL, MVCC, table, manifest, transaction, recovery, or compaction
-  correctness rules.
+- IndexedDB or OPFS implementation.
+- Browser writer lease protocol.
+- Atomic browser manifest publish.
+- Replacing persistent database open, WAL, table, blob, recovery, or cleanup
+  paths with async storage calls.
+- Changing storage formats, durability semantics, MVCC behavior, or public data
+  model behavior.
+
+## Backend Boundary Receipt
+
+- Trine operation names: storage futures, read objects, read backends, append
+  objects, writer leases, and the existing manifest/WAL/table/blob/recovery
+  storage traits.
+- Owned interface: `StorageFuture`, `StorageReadFuture`,
+  `StorageReadObject`, `StorageReadBackend`, `StorageAppendObject`, and
+  `StorageWriterLeaseBackend::WriterLease`.
+- Chosen backend: no new browser backend in this slice. Native and WASI keep
+  `Send`/`Sync` storage bounds; `wasm32-unknown-unknown` may use thread-local
+  storage futures and objects.
+- Known backend limits: browser persistence still lacks an IndexedDB/OPFS
+  adapter, writer lease, atomic manifest publish, and async persistent open path.
+- Leak-check scope: storage API names, docs, protocol, and error boundaries
+  must keep Trine-owned terminology and must not expose implementation-library
+  names as the public abstraction.
+- Verification gate: native checks, WASI checks, browser library check, tests,
+  formatting, clippy, diff check, forbidden-term scan, project-name scan, and
+  backend-name leakage scan.
 
 ## Acceptance Gate
 
-- Public maintenance budget and outcome types describe bounded flush and
-  compaction work.
-- `run_maintenance_with_budget` advances at most the requested number of flush
-  inputs and compaction units, then reports whether the budget was exhausted.
-- `compact_range_with_budget` advances one bounded compaction pass for a key
-  range without blocking behind a busy compaction reservation.
-- Budget exhaustion increments `maintenance_budget_exhaustions`.
-- Existing `flush()` and `compact_range()` barrier behavior is preserved.
-- Focused tests prove budget exhaustion and resume-by-replanning behavior.
-- Native checks, wasm target checks, tests, formatting, clippy, diff check,
-  forbidden-term scan, project-name scan, and backend-name leakage scan pass.
+- `StorageFuture` remains `Send` on native and WASI targets.
+- `StorageFuture` does not require `Send` on `wasm32-unknown-unknown`.
+- Storage object/backend trait bounds keep `Send`/`Sync` on native and WASI.
+- Storage object/backend trait bounds allow thread-local browser
+  implementations on `wasm32-unknown-unknown`.
+- Existing native, WASI, and browser target checks keep passing.
+- Evidence records that this only removes a boundary blocker; browser
+  persistence itself remains unsupported until the async engine path and backend
+  are implemented.
 
 ## Active Task Slice
 
 ```text
-task502 [x] goal:commit Phase 119 WASI backend | scope:git | verify:commit fa243b7
-task503 [x] goal:add public maintenance budget API | scope:src/db.rs src/lib.rs | verify:cargo check
-task504 [x] goal:budget flush and compaction units | scope:src/db.rs | verify:focused persistent_wal tests
-task505 [x] goal:document cooperative maintenance budgets | scope:docs protocol .phrase | verify:docs diff
-task506 [x] goal:classify browser persistent blocker | scope:storage/db audit | verify:wasm32-unknown-unknown check + blocking call audit
+task507 [x] goal:conditionalize storage future send bound | scope:src/storage.rs | verify:cargo check targets
+task508 [x] goal:conditionalize storage trait thread bounds | scope:src/storage.rs | verify:cargo check targets
+task509 [x] goal:update browser persistence evidence | scope:.phrase docs | verify:docs diff
+task510 [x] goal:commit Phase 121 | scope:git | verify:git commit
 ```
 
 ## Known Blockers
@@ -53,23 +73,30 @@ task506 [x] goal:classify browser persistent blocker | scope:storage/db audit | 
   cleanup paths still call blocking storage adapters around `NativeFileBackend`;
   that cannot be used as a real browser persistent backend on the browser main
   thread.
-- `wasm32-unknown-unknown` library compilation passes, so the browser blocker
-  is backend integration, not basic target compilation.
 
 ## Evidence
 
-- Verification: `cargo check`, `cargo check --target wasm32-wasip2 --lib`,
-  `cargo check --target wasm32-wasip2 --tests`, `cargo check --target
-  wasm32-unknown-unknown --lib`, `cargo test --test persistent_wal`, `cargo
-  clippy --all-targets --all-features -- -D warnings`, `cargo test
-  --all-targets --all-features`, `cargo fmt --check`, `git diff --check`,
-  forbidden-term scan, project-name scan, and backend-name leakage scan pass.
+- Prior verification: `wasm32-unknown-unknown` library compilation passes, so
+  the browser blocker is backend integration and persistent-engine async wiring,
+  not basic target compilation.
+- Change: `StorageFuture` is non-`Send` only on `wasm32-unknown-unknown`, while
+  native and WASI keep `Send`; storage read/backend/append/lease bounds now use
+  target-aware internal marker traits.
+- Browser compile proof: a `wasm32-unknown-unknown`-only storage object using
+  `Rc<Cell<_>>` implements `StorageReadObject`, proving browser storage handles
+  no longer need to be `Send`/`Sync`.
 - Audit: persistent paths still reference `NativeFileBackend` and
   `BlockingStorage*` APIs across `db`, `wal`, `manifest`, `table`, `blob`, and
   `recovery`.
+- Verification: `cargo check`, `cargo check --target wasm32-wasip2 --lib`,
+  `cargo check --target wasm32-wasip2 --tests`, `cargo check --target
+  wasm32-unknown-unknown --lib`, `cargo check --target wasm32-unknown-unknown
+  --tests`, `cargo test --all-targets --all-features`, `cargo clippy
+  --all-targets --all-features -- -D warnings`, `cargo fmt --check`, `git diff
+  --check`, forbidden-term scan excluding local agent instructions, and diff
+  backend-name leakage scan pass.
 
 ## Next Recommendation
 
-- Commit Phase 120, then start a browser persistence phase whose first task is
-  replacing the remaining blocking persistent engine calls with async storage
-  operations before wiring IndexedDB/OPFS.
+- Start the next browser persistence slice by replacing one persistent subsystem
+  at a time with async storage operations before wiring IndexedDB/OPFS.
