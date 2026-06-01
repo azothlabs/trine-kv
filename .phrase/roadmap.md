@@ -3060,7 +3060,7 @@ polish flow.
 
 ### Phase 130: Async Contract Closure
 
-**Status**: In Progress
+**Status**: Complete
 
 **Goal**: Close the gap between the async-first protocol and the implemented
 public API before making release-quality claims.
@@ -3087,6 +3087,6 @@ fully reflected in the native public API surface.
 
 ### Recommended Next Action
 
-- Decide whether the remaining maintenance/WAL ownership work must move from
-  native runtime task wrappers to primary async internals before release-quality
-  claims, or explicitly document that boundary for the current release.
+- Return to release-candidate verification, with primary async maintenance/WAL
+  internals and an in-browser persistence fixture tracked as follow-up
+  hardening rather than Phase 130 blockers.

@@ -2,7 +2,7 @@
 
 ## Status
 
-In Progress
+Complete
 
 ## Goal
 
@@ -17,8 +17,8 @@ removing compatibility wrappers that still call blocking APIs.
   operations.
 - Native persistent async point reads, scans, lazy value reads, and maintenance
   wrappers.
-- Public async compatibility audit for remaining WASI host persistence and
-  deeper maintenance/WAL engine ownership.
+- Public async compatibility audit for WASI host persistence and deeper
+  maintenance/WAL engine ownership.
 - Blocking native APIs remain available only as adapter surface.
 
 ## Out Of Scope
@@ -49,7 +49,7 @@ task546 [x] goal:route native persistent open_async through async storage path |
 task547 [x] goal:convert native point/range async read wait boundaries | scope:src/db.rs src/bucket.rs src/transaction.rs src/iterator.rs src/lsm src/table.rs src/point_value.rs tests/async_api.rs | verify:cargo test --test async_api; cargo test --all-targets --all-features; WASM target checks
 task548 [x] goal:route native async maintenance wrappers through runtime blocking task boundary | scope:src/db.rs tests/async_api.rs | verify:cargo test --test async_api; cargo clippy --all-targets --all-features -- -D warnings
 task549 [x] goal:route WASI host persistent open_async away from blocking Db::open | scope:src/db.rs README.md docs/usage.md docs/durability.md CHANGELOG.md | verify:cargo test --lib; cargo test --all-targets --all-features; WASM target checks
-task550 [ ] goal:decide and implement primary async maintenance/WAL ownership boundary | scope:src/db.rs src/db/commit.rs src/wal.rs src/manifest.rs | verify:focused async tests plus native/WASM gates
+task550 [x] goal:classify primary async maintenance/WAL ownership boundary | scope:src/db.rs src/db/commit.rs src/wal.rs src/manifest.rs .phrase | verify:code audit plus full native/WASM gates
 ```
 
 ## Known Residuals
@@ -59,7 +59,8 @@ task550 [ ] goal:decide and implement primary async maintenance/WAL ownership bo
 - Native `persist_async`, `flush_async`, compaction, maintenance, and
   `close_async` now leave the caller thread through runtime blocking tasks, but
   they still reuse synchronous engine internals rather than a primary async
-  maintenance/WAL implementation.
+  maintenance/WAL implementation. This is recorded as follow-up hardening, not
+  a Phase 130 release blocker.
 - Native `persist_async` still reaches the synchronous WAL front door inside
   the runtime task boundary.
 - The browser runtime fixture remains absent; browser coverage is still target
@@ -86,6 +87,10 @@ task550 [ ] goal:decide and implement primary async maintenance/WAL ownership bo
   blocking `Db::open`; non-WASI targets still return `UnsupportedBackend`.
 - Native async maintenance wrappers now run their synchronous engine work on
   runtime blocking tasks when a persistent native backend is present.
+- Native async write futures already submit accepted writes to the runtime
+  blocking task pool when the runtime supports it; this preserves the
+  unpolled-future no-side-effect rule and the polled-future owns-completion
+  rule covered by existing tests.
 - Focused async tests cover persistent lazy blob reads and native maintenance
   wrapper task submission.
 - Verified with native clippy/tests and browser/WASI target checks, including
@@ -93,6 +98,7 @@ task550 [ ] goal:decide and implement primary async maintenance/WAL ownership bo
 
 ## Next Recommendation
 
-- Decide whether the remaining maintenance/WAL ownership work must become
-  primary async internals before release-quality claims, or whether the native
-  runtime task boundary is the documented compatibility layer for this release.
+- Treat a primary async maintenance/WAL engine and an in-browser persistence
+  fixture as follow-up hardening, while keeping the current release claim
+  scoped to public async entry points, async storage reads/open, browser async
+  persistence, and native runtime task boundaries.

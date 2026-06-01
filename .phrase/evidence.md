@@ -8959,6 +8959,10 @@ Record only evidence that can change planning or durable decisions.
   `Db::open`; non-WASI targets still return `UnsupportedBackend`.
 - Updated usage, durability, README, and changelog text so WASI async open is
   described as host-boundary inline work rather than platform async I/O.
+- Audited public async entry points after the read, maintenance, and WASI
+  slices: native async writes already submit accepted writes to the runtime
+  blocking task pool when the runtime supports it, native async maintenance now
+  does the same, and memory fallbacks remain CPU-only compatibility behavior.
 
 ### Verification
 
@@ -8977,7 +8981,8 @@ Record only evidence that can change planning or durable decisions.
 ### Remaining Blockers
 
 - Native async maintenance wrappers now leave the caller thread through runtime
-  blocking tasks, but they are not a primary async maintenance/WAL engine.
+  blocking tasks, but they are not a primary async maintenance/WAL engine. This
+  remains follow-up hardening rather than a Phase 130 blocker.
 - Native `persist_async` still reaches the synchronous WAL front door inside
   the runtime task boundary.
 - WASI async open still has inline host filesystem completion rather than a
@@ -8988,7 +8993,6 @@ Record only evidence that can change planning or durable decisions.
 
 ### Recommended Next Action
 
-- Decide whether maintenance/WAL ownership must move to primary async internals
-  before release-quality claims, or document the native runtime task boundary as
-  the release compatibility layer and keep true async maintenance as follow-up
-  hardening.
+- Return to release-candidate verification. Track primary async
+  maintenance/WAL internals and an in-browser persistence fixture as follow-up
+  hardening rather than Phase 130 blockers.
