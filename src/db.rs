@@ -1424,6 +1424,8 @@ impl Db {
         stats.storage_uses_platform_async_io = storage_stats.uses_platform_async_io;
         stats.storage_blocking_adapter_tasks = storage_stats.blocking_adapter_tasks;
         stats.storage_platform_async_io_tasks = storage_stats.platform_async_io_tasks;
+        stats.storage_platform_backend_fallback_tasks =
+            storage_stats.platform_backend_fallback_tasks;
         stats.storage_platform_blocking_fallback_tasks =
             storage_stats.platform_blocking_fallback_tasks;
         stats.storage_inline_tasks = storage_stats.inline_tasks;

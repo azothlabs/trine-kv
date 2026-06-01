@@ -366,8 +366,30 @@ Rules:
 - may add stronger platform-specific implementations behind the same contract.
 - must report `BlockingAdapter` separately from `PlatformAsyncIo`; using a
   bounded blocking pool must not be described as true platform async I/O.
+- must report platform backend fallback tasks separately from true platform
+  async I/O tasks when a platform driver is selected but a target or operation
+  cannot honestly use a native async file primitive.
 - must report platform-driver blocking fallback tasks separately from both
   Trine's bounded blocking adapter and true platform async I/O tasks.
+
+#### Native Platform Backend Matrix
+
+Current platform backend classifications:
+
+```text
+Linux: file read/write/sync/open/rename/delete/create/stat/lease are true
+       platform async when the native async backend feature is enabled;
+       directory listing is platform-driver blocking fallback.
+Windows: lower-level file read/write primitives can use IOCP, but current
+         Trine composite storage operations include fallback-classified open,
+         metadata, sync, rename, directory, or listing steps and are counted as
+         backend fallback unless replaced by a stronger implementation.
+macOS/BSD/other Unix: ordinary file work is backend fallback in this phase;
+                      do not claim kqueue/polling as true async regular-file
+                      I/O without a stronger backend.
+Other targets: unsupported fallback; persistent platform I/O must be rejected
+               or explicitly counted as fallback.
+```
 
 ### 9.3 WASI Backend
 
@@ -432,6 +454,8 @@ Stats and diagnostics should expose:
 - background task budget exhaustion;
 - blocking adapter call count when enabled;
 - whether the storage backend uses a blocking adapter or platform async I/O;
+- true platform async task count;
+- platform backend fallback count;
 - platform-driver blocking fallback count for operations without a real
   platform primitive;
 - unsupported capability errors.

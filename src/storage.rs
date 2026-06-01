@@ -26,7 +26,7 @@ use crate::{
 };
 
 #[cfg(feature = "platform-io")]
-use crate::io::PlatformIoDriver;
+use crate::io::{PlatformIoDriver, PlatformIoOperation, PlatformIoTaskClass};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum StorageObjectKind {
@@ -787,6 +787,7 @@ impl NativeFileBackend {
             uses_platform_async_io: driver.kind().is_platform_async(),
             blocking_adapter_tasks: self.metrics.blocking_adapter_tasks(),
             platform_async_io_tasks: self.metrics.platform_async_io_tasks(),
+            platform_backend_fallback_tasks: self.metrics.platform_backend_fallback_tasks(),
             platform_blocking_fallback_tasks: self.metrics.platform_blocking_fallback_tasks(),
             inline_tasks: self.metrics.inline_tasks(),
         }
@@ -838,6 +839,7 @@ impl Default for NativeFileBackend {
 struct NativeFileStorageMetrics {
     blocking_adapter: AtomicU64,
     platform_async_io: AtomicU64,
+    platform_backend_fallback: AtomicU64,
     platform_blocking_fallback: AtomicU64,
     inline: AtomicU64,
 }
@@ -848,14 +850,23 @@ impl NativeFileStorageMetrics {
     }
 
     #[cfg(feature = "platform-io")]
-    fn record_platform_async_io_task(&self) {
-        self.platform_async_io.fetch_add(1, Ordering::Relaxed);
-    }
-
     #[cfg(feature = "platform-io")]
-    fn record_platform_blocking_fallback_task(&self) {
-        self.platform_blocking_fallback
-            .fetch_add(1, Ordering::Relaxed);
+    fn record_platform_io_task(&self, class: PlatformIoTaskClass) {
+        match class {
+            PlatformIoTaskClass::TrueAsync => {
+                self.platform_async_io.fetch_add(1, Ordering::Relaxed);
+            }
+            PlatformIoTaskClass::BackendFallback => {
+                self.platform_backend_fallback
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            PlatformIoTaskClass::BlockingFallback => {
+                self.platform_backend_fallback
+                    .fetch_add(1, Ordering::Relaxed);
+                self.platform_blocking_fallback
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     fn record_inline_task(&self) {
@@ -870,6 +881,10 @@ impl NativeFileStorageMetrics {
         self.platform_async_io.load(Ordering::Acquire)
     }
 
+    fn platform_backend_fallback_tasks(&self) -> u64 {
+        self.platform_backend_fallback.load(Ordering::Acquire)
+    }
+
     fn platform_blocking_fallback_tasks(&self) -> u64 {
         self.platform_blocking_fallback.load(Ordering::Acquire)
     }
@@ -879,12 +894,22 @@ impl NativeFileStorageMetrics {
     }
 }
 
+#[cfg(feature = "platform-io")]
+fn record_platform_io_task(
+    metrics: &NativeFileStorageMetrics,
+    _driver: &PlatformIoDriver,
+    operation: PlatformIoOperation,
+) {
+    metrics.record_platform_io_task(PlatformIoDriver::task_class(operation));
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct NativeFileStorageStats {
     pub(crate) uses_blocking_adapter: bool,
     pub(crate) uses_platform_async_io: bool,
     pub(crate) blocking_adapter_tasks: u64,
     pub(crate) platform_async_io_tasks: u64,
+    pub(crate) platform_backend_fallback_tasks: u64,
     pub(crate) platform_blocking_fallback_tasks: u64,
     pub(crate) inline_tasks: u64,
 }
@@ -947,7 +972,11 @@ impl StorageObjectReadBackend for NativeFileBackend {
             return Box::pin(async move {
                 require_native_file_object_read()?;
                 let completion = driver.submit_read_optional_path(object.path().to_path_buf())?;
-                metrics.record_platform_async_io_task();
+                record_platform_io_task(
+                    metrics.as_ref(),
+                    &driver,
+                    PlatformIoOperation::OptionalWholeObjectRead,
+                );
                 completion.await
             });
         }
@@ -975,7 +1004,11 @@ impl StorageAppendBackend for NativeFileBackend {
             return Box::pin(async move {
                 require_native_file_append(&object)?;
                 let completion = driver.submit_open_append_path(object.path().to_path_buf())?;
-                metrics.record_platform_async_io_task();
+                record_platform_io_task(
+                    metrics.as_ref(),
+                    &driver,
+                    PlatformIoOperation::AppendObjectOpen,
+                );
                 completion.await?;
                 Ok(NativeFileAppendObject::open_platform(
                     object,
@@ -1026,7 +1059,11 @@ impl StorageWalRewriteBackend for NativeFileBackend {
                     prepare_native_file_wal_rewrite(&object, &temporary_object, durability)?;
                 let completion = driver
                     .submit_write_temp_rename_path(path, tmp_path, bytes, durability, true, true)?;
-                metrics.record_platform_async_io_task();
+                record_platform_io_task(
+                    metrics.as_ref(),
+                    &driver,
+                    PlatformIoOperation::TempWriteRenamePublish,
+                );
                 completion.await
             });
         }
@@ -1066,7 +1103,11 @@ impl StorageWriterLeaseBackend for NativeFileBackend {
                     object.path().to_path_buf(),
                     Arc::from(owner.as_bytes()),
                 )?;
-                metrics.record_platform_async_io_task();
+                record_platform_io_task(
+                    metrics.as_ref(),
+                    &driver,
+                    PlatformIoOperation::WriterLeaseAcquire,
+                );
                 completion.await?;
                 Ok(NativeFileWriterLease::from_platform(object, owner, driver))
             });
@@ -1086,7 +1127,11 @@ impl BlockingStorageWriterLeaseBackend for NativeFileBackend {
                 object.path().to_path_buf(),
                 Arc::from(owner.as_bytes()),
             )?;
-            self.metrics.record_platform_async_io_task();
+            record_platform_io_task(
+                self.metrics.as_ref(),
+                &driver,
+                PlatformIoOperation::WriterLeaseAcquire,
+            );
             wait_for_platform_io(completion)?;
             return Ok(NativeFileWriterLease::from_platform(object, owner, driver));
         }
@@ -1104,7 +1149,11 @@ impl StorageDirectoryCreateBackend for NativeFileBackend {
                 require_native_file_directory_create()?;
                 let completion =
                     driver.submit_create_dir_all_path(directory.path().to_path_buf())?;
-                metrics.record_platform_async_io_task();
+                record_platform_io_task(
+                    metrics.as_ref(),
+                    &driver,
+                    PlatformIoOperation::DirectoryCreate,
+                );
                 completion.await
             });
         }
@@ -1131,7 +1180,11 @@ impl StorageDirectoryListBackend for NativeFileBackend {
                 require_native_file_directory_listing()?;
                 let completion =
                     driver.submit_list_file_paths_path(directory.path().to_path_buf())?;
-                metrics.record_platform_blocking_fallback_task();
+                record_platform_io_task(
+                    metrics.as_ref(),
+                    &driver,
+                    PlatformIoOperation::DirectoryListing,
+                );
                 let paths = completion.await?;
                 Ok(paths
                     .into_iter()
@@ -1153,7 +1206,11 @@ impl BlockingStorageDirectoryListBackend for NativeFileBackend {
         if let Some(driver) = self.platform_io.clone() {
             require_native_file_directory_listing()?;
             let completion = driver.submit_list_file_paths_path(directory.path().to_path_buf())?;
-            self.metrics.record_platform_blocking_fallback_task();
+            record_platform_io_task(
+                self.metrics.as_ref(),
+                &driver,
+                PlatformIoOperation::DirectoryListing,
+            );
             let paths = wait_for_platform_io(completion)?;
             return Ok(paths
                 .into_iter()
@@ -1173,7 +1230,11 @@ impl StorageDirectorySyncBackend for NativeFileBackend {
             return Box::pin(async move {
                 require_native_file_directory_sync()?;
                 let completion = driver.submit_sync_dir_path(directory.path().to_path_buf())?;
-                metrics.record_platform_async_io_task();
+                record_platform_io_task(
+                    metrics.as_ref(),
+                    &driver,
+                    PlatformIoOperation::DirectorySync,
+                );
                 completion.await
             });
         }
@@ -1199,7 +1260,11 @@ impl StorageManifestReadBackend for NativeFileBackend {
             return Box::pin(async move {
                 require_native_file_manifest_read(&object)?;
                 let completion = driver.submit_read_optional_path(object.path().to_path_buf())?;
-                metrics.record_platform_async_io_task();
+                record_platform_io_task(
+                    metrics.as_ref(),
+                    &driver,
+                    PlatformIoOperation::OptionalWholeObjectRead,
+                );
                 completion.await
             });
         }
@@ -1229,7 +1294,11 @@ impl StorageManifestPublishBackend for NativeFileBackend {
                 let completion = driver.submit_write_temp_rename_path(
                     path, tmp_path, bytes, durability, false, true,
                 )?;
-                metrics.record_platform_async_io_task();
+                record_platform_io_task(
+                    metrics.as_ref(),
+                    &driver,
+                    PlatformIoOperation::TempWriteRenamePublish,
+                );
                 completion.await
             });
         }
@@ -1266,7 +1335,11 @@ impl StorageObjectWriteBackend for NativeFileBackend {
                 let completion = driver.submit_write_temp_rename_path(
                     path, tmp_path, bytes, durability, true, false,
                 )?;
-                metrics.record_platform_async_io_task();
+                record_platform_io_task(
+                    metrics.as_ref(),
+                    &driver,
+                    PlatformIoOperation::TempWriteRenamePublish,
+                );
                 completion.await
             });
         }
@@ -1294,7 +1367,11 @@ impl StorageObjectDeleteBackend for NativeFileBackend {
             return Box::pin(async move {
                 require_native_file_object_delete(&object)?;
                 let completion = driver.submit_delete_path(object.path().to_path_buf())?;
-                metrics.record_platform_async_io_task();
+                record_platform_io_task(
+                    metrics.as_ref(),
+                    &driver,
+                    PlatformIoOperation::ObjectDelete,
+                );
                 completion.await
             });
         }
@@ -1321,7 +1398,11 @@ impl StorageObjectListBackend for NativeFileBackend {
                 require_native_file_object_listing()?;
                 let completion =
                     driver.submit_list_file_paths_path(request.root().to_path_buf())?;
-                metrics.record_platform_blocking_fallback_task();
+                record_platform_io_task(
+                    metrics.as_ref(),
+                    &driver,
+                    PlatformIoOperation::DirectoryListing,
+                );
                 let paths = completion.await?;
                 Ok(native_file_objects_from_paths(&request, paths))
             });
@@ -1340,7 +1421,11 @@ impl BlockingStorageObjectListBackend for NativeFileBackend {
         if let Some(driver) = self.platform_io.clone() {
             require_native_file_object_listing()?;
             let completion = driver.submit_list_file_paths_path(request.root().to_path_buf())?;
-            self.metrics.record_platform_blocking_fallback_task();
+            record_platform_io_task(
+                self.metrics.as_ref(),
+                &driver,
+                PlatformIoOperation::DirectoryListing,
+            );
             let paths = wait_for_platform_io(completion)?;
             return Ok(native_file_objects_from_paths(&request, paths));
         }
@@ -1426,6 +1511,15 @@ impl StorageReadObject for NativeFileObject {
     }
 
     fn len(&self) -> StorageReadFuture<'_, u64> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = &self.platform_io {
+            record_platform_io_task(
+                self.metrics.as_ref(),
+                driver,
+                PlatformIoOperation::LengthLookup,
+            );
+        }
+
         Box::pin(async move { self.len_io()?.await })
     }
 
@@ -1443,8 +1537,12 @@ impl StorageReadObject for NativeFileObject {
         len: usize,
     ) -> StorageReadFuture<'_, StorageReadBuffer> {
         #[cfg(feature = "platform-io")]
-        if self.platform_io.is_some() {
-            self.metrics.record_platform_async_io_task();
+        if let Some(driver) = &self.platform_io {
+            record_platform_io_task(
+                self.metrics.as_ref(),
+                driver,
+                PlatformIoOperation::OwnedRandomRead,
+            );
             return Box::pin(async move { self.read_exact_at_owned_io(offset, len)?.await });
         }
 
@@ -1591,8 +1689,8 @@ impl StorageAppendObject for NativeFileAppendObject {
     ) -> StorageFuture<'op, ()> {
         let bytes: Arc<[u8]> = Arc::from(bytes);
         #[cfg(feature = "platform-io")]
-        if self.platform_io.is_some() {
-            self.metrics.record_platform_async_io_task();
+        if let Some(driver) = &self.platform_io {
+            record_platform_io_task(self.metrics.as_ref(), driver, PlatformIoOperation::Append);
             return Box::pin(async move { self.append_io(bytes, durability)?.await });
         }
 
@@ -1621,8 +1719,8 @@ impl StorageAppendObject for NativeFileAppendObject {
 
     fn persist(&mut self, durability: DurabilityMode) -> StorageFuture<'_, ()> {
         #[cfg(feature = "platform-io")]
-        if self.platform_io.is_some() {
-            self.metrics.record_platform_async_io_task();
+        if let Some(driver) = &self.platform_io {
+            record_platform_io_task(self.metrics.as_ref(), driver, PlatformIoOperation::Persist);
             return Box::pin(async move { self.persist_io(durability)?.await });
         }
 
@@ -2817,8 +2915,7 @@ mod tests {
         );
 
         let stats = backend.stats();
-        assert!(stats.uses_platform_async_io);
-        assert!(stats.platform_async_io_tasks >= 4);
+        assert_platform_task_accounting(stats, 4, 0);
 
         std::fs::remove_dir_all(root).expect("test dir removes");
     }
@@ -2855,6 +2952,41 @@ mod tests {
                 .iter()
                 .any(|file| file.path() == table.path()),
             "blocking directory listing should include the table"
+        );
+    }
+
+    #[cfg(feature = "platform-io")]
+    fn assert_platform_task_accounting(
+        stats: NativeFileStorageStats,
+        min_driver_tasks: u64,
+        min_blocking_fallback_tasks: u64,
+    ) {
+        assert!(stats.uses_platform_async_io);
+        assert_eq!(stats.blocking_adapter_tasks, 0);
+
+        let driver_tasks = stats
+            .platform_async_io_tasks
+            .saturating_add(stats.platform_backend_fallback_tasks);
+        assert!(
+            driver_tasks >= min_driver_tasks,
+            "platform driver task count {driver_tasks} should be at least {min_driver_tasks}"
+        );
+        assert!(
+            stats.platform_blocking_fallback_tasks >= min_blocking_fallback_tasks,
+            "platform blocking fallback count {} should be at least {}",
+            stats.platform_blocking_fallback_tasks,
+            min_blocking_fallback_tasks
+        );
+
+        #[cfg(target_os = "linux")]
+        assert!(
+            stats.platform_async_io_tasks > 0,
+            "Linux platform backend should account true async work"
+        );
+        #[cfg(all(unix, not(target_os = "linux")))]
+        assert_eq!(
+            stats.platform_async_io_tasks, 0,
+            "Unix polling backend must not claim true async file work"
         );
     }
 
@@ -2941,10 +3073,7 @@ mod tests {
         assert!(!table.path().exists(), "table object should be deleted");
 
         let stats = backend.stats();
-        assert!(stats.uses_platform_async_io);
-        assert_eq!(stats.blocking_adapter_tasks, 0);
-        assert!(stats.platform_async_io_tasks >= 9);
-        assert!(stats.platform_blocking_fallback_tasks >= 4);
+        assert_platform_task_accounting(stats, 11, 4);
 
         std::fs::remove_dir_all(root).expect("test dir removes");
     }

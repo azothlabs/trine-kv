@@ -96,8 +96,10 @@ let db = Db::open(options)?;
 Directory and object listing are also submitted through the platform driver.
 The selected platform backend does not expose a directory enumeration primitive,
 so those listing calls are reported as
-`storage_platform_blocking_fallback_tasks`, separate from true platform I/O
-tasks and separate from Trine's bounded blocking adapter task count.
+`storage_platform_blocking_fallback_tasks`. `DbStats` also separates true
+platform async file work (`storage_platform_async_io_tasks`) from platform
+backend fallback work (`storage_platform_backend_fallback_tasks`) and from
+Trine's bounded blocking adapter task count.
 
 `Db`, `Bucket`, and `Snapshot` are cheap handles. `Db` writes to the built-in
 default bucket. A named `Bucket` keeps its database open, so release bucket

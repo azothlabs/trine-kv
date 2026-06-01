@@ -80,6 +80,7 @@ dependencies = [
  "crossbeam-channel",
  "crossbeam-queue",
  "futures-util",
+ "io-uring",
  "libc",
  "once_cell",
  "paste",
@@ -267,6 +268,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
+name = "io-uring"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d09b98f7eace8982db770e4408e7470b028ce513ac28fecdc6bf4c30fe92b62"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -414,6 +426,9 @@ name = "trine-kv"
 version = "0.1.0"
 dependencies = [
  "compio",
+ "compio-driver",
+ "compio-fs",
+ "compio-runtime",
  "lz4_flex",
 ]
 

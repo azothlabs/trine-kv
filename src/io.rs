@@ -37,6 +37,80 @@ impl IoDriverKind {
     }
 }
 
+#[cfg(feature = "platform-io")]
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlatformIoBackendKind {
+    LinuxNative,
+    WindowsNative,
+    UnixFallback,
+    UnsupportedFallback,
+}
+
+#[cfg(feature = "platform-io")]
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlatformIoTaskClass {
+    TrueAsync,
+    BackendFallback,
+    BlockingFallback,
+}
+
+#[cfg(feature = "platform-io")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlatformIoOperation {
+    LengthLookup,
+    OwnedRandomRead,
+    OptionalWholeObjectRead,
+    TempWriteRenamePublish,
+    AppendObjectOpen,
+    Append,
+    Persist,
+    ObjectDelete,
+    DirectoryCreate,
+    DirectorySync,
+    DirectoryListing,
+    WriterLeaseAcquire,
+}
+
+#[cfg(feature = "platform-io")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlatformIoBackendMatrix {
+    pub(crate) kind: PlatformIoBackendKind,
+    pub(crate) length_lookup: PlatformIoTaskClass,
+    pub(crate) owned_random_read: PlatformIoTaskClass,
+    pub(crate) optional_whole_object_read: PlatformIoTaskClass,
+    pub(crate) temp_write_rename_publish: PlatformIoTaskClass,
+    pub(crate) append_object_open: PlatformIoTaskClass,
+    pub(crate) append: PlatformIoTaskClass,
+    pub(crate) persist: PlatformIoTaskClass,
+    pub(crate) object_delete: PlatformIoTaskClass,
+    pub(crate) directory_create: PlatformIoTaskClass,
+    pub(crate) directory_sync: PlatformIoTaskClass,
+    pub(crate) directory_listing: PlatformIoTaskClass,
+    pub(crate) writer_lease_acquire: PlatformIoTaskClass,
+}
+
+#[cfg(feature = "platform-io")]
+impl PlatformIoBackendMatrix {
+    pub(crate) const fn class_for(self, operation: PlatformIoOperation) -> PlatformIoTaskClass {
+        match operation {
+            PlatformIoOperation::LengthLookup => self.length_lookup,
+            PlatformIoOperation::OwnedRandomRead => self.owned_random_read,
+            PlatformIoOperation::OptionalWholeObjectRead => self.optional_whole_object_read,
+            PlatformIoOperation::TempWriteRenamePublish => self.temp_write_rename_publish,
+            PlatformIoOperation::AppendObjectOpen => self.append_object_open,
+            PlatformIoOperation::Append => self.append,
+            PlatformIoOperation::Persist => self.persist,
+            PlatformIoOperation::ObjectDelete => self.object_delete,
+            PlatformIoOperation::DirectoryCreate => self.directory_create,
+            PlatformIoOperation::DirectorySync => self.directory_sync,
+            PlatformIoOperation::DirectoryListing => self.directory_listing,
+            PlatformIoOperation::WriterLeaseAcquire => self.writer_lease_acquire,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IoDriverInfo {
     kind: IoDriverKind,
@@ -390,6 +464,14 @@ impl PlatformIoDriver {
 
     pub(crate) const fn info() -> IoDriverInfo {
         IoDriverInfo::platform()
+    }
+
+    pub(crate) fn backend_matrix() -> PlatformIoBackendMatrix {
+        platform_backend::matrix()
+    }
+
+    pub(crate) fn task_class(operation: PlatformIoOperation) -> PlatformIoTaskClass {
+        Self::backend_matrix().class_for(operation)
     }
 
     pub(crate) fn submit_len_path(&self, path: PathBuf) -> Result<IoCompletion<u64>> {
@@ -768,6 +850,54 @@ mod tests {
         );
         assert_eq!(driver.step().expect("blocking adapter step succeeds"), 0);
         assert_eq!(driver.drain().expect("blocking adapter drain succeeds"), 0);
+    }
+
+    #[cfg(feature = "platform-io")]
+    #[test]
+    fn platform_backend_matrix_matches_target_family() {
+        let matrix = PlatformIoDriver::backend_matrix();
+        assert_eq!(
+            matrix.directory_listing,
+            PlatformIoTaskClass::BlockingFallback
+        );
+
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(matrix.kind, PlatformIoBackendKind::LinuxNative);
+            assert_eq!(matrix.owned_random_read, PlatformIoTaskClass::TrueAsync);
+            assert_eq!(
+                matrix.temp_write_rename_publish,
+                PlatformIoTaskClass::TrueAsync
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(matrix.kind, PlatformIoBackendKind::WindowsNative);
+            assert_eq!(
+                matrix.owned_random_read,
+                PlatformIoTaskClass::BackendFallback
+            );
+            assert_eq!(
+                matrix.temp_write_rename_publish,
+                PlatformIoTaskClass::BackendFallback
+            );
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            assert_eq!(matrix.kind, PlatformIoBackendKind::UnixFallback);
+            assert_eq!(
+                matrix.owned_random_read,
+                PlatformIoTaskClass::BackendFallback
+            );
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            assert_eq!(matrix.kind, PlatformIoBackendKind::UnsupportedFallback);
+            assert_eq!(
+                matrix.owned_random_read,
+                PlatformIoTaskClass::BackendFallback
+            );
+        }
     }
 
     #[test]

@@ -29,6 +29,9 @@ path = "src/lib.rs"
 
 [dependencies]
 compio = { version = "0.14.0", default-features = false, features = ["runtime"], optional = true }
+compio-driver = { version = "0.7.1", default-features = false, features = ["io-uring"], optional = true }
+compio-fs = { version = "0.7.0", default-features = false, features = ["io-uring"], optional = true }
+compio-runtime = { version = "0.7.0", default-features = false, features = ["io-uring"], optional = true }
 lz4_flex = "0.13.1"
 
 [[bench]]
@@ -43,4 +46,4 @@ all = "warn"
 pedantic = "warn"
 
 [features]
-platform-io = ["dep:compio"]
+platform-io = ["dep:compio", "dep:compio-driver", "dep:compio-fs", "dep:compio-runtime"]

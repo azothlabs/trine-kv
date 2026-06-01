@@ -9,7 +9,35 @@ use crate::{
     storage::StorageReadBuffer,
 };
 
-use super::PlatformIoTask;
+use super::{PlatformIoBackendMatrix, PlatformIoTask};
+
+#[cfg(target_os = "linux")]
+mod linux_backend;
+#[cfg(all(unix, not(target_os = "linux")))]
+mod unix_backend;
+#[cfg(not(any(target_os = "linux", windows, unix)))]
+mod unsupported_backend;
+#[cfg(windows)]
+mod windows_backend;
+
+pub(super) fn matrix() -> PlatformIoBackendMatrix {
+    #[cfg(target_os = "linux")]
+    {
+        linux_backend::matrix()
+    }
+    #[cfg(windows)]
+    {
+        windows_backend::matrix()
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        unix_backend::matrix()
+    }
+    #[cfg(not(any(target_os = "linux", windows, unix)))]
+    {
+        unsupported_backend::matrix()
+    }
+}
 
 pub(super) fn run_worker(receiver: mpsc::Receiver<PlatformIoTask>) {
     let runtime = match compio::runtime::Runtime::new() {

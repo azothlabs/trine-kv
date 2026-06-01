@@ -8017,6 +8017,12 @@ Record only evidence that can change planning or durable decisions.
 - `git diff --check`
 - forbidden-term scan
 - project-name scan
+- backend-name leakage scan for docs/current/protocol/roadmap and
+  storage/db/stats/io boundary
+- `cargo fmt --check`
+- `git diff --check`
+- forbidden-term scan
+- project-name scan
 - backend-name leakage scan for docs/current/protocol/roadmap and storage/db/stats/io boundary
 
 ### Remaining Blockers
@@ -8030,3 +8036,69 @@ Record only evidence that can change planning or durable decisions.
 
 - Commit the correction, then start the next platform backend phase only after
   writing the backend boundary receipt first.
+
+## Phases 110-116: Native Platform Backend Matrix Closure
+
+### Observation
+
+- The selected backend line can use Linux native async support when its native
+  async feature is enabled and can use Windows IOCP for lower-level read/write
+  primitives, but current Windows Trine composite storage operations still
+  include fallback-classified open, metadata, sync, rename, or directory steps.
+  Non-Linux Unix falls back to polling.
+- Directory enumeration is not exposed as a true async filesystem operation by
+  the selected backend line.
+- Trine needed per-operation accounting so platform-driver work could be
+  reported as true platform async, backend fallback, or blocking fallback
+  instead of one blended counter.
+
+### Interpretation
+
+- The honest async boundary is operation-specific, not backend-wide.
+- Linux regular-file operations can be classified as true platform async when
+  `platform-io` enables the native async backend feature.
+- Windows has partial true async primitive coverage for lower-level file
+  read/write, but the current Trine operation matrix must classify composite
+  storage operations as backend fallback until every step in the operation has
+  a native async path.
+- macOS/BSD and other non-Linux Unix targets cannot be described as true native
+  async for ordinary file work in this phase.
+
+### Change
+
+- Added a target-family platform backend matrix below Trine's `io` boundary.
+- Added operation classes for true platform async, backend fallback, and
+  blocking fallback.
+- Added target switch modules for Linux, Windows, Unix fallback, and unsupported
+  fallback.
+- Enabled the Linux native async backend feature through `platform-io` without
+  making the backend dependency the architecture subject.
+- Split storage stats into true platform async tasks, platform backend fallback
+  tasks, platform blocking fallback tasks, and bounded blocking-adapter tasks.
+- Recorded directory enumeration as an explicit platform-driver blocking
+  fallback.
+- Added ADR 0002 as the durable native platform I/O backend matrix.
+
+### Verification
+
+- `cargo check`
+- `cargo check --features platform-io`
+- `cargo test platform_backend_matrix_matches_target_family --lib
+  --features platform-io`
+- `cargo test platform_io_native_file_management_ops_use_platform_driver --lib
+  --features platform-io`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+
+### Remaining Blockers
+
+- Directory enumeration remains true-async-blocked until a backend exposes a
+  native async enumeration operation.
+- macOS/BSD ordinary file work remains backend fallback in this phase.
+- Windows composite storage operation classes remain fallback until a
+  target-specific implementation proves stronger end-to-end coverage.
+
+### Recommended Next Action
+
+- Treat phases 110 through 116 as closed. Future OS backend work should start
+  from ADR 0002 and a fresh backend boundary receipt.

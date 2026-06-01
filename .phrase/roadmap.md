@@ -2492,3 +2492,155 @@ backend boundary receipt required before further backend work.
 - Adding target-specific Linux, macOS/BSD, or Windows native backend
   implementations.
 - Making platform I/O the default runtime.
+
+### Phase 110: Native Backend Capability Matrix
+
+**Status**: Complete
+
+**Goal**: Record the native platform backend capability matrix at Trine's `io`
+operation boundary before adding more platform behavior.
+
+**Entry Condition**: Phase 109 complete and backend boundary receipt written.
+
+**Acceptance Gate**:
+
+- Linux, Windows, Unix fallback, and unsupported fallback target families have
+  explicit operation classes.
+- The matrix distinguishes true platform async, backend fallback, and blocking
+  fallback.
+- Directory enumeration is not classified as true platform async.
+
+**Major Out Of Scope**:
+
+- Replacing the selected backend dependency.
+- Making platform I/O the default runtime.
+
+### Phase 111: IO Backend Switch Layer
+
+**Status**: Complete
+
+**Goal**: Keep target-specific platform backend selection below Trine's `io`
+boundary.
+
+**Entry Condition**: Phase 110 matrix accepted.
+
+**Acceptance Gate**:
+
+- `src/io.rs` exposes Trine-owned driver metadata and operation classes.
+- Target-specific backend modules live below the platform backend
+  implementation boundary.
+- Storage, stats, docs, protocol, and roadmap do not name backend dependency
+  crates as the architecture subject.
+
+**Major Out Of Scope**:
+
+- Changing public API, storage format, WAL, MVCC, table, manifest, compaction,
+  transaction, or recovery semantics.
+
+### Phase 112: Linux Native Async Backend
+
+**Status**: Complete
+
+**Goal**: Enable Linux native async backend support through the `platform-io`
+feature and classify supported Linux file operations honestly.
+
+**Entry Condition**: Phase 111 switch layer complete.
+
+**Acceptance Gate**:
+
+- `platform-io` enables the selected backend's Linux native async feature.
+- Linux regular-file operations covered by the backend matrix are classified as
+  true platform async.
+- Directory enumeration remains blocking fallback.
+
+**Major Out Of Scope**:
+
+- Hand-written Linux OS bindings.
+- Making platform I/O the default runtime.
+
+### Phase 113: Windows Backend Classification
+
+**Status**: Complete
+
+**Goal**: Classify Windows platform backend coverage without overstating
+end-to-end IOCP coverage for Trine composite storage operations.
+
+**Entry Condition**: Phase 111 switch layer complete.
+
+**Acceptance Gate**:
+
+- Windows read/write primitives are recorded as IOCP-capable evidence.
+- Current Windows Trine composite storage operations are classified as backend
+  fallback unless every step in the operation has a native async path.
+- Windows metadata/open/sync/rename/directory/listing gaps are classified as
+  backend fallback or blocking fallback.
+- Stats can report fallback work separately from true platform async work.
+
+**Major Out Of Scope**:
+
+- Hand-written Windows OS bindings.
+
+### Phase 114: macOS/BSD Backend Decision
+
+**Status**: Complete
+
+**Goal**: Record the macOS/BSD and other non-Linux Unix fallback decision.
+
+**Entry Condition**: Phase 111 switch layer complete.
+
+**Acceptance Gate**:
+
+- Non-Linux Unix regular-file work is not claimed as true native async in this
+  phase.
+- Fallback-classified platform-driver work remains observable in stats.
+- ADR/protocol wording captures the decision.
+
+**Major Out Of Scope**:
+
+- Claiming kqueue or polling makes ordinary file reads and writes true native
+  async.
+- Adding hand-written macOS or BSD backend code.
+
+### Phase 115: Directory Enumeration Closure
+
+**Status**: Complete
+
+**Goal**: Close directory enumeration honestly as an explicit platform-driver
+blocking fallback.
+
+**Entry Condition**: Phase 110 matrix identifies listing as unsupported for
+true platform async.
+
+**Acceptance Gate**:
+
+- Directory and object listing tasks are counted as platform blocking fallback.
+- Blocking fallback is separate from true platform async work and separate from
+  Trine's bounded blocking adapter.
+- Focused platform storage tests assert fallback accounting.
+
+**Major Out Of Scope**:
+
+- Claiming directory enumeration is true platform async before a backend
+  exposes a native async enumeration operation.
+
+### Phase 116: Async Storage Final Gate
+
+**Status**: Complete
+
+**Goal**: Verify the async storage platform I/O closure across formatting,
+linting, tests, naming, and protocol evidence.
+
+**Entry Condition**: Phases 110 through 115 complete.
+
+**Acceptance Gate**:
+
+- Formatting, clippy, focused platform tests, full tests, diff checks,
+  forbidden-term scan, project-name scan, and backend-name leakage scan pass.
+- Current phase, roadmap, evidence, protocol, and ADR documents match the
+  implemented boundary.
+- Commit records why the change exists, what was verified, and what risks
+  remain.
+
+**Major Out Of Scope**:
+
+- New platform behavior beyond the accepted matrix.

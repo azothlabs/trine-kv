@@ -42,6 +42,8 @@ Evidence notes should separate:
 ## Trine KV V1 Source Of Truth
 
 - V1 engine decision: `.phrase/adr/0001-v1-lsm-mvcc-engine.md`.
+- Native platform I/O backend matrix:
+  `.phrase/adr/0002-native-platform-io-backend-matrix.md`.
 - V1 protocol and storage contract: `.phrase/protocol/trine-kv-v1-spec.md`.
 - Trine specs, ADRs, tests, and local design notes are the source of truth.
 - Do not implement Trine by depending on another storage engine.
