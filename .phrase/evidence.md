@@ -7161,3 +7161,360 @@ Record only evidence that can change planning or durable decisions.
 - Record/benchmark the bounded delta read cost before choosing the next
   write-path step. WAL shard front doors should remain a later persistent write
   phase until recovery and cancellation tests are staged for that change.
+
+## Phase 96: Delta Read Cost Measurement
+
+### Observation
+
+- Phase 95 removed the active-memtable mirror for in-memory commits, so the
+  generic in-memory benchmark rows began measuring delta-backed reads without
+  saying that explicitly.
+- The async/write-path protocols require read-amplification evidence before
+  changing the next write boundary.
+
+### Interpretation
+
+- The safe next slice was measurement rather than WAL shard work.
+- Active-memtable comparison rows are useful as a local read-path baseline when
+  they avoid freeze/flush and table reads.
+- Merged-delta rows show the best bounded delta shape when open epochs are
+  forced to merge quickly.
+
+### Change
+
+- Added v1 benchmark rows for active-memtable point/range reads and
+  merged-delta point/missing/range reads.
+- The new rows assert recent write bytes exist while immutable memtables and
+  table files stay absent.
+- Recorded the benchmark output in
+  `docs/benchmarks/v1-delta-read-cost.md`.
+
+### Verification
+
+- `cargo test --bench v1_bench`
+- `cargo fmt`
+- `cargo bench --bench v1_bench`
+
+### Benchmark Rows
+
+- `random get`: 1560 us
+- `missing get`: 1221 us
+- `active memtable random get`: 768 us
+- `merged delta random get`: 697 us
+- `merged delta missing get`: 484 us
+- `bounded range scan`: 6057 us
+- `active memtable range scan`: 2040 us
+- `merged delta range scan`: 3019 us
+
+### Remaining Blockers
+
+- Default in-memory rows were still materially slower than merged-delta rows,
+  so default open-epoch read-chain cost needed one more narrow pass before WAL
+  shard front doors.
+- The publish barrier still serializes transaction validation, WAL append,
+  delta publication, visibility marking, and persistent freeze.
+- Persistent commits still use the single WAL writer.
+
+### Recommended Next Action
+
+- Tune the default delta read-chain budget before WAL shard front-door work.
+
+## Phase 97: Delta Read Chain Budget
+
+### Observation
+
+- Phase 96 showed merged-delta point reads in the same local range as
+  active-memtable reads, while default in-memory point and range rows remained
+  slower.
+- Lowering the delta-count budget to 4 improved range reads in one run but made
+  write-path rows less convincing, so that path was rejected.
+- Keeping the budget value at 8 and merging when the shard reaches the budget
+  reduces a common high-water read chain without lowering the configured
+  budget.
+
+### Interpretation
+
+- The useful fix was a budget-boundary adjustment, not a broader delta shard
+  redesign.
+- This keeps the write-path behavior close to the previous merge frequency
+  while avoiding a default state that can stop exactly at the longest allowed
+  chain.
+
+### Change
+
+- Delta open epochs now merge when the shard reaches the delta-count budget.
+- Focused delta tests now assert snapshot-safe visibility and bounded chains
+  without relying on the old exact "beyond budget" counts.
+- Recorded before/after rows in
+  `docs/benchmarks/v1-delta-read-chain-budget.md`.
+
+### Verification
+
+- `cargo test delta --lib`
+- `cargo test --test in_memory_mvcc`
+- `cargo test --bench v1_bench`
+- `cargo fmt --check`
+- `cargo bench --bench v1_bench` repeated after the change
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan passed outside instruction files.
+
+### Benchmark Rows
+
+- `random get`: 1560 us before; 1114 us and 1101 us after
+- `missing get`: 1221 us before; 789 us and 760 us after
+- `bounded range scan`: 6057 us before; 4212 us and 4018 us after
+- `batch write`: 643 us before; 845 us and 630 us after
+- `single-key put`: 7711 us before; 16155 us and 8696 us after
+
+### Remaining Blockers
+
+- The publish barrier still serializes transaction validation, WAL append,
+  delta publication, visibility marking, and persistent freeze.
+- Persistent commits still use the single WAL writer.
+- Native-file async reads still use the bounded blocking adapter rather than
+  platform-native async file I/O.
+- Table open header/footer reads still use synchronous borrowed reads.
+
+### Recommended Next Action
+
+- Return to the async/write-path plan by staging persistent WAL front-door work
+  only after recovery and cancellation tests are prepared.
+
+## Phase 98: Persistent WAL Front-Door Staging
+
+### Observation
+
+- Phase 97 removed delta read-chain cost as the immediate blocker.
+- The foreground write-path protocol requires recovery and cancellation tests
+  before WAL shard front-door changes.
+- Persistent commits still routed directly through a single locked `WalWriter`
+  inside the publish barrier.
+
+### Interpretation
+
+- The safe next slice was to name the WAL front-door boundary while keeping one
+  lane, one WAL file, existing frame format, existing recovery ordering, and
+  the current publish barrier.
+- The tests should prove the future split points: WAL accept is recovery truth,
+  unpolled async writes do nothing, and accepted async writes survive caller
+  future drop.
+
+### Change
+
+- Added `WalFrontDoor`, a single-lane wrapper around the current `WalWriter`.
+- Routed persistent commit append, explicit WAL persist, and WAL rewrite/reopen
+  through the front-door boundary.
+- Added WAL unit tests proving whole-record accept and rewrite plus continued
+  append.
+- Added a persistent recovery test that manually writes a WAL-accepted record
+  with no in-memory publish, then reopens and reads it through WAL replay.
+- Added persistent async cancellation tests for dropped unpolled writes and
+  dropped polled accepted writes that survive reopen.
+
+### Verification
+
+- `cargo test wal --lib`
+- `cargo test --test async_api`
+- `cargo test --test persistent_wal`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan passed outside instruction files.
+
+### Remaining Blockers
+
+- The publish barrier still serializes transaction validation, WAL append,
+  persistent memtable publication, visibility marking, and persistent freeze.
+- Persistent commits still use one WAL append lane.
+- WAL shard recovery merge order is not implemented yet.
+- Native-file async reads still use the bounded blocking adapter rather than
+  platform-native async file I/O.
+- Table open header/footer reads still use synchronous borrowed reads.
+
+### Recommended Next Action
+
+- Start separating WAL front-door acceptance from the current publish barrier
+  while keeping one WAL lane and the existing recovery contract.
+
+## Phase 99: Persistent WAL Preaccept
+
+### Observation
+
+- Phase 98 named the WAL front-door boundary and added recovery/cancellation
+  tests, but persistent commit append still happened inside the publish barrier.
+- The protocol order allows persistent writes to route through WAL front doors
+  before changing visible-sequence behavior or WAL shard recovery ordering.
+
+### Interpretation
+
+- Persistent blind writes can accept WAL before publication because they do not
+  need transaction read-set validation.
+- Transaction writes must stay deferred until validation succeeds inside the
+  publish barrier.
+- Commit slot reservation plus WAL acceptance can move earlier without changing
+  reader visibility because `CommitTracker` only advances the visible sequence
+  after publication marks the slot visible.
+
+### Change
+
+- Added writer-local `WalAcceptState` to distinguish deferred commits from
+  commits already accepted by the WAL front door.
+- Persistent non-transaction writes now reserve a commit slot and accept their
+  whole WAL record before entering the publish barrier.
+- The publish path reuses a preaccepted slot, while deferred paths still reserve
+  and accept under the barrier.
+- Added a focused commit test proving the WAL record exists before publication,
+  while `last_committed_sequence` and point reads remain unchanged until the
+  writer-local state is published.
+
+### Verification
+
+- `cargo test persistent_blind_write_accepts_wal_before_publish_barrier --lib`
+- `cargo test wal --lib`
+- `cargo test --test async_api`
+- `cargo test --test persistent_wal`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan passed outside instruction files.
+
+### Remaining Blockers
+
+- The publish barrier still serializes transaction validation, persistent
+  memtable publication, visibility marking, and persistent freeze.
+- Transaction writes still accept WAL only after read-set validation inside the
+  publish barrier.
+- Persistent commits still use one WAL append lane.
+- WAL shard recovery merge order is not implemented yet.
+- Native-file async reads still use the bounded blocking adapter rather than
+  platform-native async file I/O.
+- Table open header/footer reads still use synchronous borrowed reads.
+
+### Recommended Next Action
+
+- Continue with visible-sequence publication work before changing WAL shard
+  recovery ordering or adding multiple WAL lanes.
+
+## Phase 100: Visible-Sequence Completion
+
+### Observation
+
+- Phase 99 moved persistent blind-write WAL acceptance before the publish
+  barrier, but normal writer-local publish still completed slot visibility
+  inside the publish function.
+- `CommitTracker` already had visible-sequence ordering and could hold public
+  visibility behind an earlier open slot.
+
+### Interpretation
+
+- Slot visibility completion can move out of the normal publish-barrier path
+  without letting readers see data early, because readers use the tracker
+  visible sequence.
+- Transaction validation, memtable publication, and persistent freeze should
+  remain under the publish barrier for this slice.
+- The useful proof is out-of-order slot completion: a later slot can finish
+  first, but public visibility must not advance past the earlier slot.
+
+### Change
+
+- `PublishedWrite` now carries an optional `CommitSlot` for later visibility
+  completion.
+- `publish_accepted_write_state` drops the publish barrier before marking the
+  slot visible in the normal success path.
+- Manual writer-local publish tests now complete slots explicitly.
+- Added a focused test that publishes two writer-local states, completes the
+  second slot first, and proves the visible sequence waits for the first slot
+  before exposing either write.
+
+### Verification
+
+- `cargo test visible_sequence_waits_for_earlier_published_slot_completion --lib`
+- `cargo test writer_local_state_publishes_under_publish_barrier --lib`
+- `cargo test persistent_blind_write_accepts_wal_before_publish_barrier --lib`
+- `cargo test commit_tracker --lib`
+- `cargo test commit --lib`
+- `cargo test --test async_api`
+- `cargo test --test persistent_wal`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan passed outside instruction files.
+
+### Remaining Blockers
+
+- The publish barrier still serializes transaction validation, persistent
+  memtable publication, and persistent freeze.
+- Transaction writes still accept WAL only after read-set validation inside the
+  publish barrier.
+- Persistent commits still use one WAL append lane.
+- WAL shard recovery merge order is not implemented yet.
+- Native-file async reads still use the bounded blocking adapter rather than
+  platform-native async file I/O.
+- Table open header/footer reads still use synchronous borrowed reads.
+
+### Recommended Next Action
+
+- Choose the next write-path slice from current evidence: either introduce a
+  single-lane WAL front-door worker boundary or stage WAL shard recovery merge
+  tests before adding multiple WAL lanes.
+
+## Phase 101: WAL Recovery Merge Boundary
+
+### Observation
+
+- Phase 100 moved normal slot visibility completion out of the publish barrier,
+  but recovery still consumed one ordered WAL batch stream directly.
+- The foreground write-path protocol requires deterministic sequence-order
+  replay before multiple WAL append lanes can be safe.
+
+### Interpretation
+
+- A recovery merge helper can be introduced before multiple WAL files exist, as
+  long as current persistent open still feeds exactly one stream.
+- The helper should reject duplicate commit sequences across streams and
+  non-increasing sequences inside a stream, because either case would make
+  recovery ambiguous.
+
+### Change
+
+- Added `wal::merge_batch_streams_by_sequence`.
+- The helper validates source stream order, sorts merged batches by commit
+  sequence, and rejects duplicate sequences across streams.
+- Persistent open now routes the current single WAL stream through the merge
+  helper before replay.
+- Added focused WAL tests for cross-source ordering, duplicate sequence
+  rejection, and non-increasing source rejection.
+
+### Verification
+
+- `cargo test wal_stream_merge --lib`
+- `cargo test wal --lib`
+- `cargo test --test persistent_wal`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan passed outside instruction files.
+
+### Remaining Blockers
+
+- The database still has one WAL append lane and one WAL file.
+- WAL shard file discovery and per-shard recovery reads are not implemented.
+- The publish barrier still serializes transaction validation, persistent
+  memtable publication, and persistent freeze.
+- Transaction writes still accept WAL only after read-set validation inside the
+  publish barrier.
+- Native-file async reads still use the bounded blocking adapter rather than
+  platform-native async file I/O.
+- Table open header/footer reads still use synchronous borrowed reads.
+
+### Recommended Next Action
+
+- Choose a narrow next slice: either WAL shard file discovery with one active
+  lane, or a single-lane front-door worker queue that preserves the merge and
+  recovery rules now tested.

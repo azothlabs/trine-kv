@@ -39,7 +39,7 @@ use crate::{
     table::{self, Table},
     transaction::{Transaction, TransactionOptions},
     types::{CommitInfo, KeyRange, Sequence, Value},
-    wal::{self, WalWriter},
+    wal::{self, WalFrontDoor},
     write_batch::BatchOperation,
 };
 
@@ -63,7 +63,7 @@ pub(crate) struct DbInner {
     snapshots: Arc<SnapshotTracker>,
     pending_obsolete_table_ids: Mutex<BTreeSet<table::TableId>>,
     manifest: Option<Mutex<ManifestStore>>,
-    wal: Option<Mutex<WalWriter>>,
+    wal: Option<WalFrontDoor>,
     block_cache: Arc<cache::BlockCache>,
     compaction_runs: AtomicU64,
     compaction_input_tables: AtomicU64,
@@ -784,13 +784,14 @@ impl Db {
         let wal_path = wal::wal_path(path);
         let batches =
             wal::read_batches_after_with_backend(&native_storage, &wal_path, replay_floor)?;
+        let batches = wal::merge_batch_streams_by_sequence([batches])?;
         let wal = if options.read_only {
             None
         } else {
-            Some(Mutex::new(WalWriter::open_append_with_backend(
+            Some(WalFrontDoor::open_single_lane_with_backend(
                 &native_storage,
                 &wal_path,
-            )?))
+            )?)
         };
 
         let db = Self {
@@ -1197,9 +1198,7 @@ impl Db {
             StorageMode::InMemory => Ok(()),
             StorageMode::Persistent { .. } => {
                 if let Some(wal) = &self.inner.wal {
-                    wal.lock()
-                        .map_err(|_| lock_poisoned("WAL writer"))?
-                        .persist(mode)?;
+                    wal.persist(mode)?;
                 }
                 Ok(())
             }
@@ -2607,15 +2606,11 @@ impl Db {
             return Ok(());
         };
 
-        let wal_path = wal::wal_path(db_path);
-        let mut writer = wal.lock().map_err(|_| lock_poisoned("WAL writer"))?;
-        writer.persist(DurabilityMode::SyncAll)?;
-        wal::rewrite_batches_after_with_backend(
+        wal.rewrite_after_replay_floor(
             &self.inner.native_storage,
-            &wal_path,
+            &wal::wal_path(db_path),
             replay_floor,
-        )?;
-        writer.reopen_append_with_backend(&self.inner.native_storage, &wal_path)
+        )
     }
 
     fn install_flushed_tables(

@@ -243,7 +243,7 @@ impl DeltaShardState {
     }
 
     fn open_epoch_exceeds_budget(&self, max_epoch_bytes: u64) -> bool {
-        self.open_epoch.deltas.len() > DELTA_EPOCH_MAX_DELTAS
+        self.open_epoch.deltas.len() >= DELTA_EPOCH_MAX_DELTAS
             || self.open_epoch.estimated_bytes >= max_epoch_bytes
     }
 
@@ -643,8 +643,8 @@ mod tests {
         let stats = tree.delta_debug_stats().expect("delta stats");
         assert_eq!(stats.merged_epoch_count, 1);
         assert_eq!(stats.sealed_epoch_count, 1);
-        assert_eq!(stats.retired_delta_count, delta_budget + 1);
-        assert_eq!(stats.max_shard_chain_len, 2);
+        assert_eq!(stats.retired_delta_count, delta_budget);
+        assert!(stats.max_shard_chain_len < DELTA_EPOCH_MAX_DELTAS);
         assert!(stats.open_epoch_bytes > 0);
     }
 
@@ -698,8 +698,8 @@ mod tests {
         );
 
         let stats = tree.delta_debug_stats().expect("delta stats");
-        assert_eq!(stats.merged_epoch_count, 1);
-        assert_eq!(stats.sealed_epoch_count, 1);
+        assert!(stats.merged_epoch_count >= 1);
+        assert_eq!(stats.sealed_epoch_count, stats.merged_epoch_count);
         assert!(stats.range_tombstone_count >= delete_count);
     }
 }

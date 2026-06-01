@@ -11,7 +11,7 @@ use trine_kv::{
     BlobGcRatio, BlobLevelMergePolicy, BucketOptions, CompressionProfile, Db, DbOptions,
     DurabilityMode, Error, FailOnCorruptionPolicy, FilterPolicy, IndexSearchPolicy, KeyRange,
     PrefixExtractor, PrefixFilterPolicy, Sequence, TransactionOptions, WriteBatch, WriteOptions,
-    blob, codec::CodecId, manifest, recovery, table, wal,
+    blob, codec::CodecId, manifest, recovery, table, wal, write_batch::BatchOperation,
 };
 
 fn temp_db_path(name: &str) -> PathBuf {
@@ -244,6 +244,42 @@ fn persistent_wal_replays_point_and_range_batches() {
             )
             .expect("post-replay write commits");
         assert_eq!(info.sequence().get(), 6);
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_recovery_replays_front_door_accepted_record_without_memory_publish() {
+    let path = temp_db_path("front-door-recovery");
+    let options = DbOptions::persistent(&path).with_durability(DurabilityMode::Flush);
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db creates manifest");
+        assert_eq!(db.last_committed_sequence(), Sequence::ZERO);
+    }
+
+    let mut writer = wal::WalWriter::open_append(&wal::wal_path(&path)).expect("WAL opens");
+    writer
+        .append_batch(
+            Sequence::new(1),
+            &[BatchOperation::Put {
+                bucket: "default".to_owned(),
+                key: b"accepted".to_vec(),
+                value: b"from-wal".to_vec(),
+            }],
+            DurabilityMode::Flush,
+        )
+        .expect("front-door accepted record is written");
+
+    {
+        let db = Db::open(options).expect("persistent db replays WAL-only record");
+        let bucket = db.default_bucket().expect("bucket reopens");
+        assert_eq!(
+            bucket.get(b"accepted").expect("accepted record replays"),
+            Some(b"from-wal".to_vec())
+        );
+        assert_eq!(db.last_committed_sequence(), Sequence::new(1));
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");

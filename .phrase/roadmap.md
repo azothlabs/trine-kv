@@ -2111,3 +2111,153 @@ plus merge behavior.
   compaction, and public API shape remain unchanged.
 - Focused in-memory/transaction/async/persistent-write-buffer tests,
   formatting, clippy, full tests, and diff checks pass.
+
+### Phase 96: Delta Read Cost Measurement
+
+**Status**: Complete
+
+**Goal**: Measure the bounded read-path cost introduced by delta-backed
+in-memory writes before selecting the next async/write-path implementation
+slice.
+
+**Entry Condition**: Phase 95 complete and in-memory writes no longer replay
+through the active memtable.
+
+**Acceptance Gate**:
+
+- The v1 benchmark emits active-memtable and delta-backed rows for point and
+  bounded range reads.
+- The delta-backed rows assert they are reading recent in-memory write data
+  without immutable memtables or table files.
+- The active-memtable comparison rows assert they avoid freeze/flush and table
+  reads.
+- Benchmark output is recorded as evidence with a clear next recommendation.
+- Public async/blocking API, storage formats, MVCC, recovery contract, commit
+  tracker, compaction behavior, and WAL/table/blob/manifest formats remain
+  unchanged.
+- Focused benchmark build/run, formatting, clippy, full tests, diff checks, and
+  forbidden-term scan pass.
+
+### Phase 97: Delta Read Chain Budget
+
+**Status**: Complete
+
+**Goal**: Reduce the default in-memory delta read-chain cost exposed by Phase
+96 without changing public API, storage formats, or persistent write behavior.
+
+**Entry Condition**: Phase 96 benchmark evidence shows merged-delta reads are
+bounded, while default in-memory rows remain slower because open epochs can
+keep multiple deltas per shard.
+
+**Acceptance Gate**:
+
+- Default in-memory point and bounded range benchmark rows improve or remain
+  acceptable relative to the Phase 96 measurement.
+- Write-path benchmark rows do not regress enough to invalidate the change.
+- Delta epoch merge tests still prove snapshot-safe point and range tombstone
+  visibility.
+- Public async/blocking API, storage formats, MVCC, recovery contract, commit
+  tracker, compaction behavior, and persistent WAL/table/blob/manifest formats
+  remain unchanged.
+- Focused delta/in-memory/benchmark verification, formatting, clippy, full
+  tests, diff checks, and forbidden-term scan pass.
+
+### Phase 98: Persistent WAL Front-Door Staging
+
+**Status**: Complete
+
+**Goal**: Put persistent WAL append behind a named front-door boundary and
+stage recovery/cancellation tests before later WAL shard work.
+
+**Entry Condition**: Phase 97 complete and the async/write-path protocol says
+WAL front-door work must wait for recovery and cancellation tests.
+
+**Acceptance Gate**:
+
+- Persistent commits append through a named WAL front-door boundary while still
+  using one WAL lane and the existing WAL file format.
+- The front-door boundary can accept a whole commit record, rewrite after a
+  replay floor, and continue accepting appends.
+- Recovery tests prove a WAL-accepted record can replay even when no in-memory
+  publish happened before open.
+- Persistent async cancellation tests prove unpolled writes leave no WAL record
+  and polled accepted writes survive caller future drop plus reopen.
+- Public async/blocking API, storage formats, MVCC, recovery contract,
+  compaction behavior, and manifest/table/blob formats remain unchanged.
+- Focused WAL/recovery/async tests, formatting, clippy, full tests, diff
+  checks, and forbidden-term scan pass.
+
+### Phase 99: Persistent WAL Preaccept
+
+**Status**: Complete
+
+**Goal**: Separate persistent blind-write WAL acceptance from the publish
+barrier while keeping visibility, transaction validation, and recovery
+semantics unchanged.
+
+**Entry Condition**: Phase 98 complete and persistent commits route through the
+named single-lane WAL front door.
+
+**Acceptance Gate**:
+
+- Persistent non-transaction writes can reserve a commit slot and accept the
+  whole WAL record before entering the publish barrier.
+- The accepted WAL record remains invisible to readers until writer-local state
+  is published and the commit slot becomes visible.
+- Transaction writes continue accepting WAL only after read-set validation.
+- In-memory writes continue using the deferred no-WAL path.
+- One WAL lane, WAL frame format, recovery contract, public async/blocking API,
+  storage formats, MVCC, compaction behavior, and manifest/table/blob formats
+  remain unchanged.
+- Focused commit/WAL/recovery/async tests, formatting, clippy, full tests, diff
+  checks, and forbidden-term scan pass.
+
+### Phase 100: Visible-Sequence Completion
+
+**Status**: Complete
+
+**Goal**: Move normal commit slot visibility completion out of the publish
+barrier while preserving data-publication ordering and reader-visible sequence
+rules.
+
+**Entry Condition**: Phase 99 complete and persistent blind writes can accept
+WAL before waiting for publication.
+
+**Acceptance Gate**:
+
+- Writer-local publish returns the commit slot that must become visible.
+- The public write path leaves the publish barrier before completing the commit
+  slot in the normal success path.
+- Completing a later slot before an earlier slot does not advance public
+  visibility past the earlier open slot.
+- Transaction validation, memtable publication, and persistent freeze remain
+  serialized by the publish barrier.
+- One WAL lane, WAL frame format, recovery contract, public async/blocking API,
+  storage formats, MVCC, compaction behavior, and manifest/table/blob formats
+  remain unchanged.
+- Focused commit/WAL/recovery/async tests, formatting, clippy, full tests, diff
+  checks, and forbidden-term scan pass.
+
+### Phase 101: WAL Recovery Merge Boundary
+
+**Status**: Complete
+
+**Goal**: Stage the WAL recovery sequence-merge boundary for future WAL shard
+replay while keeping current persistent databases on one WAL stream.
+
+**Entry Condition**: Phase 100 complete and visible-sequence completion no
+longer depends on the normal publish-barrier path.
+
+**Acceptance Gate**:
+
+- WAL batch-stream merge orders batches from multiple sources by commit
+  sequence.
+- WAL batch-stream merge rejects duplicate commit sequences across sources.
+- WAL batch-stream merge rejects non-increasing sequences inside one source.
+- Current persistent open still reads one WAL stream and replays through the
+  merge boundary.
+- One WAL lane, WAL file name, WAL frame format, recovery behavior, public
+  async/blocking API, storage formats, MVCC, compaction behavior, and
+  manifest/table/blob formats remain unchanged.
+- Focused WAL/recovery tests, formatting, clippy, full tests, diff checks, and
+  forbidden-term scan pass.

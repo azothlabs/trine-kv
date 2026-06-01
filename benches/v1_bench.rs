@@ -29,7 +29,12 @@ fn main() {
         bench_batch_write(),
         bench_random_get(),
         bench_missing_get(),
+        bench_active_memtable_random_get(),
+        bench_delta_backed_random_get(),
+        bench_delta_backed_missing_get(),
         bench_bounded_range_scan(),
+        bench_active_memtable_range_scan(),
+        bench_delta_backed_range_scan(),
         bench_prefix_scan(),
     ];
     results.extend(bench_prefix_partition_scans());
@@ -127,32 +132,39 @@ fn bench_random_get() -> BenchResult {
     let db = populated_memory_db(ROWS);
     let bucket = db.default_bucket().expect("bucket opens");
     measure("random get", OPS, || {
-        let mut checksum = 0;
-        let mut seed = 0x1234_5678_u64;
-        for _ in 0..OPS {
-            seed = xorshift(seed);
-            let index = seed_index(seed, ROWS);
-            checksum += bucket
-                .get(&key(index))
-                .expect("get succeeds")
-                .map_or(0, |value| value.len() as u64);
-        }
-        checksum
+        random_get_checksum(&bucket, ROWS, OPS, 0x1234_5678)
     })
 }
 
 fn bench_missing_get() -> BenchResult {
     let db = populated_memory_db(ROWS);
     let bucket = db.default_bucket().expect("bucket opens");
-    measure("missing get", OPS, || {
-        let mut checksum = 0;
-        for index in 0..OPS {
-            checksum += bucket
-                .get(format!("missing-{index:04}").as_bytes())
-                .expect("missing get succeeds")
-                .map_or(0, |value| value.len() as u64);
-        }
-        checksum
+    measure("missing get", OPS, || missing_get_checksum(&bucket, OPS))
+}
+
+fn bench_active_memtable_random_get() -> BenchResult {
+    let (dir, db, bucket) = populated_active_memtable_db("active-memtable-random-get", ROWS);
+    let result = measure("active memtable random get", OPS, || {
+        random_get_checksum(&bucket, ROWS, OPS, 0x4ac7_1fe5)
+    });
+    drop(db);
+    cleanup_dir(&dir);
+    result
+}
+
+fn bench_delta_backed_random_get() -> BenchResult {
+    let db = populated_delta_memory_db(ROWS);
+    let bucket = db.default_bucket().expect("bucket opens");
+    measure("merged delta random get", OPS, || {
+        random_get_checksum(&bucket, ROWS, OPS, 0x4ac7_1fe5)
+    })
+}
+
+fn bench_delta_backed_missing_get() -> BenchResult {
+    let db = populated_delta_memory_db(ROWS);
+    let bucket = db.default_bucket().expect("bucket opens");
+    measure("merged delta missing get", OPS, || {
+        missing_get_checksum(&bucket, OPS)
     })
 }
 
@@ -160,17 +172,25 @@ fn bench_bounded_range_scan() -> BenchResult {
     let db = populated_memory_db(ROWS);
     let bucket = db.default_bucket().expect("bucket opens");
     measure("bounded range scan", 128, || {
-        let mut checksum = 0;
-        for start in 0..128 {
-            let end = start + 32;
-            let iter = bucket
-                .range(&KeyRange::half_open(key(start), key(end)))
-                .expect("range succeeds");
-            checksum += iter
-                .map(|item| item.expect("range item").value.len() as u64)
-                .sum::<u64>();
-        }
-        checksum
+        range_scan_checksum(&bucket, 128)
+    })
+}
+
+fn bench_active_memtable_range_scan() -> BenchResult {
+    let (dir, db, bucket) = populated_active_memtable_db("active-memtable-range-scan", ROWS);
+    let result = measure("active memtable range scan", 128, || {
+        range_scan_checksum(&bucket, 128)
+    });
+    drop(db);
+    cleanup_dir(&dir);
+    result
+}
+
+fn bench_delta_backed_range_scan() -> BenchResult {
+    let db = populated_delta_memory_db(ROWS);
+    let bucket = db.default_bucket().expect("bucket opens");
+    measure("merged delta range scan", 128, || {
+        range_scan_checksum(&bucket, 128)
     })
 }
 
@@ -811,6 +831,64 @@ fn populated_memory_db(rows: usize) -> Db {
     db
 }
 
+fn populated_delta_memory_db(rows: usize) -> Db {
+    let mut options = DbOptions::memory();
+    options.write_buffer_bytes = 1;
+    let db = Db::memory(options).expect("memory db opens");
+    let bucket = db.default_bucket().expect("bucket opens");
+    for index in 0..rows {
+        bucket.put(key(index), value(index)).expect("put succeeds");
+    }
+    assert_delta_backed_memory_stats(&db);
+    db
+}
+
+fn populated_active_memtable_db(name: &str, rows: usize) -> (PathBuf, Db, trine_kv::Bucket) {
+    let dir = temp_dir(name);
+    let mut options = DbOptions::persistent(&dir);
+    options.background_worker_count = 0;
+    options.write_buffer_bytes = 64 * 1024 * 1024;
+    let db = Db::open(options).expect("persistent db opens");
+    let bucket = db.default_bucket().expect("bucket opens");
+    for index in 0..rows {
+        bucket.put(key(index), value(index)).expect("put succeeds");
+    }
+    assert_active_memtable_stats(&db);
+    (dir, db, bucket)
+}
+
+fn assert_delta_backed_memory_stats(db: &Db) {
+    let stats = db.stats();
+    assert!(
+        stats.memtable_bytes > 0,
+        "delta-backed benchmark must keep recent write bytes in memory stats"
+    );
+    assert_eq!(
+        stats.immutable_memtables, 0,
+        "delta-backed benchmark must not use immutable memtable queues"
+    );
+    assert_eq!(
+        stats.total_tables, 0,
+        "delta-backed benchmark must stay in memory"
+    );
+}
+
+fn assert_active_memtable_stats(db: &Db) {
+    let stats = db.stats();
+    assert!(
+        stats.memtable_bytes > 0,
+        "active memtable benchmark must keep recent write bytes in memory stats"
+    );
+    assert_eq!(
+        stats.immutable_memtables, 0,
+        "active memtable benchmark must avoid freeze/flush work"
+    );
+    assert_eq!(
+        stats.total_tables, 0,
+        "active memtable benchmark must avoid table reads"
+    );
+}
+
 fn populated_prefix_db(rows: usize, filters: bool) -> Db {
     let mut options = DbOptions::memory();
     options.default_bucket_options = prefix_options(filters);
@@ -822,6 +900,44 @@ fn populated_prefix_db(rows: usize, filters: bool) -> Db {
             .expect("put succeeds");
     }
     db
+}
+
+fn random_get_checksum(bucket: &trine_kv::Bucket, rows: usize, ops: usize, mut seed: u64) -> u64 {
+    let mut checksum = 0;
+    for _ in 0..ops {
+        seed = xorshift(seed);
+        let index = seed_index(seed, rows);
+        checksum += bucket
+            .get(&key(index))
+            .expect("get succeeds")
+            .map_or(0, |value| value.len() as u64);
+    }
+    checksum
+}
+
+fn missing_get_checksum(bucket: &trine_kv::Bucket, ops: usize) -> u64 {
+    let mut checksum = 0;
+    for index in 0..ops {
+        checksum += bucket
+            .get(format!("missing-{index:04}").as_bytes())
+            .expect("missing get succeeds")
+            .map_or(0, |value| value.len() as u64);
+    }
+    checksum
+}
+
+fn range_scan_checksum(bucket: &trine_kv::Bucket, scans: usize) -> u64 {
+    let mut checksum = 0;
+    for start in 0..scans {
+        let end = start + 32;
+        let iter = bucket
+            .range(&KeyRange::half_open(key(start), key(end)))
+            .expect("range succeeds");
+        checksum += iter
+            .map(|item| item.expect("range item").value.len() as u64)
+            .sum::<u64>();
+    }
+    checksum
 }
 
 fn flushed_persistent_db(

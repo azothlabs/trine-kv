@@ -10,7 +10,7 @@ use std::{
 
 use trine_kv::{
     BucketOptions, Db, DbOptions, DurabilityMode, Iter, KeyRange, KeyValue, LazyIter,
-    RuntimeOptions, Sequence, TransactionOptions, WriteBatch, WriteOptions,
+    RuntimeOptions, Sequence, TransactionOptions, WriteBatch, WriteOptions, wal,
 };
 
 struct ThreadWake {
@@ -263,6 +263,43 @@ fn dropping_unpolled_async_write_future_has_no_side_effect() {
 }
 
 #[test]
+fn dropping_unpolled_persistent_async_write_future_has_no_wal_side_effect() {
+    let path = temp_db_path("persistent-unpolled-write");
+    let mut options = DbOptions::persistent(&path).with_durability(DurabilityMode::Flush);
+    options.background_worker_count = 0;
+    let db = Db::open(options.clone()).expect("persistent db opens");
+
+    let write = db.put_with_options_async(
+        b"cancelled".to_vec(),
+        b"value".to_vec(),
+        WriteOptions::flush(),
+    );
+    drop(write);
+
+    assert_eq!(
+        db.get(b"cancelled").expect("read after dropped future"),
+        None
+    );
+    assert_eq!(db.last_committed_sequence(), Sequence::ZERO);
+    drop(db);
+    assert!(
+        wal::read_batches(&wal::wal_path(&path))
+            .expect("WAL reads")
+            .is_empty(),
+        "unpolled write future must not append a WAL record"
+    );
+
+    let reopened = Db::open(options).expect("persistent db reopens");
+    assert_eq!(
+        reopened
+            .get(b"cancelled")
+            .expect("reopen after dropped future"),
+        None
+    );
+    cleanup_dir(&path);
+}
+
+#[test]
 fn polled_async_write_future_reaches_visible_terminal_commit() {
     let db = Db::open_memory().expect("memory db opens");
     let mut batch = WriteBatch::new();
@@ -304,6 +341,43 @@ fn dropping_polled_async_write_future_does_not_cancel_accepted_native_write() {
         Some(b"value".to_vec())
     );
     assert_eq!(db.last_committed_sequence(), Sequence::new(1));
+}
+
+#[test]
+fn dropping_polled_persistent_async_write_future_survives_reopen() {
+    let path = temp_db_path("persistent-polled-write");
+    let mut options = DbOptions::persistent(&path).with_durability(DurabilityMode::Flush);
+    options.background_worker_count = 0;
+    let db = Db::open(options.clone()).expect("persistent db opens");
+    let mut batch = WriteBatch::new();
+    batch.put(b"accepted-after-drop".to_vec(), b"value".to_vec());
+
+    let mut write = Box::pin(db.write_async(batch, WriteOptions::flush()));
+    let waker = current_thread_waker();
+    let mut context = Context::from_waker(&waker);
+    assert!(matches!(
+        Future::poll(write.as_mut(), &mut context),
+        Poll::Pending
+    ));
+    drop(write);
+
+    wait_until(|| {
+        db.get(b"accepted-after-drop")
+            .expect("read after accepted future drop")
+            .is_some()
+    });
+    assert_eq!(db.last_committed_sequence(), Sequence::new(1));
+    drop(db);
+
+    let reopened = Db::open(options).expect("persistent db reopens");
+    assert_eq!(
+        reopened
+            .get(b"accepted-after-drop")
+            .expect("replay after accepted future drop"),
+        Some(b"value".to_vec())
+    );
+    assert_eq!(reopened.last_committed_sequence(), Sequence::new(1));
+    cleanup_dir(&path);
 }
 
 #[test]

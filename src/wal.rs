@@ -1,7 +1,7 @@
 use std::{
     ops::Bound,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use crate::{
@@ -51,6 +51,16 @@ pub struct WalWriter {
     append: NativeFileAppendObject,
 }
 
+#[derive(Debug)]
+pub(crate) struct WalFrontDoor {
+    lane: Mutex<WalWriter>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WalFrontDoorAccept {
+    sequence: Sequence,
+}
+
 impl WalWriter {
     pub fn open_append(path: &Path) -> Result<Self> {
         let backend = NativeFileBackend::new();
@@ -95,6 +105,59 @@ impl WalWriter {
     }
 }
 
+impl WalFrontDoor {
+    pub(crate) fn open_single_lane_with_backend(
+        backend: &NativeFileBackend,
+        path: &Path,
+    ) -> Result<Self> {
+        Ok(Self {
+            lane: Mutex::new(WalWriter::open_append_with_backend(backend, path)?),
+        })
+    }
+
+    pub(crate) fn accept_commit(
+        &self,
+        sequence: Sequence,
+        operations: &[BatchOperation],
+        durability: DurabilityMode,
+    ) -> Result<WalFrontDoorAccept> {
+        self.lane
+            .lock()
+            .map_err(|_| wal_front_door_lock_poisoned())?
+            .append_batch(sequence, operations, durability)?;
+        Ok(WalFrontDoorAccept { sequence })
+    }
+
+    pub(crate) fn persist(&self, durability: DurabilityMode) -> Result<()> {
+        self.lane
+            .lock()
+            .map_err(|_| wal_front_door_lock_poisoned())?
+            .persist(durability)
+    }
+
+    pub(crate) fn rewrite_after_replay_floor(
+        &self,
+        backend: &NativeFileBackend,
+        path: &Path,
+        replay_floor: Sequence,
+    ) -> Result<()> {
+        let mut lane = self
+            .lane
+            .lock()
+            .map_err(|_| wal_front_door_lock_poisoned())?;
+        lane.persist(DurabilityMode::SyncAll)?;
+        rewrite_batches_after_with_backend(backend, path, replay_floor)?;
+        lane.reopen_append_with_backend(backend, path)
+    }
+}
+
+impl WalFrontDoorAccept {
+    #[must_use]
+    pub(crate) const fn sequence(self) -> Sequence {
+        self.sequence
+    }
+}
+
 #[must_use]
 pub fn wal_path(db_path: &Path) -> PathBuf {
     db_path.join(WAL_FILE_NAME)
@@ -118,6 +181,26 @@ pub(crate) fn read_batches_after_with_backend(
         return Ok(Vec::new());
     };
     decode_frames_after(bytes.as_ref(), replay_floor)
+}
+
+pub(crate) fn merge_batch_streams_by_sequence<I>(streams: I) -> Result<Vec<WalBatch>>
+where
+    I: IntoIterator<Item = Vec<WalBatch>>,
+{
+    let mut merged = Vec::new();
+    for stream in streams {
+        validate_wal_stream_order(&stream)?;
+        merged.extend(stream);
+    }
+
+    merged.sort_by_key(|batch| batch.sequence);
+    for pair in merged.windows(2) {
+        if pair[0].sequence == pair[1].sequence {
+            return Err(invalid_wal("duplicate WAL sequence across streams"));
+        }
+    }
+
+    Ok(merged)
 }
 
 pub fn rewrite_batches_after(path: &Path, replay_floor: Sequence) -> Result<()> {
@@ -177,6 +260,23 @@ fn rewrite_wal_object_with_backend(
 
 fn wal_storage_object(path: &Path) -> StorageObjectId {
     StorageObjectId::native_file(StorageObjectKind::Wal, path)
+}
+
+fn wal_front_door_lock_poisoned() -> Error {
+    Error::Corruption {
+        message: "WAL front door lock poisoned".to_owned(),
+    }
+}
+
+fn validate_wal_stream_order(batches: &[WalBatch]) -> Result<()> {
+    let mut last_seen = Sequence::ZERO;
+    for batch in batches {
+        if batch.sequence <= last_seen {
+            return Err(invalid_wal("WAL stream sequence did not increase"));
+        }
+        last_seen = batch.sequence;
+    }
+    Ok(())
 }
 
 fn encode_batches_after(batches: &[WalBatch], replay_floor: Sequence) -> Result<Vec<u8>> {
@@ -499,9 +599,136 @@ impl<'payload> Cursor<'payload> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{types::Sequence, write_batch::BatchOperation};
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
-    use super::{WAL_FORMAT_VERSION, WAL_MAGIC, checksum, decode_frames_after, decode_payload};
+    use crate::{
+        options::DurabilityMode, storage::NativeFileBackend, types::Sequence,
+        write_batch::BatchOperation,
+    };
+
+    use super::{
+        WAL_FILE_NAME, WAL_FORMAT_VERSION, WAL_MAGIC, WalFrontDoor, checksum, decode_frames_after,
+        decode_payload, merge_batch_streams_by_sequence, read_batches_after_with_backend,
+    };
+
+    #[test]
+    fn wal_front_door_accepts_whole_commit_record() {
+        let dir = temp_dir("front-door-accept");
+        fs::create_dir_all(&dir).expect("create WAL test dir");
+        let path = dir.join(WAL_FILE_NAME);
+        let backend = NativeFileBackend::new();
+        let front_door =
+            WalFrontDoor::open_single_lane_with_backend(&backend, &path).expect("front door opens");
+        let operations = vec![BatchOperation::Put {
+            bucket: "default".to_owned(),
+            key: b"a".to_vec(),
+            value: b"a1".to_vec(),
+        }];
+
+        let accepted = front_door
+            .accept_commit(Sequence::new(7), &operations, DurabilityMode::Flush)
+            .expect("front door accepts commit");
+
+        assert_eq!(accepted.sequence(), Sequence::new(7));
+        let batches =
+            read_batches_after_with_backend(&backend, &path, Sequence::ZERO).expect("WAL reads");
+        assert_eq!(
+            batches,
+            vec![super::WalBatch {
+                sequence: Sequence::new(7),
+                operations,
+            }]
+        );
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn wal_front_door_rewrite_reopens_append_lane() {
+        let dir = temp_dir("front-door-rewrite");
+        fs::create_dir_all(&dir).expect("create WAL test dir");
+        let path = dir.join(WAL_FILE_NAME);
+        let backend = NativeFileBackend::new();
+        let front_door =
+            WalFrontDoor::open_single_lane_with_backend(&backend, &path).expect("front door opens");
+
+        front_door
+            .accept_commit(Sequence::new(1), &[put("a", "old")], DurabilityMode::Flush)
+            .expect("first commit accepts");
+        front_door
+            .accept_commit(Sequence::new(2), &[put("b", "kept")], DurabilityMode::Flush)
+            .expect("second commit accepts");
+        front_door
+            .rewrite_after_replay_floor(&backend, &path, Sequence::new(1))
+            .expect("front door rewrites WAL");
+        front_door
+            .accept_commit(Sequence::new(3), &[put("c", "new")], DurabilityMode::Flush)
+            .expect("append lane still accepts after rewrite");
+
+        let sequences = read_batches_after_with_backend(&backend, &path, Sequence::ZERO)
+            .expect("WAL reads")
+            .into_iter()
+            .map(|batch| batch.sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, vec![Sequence::new(2), Sequence::new(3)]);
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn wal_stream_merge_orders_batches_across_sources() {
+        let first = vec![batch(Sequence::new(1)), batch(Sequence::new(4))];
+        let second = vec![batch(Sequence::new(2)), batch(Sequence::new(3))];
+
+        let sequences = merge_batch_streams_by_sequence([first, second])
+            .expect("streams merge")
+            .into_iter()
+            .map(|batch| batch.sequence)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            sequences,
+            vec![
+                Sequence::new(1),
+                Sequence::new(2),
+                Sequence::new(3),
+                Sequence::new(4)
+            ]
+        );
+    }
+
+    #[test]
+    fn wal_stream_merge_rejects_duplicate_sequence() {
+        let error = merge_batch_streams_by_sequence([
+            vec![batch(Sequence::new(1)), batch(Sequence::new(3))],
+            vec![batch(Sequence::new(2)), batch(Sequence::new(3))],
+        ])
+        .expect_err("duplicate sequence fails");
+
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate WAL sequence across streams"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn wal_stream_merge_rejects_non_increasing_source() {
+        let error = merge_batch_streams_by_sequence([vec![
+            batch(Sequence::new(2)),
+            batch(Sequence::new(1)),
+        ]])
+        .expect_err("non-increasing source fails");
+
+        assert!(
+            error
+                .to_string()
+                .contains("WAL stream sequence did not increase"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn wal_decode_rejects_operation_count_before_large_allocation() {
@@ -564,5 +791,39 @@ mod tests {
         bytes.extend_from_slice(&payload_checksum.to_le_bytes());
         bytes.extend_from_slice(payload);
         bytes
+    }
+
+    fn put(key: &str, value: &str) -> BatchOperation {
+        BatchOperation::Put {
+            bucket: "default".to_owned(),
+            key: key.as_bytes().to_vec(),
+            value: value.as_bytes().to_vec(),
+        }
+    }
+
+    fn batch(sequence: Sequence) -> super::WalBatch {
+        super::WalBatch {
+            sequence,
+            operations: Vec::new(),
+        }
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "trine-kv-wal-{name}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn cleanup_dir(dir: &std::path::Path) {
+        match fs::remove_dir_all(dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("failed to cleanup {}: {error}", dir.display()),
+        }
     }
 }
