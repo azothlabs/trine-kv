@@ -7781,7 +7781,7 @@ Record only evidence that can change planning or durable decisions.
   `compio` 0.14.
 - Added `RuntimeOptions::platform_io()` and
   `RuntimeCapabilities::platform_async_io()`.
-- Added feature-gated `PlatformIoDriver` with a dedicated compio worker and
+- Added feature-gated `PlatformIoDriver` with a dedicated backend worker and
   `IoCompletion` delivery.
 - Routed native-file length, owned random reads, append, and persist through
   `PlatformIoDriver` when platform I/O is selected.
@@ -7815,3 +7815,218 @@ Record only evidence that can change planning or durable decisions.
 - Move the remaining native-file storage operations below the `io` driver
   boundary where platform I/O can support them, keeping unsupported operations
   explicitly reported as blocking-adapter work.
+
+## Phase 107: Platform I/O Storage Operation Coverage
+
+### Observation
+
+- Phase 106 left object read/write/delete, manifest read/publish, WAL rewrite,
+  directory create/sync, and writer lease acquisition outside the platform I/O
+  driver even when `RuntimeMode::PlatformIo` was selected.
+- The selected platform backend line exposes file read/write/sync, temp publish
+  through rename, file delete, directory create, and directory sync building
+  blocks.
+- The same backend line does not expose directory enumeration, so directory and
+  object listing cannot be moved without adding a different driver surface.
+
+### Interpretation
+
+- The platform driver can cover the remaining file mutation and publish work
+  without changing the storage contract or public API.
+- Listing should stay on the bounded blocking adapter until the `io` boundary
+  has an explicit directory enumeration operation backed by a real platform
+  implementation.
+
+### Change
+
+- Extended `PlatformIoDriver` with optional whole-object read,
+  temp-write-plus-rename publish, append-object opening, object delete,
+  directory create, directory sync, and writer lease acquisition tasks.
+- Routed native-file object read/write/delete, manifest read/publish, WAL
+  rewrite, append-object opening, directory create/sync, and writer lease
+  acquisition through `PlatformIoDriver` under `RuntimeMode::PlatformIo`.
+- Preserved default native-thread and inline behavior, plus blocking API
+  behavior.
+- Added a platform management test that covers object mutation, manifest
+  publish/read, WAL rewrite, writer lease acquisition, directory sync, delete,
+  stats, and zero bounded blocking-adapter task usage.
+- Updated the async storage protocol and usage docs to reflect the new coverage
+  and the remaining listing boundary.
+
+### Verification
+
+- `cargo check`
+- `cargo check --features platform-io`
+- `cargo test platform_io_native_file_management_ops_use_platform_driver --lib
+  --features platform-io`
+- `cargo test platform_io --lib --features platform-io`
+- `cargo test storage --lib --features platform-io`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo fmt --check`
+- `git diff --check`
+- forbidden-term scan
+- project-name scan
+
+### Remaining Blockers
+
+- Directory and object listing remain on the bounded blocking adapter because
+  the selected platform crate does not expose directory enumeration.
+- Lease-drop cleanup remains synchronous drop-time cleanup.
+
+### Recommended Next Action
+
+- Commit this phase, then start a narrow directory enumeration follow-up only
+  if the selected platform driver can support it honestly.
+
+## Phase 108: Platform Listing And Lease Cleanup Closure
+
+### Observation
+
+- Directory and object listing were the last native-file operations still using
+  Trine's bounded blocking adapter under `RuntimeMode::PlatformIo`.
+- Recovery/open paths can call the blocking listing traits, so async-only
+  listing coverage would not close the recovery scanning tail.
+- The selected platform backend line still does not expose a directory
+  enumeration primitive.
+- Writer lease acquisition was below the platform driver, but drop cleanup
+  still used synchronous file reads/removes.
+
+### Interpretation
+
+- Listing can move below the `io` driver boundary, but it must be reported as a
+  platform-driver blocking fallback rather than true platform async I/O.
+- Blocking listing methods should use the same platform driver fallback when a
+  platform backend is selected, so recovery/open scans do not use Trine's
+  bounded blocking adapter.
+- Writer lease drop cleanup can submit read/delete operations to the existing
+  platform driver and wait during drop, preserving existing cleanup semantics.
+
+### Change
+
+- Added a `PlatformIoDriver` listing task that returns sorted file paths.
+- Implemented listing through the platform driver's blocking fallback because
+  no directory enumeration primitive is available in the selected platform
+  crate.
+- Routed async and blocking native-file directory/object listing through the
+  platform driver when `RuntimeMode::PlatformIo` is selected.
+- Added `storage_platform_blocking_fallback_tasks` to storage stats and
+  `DbStats`.
+- Stored the platform driver on platform-acquired writer leases and used it for
+  owner-check plus delete during drop cleanup.
+- Updated usage docs and the async storage protocol to record the separate
+  fallback counter.
+
+### Verification
+
+- `cargo check`
+- `cargo check --features platform-io`
+- `cargo test platform_io_native_file_management_ops_use_platform_driver --lib
+  --features platform-io`
+- `cargo test storage --lib --features platform-io`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo fmt --check`
+- `git diff --check`
+- forbidden-term scan
+- project-name scan
+
+### Remaining Blockers
+
+- Directory enumeration is not true platform async I/O until the selected
+  platform driver exposes a real directory enumeration operation.
+- Some Windows metadata operations inside the platform crate may still use the
+  crate's internal blocking fallback.
+
+### Recommended Next Action
+
+- Commit this closure, then only revisit true directory async when the selected
+  platform driver exposes a real directory enumeration operation.
+
+## Process Correction: Backend Boundary Guardrail
+
+### Observation
+
+- The platform I/O implementation kept Trine's code path behind `src/io.rs`,
+  but phase wording and docs overemphasized the selected backend crate.
+- That wording made the work look backend-led instead of `io`-boundary-led,
+  which violated the intended architecture direction.
+
+### Interpretation
+
+- A passing implementation is not enough if the phase language lets the backend
+  become the design subject.
+- Future platform I/O work needs a written boundary check before implementation
+  and a leakage scan before completion.
+
+### Change
+
+- Added a durable decision rule requiring Trine's own `io` and storage
+  contracts to remain the architecture subject.
+- Added a protocol rule requiring a backend boundary receipt before platform
+  I/O backend work.
+- Added a completion rule to scan docs/protocol wording for backend-name
+  leakage outside dependency-selection evidence.
+
+### Recommended Next Action
+
+- Before the next platform I/O change, update `current.md` with the boundary
+  receipt and make the first task a naming/leakage check, not backend coding.
+
+## Phase 109: IO Boundary Correction
+
+### Observation
+
+- Phase 108 behavior was verified, but `src/io.rs` still mixed Trine-owned
+  driver and completion code with the selected backend implementation.
+- Storage already submitted through `crate::io`, but the code layout made the
+  backend implementation look too close to the architecture boundary.
+- Docs/current/protocol/roadmap needed a leakage scan so dependency names stay
+  out of user-facing and protocol language.
+
+### Interpretation
+
+- The correct architecture is Trine `io` first: operation routing and
+  completions live in the boundary, while backend execution lives below it.
+- The previous behavior can be preserved while making the boundary easier to
+  review and harder to drift.
+
+### Change
+
+- Replaced the current phase with an explicit backend boundary receipt.
+- Moved selected native platform backend execution from `src/io.rs` into
+  `src/io/platform_backend.rs`.
+- Kept `src/io.rs` focused on `IoCompletion`, driver metadata, driver
+  submission, and operation routing.
+- Confirmed `src/storage.rs`, `src/db.rs`, and `src/stats.rs` do not reference
+  the backend implementation module or dependency.
+- Updated usage docs to describe Trine's feature-gated native file driver and
+  platform backend fallback rather than a specific dependency.
+- Added durable process guardrails in `decision.md` and the async storage
+  protocol.
+
+### Verification
+
+- `cargo check`
+- `cargo check --features platform-io`
+- `cargo test platform_io_native_file_management_ops_use_platform_driver --lib
+  --features platform-io`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo fmt --check`
+- `git diff --check`
+- forbidden-term scan
+- project-name scan
+- backend-name leakage scan for docs/current/protocol/roadmap and storage/db/stats/io boundary
+
+### Remaining Blockers
+
+- Directory enumeration remains a separately counted platform-driver blocking
+  fallback until a backend exposes a true async directory enumeration operation.
+- Target-specific Linux, macOS/BSD, and Windows native backend implementations
+  are still a future phase.
+
+### Recommended Next Action
+
+- Commit the correction, then start the next platform backend phase only after
+  writing the backend boundary receipt first.

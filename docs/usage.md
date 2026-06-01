@@ -40,8 +40,8 @@ trine-kv = { path = "../trine-kv" }
 If you consume the crate through git, replace the path dependency with your
 repository URL.
 
-Enable native platform I/O explicitly when you want the compio-backed native
-file driver for supported read and WAL append operations:
+Enable native platform I/O explicitly when you want Trine's feature-gated
+native file driver:
 
 ```toml
 [dependencies]
@@ -81,7 +81,9 @@ let db = Db::open(
 ```
 
 With the `platform-io` feature enabled, select the platform I/O runtime for
-native-file length, owned random reads, append, and persist:
+native-file data reads/writes, WAL append-object opening/append/persist/rewrite,
+manifest publish/read, object delete, directory create/sync, and writer lease
+acquisition:
 
 ```rust
 use trine_kv::{Db, DbOptions, RuntimeOptions};
@@ -91,8 +93,11 @@ options.runtime = RuntimeOptions::platform_io();
 let db = Db::open(options)?;
 ```
 
-Other native-file metadata and publish operations still use the bounded
-blocking adapter and are reported separately in `DbStats`.
+Directory and object listing are also submitted through the platform driver.
+The selected platform backend does not expose a directory enumeration primitive,
+so those listing calls are reported as
+`storage_platform_blocking_fallback_tasks`, separate from true platform I/O
+tasks and separate from Trine's bounded blocking adapter task count.
 
 `Db`, `Bucket`, and `Snapshot` are cheap handles. `Db` writes to the built-in
 default bucket. A named `Bucket` keeps its database open, so release bucket

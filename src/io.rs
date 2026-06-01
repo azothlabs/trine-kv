@@ -16,6 +16,9 @@ use crate::{
     storage::StorageReadBuffer,
 };
 
+#[cfg(feature = "platform-io")]
+mod platform_backend;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IoDriverKind {
     Inline,
@@ -328,15 +331,53 @@ enum PlatformIoTask {
         len: usize,
         completion: IoCompletion<StorageReadBuffer>,
     },
+    ReadOptional {
+        path: PathBuf,
+        completion: IoCompletion<Option<Arc<[u8]>>>,
+    },
+    WriteTempRename {
+        path: PathBuf,
+        tmp_path: PathBuf,
+        bytes: Arc<[u8]>,
+        durability: DurabilityMode,
+        create_parent: bool,
+        sync_parent_on_sync_all: bool,
+        completion: IoCompletion<()>,
+    },
     Append {
         path: PathBuf,
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
         completion: IoCompletion<()>,
     },
+    OpenAppend {
+        path: PathBuf,
+        completion: IoCompletion<()>,
+    },
     Persist {
         path: PathBuf,
         durability: DurabilityMode,
+        completion: IoCompletion<()>,
+    },
+    Delete {
+        path: PathBuf,
+        completion: IoCompletion<()>,
+    },
+    CreateDirAll {
+        path: PathBuf,
+        completion: IoCompletion<()>,
+    },
+    SyncDir {
+        path: PathBuf,
+        completion: IoCompletion<()>,
+    },
+    ListFilePaths {
+        path: PathBuf,
+        completion: IoCompletion<Vec<PathBuf>>,
+    },
+    AcquireWriterLease {
+        path: PathBuf,
+        owner: Arc<[u8]>,
         completion: IoCompletion<()>,
     },
 }
@@ -375,6 +416,39 @@ impl PlatformIoDriver {
         Ok(waiter)
     }
 
+    pub(crate) fn submit_read_optional_path(
+        &self,
+        path: PathBuf,
+    ) -> Result<IoCompletion<Option<Arc<[u8]>>>> {
+        let completion = IoCompletion::new();
+        let waiter = completion.clone();
+        self.submit_task(PlatformIoTask::ReadOptional { path, completion })?;
+        Ok(waiter)
+    }
+
+    pub(crate) fn submit_write_temp_rename_path(
+        &self,
+        path: PathBuf,
+        tmp_path: PathBuf,
+        bytes: Arc<[u8]>,
+        durability: DurabilityMode,
+        create_parent: bool,
+        sync_parent_on_sync_all: bool,
+    ) -> Result<IoCompletion<()>> {
+        let completion = IoCompletion::new();
+        let waiter = completion.clone();
+        self.submit_task(PlatformIoTask::WriteTempRename {
+            path,
+            tmp_path,
+            bytes,
+            durability,
+            create_parent,
+            sync_parent_on_sync_all,
+            completion,
+        })?;
+        Ok(waiter)
+    }
+
     pub(crate) fn submit_append_path(
         &self,
         path: PathBuf,
@@ -392,6 +466,13 @@ impl PlatformIoDriver {
         Ok(waiter)
     }
 
+    pub(crate) fn submit_open_append_path(&self, path: PathBuf) -> Result<IoCompletion<()>> {
+        let completion = IoCompletion::new();
+        let waiter = completion.clone();
+        self.submit_task(PlatformIoTask::OpenAppend { path, completion })?;
+        Ok(waiter)
+    }
+
     pub(crate) fn submit_persist_path(
         &self,
         path: PathBuf,
@@ -402,6 +483,52 @@ impl PlatformIoDriver {
         self.submit_task(PlatformIoTask::Persist {
             path,
             durability,
+            completion,
+        })?;
+        Ok(waiter)
+    }
+
+    pub(crate) fn submit_delete_path(&self, path: PathBuf) -> Result<IoCompletion<()>> {
+        let completion = IoCompletion::new();
+        let waiter = completion.clone();
+        self.submit_task(PlatformIoTask::Delete { path, completion })?;
+        Ok(waiter)
+    }
+
+    pub(crate) fn submit_create_dir_all_path(&self, path: PathBuf) -> Result<IoCompletion<()>> {
+        let completion = IoCompletion::new();
+        let waiter = completion.clone();
+        self.submit_task(PlatformIoTask::CreateDirAll { path, completion })?;
+        Ok(waiter)
+    }
+
+    pub(crate) fn submit_sync_dir_path(&self, path: PathBuf) -> Result<IoCompletion<()>> {
+        let completion = IoCompletion::new();
+        let waiter = completion.clone();
+        self.submit_task(PlatformIoTask::SyncDir { path, completion })?;
+        Ok(waiter)
+    }
+
+    pub(crate) fn submit_list_file_paths_path(
+        &self,
+        path: PathBuf,
+    ) -> Result<IoCompletion<Vec<PathBuf>>> {
+        let completion = IoCompletion::new();
+        let waiter = completion.clone();
+        self.submit_task(PlatformIoTask::ListFilePaths { path, completion })?;
+        Ok(waiter)
+    }
+
+    pub(crate) fn submit_acquire_writer_lease_path(
+        &self,
+        path: PathBuf,
+        owner: Arc<[u8]>,
+    ) -> Result<IoCompletion<()>> {
+        let completion = IoCompletion::new();
+        let waiter = completion.clone();
+        self.submit_task(PlatformIoTask::AcquireWriterLease {
+            path,
+            owner,
             completion,
         })?;
         Ok(waiter)
@@ -424,7 +551,7 @@ impl PlatformIoDriver {
         let (next_sender, receiver) = mpsc::channel();
         thread::Builder::new()
             .name("trine-kv-platform-io".to_owned())
-            .spawn(move || platform_io_worker_loop(receiver))
+            .spawn(move || platform_backend::run_worker(receiver))
             .map_err(Error::Io)?;
         *sender = Some(next_sender.clone());
         Ok(next_sender)
@@ -436,7 +563,7 @@ impl PlatformIoTask {
     async fn run(self) {
         match self {
             Self::Len { path, completion } => {
-                complete_platform_io(&completion, platform_len(path).await);
+                complete_platform_io(&completion, platform_backend::len(path).await);
             }
             Self::ReadExactAtOwned {
                 path,
@@ -446,7 +573,32 @@ impl PlatformIoTask {
             } => {
                 complete_platform_io(
                     &completion,
-                    platform_read_exact_at_owned(path, offset, len).await,
+                    platform_backend::read_exact_at_owned(path, offset, len).await,
+                );
+            }
+            Self::ReadOptional { path, completion } => {
+                complete_platform_io(&completion, platform_backend::read_optional(path).await);
+            }
+            Self::WriteTempRename {
+                path,
+                tmp_path,
+                bytes,
+                durability,
+                create_parent,
+                sync_parent_on_sync_all,
+                completion,
+            } => {
+                complete_platform_io(
+                    &completion,
+                    platform_backend::write_temp_rename(
+                        path,
+                        tmp_path,
+                        bytes,
+                        durability,
+                        create_parent,
+                        sync_parent_on_sync_all,
+                    )
+                    .await,
                 );
             }
             Self::Append {
@@ -455,14 +607,45 @@ impl PlatformIoTask {
                 durability,
                 completion,
             } => {
-                complete_platform_io(&completion, platform_append(path, bytes, durability).await);
+                complete_platform_io(
+                    &completion,
+                    platform_backend::append(path, bytes, durability).await,
+                );
+            }
+            Self::OpenAppend { path, completion } => {
+                complete_platform_io(&completion, platform_backend::open_append(path).await);
             }
             Self::Persist {
                 path,
                 durability,
                 completion,
             } => {
-                complete_platform_io(&completion, platform_persist_path(path, durability).await);
+                complete_platform_io(
+                    &completion,
+                    platform_backend::persist_path(path, durability).await,
+                );
+            }
+            Self::Delete { path, completion } => {
+                complete_platform_io(&completion, platform_backend::delete_path(path).await);
+            }
+            Self::CreateDirAll { path, completion } => {
+                complete_platform_io(&completion, platform_backend::create_dir_all(path).await);
+            }
+            Self::SyncDir { path, completion } => {
+                complete_platform_io(&completion, platform_backend::sync_directory(path).await);
+            }
+            Self::ListFilePaths { path, completion } => {
+                complete_platform_io(&completion, platform_backend::list_file_paths(path).await);
+            }
+            Self::AcquireWriterLease {
+                path,
+                owner,
+                completion,
+            } => {
+                complete_platform_io(
+                    &completion,
+                    platform_backend::acquire_writer_lease(path, owner).await,
+                );
             }
         }
     }
@@ -474,7 +657,20 @@ impl PlatformIoTask {
             Self::ReadExactAtOwned { completion, .. } => {
                 complete_platform_io(&completion, Err(error()));
             }
-            Self::Append { completion, .. } | Self::Persist { completion, .. } => {
+            Self::ReadOptional { completion, .. } => {
+                complete_platform_io(&completion, Err(error()));
+            }
+            Self::ListFilePaths { completion, .. } => {
+                complete_platform_io(&completion, Err(error()));
+            }
+            Self::Append { completion, .. }
+            | Self::OpenAppend { completion, .. }
+            | Self::Persist { completion, .. }
+            | Self::WriteTempRename { completion, .. }
+            | Self::Delete { completion, .. }
+            | Self::CreateDirAll { completion, .. }
+            | Self::SyncDir { completion, .. }
+            | Self::AcquireWriterLease { completion, .. } => {
                 complete_platform_io(&completion, Err(error()));
             }
         }
@@ -485,90 +681,6 @@ impl PlatformIoTask {
 fn complete_platform_io<T>(completion: &IoCompletion<T>, result: Result<T>) {
     let completed = completion.complete(result);
     debug_assert!(completed.is_ok());
-}
-
-#[cfg(feature = "platform-io")]
-fn platform_io_worker_loop(receiver: mpsc::Receiver<PlatformIoTask>) {
-    let runtime = match compio::runtime::Runtime::new() {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            let message = format!("platform I/O runtime failed to start: {error}");
-            for task in receiver {
-                task.complete_start_error(&message);
-            }
-            return;
-        }
-    };
-
-    for task in receiver {
-        runtime.block_on(task.run());
-    }
-}
-
-#[cfg(feature = "platform-io")]
-async fn platform_len(path: PathBuf) -> Result<u64> {
-    let file = compio::fs::File::open(path).await.map_err(Error::Io)?;
-    let metadata = file.metadata().await.map_err(Error::Io)?;
-    Ok(metadata.len())
-}
-
-#[cfg(feature = "platform-io")]
-async fn platform_read_exact_at_owned(
-    path: PathBuf,
-    offset: usize,
-    len: usize,
-) -> Result<StorageReadBuffer> {
-    use compio::io::AsyncReadAtExt;
-
-    let file = compio::fs::File::open(path).await.map_err(Error::Io)?;
-    let buffer = vec![0; len];
-    let compio::buf::BufResult(result, buffer) =
-        file.read_exact_at(buffer, platform_offset(offset)?).await;
-    result.map_err(Error::Io)?;
-    Ok(StorageReadBuffer::from_vec(offset, buffer))
-}
-
-#[cfg(feature = "platform-io")]
-async fn platform_append(
-    path: PathBuf,
-    bytes: Arc<[u8]>,
-    durability: DurabilityMode,
-) -> Result<()> {
-    use compio::io::AsyncWriteAtExt;
-
-    let mut options = compio::fs::OpenOptions::new();
-    options.write(true).create(true);
-    let mut file = options.open(&path).await.map_err(Error::Io)?;
-    let offset = match std::fs::metadata(&path) {
-        Ok(metadata) => metadata.len(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(error) => return Err(Error::Io(error)),
-    };
-    let compio::buf::BufResult(result, _buffer) = file.write_all_at(bytes.to_vec(), offset).await;
-    result.map_err(Error::Io)?;
-    platform_persist_file(&file, durability).await
-}
-
-#[cfg(feature = "platform-io")]
-async fn platform_persist_path(path: PathBuf, durability: DurabilityMode) -> Result<()> {
-    let mut options = compio::fs::OpenOptions::new();
-    options.write(true);
-    let file = options.open(path).await.map_err(Error::Io)?;
-    platform_persist_file(&file, durability).await
-}
-
-#[cfg(feature = "platform-io")]
-async fn platform_persist_file(file: &compio::fs::File, durability: DurabilityMode) -> Result<()> {
-    match durability {
-        DurabilityMode::Buffered | DurabilityMode::Flush => Ok(()),
-        DurabilityMode::SyncData => file.sync_data().await.map_err(Error::Io),
-        DurabilityMode::SyncAll => file.sync_all().await.map_err(Error::Io),
-    }
-}
-
-#[cfg(feature = "platform-io")]
-fn platform_offset(offset: usize) -> Result<u64> {
-    u64::try_from(offset).map_err(|_| Error::invalid_options("platform I/O offset overflow"))
 }
 
 #[cfg(test)]

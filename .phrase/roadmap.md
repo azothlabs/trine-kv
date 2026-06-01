@@ -2406,3 +2406,89 @@ paths submit through `io` completions.
 - Making platform I/O the default runtime.
 - Moving manifest publish, directory operations, object listing, writer lease,
   recovery scanning, and all remaining metadata operations to platform I/O.
+
+### Phase 107: Platform I/O Storage Operation Coverage
+
+**Status**: Complete
+
+**Goal**: Move native-file storage operations that have platform support below
+the opt-in `io` platform driver.
+
+**Entry Condition**: Phase 106 complete and the remaining native-file operation
+tails are known.
+
+**Acceptance Gate**:
+
+- Platform I/O builds route object read/write/delete, manifest read/publish,
+  WAL rewrite, append-object opening, directory create/sync, and writer lease
+  acquisition through `PlatformIoDriver`.
+- Platform task stats cover the newly routed operations and bounded
+  blocking-adapter stats stay separate.
+- Default native-thread runtime, inline runtime, blocking APIs, public API,
+  storage formats, WAL, MVCC, manifest, table, and compaction behavior remain
+  unchanged.
+- Formatting, clippy, full tests, diff checks, and forbidden-term scan pass.
+
+**Major Out Of Scope**:
+
+- Directory and object listing until the platform driver exposes directory
+  enumeration.
+- Making platform I/O the default runtime.
+- Changing lease-drop cleanup.
+
+### Phase 108: Platform Listing And Lease Cleanup Closure
+
+**Status**: Complete
+
+**Goal**: Close the listing and lease-drop tail without overstating platform
+driver capabilities.
+
+**Entry Condition**: Phase 107 complete and directory/object listing plus
+lease-drop cleanup are the remaining native-file platform I/O tails.
+
+**Acceptance Gate**:
+
+- Platform I/O builds route async and blocking directory/object listing through
+  `PlatformIoDriver`.
+- Listing work is counted as platform blocking fallback, not true platform
+  async I/O and not Trine bounded blocking-adapter work.
+- Writer lease drop cleanup uses the platform driver after platform I/O
+  acquisition.
+- Recovery/open paths using blocking listing can use the same platform driver
+  fallback when platform I/O is selected.
+- Formatting, clippy, full tests, diff checks, and forbidden-term scan pass.
+
+**Major Out Of Scope**:
+
+- Claiming directory enumeration is true platform async I/O before the selected
+  driver exposes a real operation.
+- Making platform I/O the default runtime.
+
+### Phase 109: IO Boundary Correction
+
+**Status**: Complete
+
+**Goal**: Correct the platform I/O architecture so Trine's `io` boundary is the
+design subject and the selected native backend is only an implementation detail.
+
+**Entry Condition**: Phase 108 complete, process guardrail added, and the
+backend boundary receipt required before further backend work.
+
+**Acceptance Gate**:
+
+- `src/io.rs` expresses Trine-owned completion, driver info, driver submission,
+  and operation routing without backend dependency references.
+- Backend-specific native platform implementation lives below the `io` boundary
+  in a feature-gated implementation module.
+- Storage, stats, docs, current phase, roadmap, and protocol pass backend-name
+  leakage checks outside dependency-selection evidence.
+- Phase record contains the backend boundary receipt.
+- Formatting, clippy, full tests, diff checks, forbidden-term scan, and
+  backend-name leakage scan pass.
+
+**Major Out Of Scope**:
+
+- Replacing the selected backend dependency.
+- Adding target-specific Linux, macOS/BSD, or Windows native backend
+  implementations.
+- Making platform I/O the default runtime.

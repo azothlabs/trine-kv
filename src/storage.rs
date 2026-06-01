@@ -787,6 +787,7 @@ impl NativeFileBackend {
             uses_platform_async_io: driver.kind().is_platform_async(),
             blocking_adapter_tasks: self.metrics.blocking_adapter_tasks(),
             platform_async_io_tasks: self.metrics.platform_async_io_tasks(),
+            platform_blocking_fallback_tasks: self.metrics.platform_blocking_fallback_tasks(),
             inline_tasks: self.metrics.inline_tasks(),
         }
     }
@@ -837,6 +838,7 @@ impl Default for NativeFileBackend {
 struct NativeFileStorageMetrics {
     blocking_adapter: AtomicU64,
     platform_async_io: AtomicU64,
+    platform_blocking_fallback: AtomicU64,
     inline: AtomicU64,
 }
 
@@ -848,6 +850,12 @@ impl NativeFileStorageMetrics {
     #[cfg(feature = "platform-io")]
     fn record_platform_async_io_task(&self) {
         self.platform_async_io.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "platform-io")]
+    fn record_platform_blocking_fallback_task(&self) {
+        self.platform_blocking_fallback
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_inline_task(&self) {
@@ -862,6 +870,10 @@ impl NativeFileStorageMetrics {
         self.platform_async_io.load(Ordering::Acquire)
     }
 
+    fn platform_blocking_fallback_tasks(&self) -> u64 {
+        self.platform_blocking_fallback.load(Ordering::Acquire)
+    }
+
     fn inline_tasks(&self) -> u64 {
         self.inline.load(Ordering::Acquire)
     }
@@ -873,6 +885,7 @@ pub(crate) struct NativeFileStorageStats {
     pub(crate) uses_platform_async_io: bool,
     pub(crate) blocking_adapter_tasks: u64,
     pub(crate) platform_async_io_tasks: u64,
+    pub(crate) platform_blocking_fallback_tasks: u64,
     pub(crate) inline_tasks: u64,
 }
 
@@ -928,6 +941,17 @@ impl BlockingStorageReadBackend for NativeFileBackend {
 
 impl StorageObjectReadBackend for NativeFileBackend {
     fn read_object_bytes(&self, object: StorageObjectId) -> StorageFuture<'_, Option<Arc<[u8]>>> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = self.platform_io.clone() {
+            let metrics = Arc::clone(&self.metrics);
+            return Box::pin(async move {
+                require_native_file_object_read()?;
+                let completion = driver.submit_read_optional_path(object.path().to_path_buf())?;
+                metrics.record_platform_async_io_task();
+                completion.await
+            });
+        }
+
         self.run_owned_storage_task(move || read_native_file_object_bytes(&object))
     }
 }
@@ -946,6 +970,22 @@ impl StorageAppendBackend for NativeFileBackend {
         #[cfg(feature = "platform-io")]
         let platform_io = self.platform_io.clone();
         let metrics = Arc::clone(&self.metrics);
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = platform_io.clone() {
+            return Box::pin(async move {
+                require_native_file_append(&object)?;
+                let completion = driver.submit_open_append_path(object.path().to_path_buf())?;
+                metrics.record_platform_async_io_task();
+                completion.await?;
+                Ok(NativeFileAppendObject::open_platform(
+                    object,
+                    runtime,
+                    platform_io,
+                    metrics,
+                ))
+            });
+        }
+
         self.run_owned_storage_task(move || {
             NativeFileAppendObject::open(
                 &object,
@@ -978,6 +1018,19 @@ impl StorageWalRewriteBackend for NativeFileBackend {
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
     ) -> StorageFuture<'_, ()> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = self.platform_io.clone() {
+            let metrics = Arc::clone(&self.metrics);
+            return Box::pin(async move {
+                let (path, tmp_path) =
+                    prepare_native_file_wal_rewrite(&object, &temporary_object, durability)?;
+                let completion = driver
+                    .submit_write_temp_rename_path(path, tmp_path, bytes, durability, true, true)?;
+                metrics.record_platform_async_io_task();
+                completion.await
+            });
+        }
+
         self.run_owned_storage_task(move || {
             rewrite_native_file_wal(&object, &temporary_object, &bytes, durability)
         })
@@ -1003,18 +1056,59 @@ impl StorageWriterLeaseBackend for NativeFileBackend {
         &self,
         object: StorageObjectId,
     ) -> StorageFuture<'_, Self::WriterLease> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = self.platform_io.clone() {
+            let metrics = Arc::clone(&self.metrics);
+            return Box::pin(async move {
+                require_native_file_writer_lease(&object)?;
+                let owner = writer_lease_owner_text();
+                let completion = driver.submit_acquire_writer_lease_path(
+                    object.path().to_path_buf(),
+                    Arc::from(owner.as_bytes()),
+                )?;
+                metrics.record_platform_async_io_task();
+                completion.await?;
+                Ok(NativeFileWriterLease::from_platform(object, owner, driver))
+            });
+        }
+
         self.run_owned_storage_task(move || NativeFileWriterLease::acquire(object))
     }
 }
 
 impl BlockingStorageWriterLeaseBackend for NativeFileBackend {
     fn acquire_writer_lease_blocking(&self, object: StorageObjectId) -> Result<Self::WriterLease> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = self.platform_io.clone() {
+            require_native_file_writer_lease(&object)?;
+            let owner = writer_lease_owner_text();
+            let completion = driver.submit_acquire_writer_lease_path(
+                object.path().to_path_buf(),
+                Arc::from(owner.as_bytes()),
+            )?;
+            self.metrics.record_platform_async_io_task();
+            wait_for_platform_io(completion)?;
+            return Ok(NativeFileWriterLease::from_platform(object, owner, driver));
+        }
+
         NativeFileWriterLease::acquire(object)
     }
 }
 
 impl StorageDirectoryCreateBackend for NativeFileBackend {
     fn create_directory_all(&self, directory: StorageDirectoryId) -> StorageFuture<'_, ()> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = self.platform_io.clone() {
+            let metrics = Arc::clone(&self.metrics);
+            return Box::pin(async move {
+                require_native_file_directory_create()?;
+                let completion =
+                    driver.submit_create_dir_all_path(directory.path().to_path_buf())?;
+                metrics.record_platform_async_io_task();
+                completion.await
+            });
+        }
+
         self.run_owned_storage_task(move || create_native_file_directory_all(&directory))
     }
 }
@@ -1030,6 +1124,22 @@ impl StorageDirectoryListBackend for NativeFileBackend {
         &self,
         directory: StorageDirectoryId,
     ) -> StorageFuture<'_, Vec<StorageDirectoryFile>> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = self.platform_io.clone() {
+            let metrics = Arc::clone(&self.metrics);
+            return Box::pin(async move {
+                require_native_file_directory_listing()?;
+                let completion =
+                    driver.submit_list_file_paths_path(directory.path().to_path_buf())?;
+                metrics.record_platform_blocking_fallback_task();
+                let paths = completion.await?;
+                Ok(paths
+                    .into_iter()
+                    .map(StorageDirectoryFile::native_file)
+                    .collect())
+            });
+        }
+
         self.run_owned_storage_task(move || list_native_file_directory_files(&directory))
     }
 }
@@ -1039,12 +1149,35 @@ impl BlockingStorageDirectoryListBackend for NativeFileBackend {
         &self,
         directory: StorageDirectoryId,
     ) -> Result<Vec<StorageDirectoryFile>> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = self.platform_io.clone() {
+            require_native_file_directory_listing()?;
+            let completion = driver.submit_list_file_paths_path(directory.path().to_path_buf())?;
+            self.metrics.record_platform_blocking_fallback_task();
+            let paths = wait_for_platform_io(completion)?;
+            return Ok(paths
+                .into_iter()
+                .map(StorageDirectoryFile::native_file)
+                .collect());
+        }
+
         list_native_file_directory_files(&directory)
     }
 }
 
 impl StorageDirectorySyncBackend for NativeFileBackend {
     fn sync_directory_after_renames(&self, directory: StorageDirectoryId) -> StorageFuture<'_, ()> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = self.platform_io.clone() {
+            let metrics = Arc::clone(&self.metrics);
+            return Box::pin(async move {
+                require_native_file_directory_sync()?;
+                let completion = driver.submit_sync_dir_path(directory.path().to_path_buf())?;
+                metrics.record_platform_async_io_task();
+                completion.await
+            });
+        }
+
         self.run_owned_storage_task(move || sync_native_file_directory_after_renames(&directory))
     }
 }
@@ -1060,6 +1193,17 @@ impl StorageManifestReadBackend for NativeFileBackend {
         &self,
         object: StorageObjectId,
     ) -> StorageFuture<'_, Option<Arc<[u8]>>> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = self.platform_io.clone() {
+            let metrics = Arc::clone(&self.metrics);
+            return Box::pin(async move {
+                require_native_file_manifest_read(&object)?;
+                let completion = driver.submit_read_optional_path(object.path().to_path_buf())?;
+                metrics.record_platform_async_io_task();
+                completion.await
+            });
+        }
+
         self.run_owned_storage_task(move || read_current_manifest_from_native_file(&object))
     }
 }
@@ -1077,6 +1221,19 @@ impl StorageManifestPublishBackend for NativeFileBackend {
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
     ) -> StorageFuture<'_, ()> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = self.platform_io.clone() {
+            let metrics = Arc::clone(&self.metrics);
+            return Box::pin(async move {
+                let (path, tmp_path) = prepare_native_file_manifest_publish(&object, durability)?;
+                let completion = driver.submit_write_temp_rename_path(
+                    path, tmp_path, bytes, durability, false, true,
+                )?;
+                metrics.record_platform_async_io_task();
+                completion.await
+            });
+        }
+
         self.run_owned_storage_task(move || {
             publish_manifest_to_native_file(&object, &bytes, durability)
         })
@@ -1101,6 +1258,19 @@ impl StorageObjectWriteBackend for NativeFileBackend {
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
     ) -> StorageFuture<'_, ()> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = self.platform_io.clone() {
+            let metrics = Arc::clone(&self.metrics);
+            return Box::pin(async move {
+                let (path, tmp_path) = prepare_native_file_object_write(&object, durability)?;
+                let completion = driver.submit_write_temp_rename_path(
+                    path, tmp_path, bytes, durability, true, false,
+                )?;
+                metrics.record_platform_async_io_task();
+                completion.await
+            });
+        }
+
         self.run_owned_storage_task(move || write_native_file_object(&object, &bytes, durability))
     }
 }
@@ -1118,6 +1288,17 @@ impl BlockingStorageObjectWriteBackend for NativeFileBackend {
 
 impl StorageObjectDeleteBackend for NativeFileBackend {
     fn delete_object(&self, object: StorageObjectId) -> StorageFuture<'_, ()> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = self.platform_io.clone() {
+            let metrics = Arc::clone(&self.metrics);
+            return Box::pin(async move {
+                require_native_file_object_delete(&object)?;
+                let completion = driver.submit_delete_path(object.path().to_path_buf())?;
+                metrics.record_platform_async_io_task();
+                completion.await
+            });
+        }
+
         self.run_owned_storage_task(move || delete_native_file_object(&object))
     }
 }
@@ -1133,6 +1314,19 @@ impl StorageObjectListBackend for NativeFileBackend {
         &self,
         request: StorageObjectListRequest,
     ) -> StorageFuture<'_, Vec<StorageObjectId>> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = self.platform_io.clone() {
+            let metrics = Arc::clone(&self.metrics);
+            return Box::pin(async move {
+                require_native_file_object_listing()?;
+                let completion =
+                    driver.submit_list_file_paths_path(request.root().to_path_buf())?;
+                metrics.record_platform_blocking_fallback_task();
+                let paths = completion.await?;
+                Ok(native_file_objects_from_paths(&request, paths))
+            });
+        }
+
         self.run_owned_storage_task(move || list_native_file_objects(&request))
     }
 }
@@ -1142,6 +1336,15 @@ impl BlockingStorageObjectListBackend for NativeFileBackend {
         &self,
         request: StorageObjectListRequest,
     ) -> Result<Vec<StorageObjectId>> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = self.platform_io.clone() {
+            require_native_file_object_listing()?;
+            let completion = driver.submit_list_file_paths_path(request.root().to_path_buf())?;
+            self.metrics.record_platform_blocking_fallback_task();
+            let paths = wait_for_platform_io(completion)?;
+            return Ok(native_file_objects_from_paths(&request, paths));
+        }
+
         list_native_file_objects(&request)
     }
 }
@@ -1280,7 +1483,7 @@ impl BlockingStorageReadObject for NativeFileObject {
 #[derive(Debug)]
 pub(crate) struct NativeFileAppendObject {
     object: StorageObjectId,
-    file: Arc<Mutex<File>>,
+    file: Option<Arc<Mutex<File>>>,
     runtime: Option<Runtime>,
     #[cfg(feature = "platform-io")]
     platform_io: Option<PlatformIoDriver>,
@@ -1297,7 +1500,7 @@ impl NativeFileAppendObject {
         let file = open_native_append_file(object)?;
         Ok(Self {
             object: object.clone(),
-            file: Arc::new(Mutex::new(file)),
+            file: Some(Arc::new(Mutex::new(file))),
             runtime,
             #[cfg(feature = "platform-io")]
             platform_io,
@@ -1305,18 +1508,48 @@ impl NativeFileAppendObject {
         })
     }
 
-    fn append_to_file(&self, bytes: &[u8], durability: DurabilityMode) -> Result<()> {
-        let mut file = self.lock_file()?;
+    #[cfg(feature = "platform-io")]
+    fn open_platform(
+        object: StorageObjectId,
+        runtime: Option<Runtime>,
+        platform_io: Option<PlatformIoDriver>,
+        metrics: Arc<NativeFileStorageMetrics>,
+    ) -> Self {
+        Self {
+            object,
+            file: None,
+            runtime,
+            platform_io,
+            metrics,
+        }
+    }
+
+    fn append_to_file(&mut self, bytes: &[u8], durability: DurabilityMode) -> Result<()> {
+        let mut file = self.lock_or_open_file()?;
         append_native_file_object(&mut file, bytes, durability)
     }
 
-    fn persist_file(&self, durability: DurabilityMode) -> Result<()> {
-        let mut file = self.lock_file()?;
+    fn persist_file(&mut self, durability: DurabilityMode) -> Result<()> {
+        let mut file = self.lock_or_open_file()?;
         persist_native_append_file(&mut file, durability)
     }
 
-    fn lock_file(&self) -> Result<MutexGuard<'_, File>> {
-        lock_native_append_file(self.file.as_ref(), &self.object)
+    fn file_handle(&self) -> Result<Arc<Mutex<File>>> {
+        self.file
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| Error::runtime_busy("platform append object has no local file handle"))
+    }
+
+    fn lock_or_open_file(&mut self) -> Result<MutexGuard<'_, File>> {
+        if self.file.is_none() {
+            self.file = Some(Arc::new(Mutex::new(open_native_append_file(&self.object)?)));
+        }
+        let file = self
+            .file
+            .as_ref()
+            .expect("append file handle is initialized");
+        lock_native_append_file(file.as_ref(), &self.object)
     }
 }
 
@@ -1328,7 +1561,7 @@ impl IoAppendObject for NativeFileAppendObject {
         }
 
         let object = self.object.clone();
-        let file = Arc::clone(&self.file);
+        let file = self.file_handle()?;
         InlineIoDriver.submit_append(move || {
             let mut file = lock_native_append_file(file.as_ref(), &object)?;
             append_native_file_object(&mut file, bytes.as_ref(), durability)
@@ -1342,7 +1575,7 @@ impl IoAppendObject for NativeFileAppendObject {
         }
 
         let object = self.object.clone();
-        let file = Arc::clone(&self.file);
+        let file = self.file_handle()?;
         InlineIoDriver.submit_sync(move || {
             let mut file = lock_native_append_file(file.as_ref(), &object)?;
             persist_native_append_file(&mut file, durability)
@@ -1366,7 +1599,10 @@ impl StorageAppendObject for NativeFileAppendObject {
         if let Some(runtime) = self.runtime.clone() {
             if runtime.capabilities().blocking_adapter() {
                 let object = self.object.clone();
-                let file = Arc::clone(&self.file);
+                let file = match self.file_handle() {
+                    Ok(file) => file,
+                    Err(error) => return Box::pin(async move { Err(error) }),
+                };
                 self.metrics.record_blocking_adapter_task();
                 return Box::pin(async move {
                     BlockingAdapterIoDriver::new(runtime)
@@ -1393,7 +1629,10 @@ impl StorageAppendObject for NativeFileAppendObject {
         if let Some(runtime) = self.runtime.clone() {
             if runtime.capabilities().blocking_adapter() {
                 let object = self.object.clone();
-                let file = Arc::clone(&self.file);
+                let file = match self.file_handle() {
+                    Ok(file) => file,
+                    Err(error) => return Box::pin(async move { Err(error) }),
+                };
                 self.metrics.record_blocking_adapter_task();
                 return Box::pin(async move {
                     BlockingAdapterIoDriver::new(runtime)
@@ -1426,6 +1665,8 @@ pub(crate) struct NativeFileWriterLease {
     object: StorageObjectId,
     owner: String,
     file: Option<File>,
+    #[cfg(feature = "platform-io")]
+    platform_io: Option<PlatformIoDriver>,
 }
 
 impl NativeFileWriterLease {
@@ -1441,17 +1682,70 @@ impl NativeFileWriterLease {
             object,
             owner,
             file: Some(file),
+            #[cfg(feature = "platform-io")]
+            platform_io: None,
         })
+    }
+
+    #[cfg(feature = "platform-io")]
+    fn from_platform(
+        object: StorageObjectId,
+        owner: String,
+        platform_io: PlatformIoDriver,
+    ) -> Self {
+        Self {
+            object,
+            owner,
+            file: None,
+            platform_io: Some(platform_io),
+        }
     }
 }
 
 impl Drop for NativeFileWriterLease {
     fn drop(&mut self) {
+        drop(self.file.take());
+
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = self.platform_io.as_ref() {
+            let cleaned =
+                cleanup_native_file_writer_lease_platform(driver, &self.object, &self.owner);
+            if cleaned.is_ok() {
+                return;
+            }
+        }
+
         let should_remove = fs::read_to_string(self.object.path())
             .is_ok_and(|contents| contents.as_str() == self.owner.as_str());
-        drop(self.file.take());
         if should_remove {
             let _ = fs::remove_file(self.object.path());
+        }
+    }
+}
+
+#[cfg(feature = "platform-io")]
+fn cleanup_native_file_writer_lease_platform(
+    driver: &PlatformIoDriver,
+    object: &StorageObjectId,
+    owner: &str,
+) -> Result<()> {
+    let bytes =
+        wait_for_platform_io(driver.submit_read_optional_path(object.path().to_path_buf())?)?;
+    if bytes.is_some_and(|bytes| bytes.as_ref() == owner.as_bytes()) {
+        wait_for_platform_io(driver.submit_delete_path(object.path().to_path_buf())?)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "platform-io")]
+fn wait_for_platform_io<T>(completion: IoCompletion<T>) -> Result<T> {
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    let mut completion = std::pin::pin!(completion);
+    loop {
+        match completion.as_mut().poll(&mut context) {
+            Poll::Ready(result) => return result,
+            Poll::Pending => std::thread::sleep(std::time::Duration::from_millis(1)),
         }
     }
 }
@@ -1588,9 +1882,158 @@ fn read_exact_at_native_file(file: &mut File, offset: usize, bytes: &mut [u8]) -
     Ok(())
 }
 
-fn read_native_file_object_bytes(object: &StorageObjectId) -> Result<Option<Arc<[u8]>>> {
+fn require_native_file_object_read() -> Result<()> {
     let capabilities = StorageCapabilities::native_file_read();
-    capabilities.require(StorageCapability::ObjectRead)?;
+    capabilities.require(StorageCapability::ObjectRead)
+}
+
+fn require_native_file_object_listing() -> Result<()> {
+    let capabilities = StorageCapabilities::native_file_read();
+    capabilities.require(StorageCapability::ObjectListing)
+}
+
+fn require_native_file_directory_listing() -> Result<()> {
+    let capabilities = StorageCapabilities::native_file_read();
+    capabilities.require(StorageCapability::DirectoryListing)
+}
+
+fn require_native_file_append(object: &StorageObjectId) -> Result<()> {
+    if object.kind() != StorageObjectKind::Wal {
+        return Err(Error::invalid_options(
+            "append storage objects must use WAL object kind",
+        ));
+    }
+
+    let capabilities = StorageCapabilities::native_file();
+    capabilities.require(StorageCapability::Append)
+}
+
+fn require_native_file_manifest_read(object: &StorageObjectId) -> Result<()> {
+    if object.kind() != StorageObjectKind::Manifest {
+        return Err(Error::invalid_options(
+            "current manifest read requires a manifest storage object",
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_native_file_manifest_publish(
+    object: &StorageObjectId,
+    durability: DurabilityMode,
+) -> Result<(PathBuf, PathBuf)> {
+    if object.kind() != StorageObjectKind::Manifest {
+        return Err(Error::invalid_options(
+            "manifest publish requires a manifest storage object",
+        ));
+    }
+
+    let capabilities = StorageCapabilities::native_file();
+    capabilities.require(StorageCapability::AtomicManifestPublish)?;
+    capabilities.require_durability(durability)?;
+
+    let path = object.path().to_path_buf();
+    let tmp_path = path.with_extension("tmp");
+    Ok((path, tmp_path))
+}
+
+fn prepare_native_file_object_write(
+    object: &StorageObjectId,
+    durability: DurabilityMode,
+) -> Result<(PathBuf, PathBuf)> {
+    match object.kind() {
+        StorageObjectKind::Manifest => {
+            return Err(Error::invalid_options(
+                "manifest storage objects must use manifest publish",
+            ));
+        }
+        StorageObjectKind::Temporary => {
+            return Err(Error::invalid_options(
+                "temporary storage objects must use their owning publish operation",
+            ));
+        }
+        StorageObjectKind::Blob
+        | StorageObjectKind::RecoveryReport
+        | StorageObjectKind::Table
+        | StorageObjectKind::Wal
+        | StorageObjectKind::WriterLease => {}
+    }
+
+    let capabilities = StorageCapabilities::native_file();
+    capabilities.require(StorageCapability::ObjectWrite)?;
+    capabilities.require_durability(durability)?;
+
+    let path = object.path().to_path_buf();
+    let tmp_path = path.with_extension("tmp");
+    Ok((path, tmp_path))
+}
+
+fn require_native_file_object_delete(object: &StorageObjectId) -> Result<()> {
+    if object.kind() == StorageObjectKind::Manifest {
+        return Err(Error::invalid_options(
+            "manifest storage objects must use manifest publish",
+        ));
+    }
+
+    let capabilities = StorageCapabilities::native_file();
+    capabilities.require(StorageCapability::ObjectDelete)
+}
+
+fn prepare_native_file_wal_rewrite(
+    object: &StorageObjectId,
+    temporary_object: &StorageObjectId,
+    durability: DurabilityMode,
+) -> Result<(PathBuf, PathBuf)> {
+    if object.kind() != StorageObjectKind::Wal || temporary_object.kind() != StorageObjectKind::Wal
+    {
+        return Err(Error::invalid_options(
+            "WAL rewrite requires WAL storage objects",
+        ));
+    }
+
+    let capabilities = StorageCapabilities::native_file();
+    capabilities.require(StorageCapability::AtomicWalRewrite)?;
+    capabilities.require_durability(durability)?;
+
+    let path = object.path().to_path_buf();
+    let tmp_path = temporary_object.path().to_path_buf();
+    if path == tmp_path {
+        return Err(Error::invalid_options(
+            "WAL rewrite temporary object must differ from final object",
+        ));
+    }
+    if path.parent() != tmp_path.parent() {
+        return Err(Error::invalid_options(
+            "WAL rewrite temporary object must share the final object's parent directory",
+        ));
+    }
+
+    Ok((path, tmp_path))
+}
+
+fn require_native_file_writer_lease(object: &StorageObjectId) -> Result<()> {
+    if object.kind() != StorageObjectKind::WriterLease {
+        return Err(Error::invalid_options(
+            "writer lease requires a writer lease storage object",
+        ));
+    }
+
+    let capabilities = StorageCapabilities::native_file();
+    capabilities.require(StorageCapability::WriterLease)
+}
+
+fn require_native_file_directory_create() -> Result<()> {
+    let capabilities = StorageCapabilities::native_file();
+    capabilities.require(StorageCapability::DirectoryCreate)
+}
+
+fn require_native_file_directory_sync() -> Result<()> {
+    let capabilities = StorageCapabilities::native_file();
+    capabilities.require(StorageCapability::DirectorySync)?;
+    capabilities.require(StorageCapability::StrictMetadataSync)
+}
+
+fn read_native_file_object_bytes(object: &StorageObjectId) -> Result<Option<Arc<[u8]>>> {
+    require_native_file_object_read()?;
 
     let file = match File::open(object.path()) {
         Ok(file) => file,
@@ -1614,14 +2057,7 @@ fn read_native_file_object_bytes(object: &StorageObjectId) -> Result<Option<Arc<
 }
 
 fn open_native_append_file(object: &StorageObjectId) -> Result<File> {
-    if object.kind() != StorageObjectKind::Wal {
-        return Err(Error::invalid_options(
-            "append storage objects must use WAL object kind",
-        ));
-    }
-
-    let capabilities = StorageCapabilities::native_file();
-    capabilities.require(StorageCapability::Append)?;
+    require_native_file_append(object)?;
 
     if let Some(parent) = object.path().parent() {
         fs::create_dir_all(parent)?;
@@ -1687,55 +2123,26 @@ fn rewrite_native_file_wal(
     bytes: &[u8],
     durability: DurabilityMode,
 ) -> Result<()> {
-    if object.kind() != StorageObjectKind::Wal || temporary_object.kind() != StorageObjectKind::Wal
-    {
-        return Err(Error::invalid_options(
-            "WAL rewrite requires WAL storage objects",
-        ));
-    }
-
-    let capabilities = StorageCapabilities::native_file();
-    capabilities.require(StorageCapability::AtomicWalRewrite)?;
-    capabilities.require_durability(durability)?;
-
-    let path = object.path();
-    let tmp_path = temporary_object.path();
-    if path == tmp_path {
-        return Err(Error::invalid_options(
-            "WAL rewrite temporary object must differ from final object",
-        ));
-    }
-    if path.parent() != tmp_path.parent() {
-        return Err(Error::invalid_options(
-            "WAL rewrite temporary object must share the final object's parent directory",
-        ));
-    }
+    let (path, tmp_path) = prepare_native_file_wal_rewrite(object, temporary_object, durability)?;
     if let Some(parent) = tmp_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
     {
-        let mut file = File::create(tmp_path)?;
+        let mut file = File::create(&tmp_path)?;
         file.write_all(bytes)?;
         sync_native_file_for_durability(&file, durability)?;
     }
-    fs::rename(tmp_path, path)?;
+    fs::rename(&tmp_path, &path)?;
     if durability == DurabilityMode::SyncAll {
-        sync_native_file_parent_directory_after_rename(path)?;
+        sync_native_file_parent_directory_after_rename(&path)?;
     }
 
     Ok(())
 }
 
 fn acquire_native_file_writer_lease(object: &StorageObjectId) -> Result<File> {
-    if object.kind() != StorageObjectKind::WriterLease {
-        return Err(Error::invalid_options(
-            "writer lease requires a writer lease storage object",
-        ));
-    }
-
-    let capabilities = StorageCapabilities::native_file();
-    capabilities.require(StorageCapability::WriterLease)?;
+    require_native_file_writer_lease(object)?;
 
     if let Some(parent) = object.path().parent() {
         fs::create_dir_all(parent)?;
@@ -1768,8 +2175,7 @@ fn write_native_file_writer_lease_owner(file: &mut File, owner: &str) -> Result<
 }
 
 fn create_native_file_directory_all(directory: &StorageDirectoryId) -> Result<()> {
-    let capabilities = StorageCapabilities::native_file();
-    capabilities.require(StorageCapability::DirectoryCreate)?;
+    require_native_file_directory_create()?;
 
     fs::create_dir_all(directory.path()).map_err(Error::from)
 }
@@ -1777,8 +2183,7 @@ fn create_native_file_directory_all(directory: &StorageDirectoryId) -> Result<()
 fn list_native_file_directory_files(
     directory: &StorageDirectoryId,
 ) -> Result<Vec<StorageDirectoryFile>> {
-    let capabilities = StorageCapabilities::native_file_read();
-    capabilities.require(StorageCapability::DirectoryListing)?;
+    require_native_file_directory_listing()?;
 
     let mut files = Vec::new();
     for entry in fs::read_dir(directory.path())? {
@@ -1794,27 +2199,19 @@ fn list_native_file_directory_files(
 }
 
 fn sync_native_file_directory_after_renames(directory: &StorageDirectoryId) -> Result<()> {
-    let capabilities = StorageCapabilities::native_file();
-    capabilities.require(StorageCapability::DirectorySync)?;
-    capabilities.require(StorageCapability::StrictMetadataSync)?;
+    require_native_file_directory_sync()?;
 
     sync_dir_after_renames(directory.path())
 }
 
 fn sync_native_file_parent_directory_after_rename(path: &Path) -> Result<()> {
-    let capabilities = StorageCapabilities::native_file();
-    capabilities.require(StorageCapability::DirectorySync)?;
-    capabilities.require(StorageCapability::StrictMetadataSync)?;
+    require_native_file_directory_sync()?;
 
     sync_parent_dir_after_rename(path)
 }
 
 fn read_current_manifest_from_native_file(object: &StorageObjectId) -> Result<Option<Arc<[u8]>>> {
-    if object.kind() != StorageObjectKind::Manifest {
-        return Err(Error::invalid_options(
-            "current manifest read requires a manifest storage object",
-        ));
-    }
+    require_native_file_manifest_read(object)?;
 
     match fs::read(object.path()) {
         Ok(bytes) => Ok(Some(Arc::from(bytes))),
@@ -1824,22 +2221,31 @@ fn read_current_manifest_from_native_file(object: &StorageObjectId) -> Result<Op
 }
 
 fn list_native_file_objects(request: &StorageObjectListRequest) -> Result<Vec<StorageObjectId>> {
-    let mut objects = Vec::new();
+    require_native_file_object_listing()?;
+
+    let mut paths = Vec::new();
     for entry in fs::read_dir(request.root())? {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue;
         }
 
-        let path = entry.path();
-        if !native_file_matches_list_request(request, &path) {
-            continue;
-        }
-
-        objects.push(StorageObjectId::native_file(request.kind(), path));
+        paths.push(entry.path());
     }
+    Ok(native_file_objects_from_paths(request, paths))
+}
+
+fn native_file_objects_from_paths(
+    request: &StorageObjectListRequest,
+    paths: Vec<PathBuf>,
+) -> Vec<StorageObjectId> {
+    let mut objects = paths
+        .into_iter()
+        .filter(|path| native_file_matches_list_request(request, path))
+        .map(|path| StorageObjectId::native_file(request.kind(), path))
+        .collect::<Vec<_>>();
     objects.sort_unstable();
-    Ok(objects)
+    objects
 }
 
 fn native_file_matches_list_request(request: &StorageObjectListRequest, path: &Path) -> bool {
@@ -1855,53 +2261,23 @@ fn write_native_file_object(
     bytes: &[u8],
     durability: DurabilityMode,
 ) -> Result<()> {
-    match object.kind() {
-        StorageObjectKind::Manifest => {
-            return Err(Error::invalid_options(
-                "manifest storage objects must use manifest publish",
-            ));
-        }
-        StorageObjectKind::Temporary => {
-            return Err(Error::invalid_options(
-                "temporary storage objects must use their owning publish operation",
-            ));
-        }
-        StorageObjectKind::Blob
-        | StorageObjectKind::RecoveryReport
-        | StorageObjectKind::Table
-        | StorageObjectKind::Wal
-        | StorageObjectKind::WriterLease => {}
-    }
-
-    let capabilities = StorageCapabilities::native_file();
-    capabilities.require(StorageCapability::ObjectWrite)?;
-    capabilities.require_durability(durability)?;
-
-    let path = object.path();
+    let (path, tmp_path) = prepare_native_file_object_write(object, durability)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let tmp_path = path.with_extension("tmp");
     {
         let mut file = File::create(&tmp_path)?;
         file.write_all(bytes)?;
         sync_native_file_for_durability(&file, durability)?;
     }
-    fs::rename(tmp_path, path)?;
+    fs::rename(&tmp_path, &path)?;
 
     Ok(())
 }
 
 fn delete_native_file_object(object: &StorageObjectId) -> Result<()> {
-    if object.kind() == StorageObjectKind::Manifest {
-        return Err(Error::invalid_options(
-            "manifest storage objects must use manifest publish",
-        ));
-    }
-
-    let capabilities = StorageCapabilities::native_file();
-    capabilities.require(StorageCapability::ObjectDelete)?;
+    require_native_file_object_delete(object)?;
 
     match fs::remove_file(object.path()) {
         Ok(()) => Ok(()),
@@ -1915,26 +2291,15 @@ fn publish_manifest_to_native_file(
     bytes: &[u8],
     durability: DurabilityMode,
 ) -> Result<()> {
-    if object.kind() != StorageObjectKind::Manifest {
-        return Err(Error::invalid_options(
-            "manifest publish requires a manifest storage object",
-        ));
-    }
-
-    let capabilities = StorageCapabilities::native_file();
-    capabilities.require(StorageCapability::AtomicManifestPublish)?;
-    capabilities.require_durability(durability)?;
-
-    let path = object.path();
-    let tmp_path = path.with_extension("tmp");
+    let (path, tmp_path) = prepare_native_file_manifest_publish(object, durability)?;
     {
         let mut file = File::create(&tmp_path)?;
         file.write_all(bytes)?;
         sync_native_file_for_durability(&file, durability)?;
     }
-    fs::rename(tmp_path, path)?;
+    fs::rename(&tmp_path, &path)?;
     if durability == DurabilityMode::SyncAll {
-        sync_native_file_parent_directory_after_rename(path)?;
+        sync_native_file_parent_directory_after_rename(&path)?;
     }
 
     Ok(())
@@ -2433,8 +2798,7 @@ mod tests {
         assert_eq!(&*buffer.into_bytes(), b"cde");
 
         let wal = StorageObjectId::native_file(StorageObjectKind::Wal, root.join("trine.wal"));
-        let mut append = backend
-            .open_append_blocking(wal.clone())
+        let mut append = block_on_test_future(backend.open_append(wal.clone()))
             .expect("platform I/O append object opens");
         block_on_test_future(StorageAppendObject::append(
             &mut append,
@@ -2454,7 +2818,133 @@ mod tests {
 
         let stats = backend.stats();
         assert!(stats.uses_platform_async_io);
-        assert!(stats.platform_async_io_tasks >= 3);
+        assert!(stats.platform_async_io_tasks >= 4);
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[cfg(feature = "platform-io")]
+    fn assert_platform_io_listing_fallbacks(
+        backend: &NativeFileBackend,
+        directory: StorageDirectoryId,
+        table: &StorageObjectId,
+    ) {
+        let list_request =
+            StorageObjectListRequest::native_file(StorageObjectKind::Table, directory.path())
+                .with_file_extension("trinet");
+        let listed_objects = block_on_test_future(backend.list_objects(list_request.clone()))
+            .expect("platform I/O object listing fallback completes");
+        assert_eq!(listed_objects, vec![table.clone()]);
+
+        let listed_files = block_on_test_future(backend.list_directory_files(directory.clone()))
+            .expect("platform I/O directory listing fallback completes");
+        assert!(
+            listed_files.iter().any(|file| file.path() == table.path()),
+            "directory listing should include the table"
+        );
+        assert_eq!(
+            backend
+                .list_objects_blocking(list_request)
+                .expect("blocking object listing fallback completes"),
+            vec![table.clone()]
+        );
+        assert!(
+            backend
+                .list_directory_files_blocking(directory)
+                .expect("blocking directory listing fallback completes")
+                .iter()
+                .any(|file| file.path() == table.path()),
+            "blocking directory listing should include the table"
+        );
+    }
+
+    #[cfg(feature = "platform-io")]
+    #[test]
+    fn platform_io_native_file_management_ops_use_platform_driver() {
+        let root = temp_storage_root("trine-kv-platform-io-management");
+        let runtime = Runtime::new(RuntimeOptions::platform_io());
+        let backend = NativeFileBackend::with_runtime(runtime);
+        let directory = StorageDirectoryId::native_file(&root);
+
+        block_on_test_future(backend.create_directory_all(directory.clone()))
+            .expect("platform I/O directory create completes");
+        assert!(root.is_dir(), "directory create should create root");
+
+        let table = StorageObjectId::native_file(
+            StorageObjectKind::Table,
+            root.join("table-00000000000000000033.trinet"),
+        );
+        block_on_test_future(backend.write_object(
+            table.clone(),
+            Arc::from(&b"table bytes"[..]),
+            DurabilityMode::Buffered,
+        ))
+        .expect("platform I/O object write completes");
+        let table_bytes = block_on_test_future(backend.read_object_bytes(table.clone()))
+            .expect("platform I/O object read completes")
+            .expect("table object exists");
+        assert_eq!(&*table_bytes, b"table bytes");
+
+        let manifest =
+            StorageObjectId::native_file(StorageObjectKind::Manifest, root.join("MANIFEST"));
+        block_on_test_future(backend.publish_manifest(
+            manifest.clone(),
+            Arc::from(&b"manifest bytes"[..]),
+            DurabilityMode::SyncAll,
+        ))
+        .expect("platform I/O manifest publish completes");
+        let manifest_bytes = block_on_test_future(backend.read_current_manifest(manifest.clone()))
+            .expect("platform I/O manifest read completes")
+            .expect("manifest exists");
+        assert_eq!(&*manifest_bytes, b"manifest bytes");
+
+        let wal = StorageObjectId::native_file(StorageObjectKind::Wal, root.join("trine.wal"));
+        let wal_tmp =
+            StorageObjectId::native_file(StorageObjectKind::Wal, root.join("trine.wal.tmp"));
+        std::fs::write(wal.path(), b"old wal").expect("old WAL writes");
+        block_on_test_future(backend.rewrite_wal(
+            wal.clone(),
+            wal_tmp.clone(),
+            Arc::from(&b"new wal"[..]),
+            DurabilityMode::SyncAll,
+        ))
+        .expect("platform I/O WAL rewrite completes");
+        assert_eq!(
+            std::fs::read(wal.path()).expect("WAL object reads"),
+            b"new wal"
+        );
+        assert!(
+            !wal_tmp.path().exists(),
+            "WAL rewrite should remove the temporary object"
+        );
+
+        let lease_object =
+            StorageObjectId::native_file(StorageObjectKind::WriterLease, root.join("LOCK"));
+        let lease = block_on_test_future(backend.acquire_writer_lease(lease_object.clone()))
+            .expect("platform I/O writer lease acquires");
+        assert!(
+            lease_object.path().exists(),
+            "writer lease marker should exist"
+        );
+        drop(lease);
+        assert!(
+            !lease_object.path().exists(),
+            "dropping writer lease should remove marker"
+        );
+
+        assert_platform_io_listing_fallbacks(&backend, directory.clone(), &table);
+
+        block_on_test_future(backend.sync_directory_after_renames(directory))
+            .expect("platform I/O directory sync completes");
+        block_on_test_future(backend.delete_object(table.clone()))
+            .expect("platform I/O object delete completes");
+        assert!(!table.path().exists(), "table object should be deleted");
+
+        let stats = backend.stats();
+        assert!(stats.uses_platform_async_io);
+        assert_eq!(stats.blocking_adapter_tasks, 0);
+        assert!(stats.platform_async_io_tasks >= 9);
+        assert!(stats.platform_blocking_fallback_tasks >= 4);
 
         std::fs::remove_dir_all(root).expect("test dir removes");
     }

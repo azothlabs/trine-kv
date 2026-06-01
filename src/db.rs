@@ -1327,20 +1327,8 @@ impl Db {
             blob_gc_discarded_bytes: self.inner.blob_gc_discarded_bytes.load(Ordering::Acquire),
             ..DbStats::default()
         };
-        if let Some(wal) = &self.inner.wal {
-            let wal_stats = wal.stats();
-            stats.wal_shards = wal_stats.shards;
-            stats.wal_open_shards = wal_stats.open_shards;
-            stats.wal_queue_capacity = wal_stats.queue_capacity;
-            stats.wal_records_accepted = wal_stats.records_accepted;
-            stats.wal_bytes_accepted = wal_stats.bytes_accepted;
-        }
-        let storage_stats = self.inner.native_storage.stats();
-        stats.storage_uses_blocking_adapter = storage_stats.uses_blocking_adapter;
-        stats.storage_uses_platform_async_io = storage_stats.uses_platform_async_io;
-        stats.storage_blocking_adapter_tasks = storage_stats.blocking_adapter_tasks;
-        stats.storage_platform_async_io_tasks = storage_stats.platform_async_io_tasks;
-        stats.storage_inline_tasks = storage_stats.inline_tasks;
+        self.add_wal_stats(&mut stats);
+        self.add_storage_runtime_stats(&mut stats);
         let (blob_read_count, blob_read_bytes) = self.inner.blob_reads.snapshot();
         stats.blob_read_count = blob_read_count;
         stats.blob_read_bytes = blob_read_bytes;
@@ -1417,6 +1405,28 @@ impl Db {
         }
 
         stats
+    }
+
+    fn add_wal_stats(&self, stats: &mut DbStats) {
+        if let Some(wal) = &self.inner.wal {
+            let wal_stats = wal.stats();
+            stats.wal_shards = wal_stats.shards;
+            stats.wal_open_shards = wal_stats.open_shards;
+            stats.wal_queue_capacity = wal_stats.queue_capacity;
+            stats.wal_records_accepted = wal_stats.records_accepted;
+            stats.wal_bytes_accepted = wal_stats.bytes_accepted;
+        }
+    }
+
+    fn add_storage_runtime_stats(&self, stats: &mut DbStats) {
+        let storage_stats = self.inner.native_storage.stats();
+        stats.storage_uses_blocking_adapter = storage_stats.uses_blocking_adapter;
+        stats.storage_uses_platform_async_io = storage_stats.uses_platform_async_io;
+        stats.storage_blocking_adapter_tasks = storage_stats.blocking_adapter_tasks;
+        stats.storage_platform_async_io_tasks = storage_stats.platform_async_io_tasks;
+        stats.storage_platform_blocking_fallback_tasks =
+            storage_stats.platform_blocking_fallback_tasks;
+        stats.storage_inline_tasks = storage_stats.inline_tasks;
     }
 
     #[must_use]

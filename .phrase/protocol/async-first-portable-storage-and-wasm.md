@@ -136,6 +136,26 @@ The runtime boundary may provide:
 
 Unsupported runtime features must be visible during open or option validation.
 
+### 4.4.1 `io` Boundary Before Backend Choice
+
+Trine's `io` module and storage contract own the architecture. Platform crates
+and OS APIs are backend implementations behind that boundary.
+
+Rules:
+
+- phase goals and acceptance gates name Trine operations, traits, capabilities,
+  completions, stats, and recovery behavior before naming a backend crate;
+- backend crate names may appear in Cargo metadata, implementation modules, and
+  dependency-selection evidence, but not as the subject of user-facing docs or
+  protocol wording;
+- backend-specific limits must be represented as capabilities, fallbacks, or
+  explicit blockers rather than hidden in implementation details;
+- a platform I/O phase must include a backend boundary receipt before code
+  changes: owned Trine operation names, selected backend, known unsupported
+  operations, leak-check scope, and verification commands;
+- review is not complete until docs and protocol are scanned for backend-name
+  leakage outside dependency-selection evidence.
+
 ### 4.5 Storage Operations Are Database Operations
 
 The storage contract describes what the database needs, not one platform's file
@@ -336,13 +356,18 @@ Rules:
 - may implement async operations with a bounded blocking pool when the host file
   API is blocking;
 - may use the opt-in `platform-io` runtime mode for native-file length, owned
-  random read, append, and persist operations when the build enables the
-  matching platform I/O feature;
+  random reads, whole-object reads, temp-write publish operations, WAL
+  append-object opening/append/persist/rewrite, object delete, directory
+  create/sync, and writer lease acquisition when the build enables the matching
+  platform I/O feature;
+- may submit directory and object listing through the platform driver only as a
+  separately reported platform blocking fallback until that driver exposes a
+  real directory enumeration operation;
 - may add stronger platform-specific implementations behind the same contract.
 - must report `BlockingAdapter` separately from `PlatformAsyncIo`; using a
   bounded blocking pool must not be described as true platform async I/O.
-- must continue to report blocking-adapter work for native-file operations that
-  have not moved below the platform I/O driver.
+- must report platform-driver blocking fallback tasks separately from both
+  Trine's bounded blocking adapter and true platform async I/O tasks.
 
 ### 9.3 WASI Backend
 
@@ -407,6 +432,8 @@ Stats and diagnostics should expose:
 - background task budget exhaustion;
 - blocking adapter call count when enabled;
 - whether the storage backend uses a blocking adapter or platform async I/O;
+- platform-driver blocking fallback count for operations without a real
+  platform primitive;
 - unsupported capability errors.
 
 ## 12. Required Tests

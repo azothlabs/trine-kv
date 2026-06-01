@@ -30,6 +30,14 @@ Evidence notes should separate:
 - Write comments for non-obvious Rust engine invariants, especially lock order,
   MVCC visibility, batch atomicity, and storage-format assumptions.
 - Prefer concrete storage-engine language in explanations and comments.
+- For platform I/O and storage backend work, Trine's own boundary must be the
+  design subject. External crates, OS APIs, and libraries are implementation
+  choices only; they must not drive public naming, phase goals, protocol
+  wording, or acceptance gates.
+- Before implementing or extending a backend, record a backend boundary receipt
+  in `current.md` or the active protocol: Trine operation names, owned
+  interface, chosen backend, known backend limits, leak-check scope, and
+  verification gate.
 
 ## Trine KV V1 Source Of Truth
 
@@ -71,3 +79,5 @@ A phase can close only when:
 - Static spec/plan/task/change bookkeeping for every session.
 - Treating stale plans as current truth after fresh evidence contradicts them.
 - Abstract jargon when plain engine terminology is clearer.
+- Letting an external backend crate become the architecture boundary instead
+  of Trine's `io` and storage contracts.
