@@ -594,6 +594,7 @@ impl Db {
         let mut delta_publication_started = false;
         let publish_in_memory_deltas =
             matches!(self.inner.options.storage_mode, StorageMode::InMemory);
+        let delta_epoch_max_bytes = usize_to_u64_saturating(self.inner.options.write_buffer_bytes);
         for delta in prepared.deltas {
             debug_assert!(!delta.bucket.is_empty());
             if publish_in_memory_deltas {
@@ -601,16 +602,18 @@ impl Db {
                     .operations
                     .iter()
                     .map(|operation| (operation.operation.clone(), operation.batch_index));
-                if let Err(error) = delta
-                    .state
-                    .publish_delta_operations(delta_operations, sequence)
-                {
+                if let Err(error) = delta.state.publish_delta_operations_with_budget(
+                    delta_operations,
+                    sequence,
+                    delta_epoch_max_bytes,
+                ) {
                     if !delta_publication_started {
                         self.inner.commit_tracker.mark_skipped(slot)?;
                     }
                     return Err(error);
                 }
                 delta_publication_started = true;
+                continue;
             }
             for operation in delta.operations {
                 if let Err(error) = delta.state.apply_operation(
@@ -1080,10 +1083,50 @@ mod tests {
             Some(b"v".to_vec())
         );
         let state = db.bucket_state("default").expect("default bucket state");
+        assert_eq!(
+            state
+                .active_memtable_bytes()
+                .expect("active memtable bytes"),
+            0
+        );
         let (delta_count, point_delta_count, range_tombstone_count) =
             state.delta_debug_counts().expect("delta counts");
         assert_eq!(delta_count, 1);
         assert_eq!(point_delta_count, 1);
         assert_eq!(range_tombstone_count, 0);
+        let db_stats = db.stats();
+        assert!(db_stats.memtable_bytes > 0);
+        assert_eq!(db_stats.immutable_memtables, 0);
+    }
+
+    #[test]
+    fn in_memory_write_budget_merges_deltas_without_active_mirror() {
+        let mut options = DbOptions::memory();
+        options.write_buffer_bytes = 1;
+        let db = Db::memory(options).expect("memory db opens");
+
+        db.put(b"k", b"v1").expect("first write");
+        let snapshot = db.snapshot();
+        db.put(b"k", b"v2").expect("second write");
+
+        assert_eq!(db.get(b"k").expect("current read"), Some(b"v2".to_vec()));
+        assert_eq!(
+            snapshot
+                .get(&db.default_bucket().expect("default bucket"), b"k")
+                .expect("snapshot read"),
+            Some(b"v1".to_vec())
+        );
+
+        let state = db.bucket_state("default").expect("default bucket state");
+        assert_eq!(
+            state
+                .active_memtable_bytes()
+                .expect("active memtable bytes"),
+            0
+        );
+        let delta_stats = state.delta_debug_stats().expect("delta stats");
+        assert_eq!(delta_stats.merged_epoch_count, 1);
+        assert_eq!(delta_stats.max_shard_chain_len, 1);
+        assert!(delta_stats.open_epoch_bytes > 0);
     }
 }

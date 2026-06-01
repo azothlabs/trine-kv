@@ -83,7 +83,9 @@ impl LsmTree {
     }
 
     pub(crate) fn memtable_bytes(&self) -> Result<u64> {
-        let mut bytes = self.active_memtable_bytes()?;
+        let mut bytes = self
+            .active_memtable_bytes()?
+            .saturating_add(self.delta_estimated_bytes()?);
         let immutable_memtables = self
             .immutable_memtables
             .read()

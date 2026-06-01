@@ -14,6 +14,7 @@ use crate::{
 use super::tree::{LsmTree, RangeTombstone, lock_poisoned};
 
 const DELTA_SHARD_COUNT: usize = 16;
+const DELTA_EPOCH_MAX_DELTAS: usize = 8;
 
 #[derive(Debug)]
 pub(crate) struct DeltaShardSet {
@@ -22,7 +23,21 @@ pub(crate) struct DeltaShardSet {
 
 #[derive(Debug, Default)]
 struct DeltaShard {
-    deltas: RwLock<Vec<Arc<InMemoryDelta>>>,
+    state: RwLock<DeltaShardState>,
+}
+
+#[derive(Debug, Default)]
+struct DeltaShardState {
+    open_epoch: DeltaEpoch,
+    sealed_epoch_count: u64,
+    merged_epoch_count: u64,
+    retired_delta_count: u64,
+}
+
+#[derive(Debug, Default)]
+struct DeltaEpoch {
+    deltas: Vec<Arc<InMemoryDelta>>,
+    estimated_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +51,19 @@ pub(crate) struct InMemoryDelta {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DeltaSnapshot {
     deltas: Vec<Arc<InMemoryDelta>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DeltaDebugStats {
+    pub(crate) delta_count: usize,
+    pub(crate) point_delta_count: usize,
+    pub(crate) range_tombstone_count: usize,
+    pub(crate) max_shard_chain_len: usize,
+    pub(crate) open_epoch_bytes: u64,
+    pub(crate) sealed_epoch_count: u64,
+    pub(crate) merged_epoch_count: u64,
+    pub(crate) retired_delta_count: u64,
 }
 
 #[derive(Debug)]
@@ -54,10 +82,20 @@ impl DeltaShardSet {
         }
     }
 
+    #[cfg(test)]
     fn publish_operations(
         &self,
         operations: impl IntoIterator<Item = (BatchOperation, u32)>,
         sequence: Sequence,
+    ) -> Result<()> {
+        self.publish_operations_with_budget(operations, sequence, u64::MAX)
+    }
+
+    fn publish_operations_with_budget(
+        &self,
+        operations: impl IntoIterator<Item = (BatchOperation, u32)>,
+        sequence: Sequence,
+        max_epoch_bytes: u64,
     ) -> Result<()> {
         let mut builders = (0..self.shards.len())
             .map(|_| DeltaBuilder::new())
@@ -83,7 +121,7 @@ impl DeltaShardSet {
 
         for (shard, builder) in self.shards.iter().zip(builders) {
             if let Some(delta) = builder.finish(sequence) {
-                shard.publish(delta)?;
+                shard.publish(delta, max_epoch_bytes)?;
             }
         }
 
@@ -105,6 +143,14 @@ impl DeltaShardSet {
         })
     }
 
+    fn estimated_bytes(&self) -> Result<u64> {
+        let mut bytes = 0_u64;
+        for shard in &self.shards {
+            bytes = bytes.saturating_add(shard.estimated_bytes()?);
+        }
+        Ok(bytes)
+    }
+
     fn shard_index_for_key(&self, key: &[u8]) -> usize {
         debug_assert!(!self.shards.is_empty());
         let shard_count = u64::try_from(self.shards.len()).expect("delta shard count fits u64");
@@ -114,43 +160,113 @@ impl DeltaShardSet {
 
     #[cfg(test)]
     fn debug_counts(&self) -> Result<(usize, usize, usize)> {
-        let mut delta_count = 0_usize;
-        let mut point_delta_count = 0_usize;
-        let mut range_tombstone_count = 0_usize;
+        let stats = self.debug_stats()?;
+
+        Ok((
+            stats.delta_count,
+            stats.point_delta_count,
+            stats.range_tombstone_count,
+        ))
+    }
+
+    #[cfg(test)]
+    fn debug_stats(&self) -> Result<DeltaDebugStats> {
+        let mut aggregate = DeltaDebugStats::default();
 
         for shard in &self.shards {
-            let deltas = shard
-                .deltas
+            let shard_state = shard
+                .state
                 .read()
                 .map_err(|_| lock_poisoned("delta shard"))?;
-            delta_count = delta_count.saturating_add(deltas.len());
-            for delta in deltas.iter() {
+            aggregate.delta_count = aggregate
+                .delta_count
+                .saturating_add(shard_state.open_epoch.deltas.len());
+            aggregate.max_shard_chain_len = aggregate
+                .max_shard_chain_len
+                .max(shard_state.open_epoch.deltas.len());
+            aggregate.open_epoch_bytes = aggregate
+                .open_epoch_bytes
+                .saturating_add(shard_state.open_epoch.estimated_bytes);
+            aggregate.sealed_epoch_count = aggregate
+                .sealed_epoch_count
+                .saturating_add(shard_state.sealed_epoch_count);
+            aggregate.merged_epoch_count = aggregate
+                .merged_epoch_count
+                .saturating_add(shard_state.merged_epoch_count);
+            aggregate.retired_delta_count = aggregate
+                .retired_delta_count
+                .saturating_add(shard_state.retired_delta_count);
+            for delta in &shard_state.open_epoch.deltas {
                 if delta.memtable.estimated_bytes() != 0 {
-                    point_delta_count = point_delta_count.saturating_add(1);
+                    aggregate.point_delta_count = aggregate.point_delta_count.saturating_add(1);
                 }
-                range_tombstone_count =
-                    range_tombstone_count.saturating_add(delta.range_tombstones.len());
+                aggregate.range_tombstone_count = aggregate
+                    .range_tombstone_count
+                    .saturating_add(delta.range_tombstones.len());
             }
         }
 
-        Ok((delta_count, point_delta_count, range_tombstone_count))
+        Ok(aggregate)
     }
 }
 
 impl DeltaShard {
-    fn publish(&self, delta: Arc<InMemoryDelta>) -> Result<()> {
-        self.deltas
+    fn publish(&self, delta: Arc<InMemoryDelta>, max_epoch_bytes: u64) -> Result<()> {
+        self.state
             .write()
             .map_err(|_| lock_poisoned("delta shard"))?
-            .push(delta);
-        Ok(())
+            .publish(delta, max_epoch_bytes)
     }
 
     fn snapshot(&self) -> Result<Vec<Arc<InMemoryDelta>>> {
-        self.deltas
+        self.state
             .read()
             .map_err(|_| lock_poisoned("delta shard"))
-            .map(|deltas| deltas.clone())
+            .map(|state| state.open_epoch.deltas.clone())
+    }
+
+    fn estimated_bytes(&self) -> Result<u64> {
+        self.state
+            .read()
+            .map_err(|_| lock_poisoned("delta shard"))
+            .map(|state| state.open_epoch.estimated_bytes)
+    }
+}
+
+impl DeltaShardState {
+    fn publish(&mut self, delta: Arc<InMemoryDelta>, max_epoch_bytes: u64) -> Result<()> {
+        self.open_epoch.push(delta);
+        if self.open_epoch_exceeds_budget(max_epoch_bytes) {
+            self.seal_and_merge_open_epoch()?;
+        }
+        Ok(())
+    }
+
+    fn open_epoch_exceeds_budget(&self, max_epoch_bytes: u64) -> bool {
+        self.open_epoch.deltas.len() > DELTA_EPOCH_MAX_DELTAS
+            || self.open_epoch.estimated_bytes >= max_epoch_bytes
+    }
+
+    fn seal_and_merge_open_epoch(&mut self) -> Result<()> {
+        if self.open_epoch.deltas.len() <= 1 {
+            return Ok(());
+        }
+
+        let sealed = std::mem::take(&mut self.open_epoch);
+        let retired_count = usize_to_u64_saturating(sealed.deltas.len());
+        let merged = merge_deltas(&sealed.deltas)?;
+        self.sealed_epoch_count = self.sealed_epoch_count.saturating_add(1);
+        self.merged_epoch_count = self.merged_epoch_count.saturating_add(1);
+        self.retired_delta_count = self.retired_delta_count.saturating_add(retired_count);
+        self.open_epoch.push(merged);
+        Ok(())
+    }
+}
+
+impl DeltaEpoch {
+    fn push(&mut self, delta: Arc<InMemoryDelta>) {
+        self.estimated_bytes = self.estimated_bytes.saturating_add(delta.estimated_bytes);
+        self.deltas.push(delta);
     }
 }
 
@@ -225,13 +341,64 @@ impl DeltaBuilder {
     }
 }
 
+fn merge_deltas(deltas: &[Arc<InMemoryDelta>]) -> Result<Arc<InMemoryDelta>> {
+    debug_assert!(!deltas.is_empty());
+    let memtable = Arc::new(Memtable::default());
+    let mut range_tombstones = Vec::new();
+    let mut total_range_tombstone_bytes = 0_u64;
+    let mut sequence = Sequence::ZERO;
+
+    for delta in deltas {
+        sequence = sequence.max(delta.sequence);
+
+        let entries = delta
+            .memtable
+            .read_entries()
+            .map_err(|_| lock_poisoned("delta memtable entries"))?;
+        for (internal_key, value) in entries.iter() {
+            memtable
+                .insert(internal_key.clone(), value.clone())
+                .map_err(|()| lock_poisoned("delta merge memtable entries"))?;
+        }
+
+        for tombstone in delta.range_tombstones.iter() {
+            let tombstone_bytes = range_tombstone_bytes(&tombstone.range);
+            total_range_tombstone_bytes =
+                total_range_tombstone_bytes.saturating_add(tombstone_bytes);
+            range_tombstones.push(tombstone.clone());
+        }
+    }
+    range_tombstone::sort_tombstones(&mut range_tombstones);
+
+    let estimated_bytes = memtable
+        .estimated_bytes()
+        .saturating_add(total_range_tombstone_bytes);
+    Ok(Arc::new(InMemoryDelta {
+        memtable,
+        range_tombstones: Arc::new(range_tombstones),
+        estimated_bytes,
+        sequence,
+    }))
+}
+
 impl LsmTree {
+    #[cfg(test)]
     pub(crate) fn publish_delta_operations(
         &self,
         operations: impl IntoIterator<Item = (BatchOperation, u32)>,
         sequence: Sequence,
     ) -> Result<()> {
         self.delta_shards.publish_operations(operations, sequence)
+    }
+
+    pub(crate) fn publish_delta_operations_with_budget(
+        &self,
+        operations: impl IntoIterator<Item = (BatchOperation, u32)>,
+        sequence: Sequence,
+        max_epoch_bytes: u64,
+    ) -> Result<()> {
+        self.delta_shards
+            .publish_operations_with_budget(operations, sequence, max_epoch_bytes)
     }
 
     pub(crate) fn delta_snapshot(&self) -> Result<DeltaSnapshot> {
@@ -243,7 +410,8 @@ impl LsmTree {
     }
 
     pub(crate) fn delta_mirror_covers(&self, read_sequence: Sequence) -> bool {
-        self.delta_mirror_sequence.load(Ordering::Acquire) >= read_sequence.get()
+        let mirror_sequence = self.delta_mirror_sequence.load(Ordering::Acquire);
+        mirror_sequence != Sequence::ZERO.get() && mirror_sequence >= read_sequence.get()
     }
 
     pub(crate) fn mark_delta_mirror_sequence(&self, sequence: Sequence) {
@@ -251,9 +419,18 @@ impl LsmTree {
             .fetch_max(sequence.get(), Ordering::AcqRel);
     }
 
+    pub(crate) fn delta_estimated_bytes(&self) -> Result<u64> {
+        self.delta_shards.estimated_bytes()
+    }
+
     #[cfg(test)]
     pub(crate) fn delta_debug_counts(&self) -> Result<(usize, usize, usize)> {
         self.delta_shards.debug_counts()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delta_debug_stats(&self) -> Result<DeltaDebugStats> {
+        self.delta_shards.debug_stats()
     }
 }
 
@@ -299,7 +476,7 @@ mod tests {
         write_batch::BatchOperation,
     };
 
-    use super::LsmTree;
+    use super::{DELTA_EPOCH_MAX_DELTAS, LsmTree};
 
     #[test]
     fn delta_heads_feed_point_reads_without_active_memtable() {
@@ -429,5 +606,100 @@ mod tests {
         assert_eq!((first.key, first.value), (b"a".to_vec(), b"one".to_vec()));
         assert_eq!((second.key, second.value), (b"b".to_vec(), b"two".to_vec()));
         assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn delta_epoch_merge_bounds_chain_and_preserves_point_reads() {
+        let tree = LsmTree::new(BucketOptions::default(), Vec::new()).expect("tree builds");
+        let delta_budget = u64::try_from(DELTA_EPOCH_MAX_DELTAS).expect("delta budget fits u64");
+        let write_count = delta_budget + 2;
+
+        for sequence in 1..=write_count {
+            tree.publish_delta_operations(
+                vec![(
+                    BatchOperation::Put {
+                        bucket: DEFAULT_BUCKET_NAME.to_owned(),
+                        key: b"k".to_vec(),
+                        value: format!("v{sequence}").into_bytes(),
+                    },
+                    0,
+                )],
+                Sequence::new(sequence),
+            )
+            .expect("publish delta");
+        }
+
+        assert_eq!(
+            tree.read_visible_point(b"k", Sequence::new(write_count), None, None, None)
+                .expect("latest point survives merge"),
+            Some(format!("v{write_count}").into_bytes())
+        );
+        assert_eq!(
+            tree.read_visible_point(b"k", Sequence::new(3), None, None, None)
+                .expect("older point survives merge"),
+            Some(b"v3".to_vec())
+        );
+
+        let stats = tree.delta_debug_stats().expect("delta stats");
+        assert_eq!(stats.merged_epoch_count, 1);
+        assert_eq!(stats.sealed_epoch_count, 1);
+        assert_eq!(stats.retired_delta_count, delta_budget + 1);
+        assert_eq!(stats.max_shard_chain_len, 2);
+        assert!(stats.open_epoch_bytes > 0);
+    }
+
+    #[test]
+    fn delta_epoch_merge_preserves_range_tombstone_visibility() {
+        let tree = LsmTree::new(BucketOptions::default(), Vec::new()).expect("tree builds");
+        tree.publish_delta_operations(
+            vec![(
+                BatchOperation::Put {
+                    bucket: DEFAULT_BUCKET_NAME.to_owned(),
+                    key: b"k".to_vec(),
+                    value: b"v".to_vec(),
+                },
+                0,
+            )],
+            Sequence::new(1),
+        )
+        .expect("publish put delta");
+
+        let delete_count = DELTA_EPOCH_MAX_DELTAS;
+        for index in 0..delete_count {
+            let sequence = u64::try_from(index).expect("delete index fits u64") + 2;
+            tree.publish_delta_operations(
+                vec![(
+                    BatchOperation::DeleteRange {
+                        bucket: DEFAULT_BUCKET_NAME.to_owned(),
+                        range: KeyRange::half_open(b"a".to_vec(), b"z".to_vec()),
+                    },
+                    0,
+                )],
+                Sequence::new(sequence),
+            )
+            .expect("publish range delta");
+        }
+
+        assert_eq!(
+            tree.read_visible_point(b"k", Sequence::new(1), None, None, None)
+                .expect("snapshot before range tombstones"),
+            Some(b"v".to_vec())
+        );
+        assert_eq!(
+            tree.read_visible_point(
+                b"k",
+                Sequence::new(u64::try_from(delete_count).expect("delete count fits u64") + 1),
+                None,
+                None,
+                None
+            )
+            .expect("range tombstones survive merge"),
+            None
+        );
+
+        let stats = tree.delta_debug_stats().expect("delta stats");
+        assert_eq!(stats.merged_epoch_count, 1);
+        assert_eq!(stats.sealed_epoch_count, 1);
+        assert!(stats.range_tombstone_count >= delete_count);
     }
 }

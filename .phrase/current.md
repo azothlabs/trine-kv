@@ -6,19 +6,17 @@ Complete
 
 ## Goal
 
-Publish in-memory writes into key-sharded delta heads and make in-memory read
-paths include those deltas, while preserving the existing active-memtable
-mirror and public behavior.
+Stop mirroring in-memory writes into the active memtable by making delta heads
+carry in-memory write accounting and read visibility.
 
 ## Scope
 
-- Add bucket-local in-memory delta heads split by a fixed key-shard count.
-- Publish accepted in-memory writes into those delta heads after WAL acceptance
-  and before the sequence is marked visible.
-- Make point reads, range/prefix scans, and transaction conflict checks include
-  delta-head records and range tombstones.
-- Keep the current active-memtable publication path as a compatibility mirror
-  for freeze/stats behavior in this phase.
+- Count delta epoch bytes in the LSM memory accounting used by stats.
+- Publish in-memory commits through delta heads without replaying the same
+  operations into the active memtable.
+- Preserve point reads, range/prefix scans, snapshots, and transaction conflict
+  checks without the active-memtable mirror.
+- Keep persistent commits on the existing active/immutable memtable path.
 - Preserve existing public async API shape, blocking API, commit tracker,
   WAL/table/blob/manifest formats, MVCC, compaction, recovery, cleanup, and
   persistent storage behavior.
@@ -27,42 +25,41 @@ mirror and public behavior.
 
 - Adding WAL shards or changing WAL recovery ordering.
 - Removing or narrowing the publish barrier.
-- Removing active-memtable publication or changing flush/freeze accounting.
+- Changing persistent flush/freeze accounting.
+- Adding background delta merge workers.
 - Moving table open metadata reads onto async owned completions.
 - Adding true async OS file I/O or public runtime tuning options.
 - Changing public storage formats or recovery protocol.
 
 ## Acceptance Gate
 
-- Roadmap records this as the in-memory key-sharded delta-head phase.
-- In-memory writes publish immutable delta data into bucket-local key shards.
-- Point reads and range/prefix scans include in-memory delta heads under MVCC
-  visibility and range tombstone rules.
-- Transaction conflict checks see records and range tombstones published
-  through delta heads.
-- Active-memtable publication remains as the current compatibility mirror.
+- Roadmap records this as the in-memory delta-backed write phase.
+- In-memory commits publish through delta heads without active-memtable mirror
+  writes.
+- `DbStats::memtable_bytes` counts in-memory delta bytes.
+- Point reads and range/prefix scans keep seeing in-memory writes under MVCC
+  visibility rules.
+- Snapshots and transaction conflict checks keep working without the mirror.
+- Persistent write behavior remains unchanged.
 - Focused commit/write/async tests, formatting, clippy, full tests,
   `git diff --check`, and forbidden-term scan pass.
-- Evidence records remaining write-path blockers and the recommended next
-  phase.
+- Evidence records remaining write-path blockers and the recommended next phase.
 
 ## Active Task Slice
 
 ```text
-task387 [x] goal:start in-memory delta-head phase | scope:current roadmap | verify:manual
-task388 [x] goal:add key-sharded delta head storage | scope:src/lsm | verify:lsm tests
-task389 [x] goal:publish in-memory prepared writes to delta heads | scope:src/db/commit.rs src/lsm | verify:commit/mvcc tests
-task390 [x] goal:include delta heads in point/scan/conflict reads | scope:src/lsm | verify:mvcc/iteration/transaction tests
-task391 [x] goal:verify focused and full gates | scope:src tests benches | verify:full tests
-task392 [x] goal:record evidence and commit | scope:.phrase/evidence.md current roadmap src | verify:git status
+task398 [x] goal:start in-memory delta-backed write phase | scope:current roadmap | verify:manual
+task399 [x] goal:count delta epoch bytes in LSM memory accounting | scope:src/lsm | verify:stats tests
+task400 [x] goal:skip active-memtable mirror for in-memory commits | scope:src/db/commit.rs src/lsm | verify:in-memory tests
+task401 [x] goal:prove reads and transaction checks work without mirror | scope:tests src/db/commit.rs | verify:mvcc/iteration/transaction tests
+task402 [x] goal:record evidence and run verification | scope:.phrase src tests | verify:full gate
 ```
 
 ## Known Blockers
 
 - The publish barrier still serializes transaction validation, sequence
-  assignment, WAL append, delta publication, visibility marking, and freeze.
-- Active-memtable publication remains as a compatibility mirror until a later
-  phase moves freeze/stats behavior onto delta epochs or merge outputs.
+  assignment, WAL append, delta publication, visibility marking, and persistent
+  freeze.
 - Persistent commits still use the single WAL writer.
 - Native-file async reads still use the bounded blocking adapter rather than
   platform-native async file I/O.
@@ -73,11 +70,6 @@ task392 [x] goal:record evidence and commit | scope:.phrase/evidence.md current 
 
 - Phase 92 added writer-local `PreparedCommit` data and current single-shard
   bucket deltas while preserving existing publication behavior.
-- The foreground write-path protocol lists publishing deltas through
-  key-sharded heads as the next staged slice after prepared commits.
-- Current freeze and stats behavior still depend on active/immutable memtables,
-  so this phase keeps the active memtable as a mirror while proving delta-head
-  reads.
 - `LsmTree` now owns fixed bucket-local delta shards. In-memory commits publish
   immutable delta data into those shards before active-memtable mirror writes.
 - Delta-only LSM tests prove point records, range tombstones, and range scans
@@ -85,8 +77,23 @@ task392 [x] goal:record evidence and commit | scope:.phrase/evidence.md current 
 - Normal in-memory point reads, snapshot readers, scans, and transaction
   conflict checks avoid scanning mirrored deltas when active/immutable
   memtables already cover the read sequence.
-- Verification passed: `cargo test delta --lib`,
+- Phase 93 left delta heads without epoch sealing, merge, retirement, or read
+  amplification budgets.
+- Delta shards now track open epoch bytes, max chain length, sealed epochs,
+  merged epochs, and retired delta counts.
+- Over-budget open epochs are sealed and merged into one immutable delta while
+  old snapshots keep cloned `Arc` references to pre-merge deltas.
+- Delta tests prove merged point records remain readable at both latest and
+  older sequences, and merged range tombstones still hide covered point records.
+- In-memory commits now publish through delta heads and skip active-memtable
+  mirror writes.
+- `DbStats::memtable_bytes` includes delta epoch bytes, so in-memory recent
+  writes remain visible in memory accounting.
+- `delta_mirror_covers` now requires a non-zero mirror sequence; read sequence
+  zero must still inspect deltas when the mirror has been removed.
+- Verification passed: `cargo test commit --lib`, `cargo test delta --lib`,
   `cargo test --test in_memory_mvcc`, `cargo test --test in_memory_iteration`,
+  `cargo test --test in_memory_range_delete`,
   `cargo test --test in_memory_transaction`, `cargo test --test async_api`,
   `cargo test persistent_write_buffer --test persistent_wal`,
   `cargo clippy --all-targets --all-features -- -D warnings`,
@@ -94,7 +101,6 @@ task392 [x] goal:record evidence and commit | scope:.phrase/evidence.md current 
 
 ## Next Recommendation
 
-- Continue by removing the active-memtable mirror from in-memory writes only
-  after delta epochs or merge outputs can preserve freeze/stats and bounded
-  read amplification. WAL shard front doors should remain a later persistent
-  write phase.
+- Continue with write-path contention work only after recording/benchmarking
+  the new bounded delta read cost. WAL shard front doors remain a later
+  persistent write phase.

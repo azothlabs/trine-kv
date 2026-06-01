@@ -7037,3 +7037,127 @@ Record only evidence that can change planning or durable decisions.
 - Add delta epoch sealing/merge or equivalent in-memory accounting before
   removing the active-memtable mirror. WAL shard front doors should remain a
   later persistent write phase.
+
+## Phase 94: Delta Epoch Merge Accounting
+
+### Observation
+
+- Phase 93 proved in-memory delta heads on the read path, but each shard still
+  kept an unbounded delta chain.
+- Active-memtable publication still provides current write-buffer freeze and
+  stats behavior, so removing it in this phase would have mixed accounting and
+  publication changes.
+
+### Interpretation
+
+- The safe next slice was to add per-shard epoch accounting and an immediate
+  merge path for over-budget open epochs while keeping the active-memtable
+  mirror.
+- Replacing an epoch with a merged delta is snapshot-safe because readers clone
+  `Arc` references before the shard state is changed.
+
+### Change
+
+- Delta shards now store an open epoch with byte accounting, chain length, and
+  merge counters instead of a bare delta vector.
+- When a shard's open epoch exceeds the internal delta-count budget, it is
+  sealed and merged into one immutable delta.
+- The merged delta keeps all point records and range tombstones with their
+  original sequences and batch indexes.
+- Added focused delta tests for bounded chain length, point-read visibility
+  across merged deltas, and range tombstone visibility after merge.
+
+### Verification
+
+- `cargo test delta --lib`
+- `cargo test --test in_memory_mvcc`
+- `cargo test --test in_memory_iteration`
+- `cargo test --test in_memory_transaction`
+- `cargo test --test async_api`
+- `cargo test persistent_write_buffer --test persistent_wal`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --check`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan passed outside the repository instruction file.
+
+### Remaining Blockers
+
+- Active-memtable publication remains as the compatibility mirror for
+  write-buffer freeze and public stats behavior.
+- The publish barrier still serializes WAL append, delta publication,
+  active-memtable mirror writes, visible marking, and freeze.
+- Persistent commits still use the single WAL writer.
+- Native-file async reads still use the bounded blocking adapter rather than
+  platform-native async file I/O.
+- Table open header/footer reads still use synchronous borrowed reads.
+
+### Recommended Next Action
+
+- Move in-memory freeze/stats accounting onto delta epochs or merged outputs,
+  then remove active-memtable publication from in-memory writes. Keep WAL shard
+  front doors as a later persistent write phase.
+
+## Phase 95: In-Memory Delta-Backed Writes
+
+### Observation
+
+- Phase 94 gave delta shards bounded epoch accounting and merge behavior, but
+  in-memory commits still replayed the same operations into the active memtable.
+- `DbStats::memtable_bytes` previously came from active/immutable memtables, so
+  removing the mirror required delta bytes to participate in LSM memory stats.
+- After removing mirror writes, transaction range validation exposed that read
+  sequence zero must still inspect delta heads; a zero mirror sequence no longer
+  proves mirror coverage.
+
+### Interpretation
+
+- In-memory writes can now use delta heads as their write target while keeping
+  persistent commits on the existing active/immutable memtable path.
+- The mirror coverage check must distinguish "covered through active memtable"
+  from the initial zero value.
+- Public memory accounting should continue to report recent in-memory write
+  bytes through `DbStats::memtable_bytes`, even though
+  `DbStats::immutable_memtables` no longer increases for in-memory delta-only
+  writes.
+
+### Change
+
+- Added delta epoch byte accounting to `LsmTree::memtable_bytes`.
+- Routed in-memory commits through `publish_delta_operations_with_budget` and
+  skipped active-memtable `apply_operation` for those commits.
+- Kept persistent commits on the active/immutable memtable path.
+- Tightened `delta_mirror_covers` so only a non-zero mirror sequence can suppress
+  delta reads.
+- Updated in-memory write-buffer coverage to assert delta-backed memory stats
+  and no active-memtable mirror.
+
+### Verification
+
+- `cargo test commit --lib`
+- `cargo test delta --lib`
+- `cargo test --test in_memory_mvcc`
+- `cargo test --test in_memory_iteration`
+- `cargo test --test in_memory_range_delete`
+- `cargo test --test in_memory_transaction`
+- `cargo test --test async_api`
+- `cargo test persistent_write_buffer --test persistent_wal`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --check`
+- `cargo test --all-targets --all-features`
+
+### Remaining Blockers
+
+- The publish barrier still serializes transaction validation, WAL append, delta
+  publication, visibility marking, and persistent freeze.
+- Persistent commits still use the single WAL writer.
+- Native-file async reads still use the bounded blocking adapter rather than
+  platform-native async file I/O.
+- Table open header/footer reads still use synchronous borrowed reads.
+- Runtime tuning options are still internal.
+
+### Recommended Next Action
+
+- Record/benchmark the bounded delta read cost before choosing the next
+  write-path step. WAL shard front doors should remain a later persistent write
+  phase until recovery and cancellation tests are staged for that change.

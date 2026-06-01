@@ -2064,3 +2064,50 @@ available before publish-time memtable mutation.
   unchanged.
 - Focused commit/MVCC/iteration/transaction/async tests, formatting, clippy,
   full tests, and diff checks pass.
+
+### Phase 94: Delta Epoch Merge Accounting
+
+**Status**: Complete
+
+**Goal**: Add bounded in-memory delta epoch sealing, merge, and accounting so
+delta heads have a safe path toward replacing the active-memtable mirror.
+
+**Entry Condition**: Phase 93 complete and evidence shows delta heads are
+read-integrated but still unbounded without epoch merge behavior.
+
+**Acceptance Gate**:
+
+- Delta shards track open epoch bytes and chain length.
+- A shard seals and merges an over-budget epoch into one immutable delta while
+  keeping old snapshots safe through `Arc` ownership.
+- Point reads, range/prefix scans, and transaction conflict checks keep seeing
+  records and range tombstones across merged delta epochs.
+- Active-memtable publication remains as the current compatibility mirror.
+- Public async/blocking API, storage formats, MVCC, recovery contract, commit
+  tracker, compaction behavior, and WAL/table/blob/manifest formats remain
+  unchanged.
+- Focused delta/MVCC/iteration/transaction/async tests, formatting, clippy,
+  full tests, and diff checks pass.
+
+### Phase 95: In-Memory Delta-Backed Writes
+
+**Status**: Complete
+
+**Goal**: Stop mirroring in-memory writes into the active memtable by making
+delta heads carry in-memory write accounting and read visibility.
+
+**Entry Condition**: Phase 94 complete and delta shards have epoch accounting
+plus merge behavior.
+
+**Acceptance Gate**:
+
+- In-memory commits publish through delta heads without also mutating the active
+  memtable.
+- In-memory stats count delta bytes so recent writes remain visible in
+  `DbStats::memtable_bytes`.
+- Point reads, range/prefix scans, snapshots, and transaction conflict checks
+  keep working without the active-memtable mirror.
+- Persistent write behavior, WAL/table/blob/manifest formats, recovery,
+  compaction, and public API shape remain unchanged.
+- Focused in-memory/transaction/async/persistent-write-buffer tests,
+  formatting, clippy, full tests, and diff checks pass.

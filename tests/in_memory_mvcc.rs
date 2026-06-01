@@ -1,7 +1,7 @@
 use trine_kv::{Db, DbOptions, Error, WriteBatch, WriteOptions};
 
 #[test]
-fn write_buffer_freeze_reads_immutable_in_memory() {
+fn write_buffer_budget_reads_delta_backed_in_memory_writes() {
     let mut options = DbOptions::memory();
     options.write_buffer_bytes = 1;
     let db = Db::memory(options).expect("memory db opens");
@@ -9,9 +9,14 @@ fn write_buffer_freeze_reads_immutable_in_memory() {
 
     bucket.put(b"user:1", b"ada").expect("write user");
 
-    assert_eq!(db.stats().immutable_memtables, 1);
+    let stats = db.stats();
+    assert!(
+        stats.memtable_bytes > 0,
+        "delta-backed writes still count as in-memory write data"
+    );
+    assert_eq!(stats.immutable_memtables, 0);
     assert_eq!(
-        bucket.get(b"user:1").expect("point read sees immutable"),
+        bucket.get(b"user:1").expect("point read sees delta"),
         Some(b"ada".to_vec())
     );
 }
