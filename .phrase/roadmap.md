@@ -2826,3 +2826,36 @@ by blocking persistent subsystems.
 ### Recommended Next Action
 
 - Convert the next persistent subsystem along the open/recovery path.
+
+### Phase 123: Async WAL Recovery Read Boundary
+
+**Status**: Complete
+
+**Goal**: Move WAL recovery object reads, shard discovery, and recovery stream
+reads onto async storage-trait helpers while preserving existing WAL write
+behavior.
+
+**Entry Condition**: Phase 122 complete and browser persistence remains blocked
+by blocking WAL recovery reads.
+
+**Acceptance Gate**:
+
+- WAL object read has an async storage-trait helper.
+- WAL shard discovery has an async storage-trait helper.
+- WAL recovery streams can be read through async storage helpers.
+- Async WAL discovery preserves ordering and malformed-name validation.
+- Async WAL batch read preserves replay-floor filtering.
+- Existing synchronous WAL behavior remains unchanged.
+- Final verification gate passes.
+
+**Major Out Of Scope**:
+
+- Async WAL append/front-door workers.
+- WAL rewrite conversion.
+- IndexedDB or OPFS implementation.
+- Browser writer lease protocol.
+- Async table, blob, recovery-report, cleanup, or full persistent database open.
+
+### Recommended Next Action
+
+- Convert the next open/recovery subsystem.

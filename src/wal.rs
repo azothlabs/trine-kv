@@ -17,8 +17,8 @@ use crate::{
         BlockingStorageAppendBackend, BlockingStorageAppendObject,
         BlockingStorageDirectoryListBackend, BlockingStorageObjectReadBackend,
         BlockingStorageWalRewriteBackend, NativeFileAppendObject, NativeFileBackend,
-        StorageCapability, StorageDirectoryId, StorageObjectId, StorageObjectKind,
-        StorageReadBackend,
+        StorageCapability, StorageDirectoryId, StorageDirectoryListBackend, StorageObjectId,
+        StorageObjectKind, StorageObjectReadBackend, StorageReadBackend,
     },
     types::{KeyRange, Sequence},
     write_batch::BatchOperation,
@@ -391,6 +391,21 @@ pub(crate) fn read_batches_after_with_backend(
     decode_frames_after(bytes.as_ref(), replay_floor)
 }
 
+#[allow(dead_code)]
+pub(crate) async fn read_batches_after_with_backend_async<B>(
+    backend: &B,
+    path: &Path,
+    replay_floor: Sequence,
+) -> Result<Vec<WalBatch>>
+where
+    B: StorageObjectReadBackend,
+{
+    let Some(bytes) = read_wal_object_with_backend_async(backend, path).await? else {
+        return Ok(Vec::new());
+    };
+    decode_frames_after(bytes.as_ref(), replay_floor)
+}
+
 pub(crate) fn read_recovery_streams_after_with_backend(
     backend: &NativeFileBackend,
     db_path: &Path,
@@ -407,6 +422,22 @@ pub(crate) fn read_recovery_streams_after_with_backend(
     Ok(streams)
 }
 
+#[allow(dead_code)]
+pub(crate) async fn read_recovery_streams_after_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+    replay_floor: Sequence,
+) -> Result<Vec<Vec<WalBatch>>>
+where
+    B: StorageDirectoryListBackend + StorageObjectReadBackend,
+{
+    let mut streams = Vec::new();
+    for path in discover_wal_paths_with_backend_async(backend, db_path).await? {
+        streams.push(read_batches_after_with_backend_async(backend, &path, replay_floor).await?);
+    }
+    Ok(streams)
+}
+
 pub(crate) fn discover_wal_paths_with_backend(
     backend: &NativeFileBackend,
     db_path: &Path,
@@ -414,23 +445,46 @@ pub(crate) fn discover_wal_paths_with_backend(
     backend
         .capabilities()
         .require(StorageCapability::DirectoryListing)?;
+    let files = backend.list_directory_files_blocking(StorageDirectoryId::native_file(db_path))?;
+    discover_wal_paths_from_directory_entries(
+        files.into_iter().map(|file| file.path().to_path_buf()),
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) async fn discover_wal_paths_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+) -> Result<Vec<PathBuf>>
+where
+    B: StorageDirectoryListBackend,
+{
+    backend
+        .capabilities()
+        .require(StorageCapability::DirectoryListing)?;
+    let files = backend
+        .list_directory_files(StorageDirectoryId::native_file(db_path))
+        .await?;
+    discover_wal_paths_from_directory_entries(
+        files.into_iter().map(|file| file.path().to_path_buf()),
+    )
+}
+
+fn discover_wal_paths_from_directory_entries<I>(files: I) -> Result<Vec<PathBuf>>
+where
+    I: IntoIterator<Item = PathBuf>,
+{
     let mut paths_by_shard = BTreeMap::new();
-    for file in backend.list_directory_files_blocking(StorageDirectoryId::native_file(db_path))? {
-        let Some(file_name) = file.path().file_name().and_then(|name| name.to_str()) else {
+    for path in files {
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             return Err(Error::Corruption {
-                message: format!(
-                    "WAL file name is not valid UTF-8: {}",
-                    file.path().display()
-                ),
+                message: format!("WAL file name is not valid UTF-8: {}", path.display()),
             });
         };
         let Some(shard_index) = wal_shard_index_from_file_name(file_name)? else {
             continue;
         };
-        if paths_by_shard
-            .insert(shard_index, file.path().to_path_buf())
-            .is_some()
-        {
+        if paths_by_shard.insert(shard_index, path).is_some() {
             return Err(invalid_wal("duplicate WAL shard file"));
         }
     }
@@ -514,6 +568,19 @@ fn read_wal_object_with_backend(
         .capabilities()
         .require(StorageCapability::ObjectRead)?;
     backend.read_object_bytes_blocking(wal_storage_object(path))
+}
+
+async fn read_wal_object_with_backend_async<B>(
+    backend: &B,
+    path: &Path,
+) -> Result<Option<Arc<[u8]>>>
+where
+    B: StorageObjectReadBackend,
+{
+    backend
+        .capabilities()
+        .require(StorageCapability::ObjectRead)?;
+    backend.read_object_bytes(wal_storage_object(path)).await
 }
 
 fn rewrite_wal_object_with_backend(
@@ -1022,6 +1089,8 @@ impl<'payload> Cursor<'payload> {
 mod tests {
     use std::{
         fs,
+        future::Future,
+        task::{Context, Poll, Waker},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1033,8 +1102,10 @@ mod tests {
     use super::{
         DEFAULT_WAL_SHARD_COUNT, WAL_FILE_NAME, WAL_FORMAT_VERSION, WAL_FRONT_DOOR_QUEUE_CAPACITY,
         WAL_MAGIC, WalFrontDoor, checksum, decode_frames_after, decode_payload,
-        discover_wal_paths_with_backend, merge_batch_streams_by_sequence, read_all_batches,
-        read_batches_after_with_backend, wal_rewrite_tmp_path, wal_shard_path,
+        discover_wal_paths_with_backend, discover_wal_paths_with_backend_async,
+        merge_batch_streams_by_sequence, read_all_batches, read_batches_after_with_backend,
+        read_batches_after_with_backend_async, read_recovery_streams_after_with_backend_async,
+        wal_rewrite_tmp_path, wal_shard_path,
     };
 
     #[test]
@@ -1173,6 +1244,99 @@ mod tests {
     }
 
     #[test]
+    fn async_wal_discovery_orders_legacy_and_shard_files() {
+        let dir = temp_dir("async-wal-discovery");
+        fs::create_dir_all(&dir).expect("create WAL test dir");
+        let backend = NativeFileBackend::new();
+        fs::write(wal_shard_path(&dir, 2), b"").expect("shard 2 writes");
+        fs::write(wal_shard_path(&dir, 0), b"").expect("legacy WAL writes");
+        fs::write(wal_shard_path(&dir, 1), b"").expect("shard 1 writes");
+
+        let paths = poll_ready(discover_wal_paths_with_backend_async(&backend, &dir))
+            .expect("WAL paths discover through async helper");
+
+        assert_eq!(
+            paths,
+            vec![
+                wal_shard_path(&dir, 0),
+                wal_shard_path(&dir, 1),
+                wal_shard_path(&dir, 2),
+            ]
+        );
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn async_wal_batch_read_honors_replay_floor() {
+        let dir = temp_dir("async-wal-read-floor");
+        fs::create_dir_all(&dir).expect("create WAL test dir");
+        let path = dir.join(WAL_FILE_NAME);
+        let backend = NativeFileBackend::new();
+        let front_door =
+            WalFrontDoor::open_single_lane_with_backend(&backend, &path).expect("front door opens");
+
+        front_door
+            .accept_commit(Sequence::new(1), &[put("a", "old")], DurabilityMode::Flush)
+            .expect("first commit accepts");
+        front_door
+            .accept_commit(Sequence::new(2), &[put("b", "new")], DurabilityMode::Flush)
+            .expect("second commit accepts");
+
+        let batches = poll_ready(read_batches_after_with_backend_async(
+            &backend,
+            &path,
+            Sequence::new(1),
+        ))
+        .expect("WAL reads through async helper");
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.sequence)
+                .collect::<Vec<_>>(),
+            vec![Sequence::new(2)]
+        );
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn async_wal_recovery_streams_read_shards() {
+        let dir = temp_dir("async-wal-streams");
+        fs::create_dir_all(&dir).expect("create WAL test dir");
+        let backend = NativeFileBackend::new();
+        let front_door =
+            WalFrontDoor::open_sharded_with_backend(&backend, &dir, DEFAULT_WAL_SHARD_COUNT)
+                .expect("front door opens");
+
+        for sequence in 1..=DEFAULT_WAL_SHARD_COUNT {
+            front_door
+                .accept_commit(
+                    Sequence::new(sequence as u64),
+                    &[put("k", "v")],
+                    DurabilityMode::Flush,
+                )
+                .expect("commit accepts");
+        }
+
+        let streams = poll_ready(read_recovery_streams_after_with_backend_async(
+            &backend,
+            &dir,
+            Sequence::ZERO,
+        ))
+        .expect("WAL streams read through async helper");
+        let batches = merge_batch_streams_by_sequence(streams).expect("streams merge");
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.sequence)
+                .collect::<Vec<_>>(),
+            (1..=DEFAULT_WAL_SHARD_COUNT)
+                .map(|sequence| Sequence::new(sequence as u64))
+                .collect::<Vec<_>>()
+        );
+        cleanup_dir(&dir);
+    }
+
+    #[test]
     fn wal_rewrite_temp_paths_keep_shard_identity() {
         let dir = temp_dir("wal-rewrite-temp-paths");
         let legacy_path = wal_shard_path(&dir, 0);
@@ -1203,6 +1367,16 @@ mod tests {
             "unexpected error: {error}"
         );
         cleanup_dir(&dir);
+    }
+
+    fn poll_ready<T>(future: impl Future<Output = crate::Result<T>>) -> crate::Result<T> {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut future = std::pin::pin!(future);
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(result) => result,
+            Poll::Pending => panic!("WAL storage future unexpectedly pending"),
+        }
     }
 
     #[test]

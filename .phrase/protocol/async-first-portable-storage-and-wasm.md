@@ -467,6 +467,9 @@ Rules:
 - recovery must be deterministic per backend capability contract;
 - missing required objects fail closed;
 - final WAL tail truncation rules remain unchanged;
+- WAL object reads, WAL object listing, and recovery stream reads must be
+  available through async storage-trait calls before browser persistence is
+  wired;
 - manifest publish atomicity is validated by backend fixtures;
 - recovery must not depend on native directory scanning order.
 

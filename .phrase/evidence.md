@@ -8472,3 +8472,56 @@ Record only evidence that can change planning or durable decisions.
 
 - Commit Phase 122, then convert the next persistent subsystem along the
   open/recovery path.
+
+## Phase 123: Async WAL Recovery Read Boundary
+
+### Observation
+
+- WAL recovery read and shard discovery still used synchronous helper functions
+  around blocking storage wrappers.
+- WAL append/front-door/rewrite are separate concerns; recovery read can move to
+  async storage helpers without changing commit acceptance.
+
+### Interpretation
+
+- Browser persistence needs WAL recovery reads and directory listing to be async
+  before persistent open can run on the browser path.
+- This phase converts only WAL recovery reads. WAL writes and rewrite remain
+  native blocking paths until a later phase.
+
+### Change
+
+- Added async WAL object read, batch read, shard discovery, and recovery stream
+  helpers over `StorageObjectReadBackend` and `StorageDirectoryListBackend`.
+- Shared WAL shard discovery parsing between sync and async paths.
+- Added focused tests for async WAL discovery ordering, replay-floor filtering,
+  and sharded recovery stream reads.
+- Updated the async protocol and current phase evidence.
+
+### Verification
+
+- `cargo test wal::tests`
+- `cargo check`
+- `cargo check --target wasm32-wasip2 --lib`
+- `cargo check --target wasm32-wasip2 --tests`
+- `cargo check --target wasm32-unknown-unknown --lib`
+- `cargo check --target wasm32-unknown-unknown --tests`
+- `cargo test --all-targets --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo fmt --check`
+- `git diff --check`
+- forbidden-term scan excluding local agent instructions
+- project-name diff scan
+- backend-name diff scan
+
+### Remaining Blockers
+
+- WAL append/front-door workers still use blocking append objects and worker
+  threads.
+- Persistent database open still calls synchronous WAL recovery helpers.
+- Table, blob, recovery-report, and cleanup paths still rely on blocking storage
+  adapters around `NativeFileBackend`.
+
+### Recommended Next Action
+
+- Commit Phase 123, then convert the next open/recovery subsystem.
