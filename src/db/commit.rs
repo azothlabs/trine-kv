@@ -667,6 +667,7 @@ impl Db {
             self.inner.options.durability,
             prepared.write_options.durability,
         );
+        self.validate_storage_durability(durability)?;
         let slot = match wal_accept {
             WalAcceptState::Deferred => self.inner.commit_tracker.reserve_slot()?,
             WalAcceptState::Accepted(slot) => {
@@ -780,6 +781,7 @@ impl Db {
             self.inner.options.durability,
             prepared.write_options.durability,
         );
+        self.validate_storage_durability(durability)?;
         let slot = self.inner.commit_tracker.reserve_slot()?;
         if let Err(error) =
             self.accept_wal_front_door(slot.sequence(), &prepared.wal_operations, durability)
@@ -795,10 +797,19 @@ impl Db {
         prepared.operation_count() != 0
             && prepared.transaction_reads.is_none()
             && self.inner.wal.is_some()
+            && self.inner.options.storage_mode.persistent_path().is_some()
+    }
+
+    fn validate_storage_durability(&self, durability: DurabilityMode) -> Result<()> {
+        if self.inner.options.storage_mode.is_wasi_persistent()
             && matches!(
-                self.inner.options.storage_mode,
-                StorageMode::Persistent { .. }
+                durability,
+                DurabilityMode::SyncData | DurabilityMode::SyncAll
             )
+        {
+            return Err(Error::unsupported_durability(durability));
+        }
+        Ok(())
     }
 
     fn prepare_writer_local_commit(

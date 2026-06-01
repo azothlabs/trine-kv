@@ -66,8 +66,9 @@ Evidence notes should separate:
   writer lease, manifest publish, durability strength, and background-work
   support.
 - WASI and browser persistence must be selected through explicit host backend
-  options and fail as `UnsupportedBackend` until their required capabilities are
-  implemented.
+  options. WASI persistence may use the host-preopened filesystem on WASI
+  targets; browser persistence must fail as `UnsupportedBackend` until its
+  required capabilities are implemented.
 - WASM readiness is a design constraint for public API, runtime boundary, and
   storage backend boundaries.
 - Titan and other external storage engines may be used as design references,

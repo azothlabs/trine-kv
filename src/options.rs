@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::{codec::CodecId, prefix::PrefixExtractor, runtime::RuntimeOptions};
 
@@ -9,18 +9,42 @@ pub enum StorageMode {
     HostPersistent { backend: HostStorageBackend },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostStorageBackend {
-    Wasi,
+    Wasi { path: PathBuf },
     Browser,
 }
 
 impl HostStorageBackend {
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(&self) -> &'static str {
         match self {
-            Self::Wasi => "WASI persistent storage backend",
+            Self::Wasi { .. } => "WASI persistent storage backend",
             Self::Browser => "browser persistent storage backend",
         }
+    }
+}
+
+impl StorageMode {
+    pub(crate) fn persistent_path(&self) -> Option<&Path> {
+        match self {
+            Self::Persistent { path }
+            | Self::HostPersistent {
+                backend: HostStorageBackend::Wasi { path },
+            } => Some(path.as_path()),
+            Self::InMemory
+            | Self::HostPersistent {
+                backend: HostStorageBackend::Browser,
+            } => None,
+        }
+    }
+
+    pub(crate) const fn is_wasi_persistent(&self) -> bool {
+        matches!(
+            self,
+            Self::HostPersistent {
+                backend: HostStorageBackend::Wasi { .. }
+            }
+        )
     }
 }
 
@@ -150,13 +174,20 @@ impl DbOptions {
     }
 
     #[must_use]
-    pub fn wasi_persistent() -> Self {
+    pub fn wasi_persistent(path: impl Into<PathBuf>) -> Self {
         Self {
             storage_mode: StorageMode::HostPersistent {
-                backend: HostStorageBackend::Wasi,
+                backend: HostStorageBackend::Wasi { path: path.into() },
             },
+            background_worker_count: 0,
+            runtime: RuntimeOptions::inline(),
             ..Self::default()
         }
+    }
+
+    #[must_use]
+    pub fn wasi_persistent_read_only(path: impl Into<PathBuf>) -> Self {
+        Self::wasi_persistent(path).read_only()
     }
 
     #[must_use]

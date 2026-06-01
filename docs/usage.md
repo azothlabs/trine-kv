@@ -108,18 +108,28 @@ every current Trine storage operation is fallback-classified,
 advertise `PlatformAsyncIo`.
 
 WASI and browser persistence have explicit option constructors so callers can
-select those host boundaries without accidentally falling back to native files:
+select those host boundaries without accidentally falling back to native files.
+On WASI targets, `wasi_persistent(path)` uses the host-preopened filesystem at
+that path and defaults to inline runtime execution with no background worker
+threads:
 
 ```rust
-let wasi = Db::open(DbOptions::wasi_persistent());
+let wasi = Db::open(DbOptions::wasi_persistent("./trine-data"));
+```
+
+Strict sync durability is not claimed for WASI yet; `SyncData` and `SyncAll`
+return `UnsupportedDurability`. On non-WASI targets, the same option returns
+`UnsupportedBackend`.
+
+Browser persistence is still only an explicit unsupported host boundary:
+
+```rust
 let browser = Db::open(DbOptions::browser_persistent());
-assert!(wasi.is_err());
 assert!(browser.is_err());
 ```
 
-These modes currently return `UnsupportedBackend` until their required host
-capabilities, writer lease, durability mapping, and cooperative maintenance
-contracts are implemented.
+It will remain unsupported until its persistent adapter, reliable writer lease,
+durability mapping, and cooperative maintenance contracts are implemented.
 
 `Db`, `Bucket`, and `Snapshot` are cheap handles. `Db` writes to the built-in
 default bucket. A named `Bucket` keeps its database open, so release bucket

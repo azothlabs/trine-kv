@@ -407,9 +407,13 @@ capabilities.
 
 Rules:
 
-- `DbOptions::wasi_persistent()` selects the WASI host boundary and currently
-  returns `UnsupportedBackend` until the host capability adapter exists;
-- option validation checks required capabilities during open;
+- `DbOptions::wasi_persistent(path)` selects the WASI host boundary and uses
+  the host-preopened filesystem at `path` on WASI targets;
+- non-WASI targets return `UnsupportedBackend` for this option;
+- WASI persistent defaults to inline runtime execution with no background
+  worker threads;
+- option validation checks required runtime and durability capabilities during
+  open;
 - unsupported strict durability returns `UnsupportedDurability`;
 - writer lease support is required for writable persistent open;
 - recovery semantics match the main persistent protocol when required

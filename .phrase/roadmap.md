@@ -2701,7 +2701,35 @@ WASI/browser persistence, observability, and cooperative maintenance.
 - Resumable compaction work budgets.
 - New OS bindings or backend replacement.
 
+### Phase 119: WASI Persistent Backend
+
+**Status**: Complete
+
+**Goal**: Implement WASI persistent open against a host-preopened filesystem
+path while keeping unsupported host capabilities explicit.
+
+**Entry Condition**: Phase 118 complete and the next focused phase is real
+WASI persistence.
+
+**Acceptance Gate**:
+
+- `DbOptions::wasi_persistent(path)` selects a path-carrying WASI host backend.
+- On WASI targets, persistent open routes through the existing persistent
+  engine against the host-preopened filesystem path.
+- On non-WASI targets, the same option returns `UnsupportedBackend`.
+- Strict sync durability returns `UnsupportedDurability` for WASI until host
+  guarantees are proven.
+- Browser persistence remains unsupported.
+- Native and WASI target verification pass.
+
+**Major Out Of Scope**:
+
+- Browser persistence.
+- WASI background workers.
+- WASI strict sync durability guarantees.
+- Resumable compaction work budgets.
+
 ### Recommended Next Action
 
-- Phase 118 is complete. Choose a focused next phase for either real host
-  persistence or resumable maintenance budgets.
+- Phase 119 is complete. Choose browser persistence or resumable maintenance
+  budgets as a separate phase.

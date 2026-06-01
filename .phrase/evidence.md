@@ -8240,3 +8240,64 @@ Record only evidence that can change planning or durable decisions.
 
 - Choose a focused next phase for real host persistence or resumable
   maintenance budgets.
+
+## Phase 119: WASI Persistent Backend
+
+### Observation
+
+- Phase 118 made WASI persistence explicit, but `wasi_persistent()` did not
+  carry a path and always returned `UnsupportedBackend`.
+- `cargo check --target wasm32-wasip2 --lib` passed before implementation,
+  which means the existing persistent engine can compile for the installed
+  WASI target.
+- WASI persistence still needs a conservative durability boundary because
+  strict sync host guarantees have not been proven.
+
+### Interpretation
+
+- A real first WASI backend can reuse the existing persistent engine over the
+  WASI host-preopened filesystem, as long as the public option carries the
+  path and the database keeps the host backend identity.
+- Browser persistence should remain a separate phase because it needs a
+  different async-only adapter and writer lease story.
+
+### Change
+
+- Changed `DbOptions::wasi_persistent(path)` to carry a host filesystem path and
+  default to inline runtime execution with no background workers.
+- Added `DbOptions::wasi_persistent_read_only(path)`,
+  `Db::open_wasi_persistent(path)`, and `Db::open_wasi_read_only(path)`.
+- Routed WASI target opens through the persistent engine while preserving
+  `HostPersistent::Wasi` in the database options.
+- Kept non-WASI WASI opens and browser opens as `UnsupportedBackend`.
+- Added WASI durability guards so `SyncData` and `SyncAll` return
+  `UnsupportedDurability`.
+- Updated usage docs, the async protocol, the decision framework, roadmap, and
+  current phase.
+
+### Verification
+
+- `cargo check`
+- `cargo check --target wasm32-wasip2 --lib`
+- `cargo check --target wasm32-wasip2 --tests`
+- `cargo test --lib`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo fmt --check`
+- `git diff --check`
+- forbidden-term scan
+- project-name scan
+- backend-name leakage scan for docs/current/protocol/roadmap and
+  storage/db/stats/io/runtime boundary
+
+### Remaining Blockers
+
+- WASI strict sync durability remains unsupported until host behavior is
+  proven.
+- WASI background workers remain out of scope.
+- Browser persistence still needs its own backend phase.
+
+### Recommended Next Action
+
+- Commit Phase 119, then choose browser persistence or resumable maintenance
+  budgets as a separate phase.

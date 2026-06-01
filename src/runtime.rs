@@ -522,9 +522,8 @@ pub(crate) fn validate_runtime_options(
         ));
     }
 
-    let persistent_background_workers = matches!(storage_mode, StorageMode::Persistent { .. })
-        && !read_only
-        && background_worker_count != 0;
+    let persistent_background_workers =
+        storage_mode.persistent_path().is_some() && !read_only && background_worker_count != 0;
     if persistent_background_workers && !runtime.capabilities().background_threads() {
         return Err(Error::invalid_options(
             "background workers require runtime background threads",

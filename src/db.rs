@@ -23,7 +23,7 @@ use crate::{
     manifest::{self, ManifestState, ManifestStore},
     options::{
         BlobLevelMergePolicy, BucketOptions, DbOptions, DurabilityMode, FailOnCorruptionPolicy,
-        FilterPolicy, PrefixFilterPolicy, StorageMode, WriteOptions,
+        FilterPolicy, HostStorageBackend, PrefixFilterPolicy, StorageMode, WriteOptions,
     },
     point_value::PointValue,
     recovery,
@@ -711,13 +711,79 @@ impl Drop for Db {
 
 impl Db {
     pub fn open(options: DbOptions) -> Result<Self> {
-        match options.storage_mode {
+        match &options.storage_mode {
             StorageMode::InMemory => Self::memory(options),
             StorageMode::Persistent { .. } => Self::open_persistent_with_options(options),
-            StorageMode::HostPersistent { backend } => {
-                Err(Error::unsupported_backend(backend.as_str()))
-            }
+            StorageMode::HostPersistent {
+                backend: HostStorageBackend::Wasi { .. },
+            } => Self::open_wasi_persistent_with_options(options),
+            StorageMode::HostPersistent {
+                backend: HostStorageBackend::Browser,
+            } => Err(Error::unsupported_backend(
+                HostStorageBackend::Browser.as_str(),
+            )),
         }
+    }
+
+    pub fn open_wasi_persistent(path: impl Into<std::path::PathBuf>) -> Result<Self> {
+        Self::open(DbOptions::wasi_persistent(path))
+    }
+
+    pub fn open_wasi_read_only(path: impl Into<std::path::PathBuf>) -> Result<Self> {
+        Self::open(DbOptions::wasi_persistent_read_only(path))
+    }
+
+    fn open_wasi_persistent_with_options(options: DbOptions) -> Result<Self> {
+        let StorageMode::HostPersistent {
+            backend: HostStorageBackend::Wasi { path },
+        } = &options.storage_mode
+        else {
+            return Err(Error::invalid_options(
+                "WASI persistent open requires a path",
+            ));
+        };
+        let path = path.clone();
+        if path.as_os_str().is_empty() {
+            return Err(Error::invalid_options(
+                "WASI persistent path must be non-empty",
+            ));
+        }
+
+        #[cfg(target_os = "wasi")]
+        {
+            Self::validate_wasi_persistent_options(&options)?;
+            Self::open_persistent_with_options(options)
+        }
+
+        #[cfg(not(target_os = "wasi"))]
+        {
+            let _ = path;
+            drop(options);
+            Err(Error::unsupported_backend(
+                "WASI persistent storage backend",
+            ))
+        }
+    }
+
+    #[cfg(target_os = "wasi")]
+    fn validate_wasi_persistent_options(options: &DbOptions) -> Result<()> {
+        if options.runtime.mode != runtime::RuntimeMode::Inline {
+            return Err(Error::invalid_options(
+                "WASI persistent backend requires inline runtime",
+            ));
+        }
+        if options.background_worker_count != 0 {
+            return Err(Error::invalid_options(
+                "WASI persistent backend does not support background workers yet",
+            ));
+        }
+        if matches!(
+            options.durability,
+            DurabilityMode::SyncData | DurabilityMode::SyncAll
+        ) {
+            return Err(Error::unsupported_durability(options.durability));
+        }
+        Ok(())
     }
 
     pub fn open_memory() -> Result<Self> {
@@ -786,10 +852,11 @@ impl Db {
         let runtime = Runtime::new(options.runtime);
         let native_storage = NativeFileBackend::with_runtime(runtime.clone());
         let block_cache_bytes = options.block_cache_bytes;
-        let StorageMode::Persistent { path } = &options.storage_mode else {
+        let Some(path) = persistent_path_from_options(&options) else {
             return Err(Error::invalid_options("persistent open requires a path"));
         };
-        let db_path_for_cleanup = path.clone();
+        let db_path_for_cleanup = path.to_path_buf();
+        let path = db_path_for_cleanup.as_path();
 
         if path.exists() {
             if !path.is_dir() {
@@ -1232,9 +1299,18 @@ impl Db {
     pub fn persist(&self, mode: DurabilityMode) -> Result<()> {
         self.ensure_open()?;
 
-        match self.inner.options.storage_mode {
+        if self.inner.options.storage_mode.is_wasi_persistent()
+            && matches!(mode, DurabilityMode::SyncData | DurabilityMode::SyncAll)
+        {
+            return Err(Error::unsupported_durability(mode));
+        }
+
+        match &self.inner.options.storage_mode {
             StorageMode::InMemory => Ok(()),
-            StorageMode::Persistent { .. } => {
+            StorageMode::Persistent { .. }
+            | StorageMode::HostPersistent {
+                backend: HostStorageBackend::Wasi { .. },
+            } => {
                 if let Some(wal) = &self.inner.wal {
                     wal.persist(mode)?;
                 }
@@ -1253,10 +1329,10 @@ impl Db {
         }
         self.take_background_maintenance_error()?;
 
-        let StorageMode::Persistent { path } = &self.inner.options.storage_mode else {
+        let Some(path) = self.persistent_path() else {
             return Ok(());
         };
-        let db_path = path.clone();
+        let db_path = path.to_path_buf();
         let target_sequence = self.freeze_public_flush_target()?;
         let mut should_compact = false;
 
@@ -1300,10 +1376,10 @@ impl Db {
             return Err(Error::ReadOnly);
         }
 
-        let StorageMode::Persistent { path } = &self.inner.options.storage_mode else {
+        let Some(path) = self.persistent_path() else {
             return Ok(());
         };
-        let db_path = path.clone();
+        let db_path = path.to_path_buf();
         self.run_compaction_barrier(&db_path, &range, false)?;
 
         Ok(())
@@ -1539,10 +1615,7 @@ impl Db {
         !self.inner.options.read_only
             && self.inner.options.background_worker_count != 0
             && self.inner.runtime.capabilities().background_threads()
-            && matches!(
-                self.inner.options.storage_mode,
-                StorageMode::Persistent { .. }
-            )
+            && self.inner.options.storage_mode.persistent_path().is_some()
     }
 
     fn request_background_maintenance(&self) {
@@ -1600,10 +1673,10 @@ impl Db {
             return Ok(());
         }
 
-        let StorageMode::Persistent { path } = &self.inner.options.storage_mode else {
+        let Some(path) = self.persistent_path() else {
             return Ok(());
         };
-        let db_path = path.clone();
+        let db_path = path.to_path_buf();
         let mut should_compact = request.compaction || self.l0_pressure_exceeded()?;
 
         if request.flush && self.has_immutable_memtables()? {
@@ -1852,10 +1925,7 @@ impl Db {
     }
 
     fn persistent_path(&self) -> Option<&Path> {
-        match &self.inner.options.storage_mode {
-            StorageMode::Persistent { path } => Some(path.as_path()),
-            StorageMode::InMemory | StorageMode::HostPersistent { .. } => None,
-        }
+        self.inner.options.storage_mode.persistent_path()
     }
 
     fn persist_bucket_creation(&self, name: &str, options: &BucketOptions) -> Result<()> {
@@ -1895,10 +1965,10 @@ impl Db {
     }
 
     fn apply_write_backpressure(&self) -> Result<()> {
-        let StorageMode::Persistent { path } = &self.inner.options.storage_mode else {
+        let Some(path) = self.persistent_path() else {
             return Ok(());
         };
-        let db_path = path.clone();
+        let db_path = path.to_path_buf();
 
         loop {
             self.take_background_maintenance_error()?;
@@ -3090,8 +3160,13 @@ impl Db {
 }
 
 fn validate_options(options: &DbOptions) -> Result<()> {
-    if let StorageMode::HostPersistent { backend } = &options.storage_mode {
-        return Err(Error::unsupported_backend(backend.as_str()));
+    if let StorageMode::HostPersistent {
+        backend: HostStorageBackend::Browser,
+    } = &options.storage_mode
+    {
+        return Err(Error::unsupported_backend(
+            HostStorageBackend::Browser.as_str(),
+        ));
     }
     runtime::validate_runtime_options(
         options.runtime,
@@ -3593,10 +3668,7 @@ fn is_level_layout_compaction_error(error: &Error) -> bool {
 }
 
 fn persistent_path_from_options(options: &DbOptions) -> Option<&Path> {
-    match &options.storage_mode {
-        StorageMode::Persistent { path } => Some(path.as_path()),
-        StorageMode::InMemory | StorageMode::HostPersistent { .. } => None,
-    }
+    options.storage_mode.persistent_path()
 }
 
 fn cleanup_pending_obsolete_table_files(
@@ -3840,13 +3912,41 @@ mod tests {
         fs::remove_dir_all(path).expect("cleanup test db");
     }
 
+    #[cfg(not(target_os = "wasi"))]
     #[test]
-    fn host_persistent_backends_are_explicitly_unsupported() {
-        let wasi_error =
-            Db::open(DbOptions::wasi_persistent()).expect_err("WASI backend is not wired");
+    fn wasi_persistent_backend_requires_wasi_target() {
+        let path = temp_db_path("wasi-persistent-host-unsupported");
+        let options = DbOptions::wasi_persistent(&path);
+        assert_eq!(options.runtime.mode, crate::runtime::RuntimeMode::Inline);
+        assert_eq!(options.background_worker_count, 0);
+
+        let wasi_error = Db::open(options).expect_err("WASI backend requires WASI target");
         assert!(matches!(wasi_error, Error::UnsupportedBackend { .. }));
         assert!(wasi_error.to_string().contains("WASI persistent"));
+    }
 
+    #[cfg(target_os = "wasi")]
+    #[test]
+    fn wasi_persistent_backend_uses_host_filesystem() {
+        let path = temp_db_path("wasi-persistent-host");
+        let db = Db::open(DbOptions::wasi_persistent(&path)).expect("WASI db opens");
+        db.put(b"key", b"value").expect("WASI write succeeds");
+        db.flush().expect("WASI flush succeeds");
+        drop(db);
+
+        let db = Db::open(DbOptions::wasi_persistent_read_only(&path))
+            .expect("WASI read-only db reopens");
+        assert_eq!(
+            db.get(b"key").expect("WASI read succeeds"),
+            Some(b"value".to_vec())
+        );
+        drop(db);
+
+        fs::remove_dir_all(path).expect("cleanup WASI test db");
+    }
+
+    #[test]
+    fn browser_persistent_backend_is_explicitly_unsupported() {
         let browser_error =
             Db::open(DbOptions::browser_persistent()).expect_err("browser backend is not wired");
         assert!(matches!(browser_error, Error::UnsupportedBackend { .. }));

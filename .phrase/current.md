@@ -6,72 +6,62 @@ Complete
 
 ## Goal
 
-Close the remaining async tail after true-async capability hardening: make
-WASI/browser persistent storage an explicit host-backend boundary, expose
-storage/runtime observability needed to debug async behavior, and surface
-cooperative maintenance yields without changing storage format or core
-database semantics.
+Implement real WASI persistent open support by binding `DbOptions` to a
+host-preopened WASI filesystem path, while keeping browser persistence
+explicitly unsupported and preserving existing native-file behavior.
 
 ## Scope
 
-- Phase 118: async host boundary and observability closure.
+- Phase 119: WASI persistent backend implementation.
 
 ## Out Of Scope
 
-- Implementing real WASI or browser persistence.
-- Adding hand-written OS bindings, replacing the platform backend, or claiming
-  fallback work as true OS async.
+- Browser persistent storage.
+- Claiming WASI strict sync durability before host behavior is proven.
+- Background worker threads or resumable maintenance budgets for WASI.
 - Changing WAL, MVCC, table, manifest, transaction, recovery, or compaction
   correctness rules.
 
 ## Acceptance Gate
 
-- WASI and browser persistent modes are explicit public options and fail with
-  `UnsupportedBackend` until their host capability adapters exist.
-- `DbStats` exposes blocking-adapter queue capacity, queued/submitted/completed
-  /rejected task counts, total adapter runtime, and per-storage-operation
-  request/latency counters.
-- Cooperative maintenance yield and budget-exhaustion counters are recorded
-  when foreground work yields to background maintenance or bounded waiting
-  expires.
-- Existing runtime/storage/backend capability behavior remains unchanged.
-- Formatting, clippy, full tests, `platform-io` check, `git diff --check`,
+- `DbOptions::wasi_persistent(path)` carries a path and defaults to inline
+  runtime execution with no background workers.
+- On `target_os = "wasi"`, WASI persistent open uses the existing persistent
+  engine against the host-preopened filesystem path.
+- On non-WASI targets, WASI persistent open returns `UnsupportedBackend`.
+- WASI strict durability requests return `UnsupportedDurability`.
+- Browser persistence remains an explicit `UnsupportedBackend`.
+- Native checks, WASI target check, tests, formatting, clippy, diff check,
   forbidden-term scan, project-name scan, and backend-name leakage scan pass.
 
 ## Active Task Slice
 
 ```text
-task492 [x] goal:add explicit WASI/browser persistent backend boundary | scope:src/options.rs src/db.rs docs protocol | verify:unsupported-backend test
-task493 [x] goal:add runtime blocking-adapter queue observability | scope:src/runtime.rs src/storage.rs src/stats.rs | verify:runtime/storage tests
-task494 [x] goal:add storage operation request/latency stats | scope:src/storage.rs src/stats.rs docs | verify:storage/db stats tests
-task495 [x] goal:add cooperative maintenance yield counters | scope:src/db.rs src/stats.rs | verify:compaction wait test
-task496 [x] goal:run final gate and record evidence | scope:repo .phrase | verify:full gate
+task497 [x] goal:commit Phase 118 closure | scope:git | verify:commit 127c5b4
+task498 [x] goal:add path-carrying WASI persistent option | scope:src/options.rs src/lib.rs | verify:constructor tests
+task499 [x] goal:route WASI target to persistent engine | scope:src/db.rs src/db/commit.rs src/runtime.rs | verify:native + wasm32-wasip2 check
+task500 [x] goal:preserve unsupported non-WASI/browser boundaries | scope:src/db.rs docs protocol | verify:unit tests
+task501 [x] goal:run final gate and record evidence | scope:repo .phrase | verify:full gate
 ```
 
 ## Known Blockers
 
-- Real WASI persistence still needs host capability discovery, writable lease
-  semantics, durability mapping, and recovery proof.
-- Real browser persistence still needs an async-only adapter, reliable writer
-  lease, atomic publish story, and cooperative budgeted maintenance.
-- Cooperative maintenance is now observable, but resumable compaction work
-  budgets are still a future implementation phase.
+- WASI strict sync durability remains unsupported until host guarantees are
+  proven.
+- WASI background workers remain out of scope; default WASI persistent options
+  use inline runtime execution.
+- Browser persistence still needs an async-only adapter, reliable writer lease,
+  atomic publish story, and cooperative budgeted maintenance.
 
 ## Evidence
 
-- `DbOptions::wasi_persistent()` and `DbOptions::browser_persistent()` now
-  select explicit host persistent modes and return `UnsupportedBackend`.
-- `DbStats` now includes runtime queue stats and per-storage-operation
-  request/latency metrics.
-- `DbStats` now includes cooperative maintenance yield and budget-exhaustion
-  counters.
-- Verification: `cargo check`, `cargo check --features platform-io`, `cargo
-  test --lib`, `cargo clippy --all-targets --all-features -- -D warnings`,
-  `cargo test --all-targets --all-features`, `cargo fmt --check`, `git diff
-  --check`, forbidden-term scan, project-name scan, and backend-name leakage
-  scan pass.
+- Verification: `cargo check`, `cargo check --target wasm32-wasip2 --lib`,
+  `cargo check --target wasm32-wasip2 --tests`, `cargo test --lib`, `cargo
+  clippy --all-targets --all-features -- -D warnings`, `cargo test
+  --all-targets --all-features`, `cargo fmt --check`, `git diff --check`,
+  forbidden-term scan, project-name scan, and backend-name leakage scan pass.
 
 ## Next Recommendation
 
-- Commit this closure, then choose a focused next phase for real host
-  persistence or resumable maintenance budgets.
+- Commit Phase 119, then choose browser persistence or resumable maintenance
+  budgets as a separate phase.
