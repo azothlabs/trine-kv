@@ -15,9 +15,10 @@ use crate::{
     bucket::{Bucket, BucketName, BucketReader, DEFAULT_BUCKET_NAME},
     cache, compaction,
     error::{Error, Result},
-    iterator::{Direction, Iter, LazyIter, ScanSelector},
+    iterator::{Direction, Iter, LazyIter, ScanSelector, ScanSourceInput},
     lsm::{
-        CompactionInput as LsmCompactionInput, CompactionOutput as LsmCompactionOutput,
+        AsyncPointReadIo, CompactionInput as LsmCompactionInput,
+        CompactionOutput as LsmCompactionOutput,
         CompactionTablePayload as LsmCompactionTablePayload, FlushInput as LsmFlushInput,
         LsmPointReadSnapshot, LsmTree,
     },
@@ -1875,6 +1876,21 @@ impl Db {
         receiver.await.map_err(|_| Error::runtime_busy(label))?
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn run_native_blocking_task<T>(
+        &self,
+        task: impl FnOnce(Db) -> Result<T> + Send + 'static,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+    {
+        let db = self.clone();
+        self.inner
+            .runtime
+            .spawn_blocking_result(move || task(db))?
+            .await
+    }
+
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     async fn persist_browser_async(&self, mode: DurabilityMode) -> Result<()> {
         self.ensure_open()?;
@@ -2528,6 +2544,16 @@ impl Db {
         self.get_at_with_pin_state(bucket, key, read_sequence, false)
     }
 
+    pub(crate) async fn get_at_sequence_async(
+        &self,
+        bucket: &str,
+        key: &[u8],
+        read_sequence: Sequence,
+    ) -> Result<Option<Vec<u8>>> {
+        self.get_at_with_pin_state_async(bucket, key, read_sequence, false)
+            .await
+    }
+
     pub(crate) fn get_at_with_pin_state(
         &self,
         bucket: &str,
@@ -2537,6 +2563,18 @@ impl Db {
     ) -> Result<Option<Vec<u8>>> {
         let state = self.bucket_state(bucket)?;
         self.get_at_state_with_pin_state(&state, key, read_sequence, read_pin_held)
+    }
+
+    pub(crate) async fn get_at_with_pin_state_async(
+        &self,
+        bucket: &str,
+        key: &[u8],
+        read_sequence: Sequence,
+        read_pin_held: bool,
+    ) -> Result<Option<Vec<u8>>> {
+        let state = self.bucket_state(bucket)?;
+        self.get_at_state_with_pin_state_async(&state, key, read_sequence, read_pin_held)
+            .await
     }
 
     pub(crate) fn get_at_state_with_pin_state(
@@ -2562,6 +2600,32 @@ impl Db {
         )
     }
 
+    pub(crate) async fn get_at_state_with_pin_state_async(
+        &self,
+        state: &LsmTree,
+        key: &[u8],
+        read_sequence: Sequence,
+        read_pin_held: bool,
+    ) -> Result<Option<Vec<u8>>> {
+        self.ensure_open()?;
+        let _read_pin = if read_pin_held {
+            None
+        } else {
+            Some(self.inner.snapshots.pinned_snapshot(read_sequence))
+        };
+
+        state
+            .read_visible_point_async(
+                &self.inner.native_storage,
+                key,
+                read_sequence,
+                self.persistent_path(),
+                Some(self.inner.block_cache.as_ref()),
+                Some(self.inner.blob_reads.as_ref()),
+            )
+            .await
+    }
+
     pub(crate) fn get_value_at_state_snapshot_with_pin_state(
         &self,
         state: &LsmTree,
@@ -2585,6 +2649,36 @@ impl Db {
             Some(self.inner.block_cache.as_ref()),
             Some(self.inner.blob_reads.as_ref()),
         )
+    }
+
+    pub(crate) async fn get_value_at_state_snapshot_with_pin_state_async(
+        &self,
+        state: &LsmTree,
+        read_snapshot: &LsmPointReadSnapshot,
+        key: &[u8],
+        read_sequence: Sequence,
+        read_pin_held: bool,
+    ) -> Result<Option<PointValue>> {
+        self.ensure_open()?;
+        let _read_pin = if read_pin_held {
+            None
+        } else {
+            Some(self.inner.snapshots.pinned_snapshot(read_sequence))
+        };
+
+        state
+            .read_visible_point_value_in_snapshot_async(
+                read_snapshot,
+                key,
+                read_sequence,
+                AsyncPointReadIo::new(
+                    &self.inner.native_storage,
+                    self.persistent_path(),
+                    Some(self.inner.block_cache.as_ref()),
+                    Some(self.inner.blob_reads.as_ref()),
+                ),
+            )
+            .await
     }
 
     pub(crate) fn reader_for_state<'snapshot>(
@@ -2625,15 +2719,56 @@ impl Db {
             Some(&self.inner.block_cache),
         )?;
         let db_path = self.persistent_path().map(Path::to_path_buf);
+        let native_storage = db_path.as_ref().map(|_| self.inner.native_storage.clone());
 
         Ok(Iter::from_sources(
             direction,
-            read_sequence,
-            read_pin,
-            db_path,
-            Some(Arc::clone(&self.inner.blob_reads)),
-            scan.range_tombstones,
-            scan.sources,
+            ScanSourceInput {
+                read_sequence,
+                read_pin,
+                db_path,
+                native_storage,
+                blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
+                range_tombstones: scan.range_tombstones,
+                sources: scan.sources,
+            },
+        ))
+    }
+
+    pub(crate) async fn range_at_sequence_async(
+        &self,
+        bucket: &str,
+        range: &KeyRange,
+        read_sequence: Sequence,
+        direction: Direction,
+    ) -> Result<Iter> {
+        self.ensure_open()?;
+        let read_pin = self.inner.snapshots.pinned_snapshot(read_sequence);
+
+        let state = self.bucket_state(bucket)?;
+        let selector = ScanSelector::Range(range.clone());
+        let scan = state
+            .scan_async(
+                &selector,
+                direction,
+                read_sequence,
+                Some(&self.inner.block_cache),
+            )
+            .await?;
+        let db_path = self.persistent_path().map(Path::to_path_buf);
+        let native_storage = db_path.as_ref().map(|_| self.inner.native_storage.clone());
+
+        Ok(Iter::from_sources(
+            direction,
+            ScanSourceInput {
+                read_sequence,
+                read_pin,
+                db_path,
+                native_storage,
+                blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
+                range_tombstones: scan.range_tombstones,
+                sources: scan.sources,
+            },
         ))
     }
 
@@ -2656,15 +2791,56 @@ impl Db {
             Some(&self.inner.block_cache),
         )?;
         let db_path = self.persistent_path().map(Path::to_path_buf);
+        let native_storage = db_path.as_ref().map(|_| self.inner.native_storage.clone());
 
         Ok(LazyIter::from_sources(
             direction,
-            read_sequence,
-            read_pin,
-            db_path,
-            Some(Arc::clone(&self.inner.blob_reads)),
-            scan.range_tombstones,
-            scan.sources,
+            ScanSourceInput {
+                read_sequence,
+                read_pin,
+                db_path,
+                native_storage,
+                blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
+                range_tombstones: scan.range_tombstones,
+                sources: scan.sources,
+            },
+        ))
+    }
+
+    pub(crate) async fn range_lazy_at_sequence_async(
+        &self,
+        bucket: &str,
+        range: &KeyRange,
+        read_sequence: Sequence,
+        direction: Direction,
+    ) -> Result<LazyIter> {
+        self.ensure_open()?;
+        let read_pin = self.inner.snapshots.pinned_snapshot(read_sequence);
+
+        let state = self.bucket_state(bucket)?;
+        let selector = ScanSelector::Range(range.clone());
+        let scan = state
+            .scan_async(
+                &selector,
+                direction,
+                read_sequence,
+                Some(&self.inner.block_cache),
+            )
+            .await?;
+        let db_path = self.persistent_path().map(Path::to_path_buf);
+        let native_storage = db_path.as_ref().map(|_| self.inner.native_storage.clone());
+
+        Ok(LazyIter::from_sources(
+            direction,
+            ScanSourceInput {
+                read_sequence,
+                read_pin,
+                db_path,
+                native_storage,
+                blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
+                range_tombstones: scan.range_tombstones,
+                sources: scan.sources,
+            },
         ))
     }
 
@@ -2687,15 +2863,56 @@ impl Db {
             Some(&self.inner.block_cache),
         )?;
         let db_path = self.persistent_path().map(Path::to_path_buf);
+        let native_storage = db_path.as_ref().map(|_| self.inner.native_storage.clone());
 
         Ok(Iter::from_sources(
             direction,
-            read_sequence,
-            read_pin,
-            db_path,
-            Some(Arc::clone(&self.inner.blob_reads)),
-            scan.range_tombstones,
-            scan.sources,
+            ScanSourceInput {
+                read_sequence,
+                read_pin,
+                db_path,
+                native_storage,
+                blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
+                range_tombstones: scan.range_tombstones,
+                sources: scan.sources,
+            },
+        ))
+    }
+
+    pub(crate) async fn prefix_at_sequence_async(
+        &self,
+        bucket: &str,
+        prefix: &[u8],
+        read_sequence: Sequence,
+        direction: Direction,
+    ) -> Result<Iter> {
+        self.ensure_open()?;
+        let read_pin = self.inner.snapshots.pinned_snapshot(read_sequence);
+
+        let state = self.bucket_state(bucket)?;
+        let selector = ScanSelector::Prefix(prefix.to_vec());
+        let scan = state
+            .scan_async(
+                &selector,
+                direction,
+                read_sequence,
+                Some(&self.inner.block_cache),
+            )
+            .await?;
+        let db_path = self.persistent_path().map(Path::to_path_buf);
+        let native_storage = db_path.as_ref().map(|_| self.inner.native_storage.clone());
+
+        Ok(Iter::from_sources(
+            direction,
+            ScanSourceInput {
+                read_sequence,
+                read_pin,
+                db_path,
+                native_storage,
+                blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
+                range_tombstones: scan.range_tombstones,
+                sources: scan.sources,
+            },
         ))
     }
 
@@ -2718,15 +2935,56 @@ impl Db {
             Some(&self.inner.block_cache),
         )?;
         let db_path = self.persistent_path().map(Path::to_path_buf);
+        let native_storage = db_path.as_ref().map(|_| self.inner.native_storage.clone());
 
         Ok(LazyIter::from_sources(
             direction,
-            read_sequence,
-            read_pin,
-            db_path,
-            Some(Arc::clone(&self.inner.blob_reads)),
-            scan.range_tombstones,
-            scan.sources,
+            ScanSourceInput {
+                read_sequence,
+                read_pin,
+                db_path,
+                native_storage,
+                blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
+                range_tombstones: scan.range_tombstones,
+                sources: scan.sources,
+            },
+        ))
+    }
+
+    pub(crate) async fn prefix_lazy_at_sequence_async(
+        &self,
+        bucket: &str,
+        prefix: &[u8],
+        read_sequence: Sequence,
+        direction: Direction,
+    ) -> Result<LazyIter> {
+        self.ensure_open()?;
+        let read_pin = self.inner.snapshots.pinned_snapshot(read_sequence);
+
+        let state = self.bucket_state(bucket)?;
+        let selector = ScanSelector::Prefix(prefix.to_vec());
+        let scan = state
+            .scan_async(
+                &selector,
+                direction,
+                read_sequence,
+                Some(&self.inner.block_cache),
+            )
+            .await?;
+        let db_path = self.persistent_path().map(Path::to_path_buf);
+        let native_storage = db_path.as_ref().map(|_| self.inner.native_storage.clone());
+
+        Ok(LazyIter::from_sources(
+            direction,
+            ScanSourceInput {
+                read_sequence,
+                read_pin,
+                db_path,
+                native_storage,
+                blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
+                range_tombstones: scan.range_tombstones,
+                sources: scan.sources,
+            },
         ))
     }
 
@@ -4881,11 +5139,18 @@ impl Db {
     }
 
     pub async fn get_async(&self, key: &[u8]) -> Result<Option<Value>> {
-        self.get(key)
+        self.get_at_sequence_async(DEFAULT_BUCKET_NAME, key, self.last_committed_sequence())
+            .await
     }
 
     pub async fn get_at_async(&self, snapshot: &Snapshot, key: &[u8]) -> Result<Option<Value>> {
-        self.get_at(snapshot, key)
+        self.get_at_with_pin_state_async(
+            DEFAULT_BUCKET_NAME,
+            key,
+            snapshot.read_sequence(),
+            snapshot.is_pinned(),
+        )
+        .await
     }
 
     pub async fn put_async(&self, key: impl Into<Vec<u8>>, value: impl Into<Value>) -> Result<()> {
@@ -4938,35 +5203,87 @@ impl Db {
     }
 
     pub async fn range_async(&self, range: &KeyRange) -> Result<Iter> {
-        self.range(range)
+        self.range_at_sequence_async(
+            DEFAULT_BUCKET_NAME,
+            range,
+            self.last_committed_sequence(),
+            Direction::Forward,
+        )
+        .await
     }
 
     pub async fn range_lazy_async(&self, range: &KeyRange) -> Result<LazyIter> {
-        self.range_lazy(range)
+        self.range_lazy_at_sequence_async(
+            DEFAULT_BUCKET_NAME,
+            range,
+            self.last_committed_sequence(),
+            Direction::Forward,
+        )
+        .await
     }
 
     pub async fn range_reverse_async(&self, range: &KeyRange) -> Result<Iter> {
-        self.range_reverse(range)
+        self.range_at_sequence_async(
+            DEFAULT_BUCKET_NAME,
+            range,
+            self.last_committed_sequence(),
+            Direction::Reverse,
+        )
+        .await
     }
 
     pub async fn range_lazy_reverse_async(&self, range: &KeyRange) -> Result<LazyIter> {
-        self.range_lazy_reverse(range)
+        self.range_lazy_at_sequence_async(
+            DEFAULT_BUCKET_NAME,
+            range,
+            self.last_committed_sequence(),
+            Direction::Reverse,
+        )
+        .await
     }
 
     pub async fn prefix_async(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
-        self.prefix(prefix)
+        let prefix = prefix.into();
+        self.prefix_at_sequence_async(
+            DEFAULT_BUCKET_NAME,
+            &prefix,
+            self.last_committed_sequence(),
+            Direction::Forward,
+        )
+        .await
     }
 
     pub async fn prefix_lazy_async(&self, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
-        self.prefix_lazy(prefix)
+        let prefix = prefix.into();
+        self.prefix_lazy_at_sequence_async(
+            DEFAULT_BUCKET_NAME,
+            &prefix,
+            self.last_committed_sequence(),
+            Direction::Forward,
+        )
+        .await
     }
 
     pub async fn prefix_reverse_async(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
-        self.prefix_reverse(prefix)
+        let prefix = prefix.into();
+        self.prefix_at_sequence_async(
+            DEFAULT_BUCKET_NAME,
+            &prefix,
+            self.last_committed_sequence(),
+            Direction::Reverse,
+        )
+        .await
     }
 
     pub async fn prefix_lazy_reverse_async(&self, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
-        self.prefix_lazy_reverse(prefix)
+        let prefix = prefix.into();
+        self.prefix_lazy_at_sequence_async(
+            DEFAULT_BUCKET_NAME,
+            &prefix,
+            self.last_committed_sequence(),
+            Direction::Reverse,
+        )
+        .await
     }
 
     pub async fn persist_async(&self, mode: DurabilityMode) -> Result<()> {
@@ -4978,6 +5295,13 @@ impl Db {
             }
         ) {
             return self.persist_browser_async(mode).await;
+        }
+
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        if self.persistent_path().is_some() {
+            return self
+                .run_native_blocking_task(move |db| db.persist(mode))
+                .await;
         }
 
         self.persist(mode)
@@ -4994,6 +5318,11 @@ impl Db {
             .await;
         }
 
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        if self.persistent_path().is_some() {
+            return self.run_native_blocking_task(|db| db.flush()).await;
+        }
+
         self.flush()
     }
 
@@ -5006,6 +5335,13 @@ impl Db {
                 async move { db.compact_range_browser_async(range).await },
             )
             .await;
+        }
+
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        if self.persistent_path().is_some() {
+            return self
+                .run_native_blocking_task(move |db| db.compact_range(range))
+                .await;
         }
 
         self.compact_range(range)
@@ -5029,6 +5365,13 @@ impl Db {
             .await;
         }
 
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        if self.persistent_path().is_some() {
+            return self
+                .run_native_blocking_task(move |db| db.compact_range_with_budget(range, budget))
+                .await;
+        }
+
         self.compact_range_with_budget(range, budget)
     }
 
@@ -5046,11 +5389,29 @@ impl Db {
             .await;
         }
 
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        if self.persistent_path().is_some() {
+            return self
+                .run_native_blocking_task(move |db| db.run_maintenance_with_budget(budget))
+                .await;
+        }
+
         self.run_maintenance_with_budget(budget)
     }
 
-    pub async fn close_async(&self) {
+    pub async fn close_async(&self) -> Result<()> {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        if self.persistent_path().is_some() {
+            return self
+                .run_native_blocking_task(|db| {
+                    db.close();
+                    Ok(())
+                })
+                .await;
+        }
+
         self.close();
+        Ok(())
     }
 }
 

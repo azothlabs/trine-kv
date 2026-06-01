@@ -5,6 +5,7 @@ use crate::{
     error::{Error, Result},
     internal_key::InternalKey,
     stats::BlobReadMetrics,
+    storage::StorageReadBackend,
     types::Value,
 };
 
@@ -113,6 +114,37 @@ impl PointValueSource {
                     message: "in-memory database cannot read blob value references".to_owned(),
                 })?;
                 let bytes = blob::read_value_for_internal_key(db_path, &value, Some(internal_key))?;
+                if let Some(blob_reads) = blob_reads {
+                    blob_reads.record(bytes.len() as u64);
+                }
+                Ok(PointValue::from_owned(bytes))
+            }
+        }
+    }
+
+    pub(crate) async fn into_point_value_with_backend_async<B>(
+        self,
+        backend: &B,
+        internal_key: &InternalKey,
+        db_path: Option<&std::path::Path>,
+        blob_reads: Option<&BlobReadMetrics>,
+    ) -> Result<PointValue>
+    where
+        B: StorageReadBackend,
+    {
+        match self {
+            Self::Value(value) => Ok(value),
+            Self::Blob(value) => {
+                let db_path = db_path.ok_or_else(|| Error::Corruption {
+                    message: "in-memory database cannot read blob value references".to_owned(),
+                })?;
+                let bytes = blob::read_value_for_internal_key_with_backend_async(
+                    backend,
+                    db_path,
+                    &value,
+                    Some(internal_key),
+                )
+                .await?;
                 if let Some(blob_reads) = blob_reads {
                     blob_reads.record(bytes.len() as u64);
                 }

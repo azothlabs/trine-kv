@@ -963,6 +963,27 @@ impl Table {
         Ok(Arc::clone(cached))
     }
 
+    pub(crate) async fn range_tombstones_async(
+        &self,
+    ) -> Result<Arc<RangeTombstoneIndex<TableRangeTombstone>>> {
+        if let Ok(guard) = self.range_tombstones.read() {
+            if let Some(tombstones) = guard.as_ref() {
+                return Ok(Arc::clone(tombstones));
+            }
+        }
+
+        let tombstones = RangeTombstoneIndex::new(self.load_range_tombstones_async().await?);
+        let tombstones = Arc::new(tombstones);
+        let mut guard = self
+            .range_tombstones
+            .write()
+            .map_err(|_| Error::Corruption {
+                message: "table range tombstone cache lock poisoned".to_owned(),
+            })?;
+        let cached = guard.get_or_insert_with(|| Arc::clone(&tombstones));
+        Ok(Arc::clone(cached))
+    }
+
     pub(crate) fn range_tombstone_covers_visible_point(
         &self,
         key: &[u8],
@@ -983,6 +1004,26 @@ impl Table {
         }))
     }
 
+    pub(crate) async fn range_tombstone_covers_visible_point_async(
+        &self,
+        key: &[u8],
+        point_sequence: Sequence,
+        point_batch_index: u32,
+        read_sequence: Sequence,
+    ) -> Result<bool> {
+        if !self.may_have_range_tombstones {
+            return Ok(false);
+        }
+
+        let tombstones = self.range_tombstones_async().await?;
+        Ok(tombstones.covering_key(key).any(|tombstone| {
+            tombstone.sequence <= read_sequence
+                && (tombstone.sequence > point_sequence
+                    || (tombstone.sequence == point_sequence
+                        && tombstone.batch_index > point_batch_index))
+        }))
+    }
+
     pub(crate) fn range_tombstones_overlapping_range(
         &self,
         range: &KeyRange,
@@ -992,6 +1033,18 @@ impl Table {
         }
 
         let tombstones = self.range_tombstones()?;
+        Ok(tombstones.overlapping_range(range).cloned().collect())
+    }
+
+    pub(crate) async fn range_tombstones_overlapping_range_async(
+        &self,
+        range: &KeyRange,
+    ) -> Result<Vec<TableRangeTombstone>> {
+        if !self.may_have_range_tombstones {
+            return Ok(Vec::new());
+        }
+
+        let tombstones = self.range_tombstones_async().await?;
         Ok(tombstones.overlapping_range(range).cloned().collect())
     }
 
@@ -1248,6 +1301,74 @@ impl Table {
         Ok(None)
     }
 
+    pub(crate) async fn newest_visible_point_value_record_for_key_with_cache_async(
+        &self,
+        key: &[u8],
+        read_sequence: Sequence,
+        policy: IndexSearchPolicy,
+        block_cache: Option<&BlockCache>,
+    ) -> Result<Option<TablePointValueRecord>> {
+        let Some(start) = self
+            .first_block_for_key_async(key, policy, block_cache)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let mut saw_point_key = false;
+        let mut block_index = start;
+        while block_index < self.data_block_count {
+            self.read_path_stats.record_point_block_metadata_probe();
+            let decision = self
+                .with_data_block_metadata_async(block_index, block_cache, |block| {
+                    if block.smallest_internal_key.user_key() > key {
+                        return Ok(PointBlockDecision::Done);
+                    }
+                    let had_filter = block.point_key_filter.is_some();
+                    if !self.block_point_filter_allows(block, key) {
+                        if had_filter {
+                            self.read_path_stats.record_point_filter_miss();
+                        }
+                        return Ok(PointBlockDecision::Skip);
+                    }
+                    Ok(PointBlockDecision::Read { had_filter })
+                })
+                .await?;
+            let PointBlockDecision::Read { had_filter } = decision else {
+                if decision == PointBlockDecision::Done {
+                    break;
+                }
+                block_index += 1;
+                continue;
+            };
+            self.read_path_stats.record_point_data_block_read();
+            let block = self.load_data_block_async(block_index, block_cache).await?;
+            let (block_has_key, record) = data_block_newest_visible_point_value_record_for_key(
+                &block,
+                key,
+                read_sequence,
+                policy,
+            )?;
+            if !block_has_key {
+                if had_filter {
+                    self.filter_stats.record_block_point_false_positive();
+                }
+                block_index += 1;
+                continue;
+            }
+            saw_point_key = true;
+            if let Some(record) = record {
+                return Ok(Some(record));
+            }
+            block_index += 1;
+        }
+
+        if self.point_key_filter.is_some() && !saw_point_key {
+            self.filter_stats.record_table_point_false_positive();
+        }
+        Ok(None)
+    }
+
     #[cfg(test)]
     pub(crate) fn point_records_in_range(
         &self,
@@ -1450,6 +1571,23 @@ impl Table {
             self.payload_len,
             self.footer.range_tombstones,
         )?;
+        validate_block_codec(codec, self.properties.codec, TableSection::RangeTombstones)?;
+        decode_range_tombstone_block(&payload)
+    }
+
+    async fn load_range_tombstones_async(&self) -> Result<Vec<TableRangeTombstone>> {
+        let Some(path) = &self.path else {
+            return Err(Error::Corruption {
+                message: "table range tombstones are not loaded".to_owned(),
+            });
+        };
+        let (codec, payload) = read_single_block_section_from_file_async(
+            path,
+            self.file.as_deref(),
+            self.payload_len,
+            self.footer.range_tombstones,
+        )
+        .await?;
         validate_block_codec(codec, self.properties.codec, TableSection::RangeTombstones)?;
         decode_range_tombstone_block(&payload)
     }
@@ -1790,6 +1928,16 @@ impl Table {
         self.first_block_matching_key(key, policy, block_cache)
     }
 
+    async fn first_block_for_key_async(
+        &self,
+        key: &[u8],
+        policy: IndexSearchPolicy,
+        block_cache: Option<&BlockCache>,
+    ) -> Result<Option<usize>> {
+        self.first_block_matching_key_async(key, policy, block_cache)
+            .await
+    }
+
     fn first_block_for_range(
         &self,
         range: &KeyRange,
@@ -1866,6 +2014,34 @@ impl Table {
         };
         self.read_path_stats.record_point_index_partition_probe();
         let partition = self.load_index_partition(partition_index, block_cache)?;
+        let local_index = search::partition_point_by(partition.len(), policy, |index| {
+            partition[index].largest_internal_key.user_key() < key
+        });
+        Ok((local_index < partition.len())
+            .then_some(partition_entry.first_data_block_index + local_index))
+    }
+
+    async fn first_block_matching_key_async(
+        &self,
+        key: &[u8],
+        policy: IndexSearchPolicy,
+        block_cache: Option<&BlockCache>,
+    ) -> Result<Option<usize>> {
+        if let Some(blocks) = &self.data_blocks {
+            let index = search::partition_point_by(blocks.len(), policy, |index| {
+                blocks[index].largest_internal_key.user_key() < key
+            });
+            return Ok((index < blocks.len()).then_some(index));
+        }
+        let Some((partition_index, partition_entry)) =
+            self.first_partition_matching_key(key, policy)
+        else {
+            return Ok(None);
+        };
+        self.read_path_stats.record_point_index_partition_probe();
+        let partition = self
+            .load_index_partition_async(partition_index, block_cache)
+            .await?;
         let local_index = search::partition_point_by(partition.len(), policy, |index| {
             partition[index].largest_internal_key.user_key() < key
         });
@@ -4296,6 +4472,20 @@ fn read_single_block_section_from_file(
     read_single_block_section_from_source(&source, payload_len, section)
 }
 
+async fn read_single_block_section_from_file_async(
+    path: &Path,
+    file: Option<&NativeFileObject>,
+    payload_len: usize,
+    section: SectionHandle,
+) -> Result<(CodecId, Vec<u8>)> {
+    if let Some(file) = file {
+        return read_single_block_section_from_storage_object_async(file, payload_len, section)
+            .await;
+    }
+
+    read_single_block_section_from_file(path, None, payload_len, section)
+}
+
 fn read_single_block_section_from_source(
     source: &impl BlockReadSource,
     payload_len: usize,
@@ -4324,6 +4514,36 @@ fn read_single_block_section_from_source(
         });
     }
     read_checked_block_from_source(source, payload_len, block)
+}
+
+async fn read_single_block_section_from_storage_object_async(
+    object: &impl StorageReadObject,
+    payload_len: usize,
+    section: SectionHandle,
+) -> Result<(CodecId, Vec<u8>)> {
+    if payload_len < FOOTER_LEN {
+        return Err(invalid_table("short footer"));
+    }
+    let (_, section_end) = section_bounds(section)?;
+    if section.len == 0 {
+        return Err(invalid_table("empty single-block section"));
+    }
+    if section_end > payload_len - FOOTER_LEN {
+        return Err(Error::Corruption {
+            message: "table section layout is inconsistent".to_owned(),
+        });
+    }
+    let block = BlockHandle {
+        offset: section.offset,
+        len: section.len,
+    };
+    let (_, block_end) = block_bounds(block)?;
+    if block_end != section_end {
+        return Err(Error::Corruption {
+            message: "section block length mismatch".to_owned(),
+        });
+    }
+    read_checked_block_from_storage_object_async(object, payload_len, block).await
 }
 
 fn read_first_block_in_section_from_source(

@@ -363,11 +363,25 @@ impl Bucket {
 #[allow(clippy::unused_async)]
 impl Bucket {
     pub async fn get_async(&self, key: &[u8]) -> Result<Option<Value>> {
-        self.get(key)
+        self.db
+            .get_at_state_with_pin_state_async(
+                &self.state,
+                key,
+                self.db.last_committed_sequence(),
+                false,
+            )
+            .await
     }
 
     pub async fn get_at_async(&self, snapshot: &Snapshot, key: &[u8]) -> Result<Option<Value>> {
-        self.get_at(snapshot, key)
+        self.db
+            .get_at_state_with_pin_state_async(
+                &self.state,
+                key,
+                snapshot.read_sequence(),
+                snapshot.is_pinned(),
+            )
+            .await
     }
 
     pub async fn put_async(&self, key: impl Into<Vec<u8>>, value: impl Into<Value>) -> Result<()> {
@@ -432,35 +446,95 @@ impl Bucket {
     }
 
     pub async fn range_async(&self, range: &KeyRange) -> Result<Iter> {
-        self.range(range)
+        self.db
+            .range_at_sequence_async(
+                self.name.as_str(),
+                range,
+                self.db.last_committed_sequence(),
+                Direction::Forward,
+            )
+            .await
     }
 
     pub async fn range_lazy_async(&self, range: &KeyRange) -> Result<LazyIter> {
-        self.range_lazy(range)
+        self.db
+            .range_lazy_at_sequence_async(
+                self.name.as_str(),
+                range,
+                self.db.last_committed_sequence(),
+                Direction::Forward,
+            )
+            .await
     }
 
     pub async fn range_reverse_async(&self, range: &KeyRange) -> Result<Iter> {
-        self.range_reverse(range)
+        self.db
+            .range_at_sequence_async(
+                self.name.as_str(),
+                range,
+                self.db.last_committed_sequence(),
+                Direction::Reverse,
+            )
+            .await
     }
 
     pub async fn range_lazy_reverse_async(&self, range: &KeyRange) -> Result<LazyIter> {
-        self.range_lazy_reverse(range)
+        self.db
+            .range_lazy_at_sequence_async(
+                self.name.as_str(),
+                range,
+                self.db.last_committed_sequence(),
+                Direction::Reverse,
+            )
+            .await
     }
 
     pub async fn prefix_async(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
-        self.prefix(prefix)
+        let prefix = prefix.into();
+        self.db
+            .prefix_at_sequence_async(
+                self.name.as_str(),
+                &prefix,
+                self.db.last_committed_sequence(),
+                Direction::Forward,
+            )
+            .await
     }
 
     pub async fn prefix_lazy_async(&self, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
-        self.prefix_lazy(prefix)
+        let prefix = prefix.into();
+        self.db
+            .prefix_lazy_at_sequence_async(
+                self.name.as_str(),
+                &prefix,
+                self.db.last_committed_sequence(),
+                Direction::Forward,
+            )
+            .await
     }
 
     pub async fn prefix_reverse_async(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
-        self.prefix_reverse(prefix)
+        let prefix = prefix.into();
+        self.db
+            .prefix_at_sequence_async(
+                self.name.as_str(),
+                &prefix,
+                self.db.last_committed_sequence(),
+                Direction::Reverse,
+            )
+            .await
     }
 
     pub async fn prefix_lazy_reverse_async(&self, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
-        self.prefix_lazy_reverse(prefix)
+        let prefix = prefix.into();
+        self.db
+            .prefix_lazy_at_sequence_async(
+                self.name.as_str(),
+                &prefix,
+                self.db.last_committed_sequence(),
+                Direction::Reverse,
+            )
+            .await
     }
 }
 
@@ -502,6 +576,25 @@ impl BucketReader<'_> {
     /// or `Bucket::get`.
     pub fn get_owned(&self, key: &[u8]) -> Result<Option<Value>> {
         self.get(key)?
+            .map(|value| Ok(value.into_value()))
+            .transpose()
+    }
+
+    pub async fn get_async(&self, key: &[u8]) -> Result<Option<PointValue>> {
+        self.db
+            .get_value_at_state_snapshot_with_pin_state_async(
+                &self.state,
+                &self.read_snapshot,
+                key,
+                self.read_sequence,
+                true,
+            )
+            .await
+    }
+
+    pub async fn get_owned_async(&self, key: &[u8]) -> Result<Option<Value>> {
+        self.get_async(key)
+            .await?
             .map(|value| Ok(value.into_value()))
             .transpose()
     }

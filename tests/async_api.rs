@@ -190,7 +190,7 @@ fn memory_async_compatibility_surface_smoke() {
     block_on(db.persist_async(DurabilityMode::Buffered)).expect("memory persist is accepted");
     block_on(db.flush_async()).expect("memory flush is accepted");
     block_on(db.compact_range_async(KeyRange::all())).expect("memory compact is accepted");
-    block_on(db.close_async());
+    block_on(db.close_async()).expect("async close succeeds");
 }
 
 #[test]
@@ -289,6 +289,88 @@ fn persistent_open_async_rejects_inline_runtime() {
         block_on(Db::open_async(options)).expect_err("persistent async open needs wait support");
 
     assert!(matches!(error, Error::Unsupported { .. }));
+    cleanup_dir(&path);
+}
+
+#[test]
+fn persistent_async_reads_load_blob_values_through_storage_backend() {
+    let path = temp_db_path("persistent-async-blob-read");
+    let mut options = DbOptions::persistent(&path);
+    options.background_worker_count = 0;
+    options.default_bucket_options = options.default_bucket_options.with_blob_threshold_bytes(4);
+    let point_value = b"large-value-for-point-read".to_vec();
+    let lazy_value = b"large-value-for-lazy-read".to_vec();
+
+    let db = block_on(Db::open_async(options)).expect("persistent async open");
+    block_on(db.put_async(b"a".to_vec(), point_value.clone())).expect("point value writes");
+    block_on(db.put_async(b"b".to_vec(), lazy_value.clone())).expect("lazy value writes");
+    block_on(db.flush_async()).expect("async flush writes blob-backed table");
+
+    let before_point_tasks = db.stats().storage_blocking_adapter_tasks;
+    assert_eq!(
+        block_on(db.get_async(b"a")).expect("async point read loads blob"),
+        Some(point_value)
+    );
+    let after_point = db.stats();
+    assert_eq!(after_point.blob_read_count, 1);
+    assert!(
+        after_point.storage_blocking_adapter_tasks > before_point_tasks,
+        "async point read should enter the storage backend"
+    );
+
+    let mut iter = block_on(db.range_lazy_async(&KeyRange::half_open(b"b", b"c")))
+        .expect("async lazy range opens");
+    let row = block_on(iter.next_async())
+        .expect("async lazy iterator advances")
+        .expect("lazy row exists");
+    assert_eq!(row.key, b"b".to_vec());
+    assert!(!row.value.is_inline());
+
+    let before_lazy_tasks = db.stats().storage_blocking_adapter_tasks;
+    assert_eq!(
+        block_on(row.value.read_async()).expect("async lazy value reads"),
+        lazy_value
+    );
+    let after_lazy = db.stats();
+    assert_eq!(after_lazy.blob_read_count, 2);
+    assert!(
+        after_lazy.storage_blocking_adapter_tasks > before_lazy_tasks,
+        "async lazy value read should enter the storage backend"
+    );
+
+    cleanup_dir(&path);
+}
+
+#[test]
+fn persistent_async_maintenance_runs_on_runtime_blocking_task() {
+    let path = temp_db_path("persistent-async-maintenance");
+    let mut options = DbOptions::persistent(&path);
+    options.background_worker_count = 0;
+
+    let db = block_on(Db::open_async(options)).expect("persistent async open");
+    block_on(db.put_async(b"k".to_vec(), b"value".to_vec())).expect("write succeeds");
+
+    let before_flush = db.stats().storage_blocking_adapter_submitted_tasks;
+    block_on(db.flush_async()).expect("async flush succeeds");
+    let after_flush = db.stats();
+    assert_eq!(after_flush.immutable_memtables, 0);
+    assert!(
+        after_flush.storage_blocking_adapter_submitted_tasks > before_flush,
+        "native async flush should run through the runtime blocking task boundary"
+    );
+
+    let before_compact = db.stats().storage_blocking_adapter_submitted_tasks;
+    block_on(db.compact_range_with_budget_async(
+        KeyRange::all(),
+        trine_kv::MaintenanceBudget::single_unit(),
+    ))
+    .expect("async budgeted compaction succeeds");
+    assert!(
+        db.stats().storage_blocking_adapter_submitted_tasks > before_compact,
+        "native async compaction should run through the runtime blocking task boundary"
+    );
+
+    block_on(db.close_async()).expect("async close succeeds");
     cleanup_dir(&path);
 }
 

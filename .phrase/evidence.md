@@ -8939,6 +8939,21 @@ Record only evidence that can change planning or durable decisions.
   blob-value inline fallback it currently needs.
 - Added focused tests for persistent async WAL replay and inline runtime
   rejection.
+- Added native async table/range-tombstone lookup helpers and routed
+  persistent `get_async`, snapshot reads, bucket reads, transaction reads,
+  range scans, prefix scans, and lazy blob value reads through async table/blob
+  storage helpers instead of blocking public read methods.
+- Threaded the native storage backend into lazy scan values so
+  `LazyValue::read_async` and `LazyScan::next_async` can load separated blob
+  values through async storage waits.
+- Routed native persistent `persist_async`, `flush_async`, compaction,
+  budgeted maintenance, and `close_async` through runtime blocking tasks.
+  These wrappers no longer block the caller thread directly, but they still
+  reuse synchronous maintenance/WAL internals.
+- Changed `close_async` to return `Result<()>` so native task-bound close
+  failures are observable.
+- Added focused tests for persistent async lazy blob reads and native
+  maintenance wrapper task submission.
 
 ### Verification
 
@@ -8951,19 +8966,22 @@ Record only evidence that can change planning or durable decisions.
 - `cargo check --target wasm32-unknown-unknown --lib`
 - `cargo check --target wasm32-wasip1 --lib`
 - `cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings`
+- `git diff --check`
+- forbidden-term scan over `src`, `tests`, and `.phrase`
 
 ### Remaining Blockers
 
 - WASI host persistent `Db::open_async` still delegates to blocking `Db::open`.
-- Native `get_async`, snapshot reads, range/prefix scans, `persist_async`,
-  `flush_async`, compaction, maintenance, and close still call blocking public
-  methods.
+- Native async maintenance wrappers now leave the caller thread through runtime
+  blocking tasks, but they are not a primary async maintenance/WAL engine.
+- Native `persist_async` still reaches the synchronous WAL front door inside
+  the runtime task boundary.
 - Native persistent async open still has synchronous path metadata checks and
   synchronous cleanup/background-worker startup after recovery loading.
 - Browser runtime persistence still lacks an in-browser fixture.
 
 ### Recommended Next Action
 
-- Convert the next native async wait boundary, starting with either point/range
-  reads if table/blob I/O is the highest user-visible gap, or flush/maintenance
-  if foreground write-pressure behavior needs the stricter async guarantee.
+- Resolve WASI host persistent async open or explicitly narrow that target's
+  persistent async contract, then decide whether maintenance/WAL ownership must
+  move to primary async internals before release-quality claims.

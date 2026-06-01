@@ -12,6 +12,7 @@ use crate::{
     range_tombstone::{RangeTombstoneIndex, RangeTombstoneLike},
     snapshot::Snapshot,
     stats::BlobReadMetrics,
+    storage::NativeFileBackend,
     table::TablePointCursor,
     types::{KeyRange, KeyValue, Sequence, Value},
 };
@@ -51,6 +52,7 @@ enum LazyValueInner {
     Inline(Vec<u8>),
     Blob {
         db_path: PathBuf,
+        native_storage: Option<NativeFileBackend>,
         internal_key: InternalKey,
         value: ValueRef,
         blob_reads: Option<Arc<BlobReadMetrics>>,
@@ -62,6 +64,17 @@ enum LazyValueInner {
 enum IterInner {
     Items(std::vec::IntoIter<KeyValue>),
     Lazy(LazyScan),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScanSourceInput {
+    pub(crate) read_sequence: Sequence,
+    pub(crate) read_pin: Snapshot,
+    pub(crate) db_path: Option<PathBuf>,
+    pub(crate) native_storage: Option<NativeFileBackend>,
+    pub(crate) blob_reads: Option<Arc<BlobReadMetrics>>,
+    pub(crate) range_tombstones: Vec<ScanRangeTombstone>,
+    pub(crate) sources: Vec<RecordSource>,
 }
 
 impl Iter {
@@ -82,25 +95,18 @@ impl Iter {
         }
     }
 
-    pub(crate) fn from_sources(
-        direction: Direction,
-        read_sequence: Sequence,
-        read_pin: Snapshot,
-        db_path: Option<PathBuf>,
-        blob_reads: Option<Arc<BlobReadMetrics>>,
-        range_tombstones: Vec<ScanRangeTombstone>,
-        sources: Vec<RecordSource>,
-    ) -> Self {
+    pub(crate) fn from_sources(direction: Direction, input: ScanSourceInput) -> Self {
         Self {
             direction,
             inner: IterInner::Lazy(LazyScan {
                 direction,
-                read_sequence,
-                read_pin: Arc::new(read_pin),
-                db_path,
-                blob_reads,
-                range_tombstones: RangeTombstoneIndex::new(range_tombstones),
-                sources,
+                read_sequence: input.read_sequence,
+                read_pin: Arc::new(input.read_pin),
+                db_path: input.db_path,
+                native_storage: input.native_storage,
+                blob_reads: input.blob_reads,
+                range_tombstones: RangeTombstoneIndex::new(input.range_tombstones),
+                sources: input.sources,
                 source_heap: BinaryHeap::new(),
                 source_heap_initialized: false,
             }),
@@ -114,25 +120,18 @@ impl Iter {
 }
 
 impl LazyIter {
-    pub(crate) fn from_sources(
-        direction: Direction,
-        read_sequence: Sequence,
-        read_pin: Snapshot,
-        db_path: Option<PathBuf>,
-        blob_reads: Option<Arc<BlobReadMetrics>>,
-        range_tombstones: Vec<ScanRangeTombstone>,
-        sources: Vec<RecordSource>,
-    ) -> Self {
+    pub(crate) fn from_sources(direction: Direction, input: ScanSourceInput) -> Self {
         Self {
             direction,
             scan: LazyScan {
                 direction,
-                read_sequence,
-                read_pin: Arc::new(read_pin),
-                db_path,
-                blob_reads,
-                range_tombstones: RangeTombstoneIndex::new(range_tombstones),
-                sources,
+                read_sequence: input.read_sequence,
+                read_pin: Arc::new(input.read_pin),
+                db_path: input.db_path,
+                native_storage: input.native_storage,
+                blob_reads: input.blob_reads,
+                range_tombstones: RangeTombstoneIndex::new(input.range_tombstones),
+                sources: input.sources,
                 source_heap: BinaryHeap::new(),
                 source_heap_initialized: false,
             },
@@ -151,10 +150,10 @@ impl LazyKeyValue {
     }
 }
 
-#[allow(clippy::unused_async)]
 impl LazyKeyValue {
     pub async fn into_key_value_async(self) -> Result<KeyValue> {
-        self.into_key_value()
+        let value = self.value.into_value_async().await?;
+        Ok(KeyValue::new(self.key, value))
     }
 }
 
@@ -169,6 +168,7 @@ impl LazyValue {
             LazyValueInner::Inline(bytes) => Ok(bytes.clone()),
             LazyValueInner::Blob {
                 db_path,
+                native_storage: _,
                 internal_key,
                 value,
                 blob_reads,
@@ -189,6 +189,7 @@ impl LazyValue {
             LazyValueInner::Inline(bytes) => Ok(bytes),
             LazyValueInner::Blob {
                 db_path,
+                native_storage: _,
                 internal_key,
                 value,
                 blob_reads,
@@ -208,14 +209,79 @@ impl LazyValue {
     }
 }
 
-#[allow(clippy::unused_async)]
 impl LazyValue {
     pub async fn read_async(&self) -> Result<Value> {
-        self.read()
+        match &self.inner {
+            LazyValueInner::Inline(bytes) => Ok(bytes.clone()),
+            LazyValueInner::Blob {
+                db_path,
+                native_storage: Some(native_storage),
+                internal_key,
+                value,
+                blob_reads,
+                _read_pin: _,
+            } => {
+                let bytes = crate::blob::read_value_for_internal_key_with_backend_async(
+                    native_storage,
+                    db_path,
+                    value,
+                    Some(internal_key),
+                )
+                .await?;
+                if let Some(blob_reads) = blob_reads {
+                    blob_reads.record(bytes.len() as u64);
+                }
+                Ok(bytes)
+            }
+            LazyValueInner::Blob {
+                native_storage: None,
+                ..
+            } => self.read(),
+        }
     }
 
     pub async fn into_value_async(self) -> Result<Value> {
-        self.into_value()
+        match self.inner {
+            LazyValueInner::Inline(bytes) => Ok(bytes),
+            LazyValueInner::Blob {
+                db_path,
+                native_storage: Some(native_storage),
+                internal_key,
+                value,
+                blob_reads,
+                _read_pin: _,
+            } => {
+                let bytes = crate::blob::read_value_for_internal_key_with_backend_async(
+                    &native_storage,
+                    &db_path,
+                    &value,
+                    Some(&internal_key),
+                )
+                .await?;
+                if let Some(blob_reads) = blob_reads {
+                    blob_reads.record(bytes.len() as u64);
+                }
+                Ok(bytes)
+            }
+            LazyValueInner::Blob {
+                db_path,
+                native_storage: None,
+                internal_key,
+                value,
+                blob_reads,
+                _read_pin: _,
+            } => {
+                let bytes = crate::blob::read_value_for_internal_key(
+                    &db_path,
+                    &value,
+                    Some(&internal_key),
+                )?;
+                if let Some(blob_reads) = blob_reads {
+                    blob_reads.record(bytes.len() as u64);
+                }
+                Ok(bytes)
+            }
+        }
     }
 }
 
@@ -259,6 +325,7 @@ struct LazyScan {
     read_sequence: Sequence,
     read_pin: Arc<Snapshot>,
     db_path: Option<PathBuf>,
+    native_storage: Option<NativeFileBackend>,
     blob_reads: Option<Arc<BlobReadMetrics>>,
     range_tombstones: RangeTombstoneIndex<ScanRangeTombstone>,
     sources: Vec<RecordSource>,
@@ -273,10 +340,10 @@ impl LazyScan {
     }
 
     async fn next_async(&mut self) -> Result<Option<KeyValue>> {
-        self.next_lazy_async()
-            .await?
-            .map(LazyKeyValue::into_key_value)
-            .transpose()
+        let Some(item) = self.next_lazy_async().await? else {
+            return Ok(None);
+        };
+        item.into_key_value_async().await.map(Some)
     }
 
     fn next_lazy(&mut self) -> Option<Result<LazyKeyValue>> {
@@ -458,6 +525,7 @@ impl LazyScan {
                         value,
                         internal_key,
                         self.db_path.as_deref(),
+                        self.native_storage.clone(),
                         self.blob_reads.clone(),
                         Arc::clone(&self.read_pin),
                     )?;
@@ -931,6 +999,7 @@ fn lazy_value(
     value: Option<ValueRef>,
     internal_key: InternalKey,
     db_path: Option<&std::path::Path>,
+    native_storage: Option<NativeFileBackend>,
     blob_reads: Option<Arc<BlobReadMetrics>>,
     read_pin: Arc<Snapshot>,
 ) -> Result<LazyValue> {
@@ -949,6 +1018,7 @@ fn lazy_value(
             Ok(LazyValue {
                 inner: LazyValueInner::Blob {
                     db_path: db_path.to_path_buf(),
+                    native_storage,
                     internal_key,
                     value,
                     blob_reads,
@@ -997,7 +1067,7 @@ fn key_is_in_range(key: &[u8], range: &KeyRange) -> bool {
 mod tests {
     use std::{collections::BinaryHeap, sync::Arc};
 
-    use super::{Direction, Iter, RecordSource, ScanSelector, SourceHeapEntry};
+    use super::{Direction, Iter, RecordSource, ScanSelector, ScanSourceInput, SourceHeapEntry};
     use crate::{
         blob::ValueRef,
         internal_key::{InternalKey, ValueKind},
@@ -1034,23 +1104,26 @@ mod tests {
 
         let forward = Iter::from_sources(
             Direction::Forward,
-            Sequence::new(4),
-            Snapshot::new(Sequence::new(4)),
-            None,
-            None,
-            Vec::new(),
-            vec![
-                RecordSource::memtable(
-                    Arc::clone(&left),
-                    ScanSelector::Range(KeyRange::all()),
-                    Direction::Forward,
-                ),
-                RecordSource::memtable(
-                    Arc::clone(&right),
-                    ScanSelector::Range(KeyRange::all()),
-                    Direction::Forward,
-                ),
-            ],
+            ScanSourceInput {
+                read_sequence: Sequence::new(4),
+                read_pin: Snapshot::new(Sequence::new(4)),
+                db_path: None,
+                native_storage: None,
+                blob_reads: None,
+                range_tombstones: Vec::new(),
+                sources: vec![
+                    RecordSource::memtable(
+                        Arc::clone(&left),
+                        ScanSelector::Range(KeyRange::all()),
+                        Direction::Forward,
+                    ),
+                    RecordSource::memtable(
+                        Arc::clone(&right),
+                        ScanSelector::Range(KeyRange::all()),
+                        Direction::Forward,
+                    ),
+                ],
+            },
         );
         assert_eq!(
             collect_keys(forward),
@@ -1059,23 +1132,26 @@ mod tests {
 
         let reverse = Iter::from_sources(
             Direction::Reverse,
-            Sequence::new(4),
-            Snapshot::new(Sequence::new(4)),
-            None,
-            None,
-            Vec::new(),
-            vec![
-                RecordSource::memtable(
-                    left,
-                    ScanSelector::Range(KeyRange::all()),
-                    Direction::Reverse,
-                ),
-                RecordSource::memtable(
-                    right,
-                    ScanSelector::Range(KeyRange::all()),
-                    Direction::Reverse,
-                ),
-            ],
+            ScanSourceInput {
+                read_sequence: Sequence::new(4),
+                read_pin: Snapshot::new(Sequence::new(4)),
+                db_path: None,
+                native_storage: None,
+                blob_reads: None,
+                range_tombstones: Vec::new(),
+                sources: vec![
+                    RecordSource::memtable(
+                        left,
+                        ScanSelector::Range(KeyRange::all()),
+                        Direction::Reverse,
+                    ),
+                    RecordSource::memtable(
+                        right,
+                        ScanSelector::Range(KeyRange::all()),
+                        Direction::Reverse,
+                    ),
+                ],
+            },
         );
         assert_eq!(
             collect_keys(reverse),

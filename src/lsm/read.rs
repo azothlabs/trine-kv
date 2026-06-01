@@ -15,6 +15,7 @@ use crate::{
     point_value::{PointValue, PointValueSource},
     range_tombstone::RangeTombstoneIndex,
     stats::BlobReadMetrics,
+    storage::StorageReadBackend,
     types::Sequence,
 };
 
@@ -37,6 +38,36 @@ pub(crate) struct LsmPointReadSnapshot {
     active_memtable: Arc<Memtable>,
     active_range_tombstones: Vec<RangeTombstone>,
     immutable_memtables: Vec<ImmutableMemtable>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AsyncPointReadIo<'io, B>
+where
+    B: StorageReadBackend,
+{
+    backend: &'io B,
+    db_path: Option<&'io Path>,
+    block_cache: Option<&'io cache::BlockCache>,
+    blob_reads: Option<&'io BlobReadMetrics>,
+}
+
+impl<'io, B> AsyncPointReadIo<'io, B>
+where
+    B: StorageReadBackend,
+{
+    pub(crate) const fn new(
+        backend: &'io B,
+        db_path: Option<&'io Path>,
+        block_cache: Option<&'io cache::BlockCache>,
+        blob_reads: Option<&'io BlobReadMetrics>,
+    ) -> Self {
+        Self {
+            backend,
+            db_path,
+            block_cache,
+            blob_reads,
+        }
+    }
 }
 
 impl LsmTree {
@@ -117,6 +148,31 @@ impl LsmTree {
             .transpose()
     }
 
+    pub(crate) async fn read_visible_point_async<B>(
+        &self,
+        backend: &B,
+        key: &[u8],
+        read_sequence: Sequence,
+        db_path: Option<&Path>,
+        block_cache: Option<&cache::BlockCache>,
+        blob_reads: Option<&BlobReadMetrics>,
+    ) -> Result<Option<Vec<u8>>>
+    where
+        B: StorageReadBackend,
+    {
+        self.read_visible_point_value_async(
+            backend,
+            key,
+            read_sequence,
+            db_path,
+            block_cache,
+            blob_reads,
+        )
+        .await?
+        .map(|value| Ok(value.into_value()))
+        .transpose()
+    }
+
     pub(crate) fn read_visible_point_value(
         &self,
         key: &[u8],
@@ -134,6 +190,28 @@ impl LsmTree {
             block_cache,
             blob_reads,
         )
+    }
+
+    pub(crate) async fn read_visible_point_value_async<B>(
+        &self,
+        backend: &B,
+        key: &[u8],
+        read_sequence: Sequence,
+        db_path: Option<&Path>,
+        block_cache: Option<&cache::BlockCache>,
+        blob_reads: Option<&BlobReadMetrics>,
+    ) -> Result<Option<PointValue>>
+    where
+        B: StorageReadBackend,
+    {
+        let snapshot = self.point_read_snapshot_for_key(key, read_sequence)?;
+        self.read_visible_point_value_in_snapshot_async(
+            &snapshot,
+            key,
+            read_sequence,
+            AsyncPointReadIo::new(backend, db_path, block_cache, blob_reads),
+        )
+        .await
     }
 
     pub(crate) fn read_visible_point_value_in_snapshot(
@@ -219,6 +297,95 @@ impl LsmTree {
                     Ok(None)
                 } else {
                     point_value(value, &internal_key, db_path, blob_reads).map(Some)
+                }
+            }
+            ValueKind::PointDelete | ValueKind::RangeDelete => Ok(None),
+        }
+    }
+
+    pub(crate) async fn read_visible_point_value_in_snapshot_async<B>(
+        &self,
+        snapshot: &LsmPointReadSnapshot,
+        key: &[u8],
+        read_sequence: Sequence,
+        io: AsyncPointReadIo<'_, B>,
+    ) -> Result<Option<PointValue>>
+    where
+        B: StorageReadBackend,
+    {
+        let mut candidate = Self::newest_visible_memtable_point_candidate_in_snapshot(
+            snapshot,
+            key,
+            read_sequence,
+        )?;
+        let memtable_range_tombstones = memtable_range_tombstones_in_snapshot(snapshot);
+        let newest_candidate_sequence = Cell::new(
+            candidate
+                .as_ref()
+                .map(|candidate| candidate.internal_key.sequence()),
+        );
+
+        for table in snapshot.version.point_lookup_tables(key) {
+            if !table_may_have_newer_point_record(&table, newest_candidate_sequence.get()) {
+                continue;
+            }
+            if let Some(record) = table
+                .newest_visible_point_value_record_for_key_with_cache_async(
+                    key,
+                    read_sequence,
+                    self.options.index_search_policy,
+                    io.block_cache,
+                )
+                .await?
+            {
+                keep_newer_point_candidate_owned(&mut candidate, record.internal_key, record.value);
+                newest_candidate_sequence.set(
+                    candidate
+                        .as_ref()
+                        .map(|candidate| candidate.internal_key.sequence()),
+                );
+            }
+        }
+
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+        let PointRecordCandidate {
+            internal_key,
+            value,
+        } = candidate;
+
+        match internal_key.kind() {
+            ValueKind::Put => {
+                let covered_by_memtable_tombstone = range_tombstones_cover(
+                    &memtable_range_tombstones,
+                    key,
+                    internal_key.sequence(),
+                    internal_key.batch_index(),
+                    read_sequence,
+                );
+                let mut covered_by_table_tombstone = false;
+                if !covered_by_memtable_tombstone {
+                    for table in snapshot.version.range_tombstone_tables_for_key(key) {
+                        covered_by_table_tombstone = table
+                            .range_tombstone_covers_visible_point_async(
+                                key,
+                                internal_key.sequence(),
+                                internal_key.batch_index(),
+                                read_sequence,
+                            )
+                            .await?;
+                        if covered_by_table_tombstone {
+                            break;
+                        }
+                    }
+                }
+                if covered_by_memtable_tombstone || covered_by_table_tombstone {
+                    Ok(None)
+                } else {
+                    point_value_async(io.backend, value, &internal_key, io.db_path, io.blob_reads)
+                        .await
+                        .map(Some)
                 }
             }
             ValueKind::PointDelete | ValueKind::RangeDelete => Ok(None),
@@ -412,4 +579,23 @@ fn point_value(
     })?;
 
     value.into_point_value(internal_key, db_path, blob_reads)
+}
+
+async fn point_value_async<B>(
+    backend: &B,
+    value: Option<PointValueSource>,
+    internal_key: &InternalKey,
+    db_path: Option<&Path>,
+    blob_reads: Option<&BlobReadMetrics>,
+) -> Result<PointValue>
+where
+    B: StorageReadBackend,
+{
+    let value = value.ok_or_else(|| Error::Corruption {
+        message: "put record is missing value bytes".to_owned(),
+    })?;
+
+    value
+        .into_point_value_with_backend_async(backend, internal_key, db_path, blob_reads)
+        .await
 }

@@ -15,8 +15,10 @@ removing compatibility wrappers that still call blocking APIs.
 - Phase 130: async contract closure.
 - Native persistent `Db::open_async` and recovery through async storage-trait
   operations.
-- Public async compatibility audit for reads, scans, maintenance, close, and
-  WASI host persistence.
+- Native persistent async point reads, scans, lazy value reads, and maintenance
+  wrappers.
+- Public async compatibility audit for remaining WASI host persistence and
+  deeper maintenance/WAL engine ownership.
 - Blocking native APIs remain available only as adapter surface.
 
 ## Out Of Scope
@@ -44,7 +46,9 @@ removing compatibility wrappers that still call blocking APIs.
 
 ```text
 task546 [x] goal:route native persistent open_async through async storage path | scope:src/db.rs src/recovery.rs tests/async_api.rs | verify:cargo test --test async_api; cargo clippy --all-targets --all-features -- -D warnings; WASM target checks
-task547 [ ] goal:classify remaining async wrappers and convert the next wait boundary | scope:src/db.rs tests | verify:focused async tests plus native/WASM gates
+task547 [x] goal:convert native point/range async read wait boundaries | scope:src/db.rs src/bucket.rs src/transaction.rs src/iterator.rs src/lsm src/table.rs src/point_value.rs tests/async_api.rs | verify:cargo test --test async_api; cargo test --all-targets --all-features; WASM target checks
+task548 [x] goal:route native async maintenance wrappers through runtime blocking task boundary | scope:src/db.rs tests/async_api.rs | verify:cargo test --test async_api; cargo clippy --all-targets --all-features -- -D warnings
+task549 [ ] goal:resolve WASI async open and primary async maintenance/WAL ownership blockers | scope:src/db.rs src/wal.rs src/manifest.rs | verify:focused async tests plus native/WASM gates
 ```
 
 ## Known Residuals
@@ -53,9 +57,12 @@ task547 [ ] goal:classify remaining async wrappers and convert the next wait bou
   `Db::open`.
 - Native persistent async open still uses synchronous path metadata checks and
   synchronous cleanup/background-worker startup after recovery has loaded.
-- `get_async`, snapshot reads, range/prefix scans, native `persist_async`,
-  native `flush_async`, native compaction, native maintenance, and
-  `close_async` still call blocking public methods on native targets.
+- Native `persist_async`, `flush_async`, compaction, maintenance, and
+  `close_async` now leave the caller thread through runtime blocking tasks, but
+  they still reuse synchronous engine internals rather than a primary async
+  maintenance/WAL implementation.
+- Native `persist_async` still reaches the synchronous WAL front door inside
+  the runtime task boundary.
 - The browser runtime fixture remains absent; browser coverage is still target
   compilation and shared native tests.
 
@@ -71,10 +78,19 @@ task547 [ ] goal:classify remaining async wrappers and convert the next wait bou
   error before entering native storage waits.
 - Focused async tests cover WAL replay through persistent async reopen and
   inline runtime rejection.
-- Verified with native clippy/tests and browser/WASI target checks.
+- Native persistent async point reads, snapshot reads, bucket reads,
+  transaction reads, range scans, prefix scans, and lazy blob value reads now
+  await async table/blob storage helpers instead of delegating to blocking
+  public reads.
+- Native async maintenance wrappers now run their synchronous engine work on
+  runtime blocking tasks when a persistent native backend is present.
+- Focused async tests cover persistent lazy blob reads and native maintenance
+  wrapper task submission.
+- Verified with native clippy/tests and browser/WASI target checks, including
+  full `cargo test --all-targets --all-features`.
 
 ## Next Recommendation
 
-- Convert the next highest-impact native async wrapper: point/range reads if
-  the read path can wait on table/blob I/O, or maintenance/flush if foreground
-  write-pressure behavior needs the tighter async guarantee first.
+- Resolve the WASI host persistent async-open blocker, then decide whether the
+  remaining maintenance/WAL ownership work must become primary async internals
+  before release-quality claims.

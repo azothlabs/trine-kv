@@ -469,7 +469,7 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
 mod tests {
     use crate::{
         bucket::DEFAULT_BUCKET_NAME,
-        iterator::{Direction, Iter, ScanSelector},
+        iterator::{Direction, Iter, ScanSelector, ScanSourceInput},
         options::BucketOptions,
         snapshot::Snapshot,
         types::{KeyRange, Sequence},
@@ -587,12 +587,15 @@ mod tests {
             .expect("scan delta sources");
         let mut iter = Iter::from_sources(
             Direction::Forward,
-            Sequence::new(1),
-            Snapshot::new(Sequence::new(1)),
-            None,
-            None,
-            scan.range_tombstones,
-            scan.sources,
+            ScanSourceInput {
+                read_sequence: Sequence::new(1),
+                read_pin: Snapshot::new(Sequence::new(1)),
+                db_path: None,
+                native_storage: None,
+                blob_reads: None,
+                range_tombstones: scan.range_tombstones,
+                sources: scan.sources,
+            },
         );
 
         let first = iter

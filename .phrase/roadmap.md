@@ -3087,5 +3087,6 @@ fully reflected in the native public API surface.
 
 ### Recommended Next Action
 
-- Convert the next native async wait boundary after the persistent open/recovery
-  slice, then re-evaluate whether reads/scans or maintenance should close next.
+- Resolve the WASI host persistent async-open blocker next, then decide whether
+  the remaining maintenance/WAL ownership work must move from native runtime
+  task wrappers to primary async internals before release-quality claims.

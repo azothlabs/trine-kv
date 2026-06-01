@@ -41,6 +41,29 @@ impl LsmTree {
         })
     }
 
+    pub(crate) async fn scan_async(
+        &self,
+        selector: &ScanSelector,
+        direction: Direction,
+        read_sequence: crate::types::Sequence,
+        block_cache: Option<&Arc<cache::BlockCache>>,
+    ) -> Result<LsmScan> {
+        let version = self.current_version()?;
+        let include_deltas = !self.delta_mirror_covers(read_sequence);
+        Ok(LsmScan {
+            range_tombstones: self
+                .scan_range_tombstones_async(&version, selector, read_sequence)
+                .await?,
+            sources: self.scan_sources(
+                &version,
+                selector,
+                direction,
+                include_deltas,
+                block_cache,
+            )?,
+        })
+    }
+
     fn scan_sources(
         &self,
         version: &LsmVersion,
@@ -123,6 +146,44 @@ impl LsmTree {
             tombstones.extend(
                 table
                     .range_tombstones_overlapping_range(&range)?
+                    .into_iter()
+                    .map(|tombstone| RangeTombstone {
+                        range: tombstone.range,
+                        sequence: tombstone.sequence,
+                        batch_index: tombstone.batch_index,
+                    }),
+            );
+        }
+
+        Ok(RangeTombstoneIndex::new(tombstones)
+            .all()
+            .iter()
+            .cloned()
+            .map(|tombstone| {
+                ScanRangeTombstone::new(tombstone.range, tombstone.sequence, tombstone.batch_index)
+            })
+            .collect())
+    }
+
+    async fn scan_range_tombstones_async(
+        &self,
+        version: &LsmVersion,
+        selector: &ScanSelector,
+        read_sequence: crate::types::Sequence,
+    ) -> Result<Vec<ScanRangeTombstone>> {
+        let range = selector_query_range(selector);
+        let memtable_tombstones =
+            self.memtable_range_tombstones_for_read_sequence(read_sequence)?;
+        let mut tombstones = memtable_tombstones
+            .overlapping_range(&range)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for table in version.range_scan_tables(&range) {
+            tombstones.extend(
+                table
+                    .range_tombstones_overlapping_range_async(&range)
+                    .await?
                     .into_iter()
                     .map(|tombstone| RangeTombstone {
                         range: tombstone.range,

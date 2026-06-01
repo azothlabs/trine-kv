@@ -177,7 +177,7 @@ impl Transaction {
 #[allow(clippy::unused_async)]
 impl Transaction {
     pub async fn get_async(&mut self, key: &[u8]) -> Result<Option<Value>> {
-        self.get(key)
+        self.get_bucket_async(DEFAULT_BUCKET_NAME, key).await
     }
 
     pub async fn get_bucket_async(
@@ -185,11 +185,22 @@ impl Transaction {
         bucket: impl Into<String>,
         key: &[u8],
     ) -> Result<Option<Value>> {
-        self.get_bucket(bucket, key)
+        let bucket = bucket.into();
+        let value = self
+            .db
+            .get_at_sequence_async(&bucket, key, self.read_sequence)
+            .await?;
+        self.point_reads.push(ReadKey {
+            bucket,
+            key: key.to_vec(),
+        });
+
+        Ok(value)
     }
 
     pub async fn read_range_async(&mut self, range: KeyRange) -> Result<()> {
-        self.read_range(range)
+        self.read_range_bucket_async(DEFAULT_BUCKET_NAME, range)
+            .await
     }
 
     pub async fn read_range_bucket_async(
@@ -197,7 +208,21 @@ impl Transaction {
         bucket: impl Into<String>,
         range: KeyRange,
     ) -> Result<()> {
-        self.read_range_bucket(bucket, range)
+        self.db.ensure_open()?;
+        let bucket = bucket.into();
+        let mut iter = self
+            .db
+            .range_at_sequence_async(
+                &bucket,
+                &range,
+                self.read_sequence,
+                crate::Direction::Forward,
+            )
+            .await?;
+        while iter.next_async().await?.is_some() {}
+        self.range_reads.push(ReadRange { bucket, range });
+
+        Ok(())
     }
 
     pub async fn commit_async(self) -> Result<CommitInfo> {
