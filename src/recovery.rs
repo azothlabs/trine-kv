@@ -362,7 +362,7 @@ fn is_safe_temporary_file(name: &str) -> bool {
     // when the caller explicitly chooses the repair policy.
     name == "MANIFEST.tmp"
         || name == "RECOVERY_REPORT.tmp"
-        || name == wal::WAL_REWRITE_TMP_FILE_NAME
+        || wal::is_wal_rewrite_temporary_file_name(name)
         || (name.starts_with("table-") && has_tmp_extension(name))
         || (name.starts_with("blob-") && has_tmp_extension(name))
 }

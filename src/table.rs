@@ -3122,16 +3122,19 @@ pub(crate) fn read_table_with_backend(backend: &NativeFileBackend, path: &Path) 
 }
 
 fn read_table_header(path: &Path, source: &impl BlockReadSource) -> Result<[u8; HEADER_LEN]> {
-    let mut header = [0_u8; HEADER_LEN];
-    source
-        .read_exact_at(0, &mut header)
+    let header = source
+        .read_exact_at_owned(0, HEADER_LEN)
         .map_err(|error| Error::Corruption {
             message: format!(
                 "referenced table {} header cannot be read: {error}",
                 path.display()
             ),
-        })?;
-    Ok(header)
+        })?
+        .into_bytes();
+    header
+        .as_ref()
+        .try_into()
+        .map_err(|_| invalid_table("short table header"))
 }
 
 fn table_read_source<'src>(
@@ -3960,9 +3963,8 @@ fn read_footer_from_source(
     let footer_start = HEADER_LEN
         .checked_add(payload_len - FOOTER_LEN)
         .ok_or_else(|| invalid_table("footer offset overflow"))?;
-    let mut footer = [0_u8; FOOTER_LEN];
-    source.read_exact_at(footer_start, &mut footer)?;
-    read_footer_bytes(&footer)
+    let footer = source.read_exact_at_owned(footer_start, FOOTER_LEN)?;
+    read_footer_bytes(footer.as_slice())
 }
 
 fn read_footer_bytes(footer: &[u8]) -> Result<TableFooter> {
@@ -5390,6 +5392,44 @@ mod tests {
     use super::*;
     use crate::filter::PointKeyFilter;
     use crate::options::BucketOptions;
+    use crate::storage::StorageReadBuffer;
+
+    struct OwnedOnlySource {
+        bytes: Vec<u8>,
+    }
+
+    impl BlockReadSource for OwnedOnlySource {
+        fn read_exact_at(&self, _offset: usize, _bytes: &mut [u8]) -> Result<()> {
+            panic!("table open metadata should use owned reads")
+        }
+
+        fn read_exact_at_owned(&self, offset: usize, len: usize) -> Result<StorageReadBuffer> {
+            let bytes = self
+                .bytes
+                .get(offset..offset + len)
+                .ok_or_else(|| invalid_table("owned read outside source"))?
+                .to_vec();
+            Ok(StorageReadBuffer::from_vec(offset, bytes))
+        }
+    }
+
+    #[test]
+    fn table_open_metadata_reads_use_owned_source() {
+        let header = [7_u8; HEADER_LEN];
+        let mut bytes = header.to_vec();
+        let footer = empty_footer();
+        put_footer(&mut bytes, &footer);
+        let source = OwnedOnlySource { bytes };
+
+        assert_eq!(
+            read_table_header(Path::new("owned-read.table"), &source).expect("header reads"),
+            header
+        );
+        assert_eq!(
+            read_footer_from_source(&source, FOOTER_LEN).expect("footer reads"),
+            footer
+        );
+    }
 
     #[test]
     fn list_table_file_ids_reads_backend_object_listing() {

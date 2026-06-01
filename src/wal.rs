@@ -1,7 +1,13 @@
 use std::{
+    collections::BTreeMap,
     ops::Bound,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, SyncSender},
+    },
+    thread::{self, JoinHandle},
 };
 
 use crate::{
@@ -9,8 +15,9 @@ use crate::{
     options::DurabilityMode,
     storage::{
         BlockingStorageAppendBackend, BlockingStorageAppendObject,
-        BlockingStorageObjectReadBackend, BlockingStorageWalRewriteBackend, NativeFileAppendObject,
-        NativeFileBackend, StorageCapability, StorageObjectId, StorageObjectKind,
+        BlockingStorageDirectoryListBackend, BlockingStorageObjectReadBackend,
+        BlockingStorageWalRewriteBackend, NativeFileAppendObject, NativeFileBackend,
+        StorageCapability, StorageDirectoryId, StorageObjectId, StorageObjectKind,
         StorageReadBackend,
     },
     types::{KeyRange, Sequence},
@@ -21,8 +28,12 @@ pub const WAL_MAGIC: u32 = 0x5452_574c;
 pub const WAL_FORMAT_VERSION: u16 = 1;
 pub const WAL_FILE_NAME: &str = "trine.wal";
 pub const WAL_REWRITE_TMP_FILE_NAME: &str = "trine.wal.tmp";
+pub const DEFAULT_WAL_SHARD_COUNT: usize = 4;
 
 const HEADER_LEN: usize = 18;
+const WAL_FRONT_DOOR_QUEUE_CAPACITY: usize = 64;
+const WAL_SHARD_FILE_PREFIX: &str = "trine.wal.shard-";
+const WAL_SHARD_FILE_DIGITS: usize = 4;
 const OP_INSERT: u8 = 1;
 const OP_REMOVE: u8 = 2;
 const OP_REMOVE_RANGE: u8 = 3;
@@ -53,12 +64,51 @@ pub struct WalWriter {
 
 #[derive(Debug)]
 pub(crate) struct WalFrontDoor {
-    lane: Mutex<WalWriter>,
+    active_shard_count: usize,
+    queue_capacity: usize,
+    lanes: Vec<WalFrontDoorLane>,
+    records_accepted: AtomicU64,
+    bytes_accepted: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WalFrontDoorAccept {
     sequence: Sequence,
+    shard_index: usize,
+}
+
+#[derive(Debug)]
+struct WalFrontDoorLane {
+    shard_index: usize,
+    sender: Option<SyncSender<WalLaneCommand>>,
+    writer_open: Arc<AtomicBool>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WalFrontDoorStats {
+    pub(crate) shards: usize,
+    pub(crate) open_shards: usize,
+    pub(crate) queue_capacity: usize,
+    pub(crate) records_accepted: u64,
+    pub(crate) bytes_accepted: u64,
+}
+
+#[derive(Debug)]
+enum WalLaneCommand {
+    Append {
+        frame: Vec<u8>,
+        durability: DurabilityMode,
+        reply: SyncSender<Result<()>>,
+    },
+    Persist {
+        durability: DurabilityMode,
+        reply: SyncSender<Result<()>>,
+    },
+    Rewrite {
+        replay_floor: Sequence,
+        reply: SyncSender<Result<()>>,
+    },
 }
 
 impl WalWriter {
@@ -83,7 +133,11 @@ impl WalWriter {
         durability: DurabilityMode,
     ) -> Result<()> {
         let frame = encode_batch_frame(sequence, operations)?;
-        self.append.append_blocking(&frame, durability)
+        self.append_frame(&frame, durability)
+    }
+
+    fn append_frame(&mut self, frame: &[u8], durability: DurabilityMode) -> Result<()> {
+        self.append.append_blocking(frame, durability)
     }
 
     pub fn persist(&mut self, durability: DurabilityMode) -> Result<()> {
@@ -106,12 +160,66 @@ impl WalWriter {
 }
 
 impl WalFrontDoor {
+    #[cfg(test)]
     pub(crate) fn open_single_lane_with_backend(
         backend: &NativeFileBackend,
         path: &Path,
     ) -> Result<Self> {
+        Self::from_shard_paths(backend, 1, [(0_usize, path.to_path_buf())])
+    }
+
+    pub(crate) fn open_sharded_with_backend(
+        backend: &NativeFileBackend,
+        db_path: &Path,
+        shard_count: usize,
+    ) -> Result<Self> {
+        if shard_count == 0 {
+            return Err(Error::invalid_options("WAL shard count must be non-zero"));
+        }
+
+        let mut paths = BTreeMap::new();
+        for shard_index in 0..shard_count {
+            paths.insert(shard_index, wal_shard_path(db_path, shard_index));
+        }
+        for path in discover_wal_paths_with_backend(backend, db_path)? {
+            let shard_index = wal_shard_index_from_path(&path)?;
+            paths.insert(shard_index, path);
+        }
+
+        Self::from_shard_paths(backend, shard_count, paths)
+    }
+
+    fn from_shard_paths<I>(
+        backend: &NativeFileBackend,
+        active_shard_count: usize,
+        paths: I,
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = (usize, PathBuf)>,
+    {
+        if active_shard_count == 0 {
+            return Err(Error::invalid_options("WAL shard count must be non-zero"));
+        }
+        let mut lanes = Vec::new();
+        for (shard_index, path) in paths {
+            lanes.push(WalFrontDoorLane::spawn(
+                backend,
+                shard_index,
+                &path,
+                WAL_FRONT_DOOR_QUEUE_CAPACITY,
+            )?);
+        }
+        if lanes.is_empty() {
+            return Err(Error::invalid_options(
+                "WAL front door needs at least one lane",
+            ));
+        }
         Ok(Self {
-            lane: Mutex::new(WalWriter::open_append_with_backend(backend, path)?),
+            active_shard_count,
+            queue_capacity: WAL_FRONT_DOOR_QUEUE_CAPACITY,
+            lanes,
+            records_accepted: AtomicU64::new(0),
+            bytes_accepted: AtomicU64::new(0),
         })
     }
 
@@ -121,33 +229,108 @@ impl WalFrontDoor {
         operations: &[BatchOperation],
         durability: DurabilityMode,
     ) -> Result<WalFrontDoorAccept> {
-        self.lane
-            .lock()
-            .map_err(|_| wal_front_door_lock_poisoned())?
-            .append_batch(sequence, operations, durability)?;
-        Ok(WalFrontDoorAccept { sequence })
+        let shard_index = self.shard_index_for_sequence(sequence);
+        let lane = self.lane(shard_index)?;
+        let frame = encode_batch_frame(sequence, operations)?;
+        let frame_len = usize_to_u64_saturating(frame.len());
+        send_wal_lane_command(lane, |reply| WalLaneCommand::Append {
+            frame,
+            durability,
+            reply,
+        })?;
+        self.records_accepted.fetch_add(1, Ordering::Relaxed);
+        self.bytes_accepted.fetch_add(frame_len, Ordering::Relaxed);
+        Ok(WalFrontDoorAccept {
+            sequence,
+            shard_index,
+        })
     }
 
     pub(crate) fn persist(&self, durability: DurabilityMode) -> Result<()> {
-        self.lane
-            .lock()
-            .map_err(|_| wal_front_door_lock_poisoned())?
-            .persist(durability)
+        for lane in &self.lanes {
+            send_wal_lane_command(lane, |reply| WalLaneCommand::Persist { durability, reply })?;
+        }
+        Ok(())
     }
 
-    pub(crate) fn rewrite_after_replay_floor(
-        &self,
+    pub(crate) fn stats(&self) -> WalFrontDoorStats {
+        WalFrontDoorStats {
+            shards: self.active_shard_count,
+            open_shards: self.count_open_lanes(),
+            queue_capacity: self.queue_capacity,
+            records_accepted: self.records_accepted.load(Ordering::Acquire),
+            bytes_accepted: self.bytes_accepted.load(Ordering::Acquire),
+        }
+    }
+
+    pub(crate) fn rewrite_after_replay_floor(&self, replay_floor: Sequence) -> Result<()> {
+        for lane in &self.lanes {
+            send_wal_lane_command(lane, |reply| WalLaneCommand::Rewrite {
+                replay_floor,
+                reply,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn count_open_lanes(&self) -> usize {
+        self.lanes
+            .iter()
+            .filter(|lane| lane.writer_open.load(Ordering::Acquire))
+            .count()
+    }
+
+    fn shard_index_for_sequence(&self, sequence: Sequence) -> usize {
+        let offset = sequence.get().saturating_sub(1);
+        usize::try_from(offset % usize_to_u64_saturating(self.active_shard_count))
+            .expect("modulo result fits usize")
+    }
+
+    fn lane(&self, shard_index: usize) -> Result<&WalFrontDoorLane> {
+        self.lanes
+            .iter()
+            .find(|lane| lane.shard_index == shard_index)
+            .ok_or_else(|| Error::Corruption {
+                message: format!("WAL front door lane {shard_index} is missing"),
+            })
+    }
+}
+
+impl WalFrontDoorLane {
+    fn spawn(
         backend: &NativeFileBackend,
+        shard_index: usize,
         path: &Path,
-        replay_floor: Sequence,
-    ) -> Result<()> {
-        let mut lane = self
-            .lane
-            .lock()
-            .map_err(|_| wal_front_door_lock_poisoned())?;
-        lane.persist(DurabilityMode::SyncAll)?;
-        rewrite_batches_after_with_backend(backend, path, replay_floor)?;
-        lane.reopen_append_with_backend(backend, path)
+        queue_capacity: usize,
+    ) -> Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel(queue_capacity);
+        let writer_open = Arc::new(AtomicBool::new(false));
+        let worker_open = Arc::clone(&writer_open);
+        let worker_backend = backend.clone();
+        let worker_path = path.to_path_buf();
+        let worker = thread::Builder::new()
+            .name(format!("trine-wal-shard-{shard_index}"))
+            .spawn(move || {
+                run_wal_lane_worker(worker_backend, worker_path, worker_open, receiver);
+            })?;
+
+        Ok(Self {
+            shard_index,
+            sender: Some(sender),
+            writer_open,
+            worker: Mutex::new(Some(worker)),
+        })
+    }
+}
+
+impl Drop for WalFrontDoorLane {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        if let Ok(mut worker) = self.worker.lock() {
+            if let Some(handle) = worker.take() {
+                let _ = handle.join();
+            }
+        }
     }
 }
 
@@ -156,6 +339,12 @@ impl WalFrontDoorAccept {
     pub(crate) const fn sequence(self) -> Sequence {
         self.sequence
     }
+
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) const fn shard_index(self) -> usize {
+        self.shard_index
+    }
 }
 
 #[must_use]
@@ -163,13 +352,32 @@ pub fn wal_path(db_path: &Path) -> PathBuf {
     db_path.join(WAL_FILE_NAME)
 }
 
+#[must_use]
+pub fn wal_shard_path(db_path: &Path, shard_index: usize) -> PathBuf {
+    if shard_index == 0 {
+        return wal_path(db_path);
+    }
+    let width = WAL_SHARD_FILE_DIGITS;
+    db_path.join(format!("{WAL_SHARD_FILE_PREFIX}{shard_index:0width$}"))
+}
+
 pub fn read_batches(path: &Path) -> Result<Vec<WalBatch>> {
     read_batches_after(path, Sequence::ZERO)
+}
+
+pub fn read_all_batches(db_path: &Path) -> Result<Vec<WalBatch>> {
+    read_all_batches_after(db_path, Sequence::ZERO)
 }
 
 pub fn read_batches_after(path: &Path, replay_floor: Sequence) -> Result<Vec<WalBatch>> {
     let backend = NativeFileBackend::new();
     read_batches_after_with_backend(&backend, path, replay_floor)
+}
+
+pub fn read_all_batches_after(db_path: &Path, replay_floor: Sequence) -> Result<Vec<WalBatch>> {
+    let backend = NativeFileBackend::new();
+    let streams = read_recovery_streams_after_with_backend(&backend, db_path, replay_floor)?;
+    merge_batch_streams_by_sequence(streams)
 }
 
 pub(crate) fn read_batches_after_with_backend(
@@ -181,6 +389,52 @@ pub(crate) fn read_batches_after_with_backend(
         return Ok(Vec::new());
     };
     decode_frames_after(bytes.as_ref(), replay_floor)
+}
+
+pub(crate) fn read_recovery_streams_after_with_backend(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+    replay_floor: Sequence,
+) -> Result<Vec<Vec<WalBatch>>> {
+    let mut streams = Vec::new();
+    for path in discover_wal_paths_with_backend(backend, db_path)? {
+        streams.push(read_batches_after_with_backend(
+            backend,
+            &path,
+            replay_floor,
+        )?);
+    }
+    Ok(streams)
+}
+
+pub(crate) fn discover_wal_paths_with_backend(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+) -> Result<Vec<PathBuf>> {
+    backend
+        .capabilities()
+        .require(StorageCapability::DirectoryListing)?;
+    let mut paths_by_shard = BTreeMap::new();
+    for file in backend.list_directory_files_blocking(StorageDirectoryId::native_file(db_path))? {
+        let Some(file_name) = file.path().file_name().and_then(|name| name.to_str()) else {
+            return Err(Error::Corruption {
+                message: format!(
+                    "WAL file name is not valid UTF-8: {}",
+                    file.path().display()
+                ),
+            });
+        };
+        let Some(shard_index) = wal_shard_index_from_file_name(file_name)? else {
+            continue;
+        };
+        if paths_by_shard
+            .insert(shard_index, file.path().to_path_buf())
+            .is_some()
+        {
+            return Err(invalid_wal("duplicate WAL shard file"));
+        }
+    }
+    Ok(paths_by_shard.into_values().collect())
 }
 
 pub(crate) fn merge_batch_streams_by_sequence<I>(streams: I) -> Result<Vec<WalBatch>>
@@ -221,7 +475,27 @@ pub(crate) fn rewrite_batches_after_with_backend(
 }
 
 fn wal_rewrite_tmp_path(path: &Path) -> PathBuf {
-    path.with_file_name(WAL_REWRITE_TMP_FILE_NAME)
+    if path.file_name().and_then(|name| name.to_str()) == Some(WAL_FILE_NAME) {
+        return path.with_file_name(WAL_REWRITE_TMP_FILE_NAME);
+    }
+    let Some(file_name) = path.file_name() else {
+        return path.with_extension("tmp");
+    };
+    let mut temporary_name = file_name.to_os_string();
+    temporary_name.push(".tmp");
+    path.with_file_name(temporary_name)
+}
+
+pub(crate) fn is_wal_rewrite_temporary_file_name(file_name: &str) -> bool {
+    if file_name == WAL_REWRITE_TMP_FILE_NAME {
+        return true;
+    }
+    file_name.strip_suffix(".tmp").is_some_and(|final_name| {
+        matches!(
+            wal_shard_index_from_final_file_name(final_name),
+            Ok(Some(_))
+        )
+    })
 }
 
 fn open_wal_append_object_with_backend(
@@ -262,9 +536,110 @@ fn wal_storage_object(path: &Path) -> StorageObjectId {
     StorageObjectId::native_file(StorageObjectKind::Wal, path)
 }
 
-fn wal_front_door_lock_poisoned() -> Error {
+fn send_wal_lane_command(
+    lane: &WalFrontDoorLane,
+    command: impl FnOnce(SyncSender<Result<()>>) -> WalLaneCommand,
+) -> Result<()> {
+    let sender = lane
+        .sender
+        .as_ref()
+        .ok_or_else(wal_front_door_worker_stopped)?;
+    let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
+    sender
+        .send(command(reply_sender))
+        .map_err(|_| wal_front_door_worker_stopped())?;
+    reply_receiver
+        .recv()
+        .map_err(|_| wal_front_door_worker_stopped())?
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_wal_lane_worker(
+    backend: NativeFileBackend,
+    path: PathBuf,
+    writer_open: Arc<AtomicBool>,
+    receiver: mpsc::Receiver<WalLaneCommand>,
+) {
+    let mut writer = None::<WalWriter>;
+    while let Ok(command) = receiver.recv() {
+        match command {
+            WalLaneCommand::Append {
+                frame,
+                durability,
+                reply,
+            } => {
+                let result = append_wal_lane_frame(
+                    &backend,
+                    &path,
+                    &mut writer,
+                    &writer_open,
+                    &frame,
+                    durability,
+                );
+                let _ = reply.send(result);
+            }
+            WalLaneCommand::Persist { durability, reply } => {
+                let result = persist_wal_lane(&mut writer, durability);
+                let _ = reply.send(result);
+            }
+            WalLaneCommand::Rewrite {
+                replay_floor,
+                reply,
+            } => {
+                let result =
+                    rewrite_wal_lane_after_replay_floor(&backend, &path, &mut writer, replay_floor);
+                let _ = reply.send(result);
+            }
+        }
+    }
+}
+
+fn append_wal_lane_frame(
+    backend: &NativeFileBackend,
+    path: &Path,
+    writer: &mut Option<WalWriter>,
+    writer_open: &AtomicBool,
+    frame: &[u8],
+    durability: DurabilityMode,
+) -> Result<()> {
+    if writer.is_none() {
+        *writer = Some(WalWriter::open_append_with_backend(backend, path)?);
+        writer_open.store(true, Ordering::Release);
+    }
+    writer
+        .as_mut()
+        .expect("writer opens before append")
+        .append_frame(frame, durability)
+}
+
+fn persist_wal_lane(writer: &mut Option<WalWriter>, durability: DurabilityMode) -> Result<()> {
+    if let Some(writer) = writer.as_mut() {
+        writer.persist(durability)?;
+    }
+    Ok(())
+}
+
+fn rewrite_wal_lane_after_replay_floor(
+    backend: &NativeFileBackend,
+    path: &Path,
+    writer: &mut Option<WalWriter>,
+    replay_floor: Sequence,
+) -> Result<()> {
+    if let Some(writer) = writer.as_mut() {
+        writer.persist(DurabilityMode::SyncAll)?;
+    } else if read_wal_object_with_backend(backend, path)?.is_none() {
+        return Ok(());
+    }
+    rewrite_batches_after_with_backend(backend, path, replay_floor)?;
+    if let Some(writer) = writer.as_mut() {
+        writer.reopen_append_with_backend(backend, path)?;
+    }
+    Ok(())
+}
+
+fn wal_front_door_worker_stopped() -> Error {
     Error::Corruption {
-        message: "WAL front door lock poisoned".to_owned(),
+        message: "WAL front door worker stopped".to_owned(),
     }
 }
 
@@ -277,6 +652,48 @@ fn validate_wal_stream_order(batches: &[WalBatch]) -> Result<()> {
         last_seen = batch.sequence;
     }
     Ok(())
+}
+
+fn wal_shard_index_from_path(path: &Path) -> Result<usize> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::Corruption {
+            message: format!("WAL file name is not valid UTF-8: {}", path.display()),
+        })?;
+    wal_shard_index_from_file_name(file_name)?.ok_or_else(|| Error::Corruption {
+        message: format!("not a WAL shard file: {}", path.display()),
+    })
+}
+
+fn wal_shard_index_from_file_name(file_name: &str) -> Result<Option<usize>> {
+    if file_name == WAL_FILE_NAME {
+        return Ok(Some(0));
+    }
+    if is_wal_rewrite_temporary_file_name(file_name) {
+        return Ok(None);
+    }
+    wal_shard_index_from_final_file_name(file_name)
+}
+
+fn wal_shard_index_from_final_file_name(file_name: &str) -> Result<Option<usize>> {
+    let Some(suffix) = file_name.strip_prefix(WAL_SHARD_FILE_PREFIX) else {
+        return Ok(None);
+    };
+    if suffix.len() != WAL_SHARD_FILE_DIGITS || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(Error::Corruption {
+            message: format!("malformed WAL shard file name: {file_name}"),
+        });
+    }
+    let shard_index = suffix.parse::<usize>().map_err(|error| Error::Corruption {
+        message: format!("malformed WAL shard file name {file_name}: {error}"),
+    })?;
+    if shard_index == 0 {
+        return Err(Error::Corruption {
+            message: "WAL shard 0 must use the legacy trine.wal file name".to_owned(),
+        });
+    }
+    Ok(Some(shard_index))
 }
 
 fn encode_batches_after(batches: &[WalBatch], replay_floor: Sequence) -> Result<Vec<u8>> {
@@ -536,6 +953,10 @@ fn invalid_wal(message: &'static str) -> Error {
     }
 }
 
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 struct Cursor<'payload> {
     payload: &'payload [u8],
     offset: usize,
@@ -610,8 +1031,10 @@ mod tests {
     };
 
     use super::{
-        WAL_FILE_NAME, WAL_FORMAT_VERSION, WAL_MAGIC, WalFrontDoor, checksum, decode_frames_after,
-        decode_payload, merge_batch_streams_by_sequence, read_batches_after_with_backend,
+        DEFAULT_WAL_SHARD_COUNT, WAL_FILE_NAME, WAL_FORMAT_VERSION, WAL_FRONT_DOOR_QUEUE_CAPACITY,
+        WAL_MAGIC, WalFrontDoor, checksum, decode_frames_after, decode_payload,
+        discover_wal_paths_with_backend, merge_batch_streams_by_sequence, read_all_batches,
+        read_batches_after_with_backend, wal_rewrite_tmp_path, wal_shard_path,
     };
 
     #[test]
@@ -633,6 +1056,10 @@ mod tests {
             .expect("front door accepts commit");
 
         assert_eq!(accepted.sequence(), Sequence::new(7));
+        let stats = front_door.stats();
+        assert_eq!(stats.queue_capacity, WAL_FRONT_DOOR_QUEUE_CAPACITY);
+        assert_eq!(stats.open_shards, 1);
+        assert_eq!(stats.records_accepted, 1);
         let batches =
             read_batches_after_with_backend(&backend, &path, Sequence::ZERO).expect("WAL reads");
         assert_eq!(
@@ -661,7 +1088,7 @@ mod tests {
             .accept_commit(Sequence::new(2), &[put("b", "kept")], DurabilityMode::Flush)
             .expect("second commit accepts");
         front_door
-            .rewrite_after_replay_floor(&backend, &path, Sequence::new(1))
+            .rewrite_after_replay_floor(Sequence::new(1))
             .expect("front door rewrites WAL");
         front_door
             .accept_commit(Sequence::new(3), &[put("c", "new")], DurabilityMode::Flush)
@@ -673,6 +1100,108 @@ mod tests {
             .map(|batch| batch.sequence)
             .collect::<Vec<_>>();
         assert_eq!(sequences, vec![Sequence::new(2), Sequence::new(3)]);
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn wal_front_door_routes_commits_across_shards() {
+        let dir = temp_dir("front-door-shards");
+        fs::create_dir_all(&dir).expect("create WAL test dir");
+        let backend = NativeFileBackend::new();
+        let front_door =
+            WalFrontDoor::open_sharded_with_backend(&backend, &dir, DEFAULT_WAL_SHARD_COUNT)
+                .expect("front door opens");
+        assert_eq!(front_door.stats().open_shards, 0);
+        assert_eq!(
+            front_door.stats().queue_capacity,
+            WAL_FRONT_DOOR_QUEUE_CAPACITY
+        );
+
+        let accepted = (1..=DEFAULT_WAL_SHARD_COUNT)
+            .map(|sequence| {
+                front_door
+                    .accept_commit(
+                        Sequence::new(sequence as u64),
+                        &[put("k", "v")],
+                        DurabilityMode::Flush,
+                    )
+                    .expect("commit accepts")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            accepted
+                .iter()
+                .map(|accepted| accepted.shard_index())
+                .collect::<Vec<_>>(),
+            (0..DEFAULT_WAL_SHARD_COUNT).collect::<Vec<_>>()
+        );
+        assert_eq!(front_door.stats().open_shards, DEFAULT_WAL_SHARD_COUNT);
+        let batches = read_all_batches(&dir).expect("all WAL batches read");
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.sequence)
+                .collect::<Vec<_>>(),
+            (1..=DEFAULT_WAL_SHARD_COUNT)
+                .map(|sequence| Sequence::new(sequence as u64))
+                .collect::<Vec<_>>()
+        );
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn wal_discovery_orders_legacy_and_shard_files() {
+        let dir = temp_dir("wal-discovery");
+        fs::create_dir_all(&dir).expect("create WAL test dir");
+        let backend = NativeFileBackend::new();
+        fs::write(wal_shard_path(&dir, 2), b"").expect("shard 2 writes");
+        fs::write(wal_shard_path(&dir, 0), b"").expect("legacy WAL writes");
+        fs::write(wal_shard_path(&dir, 1), b"").expect("shard 1 writes");
+
+        let paths = discover_wal_paths_with_backend(&backend, &dir).expect("WAL paths discover");
+
+        assert_eq!(
+            paths,
+            vec![
+                wal_shard_path(&dir, 0),
+                wal_shard_path(&dir, 1),
+                wal_shard_path(&dir, 2),
+            ]
+        );
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn wal_rewrite_temp_paths_keep_shard_identity() {
+        let dir = temp_dir("wal-rewrite-temp-paths");
+        let legacy_path = wal_shard_path(&dir, 0);
+        let shard_path = wal_shard_path(&dir, 1);
+
+        assert_eq!(
+            wal_rewrite_tmp_path(&legacy_path),
+            dir.join("trine.wal.tmp")
+        );
+        assert_eq!(
+            wal_rewrite_tmp_path(&shard_path),
+            dir.join("trine.wal.shard-0001.tmp")
+        );
+    }
+
+    #[test]
+    fn wal_discovery_rejects_malformed_shard_file_name() {
+        let dir = temp_dir("wal-discovery-malformed");
+        fs::create_dir_all(&dir).expect("create WAL test dir");
+        let backend = NativeFileBackend::new();
+        fs::write(dir.join("trine.wal.shard-bad"), b"bad").expect("bad shard writes");
+
+        let error = discover_wal_paths_with_backend(&backend, &dir)
+            .expect_err("malformed shard name fails");
+
+        assert!(
+            error.to_string().contains("malformed WAL shard file name"),
+            "unexpected error: {error}"
+        );
         cleanup_dir(&dir);
     }
 

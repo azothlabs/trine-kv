@@ -286,6 +286,109 @@ fn persistent_recovery_replays_front_door_accepted_record_without_memory_publish
 }
 
 #[test]
+fn persistent_recovery_merges_records_from_wal_shards() {
+    let path = temp_db_path("wal-shard-recovery");
+    let options = DbOptions::persistent(&path).with_durability(DurabilityMode::Flush);
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db creates manifest");
+        assert_eq!(db.last_committed_sequence(), Sequence::ZERO);
+    }
+
+    let mut legacy_writer =
+        wal::WalWriter::open_append(&wal::wal_path(&path)).expect("legacy WAL opens");
+    legacy_writer
+        .append_batch(
+            Sequence::new(1),
+            &[BatchOperation::Put {
+                bucket: "default".to_owned(),
+                key: b"a".to_vec(),
+                value: b"a1".to_vec(),
+            }],
+            DurabilityMode::Flush,
+        )
+        .expect("legacy record writes");
+    let mut shard_writer =
+        wal::WalWriter::open_append(&wal::wal_shard_path(&path, 1)).expect("WAL shard opens");
+    shard_writer
+        .append_batch(
+            Sequence::new(2),
+            &[BatchOperation::Put {
+                bucket: "default".to_owned(),
+                key: b"b".to_vec(),
+                value: b"b1".to_vec(),
+            }],
+            DurabilityMode::Flush,
+        )
+        .expect("shard record writes");
+
+    {
+        let db = Db::open(options).expect("persistent db replays WAL shards");
+        let bucket = db.default_bucket().expect("bucket reopens");
+        assert_eq!(bucket.get(b"a").expect("a replays"), Some(b"a1".to_vec()));
+        assert_eq!(bucket.get(b"b").expect("b replays"), Some(b"b1".to_vec()));
+        assert_eq!(db.last_committed_sequence(), Sequence::new(2));
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_writes_route_across_wal_shards_and_recover() {
+    let path = temp_db_path("wal-shard-routing");
+    let options = DbOptions::persistent(&path).with_durability(DurabilityMode::Flush);
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        for index in 0..4 {
+            db.put_with_options(
+                format!("k{index}").as_bytes(),
+                format!("v{index}").as_bytes(),
+                WriteOptions::flush(),
+            )
+            .expect("write commits");
+        }
+        let stats = db.stats();
+        assert_eq!(stats.commit_sequences_allocated, 4);
+        assert_eq!(stats.commit_visible_sequence, 4);
+        assert_eq!(stats.commit_open_slots, 0);
+        assert_eq!(stats.wal_shards, wal::DEFAULT_WAL_SHARD_COUNT);
+        assert_eq!(stats.wal_open_shards, wal::DEFAULT_WAL_SHARD_COUNT);
+        assert!(stats.wal_queue_capacity > 0);
+        assert_eq!(stats.wal_records_accepted, 4);
+        assert!(stats.wal_bytes_accepted > 0);
+        assert!(wal::wal_shard_path(&path, 1).exists());
+        assert_eq!(
+            wal::read_all_batches(&path)
+                .expect("WAL batches read")
+                .into_iter()
+                .map(|batch| batch.sequence)
+                .collect::<Vec<_>>(),
+            vec![
+                Sequence::new(1),
+                Sequence::new(2),
+                Sequence::new(3),
+                Sequence::new(4)
+            ]
+        );
+    }
+
+    {
+        let db = Db::open(options).expect("persistent db replays sharded WAL");
+        for index in 0..4 {
+            assert_eq!(
+                db.get(format!("k{index}").as_bytes())
+                    .expect("value replays"),
+                Some(format!("v{index}").into_bytes())
+            );
+        }
+        assert_eq!(db.last_committed_sequence(), Sequence::new(4));
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_wal_replays_cross_bucket_batch() {
     let path = temp_db_path("cross-bucket");
     let options = DbOptions::persistent(&path);
@@ -486,6 +589,24 @@ fn persistent_recovery_fails_closed_on_safe_temporary_files_by_default() {
 }
 
 #[test]
+fn persistent_recovery_fails_closed_on_wal_shard_temporary_file_by_default() {
+    let path = temp_db_path("recovery-wal-shard-temp-fail-closed");
+    let options = DbOptions::persistent(&path);
+    let wal_shard_tmp = path.join("trine.wal.shard-0001.tmp");
+    write_file(&wal_shard_tmp, b"partial shard WAL rewrite");
+
+    let error = Db::open(options).expect_err("WAL shard temporary file requires repair");
+    assert!(matches!(error, Error::Corruption { .. }));
+    assert!(
+        wal_shard_tmp.exists(),
+        "fail-closed recovery should leave shard rewrite evidence untouched"
+    );
+    assert!(!recovery::recovery_report_path(&path).exists());
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_recovery_repairs_safe_temporary_files_and_writes_report() {
     let path = temp_db_path("recovery-temp-repair");
     let mut options = DbOptions::persistent(&path);
@@ -499,10 +620,12 @@ fn persistent_recovery_repairs_safe_temporary_files_and_writes_report() {
 
     let manifest_tmp = manifest::manifest_path(&path).with_extension("tmp");
     let wal_tmp = path.join(wal::WAL_REWRITE_TMP_FILE_NAME);
+    let wal_shard_tmp = path.join("trine.wal.shard-0001.tmp");
     let blob_tmp = path.join("blob-00000000000000000999.tmp");
     let table_tmp = table::table_path(&path, table::TableId(999)).with_extension("tmp");
     write_file(&manifest_tmp, b"partial manifest publish");
     write_file(&wal_tmp, b"partial WAL rewrite");
+    write_file(&wal_shard_tmp, b"partial shard WAL rewrite");
     write_file(&blob_tmp, b"partial blob file");
     write_file(&table_tmp, b"partial table file");
 
@@ -518,6 +641,7 @@ fn persistent_recovery_repairs_safe_temporary_files_and_writes_report() {
 
     assert!(!manifest_tmp.exists());
     assert!(!wal_tmp.exists());
+    assert!(!wal_shard_tmp.exists());
     assert!(!blob_tmp.exists());
     assert!(!table_tmp.exists());
     let report = recovery::read_recovery_report(&path).expect("recovery report reads");
@@ -527,6 +651,7 @@ fn persistent_recovery_repairs_safe_temporary_files_and_writes_report() {
             "MANIFEST.tmp".to_owned(),
             "blob-00000000000000000999.tmp".to_owned(),
             "table-00000000000000000999.tmp".to_owned(),
+            "trine.wal.shard-0001.tmp".to_owned(),
             "trine.wal.tmp".to_owned(),
         ]
     );
@@ -802,6 +927,31 @@ fn persistent_recovery_fails_closed_on_malformed_formal_storage_file_name() {
 }
 
 #[test]
+fn persistent_recovery_fails_closed_on_malformed_wal_shard_file_name() {
+    let path = temp_db_path("recovery-malformed-wal-shard");
+    let options = DbOptions::persistent(&path);
+
+    {
+        let db = Db::open(options.clone()).expect("persistent db opens");
+        db.put(b"k", b"v").expect("write commits");
+    }
+
+    let malformed_wal_shard = path.join("trine.wal.shard-bad");
+    write_file(&malformed_wal_shard, b"not a valid WAL shard file");
+
+    let message = corruption_message(
+        Db::open(options).expect_err("malformed WAL shard file must fail closed"),
+    );
+    assert!(message.contains("malformed WAL shard file name"));
+    assert!(
+        malformed_wal_shard.exists(),
+        "startup should leave malformed WAL shard files for operator review"
+    );
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_wal_rejects_bucket_missing_from_manifest() {
     let path = temp_db_path("wal-missing-manifest-bucket");
     let options = DbOptions::persistent(&path);
@@ -861,7 +1011,7 @@ fn persistent_flush_writes_table_and_reopen_can_skip_wal() {
     assert_eq!(tables[0].level.get(), 0);
     assert!(table::table_path(&path, tables[0].id).exists());
     assert!(
-        wal::read_batches(&wal::wal_path(&path))
+        wal::read_all_batches(&path)
             .expect("WAL reads after checkpoint")
             .is_empty(),
         "flushed batches should not remain in the WAL"
@@ -1191,7 +1341,7 @@ fn persistent_immutable_pressure_flushes_before_next_write_and_keeps_new_wal_bat
         let manifest_state =
             manifest::read_manifest(&manifest::manifest_path(&path)).expect("manifest reads");
         assert_eq!(manifest_state.wal_replay_floor(), Sequence::new(1));
-        let wal_batches = wal::read_batches(&wal::wal_path(&path)).expect("WAL reads");
+        let wal_batches = wal::read_all_batches(&path).expect("WAL reads");
         assert_eq!(
             wal_batches
                 .iter()

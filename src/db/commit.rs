@@ -40,6 +40,26 @@ struct WriterLocalWriteState {
 }
 
 #[derive(Debug)]
+enum SequencedWriteState {
+    Noop(CommitInfo),
+    Pending(SequencedWrite),
+}
+
+#[derive(Debug)]
+struct SequencedWrite {
+    prepared: PreparedCommit,
+    slot: CommitSlot,
+    durability: DurabilityMode,
+    accept_wal: bool,
+}
+
+#[derive(Debug)]
+struct DurableSequencedWrite {
+    prepared: PreparedCommit,
+    slot: CommitSlot,
+}
+
+#[derive(Debug)]
 struct PreparedCommit {
     write_options: WriteOptions,
     transaction_reads: Option<TransactionReads>,
@@ -163,6 +183,28 @@ impl WriterLocalWriteState {
             prepared,
             wal_accept,
         }
+    }
+}
+
+impl SequencedWrite {
+    const fn new(
+        prepared: PreparedCommit,
+        slot: CommitSlot,
+        durability: DurabilityMode,
+        accept_wal: bool,
+    ) -> Self {
+        Self {
+            prepared,
+            slot,
+            durability,
+            accept_wal,
+        }
+    }
+}
+
+impl DurableSequencedWrite {
+    const fn new(prepared: PreparedCommit, slot: CommitSlot) -> Self {
+        Self { prepared, slot }
     }
 }
 
@@ -563,13 +605,28 @@ impl Db {
         match accepted_state {
             AcceptedWriteState::Noop(commit_info) => Ok(commit_info),
             AcceptedWriteState::Pending(writer_state) => {
-                let published = {
+                let sequenced = {
                     let publish = self.inner.publish_barrier.enter()?;
-                    self.publish_writer_local_state_under_barrier(writer_state, &publish)?
+                    self.sequence_writer_local_state_under_barrier(writer_state, &publish)?
                 };
-                if let Some(slot) = published.visible_slot {
-                    self.inner.commit_tracker.mark_visible(slot)?;
-                }
+                let sequenced = match sequenced {
+                    SequencedWriteState::Noop(commit_info) => return Ok(commit_info),
+                    SequencedWriteState::Pending(sequenced) => sequenced,
+                };
+                let durable = self.accept_deferred_wal_for_sequenced_write(sequenced)?;
+                let published = {
+                    let _memtable_publish = self
+                        .inner
+                        .memtable_publish_lock
+                        .lock()
+                        .map_err(|_| lock_poisoned("memtable publish lock"))?;
+                    let published =
+                        self.publish_durable_writer_local_state_under_memtable_lock(durable)?;
+                    if let Some(slot) = published.visible_slot {
+                        self.inner.commit_tracker.mark_visible(slot)?;
+                    }
+                    published
+                };
                 if published.request_flush {
                     self.request_background_flush();
                 }
@@ -578,20 +635,20 @@ impl Db {
         }
     }
 
-    fn publish_writer_local_state_under_barrier(
+    fn sequence_writer_local_state_under_barrier(
         &self,
         writer_state: WriterLocalWriteState,
         _publish: &PublishBarrierGuard<'_>,
-    ) -> Result<PublishedWrite> {
+    ) -> Result<SequencedWriteState> {
         let WriterLocalWriteState {
             prepared,
             wal_accept,
         } = writer_state;
 
-        // Transaction read validation still happens in the publish slot. Blind
-        // persistent writes may have already accepted their WAL record before
-        // this point, but transaction writes cannot do that safely until their
-        // read set has been checked.
+        // Transaction read validation stays serialized with sequence
+        // assignment. Once the slot is reserved, WAL append can happen outside
+        // this global barrier without letting later commits take an earlier
+        // sequence.
         if let Some(TransactionReads {
             read_sequence,
             read_set,
@@ -600,11 +657,9 @@ impl Db {
             self.validate_transaction_reads(*read_sequence, read_set)?;
         }
         if prepared.operation_count() == 0 {
-            return Ok(PublishedWrite::new(
-                CommitInfo::new(self.last_committed_sequence()),
-                false,
-                None,
-            ));
+            return Ok(SequencedWriteState::Noop(CommitInfo::new(
+                self.last_committed_sequence(),
+            )));
         }
         debug_assert!(prepared.estimated_bytes > 0);
 
@@ -613,23 +668,49 @@ impl Db {
             prepared.write_options.durability,
         );
         let slot = match wal_accept {
-            WalAcceptState::Deferred => {
-                let slot = self.inner.commit_tracker.reserve_slot()?;
-                if let Err(error) = self.accept_wal_front_door(
-                    slot.sequence(),
-                    &prepared.wal_operations,
-                    durability,
-                ) {
-                    self.inner.commit_tracker.mark_skipped(slot)?;
-                    return Err(error);
-                }
-                slot
-            }
+            WalAcceptState::Deferred => self.inner.commit_tracker.reserve_slot()?,
             WalAcceptState::Accepted(slot) => {
                 debug_assert!(prepared.transaction_reads.is_none());
                 slot
             }
         };
+
+        Ok(SequencedWriteState::Pending(SequencedWrite::new(
+            prepared,
+            slot,
+            durability,
+            matches!(wal_accept, WalAcceptState::Deferred) && self.inner.wal.is_some(),
+        )))
+    }
+
+    fn accept_deferred_wal_for_sequenced_write(
+        &self,
+        sequenced: SequencedWrite,
+    ) -> Result<DurableSequencedWrite> {
+        let SequencedWrite {
+            prepared,
+            slot,
+            durability,
+            accept_wal,
+        } = sequenced;
+
+        if accept_wal {
+            if let Err(error) =
+                self.accept_wal_front_door(slot.sequence(), &prepared.wal_operations, durability)
+            {
+                self.inner.commit_tracker.mark_skipped(slot)?;
+                return Err(error);
+            }
+        }
+
+        Ok(DurableSequencedWrite::new(prepared, slot))
+    }
+
+    fn publish_durable_writer_local_state_under_memtable_lock(
+        &self,
+        sequenced: DurableSequencedWrite,
+    ) -> Result<PublishedWrite> {
+        let DurableSequencedWrite { prepared, slot } = sequenced;
         let sequence = slot.sequence();
 
         let mut delta_publication_started = false;
@@ -671,10 +752,9 @@ impl Db {
             }
         }
 
-        let request_flush = match self.freeze_large_active_memtables_after_commit_under_barrier(
-            sequence,
-            &prepared.touched_states,
-        ) {
+        let request_flush = match self
+            .freeze_large_active_memtables_after_commit(sequence, &prepared.touched_states)
+        {
             Ok(request_flush) => request_flush,
             Err(error) => {
                 self.inner.commit_tracker.mark_visible(slot)?;
@@ -931,6 +1011,7 @@ mod tests {
         db::CommitTracker,
         error::Error,
         options::{DbOptions, WriteOptions},
+        transaction::{ReadKey, TransactionReadSet},
         types::Sequence,
         wal,
         write_batch::BatchOperation,
@@ -940,6 +1021,32 @@ mod tests {
         AcceptedWrite, AcceptedWriteState, DurabilityMode, PreparedShardId, WalAcceptState,
         WriteRequest, effective_durability,
     };
+
+    fn publish_writer_state_for_test(
+        db: &Db,
+        writer_state: super::WriterLocalWriteState,
+        publish: &super::PublishBarrierGuard<'_>,
+    ) -> super::PublishedWrite {
+        let sequenced = db
+            .sequence_writer_local_state_under_barrier(writer_state, publish)
+            .expect("sequence writer-local state");
+        let sequenced = match sequenced {
+            super::SequencedWriteState::Noop(_) => {
+                panic!("test write should need a commit sequence")
+            }
+            super::SequencedWriteState::Pending(sequenced) => sequenced,
+        };
+        let durable = db
+            .accept_deferred_wal_for_sequenced_write(sequenced)
+            .expect("accept deferred WAL if needed");
+        let _memtable_publish = db
+            .inner
+            .memtable_publish_lock
+            .lock()
+            .expect("memtable publish lock");
+        db.publish_durable_writer_local_state_under_memtable_lock(durable)
+            .expect("publish durable writer-local state")
+    }
 
     #[test]
     fn database_durability_is_a_write_floor() {
@@ -1169,7 +1276,7 @@ mod tests {
             db.get(b"k").expect("preaccepted write is not visible"),
             None
         );
-        let wal_batches = wal::read_batches(&wal::wal_path(&path)).expect("WAL reads");
+        let wal_batches = wal::read_all_batches(&path).expect("WAL reads");
         assert_eq!(wal_batches.len(), 1);
         assert_eq!(wal_batches[0].sequence, Sequence::new(1));
 
@@ -1179,9 +1286,7 @@ mod tests {
             .publish_barrier
             .enter()
             .expect("enter publish barrier");
-        let published = db
-            .publish_writer_local_state_under_barrier(writer_state, &publish)
-            .expect("publish preaccepted write");
+        let published = publish_writer_state_for_test(&db, writer_state, &publish);
         assert_eq!(published.commit_info.sequence(), Sequence::new(1));
         let visible_slot = published.visible_slot.expect("preaccepted commit has slot");
         db.inner
@@ -1200,7 +1305,94 @@ mod tests {
     }
 
     #[test]
-    fn writer_local_state_publishes_under_publish_barrier() {
+    fn persistent_transaction_accepts_wal_after_sequence_barrier_before_memory_publish() {
+        let path = temp_db_path("transaction-wal-after-sequence");
+        let mut options = DbOptions::persistent(&path).with_durability(DurabilityMode::Flush);
+        options.background_worker_count = 0;
+        let db = Db::open(options).expect("persistent db opens");
+        let mut batch = WriteBatch::new();
+        batch.put(b"k".to_vec(), b"txn".to_vec());
+        let request = WriteRequest::transaction(
+            Sequence::ZERO,
+            TransactionReadSet {
+                point_reads: vec![ReadKey {
+                    bucket: "default".to_owned(),
+                    key: b"k".to_vec(),
+                }],
+                range_reads: Vec::new(),
+            },
+            batch,
+            WriteOptions::flush(),
+        );
+        let accepted_state = db
+            .accept_write_request(request)
+            .expect("transaction write request is accepted");
+        let AcceptedWriteState::Pending(writer_state) = accepted_state else {
+            panic!("transaction write must produce writer-local state");
+        };
+        assert!(matches!(writer_state.wal_accept, WalAcceptState::Deferred));
+        assert!(
+            wal::read_all_batches(&path).expect("WAL reads").is_empty(),
+            "transaction WAL should wait for serialized read validation"
+        );
+
+        let publish = db
+            .inner
+            .publish_barrier
+            .enter()
+            .expect("enter publish barrier");
+        let sequenced = db
+            .sequence_writer_local_state_under_barrier(writer_state, &publish)
+            .expect("transaction read set validates and slot reserves");
+        let super::SequencedWriteState::Pending(sequenced) = sequenced else {
+            panic!("transaction write should reserve a slot");
+        };
+        assert_eq!(db.stats().commit_open_slots, 1);
+        assert!(
+            wal::read_all_batches(&path).expect("WAL reads").is_empty(),
+            "sequence reservation should not append WAL while barrier is held"
+        );
+        drop(publish);
+
+        let durable = db
+            .accept_deferred_wal_for_sequenced_write(sequenced)
+            .expect("transaction WAL accepts outside publish barrier");
+        let wal_batches = wal::read_all_batches(&path).expect("WAL reads");
+        assert_eq!(wal_batches.len(), 1);
+        assert_eq!(wal_batches[0].sequence, Sequence::new(1));
+        assert_eq!(
+            db.get(b"k")
+                .expect("WAL-accepted transaction is not visible"),
+            None
+        );
+
+        let memtable_publish = db
+            .inner
+            .memtable_publish_lock
+            .lock()
+            .expect("memtable publish lock");
+        let published = db
+            .publish_durable_writer_local_state_under_memtable_lock(durable)
+            .expect("publish transaction state");
+        let visible_slot = published
+            .visible_slot
+            .expect("transaction has visible slot");
+        db.inner
+            .commit_tracker
+            .mark_visible(visible_slot)
+            .expect("mark transaction visible");
+        assert_eq!(
+            db.get(b"k").expect("transaction write is visible"),
+            Some(b"txn".to_vec())
+        );
+
+        drop(memtable_publish);
+        drop(db);
+        cleanup_dir(&path);
+    }
+
+    #[test]
+    fn writer_local_state_publishes_under_memtable_lock_after_sequence() {
         let db = Db::open_memory().expect("memory db opens");
         let mut batch = WriteBatch::new();
         batch.put(b"k".to_vec(), b"v".to_vec());
@@ -1217,9 +1409,7 @@ mod tests {
             .publish_barrier
             .enter()
             .expect("enter publish barrier");
-        let published = db
-            .publish_writer_local_state_under_barrier(writer_state, &publish)
-            .expect("publish writer-local state");
+        let published = publish_writer_state_for_test(&db, writer_state, &publish);
 
         assert!(!published.request_flush);
         assert_eq!(published.commit_info.sequence(), Sequence::new(1));
@@ -1280,12 +1470,8 @@ mod tests {
             .publish_barrier
             .enter()
             .expect("enter publish barrier");
-        let first_published = db
-            .publish_writer_local_state_under_barrier(first_state, &publish)
-            .expect("publish first state");
-        let second_published = db
-            .publish_writer_local_state_under_barrier(second_state, &publish)
-            .expect("publish second state");
+        let first_published = publish_writer_state_for_test(&db, first_state, &publish);
+        let second_published = publish_writer_state_for_test(&db, second_state, &publish);
         assert_eq!(first_published.commit_info.sequence(), Sequence::new(1));
         assert_eq!(second_published.commit_info.sequence(), Sequence::new(2));
 

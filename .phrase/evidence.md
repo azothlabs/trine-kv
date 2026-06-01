@@ -7518,3 +7518,140 @@ Record only evidence that can change planning or durable decisions.
 - Choose a narrow next slice: either WAL shard file discovery with one active
   lane, or a single-lane front-door worker queue that preserves the merge and
   recovery rules now tested.
+
+## Phase 102: WAL Shard Routing And Recovery
+
+### Observation
+
+- Phase 101 introduced sequence merge for recovery, but persistent open still
+  discovered one WAL stream and the front door still had one append lane.
+- The protocol requires one commit record to stay on one WAL shard and recovery
+  to merge all shard streams by commit sequence.
+
+### Interpretation
+
+- WAL shard routing can now land because recovery merge and cancellation tests
+  already exist.
+- Keeping shard 0 at `trine.wal` preserves legacy database compatibility while
+  adding stable names for later shards.
+- Stats are needed with the new path because failures now involve commit slots,
+  shard selection, and recovery merge rather than one file.
+
+### Change
+
+- Added WAL shard path helpers and shard discovery.
+- Persistent open discovers all shard files, rejects malformed shard names, and
+  replays all shard streams through sequence merge.
+- `WalFrontDoor` now owns multiple lanes and routes whole commit records across
+  shards by commit sequence.
+- WAL rewrite after flush now applies to every opened or existing shard.
+- WAL shard rewrite temporary files now retain the shard file name
+  (`trine.wal.shard-NNNN.tmp`) instead of colliding with the legacy WAL rewrite
+  temporary name.
+- Safe-temporary-file recovery now treats well-formed WAL shard rewrite
+  temporary files as explicit-repair candidates and still leaves them untouched
+  under the default fail-closed policy.
+- Added stats for commit sequence allocation/visibility/open slots and WAL
+  shard/open-shard/accepted-record/accepted-byte counts.
+- Added tests for WAL shard discovery, malformed shard names, multi-shard
+  routing, multi-shard recovery, shard rewrite temporary repair, and stats.
+
+### Verification
+
+- `cargo test wal --lib`
+- `cargo test --test persistent_wal`
+- `cargo test --test async_api`
+- `cargo test commit --lib`
+- `cargo test persistent_recovery_merges_records_from_wal_shards --test persistent_wal`
+- `cargo test persistent_writes_route_across_wal_shards_and_recover --test persistent_wal`
+- `cargo test persistent_recovery_fails_closed_on_malformed_wal_shard_file_name --test persistent_wal`
+- `cargo test wal_discovery --lib`
+- `cargo test wal_rewrite_temp_paths_keep_shard_identity --lib`
+- `cargo test persistent_recovery_fails_closed_on_wal_shard_temporary_file_by_default --test persistent_wal`
+- `cargo test persistent_recovery_repairs_safe_temporary_files_and_writes_report --test persistent_wal`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan passed outside instruction files.
+
+### Remaining Blockers
+
+- WAL lanes are synchronous append lanes guarded per shard; there is no bounded
+  front-door worker queue yet.
+- The publish barrier still serializes transaction validation, persistent
+  memtable publication, and persistent freeze.
+- Transaction writes still accept WAL only after read-set validation inside the
+  publish barrier.
+- Native-file async reads still use the bounded blocking adapter rather than
+  platform-native async file I/O.
+- Table open header/footer reads still use synchronous borrowed reads.
+
+### Recommended Next Action
+
+- Continue with the publish-barrier tail: keep transaction validation inside
+  the barrier, but move persistent memtable publication toward completed
+  writer-local data so the barrier no longer owns the whole post-WAL write.
+
+## Phase 103: Async Write-Path Tail Closure
+
+### Observation
+
+- Phase 102 left four local tails in the async/write path: synchronous WAL
+  shard lanes, transaction WAL append inside the validation barrier, memtable
+  publication/freeze under the global publish barrier, and table-open metadata
+  reads through borrowed buffers.
+- A fifth item, platform-native async file I/O, is not a local refactor; it
+  needs a backend with platform-specific readiness/completion support.
+
+### Interpretation
+
+- WAL worker queues, transaction WAL split, a narrower memtable publish lock,
+  and owned table-open metadata reads are safe to close inside the current
+  portable runtime boundary.
+- Replacing the bounded blocking adapter with true OS async file I/O should not
+  be hidden inside this phase, because it changes backend execution guarantees.
+
+### Change
+
+- Replaced per-shard WAL writer mutexes with bounded lane workers. Append,
+  persist, and rewrite commands are sent to the owning shard worker and return
+  typed results to the caller.
+- Added `wal_queue_capacity` stats so the new queue boundary is visible.
+- Split transaction commit so read-set validation and sequence reservation stay
+  under the publish barrier, while deferred WAL append happens outside it.
+- Added `memtable_publish_lock` and moved memtable publication plus
+  post-commit freeze under that narrower lock.
+- Public flush now takes the memtable publish lock before capturing and
+  freezing the visible boundary.
+- Table open header/footer reads now use `read_exact_at_owned`.
+- Added tests for transaction WAL accept after sequence reservation, WAL worker
+  queue stats/open lanes, and owned table-open metadata reads.
+
+### Verification
+
+- `cargo test wal_front_door --lib`
+- `cargo test commit --lib`
+- `cargo test flush --lib`
+- `cargo test table_open_metadata_reads_use_owned_source --lib`
+- `cargo test persistent_reopen_fails_when_table_checksum_is_corrupt --test persistent_wal`
+- `cargo test persistent_table_block_index_reads_points_and_ranges --test persistent_wal`
+- `cargo test --test async_api`
+- `cargo test wal --lib`
+- `cargo test --test persistent_wal`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan passed outside instruction files.
+
+### Remaining Blockers
+
+- Platform-native async file I/O is still not implemented. Native-file async
+  reads and writes continue to use the bounded runtime blocking adapter.
+
+### Recommended Next Action
+
+- Treat Phase 103 as closed under the current portable async boundary.
+- If true OS async file I/O is desired next, start a backend-specific phase with
+  an ADR/protocol update for supported platforms and fallback behavior.

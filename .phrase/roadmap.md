@@ -2261,3 +2261,66 @@ longer depends on the normal publish-barrier path.
   manifest/table/blob formats remain unchanged.
 - Focused WAL/recovery tests, formatting, clippy, full tests, diff checks, and
   forbidden-term scan pass.
+
+### Phase 102: WAL Shard Routing And Recovery
+
+**Status**: Complete
+
+**Goal**: Finish the WAL shard recovery and write-routing tail by making
+persistent WAL front doors use multiple shard files with deterministic recovery
+merge.
+
+**Entry Condition**: Phase 101 complete and WAL recovery already has a tested
+sequence merge helper.
+
+**Acceptance Gate**:
+
+- Legacy lane 0 remains `trine.wal`.
+- Additional WAL lanes use stable shard file names.
+- Persistent open discovers existing WAL shard files and replays all valid
+  streams through sequence merge.
+- Persistent writes route whole commit records across WAL shards.
+- Malformed WAL shard file names fail closed during recovery.
+- Flush WAL rewrite applies across opened or existing WAL shards after the
+  replay floor advances.
+- WAL shard rewrite temporary files keep shard-specific names and follow the
+  safe temporary recovery policy.
+- `DbStats` exposes commit tracker and WAL shard counters needed to diagnose
+  the new path.
+- Public async/blocking API, WAL frame format, storage formats, MVCC,
+  transactions, compaction behavior, and manifest/table/blob formats remain
+  unchanged.
+- Focused WAL/recovery/async/commit tests, formatting, clippy, full tests, diff
+  checks, and forbidden-term scan pass.
+
+### Phase 103: Async Write-Path Tail Closure
+
+**Status**: Complete
+
+**Goal**: Close the remaining async/write-path tails that do not require a
+platform-specific native async file-I/O backend.
+
+**Entry Condition**: Phase 102 complete and WAL shard routing/recovery already
+tested.
+
+**Acceptance Gate**:
+
+- WAL shard append/persist/rewrite commands run through bounded front-door lane
+  workers.
+- Transaction writes reserve sequence under the publish barrier but append WAL
+  outside that barrier after validation succeeds.
+- Memtable publication and post-commit freeze use a narrower memtable publish
+  lock instead of the global publish barrier.
+- Public flush freezes active memtables without allowing newer commit records
+  into an older flush boundary.
+- Table-open header/footer metadata reads use owned read buffers.
+- Public async/blocking API, WAL frame format, storage formats, MVCC,
+  compaction behavior, and manifest/table/blob formats remain unchanged.
+- Focused WAL/commit/flush/table/persistent/async tests, formatting, clippy,
+  full tests, diff checks, and forbidden-term scan pass.
+
+**Major Out Of Scope**:
+
+- Platform-native async file I/O. That remains a separate backend phase because
+  it needs explicit platform support beyond the portable bounded blocking
+  adapter.

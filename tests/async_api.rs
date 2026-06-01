@@ -283,9 +283,7 @@ fn dropping_unpolled_persistent_async_write_future_has_no_wal_side_effect() {
     assert_eq!(db.last_committed_sequence(), Sequence::ZERO);
     drop(db);
     assert!(
-        wal::read_batches(&wal::wal_path(&path))
-            .expect("WAL reads")
-            .is_empty(),
+        wal::read_all_batches(&path).expect("WAL reads").is_empty(),
         "unpolled write future must not append a WAL record"
     );
 

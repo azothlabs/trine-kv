@@ -58,6 +58,7 @@ pub(crate) struct DbInner {
     commit_tracker: CommitTracker,
     closed: AtomicBool,
     publish_barrier: PublishBarrier,
+    memtable_publish_lock: Mutex<()>,
     process_lock: Mutex<Option<recovery::ProcessLock>>,
     buckets: RwLock<BTreeMap<String, Arc<LsmTree>>>,
     snapshots: Arc<SnapshotTracker>,
@@ -86,6 +87,7 @@ pub(crate) struct DbInner {
 pub(super) struct CommitTracker {
     last_reserved_sequence: AtomicU64,
     visible_sequence: AtomicU64,
+    skipped_slots: AtomicU64,
     slots: Mutex<BTreeMap<u64, CommitSlotState>>,
 }
 
@@ -116,6 +118,7 @@ impl CommitTracker {
         Self {
             last_reserved_sequence: AtomicU64::new(visible_sequence.get()),
             visible_sequence: AtomicU64::new(visible_sequence.get()),
+            skipped_slots: AtomicU64::new(0),
             slots: Mutex::new(BTreeMap::new()),
         }
     }
@@ -135,7 +138,28 @@ impl CommitTracker {
             .store(visible_sequence.get(), Ordering::Release);
         self.last_reserved_sequence
             .store(visible_sequence.get(), Ordering::Release);
+        self.skipped_slots.store(0, Ordering::Release);
         Ok(())
+    }
+
+    fn last_reserved_sequence(&self) -> Sequence {
+        Sequence::new(self.last_reserved_sequence.load(Ordering::Acquire))
+    }
+
+    fn open_slot_count(&self) -> usize {
+        self.slots
+            .lock()
+            .map(|slots| {
+                slots
+                    .values()
+                    .filter(|state| **state == CommitSlotState::Open)
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    fn skipped_slot_count(&self) -> u64 {
+        self.skipped_slots.load(Ordering::Acquire)
     }
 
     pub(super) fn reserve_slot(&self) -> Result<CommitSlot> {
@@ -186,6 +210,9 @@ impl CommitTracker {
         match *state {
             CommitSlotState::Open => {
                 *state = terminal_state;
+                if terminal_state == CommitSlotState::Skipped {
+                    self.skipped_slots.fetch_add(1, Ordering::AcqRel);
+                }
                 self.advance_visible_sequence(&mut slots);
                 Ok(())
             }
@@ -719,6 +746,7 @@ impl Db {
                 commit_tracker: CommitTracker::new(Sequence::ZERO),
                 closed: AtomicBool::new(false),
                 publish_barrier: PublishBarrier::new(),
+                memtable_publish_lock: Mutex::new(()),
                 process_lock: Mutex::new(None),
                 buckets: RwLock::new(buckets),
                 snapshots: Arc::new(SnapshotTracker::default()),
@@ -781,16 +809,16 @@ impl Db {
         ensure_default_bucket_loaded(&mut buckets, &options)?;
         run_persistent_recovery_checks(&native_storage, path, manifest.state())?;
 
-        let wal_path = wal::wal_path(path);
-        let batches =
-            wal::read_batches_after_with_backend(&native_storage, &wal_path, replay_floor)?;
-        let batches = wal::merge_batch_streams_by_sequence([batches])?;
+        let wal_streams =
+            wal::read_recovery_streams_after_with_backend(&native_storage, path, replay_floor)?;
+        let batches = wal::merge_batch_streams_by_sequence(wal_streams)?;
         let wal = if options.read_only {
             None
         } else {
-            Some(WalFrontDoor::open_single_lane_with_backend(
+            Some(WalFrontDoor::open_sharded_with_backend(
                 &native_storage,
-                &wal_path,
+                path,
+                wal::DEFAULT_WAL_SHARD_COUNT,
             )?)
         };
 
@@ -801,6 +829,7 @@ impl Db {
                 commit_tracker: CommitTracker::new(Sequence::ZERO),
                 closed: AtomicBool::new(false),
                 publish_barrier: PublishBarrier::new(),
+                memtable_publish_lock: Mutex::new(()),
                 process_lock: Mutex::new(process_lock),
                 buckets: RwLock::new(buckets),
                 snapshots: Arc::new(SnapshotTracker::default()),
@@ -1288,12 +1317,24 @@ impl Db {
             compaction_output_tables: self.inner.compaction_output_tables.load(Ordering::Acquire),
             compaction_input_bytes: self.inner.compaction_input_bytes.load(Ordering::Acquire),
             compaction_output_bytes: self.inner.compaction_output_bytes.load(Ordering::Acquire),
+            commit_sequences_allocated: self.inner.commit_tracker.last_reserved_sequence().get(),
+            commit_visible_sequence: self.inner.commit_tracker.visible_sequence().get(),
+            commit_open_slots: self.inner.commit_tracker.open_slot_count(),
+            commit_skipped_slots: self.inner.commit_tracker.skipped_slot_count(),
             blob_gc_runs: self.inner.blob_gc_runs.load(Ordering::Acquire),
             blob_gc_input_bytes: self.inner.blob_gc_input_bytes.load(Ordering::Acquire),
             blob_gc_output_bytes: self.inner.blob_gc_output_bytes.load(Ordering::Acquire),
             blob_gc_discarded_bytes: self.inner.blob_gc_discarded_bytes.load(Ordering::Acquire),
             ..DbStats::default()
         };
+        if let Some(wal) = &self.inner.wal {
+            let wal_stats = wal.stats();
+            stats.wal_shards = wal_stats.shards;
+            stats.wal_open_shards = wal_stats.open_shards;
+            stats.wal_queue_capacity = wal_stats.queue_capacity;
+            stats.wal_records_accepted = wal_stats.records_accepted;
+            stats.wal_bytes_accepted = wal_stats.bytes_accepted;
+        }
         let (blob_read_count, blob_read_bytes) = self.inner.blob_reads.snapshot();
         stats.blob_read_count = blob_read_count;
         stats.blob_read_bytes = blob_read_bytes;
@@ -1866,6 +1907,11 @@ impl Db {
         };
 
         if freeze_active {
+            let _memtable_publish = self
+                .inner
+                .memtable_publish_lock
+                .lock()
+                .map_err(|_| lock_poisoned("memtable publish lock"))?;
             let _publish = self.inner.publish_barrier.enter()?;
             self.freeze_all_active_memtables(self.last_committed_sequence())?;
         }
@@ -1874,7 +1920,7 @@ impl Db {
         self.write_flush_inputs(db_path, &flush_inputs)
     }
 
-    fn freeze_large_active_memtables_after_commit_under_barrier(
+    fn freeze_large_active_memtables_after_commit(
         &self,
         sequence: Sequence,
         states: &[Arc<LsmTree>],
@@ -1894,9 +1940,14 @@ impl Db {
     }
 
     fn freeze_public_flush_target(&self) -> Result<Sequence> {
-        // Capture the public flush boundary while the publish barrier is
-        // held. Later concurrent commits may fill the new active memtable, but
-        // `flush()` only waits for data committed before this sequence.
+        // Lock order is memtable publish -> publish barrier. This keeps
+        // concurrent writers from adding higher-sequence records between the
+        // public flush boundary and the active-memtable freeze.
+        let _memtable_publish = self
+            .inner
+            .memtable_publish_lock
+            .lock()
+            .map_err(|_| lock_poisoned("memtable publish lock"))?;
         let _publish = self.inner.publish_barrier.enter()?;
         let target_sequence = self.last_committed_sequence();
         self.freeze_all_active_memtables(target_sequence)?;
@@ -2005,7 +2056,7 @@ impl Db {
                 return Err(error);
             }
             Self::install_flushed_tables(flush_inputs, written_tables)?;
-            self.rewrite_wal_after_replay_floor(db_path, flush_sequence)?;
+            self.rewrite_wal_after_replay_floor(flush_sequence)?;
         }
         self.l0_pressure_exceeded()
     }
@@ -2601,16 +2652,12 @@ impl Db {
             )
     }
 
-    fn rewrite_wal_after_replay_floor(&self, db_path: &Path, replay_floor: Sequence) -> Result<()> {
+    fn rewrite_wal_after_replay_floor(&self, replay_floor: Sequence) -> Result<()> {
         let Some(wal) = &self.inner.wal else {
             return Ok(());
         };
 
-        wal.rewrite_after_replay_floor(
-            &self.inner.native_storage,
-            &wal::wal_path(db_path),
-            replay_floor,
-        )
+        wal.rewrite_after_replay_floor(replay_floor)
     }
 
     fn install_flushed_tables(
