@@ -473,6 +473,8 @@ Rules:
 - WAL object reads, WAL object listing, and recovery stream reads must be
   available through async storage-trait calls before browser persistence is
   wired;
+- manifest-referenced table and blob reads must be available through async
+  storage-trait calls before browser read-only persistence is wired;
 - manifest publish atomicity is validated by backend fixtures;
 - recovery must not depend on native directory scanning order.
 

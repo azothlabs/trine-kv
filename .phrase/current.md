@@ -6,38 +6,35 @@ Complete
 
 ## Goal
 
-Add a real browser OPFS storage backend target behind Trine's storage traits so
-browser persistence has an owned storage implementation to wire into the async
-persistent engine path.
+Add async table and blob read helpers over Trine storage traits so the next
+browser read-only persistent open slice can load manifest-referenced table and
+blob objects without native blocking storage wrappers.
 
 ## Scope
 
-- Phase 124: browser OPFS storage backend.
+- Phase 125: async table/blob read boundary.
 
 ## Out Of Scope
 
 - Persistent `Db::open` browser wiring.
 - Browser writer lease protocol.
-- Async table, blob, recovery-report, cleanup, WAL append/front-door, or WAL
-  rewrite conversion.
+- Recovery-report and cleanup conversion.
+- WAL append/front-door or WAL rewrite conversion.
+- Optimizing browser blob indexed reads to avoid whole-file reads.
 - Changing storage formats, manifest format, WAL format, durability semantics,
   or MVCC behavior.
 
 ## Backend Boundary Receipt
 
-- Trine operation names: OPFS object read, random read, object write, object
-  delete, directory create, directory listing, manifest read, and manifest
-  publish.
-- Owned interface: `StorageReadBackend`, `StorageObjectReadBackend`,
-  `StorageObjectWriteBackend`, `StorageObjectDeleteBackend`,
-  `StorageDirectoryCreateBackend`, `StorageDirectoryListBackend`,
-  `StorageManifestReadBackend`, `StorageManifestPublishBackend`, and
-  `StorageFuture`.
-- Chosen backend: browser persistent storage uses OPFS on
-  `wasm32-unknown-unknown`, via a target-specific Rust OPFS adapter dependency.
-- Known backend limits: browser writer lease, strict durability proof, persistent
-  open wiring, WAL append/front-door/rewrite, and table/blob/recovery/cleanup
-  async wiring remain incomplete.
+- Trine operation names: async table read, async table listing, async blob read,
+  async blob listing, async blob indexed value read.
+- Owned interface: `StorageReadBackend`, `StorageObjectListBackend`,
+  `StorageReadObject`, and `StorageFuture`.
+- Chosen backend: no new dependency. Existing native, memory, and browser OPFS
+  storage backends enter through the same storage traits.
+- Known backend limits: read-only browser open still needs recovery-report and
+  cleanup decisions; writable browser open still needs WAL append/front-door,
+  WAL rewrite, and writer lease.
 - Leak-check scope: public API, docs, protocol, and phase text keep Trine-owned
   backend terminology; OPFS remains an implementation choice for the browser
   backend.
@@ -47,44 +44,44 @@ persistent engine path.
 
 ## Acceptance Gate
 
-- `opfs` dependency is target-scoped to `wasm32-unknown-unknown`.
-- Browser OPFS backend implements Trine storage read/object-read/write/delete,
-  directory create/list, manifest read, and manifest publish traits.
-- Browser OPFS backend compiles on `wasm32-unknown-unknown`.
-- Native and WASI targets do not depend on OPFS code.
-- Evidence records that this adds a backend target but does not complete browser
-  persistent open.
+- Async table read helper can load a table through `StorageReadBackend`.
+- Async table listing helper can enumerate table ids through
+  `StorageObjectListBackend`.
+- Async blob read/list helpers can load blob files, properties, and indexed
+  values through storage traits.
+- Existing native blocking table/blob behavior remains unchanged.
+- Evidence records remaining browser open blockers.
 
 ## Active Task Slice
 
 ```text
-task519 [x] goal:add target-scoped OPFS dependency | scope:Cargo.toml Cargo.lock | verify:wasm check
-task520 [x] goal:add browser OPFS storage backend | scope:src/storage.rs | verify:wasm check
-task521 [x] goal:update OPFS backend evidence | scope:.phrase protocol docs | verify:docs diff
-task522 [x] goal:commit Phase 124 | scope:git | verify:git commit
+task523 [x] goal:add async table read/list helpers | scope:src/table.rs | verify:table tests
+task524 [x] goal:add async blob read/list helpers | scope:src/blob.rs | verify:blob tests
+task525 [x] goal:update async read evidence | scope:.phrase docs | verify:docs diff
+task526 [x] goal:commit Phase 125 | scope:git | verify:git commit
 ```
 
 ## Known Blockers
 
 - Browser persistent open still returns `UnsupportedBackend`.
-- Browser writer lease is not implemented.
-- Table, blob, recovery-report, cleanup, WAL append/front-door, and WAL rewrite
-  still need async conversion or browser-safe alternatives.
-- OPFS strict durability guarantees are not treated as native `SyncData` or
-  `SyncAll`.
+- Recovery-report, cleanup, WAL append/front-door, WAL rewrite, and browser
+  writer lease remain incomplete.
+- Async table read may initially load full table bytes for non-native backends
+  instead of preserving native lazy table metadata reads.
+- Async indexed blob reads may initially read whole blob files for non-native
+  backends.
 
 ## Evidence
 
 - Phase 121 allowed browser storage futures and handles to be thread-local.
 - Phase 122 moved manifest read/publish/open/create onto async storage helpers.
 - Phase 123 moved WAL recovery read/discovery onto async storage helpers.
-- OPFS API evidence: MDN documents OPFS as an origin-private browser filesystem
-  and `FileSystemWritableFileStream` writes through a temporary file until close.
-- Rust adapter evidence: the `opfs` crate exposes directory, file, and writable
-  stream traits suitable for a Trine storage backend.
+- Phase 124 added a browser OPFS storage backend behind Trine storage traits.
+- Persistent open still calls synchronous table/blob helpers through
+  `NativeFileBackend`.
 
 ## Next Recommendation
 
-- Start the read-only browser persistent open slice by routing open/recovery
-  through async manifest, WAL, table, blob, and recovery-report reads before
-  adding writable browser lease support.
+- Move read-only browser persistent open to the async manifest/WAL/table/blob
+  path, then decide recovery-report and cleanup handling before writable lease
+  work.

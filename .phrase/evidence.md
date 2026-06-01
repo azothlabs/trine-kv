@@ -8582,3 +8582,58 @@ Record only evidence that can change planning or durable decisions.
 - Wire read-only browser persistent open through async manifest, WAL recovery,
   table, blob, and recovery-report reads before adding writable browser lease
   support.
+
+## Phase 125: Async Table And Blob Read Boundary
+
+### Observation
+
+- After Phase 124, browser storage can read OPFS objects through Trine storage
+  traits, but persistent open still depends on table and blob helpers tied to
+  `NativeFileBackend`.
+- Table/blob reads are needed before a read-only browser persistent open can
+  load manifest-referenced objects.
+
+### Interpretation
+
+- Table and blob read/list helpers can move behind async storage traits without
+  changing existing native blocking behavior.
+- For non-native backends, full-object table and indexed blob reads are an
+  acceptable first boundary; later phases can optimize indexed blob reads and
+  lazy table metadata reads for browser.
+
+### Change
+
+- Added async table read and table-id listing helpers over
+  `StorageReadBackend` and `StorageObjectListBackend`.
+- Added async blob file, blob property, indexed blob value, and blob-id listing
+  helpers over storage traits.
+- Reused existing table/blob format validation and added focused memory-backend
+  async read tests.
+- Updated the async storage protocol recovery requirements.
+
+### Verification
+
+- `cargo test async_ --lib`
+- `cargo test table::tests --lib`
+- `cargo test blob::tests --lib`
+- `cargo check`
+- `cargo check --target wasm32-unknown-unknown --lib`
+- `cargo check --target wasm32-unknown-unknown --tests`
+- `cargo check --target wasm32-wasip2 --lib`
+- `cargo check --target wasm32-wasip2 --tests`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings`
+- `cargo test --all-targets --all-features`
+
+### Remaining Blockers
+
+- `DbOptions::browser_persistent()` still returns `UnsupportedBackend`.
+- Read-only browser persistent open still needs an async `Db` open path and
+  recovery-report/cleanup decisions.
+- Writable browser persistent open still needs WAL append/front-door/rewrite
+  and a reliable writer lease.
+
+### Recommended Next Action
+
+- Wire read-only browser persistent open through async manifest, WAL recovery,
+  table, and blob reads, then classify recovery-report and cleanup behavior.

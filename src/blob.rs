@@ -12,8 +12,8 @@ use crate::{
     storage::{
         BlockingStorageObjectListBackend, BlockingStorageObjectWriteBackend,
         BlockingStorageReadBackend, BlockingStorageReadObject, NativeFileBackend,
-        StorageCapability, StorageObjectId, StorageObjectKind, StorageObjectListRequest,
-        StorageReadBackend,
+        StorageCapability, StorageObjectId, StorageObjectKind, StorageObjectListBackend,
+        StorageObjectListRequest, StorageReadBackend, StorageReadObject,
     },
     types::Sequence,
 };
@@ -149,14 +149,35 @@ pub(crate) fn list_blob_file_ids_with_backend(
     backend: &NativeFileBackend,
     db_path: &Path,
 ) -> Result<BTreeSet<u64>> {
-    let mut file_ids = BTreeSet::new();
     backend
         .capabilities()
         .require(StorageCapability::ObjectListing)?;
     let request = StorageObjectListRequest::native_file(StorageObjectKind::Blob, db_path)
         .with_file_extension(BLOB_FILE_EXTENSION);
+    blob_file_ids_from_objects(backend.list_objects_blocking(request)?)
+}
 
-    for object in backend.list_objects_blocking(request)? {
+#[allow(dead_code)]
+pub(crate) async fn list_blob_file_ids_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+) -> Result<BTreeSet<u64>>
+where
+    B: StorageObjectListBackend,
+{
+    backend
+        .capabilities()
+        .require(StorageCapability::ObjectListing)?;
+    let request = StorageObjectListRequest::native_file(StorageObjectKind::Blob, db_path)
+        .with_file_extension(BLOB_FILE_EXTENSION);
+    blob_file_ids_from_objects(backend.list_objects(request).await?)
+}
+
+fn blob_file_ids_from_objects(
+    objects: impl IntoIterator<Item = StorageObjectId>,
+) -> Result<BTreeSet<u64>> {
+    let mut file_ids = BTreeSet::new();
+    for object in objects {
         if let Some(file_id) = blob_file_id_from_path(object.path())? {
             file_ids.insert(file_id);
         }
@@ -334,6 +355,51 @@ pub(crate) fn read_value_for_internal_key_with_backend(
 }
 
 #[allow(dead_code)]
+pub(crate) async fn read_value_for_internal_key_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+    value: &ValueRef,
+    expected_internal_key: Option<&InternalKey>,
+) -> Result<Vec<u8>>
+where
+    B: StorageReadBackend,
+{
+    match value {
+        ValueRef::Inline(bytes) => Ok(bytes.clone()),
+        ValueRef::BlobIndex(index) => {
+            read_indexed_value_with_backend_async(backend, db_path, index, expected_internal_key)
+                .await
+        }
+        ValueRef::Blob {
+            file_id,
+            offset,
+            len,
+            checksum: expected_checksum,
+        } => {
+            let object =
+                open_blob_read_object_with_backend_async(backend, db_path, *file_id).await?;
+            let len = usize::try_from(*len).map_err(|_| Error::Corruption {
+                message: "blob length exceeds usize".to_owned(),
+            })?;
+            let mut bytes = vec![0_u8; len];
+            read_blob_exact_at_async(
+                &object,
+                *offset,
+                &mut bytes,
+                "referenced blob bytes cannot be read",
+            )
+            .await?;
+            if checksum(&bytes) != *expected_checksum {
+                return Err(Error::Corruption {
+                    message: "blob checksum mismatch".to_owned(),
+                });
+            }
+            Ok(bytes)
+        }
+    }
+}
+
+#[allow(dead_code)]
 pub(crate) fn validate_blob_file(db_path: &Path, file_id: u64) -> Result<BlobFileProperties> {
     let blob_file = read_blob_file(db_path, file_id)?;
     Ok(blob_file.properties)
@@ -396,6 +462,19 @@ pub(crate) fn read_blob_file_properties_with_backend(
     decode_properties(&properties_bytes)
 }
 
+#[allow(dead_code)]
+pub(crate) async fn read_blob_file_properties_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+    file_id: u64,
+) -> Result<BlobFileProperties>
+where
+    B: StorageReadBackend,
+{
+    let blob_file = read_blob_file_with_backend_async(backend, db_path, file_id).await?;
+    Ok(blob_file.properties)
+}
+
 pub(crate) fn read_blob_file(db_path: &Path, file_id: u64) -> Result<BlobFile> {
     let backend = blob_storage_backend();
     read_blob_file_with_backend(&backend, db_path, file_id)
@@ -416,6 +495,28 @@ pub(crate) fn read_blob_file_with_backend(
         "referenced blob file cannot be read",
     )?;
     let blob_file = decode_blob_file(&bytes)?;
+    if blob_file.header.file_id != file_id {
+        return Err(Error::Corruption {
+            message: format!(
+                "blob file id mismatch: path has {file_id}, header has {}",
+                blob_file.header.file_id
+            ),
+        });
+    }
+    Ok(blob_file)
+}
+
+#[allow(dead_code)]
+pub(crate) async fn read_blob_file_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+    file_id: u64,
+) -> Result<BlobFile>
+where
+    B: StorageReadBackend,
+{
+    let bytes = read_blob_file_bytes_with_backend_async(backend, db_path, file_id).await?;
+    let blob_file = decode_blob_file(bytes.as_ref())?;
     if blob_file.header.file_id != file_id {
         return Err(Error::Corruption {
             message: format!(
@@ -479,9 +580,53 @@ fn open_blob_read_object_with_backend(
     backend.open_read_blocking(blob_storage_object(&path))
 }
 
+async fn open_blob_read_object_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+    file_id: u64,
+) -> Result<B::ReadObject>
+where
+    B: StorageReadBackend,
+{
+    let path = blob_path(db_path, file_id);
+    backend
+        .capabilities()
+        .require(StorageCapability::RandomRead)?;
+    backend.open_read(blob_storage_object(&path)).await
+}
+
+async fn read_blob_file_bytes_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+    file_id: u64,
+) -> Result<Arc<[u8]>>
+where
+    B: StorageReadBackend,
+{
+    let object = open_blob_read_object_with_backend_async(backend, db_path, file_id).await?;
+    let file_len =
+        blob_object_len_async(&object, "referenced blob file metadata cannot be read").await?;
+    let file_len = u64_to_usize(file_len, "blob file length")?;
+    let bytes = object
+        .read_exact_at_owned(0, file_len)
+        .await
+        .map_err(|error| blob_read_error("referenced blob file cannot be read", &error))?;
+    Ok(bytes.into_bytes())
+}
+
 fn blob_object_len(object: &impl BlockingStorageReadObject, context: &'static str) -> Result<u64> {
     object
         .len_blocking()
+        .map_err(|error| blob_read_error(context, &error))
+}
+
+async fn blob_object_len_async(
+    object: &impl StorageReadObject,
+    context: &'static str,
+) -> Result<u64> {
+    object
+        .len()
+        .await
         .map_err(|error| blob_read_error(context, &error))
 }
 
@@ -494,6 +639,19 @@ fn read_blob_exact_at(
     let offset = u64_to_usize(offset, "blob read offset")?;
     object
         .read_exact_at_blocking(offset, bytes)
+        .map_err(|error| blob_read_error(context, &error))
+}
+
+async fn read_blob_exact_at_async(
+    object: &impl StorageReadObject,
+    offset: u64,
+    bytes: &mut [u8],
+    context: &'static str,
+) -> Result<()> {
+    let offset = u64_to_usize(offset, "blob read offset")?;
+    object
+        .read_exact_at(offset, bytes)
+        .await
         .map_err(|error| blob_read_error(context, &error))
 }
 
@@ -630,6 +788,24 @@ fn read_indexed_value_with_backend(
 }
 
 #[allow(dead_code)]
+async fn read_indexed_value_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+    index: &BlobIndex,
+    expected_internal_key: Option<&InternalKey>,
+) -> Result<Vec<u8>>
+where
+    B: StorageReadBackend,
+{
+    Ok(
+        read_record_for_index_with_backend_async(backend, db_path, index, expected_internal_key)
+            .await?
+            .record
+            .value,
+    )
+}
+
+#[allow(dead_code)]
 pub(crate) fn read_record_for_index(
     db_path: &Path,
     index: &BlobIndex,
@@ -655,6 +831,32 @@ pub(crate) fn read_record_for_index_with_backend(
             message: "blob index metadata mismatch".to_owned(),
         });
     }
+    if expected_internal_key.is_some_and(|expected| record.record.internal_key != *expected) {
+        return Err(Error::Corruption {
+            message: "blob record internal key mismatch".to_owned(),
+        });
+    }
+    Ok(record)
+}
+
+#[allow(dead_code)]
+pub(crate) async fn read_record_for_index_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+    index: &BlobIndex,
+    expected_internal_key: Option<&InternalKey>,
+) -> Result<BlobFileRecord>
+where
+    B: StorageReadBackend,
+{
+    let blob_file = read_blob_file_with_backend_async(backend, db_path, index.file_id).await?;
+    let record = blob_file
+        .records
+        .into_iter()
+        .find(|record| record.index == *index)
+        .ok_or_else(|| Error::Corruption {
+            message: "blob index record is missing".to_owned(),
+        })?;
     if expected_internal_key.is_some_and(|expected| record.record.internal_key != *expected) {
         return Err(Error::Corruption {
             message: "blob record internal key mismatch".to_owned(),
@@ -1173,10 +1375,13 @@ mod tests {
     use crate::{
         blob::{
             BlobFileHeader, BlobRecord, ValueRef, decode_blob_file, encode_blob_file,
-            inline_blob_values, read_indexed_value, read_record_for_index, write_large_values,
+            inline_blob_values, read_blob_file_with_backend_async, read_indexed_value,
+            read_record_for_index, read_value_for_internal_key_with_backend_async,
+            write_large_values,
         },
         codec::CodecId,
         internal_key::{InternalKey, ValueKind},
+        storage::{MemoryStorageBackend, StorageObjectId, StorageObjectKind},
         types::Sequence,
     };
 
@@ -1209,6 +1414,44 @@ mod tests {
             decoded.properties.value_bytes,
             (b"Ada".len() + b"Lin Lin Lin Lin".len()) as u64
         );
+    }
+
+    #[test]
+    fn async_blob_read_decodes_from_storage_backend() {
+        let file_id = 44;
+        let header = BlobFileHeader::new(file_id, Sequence::new(7), 16, CodecId::None);
+        let records = vec![
+            blob_record("user:1", 7, 0, b"value-one".to_vec(), CodecId::None),
+            blob_record("user:2", 8, 0, b"value-two".to_vec(), CodecId::None),
+        ];
+        let (bytes, indexes) = encode_blob_file(header, &records).expect("blob encodes");
+        let backend = MemoryStorageBackend::new();
+        let db_path = std::path::Path::new("async-blob-db");
+        backend
+            .insert_read_object(
+                StorageObjectId::native_file(
+                    StorageObjectKind::Blob,
+                    super::blob_path(db_path, file_id),
+                ),
+                bytes,
+            )
+            .expect("memory blob object inserts");
+
+        let blob_file = poll_ready(read_blob_file_with_backend_async(
+            &backend, db_path, file_id,
+        ))
+        .expect("async blob file reads");
+        assert_eq!(blob_file.header, header);
+        assert_eq!(blob_file.records.len(), 2);
+
+        let value = poll_ready(read_value_for_internal_key_with_backend_async(
+            &backend,
+            db_path,
+            &ValueRef::BlobIndex(indexes[0]),
+            Some(&records[0].internal_key),
+        ))
+        .expect("async indexed blob reads");
+        assert_eq!(value, b"value-one");
     }
 
     #[test]
@@ -1559,5 +1802,17 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("temp dir creates");
         dir
+    }
+
+    fn poll_ready<T>(
+        future: impl std::future::Future<Output = crate::Result<T>>,
+    ) -> crate::Result<T> {
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        let mut future = std::pin::pin!(future);
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => panic!("blob storage future unexpectedly pending"),
+        }
     }
 }

@@ -2886,3 +2886,29 @@ target-specific storage adapter.
 - Browser writer lease protocol.
 - Async table/blob/recovery/cleanup conversion.
 - Async WAL append/front-door/rewrite.
+
+### Phase 125: Async Table And Blob Read Boundary
+
+**Status**: Complete
+
+**Goal**: Move table and blob read/list helpers behind async storage traits so
+browser read-only persistent open has storage-neutral table/blob loading
+building blocks.
+
+**Entry Condition**: Phase 124 complete and table/blob helpers still depend on
+native blocking storage wrappers.
+
+**Acceptance Gate**:
+
+- Async table read and table listing helpers work through storage traits.
+- Async blob file, property, indexed value, and listing helpers work through
+  storage traits.
+- Existing native table/blob behavior remains unchanged.
+- Browser and WASI targets compile with the new helpers.
+
+**Major Out Of Scope**:
+
+- Browser persistent `Db::open` wiring.
+- Recovery-report and cleanup conversion.
+- WAL append/front-door/rewrite.
+- Browser writer lease protocol.

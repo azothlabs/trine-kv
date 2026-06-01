@@ -29,9 +29,10 @@ use crate::{
     stats::{FilterStats, ReadPathStats},
     storage::{
         BlockingStorageObjectListBackend, BlockingStorageObjectWriteBackend,
-        BlockingStorageReadBackend, BlockingStorageReadObject, NativeFileBackend, NativeFileObject,
-        NativeFileReadSource, StorageCapability, StorageObjectId, StorageObjectKind,
-        StorageObjectListRequest, StorageReadBackend, StorageReadObject, StorageReadSource,
+        BlockingStorageReadBackend, BlockingStorageReadObject, MemoryStorageBackend,
+        NativeFileBackend, NativeFileObject, NativeFileReadSource, StorageCapability,
+        StorageObjectId, StorageObjectKind, StorageObjectListBackend, StorageObjectListRequest,
+        StorageReadBackend, StorageReadObject, StorageReadSource,
     },
     types::{KeyRange, Sequence},
 };
@@ -315,7 +316,6 @@ impl DecodedDataBlock {
             .collect()
     }
 
-    #[cfg(test)]
     fn restart_indices_with_base(&self, base: usize) -> Vec<usize> {
         self.restart_indices
             .iter()
@@ -2882,9 +2882,30 @@ pub(crate) fn list_table_file_ids_with_backend(
         .require(StorageCapability::ObjectListing)?;
     let request = StorageObjectListRequest::native_file(StorageObjectKind::Table, db_path)
         .with_file_extension(TABLE_FILE_EXTENSION);
-    let mut table_ids = BTreeSet::new();
+    table_file_ids_from_objects(backend.list_objects_blocking(request)?)
+}
 
-    for object in backend.list_objects_blocking(request)? {
+#[allow(dead_code)]
+pub(crate) async fn list_table_file_ids_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+) -> Result<BTreeSet<TableId>>
+where
+    B: StorageObjectListBackend,
+{
+    backend
+        .capabilities()
+        .require(StorageCapability::ObjectListing)?;
+    let request = StorageObjectListRequest::native_file(StorageObjectKind::Table, db_path)
+        .with_file_extension(TABLE_FILE_EXTENSION);
+    table_file_ids_from_objects(backend.list_objects(request).await?)
+}
+
+fn table_file_ids_from_objects(
+    objects: impl IntoIterator<Item = StorageObjectId>,
+) -> Result<BTreeSet<TableId>> {
+    let mut table_ids = BTreeSet::new();
+    for object in objects {
         let path = object.path();
         let has_table_extension = path
             .extension()
@@ -3119,6 +3140,47 @@ pub(crate) fn read_table_with_backend(backend: &NativeFileBackend, path: &Path) 
         filter_stats: Arc::new(TableFilterStats::default()),
         read_path_stats: Arc::new(TableReadPathStats::default()),
     })
+}
+
+#[allow(dead_code)]
+pub(crate) async fn read_table_with_backend_async<B>(backend: &B, path: &Path) -> Result<Table>
+where
+    B: StorageReadBackend,
+{
+    backend
+        .capabilities()
+        .require(StorageCapability::RandomRead)?;
+    let object = table_storage_object(path);
+    let table_object = backend
+        .open_read(object)
+        .await
+        .map_err(|error| Error::Corruption {
+            message: format!(
+                "referenced table {} cannot be opened: {error}",
+                path.display()
+            ),
+        })?;
+    let file_len = table_object
+        .len()
+        .await
+        .map_err(|error| Error::Corruption {
+            message: format!(
+                "referenced table {} metadata cannot be read: {error}",
+                path.display()
+            ),
+        })?;
+    let file_len = usize::try_from(file_len)
+        .map_err(|_| Error::invalid_options("table file length exceeds usize"))?;
+    let bytes = table_object
+        .read_exact_at_owned(0, file_len)
+        .await
+        .map_err(|error| Error::Corruption {
+            message: format!(
+                "referenced table {} cannot be read: {error}",
+                path.display()
+            ),
+        })?;
+    decode_table_bytes(bytes.as_slice())
 }
 
 fn read_table_header(path: &Path, source: &impl BlockReadSource) -> Result<[u8; HEADER_LEN]> {
@@ -3519,7 +3581,11 @@ fn encode_table(table: &Table) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 fn decode_table(bytes: &[u8]) -> Result<Table> {
-    let backend = crate::storage::MemoryStorageBackend::new();
+    decode_table_bytes(bytes)
+}
+
+fn decode_table_bytes(bytes: &[u8]) -> Result<Table> {
+    let backend = MemoryStorageBackend::new();
     backend
         .capabilities()
         .require(StorageCapability::RandomRead)?;
@@ -3529,7 +3595,6 @@ fn decode_table(bytes: &[u8]) -> Result<Table> {
     decode_table_from_storage_object(&table_object)
 }
 
-#[cfg(test)]
 #[allow(clippy::too_many_lines)]
 fn decode_table_from_storage_object(
     table_object: &impl BlockingStorageReadObject,
@@ -3591,7 +3656,7 @@ fn decode_table_from_storage_object(
     let data_block_count =
         validate_index_top_level(top_level_block, &index_partitions, footer.indexes)?;
 
-    let (point_records, data_blocks) = decode_test_point_records_and_blocks_from_source(
+    let (point_records, data_blocks) = decode_point_records_and_blocks_from_source(
         &source,
         payload_len,
         &properties,
@@ -3649,8 +3714,7 @@ fn decode_table_from_storage_object(
     })
 }
 
-#[cfg(test)]
-fn decode_test_point_records_and_blocks_from_source(
+fn decode_point_records_and_blocks_from_source(
     source: &impl BlockReadSource,
     payload_len: usize,
     properties: &TableProperties,
@@ -4420,7 +4484,6 @@ fn decode_data_block(bytes: Vec<u8>) -> Result<DecodedDataBlock> {
     decode_data_block_with_hash_validation(bytes, false)
 }
 
-#[cfg(test)]
 fn decode_data_block_for_verify(bytes: Vec<u8>) -> Result<DecodedDataBlock> {
     decode_data_block_with_hash_validation(bytes, true)
 }
@@ -5456,6 +5519,30 @@ mod tests {
     }
 
     #[test]
+    fn async_table_read_decodes_from_storage_backend() {
+        let table = table_with_records(24, CodecId::None);
+        let payload = encode_table(&table).expect("table encodes");
+        let bytes = table_file_bytes(&payload);
+        let backend = MemoryStorageBackend::new();
+        let path = Path::new("async-table.trinet");
+        backend
+            .insert_read_object(
+                StorageObjectId::native_file(StorageObjectKind::Table, path),
+                bytes,
+            )
+            .expect("memory table object inserts");
+
+        let decoded =
+            poll_ready(read_table_with_backend_async(&backend, path)).expect("async table reads");
+
+        assert_eq!(decoded.properties(), table.properties());
+        assert_eq!(
+            decoded.point_records().expect("decoded records load"),
+            table.point_records().expect("source records load")
+        );
+    }
+
+    #[test]
     fn write_table_creates_final_object_without_leftover_tmp() {
         let root = std::env::temp_dir().join(format!(
             "trine-kv-write-table-object-{}-{}",
@@ -6265,6 +6352,16 @@ mod tests {
         bytes.extend_from_slice(&payload_checksum.to_le_bytes());
         bytes.extend_from_slice(payload);
         bytes
+    }
+
+    fn poll_ready<T>(future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        let mut future = std::pin::pin!(future);
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => panic!("table storage future unexpectedly pending"),
+        }
     }
 
     fn count_block(count: u32) -> Vec<u8> {
