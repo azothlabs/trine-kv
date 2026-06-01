@@ -51,6 +51,111 @@ pub struct Db {
     counts_as_user_handle: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenanceBudget {
+    max_flush_inputs: usize,
+    max_compaction_inputs: usize,
+}
+
+impl MaintenanceBudget {
+    pub const DEFAULT_MAX_FLUSH_INPUTS: usize = 1;
+    pub const DEFAULT_MAX_COMPACTION_INPUTS: usize = 1;
+
+    #[must_use]
+    pub const fn new(max_flush_inputs: usize, max_compaction_inputs: usize) -> Self {
+        let max_flush_inputs = if max_flush_inputs == 0 {
+            1
+        } else {
+            max_flush_inputs
+        };
+        let max_compaction_inputs = if max_compaction_inputs == 0 {
+            1
+        } else {
+            max_compaction_inputs
+        };
+        Self {
+            max_flush_inputs,
+            max_compaction_inputs,
+        }
+    }
+
+    #[must_use]
+    pub const fn single_unit() -> Self {
+        Self::new(
+            Self::DEFAULT_MAX_FLUSH_INPUTS,
+            Self::DEFAULT_MAX_COMPACTION_INPUTS,
+        )
+    }
+
+    #[must_use]
+    pub const fn unbounded() -> Self {
+        Self::new(usize::MAX, usize::MAX)
+    }
+
+    #[must_use]
+    pub const fn max_flush_inputs(self) -> usize {
+        self.max_flush_inputs
+    }
+
+    #[must_use]
+    pub const fn max_compaction_inputs(self) -> usize {
+        self.max_compaction_inputs
+    }
+
+    fn flush_input_limit(self) -> usize {
+        self.max_flush_inputs.max(1)
+    }
+
+    fn compaction_input_limit(self) -> usize {
+        self.max_compaction_inputs.max(1)
+    }
+}
+
+impl Default for MaintenanceBudget {
+    fn default() -> Self {
+        Self::single_unit()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MaintenanceOutcome {
+    pub flushes: usize,
+    pub compactions: usize,
+    pub budget_exhausted: bool,
+    pub busy: bool,
+}
+
+impl MaintenanceOutcome {
+    #[must_use]
+    pub const fn made_progress(self) -> bool {
+        self.flushes != 0 || self.compactions != 0
+    }
+
+    #[must_use]
+    pub const fn budget_exhausted(self) -> bool {
+        self.budget_exhausted
+    }
+
+    #[must_use]
+    pub const fn busy(self) -> bool {
+        self.busy
+    }
+
+    fn busy_outcome() -> Self {
+        Self {
+            busy: true,
+            ..Self::default()
+        }
+    }
+
+    fn add_assign(&mut self, other: Self) {
+        self.flushes = self.flushes.saturating_add(other.flushes);
+        self.compactions = self.compactions.saturating_add(other.compactions);
+        self.budget_exhausted |= other.budget_exhausted;
+        self.busy |= other.busy;
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct DbInner {
     options: DbOptions,
@@ -276,13 +381,6 @@ struct NamedCompactionInput {
 struct NamedCompactionOutput {
     bucket: String,
     output: LsmCompactionOutput,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MaintenanceRunOutcome {
-    Ran,
-    NoWork,
-    Busy,
 }
 
 struct PendingCompactionOutputs {
@@ -1370,6 +1468,16 @@ impl Db {
     }
 
     #[allow(clippy::needless_pass_by_value)]
+    pub fn compact_range_with_budget(
+        &self,
+        range: KeyRange,
+        budget: MaintenanceBudget,
+    ) -> Result<MaintenanceOutcome> {
+        self.take_background_maintenance_error()?;
+        self.compact_range_with_budget_internal(range, budget)
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
     fn compact_range_internal(&self, range: KeyRange) -> Result<()> {
         self.ensure_open()?;
         if self.inner.options.read_only {
@@ -1383,6 +1491,62 @@ impl Db {
         self.run_compaction_barrier(&db_path, &range, false)?;
 
         Ok(())
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn compact_range_with_budget_internal(
+        &self,
+        range: KeyRange,
+        budget: MaintenanceBudget,
+    ) -> Result<MaintenanceOutcome> {
+        self.ensure_open()?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+
+        let Some(path) = self.persistent_path() else {
+            return Ok(MaintenanceOutcome::default());
+        };
+        let db_path = path.to_path_buf();
+        self.run_compaction_once_with_budget(&db_path, &range, false, budget)
+    }
+
+    pub fn run_maintenance_with_budget(
+        &self,
+        budget: MaintenanceBudget,
+    ) -> Result<MaintenanceOutcome> {
+        self.take_background_maintenance_error()?;
+        self.ensure_open()?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+
+        let Some(path) = self.persistent_path() else {
+            return Ok(MaintenanceOutcome::default());
+        };
+        let db_path = path.to_path_buf();
+        let mut outcome = MaintenanceOutcome::default();
+        let mut should_compact = self.l0_pressure_exceeded()?;
+
+        if self.has_immutable_memtables()? {
+            let (flush_should_compact, flush_outcome) =
+                self.run_flush_once_with_budget(&db_path, false, budget)?;
+            should_compact |= flush_should_compact;
+            outcome.add_assign(flush_outcome);
+        }
+
+        if should_compact {
+            let compaction_outcome =
+                self.run_compaction_once_with_budget(&db_path, &KeyRange::all(), true, budget)?;
+            outcome.add_assign(compaction_outcome);
+        }
+
+        if outcome.made_progress() {
+            self.cleanup_pending_obsolete_table_files(&db_path)?;
+            self.cleanup_pending_obsolete_blob_files(&db_path)?;
+        }
+        self.take_background_maintenance_error()?;
+        Ok(outcome)
     }
 
     #[must_use]
@@ -1680,11 +1844,18 @@ impl Db {
         let mut should_compact = request.compaction || self.l0_pressure_exceeded()?;
 
         if request.flush && self.has_immutable_memtables()? {
-            should_compact |= self.run_flush_once(&db_path, false)?;
+            let (flush_should_compact, _) =
+                self.run_flush_once_with_budget(&db_path, false, MaintenanceBudget::single_unit())?;
+            should_compact |= flush_should_compact;
         }
 
         if should_compact {
-            self.run_compaction_once(&db_path, &KeyRange::all(), true)?;
+            self.run_compaction_once_with_budget(
+                &db_path,
+                &KeyRange::all(),
+                true,
+                MaintenanceBudget::single_unit(),
+            )?;
         }
         if self.has_immutable_memtables()? {
             self.request_background_flush();
@@ -2021,24 +2192,64 @@ impl Db {
             should_compact |= self.run_pressure_flush_once(db_path)?;
         }
         if should_compact {
-            self.run_compaction_once(db_path, &KeyRange::all(), true)?;
+            self.run_compaction_once_with_budget(
+                db_path,
+                &KeyRange::all(),
+                true,
+                MaintenanceBudget::single_unit(),
+            )?;
         }
 
         Ok(())
     }
 
     fn run_pressure_flush_once(&self, db_path: &Path) -> Result<bool> {
+        let (should_compact, _) =
+            self.run_pressure_flush_once_with_budget(db_path, MaintenanceBudget::unbounded())?;
+        Ok(should_compact)
+    }
+
+    fn run_pressure_flush_once_with_budget(
+        &self,
+        db_path: &Path,
+        budget: MaintenanceBudget,
+    ) -> Result<(bool, MaintenanceOutcome)> {
         let Some(_flush_guard) = self.inner.maintenance.try_start_flush() else {
-            return Ok(false);
+            return Ok((false, MaintenanceOutcome::busy_outcome()));
         };
 
-        let flush_inputs = self.collect_pressure_flush_inputs()?;
-        self.write_flush_inputs(db_path, &flush_inputs)
+        let (flush_inputs, budget_exhausted) =
+            self.collect_pressure_flush_inputs_with_budget(budget)?;
+        let flush_count = flush_inputs.len();
+        let should_compact = self.write_flush_inputs(db_path, &flush_inputs)?;
+        let outcome = MaintenanceOutcome {
+            flushes: flush_count,
+            budget_exhausted: budget_exhausted && flush_count != 0,
+            ..MaintenanceOutcome::default()
+        };
+        if outcome.budget_exhausted {
+            self.record_maintenance_budget_exhaustion();
+        }
+        Ok((should_compact, outcome))
     }
 
     fn run_flush_once(&self, db_path: &Path, freeze_active: bool) -> Result<bool> {
+        let (should_compact, _) = self.run_flush_once_with_budget(
+            db_path,
+            freeze_active,
+            MaintenanceBudget::unbounded(),
+        )?;
+        Ok(should_compact)
+    }
+
+    fn run_flush_once_with_budget(
+        &self,
+        db_path: &Path,
+        freeze_active: bool,
+        budget: MaintenanceBudget,
+    ) -> Result<(bool, MaintenanceOutcome)> {
         let Some(_flush_guard) = self.inner.maintenance.try_start_flush() else {
-            return Ok(false);
+            return Ok((false, MaintenanceOutcome::busy_outcome()));
         };
 
         if freeze_active {
@@ -2051,8 +2262,18 @@ impl Db {
             self.freeze_all_active_memtables(self.last_committed_sequence())?;
         }
 
-        let flush_inputs = self.collect_flush_inputs()?;
-        self.write_flush_inputs(db_path, &flush_inputs)
+        let (flush_inputs, budget_exhausted) = self.collect_flush_inputs_with_budget(budget)?;
+        let flush_count = flush_inputs.len();
+        let should_compact = self.write_flush_inputs(db_path, &flush_inputs)?;
+        let outcome = MaintenanceOutcome {
+            flushes: flush_count,
+            budget_exhausted: budget_exhausted && flush_count != 0,
+            ..MaintenanceOutcome::default()
+        };
+        if outcome.budget_exhausted {
+            self.record_maintenance_budget_exhaustion();
+        }
+        Ok((should_compact, outcome))
     }
 
     fn freeze_large_active_memtables_after_commit(
@@ -2196,7 +2417,10 @@ impl Db {
         self.l0_pressure_exceeded()
     }
 
-    fn collect_pressure_flush_inputs(&self) -> Result<Vec<NamedFlushInput>> {
+    fn collect_pressure_flush_inputs_with_budget(
+        &self,
+        budget: MaintenanceBudget,
+    ) -> Result<(Vec<NamedFlushInput>, bool)> {
         let max_immutable_memtables = self.inner.options.max_immutable_memtables;
         let mut next_table_id = self.next_table_id()?;
         let buckets = self
@@ -2205,24 +2429,36 @@ impl Db {
             .read()
             .map_err(|_| lock_poisoned("bucket registry"))?;
         let mut inputs = Vec::new();
+        let limit = budget.flush_input_limit();
+        let mut budget_exhausted = false;
 
         for (name, state) in buckets.iter() {
             if state.immutable_memtable_count() < max_immutable_memtables {
                 continue;
             }
             for input in state.prepare_flush_inputs(&mut next_table_id)? {
+                if inputs.len() >= limit {
+                    budget_exhausted = true;
+                    break;
+                }
                 inputs.push(NamedFlushInput {
                     bucket: name.clone(),
                     tree: Arc::clone(state),
                     input,
                 });
             }
+            if budget_exhausted {
+                break;
+            }
         }
 
-        Ok(inputs)
+        Ok((inputs, budget_exhausted))
     }
 
-    fn collect_flush_inputs(&self) -> Result<Vec<NamedFlushInput>> {
+    fn collect_flush_inputs_with_budget(
+        &self,
+        budget: MaintenanceBudget,
+    ) -> Result<(Vec<NamedFlushInput>, bool)> {
         let mut next_table_id = self.next_table_id()?;
         let buckets = self
             .inner
@@ -2230,18 +2466,27 @@ impl Db {
             .read()
             .map_err(|_| lock_poisoned("bucket registry"))?;
         let mut inputs = Vec::new();
+        let limit = budget.flush_input_limit();
+        let mut budget_exhausted = false;
 
         for (name, state) in buckets.iter() {
             for input in state.prepare_flush_inputs(&mut next_table_id)? {
+                if inputs.len() >= limit {
+                    budget_exhausted = true;
+                    break;
+                }
                 inputs.push(NamedFlushInput {
                     bucket: name.clone(),
                     tree: Arc::clone(state),
                     input,
                 });
             }
+            if budget_exhausted {
+                break;
+            }
         }
 
-        Ok(inputs)
+        Ok((inputs, budget_exhausted))
     }
 
     fn collect_compaction_inputs(
@@ -2282,32 +2527,37 @@ impl Db {
     ) -> Result<()> {
         loop {
             self.take_background_maintenance_error()?;
-            match self.run_compaction_once(db_path, range, local_l0_compaction)? {
-                MaintenanceRunOutcome::Ran | MaintenanceRunOutcome::NoWork => return Ok(()),
-                MaintenanceRunOutcome::Busy => {
-                    if !self.inner.maintenance.has_pending_compaction() {
-                        return Ok(());
-                    }
-                    self.request_background_compaction();
-                    self.record_cooperative_maintenance_yield();
-                    self.inner.maintenance.wait_until_compaction_idle();
-                    self.take_background_maintenance_error()?;
-                }
+            let outcome = self.run_compaction_once_with_budget(
+                db_path,
+                range,
+                local_l0_compaction,
+                MaintenanceBudget::unbounded(),
+            )?;
+            if outcome.compactions != 0 || !outcome.busy {
+                return Ok(());
             }
+            if !self.inner.maintenance.has_pending_compaction() {
+                return Ok(());
+            }
+            self.request_background_compaction();
+            self.record_cooperative_maintenance_yield();
+            self.inner.maintenance.wait_until_compaction_idle();
+            self.take_background_maintenance_error()?;
         }
     }
 
-    fn run_compaction_once(
+    fn run_compaction_once_with_budget(
         &self,
         db_path: &Path,
         range: &KeyRange,
         local_l0_compaction: bool,
-    ) -> Result<MaintenanceRunOutcome> {
+        budget: MaintenanceBudget,
+    ) -> Result<MaintenanceOutcome> {
         let oldest_active_snapshot = self.oldest_active_snapshot_sequence();
         let compaction_inputs =
             self.collect_compaction_inputs(range, oldest_active_snapshot, local_l0_compaction)?;
         if compaction_inputs.is_empty() {
-            return Ok(MaintenanceRunOutcome::NoWork);
+            return Ok(MaintenanceOutcome::default());
         }
 
         let reservations = compaction_inputs
@@ -2319,14 +2569,20 @@ impl Db {
             .collect::<Vec<_>>();
         let Some(compaction_guard) = self.inner.maintenance.reserve_compactions(reservations)
         else {
-            return Ok(MaintenanceRunOutcome::Busy);
+            return Ok(MaintenanceOutcome::busy_outcome());
         };
-        let compaction_inputs = compaction_inputs
+        let mut compaction_inputs = compaction_inputs
             .into_iter()
             .filter(|input| compaction_guard.contains(&input.bucket, &input.input.compaction_range))
             .collect::<Vec<_>>();
         if compaction_inputs.is_empty() {
-            return Ok(MaintenanceRunOutcome::Busy);
+            return Ok(MaintenanceOutcome::busy_outcome());
+        }
+        let limit = budget.compaction_input_limit();
+        let budget_exhausted = compaction_inputs.len() > limit;
+        compaction_inputs.truncate(limit);
+        if compaction_inputs.is_empty() {
+            return Ok(MaintenanceOutcome::default());
         }
 
         let PendingCompactionOutputs {
@@ -2373,7 +2629,7 @@ impl Db {
         if let Err(error) = self.validate_compacted_tables(&written_tables) {
             let _ = remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
             if is_level_layout_compaction_error(&error) {
-                return Ok(MaintenanceRunOutcome::NoWork);
+                return Ok(MaintenanceOutcome::default());
             }
             return Err(error);
         }
@@ -2395,7 +2651,15 @@ impl Db {
             self.run_blob_gc_once_locked(db_path)?;
         }
 
-        Ok(MaintenanceRunOutcome::Ran)
+        let outcome = MaintenanceOutcome {
+            compactions: compaction_inputs.len(),
+            budget_exhausted,
+            ..MaintenanceOutcome::default()
+        };
+        if outcome.budget_exhausted {
+            self.record_maintenance_budget_exhaustion();
+        }
+        Ok(outcome)
     }
 
     fn build_compaction_outputs(
@@ -3152,6 +3416,21 @@ impl Db {
 
     pub async fn compact_range_async(&self, range: KeyRange) -> Result<()> {
         self.compact_range(range)
+    }
+
+    pub async fn compact_range_with_budget_async(
+        &self,
+        range: KeyRange,
+        budget: MaintenanceBudget,
+    ) -> Result<MaintenanceOutcome> {
+        self.compact_range_with_budget(range, budget)
+    }
+
+    pub async fn run_maintenance_with_budget_async(
+        &self,
+        budget: MaintenanceBudget,
+    ) -> Result<MaintenanceOutcome> {
+        self.run_maintenance_with_budget(budget)
     }
 
     pub async fn close_async(&self) {

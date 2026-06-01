@@ -465,6 +465,23 @@ db.compact_range(KeyRange::all())?;
 If another compaction already owns an overlapping key range, `compact_range()`
 waits and retries instead of reporting success while the guard is busy.
 
+Cooperative hosts can advance maintenance in bounded steps:
+
+```rust
+use trine_kv::MaintenanceBudget;
+
+let outcome = db.run_maintenance_with_budget(MaintenanceBudget::default())?;
+if outcome.budget_exhausted() {
+    // Call again from the host scheduler when it is ready to do more work.
+}
+```
+
+`MaintenanceBudget::default()` allows one flush input and one compaction unit.
+Each unit is still published atomically; when the budget is exhausted, the next
+call resumes by planning from the current manifest and in-memory versions.
+Use `compact_range_with_budget(range, budget)` when a host wants only compaction
+work for a key range.
+
 Persistent writable databases start one background maintenance worker by
 default. Set `DbOptions::background_worker_count = 0` when a test or embedding
 needs fully manual maintenance. In-memory and read-only databases never start

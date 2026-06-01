@@ -242,6 +242,8 @@ Db::write(batch, write_options).await -> Result<CommitInfo>
 Db::persist(mode).await -> Result<()>
 Db::flush().await -> Result<()>
 Db::compact_range(range).await -> Result<()>
+Db::run_maintenance_with_budget(budget).await -> Result<MaintenanceOutcome>
+Db::compact_range_with_budget(range, budget).await -> Result<MaintenanceOutcome>
 Db::close().await -> Result<()>
 Db::snapshot() -> Snapshot
 Db::transaction(options) -> Transaction
@@ -324,7 +326,8 @@ or cooperative workers.
 Rules:
 
 - maintenance units must have explicit budgets;
-- a worker may yield and resume without losing protocol state;
+- a worker may yield and resume by replanning from the current manifest and
+  in-memory versions;
 - compaction output remains invisible until manifest publish completes;
 - cleanup remains snapshot-safe even when split across multiple worker turns;
 - startup recovery must not require background workers to complete before the

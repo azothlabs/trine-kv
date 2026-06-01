@@ -10,8 +10,9 @@ use std::{
 use trine_kv::{
     BlobGcRatio, BlobLevelMergePolicy, BucketOptions, CompressionProfile, Db, DbOptions,
     DurabilityMode, Error, FailOnCorruptionPolicy, FilterPolicy, IndexSearchPolicy, KeyRange,
-    PrefixExtractor, PrefixFilterPolicy, Sequence, TransactionOptions, WriteBatch, WriteOptions,
-    blob, codec::CodecId, manifest, recovery, table, wal, write_batch::BatchOperation,
+    MaintenanceBudget, PrefixExtractor, PrefixFilterPolicy, Sequence, TransactionOptions,
+    WriteBatch, WriteOptions, blob, codec::CodecId, manifest, recovery, table, wal,
+    write_batch::BatchOperation,
 };
 
 fn temp_db_path(name: &str) -> PathBuf {
@@ -1617,6 +1618,96 @@ fn persistent_flush_auto_compacts_overlapping_l0_below_file_limit() {
             Some(b"a2".to_vec())
         );
         assert!(db.stats().compaction_runs > 0);
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_budgeted_compaction_reports_exhaustion_and_resumes() {
+    let path = temp_db_path("budgeted-compaction-resumes");
+    let mut options = DbOptions::persistent(&path);
+    options.background_worker_count = 0;
+
+    {
+        let db = Db::open(options).expect("persistent db opens");
+        let default_bucket = db.default_bucket().expect("default bucket opens");
+        let other_bucket = db.bucket("other").expect("other bucket opens");
+
+        default_bucket.put(b"a", b"a1").expect("write default key");
+        other_bucket.put(b"b", b"b1").expect("write other key");
+        db.flush().expect("flush both buckets");
+        assert_eq!(db.stats().l0_tables, 2);
+
+        let first = db
+            .compact_range_with_budget(KeyRange::all(), MaintenanceBudget::default())
+            .expect("first budgeted compaction runs");
+        assert_eq!(first.compactions, 1);
+        assert!(first.budget_exhausted());
+        assert!(!first.busy());
+        assert_eq!(db.stats().l0_tables, 1);
+        assert_eq!(db.stats().maintenance_budget_exhaustions, 1);
+
+        let second = db
+            .compact_range_with_budget(KeyRange::all(), MaintenanceBudget::default())
+            .expect("second budgeted compaction resumes");
+        assert_eq!(second.compactions, 1);
+        assert!(!second.budget_exhausted());
+        assert_eq!(db.stats().l0_tables, 0);
+        assert_eq!(level_table_count(&db.stats(), 1), 2);
+        assert_eq!(
+            default_bucket.get(b"a").expect("default key reads"),
+            Some(b"a1".to_vec())
+        );
+        assert_eq!(
+            other_bucket.get(b"b").expect("other key reads"),
+            Some(b"b1".to_vec())
+        );
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_budgeted_maintenance_flushes_one_input_per_pass() {
+    let path = temp_db_path("budgeted-maintenance-flushes");
+    let mut options = DbOptions::persistent(&path);
+    options.background_worker_count = 0;
+    options.write_buffer_bytes = 1;
+    options.max_immutable_memtables = 4;
+
+    {
+        let db = Db::open(options).expect("persistent db opens");
+        let default_bucket = db.default_bucket().expect("default bucket opens");
+        let other_bucket = db.bucket("other").expect("other bucket opens");
+
+        default_bucket.put(b"a", b"a1").expect("write default key");
+        other_bucket.put(b"b", b"b1").expect("write other key");
+        assert_eq!(db.stats().immutable_memtables, 2);
+
+        let first = db
+            .run_maintenance_with_budget(MaintenanceBudget::default())
+            .expect("first budgeted maintenance runs");
+        assert_eq!(first.flushes, 1);
+        assert!(first.budget_exhausted());
+        assert_eq!(db.stats().immutable_memtables, 1);
+        assert_eq!(db.stats().l0_tables, 1);
+
+        let second = db
+            .run_maintenance_with_budget(MaintenanceBudget::default())
+            .expect("second budgeted maintenance resumes");
+        assert_eq!(second.flushes, 1);
+        assert!(!second.budget_exhausted());
+        assert_eq!(db.stats().immutable_memtables, 0);
+        assert_eq!(db.stats().l0_tables, 2);
+        assert_eq!(
+            default_bucket.get(b"a").expect("default key reads"),
+            Some(b"a1".to_vec())
+        );
+        assert_eq!(
+            other_bucket.get(b"b").expect("other key reads"),
+            Some(b"b1".to_vec())
+        );
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");

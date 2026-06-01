@@ -2731,5 +2731,34 @@ WASI persistence.
 
 ### Recommended Next Action
 
-- Phase 119 is complete. Choose browser persistence or resumable maintenance
-  budgets as a separate phase.
+### Phase 120: Resumable Maintenance Work Budgets
+
+**Status**: Complete
+
+**Goal**: Let hosts advance flush and compaction in bounded atomic maintenance
+units that can yield and resume by replanning from current database state.
+
+**Entry Condition**: Phase 119 complete and cooperative maintenance remains a
+browser/WASM readiness blocker.
+
+**Acceptance Gate**:
+
+- Public `MaintenanceBudget` and `MaintenanceOutcome` types exist.
+- `run_maintenance_with_budget` and `compact_range_with_budget` report progress,
+  busy reservations, and budget exhaustion.
+- Budgeted maintenance preserves existing `flush()` and `compact_range()`
+  barrier behavior.
+- Budget exhaustion is observable in stats.
+- Focused tests prove budget exhaustion and resume-by-replanning behavior.
+- Final verification gate passes.
+
+**Major Out Of Scope**:
+
+- Browser persistent storage.
+- Async-only persistent engine conversion.
+- Splitting one compaction publish across multiple manifests.
+
+### Recommended Next Action
+
+- Start a browser persistence phase by removing blocking persistent storage
+  calls from the engine path before wiring IndexedDB/OPFS.

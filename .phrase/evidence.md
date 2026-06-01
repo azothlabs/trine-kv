@@ -8301,3 +8301,65 @@ Record only evidence that can change planning or durable decisions.
 
 - Commit Phase 119, then choose browser persistence or resumable maintenance
   budgets as a separate phase.
+
+## Phase 120: Resumable Maintenance Budgets
+
+### Observation
+
+- `MaintenanceBudget` and `MaintenanceOutcome` now expose bounded maintenance
+  work to callers.
+- `run_maintenance_with_budget` advances at most the configured number of flush
+  inputs and compaction units, reports busy reservations, and records budget
+  exhaustion in `DbStats`.
+- `compact_range_with_budget` runs one bounded compaction pass for a key range;
+  a later call resumes by planning from the current manifest and in-memory
+  versions.
+- Existing `flush()` and `compact_range()` continue to use their barrier
+  behavior.
+- `cargo check --target wasm32-unknown-unknown --lib` passes.
+
+### Interpretation
+
+- Cooperative maintenance is now available as a reusable host scheduling
+  boundary.
+- Browser persistence is still blocked by integration, not by basic browser
+  target compilation.
+- The persistent engine still relies on blocking storage APIs and
+  `NativeFileBackend` across open, WAL, manifest, table, blob, recovery, and
+  cleanup paths; this cannot be treated as a true browser persistent backend.
+
+### Change
+
+- Added public budget and outcome types plus sync and async compatibility
+  methods for budgeted maintenance and compaction.
+- Budgeted maintenance records budget exhaustion stats and preserves existing
+  unbounded barrier behavior.
+- Added focused persistent tests for budget exhaustion and resume-by-replanning.
+- Updated usage docs, async protocol, roadmap, and current phase.
+
+### Verification
+
+- `cargo check`
+- `cargo check --target wasm32-wasip2 --lib`
+- `cargo check --target wasm32-wasip2 --tests`
+- `cargo check --target wasm32-unknown-unknown --lib`
+- `cargo test --test persistent_wal`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo fmt --check`
+- `git diff --check`
+- forbidden-term scan
+- project-name scan
+- backend-name leakage scan for docs/current/protocol/roadmap and
+  storage/db/stats/io/runtime boundary
+
+### Remaining Blockers
+
+- A real browser persistent backend needs async persistent open, async WAL,
+  async manifest publish/read, async table/blob reads and writes, async cleanup,
+  browser writer lease, and browser atomic manifest publish.
+
+### Recommended Next Action
+
+- Start a browser persistence phase whose first slice removes blocking
+  persistent storage calls from the engine path before wiring IndexedDB/OPFS.
