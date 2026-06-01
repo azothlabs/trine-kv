@@ -6,10 +6,11 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll, Waker},
     thread,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -77,6 +78,10 @@ struct BlockingTaskPoolState {
     wake: Condvar,
     worker_count: usize,
     queue_depth: usize,
+    submitted_tasks: AtomicU64,
+    completed_tasks: AtomicU64,
+    rejected_tasks: AtomicU64,
+    total_runtime_micros: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -94,6 +99,17 @@ struct BlockingTaskQueue {
 #[derive(Debug, Clone, Default)]
 pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RuntimeBlockingAdapterStats {
+    pub(crate) worker_count: usize,
+    pub(crate) queue_capacity: usize,
+    pub(crate) queued_tasks: usize,
+    pub(crate) submitted_tasks: u64,
+    pub(crate) completed_tasks: u64,
+    pub(crate) rejected_tasks: u64,
+    pub(crate) total_runtime_micros: u64,
 }
 
 impl RuntimeOptions {
@@ -200,7 +216,7 @@ impl RuntimeCapabilities {
 }
 
 const fn platform_async_io_flag() -> u8 {
-    if cfg!(feature = "platform-io") {
+    if cfg!(all(feature = "platform-io", target_os = "linux")) {
         PLATFORM_ASYNC_IO
     } else {
         0
@@ -285,6 +301,10 @@ impl Runtime {
         })?;
         Ok(BlockingResultFuture { state })
     }
+
+    pub(crate) fn blocking_adapter_stats(&self) -> Option<RuntimeBlockingAdapterStats> {
+        self.blocking_pool.as_ref().map(|pool| pool.stats())
+    }
 }
 
 impl<T> fmt::Debug for BlockingResultFuture<T> {
@@ -333,6 +353,10 @@ impl BlockingTaskPool {
                 wake: Condvar::new(),
                 worker_count: worker_count.max(1),
                 queue_depth: queue_depth.max(1),
+                submitted_tasks: AtomicU64::new(0),
+                completed_tasks: AtomicU64::new(0),
+                rejected_tasks: AtomicU64::new(0),
+                total_runtime_micros: AtomicU64::new(0),
             }),
             workers: Mutex::new(BlockingWorkers::default()),
         }
@@ -341,6 +365,10 @@ impl BlockingTaskPool {
     fn submit(&self, task: BlockingTask) -> Result<()> {
         self.ensure_started()?;
         self.state.submit(task)
+    }
+
+    fn stats(&self) -> RuntimeBlockingAdapterStats {
+        self.state.stats()
     }
 
     fn ensure_started(&self) -> Result<()> {
@@ -398,12 +426,15 @@ impl BlockingTaskPoolState {
             .lock()
             .map_err(|_| Error::runtime_busy("blocking task queue is poisoned"))?;
         if queue.shutdown {
+            self.rejected_tasks.fetch_add(1, Ordering::Relaxed);
             return Err(Error::Closed);
         }
         if queue.tasks.len() >= self.queue_depth {
+            self.rejected_tasks.fetch_add(1, Ordering::Relaxed);
             return Err(Error::runtime_busy("blocking task queue is full"));
         }
         queue.tasks.push_back(task);
+        self.submitted_tasks.fetch_add(1, Ordering::Relaxed);
         self.wake.notify_one();
         Ok(())
     }
@@ -432,12 +463,36 @@ impl BlockingTaskPoolState {
             self.wake.notify_all();
         }
     }
+
+    fn record_completed(&self, runtime: Duration) {
+        self.completed_tasks.fetch_add(1, Ordering::Relaxed);
+        self.total_runtime_micros
+            .fetch_add(duration_to_micros_saturating(runtime), Ordering::Relaxed);
+    }
+
+    fn stats(&self) -> RuntimeBlockingAdapterStats {
+        RuntimeBlockingAdapterStats {
+            worker_count: self.worker_count,
+            queue_capacity: self.queue_depth,
+            queued_tasks: self.queue.lock().map_or(0, |queue| queue.tasks.len()),
+            submitted_tasks: self.submitted_tasks.load(Ordering::Acquire),
+            completed_tasks: self.completed_tasks.load(Ordering::Acquire),
+            rejected_tasks: self.rejected_tasks.load(Ordering::Acquire),
+            total_runtime_micros: self.total_runtime_micros.load(Ordering::Acquire),
+        }
+    }
 }
 
 fn blocking_worker_loop(state: &BlockingTaskPoolState) {
     while let Some(task) = state.next_task() {
+        let started = Instant::now();
         let _ = panic::catch_unwind(AssertUnwindSafe(task));
+        state.record_completed(started.elapsed());
     }
+}
+
+fn duration_to_micros_saturating(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 impl RuntimeTask {
@@ -536,7 +591,10 @@ mod tests {
         assert!(platform.cancellation_tokens());
         assert!(platform.task_join());
         assert!(platform.blocking_adapter());
-        assert_eq!(platform.platform_async_io(), cfg!(feature = "platform-io"));
+        assert_eq!(
+            platform.platform_async_io(),
+            cfg!(all(feature = "platform-io", target_os = "linux"))
+        );
 
         let inline = RuntimeOptions::inline().capabilities();
         assert!(!inline.background_threads());
@@ -651,6 +709,15 @@ mod tests {
             .spawn_blocking(|| {})
             .expect_err("third blocking task exceeds bounded queue");
         assert!(matches!(error, Error::RuntimeBusy { .. }));
+        let stats = runtime
+            .blocking_adapter_stats()
+            .expect("blocking adapter stats exist");
+        assert_eq!(stats.worker_count, 1);
+        assert_eq!(stats.queue_capacity, 1);
+        assert_eq!(stats.queued_tasks, 1);
+        assert_eq!(stats.submitted_tasks, 2);
+        assert_eq!(stats.completed_tasks, 0);
+        assert_eq!(stats.rejected_tasks, 1);
         assert!(
             queued_rx.recv_timeout(Duration::from_millis(20)).is_err(),
             "queued task must wait until the active worker is released"

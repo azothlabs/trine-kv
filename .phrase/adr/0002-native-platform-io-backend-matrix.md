@@ -42,6 +42,12 @@ Trine records native platform I/O by operation class:
 - platform-driver blocking fallback task count;
 - Trine bounded blocking-adapter task count.
 
+`PlatformAsyncIo` capability is advertised only when the selected target has at
+least one true Trine-level platform async storage operation. A target whose
+current Trine composite operations are all fallback-classified must use the
+bounded blocking adapter instead of starting a platform driver only to count
+fallback work.
+
 ## Consequences
 
 - Linux true async requires the native async backend feature.
@@ -52,3 +58,5 @@ Trine records native platform I/O by operation class:
   a stronger backend is implemented and verified.
 - Directory enumeration remains a separately counted blocker until a backend
   exposes a real async directory enumeration operation.
+- With the current backend matrix, non-Linux targets do not advertise
+  `PlatformAsyncIo` even when the `platform-io` Cargo feature is enabled.

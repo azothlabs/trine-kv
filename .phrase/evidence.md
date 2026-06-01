@@ -8102,3 +8102,141 @@ Record only evidence that can change planning or durable decisions.
 
 - Treat phases 110 through 116 as closed. Future OS backend work should start
   from ADR 0002 and a fresh backend boundary receipt.
+
+## Phase 117: True Async Capability Hardening
+
+### Observation
+
+- Directory enumeration is still not exposed as a native async filesystem
+  operation by the selected backend. Linux directory snapshot listing would
+  require an async enumeration primitive rather than wrapping `read_dir` in a
+  worker.
+- Windows lower-level read/write primitives can use IOCP, but the selected
+  filesystem layer still uses blocking or ordinary APIs for open, metadata,
+  sync, delete, rename, directory create, and listing. Current Trine storage
+  operations are composite operations, so these fallback steps prevent
+  end-to-end true async classification.
+- Non-Linux Unix uses polling fallback in the selected backend. FreeBSD and
+  Solarish lower-level AIO support in the dependency is not enough for current
+  Trine composite operations because object open, metadata, sync, directory,
+  and publish steps still require fallback.
+
+### Interpretation
+
+- The three requested gaps cannot be honestly completed by changing the matrix
+  to `TrueAsync`; doing so would repeat the same architectural mistake the
+  backend boundary guardrail was added to prevent.
+- The correct closure for this slice is to prevent `PlatformAsyncIo` from being
+  advertised on targets whose current Trine storage operations are all
+  fallback-classified.
+
+### Change
+
+- Gated `RuntimeOptions::platform_io()` so `PlatformAsyncIo` is advertised only
+  on Linux with the `platform-io` feature under the current backend matrix.
+- On non-Linux targets with `platform-io`, native-file storage now uses the
+  bounded blocking adapter instead of starting a platform driver that can only
+  report fallback work for current Trine operations.
+- Expanded matrix tests so Windows and non-Linux Unix composite storage
+  operations are pinned as fallback-classified.
+- Updated ADR 0002, the async storage protocol, usage docs, decision framework,
+  roadmap, and current phase with the capability rule.
+
+### Verification
+
+- `cargo test runtime_capabilities_follow_selected_mode --lib --features
+  platform-io`
+- `cargo test platform_backend_matrix_matches_target_family --lib --features
+  platform-io`
+- `cargo test platform_io_without_true_async_storage_ops_uses_blocking_adapter
+  --lib --features platform-io`
+- `cargo check`
+- `cargo check --features platform-io`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo fmt --check`
+- `git diff --check`
+- forbidden-term scan
+- project-name scan
+- backend-name leakage scan for docs/current/protocol/roadmap and
+  storage/db/stats/io/runtime boundary
+
+### Remaining Blockers
+
+- True async directory enumeration needs a backend with a real async snapshot
+  listing primitive.
+- Windows end-to-end true async needs target-specific implementations for every
+  step in the Trine composite operations, including open, metadata, sync,
+  rename, delete, directory create, lease, and listing.
+- macOS/BSD true async needs a stronger backend or hand-written target modules
+  whose complete Trine operations are verified, not just lower-level read/write
+  primitives.
+
+### Recommended Next Action
+
+- Only start OS-binding work for one target at a time, with an ADR and target
+  proof before code.
+
+## Phase 118: Async Host Boundary And Observability Closure
+
+### Observation
+
+- The remaining async tail was not another platform-driver claim. It was an
+  explicit boundary problem for host persistence plus missing observability for
+  runtime queues, storage operations, and cooperative maintenance.
+- WASI and browser persistence require host capability adapters, writer lease
+  rules, durability mapping, and recovery proof before they can be treated as
+  implemented backends.
+- Existing `DbStats` could distinguish platform/adapter task classes, but did
+  not expose queue depth, task lifecycle counts, per-operation request latency,
+  or cooperative maintenance yields.
+
+### Interpretation
+
+- The safe closure is to make unsupported host persistence selectable and
+  explicit, then fail early with `UnsupportedBackend`.
+- Async debugging needs structured stats before more backend work; otherwise
+  callers cannot tell whether work is queued, running through a blocking
+  adapter, or waiting on maintenance.
+- Resumable compaction budgets remain separate from this slice: they need a
+  focused phase because they affect maintenance scheduling and publish timing.
+
+### Change
+
+- Added explicit WASI and browser persistent storage modes through
+  `DbOptions::wasi_persistent()` and `DbOptions::browser_persistent()`, with
+  `Db::open` returning `UnsupportedBackend`.
+- Added runtime blocking-adapter stats for queue capacity, queued tasks,
+  submitted/completed/rejected task counts, and total adapter runtime.
+- Added per-storage-operation request and latency metrics to `DbStats`.
+- Added cooperative maintenance yield and bounded-wait exhaustion counters.
+- Updated the async protocol, usage docs, decision framework, roadmap, and
+  current phase.
+
+### Verification
+
+- `cargo check`
+- `cargo check --features platform-io`
+- `cargo test --lib`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo fmt --check`
+- `git diff --check`
+- forbidden-term scan
+- project-name scan
+- backend-name leakage scan for docs/current/protocol/roadmap and
+  storage/db/stats/io/runtime boundary
+
+### Remaining Blockers
+
+- Real WASI persistence still needs host capability discovery, writable lease
+  semantics, durability mapping, and recovery proof.
+- Real browser persistence still needs an async-only adapter, reliable writer
+  lease, atomic publish story, and cooperative budgeted maintenance.
+- Cooperative maintenance is observable, but resumable compaction work budgets
+  are still not implemented.
+
+### Recommended Next Action
+
+- Choose a focused next phase for real host persistence or resumable
+  maintenance budgets.

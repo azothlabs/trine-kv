@@ -371,6 +371,10 @@ Rules:
   cannot honestly use a native async file primitive.
 - must report platform-driver blocking fallback tasks separately from both
   Trine's bounded blocking adapter and true platform async I/O tasks.
+- must advertise `PlatformAsyncIo` only when the current target has at least
+  one true Trine-level platform async storage operation. A target whose current
+  Trine composite operations are all fallback-classified must use the bounded
+  blocking adapter instead of a platform driver that only counts fallback work.
 
 #### Native Platform Backend Matrix
 
@@ -391,6 +395,11 @@ Other targets: unsupported fallback; persistent platform I/O must be rejected
                or explicitly counted as fallback.
 ```
 
+With the current backend matrix, `RuntimeOptions::platform_io()` advertises
+`PlatformAsyncIo` only on Linux when the `platform-io` Cargo feature is enabled.
+On non-Linux targets it remains a native runtime mode with blocking-adapter
+support until a stronger target backend exists.
+
 ### 9.3 WASI Backend
 
 The WASI backend is persistent only when the host grants suitable storage
@@ -398,6 +407,8 @@ capabilities.
 
 Rules:
 
+- `DbOptions::wasi_persistent()` selects the WASI host boundary and currently
+  returns `UnsupportedBackend` until the host capability adapter exists;
 - option validation checks required capabilities during open;
 - unsupported strict durability returns `UnsupportedDurability`;
 - writer lease support is required for writable persistent open;
@@ -411,6 +422,8 @@ The browser backend is async-only.
 Rules:
 
 - memory mode is always allowed when the build includes it;
+- `DbOptions::browser_persistent()` selects the browser host boundary and
+  currently returns `UnsupportedBackend` until the persistent adapter exists;
 - persistent writable mode requires reliable writer leasing;
 - if writer leasing or atomic manifest publish is unavailable, writable
   persistent open fails;
@@ -452,6 +465,7 @@ Stats and diagnostics should expose:
 - storage request latency by operation;
 - cooperative worker yields;
 - background task budget exhaustion;
+- blocking-adapter queued/submitted/completed/rejected task counts;
 - blocking adapter call count when enabled;
 - whether the storage backend uses a blocking adapter or platform async I/O;
 - true platform async task count;

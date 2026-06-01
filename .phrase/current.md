@@ -6,119 +6,72 @@ Complete
 
 ## Goal
 
-Close Phases 110 through 116 by turning the platform backend work into an
-evidence-backed capability matrix, target switch layer, honest per-operation
-stats, directory-listing closure, and final async storage verification gate.
-
-## Backend Boundary Receipt
-
-- Trine operations owned by `io`: length lookup, owned random read, optional
-  whole-object read, temp-write-and-rename publish, append-object open, append,
-  persist, object delete, directory create, directory sync, directory listing,
-  and writer lease acquisition.
-- Owned interface: `IoCompletion`, `IoDriverInfo`, `IoDriverKind`,
-  `InlineIoDriver`, `BlockingAdapterIoDriver`, `PlatformIoDriver`, platform
-  operation class, and platform backend capability matrix.
-- Selected backend: feature-gated native platform backend below `src/io.rs`.
-- Backend switch targets: Linux native async path, Windows native-capable
-  backend path with fallback-classified Trine composite operations, Unix
-  polling fallback path, and explicit unsupported fallback path.
-- Backend limits: directory listing has no true native async enumeration
-  primitive in the selected backend and remains a separately counted
-  platform-driver blocking fallback. macOS/BSD regular-file operations are not
-  claimed as true native async without a stronger backend.
-- Leak-check scope: docs/current/roadmap/protocol/storage/db/stats/io boundary
-  must name Trine `io`, platform backend, capabilities, operation classes, and
-  fallbacks rather than a dependency crate. Cargo metadata, backend
-  implementation code, and dependency-selection evidence may name the
-  dependency.
-- Verification gate: platform backend matrix tests, focused platform storage
-  tests, full feature gate, diff check, forbidden-term scan, project-name scan,
-  and backend-name leakage scan.
+Close the remaining async tail after true-async capability hardening: make
+WASI/browser persistent storage an explicit host-backend boundary, expose
+storage/runtime observability needed to debug async behavior, and surface
+cooperative maintenance yields without changing storage format or core
+database semantics.
 
 ## Scope
 
-- Phase 110: record a platform backend capability matrix for Linux, Windows,
-  macOS/BSD/Unix fallback, and unsupported fallback.
-- Phase 111: add an `io` backend switch layer below `PlatformIoDriver`.
-- Phase 112: enable Linux native async backend through the platform backend
-  feature and classify Linux operations as true async except directory listing.
-- Phase 113: record that Windows read/write primitives are IOCP-capable, while
-  current Trine composite storage operations remain backend fallback because
-  they include fallback-classified open, metadata, sync, rename, or directory
-  work.
-- Phase 114: record macOS/BSD as a backend decision: polling fallback only for
-  regular files in this phase, not true native async.
-- Phase 115: close directory enumeration by making it an explicit
-  platform-driver blocking fallback with tests and stats.
-- Phase 116: run final async storage gate and record evidence.
+- Phase 118: async host boundary and observability closure.
 
 ## Out Of Scope
 
-- Replacing the selected backend dependency.
-- Adding hand-written OS bindings for Linux, Windows, macOS, or BSD.
-- Claiming macOS/BSD ordinary file reads and writes are true native async.
-- Making platform I/O the default runtime mode.
-- Changing public API behavior, storage format, WAL, MVCC, table, manifest,
-  compaction, transaction, or recovery semantics.
+- Implementing real WASI or browser persistence.
+- Adding hand-written OS bindings, replacing the platform backend, or claiming
+  fallback work as true OS async.
+- Changing WAL, MVCC, table, manifest, transaction, recovery, or compaction
+  correctness rules.
 
 ## Acceptance Gate
 
-- Linux builds enable the native async backend feature and classify supported
-  file operations as true platform async work.
-- Windows builds classify current Trine composite storage operations as backend
-  fallback unless a future implementation proves every step in that operation
-  can use a native async primitive.
-- macOS/BSD/other Unix builds classify platform-driver file work as backend
-  fallback unless a stronger backend is added.
-- Directory listing is explicitly counted as platform-driver blocking fallback,
-  separate from true platform async work and separate from Trine's bounded
-  blocking adapter.
-- `DbStats` reports true platform async tasks, platform backend fallback tasks,
-  platform blocking fallback tasks, and blocking-adapter tasks separately.
-- Docs/protocol/current/roadmap pass backend-name leakage scan outside allowed
-  files.
-- Formatting, clippy, full tests, `git diff --check`, forbidden-term scan,
-  project-name scan, and backend-name leakage scan pass.
+- WASI and browser persistent modes are explicit public options and fail with
+  `UnsupportedBackend` until their host capability adapters exist.
+- `DbStats` exposes blocking-adapter queue capacity, queued/submitted/completed
+  /rejected task counts, total adapter runtime, and per-storage-operation
+  request/latency counters.
+- Cooperative maintenance yield and budget-exhaustion counters are recorded
+  when foreground work yields to background maintenance or bounded waiting
+  expires.
+- Existing runtime/storage/backend capability behavior remains unchanged.
+- Formatting, clippy, full tests, `platform-io` check, `git diff --check`,
+  forbidden-term scan, project-name scan, and backend-name leakage scan pass.
 
 ## Active Task Slice
 
 ```text
-task479 [x] goal:record 110-116 backend boundary receipt | scope:.phrase/current.md | verify:manual
-task480 [x] goal:add platform backend operation matrix | scope:src/io.rs src/io/platform_backend.rs | verify:io tests
-task481 [x] goal:add target backend switch modules | scope:src/io/platform_backend/*.rs | verify:cargo check --features platform-io
-task482 [x] goal:enable Linux native async backend feature | scope:Cargo.toml Cargo.lock | verify:cargo check --features platform-io
-task483 [x] goal:surface true async vs backend fallback stats | scope:src/stats.rs src/db.rs src/storage.rs | verify:platform storage tests
-task484 [x] goal:record directory enumeration closure and mac/BSD decision | scope:docs .phrase | verify:leakage scan
-task485 [x] goal:run final async storage gate | scope:repo | verify:full gate
-task486 [x] goal:commit 110-116 closure | scope:git | verify:git status
+task492 [x] goal:add explicit WASI/browser persistent backend boundary | scope:src/options.rs src/db.rs docs protocol | verify:unsupported-backend test
+task493 [x] goal:add runtime blocking-adapter queue observability | scope:src/runtime.rs src/storage.rs src/stats.rs | verify:runtime/storage tests
+task494 [x] goal:add storage operation request/latency stats | scope:src/storage.rs src/stats.rs docs | verify:storage/db stats tests
+task495 [x] goal:add cooperative maintenance yield counters | scope:src/db.rs src/stats.rs | verify:compaction wait test
+task496 [x] goal:run final gate and record evidence | scope:repo .phrase | verify:full gate
 ```
 
 ## Known Blockers
 
-- Directory enumeration remains true-async-blocked until a backend exposes a
-  native async directory enumeration operation.
-- macOS/BSD ordinary file operations remain backend fallback in this phase.
+- Real WASI persistence still needs host capability discovery, writable lease
+  semantics, durability mapping, and recovery proof.
+- Real browser persistence still needs an async-only adapter, reliable writer
+  lease, atomic publish story, and cooperative budgeted maintenance.
+- Cooperative maintenance is now observable, but resumable compaction work
+  budgets are still a future implementation phase.
 
 ## Evidence
 
-- Local dependency audit: the selected backend line supports Linux native async
-  when its native async feature is enabled and Windows IOCP for lower-level
-  read/write primitives, but current Windows Trine composite storage operations
-  still include fallback-classified steps. Non-Linux Unix uses polling
-  fallback. The filesystem crate does not expose directory enumeration.
-- Implementation evidence: the platform backend matrix now records operation
-  classes per target family, storage stats distinguish true platform async
-  tasks from backend fallback and blocking fallback tasks, and Linux builds
-  enable the selected backend's native async feature through `platform-io`.
-- Verification evidence: `cargo check`, `cargo check --features platform-io`,
-  focused platform matrix/storage tests, `cargo clippy --all-targets
-  --all-features -- -D warnings`, `cargo test --all-targets --all-features`,
-  `cargo fmt --check`, `git diff --check`, forbidden-term scan, project-name
-  scan, and backend-name leakage scan pass.
+- `DbOptions::wasi_persistent()` and `DbOptions::browser_persistent()` now
+  select explicit host persistent modes and return `UnsupportedBackend`.
+- `DbStats` now includes runtime queue stats and per-storage-operation
+  request/latency metrics.
+- `DbStats` now includes cooperative maintenance yield and budget-exhaustion
+  counters.
+- Verification: `cargo check`, `cargo check --features platform-io`, `cargo
+  test --lib`, `cargo clippy --all-targets --all-features -- -D warnings`,
+  `cargo test --all-targets --all-features`, `cargo fmt --check`, `git diff
+  --check`, forbidden-term scan, project-name scan, and backend-name leakage
+  scan pass.
 
 ## Next Recommendation
 
-- Keep the matrix as the source of truth for future platform I/O work. Only
-  start hand-written OS backend work after a new boundary receipt and
-  target-specific proof that the operation can honestly be true async.
+- Commit this closure, then choose a focused next phase for real host
+  persistence or resumable maintenance budgets.

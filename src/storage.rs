@@ -10,7 +10,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     task::{Context, Poll, Waker},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -23,6 +23,7 @@ use crate::{
     },
     options::DurabilityMode,
     runtime::Runtime,
+    stats::{StorageOperationMetric, StorageOperationStats},
 };
 
 #[cfg(feature = "platform-io")]
@@ -779,6 +780,11 @@ impl NativeFileBackend {
 
     pub(crate) fn stats(&self) -> NativeFileStorageStats {
         let driver = self.io_driver_info();
+        let blocking_adapter_stats = self
+            .runtime
+            .as_ref()
+            .and_then(Runtime::blocking_adapter_stats)
+            .unwrap_or_default();
         NativeFileStorageStats {
             uses_blocking_adapter: self
                 .runtime
@@ -786,10 +792,17 @@ impl NativeFileBackend {
                 .is_some_and(|runtime| runtime.capabilities().blocking_adapter()),
             uses_platform_async_io: driver.kind().is_platform_async(),
             blocking_adapter_tasks: self.metrics.blocking_adapter_tasks(),
+            blocking_adapter_queue_capacity: blocking_adapter_stats.queue_capacity,
+            blocking_adapter_queued_tasks: blocking_adapter_stats.queued_tasks,
+            blocking_adapter_submitted_tasks: blocking_adapter_stats.submitted_tasks,
+            blocking_adapter_completed_tasks: blocking_adapter_stats.completed_tasks,
+            blocking_adapter_rejected_tasks: blocking_adapter_stats.rejected_tasks,
+            blocking_adapter_total_runtime_micros: blocking_adapter_stats.total_runtime_micros,
             platform_async_io_tasks: self.metrics.platform_async_io_tasks(),
             platform_backend_fallback_tasks: self.metrics.platform_backend_fallback_tasks(),
             platform_blocking_fallback_tasks: self.metrics.platform_blocking_fallback_tasks(),
             inline_tasks: self.metrics.inline_tasks(),
+            operations: self.metrics.operation_stats(),
         }
     }
 
@@ -812,6 +825,7 @@ impl NativeFileBackend {
 
     fn run_owned_storage_task<T>(
         &self,
+        operation: StorageOperation,
         task: impl FnOnce() -> Result<T> + Send + 'static,
     ) -> StorageFuture<'_, T>
     where
@@ -820,12 +834,20 @@ impl NativeFileBackend {
         if let Some(runtime) = self.runtime.clone() {
             if runtime.capabilities().blocking_adapter() {
                 self.metrics.record_blocking_adapter_task();
-                return Box::pin(async move { runtime.spawn_blocking_result(task)?.await });
+                return record_timed_storage_future(
+                    Arc::clone(&self.metrics),
+                    operation,
+                    Box::pin(async move { runtime.spawn_blocking_result(task)?.await }),
+                );
             }
         }
 
         self.metrics.record_inline_task();
-        Box::pin(async move { task() })
+        record_timed_storage_future(
+            Arc::clone(&self.metrics),
+            operation,
+            Box::pin(async move { task() }),
+        )
     }
 }
 
@@ -842,6 +864,57 @@ struct NativeFileStorageMetrics {
     platform_backend_fallback: AtomicU64,
     platform_blocking_fallback: AtomicU64,
     inline: AtomicU64,
+    operations: NativeFileStorageOperationMetrics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageOperation {
+    OpenRead,
+    Len,
+    ReadExactAt,
+    ReadExactAtOwned,
+    ReadObjectBytes,
+    OpenAppend,
+    Append,
+    Persist,
+    RewriteWal,
+    AcquireWriterLease,
+    CreateDirectoryAll,
+    ListDirectoryFiles,
+    SyncDirectoryAfterRenames,
+    ReadCurrentManifest,
+    PublishManifest,
+    WriteObject,
+    DeleteObject,
+    ListObjects,
+}
+
+#[derive(Debug, Default)]
+struct NativeFileStorageOperationMetrics {
+    open_read: NativeFileStorageOperationMetric,
+    len: NativeFileStorageOperationMetric,
+    read_exact_at: NativeFileStorageOperationMetric,
+    read_exact_at_owned: NativeFileStorageOperationMetric,
+    read_object_bytes: NativeFileStorageOperationMetric,
+    open_append: NativeFileStorageOperationMetric,
+    append: NativeFileStorageOperationMetric,
+    persist: NativeFileStorageOperationMetric,
+    rewrite_wal: NativeFileStorageOperationMetric,
+    acquire_writer_lease: NativeFileStorageOperationMetric,
+    create_directory_all: NativeFileStorageOperationMetric,
+    list_directory_files: NativeFileStorageOperationMetric,
+    sync_directory_after_renames: NativeFileStorageOperationMetric,
+    read_current_manifest: NativeFileStorageOperationMetric,
+    publish_manifest: NativeFileStorageOperationMetric,
+    write_object: NativeFileStorageOperationMetric,
+    delete_object: NativeFileStorageOperationMetric,
+    list_objects: NativeFileStorageOperationMetric,
+}
+
+#[derive(Debug, Default)]
+struct NativeFileStorageOperationMetric {
+    requests: AtomicU64,
+    total_latency_micros: AtomicU64,
 }
 
 impl NativeFileStorageMetrics {
@@ -849,7 +922,6 @@ impl NativeFileStorageMetrics {
         self.blocking_adapter.fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg(feature = "platform-io")]
     #[cfg(feature = "platform-io")]
     fn record_platform_io_task(&self, class: PlatformIoTaskClass) {
         match class {
@@ -873,6 +945,12 @@ impl NativeFileStorageMetrics {
         self.inline.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_operation(&self, operation: StorageOperation, latency: Duration) {
+        self.operations
+            .metric(operation)
+            .record(duration_to_micros_saturating(latency));
+    }
+
     fn blocking_adapter_tasks(&self) -> u64 {
         self.blocking_adapter.load(Ordering::Acquire)
     }
@@ -892,6 +970,73 @@ impl NativeFileStorageMetrics {
     fn inline_tasks(&self) -> u64 {
         self.inline.load(Ordering::Acquire)
     }
+
+    fn operation_stats(&self) -> StorageOperationStats {
+        self.operations.snapshot()
+    }
+}
+
+impl NativeFileStorageOperationMetrics {
+    fn metric(&self, operation: StorageOperation) -> &NativeFileStorageOperationMetric {
+        match operation {
+            StorageOperation::OpenRead => &self.open_read,
+            StorageOperation::Len => &self.len,
+            StorageOperation::ReadExactAt => &self.read_exact_at,
+            StorageOperation::ReadExactAtOwned => &self.read_exact_at_owned,
+            StorageOperation::ReadObjectBytes => &self.read_object_bytes,
+            StorageOperation::OpenAppend => &self.open_append,
+            StorageOperation::Append => &self.append,
+            StorageOperation::Persist => &self.persist,
+            StorageOperation::RewriteWal => &self.rewrite_wal,
+            StorageOperation::AcquireWriterLease => &self.acquire_writer_lease,
+            StorageOperation::CreateDirectoryAll => &self.create_directory_all,
+            StorageOperation::ListDirectoryFiles => &self.list_directory_files,
+            StorageOperation::SyncDirectoryAfterRenames => &self.sync_directory_after_renames,
+            StorageOperation::ReadCurrentManifest => &self.read_current_manifest,
+            StorageOperation::PublishManifest => &self.publish_manifest,
+            StorageOperation::WriteObject => &self.write_object,
+            StorageOperation::DeleteObject => &self.delete_object,
+            StorageOperation::ListObjects => &self.list_objects,
+        }
+    }
+
+    fn snapshot(&self) -> StorageOperationStats {
+        StorageOperationStats {
+            open_read: self.open_read.snapshot(),
+            len: self.len.snapshot(),
+            read_exact_at: self.read_exact_at.snapshot(),
+            read_exact_at_owned: self.read_exact_at_owned.snapshot(),
+            read_object_bytes: self.read_object_bytes.snapshot(),
+            open_append: self.open_append.snapshot(),
+            append: self.append.snapshot(),
+            persist: self.persist.snapshot(),
+            rewrite_wal: self.rewrite_wal.snapshot(),
+            acquire_writer_lease: self.acquire_writer_lease.snapshot(),
+            create_directory_all: self.create_directory_all.snapshot(),
+            list_directory_files: self.list_directory_files.snapshot(),
+            sync_directory_after_renames: self.sync_directory_after_renames.snapshot(),
+            read_current_manifest: self.read_current_manifest.snapshot(),
+            publish_manifest: self.publish_manifest.snapshot(),
+            write_object: self.write_object.snapshot(),
+            delete_object: self.delete_object.snapshot(),
+            list_objects: self.list_objects.snapshot(),
+        }
+    }
+}
+
+impl NativeFileStorageOperationMetric {
+    fn record(&self, latency_micros: u64) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.total_latency_micros
+            .fetch_add(latency_micros, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> StorageOperationMetric {
+        StorageOperationMetric {
+            requests: self.requests.load(Ordering::Acquire),
+            total_latency_micros: self.total_latency_micros.load(Ordering::Acquire),
+        }
+    }
 }
 
 #[cfg(feature = "platform-io")]
@@ -908,10 +1053,48 @@ pub(crate) struct NativeFileStorageStats {
     pub(crate) uses_blocking_adapter: bool,
     pub(crate) uses_platform_async_io: bool,
     pub(crate) blocking_adapter_tasks: u64,
+    pub(crate) blocking_adapter_queue_capacity: usize,
+    pub(crate) blocking_adapter_queued_tasks: usize,
+    pub(crate) blocking_adapter_submitted_tasks: u64,
+    pub(crate) blocking_adapter_completed_tasks: u64,
+    pub(crate) blocking_adapter_rejected_tasks: u64,
+    pub(crate) blocking_adapter_total_runtime_micros: u64,
     pub(crate) platform_async_io_tasks: u64,
     pub(crate) platform_backend_fallback_tasks: u64,
     pub(crate) platform_blocking_fallback_tasks: u64,
     pub(crate) inline_tasks: u64,
+    pub(crate) operations: StorageOperationStats,
+}
+
+fn record_timed_storage_result<T>(
+    metrics: &NativeFileStorageMetrics,
+    operation: StorageOperation,
+    task: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let started = Instant::now();
+    let result = task();
+    metrics.record_operation(operation, started.elapsed());
+    result
+}
+
+fn record_timed_storage_future<'op, T>(
+    metrics: Arc<NativeFileStorageMetrics>,
+    operation: StorageOperation,
+    future: StorageFuture<'op, T>,
+) -> StorageFuture<'op, T>
+where
+    T: 'op,
+{
+    Box::pin(async move {
+        let started = Instant::now();
+        let result = future.await;
+        metrics.record_operation(operation, started.elapsed());
+        result
+    })
+}
+
+fn duration_to_micros_saturating(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 impl StorageReadBackend for NativeFileBackend {
@@ -940,27 +1123,35 @@ impl StorageReadBackend for NativeFileBackend {
         #[cfg(feature = "platform-io")]
         let platform_io = self.platform_io.clone();
         let metrics = Arc::clone(&self.metrics);
-        Box::pin(async move {
-            NativeFileObject::open(
-                object,
-                runtime,
-                #[cfg(feature = "platform-io")]
-                platform_io,
-                metrics,
-            )
-        })
+        let object_metrics = Arc::clone(&metrics);
+        record_timed_storage_future(
+            metrics,
+            StorageOperation::OpenRead,
+            Box::pin(async move {
+                NativeFileObject::open(
+                    object,
+                    runtime,
+                    #[cfg(feature = "platform-io")]
+                    platform_io,
+                    object_metrics,
+                )
+            }),
+        )
     }
 }
 
 impl BlockingStorageReadBackend for NativeFileBackend {
     fn open_read_blocking(&self, object: StorageObjectId) -> Result<Self::ReadObject> {
-        NativeFileObject::open(
-            object,
-            self.runtime.clone(),
-            #[cfg(feature = "platform-io")]
-            self.platform_io.clone(),
-            Arc::clone(&self.metrics),
-        )
+        let metrics = Arc::clone(&self.metrics);
+        record_timed_storage_result(self.metrics.as_ref(), StorageOperation::OpenRead, || {
+            NativeFileObject::open(
+                object,
+                self.runtime.clone(),
+                #[cfg(feature = "platform-io")]
+                self.platform_io.clone(),
+                metrics,
+            )
+        })
     }
 }
 
@@ -969,25 +1160,37 @@ impl StorageObjectReadBackend for NativeFileBackend {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
-            return Box::pin(async move {
-                require_native_file_object_read()?;
-                let completion = driver.submit_read_optional_path(object.path().to_path_buf())?;
-                record_platform_io_task(
-                    metrics.as_ref(),
-                    &driver,
-                    PlatformIoOperation::OptionalWholeObjectRead,
-                );
-                completion.await
-            });
+            let task_metrics = Arc::clone(&metrics);
+            return record_timed_storage_future(
+                metrics,
+                StorageOperation::ReadObjectBytes,
+                Box::pin(async move {
+                    require_native_file_object_read()?;
+                    let completion =
+                        driver.submit_read_optional_path(object.path().to_path_buf())?;
+                    record_platform_io_task(
+                        task_metrics.as_ref(),
+                        &driver,
+                        PlatformIoOperation::OptionalWholeObjectRead,
+                    );
+                    completion.await
+                }),
+            );
         }
 
-        self.run_owned_storage_task(move || read_native_file_object_bytes(&object))
+        self.run_owned_storage_task(StorageOperation::ReadObjectBytes, move || {
+            read_native_file_object_bytes(&object)
+        })
     }
 }
 
 impl BlockingStorageObjectReadBackend for NativeFileBackend {
     fn read_object_bytes_blocking(&self, object: StorageObjectId) -> Result<Option<Arc<[u8]>>> {
-        read_native_file_object_bytes(&object)
+        record_timed_storage_result(
+            self.metrics.as_ref(),
+            StorageOperation::ReadObjectBytes,
+            || read_native_file_object_bytes(&object),
+        )
     }
 }
 
@@ -1001,25 +1204,30 @@ impl StorageAppendBackend for NativeFileBackend {
         let metrics = Arc::clone(&self.metrics);
         #[cfg(feature = "platform-io")]
         if let Some(driver) = platform_io.clone() {
-            return Box::pin(async move {
-                require_native_file_append(&object)?;
-                let completion = driver.submit_open_append_path(object.path().to_path_buf())?;
-                record_platform_io_task(
-                    metrics.as_ref(),
-                    &driver,
-                    PlatformIoOperation::AppendObjectOpen,
-                );
-                completion.await?;
-                Ok(NativeFileAppendObject::open_platform(
-                    object,
-                    runtime,
-                    platform_io,
-                    metrics,
-                ))
-            });
+            let task_metrics = Arc::clone(&metrics);
+            return record_timed_storage_future(
+                metrics,
+                StorageOperation::OpenAppend,
+                Box::pin(async move {
+                    require_native_file_append(&object)?;
+                    let completion = driver.submit_open_append_path(object.path().to_path_buf())?;
+                    record_platform_io_task(
+                        task_metrics.as_ref(),
+                        &driver,
+                        PlatformIoOperation::AppendObjectOpen,
+                    );
+                    completion.await?;
+                    Ok(NativeFileAppendObject::open_platform(
+                        object,
+                        runtime,
+                        platform_io,
+                        task_metrics,
+                    ))
+                }),
+            );
         }
 
-        self.run_owned_storage_task(move || {
+        self.run_owned_storage_task(StorageOperation::OpenAppend, move || {
             NativeFileAppendObject::open(
                 &object,
                 runtime,
@@ -1033,13 +1241,16 @@ impl StorageAppendBackend for NativeFileBackend {
 
 impl BlockingStorageAppendBackend for NativeFileBackend {
     fn open_append_blocking(&self, object: StorageObjectId) -> Result<Self::AppendObject> {
-        NativeFileAppendObject::open(
-            &object,
-            self.runtime.clone(),
-            #[cfg(feature = "platform-io")]
-            self.platform_io.clone(),
-            Arc::clone(&self.metrics),
-        )
+        let metrics = Arc::clone(&self.metrics);
+        record_timed_storage_result(self.metrics.as_ref(), StorageOperation::OpenAppend, || {
+            NativeFileAppendObject::open(
+                &object,
+                self.runtime.clone(),
+                #[cfg(feature = "platform-io")]
+                self.platform_io.clone(),
+                metrics,
+            )
+        })
     }
 }
 
@@ -1054,21 +1265,27 @@ impl StorageWalRewriteBackend for NativeFileBackend {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
-            return Box::pin(async move {
-                let (path, tmp_path) =
-                    prepare_native_file_wal_rewrite(&object, &temporary_object, durability)?;
-                let completion = driver
-                    .submit_write_temp_rename_path(path, tmp_path, bytes, durability, true, true)?;
-                record_platform_io_task(
-                    metrics.as_ref(),
-                    &driver,
-                    PlatformIoOperation::TempWriteRenamePublish,
-                );
-                completion.await
-            });
+            let task_metrics = Arc::clone(&metrics);
+            return record_timed_storage_future(
+                metrics,
+                StorageOperation::RewriteWal,
+                Box::pin(async move {
+                    let (path, tmp_path) =
+                        prepare_native_file_wal_rewrite(&object, &temporary_object, durability)?;
+                    let completion = driver.submit_write_temp_rename_path(
+                        path, tmp_path, bytes, durability, true, true,
+                    )?;
+                    record_platform_io_task(
+                        task_metrics.as_ref(),
+                        &driver,
+                        PlatformIoOperation::TempWriteRenamePublish,
+                    );
+                    completion.await
+                }),
+            );
         }
 
-        self.run_owned_storage_task(move || {
+        self.run_owned_storage_task(StorageOperation::RewriteWal, move || {
             rewrite_native_file_wal(&object, &temporary_object, &bytes, durability)
         })
     }
@@ -1082,7 +1299,9 @@ impl BlockingStorageWalRewriteBackend for NativeFileBackend {
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
     ) -> Result<()> {
-        rewrite_native_file_wal(&object, &temporary_object, &bytes, durability)
+        record_timed_storage_result(self.metrics.as_ref(), StorageOperation::RewriteWal, || {
+            rewrite_native_file_wal(&object, &temporary_object, &bytes, durability)
+        })
     }
 }
 
@@ -1096,24 +1315,31 @@ impl StorageWriterLeaseBackend for NativeFileBackend {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
-            return Box::pin(async move {
-                require_native_file_writer_lease(&object)?;
-                let owner = writer_lease_owner_text();
-                let completion = driver.submit_acquire_writer_lease_path(
-                    object.path().to_path_buf(),
-                    Arc::from(owner.as_bytes()),
-                )?;
-                record_platform_io_task(
-                    metrics.as_ref(),
-                    &driver,
-                    PlatformIoOperation::WriterLeaseAcquire,
-                );
-                completion.await?;
-                Ok(NativeFileWriterLease::from_platform(object, owner, driver))
-            });
+            let task_metrics = Arc::clone(&metrics);
+            return record_timed_storage_future(
+                metrics,
+                StorageOperation::AcquireWriterLease,
+                Box::pin(async move {
+                    require_native_file_writer_lease(&object)?;
+                    let owner = writer_lease_owner_text();
+                    let completion = driver.submit_acquire_writer_lease_path(
+                        object.path().to_path_buf(),
+                        Arc::from(owner.as_bytes()),
+                    )?;
+                    record_platform_io_task(
+                        task_metrics.as_ref(),
+                        &driver,
+                        PlatformIoOperation::WriterLeaseAcquire,
+                    );
+                    completion.await?;
+                    Ok(NativeFileWriterLease::from_platform(object, owner, driver))
+                }),
+            );
         }
 
-        self.run_owned_storage_task(move || NativeFileWriterLease::acquire(object))
+        self.run_owned_storage_task(StorageOperation::AcquireWriterLease, move || {
+            NativeFileWriterLease::acquire(object)
+        })
     }
 }
 
@@ -1121,22 +1347,32 @@ impl BlockingStorageWriterLeaseBackend for NativeFileBackend {
     fn acquire_writer_lease_blocking(&self, object: StorageObjectId) -> Result<Self::WriterLease> {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = self.platform_io.clone() {
-            require_native_file_writer_lease(&object)?;
-            let owner = writer_lease_owner_text();
-            let completion = driver.submit_acquire_writer_lease_path(
-                object.path().to_path_buf(),
-                Arc::from(owner.as_bytes()),
-            )?;
-            record_platform_io_task(
+            return record_timed_storage_result(
                 self.metrics.as_ref(),
-                &driver,
-                PlatformIoOperation::WriterLeaseAcquire,
+                StorageOperation::AcquireWriterLease,
+                || {
+                    require_native_file_writer_lease(&object)?;
+                    let owner = writer_lease_owner_text();
+                    let completion = driver.submit_acquire_writer_lease_path(
+                        object.path().to_path_buf(),
+                        Arc::from(owner.as_bytes()),
+                    )?;
+                    record_platform_io_task(
+                        self.metrics.as_ref(),
+                        &driver,
+                        PlatformIoOperation::WriterLeaseAcquire,
+                    );
+                    wait_for_platform_io(completion)?;
+                    Ok(NativeFileWriterLease::from_platform(object, owner, driver))
+                },
             );
-            wait_for_platform_io(completion)?;
-            return Ok(NativeFileWriterLease::from_platform(object, owner, driver));
         }
 
-        NativeFileWriterLease::acquire(object)
+        record_timed_storage_result(
+            self.metrics.as_ref(),
+            StorageOperation::AcquireWriterLease,
+            || NativeFileWriterLease::acquire(object),
+        )
     }
 }
 
@@ -1145,26 +1381,37 @@ impl StorageDirectoryCreateBackend for NativeFileBackend {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
-            return Box::pin(async move {
-                require_native_file_directory_create()?;
-                let completion =
-                    driver.submit_create_dir_all_path(directory.path().to_path_buf())?;
-                record_platform_io_task(
-                    metrics.as_ref(),
-                    &driver,
-                    PlatformIoOperation::DirectoryCreate,
-                );
-                completion.await
-            });
+            let task_metrics = Arc::clone(&metrics);
+            return record_timed_storage_future(
+                metrics,
+                StorageOperation::CreateDirectoryAll,
+                Box::pin(async move {
+                    require_native_file_directory_create()?;
+                    let completion =
+                        driver.submit_create_dir_all_path(directory.path().to_path_buf())?;
+                    record_platform_io_task(
+                        task_metrics.as_ref(),
+                        &driver,
+                        PlatformIoOperation::DirectoryCreate,
+                    );
+                    completion.await
+                }),
+            );
         }
 
-        self.run_owned_storage_task(move || create_native_file_directory_all(&directory))
+        self.run_owned_storage_task(StorageOperation::CreateDirectoryAll, move || {
+            create_native_file_directory_all(&directory)
+        })
     }
 }
 
 impl BlockingStorageDirectoryCreateBackend for NativeFileBackend {
     fn create_directory_all_blocking(&self, directory: StorageDirectoryId) -> Result<()> {
-        create_native_file_directory_all(&directory)
+        record_timed_storage_result(
+            self.metrics.as_ref(),
+            StorageOperation::CreateDirectoryAll,
+            || create_native_file_directory_all(&directory),
+        )
     }
 }
 
@@ -1176,24 +1423,31 @@ impl StorageDirectoryListBackend for NativeFileBackend {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
-            return Box::pin(async move {
-                require_native_file_directory_listing()?;
-                let completion =
-                    driver.submit_list_file_paths_path(directory.path().to_path_buf())?;
-                record_platform_io_task(
-                    metrics.as_ref(),
-                    &driver,
-                    PlatformIoOperation::DirectoryListing,
-                );
-                let paths = completion.await?;
-                Ok(paths
-                    .into_iter()
-                    .map(StorageDirectoryFile::native_file)
-                    .collect())
-            });
+            let task_metrics = Arc::clone(&metrics);
+            return record_timed_storage_future(
+                metrics,
+                StorageOperation::ListDirectoryFiles,
+                Box::pin(async move {
+                    require_native_file_directory_listing()?;
+                    let completion =
+                        driver.submit_list_file_paths_path(directory.path().to_path_buf())?;
+                    record_platform_io_task(
+                        task_metrics.as_ref(),
+                        &driver,
+                        PlatformIoOperation::DirectoryListing,
+                    );
+                    let paths = completion.await?;
+                    Ok(paths
+                        .into_iter()
+                        .map(StorageDirectoryFile::native_file)
+                        .collect())
+                }),
+            );
         }
 
-        self.run_owned_storage_task(move || list_native_file_directory_files(&directory))
+        self.run_owned_storage_task(StorageOperation::ListDirectoryFiles, move || {
+            list_native_file_directory_files(&directory)
+        })
     }
 }
 
@@ -1204,21 +1458,32 @@ impl BlockingStorageDirectoryListBackend for NativeFileBackend {
     ) -> Result<Vec<StorageDirectoryFile>> {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = self.platform_io.clone() {
-            require_native_file_directory_listing()?;
-            let completion = driver.submit_list_file_paths_path(directory.path().to_path_buf())?;
-            record_platform_io_task(
+            return record_timed_storage_result(
                 self.metrics.as_ref(),
-                &driver,
-                PlatformIoOperation::DirectoryListing,
+                StorageOperation::ListDirectoryFiles,
+                || {
+                    require_native_file_directory_listing()?;
+                    let completion =
+                        driver.submit_list_file_paths_path(directory.path().to_path_buf())?;
+                    record_platform_io_task(
+                        self.metrics.as_ref(),
+                        &driver,
+                        PlatformIoOperation::DirectoryListing,
+                    );
+                    let paths = wait_for_platform_io(completion)?;
+                    Ok(paths
+                        .into_iter()
+                        .map(StorageDirectoryFile::native_file)
+                        .collect())
+                },
             );
-            let paths = wait_for_platform_io(completion)?;
-            return Ok(paths
-                .into_iter()
-                .map(StorageDirectoryFile::native_file)
-                .collect());
         }
 
-        list_native_file_directory_files(&directory)
+        record_timed_storage_result(
+            self.metrics.as_ref(),
+            StorageOperation::ListDirectoryFiles,
+            || list_native_file_directory_files(&directory),
+        )
     }
 }
 
@@ -1227,25 +1492,36 @@ impl StorageDirectorySyncBackend for NativeFileBackend {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
-            return Box::pin(async move {
-                require_native_file_directory_sync()?;
-                let completion = driver.submit_sync_dir_path(directory.path().to_path_buf())?;
-                record_platform_io_task(
-                    metrics.as_ref(),
-                    &driver,
-                    PlatformIoOperation::DirectorySync,
-                );
-                completion.await
-            });
+            let task_metrics = Arc::clone(&metrics);
+            return record_timed_storage_future(
+                metrics,
+                StorageOperation::SyncDirectoryAfterRenames,
+                Box::pin(async move {
+                    require_native_file_directory_sync()?;
+                    let completion = driver.submit_sync_dir_path(directory.path().to_path_buf())?;
+                    record_platform_io_task(
+                        task_metrics.as_ref(),
+                        &driver,
+                        PlatformIoOperation::DirectorySync,
+                    );
+                    completion.await
+                }),
+            );
         }
 
-        self.run_owned_storage_task(move || sync_native_file_directory_after_renames(&directory))
+        self.run_owned_storage_task(StorageOperation::SyncDirectoryAfterRenames, move || {
+            sync_native_file_directory_after_renames(&directory)
+        })
     }
 }
 
 impl BlockingStorageDirectorySyncBackend for NativeFileBackend {
     fn sync_directory_after_renames_blocking(&self, directory: StorageDirectoryId) -> Result<()> {
-        sync_native_file_directory_after_renames(&directory)
+        record_timed_storage_result(
+            self.metrics.as_ref(),
+            StorageOperation::SyncDirectoryAfterRenames,
+            || sync_native_file_directory_after_renames(&directory),
+        )
     }
 }
 
@@ -1257,25 +1533,37 @@ impl StorageManifestReadBackend for NativeFileBackend {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
-            return Box::pin(async move {
-                require_native_file_manifest_read(&object)?;
-                let completion = driver.submit_read_optional_path(object.path().to_path_buf())?;
-                record_platform_io_task(
-                    metrics.as_ref(),
-                    &driver,
-                    PlatformIoOperation::OptionalWholeObjectRead,
-                );
-                completion.await
-            });
+            let task_metrics = Arc::clone(&metrics);
+            return record_timed_storage_future(
+                metrics,
+                StorageOperation::ReadCurrentManifest,
+                Box::pin(async move {
+                    require_native_file_manifest_read(&object)?;
+                    let completion =
+                        driver.submit_read_optional_path(object.path().to_path_buf())?;
+                    record_platform_io_task(
+                        task_metrics.as_ref(),
+                        &driver,
+                        PlatformIoOperation::OptionalWholeObjectRead,
+                    );
+                    completion.await
+                }),
+            );
         }
 
-        self.run_owned_storage_task(move || read_current_manifest_from_native_file(&object))
+        self.run_owned_storage_task(StorageOperation::ReadCurrentManifest, move || {
+            read_current_manifest_from_native_file(&object)
+        })
     }
 }
 
 impl BlockingStorageManifestReadBackend for NativeFileBackend {
     fn read_current_manifest_blocking(&self, object: StorageObjectId) -> Result<Option<Arc<[u8]>>> {
-        read_current_manifest_from_native_file(&object)
+        record_timed_storage_result(
+            self.metrics.as_ref(),
+            StorageOperation::ReadCurrentManifest,
+            || read_current_manifest_from_native_file(&object),
+        )
     }
 }
 
@@ -1289,21 +1577,27 @@ impl StorageManifestPublishBackend for NativeFileBackend {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
-            return Box::pin(async move {
-                let (path, tmp_path) = prepare_native_file_manifest_publish(&object, durability)?;
-                let completion = driver.submit_write_temp_rename_path(
-                    path, tmp_path, bytes, durability, false, true,
-                )?;
-                record_platform_io_task(
-                    metrics.as_ref(),
-                    &driver,
-                    PlatformIoOperation::TempWriteRenamePublish,
-                );
-                completion.await
-            });
+            let task_metrics = Arc::clone(&metrics);
+            return record_timed_storage_future(
+                metrics,
+                StorageOperation::PublishManifest,
+                Box::pin(async move {
+                    let (path, tmp_path) =
+                        prepare_native_file_manifest_publish(&object, durability)?;
+                    let completion = driver.submit_write_temp_rename_path(
+                        path, tmp_path, bytes, durability, false, true,
+                    )?;
+                    record_platform_io_task(
+                        task_metrics.as_ref(),
+                        &driver,
+                        PlatformIoOperation::TempWriteRenamePublish,
+                    );
+                    completion.await
+                }),
+            );
         }
 
-        self.run_owned_storage_task(move || {
+        self.run_owned_storage_task(StorageOperation::PublishManifest, move || {
             publish_manifest_to_native_file(&object, &bytes, durability)
         })
     }
@@ -1316,7 +1610,11 @@ impl BlockingStorageManifestPublishBackend for NativeFileBackend {
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
     ) -> Result<()> {
-        publish_manifest_to_native_file(&object, &bytes, durability)
+        record_timed_storage_result(
+            self.metrics.as_ref(),
+            StorageOperation::PublishManifest,
+            || publish_manifest_to_native_file(&object, &bytes, durability),
+        )
     }
 }
 
@@ -1330,21 +1628,28 @@ impl StorageObjectWriteBackend for NativeFileBackend {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
-            return Box::pin(async move {
-                let (path, tmp_path) = prepare_native_file_object_write(&object, durability)?;
-                let completion = driver.submit_write_temp_rename_path(
-                    path, tmp_path, bytes, durability, true, false,
-                )?;
-                record_platform_io_task(
-                    metrics.as_ref(),
-                    &driver,
-                    PlatformIoOperation::TempWriteRenamePublish,
-                );
-                completion.await
-            });
+            let task_metrics = Arc::clone(&metrics);
+            return record_timed_storage_future(
+                metrics,
+                StorageOperation::WriteObject,
+                Box::pin(async move {
+                    let (path, tmp_path) = prepare_native_file_object_write(&object, durability)?;
+                    let completion = driver.submit_write_temp_rename_path(
+                        path, tmp_path, bytes, durability, true, false,
+                    )?;
+                    record_platform_io_task(
+                        task_metrics.as_ref(),
+                        &driver,
+                        PlatformIoOperation::TempWriteRenamePublish,
+                    );
+                    completion.await
+                }),
+            );
         }
 
-        self.run_owned_storage_task(move || write_native_file_object(&object, &bytes, durability))
+        self.run_owned_storage_task(StorageOperation::WriteObject, move || {
+            write_native_file_object(&object, &bytes, durability)
+        })
     }
 }
 
@@ -1355,7 +1660,9 @@ impl BlockingStorageObjectWriteBackend for NativeFileBackend {
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
     ) -> Result<()> {
-        write_native_file_object(&object, &bytes, durability)
+        record_timed_storage_result(self.metrics.as_ref(), StorageOperation::WriteObject, || {
+            write_native_file_object(&object, &bytes, durability)
+        })
     }
 }
 
@@ -1364,25 +1671,36 @@ impl StorageObjectDeleteBackend for NativeFileBackend {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
-            return Box::pin(async move {
-                require_native_file_object_delete(&object)?;
-                let completion = driver.submit_delete_path(object.path().to_path_buf())?;
-                record_platform_io_task(
-                    metrics.as_ref(),
-                    &driver,
-                    PlatformIoOperation::ObjectDelete,
-                );
-                completion.await
-            });
+            let task_metrics = Arc::clone(&metrics);
+            return record_timed_storage_future(
+                metrics,
+                StorageOperation::DeleteObject,
+                Box::pin(async move {
+                    require_native_file_object_delete(&object)?;
+                    let completion = driver.submit_delete_path(object.path().to_path_buf())?;
+                    record_platform_io_task(
+                        task_metrics.as_ref(),
+                        &driver,
+                        PlatformIoOperation::ObjectDelete,
+                    );
+                    completion.await
+                }),
+            );
         }
 
-        self.run_owned_storage_task(move || delete_native_file_object(&object))
+        self.run_owned_storage_task(StorageOperation::DeleteObject, move || {
+            delete_native_file_object(&object)
+        })
     }
 }
 
 impl BlockingStorageObjectDeleteBackend for NativeFileBackend {
     fn delete_object_blocking(&self, object: StorageObjectId) -> Result<()> {
-        delete_native_file_object(&object)
+        record_timed_storage_result(
+            self.metrics.as_ref(),
+            StorageOperation::DeleteObject,
+            || delete_native_file_object(&object),
+        )
     }
 }
 
@@ -1394,21 +1712,28 @@ impl StorageObjectListBackend for NativeFileBackend {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
-            return Box::pin(async move {
-                require_native_file_object_listing()?;
-                let completion =
-                    driver.submit_list_file_paths_path(request.root().to_path_buf())?;
-                record_platform_io_task(
-                    metrics.as_ref(),
-                    &driver,
-                    PlatformIoOperation::DirectoryListing,
-                );
-                let paths = completion.await?;
-                Ok(native_file_objects_from_paths(&request, paths))
-            });
+            let task_metrics = Arc::clone(&metrics);
+            return record_timed_storage_future(
+                metrics,
+                StorageOperation::ListObjects,
+                Box::pin(async move {
+                    require_native_file_object_listing()?;
+                    let completion =
+                        driver.submit_list_file_paths_path(request.root().to_path_buf())?;
+                    record_platform_io_task(
+                        task_metrics.as_ref(),
+                        &driver,
+                        PlatformIoOperation::DirectoryListing,
+                    );
+                    let paths = completion.await?;
+                    Ok(native_file_objects_from_paths(&request, paths))
+                }),
+            );
         }
 
-        self.run_owned_storage_task(move || list_native_file_objects(&request))
+        self.run_owned_storage_task(StorageOperation::ListObjects, move || {
+            list_native_file_objects(&request)
+        })
     }
 }
 
@@ -1419,18 +1744,27 @@ impl BlockingStorageObjectListBackend for NativeFileBackend {
     ) -> Result<Vec<StorageObjectId>> {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = self.platform_io.clone() {
-            require_native_file_object_listing()?;
-            let completion = driver.submit_list_file_paths_path(request.root().to_path_buf())?;
-            record_platform_io_task(
+            return record_timed_storage_result(
                 self.metrics.as_ref(),
-                &driver,
-                PlatformIoOperation::DirectoryListing,
+                StorageOperation::ListObjects,
+                || {
+                    require_native_file_object_listing()?;
+                    let completion =
+                        driver.submit_list_file_paths_path(request.root().to_path_buf())?;
+                    record_platform_io_task(
+                        self.metrics.as_ref(),
+                        &driver,
+                        PlatformIoOperation::DirectoryListing,
+                    );
+                    let paths = wait_for_platform_io(completion)?;
+                    Ok(native_file_objects_from_paths(&request, paths))
+                },
             );
-            let paths = wait_for_platform_io(completion)?;
-            return Ok(native_file_objects_from_paths(&request, paths));
         }
 
-        list_native_file_objects(&request)
+        record_timed_storage_result(self.metrics.as_ref(), StorageOperation::ListObjects, || {
+            list_native_file_objects(&request)
+        })
     }
 }
 
@@ -1520,7 +1854,11 @@ impl StorageReadObject for NativeFileObject {
             );
         }
 
-        Box::pin(async move { self.len_io()?.await })
+        record_timed_storage_future(
+            Arc::clone(&self.metrics),
+            StorageOperation::Len,
+            Box::pin(async move { self.len_io()?.await }),
+        )
     }
 
     fn read_exact_at<'op>(
@@ -1528,7 +1866,11 @@ impl StorageReadObject for NativeFileObject {
         offset: usize,
         bytes: &'op mut [u8],
     ) -> StorageReadFuture<'op, ()> {
-        Box::pin(async move { self.read_exact_at_offset(offset, bytes) })
+        record_timed_storage_future(
+            Arc::clone(&self.metrics),
+            StorageOperation::ReadExactAt,
+            Box::pin(async move { self.read_exact_at_offset(offset, bytes) }),
+        )
     }
 
     fn read_exact_at_owned(
@@ -1543,30 +1885,44 @@ impl StorageReadObject for NativeFileObject {
                 driver,
                 PlatformIoOperation::OwnedRandomRead,
             );
-            return Box::pin(async move { self.read_exact_at_owned_io(offset, len)?.await });
+            return record_timed_storage_future(
+                Arc::clone(&self.metrics),
+                StorageOperation::ReadExactAtOwned,
+                Box::pin(async move { self.read_exact_at_owned_io(offset, len)?.await }),
+            );
         }
 
         if let Some(runtime) = self.runtime.clone() {
             if runtime.capabilities().blocking_adapter() {
                 let object = self.object.clone();
                 self.metrics.record_blocking_adapter_task();
-                return Box::pin(async move {
-                    BlockingAdapterIoDriver::new(runtime)
-                        .submit_read_exact_at_owned(move || {
-                            read_exact_at_native_file_owned(&object, offset, len)
-                        })?
-                        .await
-                });
+                return record_timed_storage_future(
+                    Arc::clone(&self.metrics),
+                    StorageOperation::ReadExactAtOwned,
+                    Box::pin(async move {
+                        BlockingAdapterIoDriver::new(runtime)
+                            .submit_read_exact_at_owned(move || {
+                                read_exact_at_native_file_owned(&object, offset, len)
+                            })?
+                            .await
+                    }),
+                );
             }
         }
         self.metrics.record_inline_task();
-        Box::pin(async move { self.read_exact_at_owned_io(offset, len)?.await })
+        record_timed_storage_future(
+            Arc::clone(&self.metrics),
+            StorageOperation::ReadExactAtOwned,
+            Box::pin(async move { self.read_exact_at_owned_io(offset, len)?.await }),
+        )
     }
 }
 
 impl BlockingStorageReadObject for NativeFileObject {
     fn len_blocking(&self) -> Result<u64> {
-        len_native_file_handle(self.file.as_ref(), &self.object)
+        record_timed_storage_result(self.metrics.as_ref(), StorageOperation::Len, || {
+            len_native_file_handle(self.file.as_ref(), &self.object)
+        })
     }
 
     fn read_exact_at_blocking(&self, offset: usize, bytes: &mut [u8]) -> Result<()> {
@@ -1574,7 +1930,11 @@ impl BlockingStorageReadObject for NativeFileObject {
     }
 
     fn read_exact_at_owned_blocking(&self, offset: usize, len: usize) -> Result<StorageReadBuffer> {
-        self.read_exact_at_offset_owned(offset, len)
+        record_timed_storage_result(
+            self.metrics.as_ref(),
+            StorageOperation::ReadExactAtOwned,
+            || self.read_exact_at_offset_owned(offset, len),
+        )
     }
 }
 
@@ -1691,7 +2051,11 @@ impl StorageAppendObject for NativeFileAppendObject {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = &self.platform_io {
             record_platform_io_task(self.metrics.as_ref(), driver, PlatformIoOperation::Append);
-            return Box::pin(async move { self.append_io(bytes, durability)?.await });
+            return record_timed_storage_future(
+                Arc::clone(&self.metrics),
+                StorageOperation::Append,
+                Box::pin(async move { self.append_io(bytes, durability)?.await }),
+            );
         }
 
         if let Some(runtime) = self.runtime.clone() {
@@ -1702,26 +2066,38 @@ impl StorageAppendObject for NativeFileAppendObject {
                     Err(error) => return Box::pin(async move { Err(error) }),
                 };
                 self.metrics.record_blocking_adapter_task();
-                return Box::pin(async move {
-                    BlockingAdapterIoDriver::new(runtime)
-                        .submit_append(move || {
-                            let mut file = lock_native_append_file(file.as_ref(), &object)?;
-                            append_native_file_object(&mut file, bytes.as_ref(), durability)
-                        })?
-                        .await
-                });
+                return record_timed_storage_future(
+                    Arc::clone(&self.metrics),
+                    StorageOperation::Append,
+                    Box::pin(async move {
+                        BlockingAdapterIoDriver::new(runtime)
+                            .submit_append(move || {
+                                let mut file = lock_native_append_file(file.as_ref(), &object)?;
+                                append_native_file_object(&mut file, bytes.as_ref(), durability)
+                            })?
+                            .await
+                    }),
+                );
             }
         }
 
         self.metrics.record_inline_task();
-        Box::pin(async move { self.append_io(bytes, durability)?.await })
+        record_timed_storage_future(
+            Arc::clone(&self.metrics),
+            StorageOperation::Append,
+            Box::pin(async move { self.append_io(bytes, durability)?.await }),
+        )
     }
 
     fn persist(&mut self, durability: DurabilityMode) -> StorageFuture<'_, ()> {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = &self.platform_io {
             record_platform_io_task(self.metrics.as_ref(), driver, PlatformIoOperation::Persist);
-            return Box::pin(async move { self.persist_io(durability)?.await });
+            return record_timed_storage_future(
+                Arc::clone(&self.metrics),
+                StorageOperation::Persist,
+                Box::pin(async move { self.persist_io(durability)?.await }),
+            );
         }
 
         if let Some(runtime) = self.runtime.clone() {
@@ -1732,29 +2108,45 @@ impl StorageAppendObject for NativeFileAppendObject {
                     Err(error) => return Box::pin(async move { Err(error) }),
                 };
                 self.metrics.record_blocking_adapter_task();
-                return Box::pin(async move {
-                    BlockingAdapterIoDriver::new(runtime)
-                        .submit_sync(move || {
-                            let mut file = lock_native_append_file(file.as_ref(), &object)?;
-                            persist_native_append_file(&mut file, durability)
-                        })?
-                        .await
-                });
+                return record_timed_storage_future(
+                    Arc::clone(&self.metrics),
+                    StorageOperation::Persist,
+                    Box::pin(async move {
+                        BlockingAdapterIoDriver::new(runtime)
+                            .submit_sync(move || {
+                                let mut file = lock_native_append_file(file.as_ref(), &object)?;
+                                persist_native_append_file(&mut file, durability)
+                            })?
+                            .await
+                    }),
+                );
             }
         }
 
         self.metrics.record_inline_task();
-        Box::pin(async move { self.persist_io(durability)?.await })
+        record_timed_storage_future(
+            Arc::clone(&self.metrics),
+            StorageOperation::Persist,
+            Box::pin(async move { self.persist_io(durability)?.await }),
+        )
     }
 }
 
 impl BlockingStorageAppendObject for NativeFileAppendObject {
     fn append_blocking(&mut self, bytes: &[u8], durability: DurabilityMode) -> Result<()> {
-        self.append_to_file(bytes, durability)
+        let started = Instant::now();
+        let result = self.append_to_file(bytes, durability);
+        self.metrics
+            .record_operation(StorageOperation::Append, started.elapsed());
+        result
     }
 
     fn persist_blocking(&mut self, durability: DurabilityMode) -> Result<()> {
-        self.persist_file(durability)
+        let started = Instant::now();
+        let result = self.persist_file(durability);
+        self.metrics
+            .record_operation(StorageOperation::Persist, started.elapsed());
+        result
     }
 }
 
@@ -2873,7 +3265,7 @@ mod tests {
         std::fs::remove_dir_all(root).expect("test dir removes");
     }
 
-    #[cfg(feature = "platform-io")]
+    #[cfg(all(feature = "platform-io", target_os = "linux"))]
     #[test]
     fn platform_io_native_file_read_and_append_use_platform_driver() {
         let root = temp_storage_root("trine-kv-platform-io-storage");
@@ -2920,7 +3312,7 @@ mod tests {
         std::fs::remove_dir_all(root).expect("test dir removes");
     }
 
-    #[cfg(feature = "platform-io")]
+    #[cfg(all(feature = "platform-io", target_os = "linux"))]
     fn assert_platform_io_listing_fallbacks(
         backend: &NativeFileBackend,
         directory: StorageDirectoryId,
@@ -2955,7 +3347,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "platform-io")]
+    #[cfg(all(feature = "platform-io", target_os = "linux"))]
     fn assert_platform_task_accounting(
         stats: NativeFileStorageStats,
         min_driver_tasks: u64,
@@ -2990,7 +3382,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "platform-io")]
+    #[cfg(all(feature = "platform-io", target_os = "linux"))]
     #[test]
     fn platform_io_native_file_management_ops_use_platform_driver() {
         let root = temp_storage_root("trine-kv-platform-io-management");
@@ -3074,6 +3466,40 @@ mod tests {
 
         let stats = backend.stats();
         assert_platform_task_accounting(stats, 11, 4);
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[cfg(all(feature = "platform-io", not(target_os = "linux")))]
+    #[test]
+    fn platform_io_without_true_async_storage_ops_uses_blocking_adapter() {
+        let root = temp_storage_root("trine-kv-platform-io-fallback-storage");
+        std::fs::create_dir_all(&root).expect("test dir creates");
+        let table =
+            StorageObjectId::native_file(StorageObjectKind::Table, root.join("table.trinet"));
+        std::fs::write(table.path(), b"abcdef").expect("table file writes");
+
+        let runtime = Runtime::new(RuntimeOptions::platform_io());
+        let backend = NativeFileBackend::with_runtime(runtime);
+        let capabilities = backend.capabilities();
+        assert!(!capabilities.supports(StorageCapability::PlatformAsyncIo));
+        assert!(capabilities.supports(StorageCapability::BlockingAdapter));
+
+        let object = backend
+            .open_read_blocking(table)
+            .expect("read object opens without platform driver");
+        let buffer = block_on_test_future(object.read_exact_at_owned(2, 3))
+            .expect("read completes through blocking adapter");
+        assert_eq!(buffer.offset(), 2);
+        assert_eq!(&*buffer.into_bytes(), b"cde");
+
+        let stats = backend.stats();
+        assert!(stats.uses_blocking_adapter);
+        assert!(!stats.uses_platform_async_io);
+        assert_eq!(stats.platform_async_io_tasks, 0);
+        assert_eq!(stats.platform_backend_fallback_tasks, 0);
+        assert_eq!(stats.platform_blocking_fallback_tasks, 0);
+        assert_eq!(stats.blocking_adapter_tasks, 1);
 
         std::fs::remove_dir_all(root).expect("test dir removes");
     }
@@ -3201,6 +3627,11 @@ mod tests {
         let stats = backend.stats();
         assert!(stats.uses_blocking_adapter);
         assert_eq!(stats.blocking_adapter_tasks, 1);
+        assert_eq!(stats.blocking_adapter_queue_capacity, 2);
+        assert_eq!(stats.blocking_adapter_submitted_tasks, 2);
+        assert_eq!(stats.blocking_adapter_completed_tasks, 2);
+        assert_eq!(stats.operations.read_object_bytes.requests, 1);
+        assert!(stats.operations.read_object_bytes.total_latency_micros > 0);
         assert_eq!(stats.inline_tasks, 0);
 
         std::fs::remove_file(path).expect("test file removes");

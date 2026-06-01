@@ -48,8 +48,8 @@ pub use iterator::{Direction, Iter, LazyIter, LazyKeyValue, LazyValue};
 pub use mvcc::SnapshotSequence;
 pub use options::{
     BlobGcRatio, BlobLevelMergePolicy, BucketOptions, CompressionProfile, DbOptions,
-    DurabilityMode, FailOnCorruptionPolicy, FilterPolicy, IndexSearchPolicy, PrefixFilterPolicy,
-    StorageMode, WriteOptions,
+    DurabilityMode, FailOnCorruptionPolicy, FilterPolicy, HostStorageBackend, IndexSearchPolicy,
+    PrefixFilterPolicy, StorageMode, WriteOptions,
 };
 pub use point_value::PointValue;
 pub use prefix::PrefixExtractor;

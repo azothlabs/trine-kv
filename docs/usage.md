@@ -80,7 +80,8 @@ let db = Db::open(
 )?;
 ```
 
-With the `platform-io` feature enabled, select the platform I/O runtime for
+With the `platform-io` feature enabled on a target that has true Trine-level
+platform async storage operations, select the platform I/O runtime for
 native-file data reads/writes, WAL append-object opening/append/persist/rewrite,
 manifest publish/read, object delete, directory create/sync, and writer lease
 acquisition:
@@ -99,7 +100,26 @@ so those listing calls are reported as
 `storage_platform_blocking_fallback_tasks`. `DbStats` also separates true
 platform async file work (`storage_platform_async_io_tasks`) from platform
 backend fallback work (`storage_platform_backend_fallback_tasks`) and from
-Trine's bounded blocking adapter task count.
+Trine's bounded blocking adapter task count. It also reports blocking-adapter
+queue capacity, queued/submitted/completed/rejected task counts, total adapter
+runtime, and per-storage-operation request/latency counters. On targets where
+every current Trine storage operation is fallback-classified,
+`RuntimeOptions::platform_io()` uses the bounded blocking adapter and does not
+advertise `PlatformAsyncIo`.
+
+WASI and browser persistence have explicit option constructors so callers can
+select those host boundaries without accidentally falling back to native files:
+
+```rust
+let wasi = Db::open(DbOptions::wasi_persistent());
+let browser = Db::open(DbOptions::browser_persistent());
+assert!(wasi.is_err());
+assert!(browser.is_err());
+```
+
+These modes currently return `UnsupportedBackend` until their required host
+capabilities, writer lease, durability mapping, and cooperative maintenance
+contracts are implemented.
 
 `Db`, `Bucket`, and `Snapshot` are cheap handles. `Db` writes to the built-in
 default bucket. A named `Bucket` keeps its database open, so release bucket
@@ -459,12 +479,12 @@ Inspect live state with `Db::stats`:
 ```rust
 let stats = db.stats();
 println!(
-    "buckets={} tables={} cache_hits={} blob_reads={} blob_gc_runs={}",
+    "buckets={} tables={} cache_hits={} blob_reads={} storage_reads={}",
     stats.live_buckets,
     stats.total_tables,
     stats.block_cache_hits,
     stats.blob_read_count,
-    stats.blob_gc_runs,
+    stats.storage_operations.read_object_bytes.requests,
 );
 ```
 

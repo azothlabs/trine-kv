@@ -873,20 +873,66 @@ mod tests {
         #[cfg(windows)]
         {
             assert_eq!(matrix.kind, PlatformIoBackendKind::WindowsNative);
+            assert_eq!(matrix.length_lookup, PlatformIoTaskClass::BackendFallback);
             assert_eq!(
                 matrix.owned_random_read,
+                PlatformIoTaskClass::BackendFallback
+            );
+            assert_eq!(
+                matrix.optional_whole_object_read,
                 PlatformIoTaskClass::BackendFallback
             );
             assert_eq!(
                 matrix.temp_write_rename_publish,
                 PlatformIoTaskClass::BackendFallback
             );
+            assert_eq!(
+                matrix.append_object_open,
+                PlatformIoTaskClass::BackendFallback
+            );
+            assert_eq!(matrix.append, PlatformIoTaskClass::BackendFallback);
+            assert_eq!(matrix.persist, PlatformIoTaskClass::BackendFallback);
+            assert_eq!(matrix.object_delete, PlatformIoTaskClass::BackendFallback);
+            assert_eq!(
+                matrix.directory_create,
+                PlatformIoTaskClass::BackendFallback
+            );
+            assert_eq!(matrix.directory_sync, PlatformIoTaskClass::BackendFallback);
+            assert_eq!(
+                matrix.writer_lease_acquire,
+                PlatformIoTaskClass::BackendFallback
+            );
         }
         #[cfg(all(unix, not(target_os = "linux")))]
         {
             assert_eq!(matrix.kind, PlatformIoBackendKind::UnixFallback);
+            assert_eq!(matrix.length_lookup, PlatformIoTaskClass::BackendFallback);
             assert_eq!(
                 matrix.owned_random_read,
+                PlatformIoTaskClass::BackendFallback
+            );
+            assert_eq!(
+                matrix.optional_whole_object_read,
+                PlatformIoTaskClass::BackendFallback
+            );
+            assert_eq!(
+                matrix.temp_write_rename_publish,
+                PlatformIoTaskClass::BackendFallback
+            );
+            assert_eq!(
+                matrix.append_object_open,
+                PlatformIoTaskClass::BackendFallback
+            );
+            assert_eq!(matrix.append, PlatformIoTaskClass::BackendFallback);
+            assert_eq!(matrix.persist, PlatformIoTaskClass::BackendFallback);
+            assert_eq!(matrix.object_delete, PlatformIoTaskClass::BackendFallback);
+            assert_eq!(
+                matrix.directory_create,
+                PlatformIoTaskClass::BackendFallback
+            );
+            assert_eq!(matrix.directory_sync, PlatformIoTaskClass::BackendFallback);
+            assert_eq!(
+                matrix.writer_lease_acquire,
                 PlatformIoTaskClass::BackendFallback
             );
         }

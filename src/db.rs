@@ -76,6 +76,8 @@ pub(crate) struct DbInner {
     blob_gc_output_bytes: AtomicU64,
     blob_gc_discarded_bytes: AtomicU64,
     blob_reads: Arc<BlobReadMetrics>,
+    maintenance_cooperative_yields: AtomicU64,
+    maintenance_budget_exhaustions: AtomicU64,
     native_storage: NativeFileBackend,
     runtime: Runtime,
     runtime_shutdown: CancellationToken,
@@ -712,6 +714,9 @@ impl Db {
         match options.storage_mode {
             StorageMode::InMemory => Self::memory(options),
             StorageMode::Persistent { .. } => Self::open_persistent_with_options(options),
+            StorageMode::HostPersistent { backend } => {
+                Err(Error::unsupported_backend(backend.as_str()))
+            }
         }
     }
 
@@ -764,6 +769,8 @@ impl Db {
                 blob_gc_output_bytes: AtomicU64::new(0),
                 blob_gc_discarded_bytes: AtomicU64::new(0),
                 blob_reads: Arc::new(BlobReadMetrics::default()),
+                maintenance_cooperative_yields: AtomicU64::new(0),
+                maintenance_budget_exhaustions: AtomicU64::new(0),
                 native_storage: NativeFileBackend::new(),
                 runtime,
                 runtime_shutdown: CancellationToken::new(),
@@ -847,6 +854,8 @@ impl Db {
                 blob_gc_output_bytes: AtomicU64::new(0),
                 blob_gc_discarded_bytes: AtomicU64::new(0),
                 blob_reads: Arc::new(BlobReadMetrics::default()),
+                maintenance_cooperative_yields: AtomicU64::new(0),
+                maintenance_budget_exhaustions: AtomicU64::new(0),
                 native_storage,
                 runtime,
                 runtime_shutdown: CancellationToken::new(),
@@ -1231,6 +1240,9 @@ impl Db {
                 }
                 Ok(())
             }
+            StorageMode::HostPersistent { backend } => {
+                Err(Error::unsupported_backend(backend.as_str()))
+            }
         }
     }
 
@@ -1256,6 +1268,7 @@ impl Db {
             }
 
             self.request_background_flush();
+            self.record_cooperative_maintenance_yield();
             self.inner.maintenance.wait_until_flush_idle();
         }
 
@@ -1325,6 +1338,14 @@ impl Db {
             blob_gc_input_bytes: self.inner.blob_gc_input_bytes.load(Ordering::Acquire),
             blob_gc_output_bytes: self.inner.blob_gc_output_bytes.load(Ordering::Acquire),
             blob_gc_discarded_bytes: self.inner.blob_gc_discarded_bytes.load(Ordering::Acquire),
+            maintenance_cooperative_yields: self
+                .inner
+                .maintenance_cooperative_yields
+                .load(Ordering::Acquire),
+            maintenance_budget_exhaustions: self
+                .inner
+                .maintenance_budget_exhaustions
+                .load(Ordering::Acquire),
             ..DbStats::default()
         };
         self.add_wal_stats(&mut stats);
@@ -1423,12 +1444,24 @@ impl Db {
         stats.storage_uses_blocking_adapter = storage_stats.uses_blocking_adapter;
         stats.storage_uses_platform_async_io = storage_stats.uses_platform_async_io;
         stats.storage_blocking_adapter_tasks = storage_stats.blocking_adapter_tasks;
+        stats.storage_blocking_adapter_queue_capacity =
+            storage_stats.blocking_adapter_queue_capacity;
+        stats.storage_blocking_adapter_queued_tasks = storage_stats.blocking_adapter_queued_tasks;
+        stats.storage_blocking_adapter_submitted_tasks =
+            storage_stats.blocking_adapter_submitted_tasks;
+        stats.storage_blocking_adapter_completed_tasks =
+            storage_stats.blocking_adapter_completed_tasks;
+        stats.storage_blocking_adapter_rejected_tasks =
+            storage_stats.blocking_adapter_rejected_tasks;
+        stats.storage_blocking_adapter_total_runtime_micros =
+            storage_stats.blocking_adapter_total_runtime_micros;
         stats.storage_platform_async_io_tasks = storage_stats.platform_async_io_tasks;
         stats.storage_platform_backend_fallback_tasks =
             storage_stats.platform_backend_fallback_tasks;
         stats.storage_platform_blocking_fallback_tasks =
             storage_stats.platform_blocking_fallback_tasks;
         stats.storage_inline_tasks = storage_stats.inline_tasks;
+        stats.storage_operations = storage_stats.operations;
     }
 
     #[must_use]
@@ -1547,6 +1580,18 @@ impl Db {
         } else {
             Ok(())
         }
+    }
+
+    fn record_cooperative_maintenance_yield(&self) {
+        self.inner
+            .maintenance_cooperative_yields
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn record_maintenance_budget_exhaustion(&self) {
+        self.inner
+            .maintenance_budget_exhaustions
+            .fetch_add(1, Ordering::AcqRel);
     }
 
     fn run_background_maintenance(&self, request: MaintenanceRequest) -> Result<()> {
@@ -1809,7 +1854,7 @@ impl Db {
     fn persistent_path(&self) -> Option<&Path> {
         match &self.inner.options.storage_mode {
             StorageMode::Persistent { path } => Some(path.as_path()),
-            StorageMode::InMemory => None,
+            StorageMode::InMemory | StorageMode::HostPersistent { .. } => None,
         }
     }
 
@@ -1865,6 +1910,7 @@ impl Db {
             self.inner.maintenance.request(pressure.request());
             if self.background_workers_enabled() {
                 let progress = self.inner.maintenance.progress();
+                self.record_cooperative_maintenance_yield();
                 if self
                     .inner
                     .maintenance
@@ -1872,6 +1918,7 @@ impl Db {
                 {
                     continue;
                 }
+                self.record_maintenance_budget_exhaustion();
             }
 
             self.run_maintenance_for_pressure(&db_path, pressure)?;
@@ -2172,6 +2219,7 @@ impl Db {
                         return Ok(());
                     }
                     self.request_background_compaction();
+                    self.record_cooperative_maintenance_yield();
                     self.inner.maintenance.wait_until_compaction_idle();
                     self.take_background_maintenance_error()?;
                 }
@@ -3042,6 +3090,9 @@ impl Db {
 }
 
 fn validate_options(options: &DbOptions) -> Result<()> {
+    if let StorageMode::HostPersistent { backend } = &options.storage_mode {
+        return Err(Error::unsupported_backend(backend.as_str()));
+    }
     runtime::validate_runtime_options(
         options.runtime,
         &options.storage_mode,
@@ -3544,7 +3595,7 @@ fn is_level_layout_compaction_error(error: &Error) -> bool {
 fn persistent_path_from_options(options: &DbOptions) -> Option<&Path> {
     match &options.storage_mode {
         StorageMode::Persistent { path } => Some(path.as_path()),
-        StorageMode::InMemory => None,
+        StorageMode::InMemory | StorageMode::HostPersistent { .. } => None,
     }
 }
 
@@ -3777,10 +3828,29 @@ mod tests {
         assert!(stats.live_blob_bytes >= value.len() as u64);
         assert!(stats.storage_uses_blocking_adapter);
         assert!(!stats.storage_uses_platform_async_io);
+        assert_eq!(stats.storage_blocking_adapter_queue_capacity, 1024);
+        assert!(
+            stats.storage_blocking_adapter_submitted_tasks >= stats.storage_blocking_adapter_tasks
+        );
+        assert!(stats.storage_operations.open_append.requests > 0);
+        assert!(stats.storage_operations.write_object.requests > 0);
         assert_eq!(stats.storage_inline_tasks, 0);
 
         drop(db);
         fs::remove_dir_all(path).expect("cleanup test db");
+    }
+
+    #[test]
+    fn host_persistent_backends_are_explicitly_unsupported() {
+        let wasi_error =
+            Db::open(DbOptions::wasi_persistent()).expect_err("WASI backend is not wired");
+        assert!(matches!(wasi_error, Error::UnsupportedBackend { .. }));
+        assert!(wasi_error.to_string().contains("WASI persistent"));
+
+        let browser_error =
+            Db::open(DbOptions::browser_persistent()).expect_err("browser backend is not wired");
+        assert!(matches!(browser_error, Error::UnsupportedBackend { .. }));
+        assert!(browser_error.to_string().contains("browser persistent"));
     }
 
     #[test]
@@ -3941,6 +4011,7 @@ mod tests {
             .expect("compaction succeeds");
         handle.join().expect("compaction thread joins");
         assert!(db.stats().compaction_runs > 0);
+        assert!(db.stats().maintenance_cooperative_yields > 0);
 
         drop(db);
         fs::remove_dir_all(path).expect("cleanup test db");

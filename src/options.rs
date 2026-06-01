@@ -6,6 +6,22 @@ use crate::{codec::CodecId, prefix::PrefixExtractor, runtime::RuntimeOptions};
 pub enum StorageMode {
     InMemory,
     Persistent { path: PathBuf },
+    HostPersistent { backend: HostStorageBackend },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostStorageBackend {
+    Wasi,
+    Browser,
+}
+
+impl HostStorageBackend {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Wasi => "WASI persistent storage backend",
+            Self::Browser => "browser persistent storage backend",
+        }
+    }
 }
 
 impl Default for StorageMode {
@@ -129,6 +145,26 @@ impl DbOptions {
     pub fn persistent(path: impl Into<PathBuf>) -> Self {
         Self {
             storage_mode: StorageMode::Persistent { path: path.into() },
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub fn wasi_persistent() -> Self {
+        Self {
+            storage_mode: StorageMode::HostPersistent {
+                backend: HostStorageBackend::Wasi,
+            },
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub fn browser_persistent() -> Self {
+        Self {
+            storage_mode: StorageMode::HostPersistent {
+                backend: HostStorageBackend::Browser,
+            },
             ..Self::default()
         }
     }

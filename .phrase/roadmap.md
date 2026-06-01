@@ -2644,3 +2644,64 @@ linting, tests, naming, and protocol evidence.
 **Major Out Of Scope**:
 
 - New platform behavior beyond the accepted matrix.
+
+### Phase 117: True Async Capability Hardening
+
+**Status**: Complete
+
+**Goal**: Close the requested true-async gaps for directory enumeration,
+Windows composite storage operations, and macOS/BSD/other Unix file work by
+preventing false `PlatformAsyncIo` capability reporting.
+
+**Entry Condition**: Phase 116 complete and the remaining gaps are known.
+
+**Acceptance Gate**:
+
+- `PlatformAsyncIo` is advertised only when the current target has at least one
+  true Trine-level platform async storage operation.
+- Non-Linux targets with the `platform-io` feature use the bounded blocking
+  adapter instead of starting a platform driver whose current Trine operations
+  are all fallback-classified.
+- Directory enumeration remains explicit fallback and is not counted as true
+  platform async work.
+- Windows and non-Linux Unix matrix tests assert fallback classification for
+  current Trine composite storage operations.
+- Protocol, ADR, current phase, and usage docs record the capability rule.
+
+**Major Out Of Scope**:
+
+- Hand-written OS bindings or backend replacement for Linux directory
+  enumeration, Windows end-to-end composite operations, dispatch I/O, POSIX AIO,
+  kqueue, or other target-specific mechanisms.
+
+### Phase 118: Async Host Boundary And Observability Closure
+
+**Status**: Complete
+
+**Goal**: Close the remaining async tail by making host persistent storage
+selection explicit, exposing storage/runtime async observability, and recording
+cooperative maintenance yields.
+
+**Entry Condition**: Phase 117 complete and remaining async items are
+WASI/browser persistence, observability, and cooperative maintenance.
+
+**Acceptance Gate**:
+
+- WASI and browser persistent modes are explicit public options and fail with
+  `UnsupportedBackend` until real host adapters exist.
+- `DbStats` reports blocking-adapter queue depth, task lifecycle counts, total
+  adapter runtime, and per-storage-operation request/latency metrics.
+- Cooperative maintenance yields and bounded-wait expirations are observable.
+- Existing runtime/storage/backend capability behavior remains unchanged.
+- Final verification gate passes.
+
+**Major Out Of Scope**:
+
+- Implementing real WASI or browser persistence.
+- Resumable compaction work budgets.
+- New OS bindings or backend replacement.
+
+### Recommended Next Action
+
+- Phase 118 is complete. Choose a focused next phase for either real host
+  persistence or resumable maintenance budgets.

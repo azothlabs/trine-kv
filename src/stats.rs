@@ -40,14 +40,51 @@ pub struct DbStats {
     pub storage_uses_blocking_adapter: bool,
     pub storage_uses_platform_async_io: bool,
     pub storage_blocking_adapter_tasks: u64,
+    pub storage_blocking_adapter_queue_capacity: usize,
+    pub storage_blocking_adapter_queued_tasks: usize,
+    pub storage_blocking_adapter_submitted_tasks: u64,
+    pub storage_blocking_adapter_completed_tasks: u64,
+    pub storage_blocking_adapter_rejected_tasks: u64,
+    pub storage_blocking_adapter_total_runtime_micros: u64,
     pub storage_platform_async_io_tasks: u64,
     pub storage_platform_backend_fallback_tasks: u64,
     pub storage_platform_blocking_fallback_tasks: u64,
     pub storage_inline_tasks: u64,
+    pub storage_operations: StorageOperationStats,
+    pub maintenance_cooperative_yields: u64,
+    pub maintenance_budget_exhaustions: u64,
     pub block_cache_hits: u64,
     pub block_cache_misses: u64,
     pub read_path: ReadPathStats,
     pub filters: FilterStats,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StorageOperationMetric {
+    pub requests: u64,
+    pub total_latency_micros: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StorageOperationStats {
+    pub open_read: StorageOperationMetric,
+    pub len: StorageOperationMetric,
+    pub read_exact_at: StorageOperationMetric,
+    pub read_exact_at_owned: StorageOperationMetric,
+    pub read_object_bytes: StorageOperationMetric,
+    pub open_append: StorageOperationMetric,
+    pub append: StorageOperationMetric,
+    pub persist: StorageOperationMetric,
+    pub rewrite_wal: StorageOperationMetric,
+    pub acquire_writer_lease: StorageOperationMetric,
+    pub create_directory_all: StorageOperationMetric,
+    pub list_directory_files: StorageOperationMetric,
+    pub sync_directory_after_renames: StorageOperationMetric,
+    pub read_current_manifest: StorageOperationMetric,
+    pub publish_manifest: StorageOperationMetric,
+    pub write_object: StorageOperationMetric,
+    pub delete_object: StorageOperationMetric,
+    pub list_objects: StorageOperationMetric,
 }
 
 #[derive(Debug, Default)]

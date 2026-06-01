@@ -57,9 +57,17 @@ Evidence notes should separate:
   protocol spec or adding a follow-up ADR.
 - Trine's primary database API and storage boundary are async-first. Blocking
   native APIs are adapters over the primary async engine.
+- `PlatformAsyncIo` must mean at least one current Trine storage operation is
+  executed by a real OS async primitive for the selected target. A backend that
+  only provides polling, thread-pool fallback, or lower-level primitives that
+  are not enough for a complete Trine operation must not advertise that
+  capability.
 - Persistent storage behavior is governed by backend capabilities, including
   writer lease, manifest publish, durability strength, and background-work
   support.
+- WASI and browser persistence must be selected through explicit host backend
+  options and fail as `UnsupportedBackend` until their required capabilities are
+  implemented.
 - WASM readiness is a design constraint for public API, runtime boundary, and
   storage backend boundaries.
 - Titan and other external storage engines may be used as design references,
