@@ -40,6 +40,7 @@ pub struct DbStats {
     pub storage_uses_blocking_adapter: bool,
     pub storage_uses_platform_async_io: bool,
     pub storage_blocking_adapter_tasks: u64,
+    pub storage_platform_async_io_tasks: u64,
     pub storage_inline_tasks: u64,
     pub block_cache_hits: u64,
     pub block_cache_misses: u64,

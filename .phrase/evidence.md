@@ -1910,6 +1910,8 @@ Record only evidence that can change planning or durable decisions.
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --all-targets --all-features`
 - `git diff --check`
+- forbidden-term scan
+- `git diff --check`
 - Forbidden-term scan over changed Rust and `.phrase` files.
 - `cargo run --example quickstart`
 - `cargo run --example user_store`
@@ -7706,3 +7708,110 @@ Record only evidence that can change planning or durable decisions.
 
 - Do not start platform-native async file I/O until a concrete driver and
   supported-platform matrix are chosen.
+
+## Phase 105: IO Completion And Driver Boundary
+
+### Observation
+
+- Phase 104 made storage backend capability reporting honest, but completion
+  and driver submission still lived inside storage code.
+- The next backend work needs a stable internal `io` layer so platform drivers
+  can emulate the same operation shape without changing engine callers.
+
+### Interpretation
+
+- The engine should see Trine I/O completions, not platform-specific runtime
+  details.
+- Native-file syscall and blocking-adapter paths can use the same completion
+  shape before a platform driver exists.
+
+### Change
+
+- Added `src/io.rs` with `IoCompletion`, `IoDriverKind`, `IoDriverInfo`,
+  `IoDriver`, `InlineIoDriver`, `BlockingAdapterIoDriver`, `IoReadObject`, and
+  `IoAppendObject`.
+- Added driver submission methods for read length, owned random read, append,
+  and sync, plus step/drain hooks for future platform drivers.
+- Moved native-file read length, owned random read, append, and persist
+  submission through the `io` completion and driver traits.
+- Routed native-file blocking-adapter read/append/persist operations through
+  `BlockingAdapterIoDriver` instead of ad hoc completion wiring in storage.
+- Kept existing storage capability and stats behavior unchanged.
+- Added focused inline-driver, blocking-adapter-driver, native-file read, and
+  native-file append I/O completion tests.
+
+### Verification
+
+- `cargo check`
+- `cargo test io --lib`
+- `cargo test storage --lib`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+
+### Remaining Blockers
+
+- Platform-specific drivers are not implemented yet.
+
+### Recommended Next Action
+
+- Start a platform-driver spike below `io`.
+
+## Phase 106: Feature-Gated Platform I/O Driver
+
+### Observation
+
+- A completion boundary alone still left native-file read and WAL append work
+  on inline or bounded blocking-adapter execution.
+- `compio` 0.18 failed the current Rust 1.85 gate through transitive
+  dependencies, while `compio` 0.14 compiled with the `runtime` feature and no
+  default features.
+
+### Interpretation
+
+- The platform I/O path must be opt-in and feature-gated so default builds,
+  WASM-ready builds, and current blocking-adapter behavior remain stable.
+- `RuntimeMode::PlatformIo` can select the platform driver for data reads and
+  WAL append/persist while still using the bounded blocking adapter for native
+  metadata and publish operations that have not moved below `io` yet.
+
+### Change
+
+- Added optional Cargo feature `platform-io = ["dep:compio"]` using
+  `compio` 0.14.
+- Added `RuntimeOptions::platform_io()` and
+  `RuntimeCapabilities::platform_async_io()`.
+- Added feature-gated `PlatformIoDriver` with a dedicated compio worker and
+  `IoCompletion` delivery.
+- Routed native-file length, owned random reads, append, and persist through
+  `PlatformIoDriver` when platform I/O is selected.
+- Added storage stats for platform I/O task counts.
+- Documented the opt-in runtime path in the async storage protocol and usage
+  guide.
+
+### Verification
+
+- `cargo check`
+- `cargo check --features platform-io`
+- `cargo test runtime --lib`
+- `cargo test storage --lib`
+- `cargo test platform_io_native_file_read_and_append_use_platform_driver --lib
+  --features platform-io`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `git diff --check`
+- forbidden-term scan
+- project-name scan
+
+### Remaining Blockers
+
+- Manifest publish, object writes, WAL rewrite, object reads, directory
+  operations, writer lease acquisition, object listing, and recovery scanning
+  still use the bounded blocking adapter on native files.
+
+### Recommended Next Action
+
+- Move the remaining native-file storage operations below the `io` driver
+  boundary where platform I/O can support them, keeping unsupported operations
+  explicitly reported as blocking-adapter work.

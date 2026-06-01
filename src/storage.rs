@@ -17,9 +17,16 @@ use crate::{
     block::BlockReadSource,
     durability::{sync_dir_after_renames, sync_parent_dir_after_rename},
     error::{Error, Result},
+    io::{
+        BlockingAdapterIoDriver, InlineIoDriver, IoAppendObject, IoCompletion, IoDriver,
+        IoDriverInfo, IoReadObject,
+    },
     options::DurabilityMode,
     runtime::Runtime,
 };
+
+#[cfg(feature = "platform-io")]
+use crate::io::PlatformIoDriver;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum StorageObjectKind {
@@ -740,6 +747,8 @@ impl BlockingStorageReadObject for MemoryStorageObject {
 #[derive(Debug, Clone)]
 pub(crate) struct NativeFileBackend {
     runtime: Option<Runtime>,
+    #[cfg(feature = "platform-io")]
+    platform_io: Option<PlatformIoDriver>,
     metrics: Arc<NativeFileStorageMetrics>,
 }
 
@@ -747,25 +756,55 @@ impl NativeFileBackend {
     pub(crate) fn new() -> Self {
         Self {
             runtime: None,
+            #[cfg(feature = "platform-io")]
+            platform_io: None,
             metrics: Arc::new(NativeFileStorageMetrics::default()),
         }
     }
 
     #[allow(dead_code)]
     pub(crate) fn with_runtime(runtime: Runtime) -> Self {
+        #[cfg(feature = "platform-io")]
+        let platform_io = runtime
+            .capabilities()
+            .platform_async_io()
+            .then(PlatformIoDriver::new);
         Self {
             runtime: Some(runtime),
+            #[cfg(feature = "platform-io")]
+            platform_io,
             metrics: Arc::new(NativeFileStorageMetrics::default()),
         }
     }
 
     pub(crate) fn stats(&self) -> NativeFileStorageStats {
-        let capabilities = self.capabilities();
+        let driver = self.io_driver_info();
         NativeFileStorageStats {
-            uses_blocking_adapter: capabilities.supports(StorageCapability::BlockingAdapter),
-            uses_platform_async_io: capabilities.supports(StorageCapability::PlatformAsyncIo),
+            uses_blocking_adapter: self
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.capabilities().blocking_adapter()),
+            uses_platform_async_io: driver.kind().is_platform_async(),
             blocking_adapter_tasks: self.metrics.blocking_adapter_tasks(),
+            platform_async_io_tasks: self.metrics.platform_async_io_tasks(),
             inline_tasks: self.metrics.inline_tasks(),
+        }
+    }
+
+    fn io_driver_info(&self) -> IoDriverInfo {
+        #[cfg(feature = "platform-io")]
+        if self.platform_io.is_some() {
+            return PlatformIoDriver::info();
+        }
+
+        if self
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.capabilities().blocking_adapter())
+        {
+            IoDriverInfo::blocking_adapter()
+        } else {
+            InlineIoDriver.info()
         }
     }
 
@@ -796,25 +835,35 @@ impl Default for NativeFileBackend {
 
 #[derive(Debug, Default)]
 struct NativeFileStorageMetrics {
-    blocking_adapter_tasks: AtomicU64,
-    inline_tasks: AtomicU64,
+    blocking_adapter: AtomicU64,
+    platform_async_io: AtomicU64,
+    inline: AtomicU64,
 }
 
 impl NativeFileStorageMetrics {
     fn record_blocking_adapter_task(&self) {
-        self.blocking_adapter_tasks.fetch_add(1, Ordering::Relaxed);
+        self.blocking_adapter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "platform-io")]
+    fn record_platform_async_io_task(&self) {
+        self.platform_async_io.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_inline_task(&self) {
-        self.inline_tasks.fetch_add(1, Ordering::Relaxed);
+        self.inline.fetch_add(1, Ordering::Relaxed);
     }
 
     fn blocking_adapter_tasks(&self) -> u64 {
-        self.blocking_adapter_tasks.load(Ordering::Acquire)
+        self.blocking_adapter.load(Ordering::Acquire)
+    }
+
+    fn platform_async_io_tasks(&self) -> u64 {
+        self.platform_async_io.load(Ordering::Acquire)
     }
 
     fn inline_tasks(&self) -> u64 {
-        self.inline_tasks.load(Ordering::Acquire)
+        self.inline.load(Ordering::Acquire)
     }
 }
 
@@ -823,6 +872,7 @@ pub(crate) struct NativeFileStorageStats {
     pub(crate) uses_blocking_adapter: bool,
     pub(crate) uses_platform_async_io: bool,
     pub(crate) blocking_adapter_tasks: u64,
+    pub(crate) platform_async_io_tasks: u64,
     pub(crate) inline_tasks: u64,
 }
 
@@ -831,11 +881,13 @@ impl StorageReadBackend for NativeFileBackend {
 
     fn capabilities(&self) -> StorageCapabilities {
         let capabilities = StorageCapabilities::native_file();
-        if self
-            .runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.capabilities().blocking_adapter())
-        {
+        if self.io_driver_info().kind().is_platform_async() {
+            capabilities
+                .with(StorageCapability::AsyncTasks)
+                .with(StorageCapability::BlockingAdapter)
+                .with(StorageCapability::BackgroundThreads)
+                .with(StorageCapability::PlatformAsyncIo)
+        } else if self.io_driver_info().kind().is_blocking_adapter() {
             capabilities
                 .with(StorageCapability::AsyncTasks)
                 .with(StorageCapability::BlockingAdapter)
@@ -847,14 +899,30 @@ impl StorageReadBackend for NativeFileBackend {
 
     fn open_read(&self, object: StorageObjectId) -> StorageReadFuture<'_, Self::ReadObject> {
         let runtime = self.runtime.clone();
+        #[cfg(feature = "platform-io")]
+        let platform_io = self.platform_io.clone();
         let metrics = Arc::clone(&self.metrics);
-        Box::pin(async move { NativeFileObject::open(object, runtime, metrics) })
+        Box::pin(async move {
+            NativeFileObject::open(
+                object,
+                runtime,
+                #[cfg(feature = "platform-io")]
+                platform_io,
+                metrics,
+            )
+        })
     }
 }
 
 impl BlockingStorageReadBackend for NativeFileBackend {
     fn open_read_blocking(&self, object: StorageObjectId) -> Result<Self::ReadObject> {
-        NativeFileObject::open(object, self.runtime.clone(), Arc::clone(&self.metrics))
+        NativeFileObject::open(
+            object,
+            self.runtime.clone(),
+            #[cfg(feature = "platform-io")]
+            self.platform_io.clone(),
+            Arc::clone(&self.metrics),
+        )
     }
 }
 
@@ -875,14 +943,30 @@ impl StorageAppendBackend for NativeFileBackend {
 
     fn open_append(&self, object: StorageObjectId) -> StorageFuture<'_, Self::AppendObject> {
         let runtime = self.runtime.clone();
+        #[cfg(feature = "platform-io")]
+        let platform_io = self.platform_io.clone();
         let metrics = Arc::clone(&self.metrics);
-        self.run_owned_storage_task(move || NativeFileAppendObject::open(&object, runtime, metrics))
+        self.run_owned_storage_task(move || {
+            NativeFileAppendObject::open(
+                &object,
+                runtime,
+                #[cfg(feature = "platform-io")]
+                platform_io,
+                metrics,
+            )
+        })
     }
 }
 
 impl BlockingStorageAppendBackend for NativeFileBackend {
     fn open_append_blocking(&self, object: StorageObjectId) -> Result<Self::AppendObject> {
-        NativeFileAppendObject::open(&object, self.runtime.clone(), Arc::clone(&self.metrics))
+        NativeFileAppendObject::open(
+            &object,
+            self.runtime.clone(),
+            #[cfg(feature = "platform-io")]
+            self.platform_io.clone(),
+            Arc::clone(&self.metrics),
+        )
     }
 }
 
@@ -1065,8 +1149,10 @@ impl BlockingStorageObjectListBackend for NativeFileBackend {
 #[derive(Debug)]
 pub(crate) struct NativeFileObject {
     object: StorageObjectId,
-    file: Mutex<File>,
+    file: Arc<Mutex<File>>,
     runtime: Option<Runtime>,
+    #[cfg(feature = "platform-io")]
+    platform_io: Option<PlatformIoDriver>,
     metrics: Arc<NativeFileStorageMetrics>,
 }
 
@@ -1074,40 +1160,59 @@ impl NativeFileObject {
     fn open(
         object: StorageObjectId,
         runtime: Option<Runtime>,
+        #[cfg(feature = "platform-io")] platform_io: Option<PlatformIoDriver>,
         metrics: Arc<NativeFileStorageMetrics>,
     ) -> Result<Self> {
         let file = open_native_file(&object)?;
         Ok(Self {
             object,
-            file: Mutex::new(file),
+            file: Arc::new(Mutex::new(file)),
             runtime,
+            #[cfg(feature = "platform-io")]
+            platform_io,
             metrics,
         })
     }
 
-    fn len_from_native_file(&self) -> Result<u64> {
-        let file = self.lock_file()?;
-        Ok(file.metadata()?.len())
-    }
-
     fn read_exact_at_offset(&self, offset: usize, bytes: &mut [u8]) -> Result<()> {
-        let mut file = self.lock_file()?;
-        read_exact_at_native_file(&mut file, offset, bytes)
+        read_exact_at_native_file_handle(self.file.as_ref(), &self.object, offset, bytes)
     }
 
     fn read_exact_at_offset_owned(&self, offset: usize, len: usize) -> Result<StorageReadBuffer> {
-        let mut bytes = allocate_read_buffer(len)?;
-        self.read_exact_at_offset(offset, &mut bytes)?;
-        Ok(StorageReadBuffer::new(offset, Arc::from(bytes)))
+        read_exact_at_native_file_handle_owned(self.file.as_ref(), &self.object, offset, len)
+    }
+}
+
+impl IoReadObject for NativeFileObject {
+    fn len_io(&self) -> Result<IoCompletion<u64>> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = &self.platform_io {
+            return driver.submit_len_path(self.object.path().to_path_buf());
+        }
+
+        let object = self.object.clone();
+        let file = Arc::clone(&self.file);
+        InlineIoDriver.submit_len(move || len_native_file_handle(file.as_ref(), &object))
     }
 
-    fn lock_file(&self) -> Result<MutexGuard<'_, File>> {
-        self.file.lock().map_err(|_| Error::Corruption {
-            message: format!(
-                "referenced {} {} handle lock poisoned",
-                self.object.kind().as_str(),
-                self.object.path().display()
-            ),
+    fn read_exact_at_owned_io(
+        &self,
+        offset: usize,
+        len: usize,
+    ) -> Result<IoCompletion<StorageReadBuffer>> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = &self.platform_io {
+            return driver.submit_read_exact_at_owned_path(
+                self.object.path().to_path_buf(),
+                offset,
+                len,
+            );
+        }
+
+        let object = self.object.clone();
+        let file = Arc::clone(&self.file);
+        InlineIoDriver.submit_read_exact_at_owned(move || {
+            read_exact_at_native_file_handle_owned(file.as_ref(), &object, offset, len)
         })
     }
 }
@@ -1118,7 +1223,7 @@ impl StorageReadObject for NativeFileObject {
     }
 
     fn len(&self) -> StorageReadFuture<'_, u64> {
-        Box::pin(async move { self.len_from_native_file() })
+        Box::pin(async move { self.len_io()?.await })
     }
 
     fn read_exact_at<'op>(
@@ -1134,13 +1239,19 @@ impl StorageReadObject for NativeFileObject {
         offset: usize,
         len: usize,
     ) -> StorageReadFuture<'_, StorageReadBuffer> {
+        #[cfg(feature = "platform-io")]
+        if self.platform_io.is_some() {
+            self.metrics.record_platform_async_io_task();
+            return Box::pin(async move { self.read_exact_at_owned_io(offset, len)?.await });
+        }
+
         if let Some(runtime) = self.runtime.clone() {
             if runtime.capabilities().blocking_adapter() {
                 let object = self.object.clone();
                 self.metrics.record_blocking_adapter_task();
                 return Box::pin(async move {
-                    runtime
-                        .spawn_blocking_result(move || {
+                    BlockingAdapterIoDriver::new(runtime)
+                        .submit_read_exact_at_owned(move || {
                             read_exact_at_native_file_owned(&object, offset, len)
                         })?
                         .await
@@ -1148,13 +1259,13 @@ impl StorageReadObject for NativeFileObject {
             }
         }
         self.metrics.record_inline_task();
-        Box::pin(async move { self.read_exact_at_offset_owned(offset, len) })
+        Box::pin(async move { self.read_exact_at_owned_io(offset, len)?.await })
     }
 }
 
 impl BlockingStorageReadObject for NativeFileObject {
     fn len_blocking(&self) -> Result<u64> {
-        poll_ready_storage_future(StorageReadObject::len(self))
+        len_native_file_handle(self.file.as_ref(), &self.object)
     }
 
     fn read_exact_at_blocking(&self, offset: usize, bytes: &mut [u8]) -> Result<()> {
@@ -1171,6 +1282,8 @@ pub(crate) struct NativeFileAppendObject {
     object: StorageObjectId,
     file: Arc<Mutex<File>>,
     runtime: Option<Runtime>,
+    #[cfg(feature = "platform-io")]
+    platform_io: Option<PlatformIoDriver>,
     metrics: Arc<NativeFileStorageMetrics>,
 }
 
@@ -1178,6 +1291,7 @@ impl NativeFileAppendObject {
     fn open(
         object: &StorageObjectId,
         runtime: Option<Runtime>,
+        #[cfg(feature = "platform-io")] platform_io: Option<PlatformIoDriver>,
         metrics: Arc<NativeFileStorageMetrics>,
     ) -> Result<Self> {
         let file = open_native_append_file(object)?;
@@ -1185,6 +1299,8 @@ impl NativeFileAppendObject {
             object: object.clone(),
             file: Arc::new(Mutex::new(file)),
             runtime,
+            #[cfg(feature = "platform-io")]
+            platform_io,
             metrics,
         })
     }
@@ -1204,21 +1320,57 @@ impl NativeFileAppendObject {
     }
 }
 
+impl IoAppendObject for NativeFileAppendObject {
+    fn append_io(&self, bytes: Arc<[u8]>, durability: DurabilityMode) -> Result<IoCompletion<()>> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = &self.platform_io {
+            return driver.submit_append_path(self.object.path().to_path_buf(), bytes, durability);
+        }
+
+        let object = self.object.clone();
+        let file = Arc::clone(&self.file);
+        InlineIoDriver.submit_append(move || {
+            let mut file = lock_native_append_file(file.as_ref(), &object)?;
+            append_native_file_object(&mut file, bytes.as_ref(), durability)
+        })
+    }
+
+    fn persist_io(&self, durability: DurabilityMode) -> Result<IoCompletion<()>> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = &self.platform_io {
+            return driver.submit_persist_path(self.object.path().to_path_buf(), durability);
+        }
+
+        let object = self.object.clone();
+        let file = Arc::clone(&self.file);
+        InlineIoDriver.submit_sync(move || {
+            let mut file = lock_native_append_file(file.as_ref(), &object)?;
+            persist_native_append_file(&mut file, durability)
+        })
+    }
+}
+
 impl StorageAppendObject for NativeFileAppendObject {
     fn append<'op>(
         &'op mut self,
         bytes: &'op [u8],
         durability: DurabilityMode,
     ) -> StorageFuture<'op, ()> {
+        let bytes: Arc<[u8]> = Arc::from(bytes);
+        #[cfg(feature = "platform-io")]
+        if self.platform_io.is_some() {
+            self.metrics.record_platform_async_io_task();
+            return Box::pin(async move { self.append_io(bytes, durability)?.await });
+        }
+
         if let Some(runtime) = self.runtime.clone() {
             if runtime.capabilities().blocking_adapter() {
                 let object = self.object.clone();
                 let file = Arc::clone(&self.file);
-                let bytes: Arc<[u8]> = Arc::from(bytes);
                 self.metrics.record_blocking_adapter_task();
                 return Box::pin(async move {
-                    runtime
-                        .spawn_blocking_result(move || {
+                    BlockingAdapterIoDriver::new(runtime)
+                        .submit_append(move || {
                             let mut file = lock_native_append_file(file.as_ref(), &object)?;
                             append_native_file_object(&mut file, bytes.as_ref(), durability)
                         })?
@@ -1228,18 +1380,24 @@ impl StorageAppendObject for NativeFileAppendObject {
         }
 
         self.metrics.record_inline_task();
-        Box::pin(async move { self.append_to_file(bytes, durability) })
+        Box::pin(async move { self.append_io(bytes, durability)?.await })
     }
 
     fn persist(&mut self, durability: DurabilityMode) -> StorageFuture<'_, ()> {
+        #[cfg(feature = "platform-io")]
+        if self.platform_io.is_some() {
+            self.metrics.record_platform_async_io_task();
+            return Box::pin(async move { self.persist_io(durability)?.await });
+        }
+
         if let Some(runtime) = self.runtime.clone() {
             if runtime.capabilities().blocking_adapter() {
                 let object = self.object.clone();
                 let file = Arc::clone(&self.file);
                 self.metrics.record_blocking_adapter_task();
                 return Box::pin(async move {
-                    runtime
-                        .spawn_blocking_result(move || {
+                    BlockingAdapterIoDriver::new(runtime)
+                        .submit_sync(move || {
                             let mut file = lock_native_append_file(file.as_ref(), &object)?;
                             persist_native_append_file(&mut file, durability)
                         })?
@@ -1249,7 +1407,7 @@ impl StorageAppendObject for NativeFileAppendObject {
         }
 
         self.metrics.record_inline_task();
-        Box::pin(async move { self.persist_file(durability) })
+        Box::pin(async move { self.persist_io(durability)?.await })
     }
 }
 
@@ -1372,6 +1530,45 @@ fn read_exact_at_native_file_owned(
     Ok(StorageReadBuffer::new(offset, Arc::from(bytes)))
 }
 
+fn lock_native_read_file<'file>(
+    file: &'file Mutex<File>,
+    object: &StorageObjectId,
+) -> Result<MutexGuard<'file, File>> {
+    file.lock().map_err(|_| Error::Corruption {
+        message: format!(
+            "referenced {} {} handle lock poisoned",
+            object.kind().as_str(),
+            object.path().display()
+        ),
+    })
+}
+
+fn len_native_file_handle(file: &Mutex<File>, object: &StorageObjectId) -> Result<u64> {
+    let file = lock_native_read_file(file, object)?;
+    Ok(file.metadata()?.len())
+}
+
+fn read_exact_at_native_file_handle(
+    file: &Mutex<File>,
+    object: &StorageObjectId,
+    offset: usize,
+    bytes: &mut [u8],
+) -> Result<()> {
+    let mut file = lock_native_read_file(file, object)?;
+    read_exact_at_native_file(&mut file, offset, bytes)
+}
+
+fn read_exact_at_native_file_handle_owned(
+    file: &Mutex<File>,
+    object: &StorageObjectId,
+    offset: usize,
+    len: usize,
+) -> Result<StorageReadBuffer> {
+    let mut bytes = allocate_read_buffer(len)?;
+    read_exact_at_native_file_handle(file, object, offset, &mut bytes)?;
+    Ok(StorageReadBuffer::new(offset, Arc::from(bytes)))
+}
+
 fn open_native_file(object: &StorageObjectId) -> Result<File> {
     File::open(object.path()).map_err(|error| Error::Corruption {
         message: format!(
@@ -1402,8 +1599,10 @@ fn read_native_file_object_bytes(object: &StorageObjectId) -> Result<Option<Arc<
     };
     let object = NativeFileObject {
         object: object.clone(),
-        file: Mutex::new(file),
+        file: Arc::new(Mutex::new(file)),
         runtime: None,
+        #[cfg(feature = "platform-io")]
+        platform_io: None,
         metrics: Arc::new(NativeFileStorageMetrics::default()),
     };
     let len = u64_to_usize(object.len_blocking()?, "storage object length")?;
@@ -1924,6 +2123,67 @@ mod tests {
     }
 
     #[test]
+    fn native_file_read_io_completion_returns_owned_buffer() {
+        let path = std::env::temp_dir().join(format!(
+            "trine-kv-completion-storage-read-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"abcdef").expect("test file writes");
+
+        let backend = NativeFileBackend::new();
+        let object_id = StorageObjectId::native_file(StorageObjectKind::Table, &path);
+        let object = backend
+            .open_read_blocking(object_id)
+            .expect("completion object opens");
+        let completion = object
+            .read_exact_at_owned_io(2, 3)
+            .expect("completion read submits");
+        assert!(completion.is_finished().expect("completion state reads"));
+        let buffer = poll_ready_storage_future(completion).expect("completion read finishes");
+
+        assert_eq!(buffer.offset(), 2);
+        assert_eq!(&*buffer.into_bytes(), b"cde");
+
+        std::fs::remove_file(path).expect("test file removes");
+    }
+
+    #[test]
+    fn native_file_append_io_completion_writes_and_persists() {
+        let root = temp_storage_root("trine-kv-completion-append-storage");
+        let object = StorageObjectId::native_file(StorageObjectKind::Wal, root.join("trine.wal"));
+        let backend = NativeFileBackend::new();
+        let append = backend
+            .open_append_blocking(object.clone())
+            .expect("completion append object opens");
+
+        let append_completion = append
+            .append_io(Arc::from(&b"wal bytes"[..]), DurabilityMode::Buffered)
+            .expect("completion append submits");
+        assert!(
+            append_completion
+                .is_finished()
+                .expect("append completion state reads")
+        );
+        poll_ready_storage_future(append_completion).expect("completion append finishes");
+
+        let persist_completion = append
+            .persist_io(DurabilityMode::Buffered)
+            .expect("completion persist submits");
+        poll_ready_storage_future(persist_completion).expect("completion persist finishes");
+
+        assert_eq!(
+            std::fs::read(object.path()).expect("WAL object reads"),
+            b"wal bytes"
+        );
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[test]
     fn runtime_enabled_native_file_object_mutations_use_blocking_adapter() {
         let root = temp_storage_root("trine-kv-runtime-object-mutations");
         let path = root.join("table-00000000000000000011.trinet");
@@ -2146,6 +2406,55 @@ mod tests {
             std::fs::read(object.path()).expect("WAL object reads"),
             b"firstsecond"
         );
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[cfg(feature = "platform-io")]
+    #[test]
+    fn platform_io_native_file_read_and_append_use_platform_driver() {
+        let root = temp_storage_root("trine-kv-platform-io-storage");
+        std::fs::create_dir_all(&root).expect("test dir creates");
+        let table =
+            StorageObjectId::native_file(StorageObjectKind::Table, root.join("table.trinet"));
+        std::fs::write(table.path(), b"abcdef").expect("table file writes");
+
+        let runtime = Runtime::new(RuntimeOptions::platform_io());
+        let backend = NativeFileBackend::with_runtime(runtime);
+        let capabilities = backend.capabilities();
+        assert!(capabilities.supports(StorageCapability::PlatformAsyncIo));
+
+        let object = backend
+            .open_read_blocking(table)
+            .expect("platform I/O read object opens");
+        let buffer = block_on_test_future(object.read_exact_at_owned(2, 3))
+            .expect("platform I/O read completes");
+        assert_eq!(buffer.offset(), 2);
+        assert_eq!(&*buffer.into_bytes(), b"cde");
+
+        let wal = StorageObjectId::native_file(StorageObjectKind::Wal, root.join("trine.wal"));
+        let mut append = backend
+            .open_append_blocking(wal.clone())
+            .expect("platform I/O append object opens");
+        block_on_test_future(StorageAppendObject::append(
+            &mut append,
+            b"first",
+            DurabilityMode::Buffered,
+        ))
+        .expect("platform I/O append completes");
+        block_on_test_future(StorageAppendObject::persist(
+            &mut append,
+            DurabilityMode::Buffered,
+        ))
+        .expect("platform I/O persist completes");
+        assert_eq!(
+            std::fs::read(wal.path()).expect("WAL object reads"),
+            b"first"
+        );
+
+        let stats = backend.stats();
+        assert!(stats.uses_platform_async_io);
+        assert!(stats.platform_async_io_tasks >= 3);
 
         std::fs::remove_dir_all(root).expect("test dir removes");
     }

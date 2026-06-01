@@ -335,9 +335,14 @@ Rules:
 - must provide atomic manifest publish for persistent writable mode;
 - may implement async operations with a bounded blocking pool when the host file
   API is blocking;
+- may use the opt-in `platform-io` runtime mode for native-file length, owned
+  random read, append, and persist operations when the build enables the
+  matching platform I/O feature;
 - may add stronger platform-specific implementations behind the same contract.
 - must report `BlockingAdapter` separately from `PlatformAsyncIo`; using a
   bounded blocking pool must not be described as true platform async I/O.
+- must continue to report blocking-adapter work for native-file operations that
+  have not moved below the platform I/O driver.
 
 ### 9.3 WASI Backend
 

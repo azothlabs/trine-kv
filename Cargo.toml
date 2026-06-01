@@ -28,6 +28,7 @@ name = "trine_kv"
 path = "src/lib.rs"
 
 [dependencies]
+compio = { version = "0.14.0", default-features = false, features = ["runtime"], optional = true }
 lz4_flex = "0.13.1"
 
 [[bench]]
@@ -40,3 +41,6 @@ unsafe_code = "warn"
 [lints.clippy]
 all = "warn"
 pedantic = "warn"
+
+[features]
+platform-io = ["dep:compio"]

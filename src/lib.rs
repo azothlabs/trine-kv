@@ -18,6 +18,7 @@ mod durability;
 pub mod error;
 pub mod filter;
 pub mod internal_key;
+mod io;
 pub mod iterator;
 mod lsm;
 pub mod manifest;

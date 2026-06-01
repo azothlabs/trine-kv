@@ -21,6 +21,7 @@ use crate::{
 pub enum RuntimeMode {
     #[default]
     NativeThreads,
+    PlatformIo,
     Inline,
 }
 
@@ -39,6 +40,7 @@ const COOPERATIVE_TASKS: u8 = 1 << 1;
 const BLOCKING_ADAPTER: u8 = 1 << 2;
 const CANCELLATION_TOKENS: u8 = 1 << 3;
 const TASK_JOIN: u8 = 1 << 4;
+const PLATFORM_ASYNC_IO: u8 = 1 << 5;
 
 const DEFAULT_BLOCKING_WORKERS: usize = 4;
 const DEFAULT_BLOCKING_QUEUE_DEPTH: usize = 1024;
@@ -110,15 +112,24 @@ impl RuntimeOptions {
     }
 
     #[must_use]
+    pub const fn platform_io() -> Self {
+        Self {
+            mode: RuntimeMode::PlatformIo,
+        }
+    }
+
+    #[must_use]
     pub const fn capabilities(self) -> RuntimeCapabilities {
+        const NATIVE_THREAD_FLAGS: u8 = BACKGROUND_THREADS
+            | COOPERATIVE_TASKS
+            | BLOCKING_ADAPTER
+            | CANCELLATION_TOKENS
+            | TASK_JOIN;
         match self.mode {
-            RuntimeMode::NativeThreads => RuntimeCapabilities::new(
-                BACKGROUND_THREADS
-                    | COOPERATIVE_TASKS
-                    | BLOCKING_ADAPTER
-                    | CANCELLATION_TOKENS
-                    | TASK_JOIN,
-            ),
+            RuntimeMode::NativeThreads => RuntimeCapabilities::new(NATIVE_THREAD_FLAGS),
+            RuntimeMode::PlatformIo => {
+                RuntimeCapabilities::new(NATIVE_THREAD_FLAGS | platform_async_io_flag())
+            }
             RuntimeMode::Inline => {
                 RuntimeCapabilities::new(COOPERATIVE_TASKS | CANCELLATION_TOKENS)
             }
@@ -178,8 +189,21 @@ impl RuntimeCapabilities {
         self.has(TASK_JOIN)
     }
 
+    #[must_use]
+    pub const fn platform_async_io(self) -> bool {
+        self.has(PLATFORM_ASYNC_IO)
+    }
+
     const fn has(self, flag: u8) -> bool {
         self.flags & flag != 0
+    }
+}
+
+const fn platform_async_io_flag() -> u8 {
+    if cfg!(feature = "platform-io") {
+        PLATFORM_ASYNC_IO
+    } else {
+        0
     }
 }
 
@@ -221,7 +245,7 @@ impl Runtime {
         task: impl FnOnce() + Send + 'static,
     ) -> Result<RuntimeTask> {
         match self.options.mode {
-            RuntimeMode::NativeThreads => thread::Builder::new()
+            RuntimeMode::NativeThreads | RuntimeMode::PlatformIo => thread::Builder::new()
                 .name(name)
                 .spawn(task)
                 .map(RuntimeTask::NativeThread)
@@ -436,6 +460,13 @@ pub(crate) fn validate_runtime_options(
     read_only: bool,
     background_worker_count: usize,
 ) -> Result<()> {
+    #[cfg(not(feature = "platform-io"))]
+    if matches!(runtime.mode, RuntimeMode::PlatformIo) {
+        return Err(Error::unsupported_backend(
+            "platform async I/O runtime requires the platform-io feature",
+        ));
+    }
+
     let persistent_background_workers = matches!(storage_mode, StorageMode::Persistent { .. })
         && !read_only
         && background_worker_count != 0;
@@ -498,12 +529,21 @@ mod tests {
         assert!(native.cancellation_tokens());
         assert!(native.task_join());
         assert!(native.blocking_adapter());
+        assert!(!native.platform_async_io());
+
+        let platform = RuntimeOptions::platform_io().capabilities();
+        assert!(platform.background_threads());
+        assert!(platform.cancellation_tokens());
+        assert!(platform.task_join());
+        assert!(platform.blocking_adapter());
+        assert_eq!(platform.platform_async_io(), cfg!(feature = "platform-io"));
 
         let inline = RuntimeOptions::inline().capabilities();
         assert!(!inline.background_threads());
         assert!(inline.cooperative_tasks());
         assert!(inline.cancellation_tokens());
         assert!(!inline.blocking_adapter());
+        assert!(!inline.platform_async_io());
         assert!(!inline.task_join());
     }
 
@@ -631,6 +671,21 @@ mod tests {
             .expect_err("inline runtime has no blocking adapter");
 
         assert!(matches!(error, Error::Unsupported { .. }));
+    }
+
+    #[cfg(not(feature = "platform-io"))]
+    #[test]
+    fn platform_io_runtime_requires_feature() {
+        let path = std::env::temp_dir().join(format!(
+            "trine-kv-runtime-no-platform-io-{}",
+            std::process::id()
+        ));
+        let mut options = DbOptions::persistent(path.clone());
+        options.runtime = RuntimeOptions::platform_io();
+        let error = Db::open(options).expect_err("platform I/O requires feature");
+
+        assert!(matches!(error, Error::UnsupportedBackend { .. }));
+        let _ = std::fs::remove_dir_all(path);
     }
 
     #[test]

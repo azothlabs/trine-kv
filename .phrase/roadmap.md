@@ -2351,3 +2351,58 @@ the native-file backend's use of the portable blocking adapter.
 **Major Out Of Scope**:
 
 - Adding an OS async file driver or new runtime dependency.
+
+### Phase 105: IO Completion And Driver Boundary
+
+**Status**: Complete
+
+**Goal**: Introduce Trine's internal `io` completion and driver boundary before
+adding platform-specific file I/O drivers.
+
+**Entry Condition**: Phase 104 complete and backend capability reporting can
+distinguish blocking adapters from platform async I/O.
+
+**Acceptance Gate**:
+
+- `src/io.rs` owns completion state, driver kind, driver submission, and I/O
+  object traits.
+- Native-file read, append, and persist paths submit through `io` completions
+  on both inline and blocking-adapter drivers.
+- Existing native-file capabilities and stats remain stable.
+- No public API, storage format, WAL, MVCC, manifest, table, or compaction
+  behavior changes.
+- Focused storage tests, formatting, clippy, full tests, diff checks, and
+  forbidden-term scan pass.
+
+**Major Out Of Scope**:
+
+- Adding Linux io_uring, Windows IOCP, kqueue, or another platform driver.
+
+### Phase 106: Feature-Gated Platform I/O Driver
+
+**Status**: Complete
+
+**Goal**: Add an opt-in native platform I/O path below Trine's `io` completion
+boundary.
+
+**Entry Condition**: Phase 105 complete and native-file read/append/persist
+paths submit through `io` completions.
+
+**Acceptance Gate**:
+
+- Cargo exposes a `platform-io` feature that pulls in an MSRV-compatible
+  platform I/O dependency.
+- `RuntimeOptions::platform_io()` selects a native-file platform I/O driver
+  only when the feature is enabled.
+- Native-file length, owned random reads, append, and persist can complete
+  through the platform driver.
+- Native-file capabilities and stats distinguish platform I/O tasks from
+  blocking-adapter tasks.
+- Default runtime behavior remains unchanged.
+- Formatting, clippy, full tests, diff checks, and forbidden-term scan pass.
+
+**Major Out Of Scope**:
+
+- Making platform I/O the default runtime.
+- Moving manifest publish, directory operations, object listing, writer lease,
+  recovery scanning, and all remaining metadata operations to platform I/O.
