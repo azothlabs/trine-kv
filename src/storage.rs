@@ -5,7 +5,10 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll, Waker},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -207,6 +210,8 @@ pub(crate) enum StorageCapability {
     StrictMetadataSync,
     BackgroundThreads,
     AsyncTasks,
+    BlockingAdapter,
+    PlatformAsyncIo,
     CooperativeTasks,
 }
 
@@ -232,6 +237,8 @@ impl StorageCapability {
             Self::StrictMetadataSync => "strict metadata sync",
             Self::BackgroundThreads => "background threads",
             Self::AsyncTasks => "async tasks",
+            Self::BlockingAdapter => "blocking storage adapter",
+            Self::PlatformAsyncIo => "platform async I/O",
             Self::CooperativeTasks => "cooperative tasks",
         }
     }
@@ -257,7 +264,9 @@ impl StorageCapability {
             Self::StrictMetadataSync => 1 << 16,
             Self::BackgroundThreads => 1 << 17,
             Self::AsyncTasks => 1 << 18,
-            Self::CooperativeTasks => 1 << 19,
+            Self::BlockingAdapter => 1 << 19,
+            Self::PlatformAsyncIo => 1 << 20,
+            Self::CooperativeTasks => 1 << 21,
         }
     }
 }
@@ -728,20 +737,35 @@ impl BlockingStorageReadObject for MemoryStorageObject {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct NativeFileBackend {
     runtime: Option<Runtime>,
+    metrics: Arc<NativeFileStorageMetrics>,
 }
 
 impl NativeFileBackend {
-    pub(crate) const fn new() -> Self {
-        Self { runtime: None }
+    pub(crate) fn new() -> Self {
+        Self {
+            runtime: None,
+            metrics: Arc::new(NativeFileStorageMetrics::default()),
+        }
     }
 
     #[allow(dead_code)]
     pub(crate) fn with_runtime(runtime: Runtime) -> Self {
         Self {
             runtime: Some(runtime),
+            metrics: Arc::new(NativeFileStorageMetrics::default()),
+        }
+    }
+
+    pub(crate) fn stats(&self) -> NativeFileStorageStats {
+        let capabilities = self.capabilities();
+        NativeFileStorageStats {
+            uses_blocking_adapter: capabilities.supports(StorageCapability::BlockingAdapter),
+            uses_platform_async_io: capabilities.supports(StorageCapability::PlatformAsyncIo),
+            blocking_adapter_tasks: self.metrics.blocking_adapter_tasks(),
+            inline_tasks: self.metrics.inline_tasks(),
         }
     }
 
@@ -754,12 +778,52 @@ impl NativeFileBackend {
     {
         if let Some(runtime) = self.runtime.clone() {
             if runtime.capabilities().blocking_adapter() {
+                self.metrics.record_blocking_adapter_task();
                 return Box::pin(async move { runtime.spawn_blocking_result(task)?.await });
             }
         }
 
+        self.metrics.record_inline_task();
         Box::pin(async move { task() })
     }
+}
+
+impl Default for NativeFileBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Default)]
+struct NativeFileStorageMetrics {
+    blocking_adapter_tasks: AtomicU64,
+    inline_tasks: AtomicU64,
+}
+
+impl NativeFileStorageMetrics {
+    fn record_blocking_adapter_task(&self) {
+        self.blocking_adapter_tasks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_inline_task(&self) {
+        self.inline_tasks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn blocking_adapter_tasks(&self) -> u64 {
+        self.blocking_adapter_tasks.load(Ordering::Acquire)
+    }
+
+    fn inline_tasks(&self) -> u64 {
+        self.inline_tasks.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct NativeFileStorageStats {
+    pub(crate) uses_blocking_adapter: bool,
+    pub(crate) uses_platform_async_io: bool,
+    pub(crate) blocking_adapter_tasks: u64,
+    pub(crate) inline_tasks: u64,
 }
 
 impl StorageReadBackend for NativeFileBackend {
@@ -774,6 +838,7 @@ impl StorageReadBackend for NativeFileBackend {
         {
             capabilities
                 .with(StorageCapability::AsyncTasks)
+                .with(StorageCapability::BlockingAdapter)
                 .with(StorageCapability::BackgroundThreads)
         } else {
             capabilities
@@ -782,13 +847,14 @@ impl StorageReadBackend for NativeFileBackend {
 
     fn open_read(&self, object: StorageObjectId) -> StorageReadFuture<'_, Self::ReadObject> {
         let runtime = self.runtime.clone();
-        Box::pin(async move { NativeFileObject::open(object, runtime) })
+        let metrics = Arc::clone(&self.metrics);
+        Box::pin(async move { NativeFileObject::open(object, runtime, metrics) })
     }
 }
 
 impl BlockingStorageReadBackend for NativeFileBackend {
     fn open_read_blocking(&self, object: StorageObjectId) -> Result<Self::ReadObject> {
-        NativeFileObject::open(object, self.runtime.clone())
+        NativeFileObject::open(object, self.runtime.clone(), Arc::clone(&self.metrics))
     }
 }
 
@@ -809,13 +875,14 @@ impl StorageAppendBackend for NativeFileBackend {
 
     fn open_append(&self, object: StorageObjectId) -> StorageFuture<'_, Self::AppendObject> {
         let runtime = self.runtime.clone();
-        self.run_owned_storage_task(move || NativeFileAppendObject::open(&object, runtime))
+        let metrics = Arc::clone(&self.metrics);
+        self.run_owned_storage_task(move || NativeFileAppendObject::open(&object, runtime, metrics))
     }
 }
 
 impl BlockingStorageAppendBackend for NativeFileBackend {
     fn open_append_blocking(&self, object: StorageObjectId) -> Result<Self::AppendObject> {
-        NativeFileAppendObject::open(&object, self.runtime.clone())
+        NativeFileAppendObject::open(&object, self.runtime.clone(), Arc::clone(&self.metrics))
     }
 }
 
@@ -1000,15 +1067,21 @@ pub(crate) struct NativeFileObject {
     object: StorageObjectId,
     file: Mutex<File>,
     runtime: Option<Runtime>,
+    metrics: Arc<NativeFileStorageMetrics>,
 }
 
 impl NativeFileObject {
-    fn open(object: StorageObjectId, runtime: Option<Runtime>) -> Result<Self> {
+    fn open(
+        object: StorageObjectId,
+        runtime: Option<Runtime>,
+        metrics: Arc<NativeFileStorageMetrics>,
+    ) -> Result<Self> {
         let file = open_native_file(&object)?;
         Ok(Self {
             object,
             file: Mutex::new(file),
             runtime,
+            metrics,
         })
     }
 
@@ -1064,6 +1137,7 @@ impl StorageReadObject for NativeFileObject {
         if let Some(runtime) = self.runtime.clone() {
             if runtime.capabilities().blocking_adapter() {
                 let object = self.object.clone();
+                self.metrics.record_blocking_adapter_task();
                 return Box::pin(async move {
                     runtime
                         .spawn_blocking_result(move || {
@@ -1073,6 +1147,7 @@ impl StorageReadObject for NativeFileObject {
                 });
             }
         }
+        self.metrics.record_inline_task();
         Box::pin(async move { self.read_exact_at_offset_owned(offset, len) })
     }
 }
@@ -1096,15 +1171,21 @@ pub(crate) struct NativeFileAppendObject {
     object: StorageObjectId,
     file: Arc<Mutex<File>>,
     runtime: Option<Runtime>,
+    metrics: Arc<NativeFileStorageMetrics>,
 }
 
 impl NativeFileAppendObject {
-    fn open(object: &StorageObjectId, runtime: Option<Runtime>) -> Result<Self> {
+    fn open(
+        object: &StorageObjectId,
+        runtime: Option<Runtime>,
+        metrics: Arc<NativeFileStorageMetrics>,
+    ) -> Result<Self> {
         let file = open_native_append_file(object)?;
         Ok(Self {
             object: object.clone(),
             file: Arc::new(Mutex::new(file)),
             runtime,
+            metrics,
         })
     }
 
@@ -1134,6 +1215,7 @@ impl StorageAppendObject for NativeFileAppendObject {
                 let object = self.object.clone();
                 let file = Arc::clone(&self.file);
                 let bytes: Arc<[u8]> = Arc::from(bytes);
+                self.metrics.record_blocking_adapter_task();
                 return Box::pin(async move {
                     runtime
                         .spawn_blocking_result(move || {
@@ -1145,6 +1227,7 @@ impl StorageAppendObject for NativeFileAppendObject {
             }
         }
 
+        self.metrics.record_inline_task();
         Box::pin(async move { self.append_to_file(bytes, durability) })
     }
 
@@ -1153,6 +1236,7 @@ impl StorageAppendObject for NativeFileAppendObject {
             if runtime.capabilities().blocking_adapter() {
                 let object = self.object.clone();
                 let file = Arc::clone(&self.file);
+                self.metrics.record_blocking_adapter_task();
                 return Box::pin(async move {
                     runtime
                         .spawn_blocking_result(move || {
@@ -1164,6 +1248,7 @@ impl StorageAppendObject for NativeFileAppendObject {
             }
         }
 
+        self.metrics.record_inline_task();
         Box::pin(async move { self.persist_file(durability) })
     }
 }
@@ -1319,6 +1404,7 @@ fn read_native_file_object_bytes(object: &StorageObjectId) -> Result<Option<Arc<
         object: object.clone(),
         file: Mutex::new(file),
         runtime: None,
+        metrics: Arc::new(NativeFileStorageMetrics::default()),
     };
     let len = u64_to_usize(object.len_blocking()?, "storage object length")?;
     let buffer = object.read_exact_at_owned_blocking(0, len)?;
@@ -2124,16 +2210,11 @@ mod tests {
         let runtime = Runtime::with_blocking_limits(RuntimeOptions::native_threads(), 1, 2);
         let release = hold_runtime_blocking_worker(&runtime);
         let backend = NativeFileBackend::with_runtime(runtime);
-        assert!(
-            backend
-                .capabilities()
-                .supports(StorageCapability::AsyncTasks)
-        );
-        assert!(
-            backend
-                .capabilities()
-                .supports(StorageCapability::BackgroundThreads)
-        );
+        let capabilities = backend.capabilities();
+        assert!(capabilities.supports(StorageCapability::AsyncTasks));
+        assert!(capabilities.supports(StorageCapability::BlockingAdapter));
+        assert!(capabilities.supports(StorageCapability::BackgroundThreads));
+        assert!(!capabilities.supports(StorageCapability::PlatformAsyncIo));
 
         let object_id = StorageObjectId::native_file(StorageObjectKind::Table, &path);
         let object = poll_ready_storage_future(backend.open_read(object_id))
@@ -2150,6 +2231,11 @@ mod tests {
         let buffer = block_on_test_future(read).expect("runtime owned read completes");
         assert_eq!(buffer.offset(), 1);
         assert_eq!(&*buffer.into_bytes(), b"bcde");
+        let stats = backend.stats();
+        assert!(stats.uses_blocking_adapter);
+        assert!(!stats.uses_platform_async_io);
+        assert_eq!(stats.blocking_adapter_tasks, 1);
+        assert_eq!(stats.inline_tasks, 0);
 
         std::fs::remove_file(path).expect("test file removes");
     }
@@ -2184,6 +2270,10 @@ mod tests {
             .expect("runtime object read completes")
             .expect("object exists");
         assert_eq!(&*bytes, b"whole object");
+        let stats = backend.stats();
+        assert!(stats.uses_blocking_adapter);
+        assert_eq!(stats.blocking_adapter_tasks, 1);
+        assert_eq!(stats.inline_tasks, 0);
 
         std::fs::remove_file(path).expect("test file removes");
     }
@@ -2202,11 +2292,10 @@ mod tests {
 
         let runtime = Runtime::new(RuntimeOptions::inline());
         let backend = NativeFileBackend::with_runtime(runtime);
-        assert!(
-            !backend
-                .capabilities()
-                .supports(StorageCapability::AsyncTasks)
-        );
+        let capabilities = backend.capabilities();
+        assert!(!capabilities.supports(StorageCapability::AsyncTasks));
+        assert!(!capabilities.supports(StorageCapability::BlockingAdapter));
+        assert!(!capabilities.supports(StorageCapability::PlatformAsyncIo));
 
         let object_id = StorageObjectId::native_file(StorageObjectKind::Table, &path);
         let object = poll_ready_storage_future(backend.open_read(object_id))
@@ -2217,6 +2306,11 @@ mod tests {
 
         assert_eq!(buffer.offset(), 2);
         assert_eq!(&*buffer.into_bytes(), b"cde");
+        let stats = backend.stats();
+        assert!(!stats.uses_blocking_adapter);
+        assert!(!stats.uses_platform_async_io);
+        assert_eq!(stats.blocking_adapter_tasks, 0);
+        assert_eq!(stats.inline_tasks, 1);
 
         std::fs::remove_file(path).expect("test file removes");
     }

@@ -43,8 +43,8 @@ This protocol does not promise:
   API from synchronous Rust code.
 - **Storage backend**: implementation of Trine's async storage contract.
 - **Storage capability**: explicit backend promise such as volatile-only
-  storage, atomic manifest publish, durable sync, writer lease, random reads, or
-  background task support.
+  storage, atomic manifest publish, durable sync, writer lease, random reads,
+  background task support, blocking adapter support, or platform async I/O.
 - **Storage object**: backend-owned byte object used for WAL segments, table
   files, blob files, manifests, lock or lease records, reports, and temporary
   outputs.
@@ -112,6 +112,8 @@ StrictDataSync
 StrictMetadataSync
 BackgroundThreads
 AsyncTasks
+BlockingAdapter
+PlatformAsyncIo
 CooperativeTasks
 ```
 
@@ -334,6 +336,8 @@ Rules:
 - may implement async operations with a bounded blocking pool when the host file
   API is blocking;
 - may add stronger platform-specific implementations behind the same contract.
+- must report `BlockingAdapter` separately from `PlatformAsyncIo`; using a
+  bounded blocking pool must not be described as true platform async I/O.
 
 ### 9.3 WASI Backend
 
@@ -397,6 +401,7 @@ Stats and diagnostics should expose:
 - cooperative worker yields;
 - background task budget exhaustion;
 - blocking adapter call count when enabled;
+- whether the storage backend uses a blocking adapter or platform async I/O;
 - unsupported capability errors.
 
 ## 12. Required Tests

@@ -1335,6 +1335,11 @@ impl Db {
             stats.wal_records_accepted = wal_stats.records_accepted;
             stats.wal_bytes_accepted = wal_stats.bytes_accepted;
         }
+        let storage_stats = self.inner.native_storage.stats();
+        stats.storage_uses_blocking_adapter = storage_stats.uses_blocking_adapter;
+        stats.storage_uses_platform_async_io = storage_stats.uses_platform_async_io;
+        stats.storage_blocking_adapter_tasks = storage_stats.blocking_adapter_tasks;
+        stats.storage_inline_tasks = storage_stats.inline_tasks;
         let (blob_read_count, blob_read_bytes) = self.inner.blob_reads.snapshot();
         stats.blob_read_count = blob_read_count;
         stats.blob_read_bytes = blob_read_bytes;
@@ -3743,7 +3748,9 @@ mod tests {
 
         let capabilities = db.inner.native_storage.capabilities();
         assert!(capabilities.supports(StorageCapability::AsyncTasks));
+        assert!(capabilities.supports(StorageCapability::BlockingAdapter));
         assert!(capabilities.supports(StorageCapability::BackgroundThreads));
+        assert!(!capabilities.supports(StorageCapability::PlatformAsyncIo));
 
         let value = b"value-stored-through-blob".to_vec();
         db.put(b"key", value.clone()).expect("write");
@@ -3755,6 +3762,9 @@ mod tests {
         let stats = db.stats();
         assert_eq!(stats.live_blob_files, 1);
         assert!(stats.live_blob_bytes >= value.len() as u64);
+        assert!(stats.storage_uses_blocking_adapter);
+        assert!(!stats.storage_uses_platform_async_io);
+        assert_eq!(stats.storage_inline_tasks, 0);
 
         drop(db);
         fs::remove_dir_all(path).expect("cleanup test db");

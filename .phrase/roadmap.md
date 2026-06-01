@@ -2324,3 +2324,30 @@ tested.
 - Platform-native async file I/O. That remains a separate backend phase because
   it needs explicit platform support beyond the portable bounded blocking
   adapter.
+
+### Phase 104: Async Storage Backend Honesty
+
+**Status**: Complete
+
+**Goal**: Close the remaining async storage boundary by making native-file
+blocking-adapter behavior explicit and observable instead of implying true
+platform async file I/O.
+
+**Entry Condition**: Phase 103 complete and the only remaining async blocker is
+the native-file backend's use of the portable blocking adapter.
+
+**Acceptance Gate**:
+
+- Storage capabilities distinguish `BlockingAdapter` from `PlatformAsyncIo`.
+- Native-file backend reports `BlockingAdapter` only when a runtime blocking
+  adapter is active.
+- Native-file backend does not report `PlatformAsyncIo` without a real platform
+  async file driver.
+- `DbStats` exposes native-file adapter usage and task counters.
+- The async storage protocol records the distinction.
+- Focused storage/db tests, formatting, clippy, full tests, diff checks, and
+  forbidden-term scan pass.
+
+**Major Out Of Scope**:
+
+- Adding an OS async file driver or new runtime dependency.

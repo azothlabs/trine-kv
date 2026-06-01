@@ -6,87 +6,71 @@ Complete
 
 ## Goal
 
-Finish the remaining async/write-path tails that can be completed without
-adding a platform-specific native async file-I/O backend.
+Close the remaining async backend boundary honestly by distinguishing portable
+blocking-adapter async work from true platform async file I/O.
 
 ## Scope
 
-- Move WAL shard lanes behind bounded front-door worker queues.
-- Keep one commit record on one WAL shard and preserve existing recovery merge.
-- Split transaction commit into serialized read validation/sequence assignment,
-  WAL accept outside the publish barrier, and later memory publication.
-- Move memtable publication and post-commit freeze out of the global publish
-  barrier and under a narrower memtable publish lock.
-- Keep public flush freeze ordered with memtable publication.
-- Route table-open header/footer metadata reads through owned read buffers.
-- Expose the WAL queue capacity through stats.
+- Add explicit storage capability reporting for blocking-adapter-backed storage
+  tasks and platform async file I/O.
+- Keep native-file backend on the bounded blocking adapter unless a real
+  platform driver exists.
+- Expose native-file blocking-adapter usage through database stats.
+- Update the async-first storage protocol to make this distinction stable.
+- Add focused tests for capability reporting and stats.
 
 ## Out Of Scope
 
-- Adding public WAL queue/shard tuning options.
-- Changing WAL frame format, table/blob/manifest formats, MVCC semantics,
-  compaction behavior, or public API names.
-- Adding platform-native async file I/O such as io_uring, kqueue, or Windows
-  overlapped I/O.
+- Adding io_uring, kqueue, Windows overlapped I/O, Tokio, or a new runtime
+  dependency.
+- Changing WAL, SSTable, manifest, blob, MVCC, transaction, compaction, or
+  recovery formats.
+- Changing public database operation names or durability semantics.
 
 ## Acceptance Gate
 
-- WAL front-door append/persist/rewrite commands run through bounded lane
-  workers.
-- Transaction writes reserve their sequence under the publish barrier but append
-  WAL outside that barrier.
-- Memtable publication and post-commit freeze no longer hold the global publish
-  barrier.
-- Public flush captures and freezes active memtables under the memtable publish
-  lock so newer commits cannot slip into an older flush boundary.
-- Table open metadata reads use owned read buffers, not borrowed caller buffers.
-- Focused WAL, commit, flush, table-open, persistent WAL, async tests,
-  formatting, clippy, full tests, `git diff --check`, and forbidden-term scan
+- Native-file backend reports `BlockingAdapter` when it uses the runtime
+  blocking adapter.
+- Native-file backend does not report `PlatformAsyncIo` without a real
+  platform async file driver.
+- `DbStats` exposes storage adapter usage and task counts.
+- Existing async/storage tests pass with focused coverage for the boundary.
+- Formatting, clippy, full tests, `git diff --check`, and forbidden-term scan
   pass.
-- Evidence records the remaining platform-native async I/O boundary honestly.
 
 ## Active Task Slice
 
 ```text
-task440 [x] goal:start async/write-path tail phase | scope:current roadmap | verify:manual
-task441 [x] goal:add bounded WAL lane workers | scope:src/wal.rs src/stats.rs src/db.rs | verify:wal tests
-task442 [x] goal:accept transaction WAL outside publish barrier | scope:src/db/commit.rs | verify:commit tests
-task443 [x] goal:narrow memtable publication lock | scope:src/db.rs src/db/commit.rs | verify:flush and persistent tests
-task444 [x] goal:use owned table-open metadata reads | scope:src/table.rs | verify:table metadata test
-task445 [x] goal:record evidence and run final verification | scope:.phrase src tests | verify:full gate
+task446 [x] goal:commit completed write-path tail phase | scope:git | verify:commit 6fa6461
+task447 [x] goal:add honest storage async capabilities | scope:src/storage.rs | verify:storage tests
+task448 [x] goal:surface storage adapter stats | scope:src/stats.rs src/db.rs | verify:db stats test
+task449 [x] goal:update async storage protocol and evidence | scope:.phrase | verify:manual + scans
+task450 [x] goal:run final verification | scope:repo | verify:full gate
 ```
 
 ## Known Blockers
 
-- True platform-native async file I/O is still not implemented. The native-file
-  backend continues to use the bounded runtime blocking adapter for async-shaped
-  reads and writes.
+- True platform async file I/O is not available in the current dependency and
+  runtime boundary. Implementing it should be a later backend-specific phase
+  with a platform driver and fallback rules.
 
 ## Evidence
 
-- Phase 102 left WAL shard lanes synchronous, transaction WAL accept inside the
-  validation barrier, memtable publication/freeze under the global publish
-  barrier, and table-open metadata on borrowed reads.
-- WAL lanes now own worker threads with bounded queues; callers submit commands
-  and wait for typed results.
-- Transaction commit now validates reads and reserves sequence under the
-  publish barrier, then accepts WAL outside that barrier before memory
-  publication.
-- Memtable publication and post-commit freeze now run under
-  `memtable_publish_lock`; public flush takes that lock before capturing and
-  freezing its visible boundary.
-- Table open header/footer reads now use `read_exact_at_owned`.
-- Focused tests passed: `cargo test wal_front_door --lib`,
-  `cargo test commit --lib`, `cargo test flush --lib`,
-  `cargo test table_open_metadata_reads_use_owned_source --lib`, selected
-  persistent WAL recovery/table tests, and `cargo test --test async_api`.
-- Final gate passed: `cargo fmt --check`,
-  `cargo clippy --all-targets --all-features -- -D warnings`,
-  `cargo test --all-targets --all-features`, `git diff --check`, and the
-  forbidden-term scan outside instruction files.
+- Phase 103 completed the local async/write-path tails and left only the native
+  file I/O boundary.
+- The accepted async-first storage protocol allows native files to use a
+  bounded blocking pool, but requires capabilities and diagnostics to be honest.
+- Current Cargo dependencies do not include an OS async file I/O driver.
+- Native-file capabilities now distinguish `BlockingAdapter` from
+  `PlatformAsyncIo`.
+- `DbStats` now exposes whether the storage backend uses the blocking adapter
+  or platform async file I/O, plus adapter and inline task counts.
+- Verification passed: `cargo fmt --check`, `cargo test storage --lib`,
+  `cargo test --test async_api`,
+  `cargo clippy --all-targets --all-features -- -D warnings`, and
+  `cargo test --all-targets --all-features`.
 
 ## Next Recommendation
 
-- Treat platform-native async file I/O as a separate backend phase with an ADR
-  or protocol update, because it requires platform-specific execution support
-  beyond the current portable runtime boundary.
+- Start platform-native async file I/O only after choosing a concrete driver and
+  supported-platform matrix.

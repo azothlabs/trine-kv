@@ -7655,3 +7655,54 @@ Record only evidence that can change planning or durable decisions.
 - Treat Phase 103 as closed under the current portable async boundary.
 - If true OS async file I/O is desired next, start a backend-specific phase with
   an ADR/protocol update for supported platforms and fallback behavior.
+
+## Phase 104: Async Storage Backend Honesty
+
+### Observation
+
+- After Phase 103, the remaining async item was not another local write-path
+  refactor. The native-file backend still used a bounded runtime blocking
+  adapter for async-shaped file operations.
+- The async-first storage protocol already allowed this portable implementation
+  but required capabilities and diagnostics to be honest.
+
+### Interpretation
+
+- Implementing true platform async file I/O without choosing a concrete OS
+  driver would create misleading behavior.
+- The correct current slice is to make the capability boundary explicit:
+  `BlockingAdapter` is not `PlatformAsyncIo`.
+
+### Change
+
+- Added `BlockingAdapter` and `PlatformAsyncIo` storage capabilities.
+- Native-file storage reports `BlockingAdapter` only when the configured runtime
+  provides the blocking adapter.
+- Native-file storage does not report `PlatformAsyncIo`.
+- Added shared native-file storage metrics for blocking-adapter tasks and
+  inline tasks.
+- Exposed storage backend adapter usage and task counters in `DbStats`.
+- Updated the async-first storage protocol to make the distinction durable.
+- Added focused storage, DB stats, and async table-read assertions.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test runtime_enabled_native_file_owned_read_uses_blocking_adapter --lib`
+- `cargo test runtime_enabled_native_file_object_read_uses_blocking_adapter --lib`
+- `cargo test persistent_open_attaches_runtime_enabled_native_storage_backend --lib`
+- `cargo test persistent_async_range_and_prefix_advance_flushed_tables --test async_api`
+- `cargo test storage --lib`
+- `cargo test --test async_api`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+
+### Remaining Blockers
+
+- True platform async file I/O is still not implemented. It now has an explicit
+  capability boundary and should be a separate backend-specific phase.
+
+### Recommended Next Action
+
+- Do not start platform-native async file I/O until a concrete driver and
+  supported-platform matrix are chosen.
