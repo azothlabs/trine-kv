@@ -1801,27 +1801,31 @@ impl BlockingStorageObjectListBackend for NativeFileBackend {
 #[allow(dead_code)]
 mod browser_persistent_storage {
     use std::{
+        cell::RefCell,
         io,
         path::{Component, Path},
+        rc::Rc,
         sync::Arc,
     };
 
-    use futures::StreamExt;
+    use futures::{StreamExt, channel::oneshot};
+    use js_sys::{Function, Promise, Reflect};
     use opfs::{
         CreateWritableOptions, DirectoryEntry, DirectoryHandle as _, FileHandle as _,
         FileSystemRemoveOptions, GetDirectoryHandleOptions, GetFileHandleOptions,
         WritableFileStream as _,
         persistent::{self, DirectoryHandle, FileHandle},
     };
-    use wasm_bindgen::JsValue;
+    use wasm_bindgen::{JsCast, JsValue};
 
     use super::{
-        DurabilityMode, Error, Result, StorageCapabilities, StorageCapability,
-        StorageDirectoryCreateBackend, StorageDirectoryFile, StorageDirectoryId,
-        StorageDirectoryListBackend, StorageFuture, StorageManifestPublishBackend,
-        StorageManifestReadBackend, StorageObjectDeleteBackend, StorageObjectId, StorageObjectKind,
-        StorageObjectListBackend, StorageObjectListRequest, StorageObjectReadBackend,
-        StorageObjectWriteBackend, StorageReadBackend, StorageReadFuture, StorageReadObject,
+        DurabilityMode, Error, Result, StorageAppendBackend, StorageAppendObject,
+        StorageCapabilities, StorageCapability, StorageDirectoryCreateBackend,
+        StorageDirectoryFile, StorageDirectoryId, StorageDirectoryListBackend, StorageFuture,
+        StorageManifestPublishBackend, StorageManifestReadBackend, StorageObjectDeleteBackend,
+        StorageObjectId, StorageObjectKind, StorageObjectListBackend, StorageObjectListRequest,
+        StorageObjectReadBackend, StorageObjectWriteBackend, StorageReadBackend, StorageReadFuture,
+        StorageReadObject, StorageWalRewriteBackend, StorageWriterLeaseBackend,
         native_file_objects_from_paths, usize_to_u64,
     };
 
@@ -1843,18 +1847,26 @@ mod browser_persistent_storage {
         }
 
         fn capabilities_for_browser() -> StorageCapabilities {
-            StorageCapabilities::empty()
+            let capabilities = StorageCapabilities::empty()
                 .with(StorageCapability::Persistent)
                 .with(StorageCapability::RandomRead)
                 .with(StorageCapability::ObjectRead)
                 .with(StorageCapability::ObjectListing)
                 .with(StorageCapability::ObjectWrite)
                 .with(StorageCapability::ObjectDelete)
+                .with(StorageCapability::Append)
+                .with(StorageCapability::AtomicWalRewrite)
                 .with(StorageCapability::DirectoryCreate)
                 .with(StorageCapability::DirectoryListing)
                 .with(StorageCapability::AtomicManifestPublish)
+                .with(StorageCapability::Flush)
                 .with(StorageCapability::AsyncTasks)
-                .with(StorageCapability::CooperativeTasks)
+                .with(StorageCapability::CooperativeTasks);
+            if browser_web_locks_available() {
+                capabilities.with(StorageCapability::WriterLease)
+            } else {
+                capabilities
+            }
         }
 
         async fn directory_from_segments(
@@ -2050,12 +2062,13 @@ mod browser_persistent_storage {
             &self,
             object: StorageObjectId,
             bytes: Arc<[u8]>,
-            _durability: DurabilityMode,
+            durability: DurabilityMode,
         ) -> StorageFuture<'_, ()> {
             Box::pin(async move {
                 require_browser_manifest_object(&object)?;
                 Self::capabilities_for_browser()
                     .require(StorageCapability::AtomicManifestPublish)?;
+                require_browser_durability(durability)?;
                 self.write_object_bytes(&object, &bytes).await
             })
         }
@@ -2066,11 +2079,12 @@ mod browser_persistent_storage {
             &self,
             object: StorageObjectId,
             bytes: Arc<[u8]>,
-            _durability: DurabilityMode,
+            durability: DurabilityMode,
         ) -> StorageFuture<'_, ()> {
             Box::pin(async move {
                 require_browser_object_write(&object)?;
                 Self::capabilities_for_browser().require(StorageCapability::ObjectWrite)?;
+                require_browser_durability(durability)?;
                 self.write_object_bytes(&object, &bytes).await
             })
         }
@@ -2118,6 +2132,49 @@ mod browser_persistent_storage {
                 }
                 Ok(native_file_objects_from_paths(&request, paths))
             })
+        }
+    }
+
+    impl StorageAppendBackend for BrowserStorageBackend {
+        type AppendObject = BrowserAppendObject;
+
+        fn open_append(&self, object: StorageObjectId) -> StorageFuture<'_, Self::AppendObject> {
+            Box::pin(async move {
+                require_browser_wal_object(&object)?;
+                Self::capabilities_for_browser().require(StorageCapability::Append)?;
+                Ok(BrowserAppendObject {
+                    backend: self.clone(),
+                    object,
+                })
+            })
+        }
+    }
+
+    impl StorageWalRewriteBackend for BrowserStorageBackend {
+        fn rewrite_wal(
+            &self,
+            object: StorageObjectId,
+            temporary_object: StorageObjectId,
+            bytes: Arc<[u8]>,
+            durability: DurabilityMode,
+        ) -> StorageFuture<'_, ()> {
+            Box::pin(async move {
+                prepare_browser_wal_rewrite(&object, &temporary_object, durability)?;
+                self.write_object_bytes(&temporary_object, &bytes).await?;
+                self.write_object_bytes(&object, &bytes).await?;
+                self.delete_object(temporary_object).await
+            })
+        }
+    }
+
+    impl StorageWriterLeaseBackend for BrowserStorageBackend {
+        type WriterLease = BrowserWriterLease;
+
+        fn acquire_writer_lease(
+            &self,
+            object: StorageObjectId,
+        ) -> StorageFuture<'_, Self::WriterLease> {
+            Box::pin(async move { acquire_browser_writer_lease(object).await })
         }
     }
 
@@ -2173,6 +2230,57 @@ mod browser_persistent_storage {
         }
     }
 
+    pub(crate) struct BrowserAppendObject {
+        backend: BrowserStorageBackend,
+        object: StorageObjectId,
+    }
+
+    impl StorageAppendObject for BrowserAppendObject {
+        fn append<'op>(
+            &'op mut self,
+            bytes: &'op [u8],
+            durability: DurabilityMode,
+        ) -> StorageFuture<'op, ()> {
+            Box::pin(async move {
+                require_browser_wal_object(&self.object)?;
+                require_browser_durability(durability)?;
+                let mut existing = self
+                    .backend
+                    .read_object_bytes_inner(&self.object)
+                    .await?
+                    .map_or_else(Vec::new, |bytes| bytes.as_ref().to_vec());
+                existing.extend_from_slice(bytes);
+                self.backend
+                    .write_object_bytes(&self.object, &existing)
+                    .await
+            })
+        }
+
+        fn persist(&mut self, durability: DurabilityMode) -> StorageFuture<'_, ()> {
+            Box::pin(async move { require_browser_durability(durability) })
+        }
+    }
+
+    pub(crate) struct BrowserWriterLease {
+        release: Rc<RefCell<Option<Function>>>,
+        _request: Promise,
+        _callback: wasm_bindgen::closure::Closure<dyn FnMut(JsValue) -> Promise>,
+    }
+
+    impl std::fmt::Debug for BrowserWriterLease {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("BrowserWriterLease").finish_non_exhaustive()
+        }
+    }
+
+    impl Drop for BrowserWriterLease {
+        fn drop(&mut self) {
+            if let Some(resolve) = self.release.borrow_mut().take() {
+                let _ = resolve.call1(&JsValue::UNDEFINED, &JsValue::UNDEFINED);
+            }
+        }
+    }
+
     fn require_browser_manifest_object(object: &StorageObjectId) -> Result<()> {
         if object.kind() != StorageObjectKind::Manifest {
             return Err(Error::invalid_options(
@@ -2196,6 +2304,145 @@ mod browser_persistent_storage {
             | StorageObjectKind::Wal
             | StorageObjectKind::WriterLease => Ok(()),
         }
+    }
+
+    fn require_browser_wal_object(object: &StorageObjectId) -> Result<()> {
+        if object.kind() != StorageObjectKind::Wal {
+            return Err(Error::invalid_options(
+                "WAL operation requires a WAL storage object",
+            ));
+        }
+        Ok(())
+    }
+
+    fn prepare_browser_wal_rewrite(
+        object: &StorageObjectId,
+        temporary_object: &StorageObjectId,
+        durability: DurabilityMode,
+    ) -> Result<()> {
+        require_browser_wal_object(object)?;
+        require_browser_wal_object(temporary_object)?;
+        BrowserStorageBackend::capabilities_for_browser()
+            .require(StorageCapability::AtomicWalRewrite)?;
+        require_browser_durability(durability)?;
+        if object.path() == temporary_object.path() {
+            return Err(Error::invalid_options(
+                "WAL rewrite temporary object must differ from final object",
+            ));
+        }
+        if object.path().parent() != temporary_object.path().parent() {
+            return Err(Error::invalid_options(
+                "WAL rewrite temporary object must share the final object's parent directory",
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_browser_writer_lease_object(object: &StorageObjectId) -> Result<()> {
+        if object.kind() != StorageObjectKind::WriterLease {
+            return Err(Error::invalid_options(
+                "writer lease requires a writer lease storage object",
+            ));
+        }
+        BrowserStorageBackend::capabilities_for_browser().require(StorageCapability::WriterLease)
+    }
+
+    fn require_browser_durability(durability: DurabilityMode) -> Result<()> {
+        match durability {
+            DurabilityMode::Buffered | DurabilityMode::Flush => Ok(()),
+            DurabilityMode::SyncData | DurabilityMode::SyncAll => {
+                Err(Error::unsupported_durability(durability))
+            }
+        }
+    }
+
+    async fn acquire_browser_writer_lease(object: StorageObjectId) -> Result<BrowserWriterLease> {
+        require_browser_writer_lease_object(&object)?;
+        let locks = browser_lock_manager()?;
+        let request = Reflect::get(&locks, &JsValue::from_str("request"))
+            .map_err(|error| map_js_value_error(&error, "read browser lock request function"))?
+            .dyn_into::<Function>()
+            .map_err(|_| {
+                Error::unsupported_backend("browser persistent writer lease request function")
+            })?;
+        let options = js_sys::Object::new();
+        Reflect::set(&options, &JsValue::from_str("ifAvailable"), &JsValue::TRUE).map_err(
+            |error| map_js_value_error(&error, "configure browser writer lease options"),
+        )?;
+
+        let release = Rc::new(RefCell::new(None));
+        let release_for_callback = Rc::clone(&release);
+        let (sender, receiver) = oneshot::channel();
+        let sender = Rc::new(RefCell::new(Some(sender)));
+        let sender_for_callback = Rc::clone(&sender);
+        let callback = wasm_bindgen::closure::Closure::<dyn FnMut(JsValue) -> Promise>::new(
+            move |lock: JsValue| {
+                if lock.is_null() || lock.is_undefined() {
+                    if let Some(sender) = sender_for_callback.borrow_mut().take() {
+                        let _ = sender.send(false);
+                    }
+                    return Promise::resolve(&JsValue::UNDEFINED);
+                }
+
+                let release_for_promise = Rc::clone(&release_for_callback);
+                let pending = Promise::new(&mut |resolve, _reject| {
+                    *release_for_promise.borrow_mut() = Some(resolve);
+                });
+                if let Some(sender) = sender_for_callback.borrow_mut().take() {
+                    let _ = sender.send(true);
+                }
+                pending
+            },
+        );
+
+        let request_promise = request
+            .call3(
+                &locks,
+                &JsValue::from_str(&browser_writer_lease_name(&object)),
+                &options,
+                callback.as_ref(),
+            )
+            .map_err(|error| map_js_value_error(&error, "request browser writer lease"))?
+            .dyn_into::<Promise>()
+            .map_err(|_| Error::unsupported_backend("browser persistent writer lease promise"))?;
+        let acquired = receiver
+            .await
+            .map_err(|_| Error::unsupported_backend("browser persistent writer lease callback"))?;
+        if !acquired {
+            return Err(Error::runtime_busy(
+                "browser persistent writer lease is already held",
+            ));
+        }
+
+        Ok(BrowserWriterLease {
+            release,
+            _request: request_promise,
+            _callback: callback,
+        })
+    }
+
+    fn browser_lock_manager() -> Result<JsValue> {
+        let navigator = Reflect::get(&js_sys::global(), &JsValue::from_str("navigator"))
+            .map_err(|error| map_js_value_error(&error, "read browser navigator"))?;
+        if navigator.is_null() || navigator.is_undefined() {
+            return Err(Error::unsupported_backend("browser navigator"));
+        }
+        let locks = Reflect::get(&navigator, &JsValue::from_str("locks"))
+            .map_err(|error| map_js_value_error(&error, "read browser lock manager"))?;
+        if locks.is_null() || locks.is_undefined() {
+            return Err(Error::unsupported_backend(
+                "browser persistent writer lease",
+            ));
+        }
+        Ok(locks)
+    }
+
+    fn browser_web_locks_available() -> bool {
+        browser_lock_manager().is_ok()
+    }
+
+    fn browser_writer_lease_name(object: &StorageObjectId) -> String {
+        format!("trine-kv:{}", object.path().display())
     }
 
     fn require_browser_object_delete(object: &StorageObjectId) -> Result<()> {
@@ -2252,11 +2499,27 @@ mod browser_persistent_storage {
             .ok()
             .and_then(|value| value.as_string())
     }
+
+    fn map_js_value_error(error: &JsValue, action: &'static str) -> Error {
+        let message = js_value_property(error, "message")
+            .or_else(|| js_value_property(error, "name"))
+            .or_else(|| error.as_string())
+            .unwrap_or_else(|| format!("{error:?}"));
+        Error::Io(io::Error::other(format!(
+            "browser persistent storage failed to {action}: {message}"
+        )))
+    }
+
+    fn js_value_property(value: &JsValue, property: &str) -> Option<String> {
+        Reflect::get(value, &JsValue::from_str(property))
+            .ok()
+            .and_then(|value| value.as_string())
+    }
 }
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[allow(unused_imports)]
-pub(crate) use browser_persistent_storage::BrowserStorageBackend;
+pub(crate) use browser_persistent_storage::{BrowserStorageBackend, BrowserWriterLease};
 
 #[derive(Debug)]
 pub(crate) struct NativeFileObject {

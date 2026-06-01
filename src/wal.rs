@@ -17,8 +17,9 @@ use crate::{
         BlockingStorageAppendBackend, BlockingStorageAppendObject,
         BlockingStorageDirectoryListBackend, BlockingStorageObjectReadBackend,
         BlockingStorageWalRewriteBackend, NativeFileAppendObject, NativeFileBackend,
-        StorageCapability, StorageDirectoryId, StorageDirectoryListBackend, StorageObjectId,
-        StorageObjectKind, StorageObjectReadBackend, StorageReadBackend,
+        StorageAppendBackend, StorageAppendObject, StorageCapability, StorageDirectoryId,
+        StorageDirectoryListBackend, StorageObjectId, StorageObjectKind, StorageObjectReadBackend,
+        StorageReadBackend, StorageWalRewriteBackend,
     },
     types::{KeyRange, Sequence},
     write_batch::BatchOperation,
@@ -83,6 +84,14 @@ struct WalFrontDoorLane {
     sender: Option<SyncSender<WalLaneCommand>>,
     writer_open: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[derive(Debug)]
+pub(crate) struct BrowserWalFrontDoor {
+    active_shard_count: usize,
+    records_accepted: AtomicU64,
+    bytes_accepted: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -293,6 +302,109 @@ impl WalFrontDoor {
             .ok_or_else(|| Error::Corruption {
                 message: format!("WAL front door lane {shard_index} is missing"),
             })
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+impl BrowserWalFrontDoor {
+    pub(crate) async fn open_sharded_with_backend<B>(
+        backend: &B,
+        db_path: &Path,
+        shard_count: usize,
+    ) -> Result<Self>
+    where
+        B: StorageDirectoryListBackend,
+    {
+        if shard_count == 0 {
+            return Err(Error::invalid_options("WAL shard count must be non-zero"));
+        }
+        discover_wal_paths_with_backend_async(backend, db_path).await?;
+        Ok(Self {
+            active_shard_count: shard_count,
+            records_accepted: AtomicU64::new(0),
+            bytes_accepted: AtomicU64::new(0),
+        })
+    }
+
+    pub(crate) async fn accept_commit<B>(
+        &self,
+        backend: &B,
+        db_path: &Path,
+        sequence: Sequence,
+        operations: &[BatchOperation],
+        durability: DurabilityMode,
+    ) -> Result<WalFrontDoorAccept>
+    where
+        B: StorageAppendBackend,
+    {
+        let shard_index = self.shard_index_for_sequence(sequence);
+        let path = wal_shard_path(db_path, shard_index);
+        let frame = encode_batch_frame(sequence, operations)?;
+        let frame_len = usize_to_u64_saturating(frame.len());
+        let mut append = open_wal_append_object_with_backend_async(backend, &path).await?;
+        append.append(&frame, durability).await?;
+        self.records_accepted.fetch_add(1, Ordering::Relaxed);
+        self.bytes_accepted.fetch_add(frame_len, Ordering::Relaxed);
+        Ok(WalFrontDoorAccept {
+            sequence,
+            shard_index,
+        })
+    }
+
+    pub(crate) async fn persist<B>(
+        &self,
+        backend: &B,
+        db_path: &Path,
+        durability: DurabilityMode,
+    ) -> Result<()>
+    where
+        B: StorageAppendBackend,
+    {
+        for shard_index in 0..self.active_shard_count {
+            let path = wal_shard_path(db_path, shard_index);
+            let mut append = open_wal_append_object_with_backend_async(backend, &path).await?;
+            append.persist(durability).await?;
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn rewrite_after_replay_floor<B>(
+        &self,
+        backend: &B,
+        db_path: &Path,
+        replay_floor: Sequence,
+    ) -> Result<()>
+    where
+        B: StorageDirectoryListBackend + StorageObjectReadBackend + StorageWalRewriteBackend,
+    {
+        let mut paths = BTreeMap::new();
+        for shard_index in 0..self.active_shard_count {
+            paths.insert(shard_index, wal_shard_path(db_path, shard_index));
+        }
+        for path in discover_wal_paths_with_backend_async(backend, db_path).await? {
+            paths.insert(wal_shard_index_from_path(&path)?, path);
+        }
+        for path in paths.into_values() {
+            rewrite_batches_after_with_backend_async(backend, &path, replay_floor).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn stats(&self) -> WalFrontDoorStats {
+        WalFrontDoorStats {
+            shards: self.active_shard_count,
+            open_shards: self.active_shard_count,
+            queue_capacity: 0,
+            records_accepted: self.records_accepted.load(Ordering::Acquire),
+            bytes_accepted: self.bytes_accepted.load(Ordering::Acquire),
+        }
+    }
+
+    fn shard_index_for_sequence(&self, sequence: Sequence) -> usize {
+        let offset = sequence.get().saturating_sub(1);
+        usize::try_from(offset % usize_to_u64_saturating(self.active_shard_count))
+            .expect("modulo result fits usize")
     }
 }
 
@@ -528,6 +640,36 @@ pub(crate) fn rewrite_batches_after_with_backend(
     Ok(())
 }
 
+#[allow(dead_code)]
+pub(crate) async fn append_batch_with_backend_async<B>(
+    backend: &B,
+    path: &Path,
+    sequence: Sequence,
+    operations: &[BatchOperation],
+    durability: DurabilityMode,
+) -> Result<()>
+where
+    B: StorageAppendBackend,
+{
+    let frame = encode_batch_frame(sequence, operations)?;
+    let mut append = open_wal_append_object_with_backend_async(backend, path).await?;
+    append.append(&frame, durability).await
+}
+
+#[allow(dead_code)]
+pub(crate) async fn rewrite_batches_after_with_backend_async<B>(
+    backend: &B,
+    path: &Path,
+    replay_floor: Sequence,
+) -> Result<()>
+where
+    B: StorageObjectReadBackend + StorageWalRewriteBackend,
+{
+    let batches = read_batches_after_with_backend_async(backend, path, replay_floor).await?;
+    let bytes = encode_batches_after(&batches, replay_floor)?;
+    rewrite_wal_object_with_backend_async(backend, path, bytes.into()).await
+}
+
 fn wal_rewrite_tmp_path(path: &Path) -> PathBuf {
     if path.file_name().and_then(|name| name.to_str()) == Some(WAL_FILE_NAME) {
         return path.with_file_name(WAL_REWRITE_TMP_FILE_NAME);
@@ -558,6 +700,17 @@ fn open_wal_append_object_with_backend(
 ) -> Result<NativeFileAppendObject> {
     backend.capabilities().require(StorageCapability::Append)?;
     backend.open_append_blocking(wal_storage_object(path))
+}
+
+async fn open_wal_append_object_with_backend_async<B>(
+    backend: &B,
+    path: &Path,
+) -> Result<B::AppendObject>
+where
+    B: StorageAppendBackend,
+{
+    backend.capabilities().require(StorageCapability::Append)?;
+    backend.open_append(wal_storage_object(path)).await
 }
 
 fn read_wal_object_with_backend(
@@ -597,6 +750,27 @@ fn rewrite_wal_object_with_backend(
         bytes,
         DurabilityMode::SyncAll,
     )
+}
+
+async fn rewrite_wal_object_with_backend_async<B>(
+    backend: &B,
+    path: &Path,
+    bytes: Arc<[u8]>,
+) -> Result<()>
+where
+    B: StorageWalRewriteBackend,
+{
+    backend
+        .capabilities()
+        .require(StorageCapability::AtomicWalRewrite)?;
+    backend
+        .rewrite_wal(
+            wal_storage_object(path),
+            wal_storage_object(&wal_rewrite_tmp_path(path)),
+            bytes,
+            DurabilityMode::Flush,
+        )
+        .await
 }
 
 fn wal_storage_object(path: &Path) -> StorageObjectId {
@@ -1101,11 +1275,11 @@ mod tests {
 
     use super::{
         DEFAULT_WAL_SHARD_COUNT, WAL_FILE_NAME, WAL_FORMAT_VERSION, WAL_FRONT_DOOR_QUEUE_CAPACITY,
-        WAL_MAGIC, WalFrontDoor, checksum, decode_frames_after, decode_payload,
-        discover_wal_paths_with_backend, discover_wal_paths_with_backend_async,
+        WAL_MAGIC, WalFrontDoor, append_batch_with_backend_async, checksum, decode_frames_after,
+        decode_payload, discover_wal_paths_with_backend, discover_wal_paths_with_backend_async,
         merge_batch_streams_by_sequence, read_all_batches, read_batches_after_with_backend,
         read_batches_after_with_backend_async, read_recovery_streams_after_with_backend_async,
-        wal_rewrite_tmp_path, wal_shard_path,
+        rewrite_batches_after_with_backend_async, wal_rewrite_tmp_path, wal_shard_path,
     };
 
     #[test]
@@ -1288,6 +1462,72 @@ mod tests {
             Sequence::new(1),
         ))
         .expect("WAL reads through async helper");
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.sequence)
+                .collect::<Vec<_>>(),
+            vec![Sequence::new(2)]
+        );
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn async_wal_append_helper_writes_batch() {
+        let dir = temp_dir("async-wal-append");
+        fs::create_dir_all(&dir).expect("create WAL test dir");
+        let path = dir.join(WAL_FILE_NAME);
+        let backend = NativeFileBackend::new();
+
+        poll_ready(append_batch_with_backend_async(
+            &backend,
+            &path,
+            Sequence::new(1),
+            &[put("k", "v")],
+            DurabilityMode::Flush,
+        ))
+        .expect("async WAL append helper writes");
+
+        let batches = read_batches_after_with_backend(&backend, &path, Sequence::ZERO)
+            .expect("WAL reads after append");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].sequence, Sequence::new(1));
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn async_wal_rewrite_helper_keeps_batches_after_floor() {
+        let dir = temp_dir("async-wal-rewrite");
+        fs::create_dir_all(&dir).expect("create WAL test dir");
+        let path = dir.join(WAL_FILE_NAME);
+        let backend = NativeFileBackend::new();
+
+        poll_ready(append_batch_with_backend_async(
+            &backend,
+            &path,
+            Sequence::new(1),
+            &[put("a", "old")],
+            DurabilityMode::Flush,
+        ))
+        .expect("first async WAL append writes");
+        poll_ready(append_batch_with_backend_async(
+            &backend,
+            &path,
+            Sequence::new(2),
+            &[put("b", "new")],
+            DurabilityMode::Flush,
+        ))
+        .expect("second async WAL append writes");
+
+        poll_ready(rewrite_batches_after_with_backend_async(
+            &backend,
+            &path,
+            Sequence::new(1),
+        ))
+        .expect("async WAL rewrite helper rewrites");
+
+        let batches = read_batches_after_with_backend(&backend, &path, Sequence::ZERO)
+            .expect("WAL reads after rewrite");
         assert_eq!(
             batches
                 .iter()

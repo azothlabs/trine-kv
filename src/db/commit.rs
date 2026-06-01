@@ -6,6 +6,9 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use std::path::Path;
+
 use crate::{
     error::{Error, Result},
     lsm::LsmTree,
@@ -139,6 +142,7 @@ struct WriteFuture {
 }
 
 #[derive(Debug)]
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
 enum WriteFutureState {
     Start { db: Db, request: WriteRequest },
     Waiting { waiter: WriteWaiter },
@@ -446,6 +450,7 @@ impl WriteWaiter {
     }
 }
 
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
 impl WriteFuture {
     fn new(db: Db, request: WriteRequest) -> Self {
         Self {
@@ -455,6 +460,7 @@ impl WriteFuture {
 
     fn start(db: &Db, request: WriteRequest, context: &mut Context<'_>) -> WriteStart {
         let (accepted_write, waiter) = AcceptedWrite::accept(request);
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         if db.inner.runtime.capabilities().blocking_adapter() {
             if let Err(error) = waiter.register_waker(context) {
                 return WriteStart::Ready(Err(error));
@@ -506,16 +512,35 @@ impl Future for WriteFuture {
 
 impl Db {
     pub fn write(&self, batch: WriteBatch, options: WriteOptions) -> Result<CommitInfo> {
+        if self.inner.options.storage_mode.is_browser_persistent() {
+            return Err(Error::unsupported_backend(
+                "browser persistent writes require async API",
+            ));
+        }
         self.run_accepted_write(WriteRequest::batch(batch, options))
     }
 
     #[must_use = "write futures do nothing unless polled"]
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub fn write_async(
         &self,
         batch: WriteBatch,
         options: WriteOptions,
     ) -> impl Future<Output = Result<CommitInfo>> + Send + 'static {
         self.run_accepted_write_async(WriteRequest::batch(batch, options))
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    pub fn write_async(
+        &self,
+        batch: WriteBatch,
+        options: WriteOptions,
+    ) -> impl Future<Output = Result<CommitInfo>> + 'static {
+        let db = self.clone();
+        async move {
+            db.run_owned_write_request_async(WriteRequest::batch(batch, options))
+                .await
+        }
     }
 
     pub(crate) fn commit_transaction(
@@ -525,6 +550,11 @@ impl Db {
         batch: WriteBatch,
         write_options: WriteOptions,
     ) -> Result<CommitInfo> {
+        if self.inner.options.storage_mode.is_browser_persistent() {
+            return Err(Error::unsupported_backend(
+                "browser persistent transactions require async API",
+            ));
+        }
         self.run_accepted_write(WriteRequest::transaction(
             read_sequence,
             read_set,
@@ -533,6 +563,7 @@ impl Db {
         ))
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) fn commit_transaction_async(
         &self,
         read_sequence: Sequence,
@@ -548,12 +579,33 @@ impl Db {
         ))
     }
 
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    pub(crate) fn commit_transaction_async(
+        &self,
+        read_sequence: Sequence,
+        read_set: TransactionReadSet,
+        batch: WriteBatch,
+        write_options: WriteOptions,
+    ) -> impl Future<Output = Result<CommitInfo>> + 'static {
+        let db = self.clone();
+        async move {
+            db.run_owned_write_request_async(WriteRequest::transaction(
+                read_sequence,
+                read_set,
+                batch,
+                write_options,
+            ))
+            .await
+        }
+    }
+
     fn run_accepted_write(&self, request: WriteRequest) -> Result<CommitInfo> {
         let (accepted_write, waiter) = AcceptedWrite::accept(request);
         accepted_write.execute(self);
         waiter.wait()
     }
 
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
     fn run_accepted_write_async(&self, request: WriteRequest) -> WriteFuture {
         WriteFuture::new(self.clone(), request)
     }
@@ -561,6 +613,35 @@ impl Db {
     fn commit_write_request(&self, request: WriteRequest) -> Result<CommitInfo> {
         let accepted_state = self.accept_write_request(request)?;
         self.publish_accepted_write_state(accepted_state)
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    async fn run_owned_write_request_async(&self, request: WriteRequest) -> Result<CommitInfo> {
+        if !self.inner.options.storage_mode.is_browser_persistent() {
+            return self.commit_write_request(request);
+        }
+
+        let completion = Arc::new(WriteCompletion::new());
+        let waiter = WriteWaiter {
+            completion: Arc::clone(&completion),
+        };
+        let db = self.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = db.commit_write_request_async(request).await;
+            completion.complete(result);
+        });
+        std::future::poll_fn(move |context| waiter.poll_result(context)).await
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    async fn commit_write_request_async(&self, request: WriteRequest) -> Result<CommitInfo> {
+        if !self.inner.options.storage_mode.is_browser_persistent() {
+            return self.commit_write_request(request);
+        }
+
+        let accepted_state = self.accept_write_request(request)?;
+        self.publish_accepted_write_state_async(accepted_state)
+            .await
     }
 
     fn accept_write_request(&self, request: WriteRequest) -> Result<AcceptedWriteState> {
@@ -680,7 +761,7 @@ impl Db {
             prepared,
             slot,
             durability,
-            matches!(wal_accept, WalAcceptState::Deferred) && self.inner.wal.is_some(),
+            matches!(wal_accept, WalAcceptState::Deferred) && self.has_wal_front_door(),
         )))
     }
 
@@ -698,6 +779,71 @@ impl Db {
         if accept_wal {
             if let Err(error) =
                 self.accept_wal_front_door(slot.sequence(), &prepared.wal_operations, durability)
+            {
+                self.inner.commit_tracker.mark_skipped(slot)?;
+                return Err(error);
+            }
+        }
+
+        Ok(DurableSequencedWrite::new(prepared, slot))
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    async fn publish_accepted_write_state_async(
+        &self,
+        accepted_state: AcceptedWriteState,
+    ) -> Result<CommitInfo> {
+        match accepted_state {
+            AcceptedWriteState::Noop(commit_info) => Ok(commit_info),
+            AcceptedWriteState::Pending(writer_state) => {
+                let sequenced = {
+                    let publish = self.inner.publish_barrier.enter()?;
+                    self.sequence_writer_local_state_under_barrier(writer_state, &publish)?
+                };
+                let sequenced = match sequenced {
+                    SequencedWriteState::Noop(commit_info) => return Ok(commit_info),
+                    SequencedWriteState::Pending(sequenced) => sequenced,
+                };
+                let durable = self
+                    .accept_deferred_wal_for_sequenced_write_async(sequenced)
+                    .await?;
+                let published = {
+                    let _memtable_publish = self
+                        .inner
+                        .memtable_publish_lock
+                        .lock()
+                        .map_err(|_| lock_poisoned("memtable publish lock"))?;
+                    let published =
+                        self.publish_durable_writer_local_state_under_memtable_lock(durable)?;
+                    if let Some(slot) = published.visible_slot {
+                        self.inner.commit_tracker.mark_visible(slot)?;
+                    }
+                    published
+                };
+                if published.request_flush {
+                    self.request_background_flush();
+                }
+                Ok(published.commit_info)
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    async fn accept_deferred_wal_for_sequenced_write_async(
+        &self,
+        sequenced: SequencedWrite,
+    ) -> Result<DurableSequencedWrite> {
+        let SequencedWrite {
+            prepared,
+            slot,
+            durability,
+            accept_wal,
+        } = sequenced;
+
+        if accept_wal {
+            if let Err(error) = self
+                .accept_wal_front_door_async(slot.sequence(), &prepared.wal_operations, durability)
+                .await
             {
                 self.inner.commit_tracker.mark_skipped(slot)?;
                 return Err(error);
@@ -800,8 +946,22 @@ impl Db {
             && self.inner.options.storage_mode.persistent_path().is_some()
     }
 
+    fn has_wal_front_door(&self) -> bool {
+        self.inner.wal.is_some() || {
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            {
+                self.inner.browser_wal.is_some()
+            }
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            {
+                false
+            }
+        }
+    }
+
     fn validate_storage_durability(&self, durability: DurabilityMode) -> Result<()> {
-        if self.inner.options.storage_mode.is_wasi_persistent()
+        if (self.inner.options.storage_mode.is_wasi_persistent()
+            || self.inner.options.storage_mode.is_browser_persistent())
             && matches!(
                 durability,
                 DurabilityMode::SyncData | DurabilityMode::SyncAll
@@ -886,6 +1046,31 @@ impl Db {
         }
 
         Ok(())
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    async fn accept_wal_front_door_async(
+        &self,
+        sequence: Sequence,
+        operations: &[BatchOperation],
+        durability: DurabilityMode,
+    ) -> Result<()> {
+        if let Some(wal) = &self.inner.browser_wal {
+            let storage = self
+                .inner
+                .browser_storage
+                .as_ref()
+                .ok_or_else(|| Error::Corruption {
+                    message: "browser persistent database is missing storage backend".to_owned(),
+                })?;
+            let accepted = wal
+                .accept_commit(storage, Path::new(""), sequence, operations, durability)
+                .await?;
+            debug_assert_eq!(accepted.sequence(), sequence);
+            return Ok(());
+        }
+
+        self.accept_wal_front_door(sequence, operations, durability)
     }
 
     pub(super) fn replay_wal_batches(

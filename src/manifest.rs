@@ -23,6 +23,9 @@ use crate::{
     types::Sequence,
 };
 
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use crate::storage::BrowserStorageBackend;
+
 pub const MANIFEST_FILE_NAME: &str = "MANIFEST";
 const MANIFEST_MAGIC: u32 = 0x5452_4d46;
 const MANIFEST_VERSION: u16 = 7;
@@ -121,7 +124,23 @@ impl Default for ManifestState {
 pub struct ManifestStore {
     path: PathBuf,
     state: ManifestState,
-    native_storage: NativeFileBackend,
+    storage: ManifestStoreBackend,
+}
+
+#[derive(Debug, Clone)]
+enum ManifestStoreBackend {
+    Native(NativeFileBackend),
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    Browser(BrowserStorageBackend),
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedManifestPublish {
+    path: PathBuf,
+    storage: ManifestStoreBackend,
+    base_state: ManifestState,
+    next_state: ManifestState,
 }
 
 impl ManifestStore {
@@ -148,7 +167,7 @@ impl ManifestStore {
         Ok(Self {
             path,
             state,
-            native_storage,
+            storage: ManifestStoreBackend::Native(native_storage),
         })
     }
 
@@ -165,7 +184,13 @@ impl ManifestStore {
             decode_manifest(&bytes)?
         } else if create_if_missing {
             let state = ManifestState::empty();
-            publish_manifest_with_backend_async(&native_storage, &path, &state).await?;
+            publish_manifest_with_backend_async(
+                &native_storage,
+                &path,
+                &state,
+                DurabilityMode::SyncAll,
+            )
+            .await?;
             state
         } else {
             ManifestState::empty()
@@ -174,7 +199,33 @@ impl ManifestStore {
         Ok(Self {
             path,
             state,
-            native_storage,
+            storage: ManifestStoreBackend::Native(native_storage),
+        })
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    pub(crate) async fn open_or_create_with_browser_backend_async(
+        path: impl Into<PathBuf>,
+        create_if_missing: bool,
+        storage: BrowserStorageBackend,
+    ) -> Result<Self> {
+        let path = path.into();
+        let state =
+            if let Some(bytes) = read_manifest_bytes_with_backend_async(&storage, &path).await? {
+                decode_manifest(&bytes)?
+            } else if create_if_missing {
+                let state = ManifestState::empty();
+                publish_manifest_with_backend_async(&storage, &path, &state, DurabilityMode::Flush)
+                    .await?;
+                state
+            } else {
+                ManifestState::empty()
+            };
+
+        Ok(Self {
+            path,
+            state,
+            storage: ManifestStoreBackend::Browser(storage),
         })
     }
 
@@ -220,6 +271,46 @@ impl ManifestStore {
         self.publish_next_state_async(next_state).await
     }
 
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    pub(crate) fn prepare_create_bucket_publish(
+        &self,
+        name: String,
+        options: BucketOptions,
+    ) -> Result<Option<PreparedManifestPublish>> {
+        if let Some(existing) = self.state.buckets.get(&name) {
+            if existing == &options {
+                return Ok(None);
+            }
+            return Err(Error::invalid_options(
+                "existing bucket options do not match requested options",
+            ));
+        }
+
+        let mut next_state = self.state.clone();
+        next_state.buckets.insert(name.clone(), options);
+        next_state.tables.entry(name).or_default();
+        Ok(Some(PreparedManifestPublish {
+            path: self.path.clone(),
+            storage: self.storage.clone(),
+            base_state: self.state.clone(),
+            next_state,
+        }))
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    pub(crate) fn install_prepared_publish(
+        &mut self,
+        prepared: PreparedManifestPublish,
+    ) -> Result<()> {
+        if self.state != prepared.base_state {
+            return Err(Error::Corruption {
+                message: "manifest changed while async publish was pending".to_owned(),
+            });
+        }
+        self.state = prepared.next_state;
+        Ok(())
+    }
+
     pub fn update_bucket_options(&mut self, name: &str, options: BucketOptions) -> Result<()> {
         let Some(existing) = self.state.buckets.get(name) else {
             return Err(Error::Corruption {
@@ -262,6 +353,64 @@ impl ManifestStore {
         }
         next_state.wal_replay_floor = wal_replay_floor;
         self.publish_next_state(next_state)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn add_tables_async(
+        &mut self,
+        tables: Vec<(String, TableProperties)>,
+        wal_replay_floor: Sequence,
+    ) -> Result<()> {
+        for (bucket, _) in &tables {
+            if !self.state.buckets.contains_key(bucket) {
+                return Err(Error::Corruption {
+                    message: format!("table references missing bucket: {bucket}"),
+                });
+            }
+        }
+
+        let mut next_state = self.state.clone();
+        for (bucket, properties) in tables {
+            next_state
+                .tables
+                .entry(bucket)
+                .or_default()
+                .push(properties);
+        }
+        next_state.wal_replay_floor = wal_replay_floor;
+        self.publish_next_state_async(next_state).await
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    #[allow(dead_code)]
+    pub(crate) fn prepare_add_tables_publish(
+        &self,
+        tables: Vec<(String, TableProperties)>,
+        wal_replay_floor: Sequence,
+    ) -> Result<PreparedManifestPublish> {
+        for (bucket, _) in &tables {
+            if !self.state.buckets.contains_key(bucket) {
+                return Err(Error::Corruption {
+                    message: format!("table references missing bucket: {bucket}"),
+                });
+            }
+        }
+
+        let mut next_state = self.state.clone();
+        for (bucket, properties) in tables {
+            next_state
+                .tables
+                .entry(bucket)
+                .or_default()
+                .push(properties);
+        }
+        next_state.wal_replay_floor = wal_replay_floor;
+        Ok(PreparedManifestPublish {
+            path: self.path.clone(),
+            storage: self.storage.clone(),
+            base_state: self.state.clone(),
+            next_state,
+        })
     }
 
     pub fn replace_tables(
@@ -338,6 +487,64 @@ impl ManifestStore {
         self.publish_next_state(next_state)
     }
 
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    pub(crate) fn prepare_replace_tables_batch_publish(
+        &self,
+        replacements: Vec<(String, Vec<TableId>, Vec<TableProperties>)>,
+        pending_blob_deletions: Vec<u64>,
+        pending_deletion_sequence: Sequence,
+    ) -> Result<PreparedManifestPublish> {
+        for (bucket, removed_table_ids, _) in &replacements {
+            if !self.state.buckets.contains_key(bucket) {
+                return Err(Error::Corruption {
+                    message: format!("compaction references missing bucket: {bucket}"),
+                });
+            }
+
+            let tables = self
+                .state
+                .tables
+                .get(bucket)
+                .ok_or_else(|| Error::Corruption {
+                    message: format!("manifest is missing table list for bucket: {bucket}"),
+                })?;
+            for table_id in removed_table_ids {
+                if !tables.iter().any(|properties| properties.id == *table_id) {
+                    return Err(Error::Corruption {
+                        message: format!("compaction input table is missing: {}", table_id.get()),
+                    });
+                }
+            }
+        }
+
+        let mut next_state = self.state.clone();
+        for (bucket, removed_table_ids, replacements) in replacements {
+            let tables = next_state
+                .tables
+                .get_mut(&bucket)
+                .ok_or_else(|| Error::Corruption {
+                    message: format!("manifest is missing table list for bucket: {bucket}"),
+                })?;
+            tables.retain(|properties| !removed_table_ids.contains(&properties.id));
+            for replacement in replacements {
+                tables.push(replacement);
+            }
+        }
+        for file_id in pending_blob_deletions {
+            next_state
+                .pending_blob_deletions
+                .entry(file_id)
+                .or_insert(pending_deletion_sequence);
+        }
+
+        Ok(PreparedManifestPublish {
+            path: self.path.clone(),
+            storage: self.storage.clone(),
+            base_state: self.state.clone(),
+            next_state,
+        })
+    }
+
     pub fn clear_pending_blob_deletions(&mut self, file_ids: &[u64]) -> Result<()> {
         if file_ids.is_empty() {
             return Ok(());
@@ -348,6 +555,27 @@ impl ManifestStore {
             next_state.pending_blob_deletions.remove(file_id);
         }
         self.publish_next_state(next_state)
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    pub(crate) fn prepare_clear_pending_blob_deletions_publish(
+        &self,
+        file_ids: &[u64],
+    ) -> Option<PreparedManifestPublish> {
+        if file_ids.is_empty() {
+            return None;
+        }
+
+        let mut next_state = self.state.clone();
+        for file_id in file_ids {
+            next_state.pending_blob_deletions.remove(file_id);
+        }
+        Some(PreparedManifestPublish {
+            path: self.path.clone(),
+            storage: self.storage.clone(),
+            base_state: self.state.clone(),
+            next_state,
+        })
     }
 
     pub fn update_wal_replay_floor(&mut self, sequence: Sequence) -> Result<()> {
@@ -361,15 +589,71 @@ impl ManifestStore {
         // state unchanged until storage publish succeeds, so a failed create,
         // flush, or compaction cannot make later operations believe an edit was
         // committed when the durable manifest never advanced.
-        publish_manifest_with_backend(&self.native_storage, &self.path, &next_state)?;
+        match &self.storage {
+            ManifestStoreBackend::Native(native_storage) => {
+                publish_manifest_with_backend(native_storage, &self.path, &next_state)?;
+            }
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            ManifestStoreBackend::Browser(_) => {
+                return Err(Error::unsupported_backend(
+                    "browser manifest publish requires async API",
+                ));
+            }
+        }
         self.state = next_state;
         Ok(())
     }
 
     async fn publish_next_state_async(&mut self, next_state: ManifestState) -> Result<()> {
-        publish_manifest_with_backend_async(&self.native_storage, &self.path, &next_state).await?;
+        match &self.storage {
+            ManifestStoreBackend::Native(native_storage) => {
+                publish_manifest_with_backend_async(
+                    native_storage,
+                    &self.path,
+                    &next_state,
+                    DurabilityMode::SyncAll,
+                )
+                .await?;
+            }
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            ManifestStoreBackend::Browser(storage) => {
+                publish_manifest_with_backend_async(
+                    storage,
+                    &self.path,
+                    &next_state,
+                    DurabilityMode::Flush,
+                )
+                .await?;
+            }
+        }
         self.state = next_state;
         Ok(())
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+impl PreparedManifestPublish {
+    pub(crate) async fn publish_async(&self) -> Result<()> {
+        match &self.storage {
+            ManifestStoreBackend::Native(native_storage) => {
+                publish_manifest_with_backend_async(
+                    native_storage,
+                    &self.path,
+                    &self.next_state,
+                    DurabilityMode::SyncAll,
+                )
+                .await
+            }
+            ManifestStoreBackend::Browser(storage) => {
+                publish_manifest_with_backend_async(
+                    storage,
+                    &self.path,
+                    &self.next_state,
+                    DurabilityMode::Flush,
+                )
+                .await
+            }
+        }
     }
 }
 
@@ -445,15 +729,14 @@ async fn publish_manifest_with_backend_async<B>(
     backend: &B,
     path: &Path,
     state: &ManifestState,
+    durability: DurabilityMode,
 ) -> Result<()>
 where
     B: StorageManifestPublishBackend,
 {
     let bytes = encode_manifest_bytes(state)?;
     let object = manifest_storage_object(path);
-    backend
-        .publish_manifest(object, bytes, DurabilityMode::SyncAll)
-        .await
+    backend.publish_manifest(object, bytes, durability).await
 }
 
 fn encode_manifest_bytes(state: &ManifestState) -> Result<Arc<[u8]>> {

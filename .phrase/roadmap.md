@@ -2948,3 +2948,79 @@ returns `UnsupportedBackend`.
 
 - Start browser writable persistent support with async WAL append/front-door and
   WAL rewrite, then add the writer lease protocol.
+
+### Phase 127: Browser Writable Storage Foundation
+
+**Status**: Complete
+
+**Goal**: Add browser storage append, WAL rewrite, and writer lease operations
+behind Trine storage traits so writable browser support has a real storage
+foundation.
+
+**Entry Condition**: Phase 126 complete and browser writable persistent open
+still blocked by missing storage mutation operations.
+
+**Acceptance Gate**:
+
+- Browser storage supports WAL append through the async storage append trait.
+- Browser storage supports WAL rewrite through the async storage rewrite trait.
+- Browser storage can acquire a writer lease through Web Locks and fails when
+  Web Locks are unavailable or busy.
+- Browser storage reports only durability capabilities it can actually provide.
+- Async WAL append and rewrite helpers have focused tests.
+- Async recovery repair has a storage-trait helper and focused test.
+- Browser, WASI, native checks and clippy pass.
+
+**Major Out Of Scope**:
+
+- Full browser writable `Db::open_async` integration.
+- Replacing the main `ManifestStore` writable path.
+- Replacing `WalFrontDoor` synchronous append lanes.
+- Browser recovery-report repair connection in `Db::open_async`.
+- Browser cleanup mutation.
+- Browser read-path performance tuning.
+
+### Recommended Next Action
+
+- Wire writable browser `Db::open_async` by replacing the remaining native-only
+  manifest, WAL front-door, recovery repair, and cleanup dependencies.
+
+### Phase 128: Browser Writable Open And WAL-Backed Mutation
+
+**Status**: Complete
+
+**Goal**: Let browser persistent `Db::open_async` accept writable databases only
+when writer leasing, manifest open/create, recovery repair, WAL replay, and
+WAL-backed async writes are connected through Trine storage traits, and expose
+async maintenance only when the side-effecting work owns completion.
+
+**Entry Condition**: Phase 127 complete and browser writable open still blocked
+by native-only manifest, recovery, and WAL front-door dependencies.
+
+**Acceptance Gate**:
+
+- Writable browser `Db::open_async(DbOptions::browser_persistent())` acquires a
+  reliable writer lease and rejects unsupported runtime or strict durability
+  options.
+- Browser open repairs safe temporary files, opens or creates manifest state,
+  ensures the default bucket, validates recovery inputs, replays WAL, and
+  attaches a browser WAL front door.
+- Browser async writes append WAL before publishing memtable deltas.
+- Browser async writes are internally owned after acceptance, so caller future
+  cancellation only drops the waiter.
+- Browser named bucket creation uses async manifest publish.
+- Browser async flush, compaction, budgeted maintenance, WAL rewrite, obsolete
+  table cleanup, pending blob cleanup, and blob GC use browser storage traits.
+- Browser synchronous mutation and synchronous maintenance APIs fail with
+  explicit typed unsupported errors.
+- Browser, WASI, native checks and clippy pass.
+
+**Major Out Of Scope**:
+
+- Browser read-path performance tuning.
+- Browser runtime fixture automation beyond compile-time wasm verification.
+- Changing table, WAL, manifest, MVCC, transaction, or compaction semantics.
+
+### Recommended Next Action
+
+- Add an in-browser persistence fixture and use it to catch host API regressions.

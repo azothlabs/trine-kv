@@ -13,7 +13,7 @@ use crate::{
         BlockingStorageObjectListBackend, BlockingStorageObjectWriteBackend,
         BlockingStorageReadBackend, BlockingStorageReadObject, NativeFileBackend,
         StorageCapability, StorageObjectId, StorageObjectKind, StorageObjectListBackend,
-        StorageObjectListRequest, StorageReadBackend, StorageReadObject,
+        StorageObjectListRequest, StorageObjectWriteBackend, StorageReadBackend, StorageReadObject,
     },
     types::Sequence,
 };
@@ -275,6 +275,80 @@ pub(crate) fn write_large_values_with_backend(
 }
 
 #[allow(dead_code)]
+pub(crate) async fn write_large_values_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+    file_id: u64,
+    threshold: usize,
+    compression: CodecId,
+    records: &[(InternalKey, Option<ValueRef>)],
+    durability: DurabilityMode,
+) -> Result<Vec<(InternalKey, Option<ValueRef>)>>
+where
+    B: StorageObjectWriteBackend,
+{
+    let needs_blob_file = records.iter().any(
+        |(_, value)| matches!(value, Some(ValueRef::Inline(bytes)) if bytes.len() >= threshold),
+    );
+    if !needs_blob_file {
+        return Ok(records.to_vec());
+    }
+
+    let mut blob_records = Vec::new();
+    for (internal_key, value) in records {
+        if let Some(ValueRef::Inline(bytes)) = value {
+            if bytes.len() >= threshold {
+                blob_records.push(BlobRecord {
+                    internal_key: internal_key.clone(),
+                    value: bytes.clone(),
+                    compression,
+                });
+            }
+        }
+    }
+
+    let creation_sequence = records
+        .iter()
+        .map(|(internal_key, _)| internal_key.sequence())
+        .max()
+        .unwrap_or(Sequence::ZERO);
+    let threshold_bytes = usize_to_u64(threshold, "blob threshold")?;
+    let header = BlobFileHeader::new(file_id, creation_sequence, threshold_bytes, compression);
+    let indexes = write_blob_file_with_backend_async(
+        backend,
+        db_path,
+        file_id,
+        header,
+        &blob_records,
+        durability,
+    )
+    .await?;
+    let mut index_iter = indexes.into_iter();
+
+    let mut rewritten = Vec::with_capacity(records.len());
+
+    for (internal_key, value) in records {
+        let value = match value {
+            Some(ValueRef::Inline(bytes)) if bytes.len() >= threshold => {
+                let index = index_iter.next().ok_or_else(|| Error::Corruption {
+                    message: "missing blob index for separated value".to_owned(),
+                })?;
+                Some(ValueRef::BlobIndex(index))
+            }
+            value => value.clone(),
+        };
+        rewritten.push((internal_key.clone(), value));
+    }
+    if index_iter.next().is_some() {
+        return Err(Error::Corruption {
+            message: "unused blob index after rewriting large values".to_owned(),
+        });
+    }
+
+    Ok(rewritten)
+}
+
+#[allow(dead_code)]
 pub(crate) fn inline_blob_values(
     db_path: &Path,
     records: &[(InternalKey, Option<ValueRef>)],
@@ -299,6 +373,37 @@ pub(crate) fn inline_blob_values_with_backend(
                     value,
                     Some(internal_key),
                 )?))
+            }
+            None => None,
+        };
+        rewritten.push((internal_key.clone(), value));
+    }
+    Ok(rewritten)
+}
+
+#[allow(dead_code)]
+pub(crate) async fn inline_blob_values_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+    records: &[(InternalKey, Option<ValueRef>)],
+) -> Result<Vec<(InternalKey, Option<ValueRef>)>>
+where
+    B: StorageReadBackend,
+{
+    let mut rewritten = Vec::with_capacity(records.len());
+    for (internal_key, value) in records {
+        let value = match value {
+            Some(ValueRef::Inline(bytes)) => Some(ValueRef::Inline(bytes.clone())),
+            Some(value @ (ValueRef::BlobIndex(_) | ValueRef::Blob { .. })) => {
+                Some(ValueRef::Inline(
+                    read_value_for_internal_key_with_backend_async(
+                        backend,
+                        db_path,
+                        value,
+                        Some(internal_key),
+                    )
+                    .await?,
+                ))
             }
             None => None,
         };
@@ -561,6 +666,38 @@ pub(crate) fn write_blob_file_with_backend(
         Arc::from(blob_bytes.into_boxed_slice()),
         DurabilityMode::SyncAll,
     )?;
+    Ok(indexes)
+}
+
+#[allow(dead_code)]
+pub(crate) async fn write_blob_file_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+    file_id: u64,
+    header: BlobFileHeader,
+    records: &[BlobRecord],
+    durability: DurabilityMode,
+) -> Result<Vec<BlobIndex>>
+where
+    B: StorageObjectWriteBackend,
+{
+    if header.file_id != file_id {
+        return Err(Error::invalid_options(
+            "blob header file id must match the output file id",
+        ));
+    }
+    let (blob_bytes, indexes) = encode_blob_file(header, records)?;
+    let path = blob_path(db_path, file_id);
+    backend
+        .capabilities()
+        .require(StorageCapability::ObjectWrite)?;
+    backend
+        .write_object(
+            blob_storage_object(&path),
+            Arc::from(blob_bytes.into_boxed_slice()),
+            durability,
+        )
+        .await?;
     Ok(indexes)
 }
 

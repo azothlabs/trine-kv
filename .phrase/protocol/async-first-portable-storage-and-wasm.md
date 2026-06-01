@@ -443,11 +443,24 @@ Rules:
   `wasm32-unknown-unknown` for read-only persistent open;
 - browser persistent storage uses an OPFS-backed adapter behind Trine storage
   traits on `wasm32-unknown-unknown`;
-- writable browser persistent open remains unsupported until WAL append,
-  WAL rewrite, and writer lease wiring exist;
+- browser storage exposes WAL append, WAL rewrite, and writer lease operations
+  through Trine storage traits;
+- writable browser persistent open uses `Db::open_async` only, acquires a
+  writer lease, opens or creates manifest state through browser storage,
+  repairs safe temporary files, replays WAL, and attaches the browser WAL front
+  door;
+- browser async writes must append WAL before publishing memtable deltas;
+- once a browser async write has been accepted, its internal commit task owns
+  completion and the caller future is only a result waiter;
+- browser async maintenance must own side-effecting flush, compaction, manifest
+  publish installation, WAL rewrite, and cleanup work after acceptance;
+- synchronous browser writes, synchronous browser bucket creation, and
+  synchronous browser maintenance APIs must return explicit unsupported errors;
 - persistent writable mode requires reliable writer leasing;
 - if writer leasing or atomic manifest publish is unavailable, writable
   persistent open fails;
+- browser storage accepts `Buffered` and `Flush` durability and rejects
+  `SyncData` and `SyncAll`;
 - durability strength is capability-reported and may be weaker than native
   strict sync;
 - background maintenance must be cooperative and budgeted;
@@ -480,6 +493,10 @@ Rules:
 - safe temporary file checks, referenced blob validation, and unreferenced
   table/blob checks must have async storage-trait paths before a browser
   persistent open is accepted;
+- safe temporary repair and recovery-report writes must have async
+  storage-trait paths before browser writable persistent open is accepted;
+- browser writable recovery must acquire the writer lease before repairing safe
+  temporary files or accepting writes;
 - manifest publish atomicity is validated by backend fixtures;
 - recovery must not depend on native directory scanning order.
 

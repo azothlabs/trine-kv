@@ -46,6 +46,15 @@ impl StorageMode {
             }
         )
     }
+
+    pub(crate) const fn is_browser_persistent(&self) -> bool {
+        matches!(
+            self,
+            Self::HostPersistent {
+                backend: HostStorageBackend::Browser
+            }
+        )
+    }
 }
 
 impl Default for StorageMode {

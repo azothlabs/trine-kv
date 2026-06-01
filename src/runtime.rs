@@ -55,6 +55,7 @@ pub(crate) struct Runtime {
 }
 
 #[derive(Debug)]
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
 pub(crate) enum RuntimeTask {
     NativeThread(thread::JoinHandle<()>),
 }
@@ -255,6 +256,7 @@ impl Runtime {
         self.options.capabilities()
     }
 
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
     pub(crate) fn spawn_background(
         &self,
         name: String,

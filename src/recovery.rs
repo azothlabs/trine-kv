@@ -15,8 +15,9 @@ use crate::{
         BlockingStorageObjectDeleteBackend, BlockingStorageObjectReadBackend,
         BlockingStorageObjectWriteBackend, BlockingStorageReadBackend,
         BlockingStorageWriterLeaseBackend, NativeFileBackend, NativeFileWriterLease,
-        StorageCapability, StorageDirectoryId, StorageDirectoryListBackend, StorageObjectId,
-        StorageObjectKind, StorageObjectListBackend, StorageObjectReadBackend, StorageReadBackend,
+        StorageCapability, StorageDirectoryId, StorageDirectoryListBackend,
+        StorageObjectDeleteBackend, StorageObjectId, StorageObjectKind, StorageObjectListBackend,
+        StorageObjectReadBackend, StorageObjectWriteBackend, StorageReadBackend,
     },
     table::{self, TableId},
     wal,
@@ -124,6 +125,43 @@ pub(crate) fn repair_safe_temporary_files_with_backend(
         repaired_temporary_files: temporary_files.into_iter().map(|file| file.name).collect(),
     };
     write_recovery_report_with_backend(backend, db_path, &report)?;
+
+    Ok(Some(report))
+}
+
+#[allow(dead_code)]
+pub(crate) async fn repair_safe_temporary_files_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+    policy: FailOnCorruptionPolicy,
+) -> Result<Option<RecoveryReport>>
+where
+    B: StorageDirectoryListBackend + StorageObjectDeleteBackend + StorageObjectWriteBackend,
+{
+    let temporary_files = safe_temporary_files_with_backend_async(backend, db_path).await?;
+    if temporary_files.is_empty() {
+        return Ok(None);
+    }
+
+    if matches!(policy, FailOnCorruptionPolicy::FailClosed) {
+        let names = temporary_files
+            .iter()
+            .map(|file| file.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(Error::Corruption {
+            message: format!("safe temporary files require explicit repair: {names}"),
+        });
+    }
+
+    for temporary_file in &temporary_files {
+        delete_safe_temporary_file_with_backend_async(backend, &temporary_file.path).await?;
+    }
+
+    let report = RecoveryReport {
+        repaired_temporary_files: temporary_files.into_iter().map(|file| file.name).collect(),
+    };
+    write_recovery_report_with_backend_async(backend, db_path, &report).await?;
 
     Ok(Some(report))
 }
@@ -524,6 +562,38 @@ fn safe_temporary_files_with_backend(
     Ok(files)
 }
 
+async fn safe_temporary_files_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+) -> Result<Vec<TemporaryFile>>
+where
+    B: StorageDirectoryListBackend,
+{
+    backend
+        .capabilities()
+        .require(StorageCapability::DirectoryListing)?;
+    let directory_files = match backend
+        .list_directory_files(StorageDirectoryId::native_file(db_path))
+        .await
+    {
+        Ok(files) => files,
+        Err(Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+
+    let mut files = Vec::new();
+    for directory_file in directory_files {
+        let path = directory_file.path().to_path_buf();
+        let name = storage_file_name(&path)?;
+        if is_safe_temporary_file(&name) {
+            files.push(TemporaryFile { name, path });
+        }
+    }
+    files.sort_by(|left, right| left.name.cmp(&right.name));
+
+    Ok(files)
+}
+
 fn delete_safe_temporary_file_with_backend(backend: &NativeFileBackend, path: &Path) -> Result<()> {
     backend
         .capabilities()
@@ -532,6 +602,21 @@ fn delete_safe_temporary_file_with_backend(backend: &NativeFileBackend, path: &P
         StorageObjectKind::Temporary,
         path,
     ))
+}
+
+async fn delete_safe_temporary_file_with_backend_async<B>(backend: &B, path: &Path) -> Result<()>
+where
+    B: StorageObjectDeleteBackend,
+{
+    backend
+        .capabilities()
+        .require(StorageCapability::ObjectDelete)?;
+    backend
+        .delete_object(StorageObjectId::native_file(
+            StorageObjectKind::Temporary,
+            path,
+        ))
+        .await
 }
 
 fn storage_object_exists_with_backend(
@@ -622,6 +707,28 @@ fn write_recovery_report_with_backend(
     Ok(())
 }
 
+async fn write_recovery_report_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+    report: &RecoveryReport,
+) -> Result<()>
+where
+    B: StorageObjectWriteBackend,
+{
+    let path = recovery_report_path(db_path);
+    let bytes: Arc<[u8]> = Arc::from(encode_report(report).into_bytes());
+    backend
+        .capabilities()
+        .require(StorageCapability::ObjectWrite)?;
+    backend
+        .write_object(
+            recovery_report_storage_object(&path),
+            bytes,
+            DurabilityMode::Flush,
+        )
+        .await
+}
+
 fn read_recovery_report_bytes(path: &Path) -> Result<Arc<[u8]>> {
     let backend = NativeFileBackend::new();
     backend
@@ -696,13 +803,15 @@ fn decode_report(text: &str) -> Result<RecoveryReport> {
 #[cfg(test)]
 mod tests {
     use std::{
+        future::Future,
         io,
+        task::{Context, Poll, Waker},
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use super::{
         RecoveryReport, decode_report, encode_report, read_recovery_report,
-        repair_safe_temporary_files_with_backend,
+        repair_safe_temporary_files_with_backend, repair_safe_temporary_files_with_backend_async,
     };
     use crate::{options::FailOnCorruptionPolicy, storage::NativeFileBackend};
 
@@ -773,5 +882,51 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).expect("cleanup test dir");
+    }
+
+    #[test]
+    fn async_backend_repair_safe_temporary_files_writes_report() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-recovery-async-backend-repair-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("test dir creates");
+        let temporary_path = root.join("RECOVERY_REPORT.tmp");
+        std::fs::write(&temporary_path, b"temporary report").expect("temporary file writes");
+
+        let backend = NativeFileBackend::new();
+        let report = poll_ready(repair_safe_temporary_files_with_backend_async(
+            &backend,
+            &root,
+            FailOnCorruptionPolicy::RepairSafeTemporaryFiles,
+        ))
+        .expect("async backend repair succeeds")
+        .expect("repair report exists");
+
+        assert_eq!(
+            report.repaired_temporary_files(),
+            &["RECOVERY_REPORT.tmp".to_owned()]
+        );
+        assert!(!temporary_path.exists());
+        assert_eq!(
+            read_recovery_report(&root).expect("recovery report reads"),
+            report
+        );
+
+        std::fs::remove_dir_all(root).expect("cleanup test dir");
+    }
+
+    fn poll_ready<T>(future: impl Future<Output = crate::Result<T>>) -> crate::Result<T> {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut future = std::pin::pin!(future);
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(result) => result,
+            Poll::Pending => panic!("recovery storage future unexpectedly pending"),
+        }
     }
 }

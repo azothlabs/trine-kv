@@ -32,7 +32,7 @@ use crate::{
         BlockingStorageReadBackend, BlockingStorageReadObject, MemoryStorageBackend,
         NativeFileBackend, NativeFileObject, NativeFileReadSource, StorageCapability,
         StorageObjectId, StorageObjectKind, StorageObjectListBackend, StorageObjectListRequest,
-        StorageReadBackend, StorageReadObject, StorageReadSource,
+        StorageObjectWriteBackend, StorageReadBackend, StorageReadObject, StorageReadSource,
     },
     types::{KeyRange, Sequence},
 };
@@ -3055,6 +3055,110 @@ pub(crate) fn write_table_with_backend(
     )?;
 
     read_table_with_backend(backend, path)
+}
+
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn write_table_with_backend_async<B>(
+    backend: &B,
+    path: &Path,
+    table_id: TableId,
+    level: TableLevel,
+    options: &TableWriteOptions,
+    point_records: &[(InternalKey, Option<ValueRef>)],
+    range_tombstones: &[TableRangeTombstone],
+    durability: DurabilityMode,
+) -> Result<Table>
+where
+    B: StorageObjectWriteBackend,
+{
+    if point_records.is_empty() && range_tombstones.is_empty() {
+        return Err(Error::invalid_options("cannot write an empty table"));
+    }
+
+    let mut point_records = point_records.to_vec();
+    point_records.sort_by(|left, right| left.0.cmp(&right.0));
+    let db_path = path
+        .parent()
+        .ok_or_else(|| Error::invalid_options("table path has no parent"))?;
+    let point_records = if options.rewrite_blob_indexes {
+        crate::blob::inline_blob_values_with_backend_async(backend, db_path, &point_records).await?
+    } else {
+        point_records
+    };
+    let point_records = crate::blob::write_large_values_with_backend_async(
+        backend,
+        db_path,
+        table_id.get(),
+        options.blob_threshold_bytes,
+        CodecId::None,
+        &point_records,
+        durability,
+    )
+    .await?
+    .into_iter()
+    .map(|(internal_key, value)| TablePointRecord {
+        internal_key,
+        value,
+    })
+    .collect::<Vec<_>>();
+    let data_blocks = build_data_blocks(&point_records, options)?;
+    let (point_key_filter, prefix_filter) = if should_pin_read_metadata(level) {
+        (
+            build_point_key_filter(options, &point_records),
+            build_prefix_filter(options, &point_records),
+        )
+    } else {
+        (None, None)
+    };
+
+    let table = Table {
+        path: None,
+        file: None,
+        payload_len: 0,
+        footer: empty_footer(),
+        properties: table_properties(
+            table_id,
+            level,
+            options.codec,
+            &point_records,
+            range_tombstones,
+        ),
+        point_key_filter,
+        prefix_filter,
+        filter_stats: Arc::new(TableFilterStats::default()),
+        read_path_stats: Arc::new(TableReadPathStats::default()),
+        point_records: Some(point_records),
+        data_block_count: data_blocks.len(),
+        index_partitions: index_partitions_for_loaded_blocks(&data_blocks),
+        index_partition_cache: Arc::new(RwLock::new(BTreeMap::new())),
+        data_blocks: Some(data_blocks),
+        range_tombstones: Arc::new(RwLock::new(Some(Arc::new(RangeTombstoneIndex::new(
+            range_tombstones.to_vec(),
+        ))))),
+        may_have_range_tombstones: !range_tombstones.is_empty(),
+    };
+    let payload = encode_table(&table)?;
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| Error::invalid_options("table payload exceeds u32::MAX"))?;
+    let payload_checksum = checksum(&payload);
+    let mut bytes = Vec::with_capacity(HEADER_LEN + payload.len());
+
+    bytes.extend_from_slice(&TABLE_MAGIC.to_le_bytes());
+    bytes.extend_from_slice(&TABLE_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&payload_len.to_le_bytes());
+    bytes.extend_from_slice(&payload_checksum.to_le_bytes());
+    bytes.extend_from_slice(&payload);
+
+    backend
+        .capabilities()
+        .require(StorageCapability::ObjectWrite)?;
+    let object = table_storage_object(path);
+    backend
+        .write_object(object, Arc::from(bytes.into_boxed_slice()), durability)
+        .await?;
+
+    read_table_with_backend_async(backend, path).await
 }
 
 #[allow(dead_code)]

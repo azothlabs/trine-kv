@@ -8694,3 +8694,146 @@ Record only evidence that can change planning or durable decisions.
 
 - Start the browser writable phase by adding async WAL append/front-door/rewrite
   behind storage traits, then add the writer lease protocol.
+
+## Phase 127: Browser Writable Storage Foundation
+
+### Observation
+
+- Browser read-only open could load persistent state, but writable support still
+  lacked storage-level WAL append, WAL rewrite, and writer lease operations.
+- The main database writable path still owns native synchronous components, so
+  adding browser storage capabilities is necessary but not sufficient for full
+  browser writable open.
+
+### Interpretation
+
+- Browser writable support must first expose the database operations through
+  storage traits, then wire `Db::open_async` and the commit path to those
+  operations.
+- Browser storage can honestly support `Buffered` and `Flush`, but it must
+  reject strict sync modes instead of silently downgrading them.
+
+### Change
+
+- Added browser storage append support for WAL objects.
+- Added browser WAL rewrite support using a temporary WAL object followed by
+  final publish and temporary cleanup.
+- Added browser writer lease acquisition through Web Locks, with typed failure
+  when Web Locks are missing or the lease is already held.
+- Added async WAL append and rewrite helpers over storage traits.
+- Added async recovery safe-temporary repair and recovery-report write helpers
+  over storage traits.
+- Added focused tests proving async WAL append writes a batch and async WAL
+  rewrite keeps batches after the replay floor.
+- Added a focused test proving async recovery repair deletes safe temporary
+  files and writes a recovery report.
+
+### Verification
+
+- `cargo fmt`
+- `cargo check`
+- `cargo check --target wasm32-unknown-unknown --lib`
+- `cargo check --target wasm32-wasip1 --lib`
+- `cargo test async_wal --lib`
+- `cargo test recovery::tests::async_backend_repair_safe_temporary_files_writes_report --lib`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings`
+- `cargo test --lib`
+- `cargo fmt --check`
+- `git diff --check`
+- forbidden-term scan excluding local agent instructions
+- diff scan for rejected backend/project-name leakage
+
+### Remaining Blockers
+
+- Browser writable `Db::open_async` is not wired yet.
+- The main persistent `ManifestStore` writable path still owns a native file
+  backend.
+- `WalFrontDoor` still owns synchronous append lanes and worker behavior.
+- Browser recovery-report repair has a storage-trait helper but still needs
+  async database open wiring.
+- Browser cleanup mutation still needs async database open wiring.
+- Browser table/blob reads still have full-object paths where smaller async
+  reads should be added later.
+
+### Recommended Next Action
+
+- Audit the writable database open path and replace the native-only manifest,
+  WAL front-door, recovery repair, and cleanup dependencies in the next slice.
+
+## Phase 128: Browser Writable Open And WAL-Backed Mutation
+
+### Observation
+
+- Browser writable storage operations existed after Phase 127, but the database
+  open path still needed to consume them through manifest, recovery, WAL, and
+  commit boundaries.
+- The public API had additional traps: browser sync writes could appear usable
+  after an async open, named bucket creation still used sync manifest publish,
+  and maintenance paths needed to fail explicitly instead of becoming partial
+  browser behavior.
+
+### Interpretation
+
+- Writable browser open can be accepted once the writer lease, manifest
+  open/create, safe temporary repair, WAL replay, and async WAL append are on
+  the main path.
+- Browser maintenance must not be exposed just because table/blob async write
+  helpers exist. Flush and compaction need an internal completion owner so
+  caller cancellation cannot leave durable manifest state ahead of installed
+  in-memory state or WAL rewrite.
+
+### Change
+
+- Wired writable browser `Db::open_async` on `wasm32-unknown-unknown` through
+  the browser storage backend, Web Locks writer lease, async safe temporary
+  repair, browser manifest open/create, default bucket creation, recovery
+  validation, WAL replay, and a browser WAL front door.
+- Added browser manifest storage ownership so browser manifest publish uses the
+  async storage contract and `Flush` durability rather than native strict sync.
+- Routed browser `write_async` and async transaction commit through an async
+  commit path that appends WAL before publishing memtable deltas.
+- Made browser persistent async writes internally owned after acceptance by
+  spawning the side-effecting commit task locally and leaving the caller future
+  as a result waiter.
+- Added a browser WAL front door for sharded WAL append, persist, stats, and
+  rewrite-after-replay-floor building blocks.
+- Made browser sync writes, sync transactions, sync bucket creation, flush,
+  compaction, maintenance, and pressure maintenance return typed unsupported
+  errors instead of silently bypassing missing async pieces.
+- Added browser named bucket creation through async manifest publish guarded by
+  a wasm-only async manifest lock.
+- Added async table/blob write helpers behind storage traits.
+- Exposed browser `flush_async`, `compact_range_async`,
+  `compact_range_with_budget_async`, and `run_maintenance_with_budget_async`
+  through internally owned wasm-local tasks so caller cancellation only drops
+  the waiter after the side-effecting work has started.
+- Added browser async flush table writes, async manifest publish installation,
+  WAL rewrite after replay floor, budgeted compaction, obsolete table cleanup,
+  pending blob cleanup, and blob GC paths through storage traits.
+- Changed browser write pressure from unsupported to `RuntimeBusy`, pointing
+  callers to async maintenance.
+
+### Verification
+
+- `cargo fmt`
+- `cargo check`
+- `cargo check --target wasm32-unknown-unknown --lib`
+- `cargo check --target wasm32-wasip1 --lib`
+- `cargo test --lib`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings`
+- pending final gate: format check, diff check, and repository scans.
+
+### Remaining Blockers
+
+- Browser write preflight cannot await maintenance; writes under pressure return
+  `RuntimeBusy` until the caller runs async maintenance.
+- An in-browser persistence fixture would strengthen runtime evidence beyond
+  wasm compilation and shared native tests.
+- Browser read paths still use full-object table/blob helpers in some places.
+
+### Recommended Next Action
+
+- Add an in-browser persistence fixture and then optimize browser read
+  granularity only if measurements justify it.

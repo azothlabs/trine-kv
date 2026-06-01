@@ -779,6 +779,7 @@ dependencies = [
  "lz4_flex",
  "opfs",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]
