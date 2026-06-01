@@ -8525,3 +8525,60 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Commit Phase 123, then convert the next open/recovery subsystem.
+
+## Phase 124: Browser OPFS Storage Backend
+
+### Observation
+
+- Browser storage futures and handles can be thread-local, and manifest/WAL
+  recovery read helpers now have async storage-trait entry points.
+- Browser persistence still lacked an actual persistent storage adapter behind
+  Trine's storage traits.
+
+### Interpretation
+
+- A browser adapter can be added now without claiming full browser persistent
+  database open.
+- Writable browser persistent open still requires async persistent open wiring,
+  table/blob/recovery/cleanup conversion, async WAL append/front-door/rewrite,
+  and a reliable writer lease.
+
+### Change
+
+- Added target-scoped browser dependencies for an OPFS-backed adapter.
+- Added `BrowserStorageBackend` on `wasm32-unknown-unknown` implementing
+  storage read, object read/write/delete/list, directory create/list, manifest
+  read, and manifest publish traits.
+- Kept OPFS behind Trine storage traits and left native/WASI targets free of
+  browser storage code.
+- Updated the async storage protocol to record that browser persistent storage
+  has a storage adapter but not database open wiring.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo check`
+- `cargo check --target wasm32-unknown-unknown --lib`
+- `cargo check --target wasm32-unknown-unknown --tests`
+- `cargo check --target wasm32-wasip2 --lib`
+- `cargo check --target wasm32-wasip2 --tests`
+- `cargo test --all-targets --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings`
+- `git diff --check`
+- forbidden-term scan excluding local agent instructions
+
+### Remaining Blockers
+
+- `DbOptions::browser_persistent()` still returns `UnsupportedBackend`.
+- Browser persistent open still needs async table/blob/recovery/cleanup wiring.
+- Browser writable mode still needs async WAL append/front-door/rewrite and a
+  reliable writer lease.
+- Browser durability remains capability-reported and is not treated as native
+  strict sync.
+
+### Recommended Next Action
+
+- Wire read-only browser persistent open through async manifest, WAL recovery,
+  table, blob, and recovery-report reads before adding writable browser lease
+  support.

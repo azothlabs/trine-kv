@@ -2859,3 +2859,30 @@ by blocking WAL recovery reads.
 ### Recommended Next Action
 
 - Convert the next open/recovery subsystem.
+
+### Phase 124: Browser OPFS Storage Backend
+
+**Status**: Complete
+
+**Goal**: Add a real browser persistent storage adapter behind Trine's storage
+traits without claiming full browser database open support.
+
+**Entry Condition**: Phase 123 complete and browser persistence still lacks a
+target-specific storage adapter.
+
+**Acceptance Gate**:
+
+- Browser persistent storage uses an OPFS-backed adapter on
+  `wasm32-unknown-unknown`.
+- The adapter implements Trine storage read, object read/write/delete/list,
+  directory create/list, manifest read, and manifest publish traits.
+- Native and WASI targets do not depend on browser storage code.
+- Browser persistent database open remains explicitly unsupported until async
+  open/recovery/writer lease wiring exists.
+
+**Major Out Of Scope**:
+
+- Browser persistent `Db::open` wiring.
+- Browser writer lease protocol.
+- Async table/blob/recovery/cleanup conversion.
+- Async WAL append/front-door/rewrite.

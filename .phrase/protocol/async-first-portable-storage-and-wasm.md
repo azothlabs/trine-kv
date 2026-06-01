@@ -438,7 +438,10 @@ Rules:
 
 - memory mode is always allowed when the build includes it;
 - `DbOptions::browser_persistent()` selects the browser host boundary and
-  currently returns `UnsupportedBackend` until the persistent adapter exists;
+  currently returns `UnsupportedBackend` until persistent open, recovery, and
+  writer lease wiring exist;
+- browser persistent storage uses an OPFS-backed adapter behind Trine storage
+  traits on `wasm32-unknown-unknown`;
 - persistent writable mode requires reliable writer leasing;
 - if writer leasing or atomic manifest publish is unavailable, writable
   persistent open fails;

@@ -50,6 +50,7 @@ fn sync_directory(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(any(unix, windows)))]
+#[allow(clippy::unnecessary_wraps)]
 fn sync_directory(_path: &Path) -> Result<()> {
     // Rust's standard library does not expose a portable directory sync for all
     // platforms. Targets without a concrete implementation keep the previous

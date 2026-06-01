@@ -6,90 +6,85 @@ Complete
 
 ## Goal
 
-Move WAL recovery reads and shard discovery onto async storage-trait helpers so
-the browser persistent path has an async log-reading boundary after manifest.
+Add a real browser OPFS storage backend target behind Trine's storage traits so
+browser persistence has an owned storage implementation to wire into the async
+persistent engine path.
 
 ## Scope
 
-- Phase 123: async WAL recovery read boundary.
+- Phase 124: browser OPFS storage backend.
 
 ## Out Of Scope
 
-- Async WAL append/front-door workers.
-- WAL rewrite conversion.
-- IndexedDB or OPFS implementation.
+- Persistent `Db::open` browser wiring.
 - Browser writer lease protocol.
-- Async table, blob, recovery-report, cleanup, or full persistent database open.
-- Changing WAL format, merge ordering, durability semantics, or commit behavior.
+- Async table, blob, recovery-report, cleanup, WAL append/front-door, or WAL
+  rewrite conversion.
+- Changing storage formats, manifest format, WAL format, durability semantics,
+  or MVCC behavior.
 
 ## Backend Boundary Receipt
 
-- Trine operation names: WAL object read, WAL shard discovery, WAL batch decode,
-  and WAL recovery stream read.
-- Owned interface: `StorageObjectReadBackend`, `StorageDirectoryListBackend`,
-  `StorageFuture`, WAL storage object ids, and WAL stream merge helpers.
-- Chosen backend: no new browser backend in this slice. Native WAL recovery read
-  gains async helpers over the existing storage traits; browser will later
-  provide the same trait boundary.
-- Known backend limits: WAL append/front-door/rewrite, table/blob/recovery,
-  writer lease, atomic manifest publish proof, and persistent open wiring remain
-  incomplete for browser persistence.
-- Leak-check scope: WAL APIs/docs/protocol must keep Trine-owned names and must
-  not expose implementation-library names as the abstraction.
-- Verification gate: native checks, WASI checks, browser checks, focused WAL
-  tests, full tests, formatting, clippy, diff check, forbidden-term scan,
+- Trine operation names: OPFS object read, random read, object write, object
+  delete, directory create, directory listing, manifest read, and manifest
+  publish.
+- Owned interface: `StorageReadBackend`, `StorageObjectReadBackend`,
+  `StorageObjectWriteBackend`, `StorageObjectDeleteBackend`,
+  `StorageDirectoryCreateBackend`, `StorageDirectoryListBackend`,
+  `StorageManifestReadBackend`, `StorageManifestPublishBackend`, and
+  `StorageFuture`.
+- Chosen backend: browser persistent storage uses OPFS on
+  `wasm32-unknown-unknown`, via a target-specific Rust OPFS adapter dependency.
+- Known backend limits: browser writer lease, strict durability proof, persistent
+  open wiring, WAL append/front-door/rewrite, and table/blob/recovery/cleanup
+  async wiring remain incomplete.
+- Leak-check scope: public API, docs, protocol, and phase text keep Trine-owned
+  backend terminology; OPFS remains an implementation choice for the browser
+  backend.
+- Verification gate: native checks, WASI checks, browser checks, focused storage
+  checks, full tests, formatting, clippy, diff check, forbidden-term scan,
   project-name scan, and backend-name leakage scan.
 
 ## Acceptance Gate
 
-- WAL object read has an async storage-trait helper.
-- WAL shard discovery has an async storage-trait helper.
-- WAL recovery streams can be read through async storage helpers.
-- Async WAL discovery preserves ordering and malformed-name validation.
-- Async WAL batch read preserves replay-floor filtering.
-- Existing synchronous WAL behavior remains unchanged.
-- Evidence records that this is only WAL recovery reads, not async WAL writes or
-  a complete browser persistent backend.
+- `opfs` dependency is target-scoped to `wasm32-unknown-unknown`.
+- Browser OPFS backend implements Trine storage read/object-read/write/delete,
+  directory create/list, manifest read, and manifest publish traits.
+- Browser OPFS backend compiles on `wasm32-unknown-unknown`.
+- Native and WASI targets do not depend on OPFS code.
+- Evidence records that this adds a backend target but does not complete browser
+  persistent open.
 
 ## Active Task Slice
 
 ```text
-task515 [x] goal:add async WAL object read helper | scope:src/wal.rs | verify:wal tests
-task516 [x] goal:add async WAL discovery and stream helpers | scope:src/wal.rs | verify:wal tests
-task517 [x] goal:update async WAL evidence | scope:.phrase protocol | verify:docs diff
-task518 [x] goal:commit Phase 123 | scope:git | verify:git commit
+task519 [x] goal:add target-scoped OPFS dependency | scope:Cargo.toml Cargo.lock | verify:wasm check
+task520 [x] goal:add browser OPFS storage backend | scope:src/storage.rs | verify:wasm check
+task521 [x] goal:update OPFS backend evidence | scope:.phrase protocol docs | verify:docs diff
+task522 [x] goal:commit Phase 124 | scope:git | verify:git commit
 ```
 
 ## Known Blockers
 
-- WAL append/front-door workers still use blocking append objects and worker
-  threads.
-- Persistent database open still calls synchronous WAL recovery helpers.
-- Table, blob, recovery-report, and cleanup paths still rely on blocking storage
-  adapters around `NativeFileBackend`.
-- Browser persistence still requires a true async browser object store, reliable
-  writer lease, atomic manifest publish, and async persistent open path.
+- Browser persistent open still returns `UnsupportedBackend`.
+- Browser writer lease is not implemented.
+- Table, blob, recovery-report, cleanup, WAL append/front-door, and WAL rewrite
+  still need async conversion or browser-safe alternatives.
+- OPFS strict durability guarantees are not treated as native `SyncData` or
+  `SyncAll`.
 
 ## Evidence
 
+- Phase 121 allowed browser storage futures and handles to be thread-local.
 - Phase 122 moved manifest read/publish/open/create onto async storage helpers.
-- Persistent path audit still points at WAL recovery read/discovery as one of
-  the blocking subsystems that must be converted before browser persistence can
-  be real.
-- Change: WAL object reads, WAL shard discovery, and WAL recovery streams now
-  have async storage-trait helpers.
-- Async WAL discovery preserves legacy/shard ordering and malformed-name
-  validation through the shared path parser.
-- Async WAL batch read preserves replay-floor filtering.
-- Verification: `cargo test wal::tests`, `cargo check`, `cargo check --target
-  wasm32-wasip2 --lib`, `cargo check --target wasm32-wasip2 --tests`, `cargo
-  check --target wasm32-unknown-unknown --lib`, `cargo check --target
-  wasm32-unknown-unknown --tests`, `cargo test --all-targets --all-features`,
-  `cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt
-  --check`, `git diff --check`, forbidden-term scan excluding local agent
-  instructions, project-name diff scan, and backend-name diff scan pass.
+- Phase 123 moved WAL recovery read/discovery onto async storage helpers.
+- OPFS API evidence: MDN documents OPFS as an origin-private browser filesystem
+  and `FileSystemWritableFileStream` writes through a temporary file until close.
+- Rust adapter evidence: the `opfs` crate exposes directory, file, and writable
+  stream traits suitable for a Trine storage backend.
 
 ## Next Recommendation
 
-- Start the next browser persistence slice by converting the next open/recovery
-  subsystem.
+- Start the read-only browser persistent open slice by routing open/recovery
+  through async manifest, WAL, table, blob, and recovery-report reads before
+  adding writable browser lease support.
