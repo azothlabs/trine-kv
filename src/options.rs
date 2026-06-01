@@ -196,8 +196,15 @@ impl DbOptions {
             storage_mode: StorageMode::HostPersistent {
                 backend: HostStorageBackend::Browser,
             },
+            background_worker_count: 0,
+            runtime: RuntimeOptions::inline(),
             ..Self::default()
         }
+    }
+
+    #[must_use]
+    pub fn browser_persistent_read_only() -> Self {
+        Self::browser_persistent().read_only()
     }
 
     #[must_use]

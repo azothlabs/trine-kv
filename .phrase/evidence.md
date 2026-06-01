@@ -8637,3 +8637,60 @@ Record only evidence that can change planning or durable decisions.
 
 - Wire read-only browser persistent open through async manifest, WAL recovery,
   table, and blob reads, then classify recovery-report and cleanup behavior.
+
+## Phase 126: Browser Read-Only Persistent Open
+
+### Observation
+
+- Browser OPFS storage, async manifest reads, async WAL recovery reads, and
+  async table/blob reads were available, but `Db::open_async` still delegated to
+  the synchronous browser-unsupported path.
+- Browser read paths could not use native blob lookups after open because the
+  browser storage mode has no native persistent path.
+
+### Interpretation
+
+- Browser read-only open can now be wired without changing storage formats or
+  writable semantics.
+- Table records that reference blob files need to be rewritten to inline values
+  during browser read-only open until the read path can carry an async blob
+  backend.
+
+### Change
+
+- Added async recovery validation helpers for safe temporary files, missing and
+  invalid referenced blob files, and unreferenced table/blob files.
+- Added async manifest read support for direct manifest state loading.
+- Wired `Db::open_async(DbOptions::browser_persistent_read_only())` to OPFS on
+  `wasm32-unknown-unknown`, including manifest load, recovery validation, table
+  load, blob value reads, WAL recovery stream replay, and default bucket load.
+- Kept synchronous browser `Db::open` unsupported and kept writable browser
+  open unsupported.
+- Set browser persistent options to inline runtime with zero background workers,
+  and added a read-only browser options helper.
+
+### Verification
+
+- `cargo fmt`
+- `cargo check`
+- `cargo check --target wasm32-unknown-unknown --lib`
+- `cargo check --target wasm32-unknown-unknown --tests`
+- `cargo check --target wasm32-wasip1 --lib`
+- `cargo check --target wasm32-wasip1 --tests`
+- `cargo test browser_persistent --lib`
+- `cargo test --lib`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings`
+
+### Remaining Blockers
+
+- Browser writable open still needs WAL append/front-door/rewrite.
+- Browser writable open still needs a writer lease protocol.
+- Browser recovery-report repair and cleanup mutation are still not wired.
+- Browser read-only open currently reads whole table/blob objects where the
+  helper path does not yet have a smaller async read plan.
+
+### Recommended Next Action
+
+- Start the browser writable phase by adding async WAL append/front-door/rewrite
+  behind storage traits, then add the writer lease protocol.

@@ -3183,6 +3183,45 @@ where
     decode_table_bytes(bytes.as_slice())
 }
 
+#[allow(dead_code)]
+pub(crate) async fn inline_blob_values_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+    mut table: Table,
+) -> Result<Table>
+where
+    B: StorageReadBackend,
+{
+    if table.properties.blob_file_ids().is_empty() {
+        return Ok(table);
+    }
+
+    let point_records = table
+        .point_records
+        .take()
+        .ok_or_else(|| Error::Corruption {
+            message: "table point records must be loaded before async blob inline".to_owned(),
+        })?;
+    let mut rewritten = Vec::with_capacity(point_records.len());
+    for mut record in point_records {
+        if let Some(value @ (ValueRef::BlobIndex(_) | ValueRef::Blob { .. })) =
+            record.value.as_ref()
+        {
+            let bytes = crate::blob::read_value_for_internal_key_with_backend_async(
+                backend,
+                db_path,
+                value,
+                Some(&record.internal_key),
+            )
+            .await?;
+            record.value = Some(ValueRef::Inline(bytes));
+        }
+        rewritten.push(record);
+    }
+    table.point_records = Some(rewritten);
+    Ok(table)
+}
+
 fn read_table_header(path: &Path, source: &impl BlockReadSource) -> Result<[u8; HEADER_LEN]> {
     let header = source
         .read_exact_at_owned(0, HEADER_LEN)

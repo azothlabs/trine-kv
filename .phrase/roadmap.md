@@ -2912,3 +2912,39 @@ native blocking storage wrappers.
 - Recovery-report and cleanup conversion.
 - WAL append/front-door/rewrite.
 - Browser writer lease protocol.
+
+### Phase 126: Browser Read-Only Persistent Open
+
+**Status**: Complete
+
+**Goal**: Wire browser read-only persistent open through OPFS and async storage
+traits without changing writable persistent behavior.
+
+**Entry Condition**: Phase 125 complete and browser persistent open still
+returns `UnsupportedBackend`.
+
+**Acceptance Gate**:
+
+- `Db::open_async(DbOptions::browser_persistent_read_only())` uses OPFS on
+  `wasm32-unknown-unknown`.
+- Browser read-only open loads manifest state, validates recovery inputs, loads
+  manifest-referenced tables and blobs, and replays WAL recovery streams through
+  async storage traits.
+- Non-browser targets keep browser persistent async open as
+  `UnsupportedBackend`.
+- Synchronous browser persistent open remains unsupported.
+- Writable browser persistent open remains unsupported.
+- Browser and WASI targets compile.
+
+**Major Out Of Scope**:
+
+- Browser writable persistent open.
+- Browser writer lease protocol.
+- WAL append/front-door/rewrite conversion.
+- Browser recovery-report repair and cleanup mutation.
+- Browser read-path performance tuning.
+
+### Recommended Next Action
+
+- Start browser writable persistent support with async WAL append/front-door and
+  WAL rewrite, then add the writer lease protocol.

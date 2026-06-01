@@ -15,8 +15,8 @@ use crate::{
         BlockingStorageObjectDeleteBackend, BlockingStorageObjectReadBackend,
         BlockingStorageObjectWriteBackend, BlockingStorageReadBackend,
         BlockingStorageWriterLeaseBackend, NativeFileBackend, NativeFileWriterLease,
-        StorageCapability, StorageDirectoryId, StorageObjectId, StorageObjectKind,
-        StorageReadBackend,
+        StorageCapability, StorageDirectoryId, StorageDirectoryListBackend, StorageObjectId,
+        StorageObjectKind, StorageObjectListBackend, StorageObjectReadBackend, StorageReadBackend,
     },
     table::{self, TableId},
     wal,
@@ -170,6 +170,43 @@ pub(crate) fn fail_on_unreferenced_storage_files_with_backend(
 }
 
 #[allow(dead_code)]
+pub(crate) async fn fail_on_unreferenced_storage_files_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+    referenced_table_ids: &BTreeSet<TableId>,
+    referenced_blob_ids: &BTreeSet<u64>,
+) -> Result<()>
+where
+    B: StorageObjectListBackend,
+{
+    let mut unreferenced_files = Vec::new();
+
+    for table_id in table::list_table_file_ids_with_backend_async(backend, db_path).await? {
+        if !referenced_table_ids.contains(&table_id) {
+            unreferenced_files.push(storage_file_name(&table::table_path(db_path, table_id))?);
+        }
+    }
+
+    for blob_id in blob::list_blob_file_ids_with_backend_async(backend, db_path).await? {
+        if !referenced_blob_ids.contains(&blob_id) {
+            unreferenced_files.push(storage_file_name(&blob::blob_path(db_path, blob_id))?);
+        }
+    }
+
+    unreferenced_files.sort();
+    if unreferenced_files.is_empty() {
+        return Ok(());
+    }
+
+    Err(Error::Corruption {
+        message: format!(
+            "unreferenced table/blob files require operator review: {}",
+            unreferenced_files.join(", ")
+        ),
+    })
+}
+
+#[allow(dead_code)]
 pub(crate) fn fail_on_missing_referenced_blob_files(
     db_path: &Path,
     referenced_blob_ids: &BTreeSet<u64>,
@@ -192,6 +229,39 @@ pub(crate) fn fail_on_missing_referenced_blob_files_with_backend(
                 .then(|| storage_file_name(&path))
         })
         .collect::<Result<Vec<_>>>()?;
+
+    if missing_files.is_empty() {
+        return Ok(());
+    }
+
+    Err(Error::Corruption {
+        message: format!(
+            "referenced blob files are missing: {}",
+            missing_files.join(", ")
+        ),
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) async fn fail_on_missing_referenced_blob_files_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+    referenced_blob_ids: &BTreeSet<u64>,
+) -> Result<()>
+where
+    B: StorageObjectReadBackend,
+{
+    backend
+        .capabilities()
+        .require(StorageCapability::ObjectRead)?;
+    let mut missing_files = Vec::new();
+    for blob_id in referenced_blob_ids {
+        let path = blob::blob_path(db_path, *blob_id);
+        let object = StorageObjectId::native_file(StorageObjectKind::Blob, &path);
+        if backend.read_object_bytes(object).await?.is_none() {
+            missing_files.push(storage_file_name(&path)?);
+        }
+    }
 
     if missing_files.is_empty() {
         return Ok(());
@@ -293,6 +363,132 @@ pub(crate) fn fail_on_invalid_referenced_blob_files_with_backend(
     }
 
     Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) async fn fail_on_invalid_referenced_blob_files_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+    manifest: &ManifestState,
+) -> Result<()>
+where
+    B: StorageReadBackend,
+{
+    let referenced_blob_ids = manifest
+        .tables()
+        .values()
+        .flat_map(|tables| {
+            tables
+                .iter()
+                .flat_map(|properties| properties.blob_file_ids().iter().copied())
+        })
+        .collect::<BTreeSet<_>>();
+    let mut blob_properties = BTreeMap::new();
+    for blob_id in referenced_blob_ids {
+        blob_properties.insert(
+            blob_id,
+            blob::read_blob_file_properties_with_backend_async(backend, db_path, blob_id).await?,
+        );
+    }
+
+    for (bucket, tables) in manifest.tables() {
+        for table in tables {
+            let reference_ids = table
+                .blob_references()
+                .iter()
+                .map(|reference| reference.file_id)
+                .collect::<BTreeSet<_>>();
+            let file_ids = table
+                .blob_file_ids()
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            if file_ids != reference_ids {
+                return Err(Error::Corruption {
+                    message: format!(
+                        "table {} in bucket {bucket} has inconsistent blob reference ids",
+                        table.id.get()
+                    ),
+                });
+            }
+
+            for reference in table.blob_references() {
+                let properties =
+                    blob_properties
+                        .get(&reference.file_id)
+                        .ok_or_else(|| Error::Corruption {
+                            message: format!(
+                                "table {} in bucket {bucket} references missing blob metadata {}",
+                                table.id.get(),
+                                reference.file_id
+                            ),
+                        })?;
+                if reference.referenced_bytes > properties.encoded_bytes {
+                    return Err(Error::Corruption {
+                        message: format!(
+                            "table {} in bucket {bucket} references too many blob bytes in file {}",
+                            table.id.get(),
+                            reference.file_id
+                        ),
+                    });
+                }
+                if reference.smallest_internal_key < properties.smallest_internal_key
+                    || reference.largest_internal_key > properties.largest_internal_key
+                {
+                    return Err(Error::Corruption {
+                        message: format!(
+                            "table {} in bucket {bucket} has blob key span outside file {}",
+                            table.id.get(),
+                            reference.file_id
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) async fn fail_on_safe_temporary_files_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+) -> Result<()>
+where
+    B: StorageDirectoryListBackend,
+{
+    backend
+        .capabilities()
+        .require(StorageCapability::DirectoryListing)?;
+    let directory_files = match backend
+        .list_directory_files(StorageDirectoryId::native_file(db_path))
+        .await
+    {
+        Ok(files) => files,
+        Err(Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+
+    let mut temporary_files = Vec::new();
+    for directory_file in directory_files {
+        let name = storage_file_name(directory_file.path())?;
+        if is_safe_temporary_file(&name) {
+            temporary_files.push(name);
+        }
+    }
+    temporary_files.sort();
+
+    if temporary_files.is_empty() {
+        return Ok(());
+    }
+
+    Err(Error::Corruption {
+        message: format!(
+            "safe temporary files require explicit repair: {}",
+            temporary_files.join(", ")
+        ),
+    })
 }
 
 struct TemporaryFile {

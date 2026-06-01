@@ -438,10 +438,13 @@ Rules:
 
 - memory mode is always allowed when the build includes it;
 - `DbOptions::browser_persistent()` selects the browser host boundary and
-  currently returns `UnsupportedBackend` until persistent open, recovery, and
-  writer lease wiring exist;
+  keeps synchronous `Db::open` unsupported;
+- `Db::open_async(DbOptions::browser_persistent_read_only())` uses OPFS on
+  `wasm32-unknown-unknown` for read-only persistent open;
 - browser persistent storage uses an OPFS-backed adapter behind Trine storage
   traits on `wasm32-unknown-unknown`;
+- writable browser persistent open remains unsupported until WAL append,
+  WAL rewrite, and writer lease wiring exist;
 - persistent writable mode requires reliable writer leasing;
 - if writer leasing or atomic manifest publish is unavailable, writable
   persistent open fails;
@@ -471,10 +474,12 @@ Rules:
 - missing required objects fail closed;
 - final WAL tail truncation rules remain unchanged;
 - WAL object reads, WAL object listing, and recovery stream reads must be
-  available through async storage-trait calls before browser persistence is
-  wired;
-- manifest-referenced table and blob reads must be available through async
-  storage-trait calls before browser read-only persistence is wired;
+  available through async storage-trait calls for browser read-only recovery;
+- manifest-referenced table and blob reads use async storage-trait calls for
+  browser read-only recovery;
+- safe temporary file checks, referenced blob validation, and unreferenced
+  table/blob checks must have async storage-trait paths before a browser
+  persistent open is accepted;
 - manifest publish atomicity is validated by backend fixtures;
 - recovery must not depend on native directory scanning order.
 

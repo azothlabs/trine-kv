@@ -388,6 +388,25 @@ pub fn read_manifest(path: &Path) -> Result<ManifestState> {
     decode_manifest(&bytes)
 }
 
+#[allow(dead_code)]
+pub(crate) async fn read_manifest_with_backend_async<B>(
+    backend: &B,
+    path: &Path,
+) -> Result<ManifestState>
+where
+    B: StorageManifestReadBackend,
+{
+    let bytes = read_manifest_bytes_with_backend_async(backend, path)
+        .await?
+        .ok_or_else(|| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("manifest {} not found", path.display()),
+            ))
+        })?;
+    decode_manifest(&bytes)
+}
+
 fn read_manifest_bytes(path: &Path) -> Result<Option<Arc<[u8]>>> {
     let backend = NativeFileBackend::new();
     read_manifest_bytes_with_backend(&backend, path)

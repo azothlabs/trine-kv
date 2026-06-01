@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io,
     ops::Bound,
     path::Path,
     sync::{
@@ -33,8 +34,9 @@ use crate::{
     storage::{
         BlockingStorageDirectoryCreateBackend, BlockingStorageDirectorySyncBackend,
         BlockingStorageObjectDeleteBackend, BlockingStorageReadBackend, BlockingStorageReadObject,
-        NativeFileBackend, StorageCapability, StorageDirectoryId, StorageObjectId,
-        StorageObjectKind, StorageReadBackend,
+        NativeFileBackend, StorageCapability, StorageDirectoryId, StorageDirectoryListBackend,
+        StorageManifestReadBackend, StorageObjectId, StorageObjectKind, StorageObjectListBackend,
+        StorageObjectReadBackend, StorageReadBackend,
     },
     table::{self, Table},
     transaction::{Transaction, TransactionOptions},
@@ -42,6 +44,9 @@ use crate::{
     wal::{self, WalFrontDoor},
     write_batch::BatchOperation,
 };
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use crate::storage::BrowserStorageBackend;
 
 mod commit;
 
@@ -882,6 +887,119 @@ impl Db {
             return Err(Error::unsupported_durability(options.durability));
         }
         Ok(())
+    }
+
+    #[allow(clippy::unused_async)]
+    async fn open_browser_persistent_with_options_async(options: DbOptions) -> Result<Self> {
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            Self::open_browser_persistent_with_options_async_inner(options).await
+        }
+
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            drop(options);
+            Err(Error::unsupported_backend(
+                HostStorageBackend::Browser.as_str(),
+            ))
+        }
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    async fn open_browser_persistent_with_options_async_inner(options: DbOptions) -> Result<Self> {
+        Self::validate_browser_persistent_options(&options)?;
+        let storage = BrowserStorageBackend::new().await?;
+        let db_path = Path::new("");
+        let manifest_path = manifest::manifest_path(db_path);
+        let manifest = read_manifest_or_empty_with_backend_async(&storage, &manifest_path).await?;
+        let replay_floor = manifest.wal_replay_floor();
+
+        recovery::fail_on_safe_temporary_files_with_backend_async(&storage, db_path).await?;
+        run_persistent_recovery_checks_async(&storage, db_path, &manifest).await?;
+        let mut buckets = buckets_from_manifest_async(&storage, db_path, &manifest).await?;
+        ensure_default_bucket_loaded(&mut buckets, &options)?;
+
+        let wal_streams =
+            wal::read_recovery_streams_after_with_backend_async(&storage, db_path, replay_floor)
+                .await?;
+        let batches = wal::merge_batch_streams_by_sequence(wal_streams)?;
+        let block_cache_bytes = options.block_cache_bytes;
+        let runtime = Runtime::new(options.runtime);
+        let db = Self {
+            inner: Arc::new(DbInner {
+                options,
+                user_handles: AtomicUsize::new(1),
+                commit_tracker: CommitTracker::new(Sequence::ZERO),
+                closed: AtomicBool::new(false),
+                publish_barrier: PublishBarrier::new(),
+                memtable_publish_lock: Mutex::new(()),
+                process_lock: Mutex::new(None),
+                buckets: RwLock::new(buckets),
+                snapshots: Arc::new(SnapshotTracker::default()),
+                pending_obsolete_table_ids: Mutex::new(BTreeSet::new()),
+                manifest: None,
+                wal: None,
+                block_cache: Arc::new(cache::BlockCache::new(block_cache_bytes)),
+                compaction_runs: AtomicU64::new(0),
+                compaction_input_tables: AtomicU64::new(0),
+                compaction_output_tables: AtomicU64::new(0),
+                compaction_input_bytes: AtomicU64::new(0),
+                compaction_output_bytes: AtomicU64::new(0),
+                blob_gc_runs: AtomicU64::new(0),
+                blob_gc_input_bytes: AtomicU64::new(0),
+                blob_gc_output_bytes: AtomicU64::new(0),
+                blob_gc_discarded_bytes: AtomicU64::new(0),
+                blob_reads: Arc::new(BlobReadMetrics::default()),
+                maintenance_cooperative_yields: AtomicU64::new(0),
+                maintenance_budget_exhaustions: AtomicU64::new(0),
+                native_storage: NativeFileBackend::new(),
+                runtime,
+                runtime_shutdown: CancellationToken::new(),
+                maintenance: Arc::new(MaintenanceCoordinator::new()),
+                background_workers: Mutex::new(Vec::new()),
+            }),
+            counts_as_user_handle: true,
+        };
+        db.replay_wal_batches(batches, replay_floor)?;
+        Ok(db)
+    }
+
+    #[cfg_attr(
+        not(all(target_arch = "wasm32", target_os = "unknown")),
+        allow(dead_code)
+    )]
+    fn validate_browser_persistent_options(options: &DbOptions) -> Result<()> {
+        if !matches!(
+            options.storage_mode,
+            StorageMode::HostPersistent {
+                backend: HostStorageBackend::Browser
+            }
+        ) {
+            return Err(Error::invalid_options(
+                "browser persistent open requires browser backend",
+            ));
+        }
+        if !options.read_only {
+            return Err(Error::unsupported_backend(
+                "browser persistent writable open",
+            ));
+        }
+        if options.create_if_missing {
+            return Err(Error::invalid_options(
+                "browser read-only open cannot create missing storage",
+            ));
+        }
+        if options.runtime.mode != runtime::RuntimeMode::Inline {
+            return Err(Error::invalid_options(
+                "browser persistent backend requires inline runtime",
+            ));
+        }
+        if options.background_worker_count != 0 {
+            return Err(Error::invalid_options(
+                "browser persistent backend does not support background workers yet",
+            ));
+        }
+        validate_common_options(options)
     }
 
     pub fn open_memory() -> Result<Self> {
@@ -3282,7 +3400,12 @@ impl Db {
 #[allow(clippy::unused_async)]
 impl Db {
     pub async fn open_async(options: DbOptions) -> Result<Self> {
-        Self::open(options)
+        match &options.storage_mode {
+            StorageMode::HostPersistent {
+                backend: HostStorageBackend::Browser,
+            } => Self::open_browser_persistent_with_options_async(options).await,
+            _ => Self::open(options),
+        }
     }
 
     pub async fn open_memory_async() -> Result<Self> {
@@ -3447,6 +3570,10 @@ fn validate_options(options: &DbOptions) -> Result<()> {
             HostStorageBackend::Browser.as_str(),
         ));
     }
+    validate_common_options(options)
+}
+
+fn validate_common_options(options: &DbOptions) -> Result<()> {
     runtime::validate_runtime_options(
         options.runtime,
         &options.storage_mode,
@@ -3560,6 +3687,40 @@ fn run_persistent_recovery_checks(
     )
 }
 
+#[cfg_attr(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    allow(dead_code)
+)]
+async fn run_persistent_recovery_checks_async<B>(
+    backend: &B,
+    db_path: &Path,
+    manifest: &ManifestState,
+) -> Result<()>
+where
+    B: StorageReadBackend
+        + StorageObjectReadBackend
+        + StorageObjectListBackend
+        + StorageDirectoryListBackend,
+{
+    let referenced_blob_ids = referenced_blob_file_ids_from_manifest(manifest);
+    let allowed_blob_ids = allowed_blob_file_ids_from_manifest(manifest);
+    recovery::fail_on_missing_referenced_blob_files_with_backend_async(
+        backend,
+        db_path,
+        &referenced_blob_ids,
+    )
+    .await?;
+    recovery::fail_on_invalid_referenced_blob_files_with_backend_async(backend, db_path, manifest)
+        .await?;
+    recovery::fail_on_unreferenced_storage_files_with_backend_async(
+        backend,
+        db_path,
+        &referenced_table_file_ids(manifest),
+        &allowed_blob_ids,
+    )
+    .await
+}
+
 fn buckets_from_manifest(
     backend: &NativeFileBackend,
     db_path: &Path,
@@ -3584,6 +3745,62 @@ fn buckets_from_manifest(
     }
 
     Ok(buckets)
+}
+
+#[cfg_attr(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    allow(dead_code)
+)]
+async fn buckets_from_manifest_async<B>(
+    backend: &B,
+    db_path: &Path,
+    manifest: &ManifestState,
+) -> Result<BTreeMap<String, Arc<LsmTree>>>
+where
+    B: StorageReadBackend,
+{
+    let mut buckets = BTreeMap::new();
+
+    for (name, options) in manifest.buckets() {
+        validate_bucket_options(options)?;
+        let mut tables = Vec::new();
+        for properties in manifest.tables().get(name).into_iter().flatten() {
+            let table_path = table::table_path(db_path, properties.id);
+            let table = table::read_table_with_backend_async(backend, &table_path)
+                .await?
+                .with_manifest_properties(properties)?;
+            let table =
+                table::inline_blob_values_with_backend_async(backend, db_path, table).await?;
+            tables.push(Arc::new(table));
+        }
+
+        buckets.insert(
+            name.clone(),
+            Arc::new(LsmTree::new(options.clone(), tables)?),
+        );
+    }
+
+    Ok(buckets)
+}
+
+#[cfg_attr(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    allow(dead_code)
+)]
+async fn read_manifest_or_empty_with_backend_async<B>(
+    backend: &B,
+    path: &Path,
+) -> Result<ManifestState>
+where
+    B: StorageManifestReadBackend,
+{
+    match manifest::read_manifest_with_backend_async(backend, path).await {
+        Ok(manifest) => Ok(manifest),
+        Err(Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(ManifestState::empty())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn ensure_default_bucket_in_manifest(
@@ -4112,6 +4329,11 @@ mod tests {
         thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    use std::{
+        future::Future,
+        task::{Context, Poll, Wake, Waker},
+    };
 
     use super::{
         CompactionReservation, Db, Error, MaintenanceCoordinator, compaction_reservations_conflict,
@@ -4124,6 +4346,37 @@ mod tests {
         storage::{StorageCapability, StorageReadBackend},
         types::KeyRange,
     };
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    struct ThreadWaker {
+        thread: thread::Thread,
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    impl Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.thread.unpark();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.thread.unpark();
+        }
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn block_on_test_future<T>(future: impl Future<Output = crate::Result<T>>) -> crate::Result<T> {
+        let waker = Waker::from(Arc::new(ThreadWaker {
+            thread: thread::current(),
+        }));
+        let mut context = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(result) => return result,
+                Poll::Pending => thread::park_timeout(Duration::from_secs(1)),
+            }
+        }
+    }
 
     #[test]
     fn maintenance_success_does_not_clear_unreported_error() {
@@ -4226,10 +4479,32 @@ mod tests {
 
     #[test]
     fn browser_persistent_backend_is_explicitly_unsupported() {
+        let options = DbOptions::browser_persistent();
+        assert_eq!(options.runtime.mode, crate::runtime::RuntimeMode::Inline);
+        assert_eq!(options.background_worker_count, 0);
+
         let browser_error =
-            Db::open(DbOptions::browser_persistent()).expect_err("browser backend is not wired");
+            Db::open(options).expect_err("browser backend is not wired for sync open");
         assert!(matches!(browser_error, Error::UnsupportedBackend { .. }));
         assert!(browser_error.to_string().contains("browser persistent"));
+    }
+
+    #[test]
+    fn browser_persistent_read_only_options_disable_creation() {
+        let options = DbOptions::browser_persistent_read_only();
+        assert!(options.read_only);
+        assert!(!options.create_if_missing);
+        assert_eq!(options.runtime.mode, crate::runtime::RuntimeMode::Inline);
+        assert_eq!(options.background_worker_count, 0);
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn browser_persistent_open_async_requires_browser_target() {
+        let error = block_on_test_future(Db::open_async(DbOptions::browser_persistent_read_only()))
+            .expect_err("browser async open requires browser target");
+        assert!(matches!(error, Error::UnsupportedBackend { .. }));
+        assert!(error.to_string().contains("browser persistent"));
     }
 
     #[test]
