@@ -28,8 +28,8 @@ use crate::storage::BrowserStorageBackend;
 
 pub const MANIFEST_FILE_NAME: &str = "MANIFEST";
 const MANIFEST_MAGIC: u32 = 0x5452_4d46;
-const MANIFEST_VERSION: u16 = 7;
-const MIN_SUPPORTED_MANIFEST_VERSION: u16 = 4;
+const MANIFEST_VERSION: u16 = 8;
+const MIN_SUPPORTED_MANIFEST_VERSION: u16 = 8;
 const HEADER_LEN: usize = 14;
 // The lower bound for one table entry: fixed fields plus two empty byte fields.
 // Decoding uses this to reject impossible counts before reserving memory.
@@ -1062,12 +1062,7 @@ fn read_u32_at(bytes: &[u8], offset: usize) -> Result<u32> {
 }
 
 fn checksum(bytes: &[u8]) -> u32 {
-    let mut hash = 0x811c_9dc5_u32;
-    for byte in bytes {
-        hash ^= u32::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    hash
+    crate::checksum::crc32c(bytes)
 }
 
 fn invalid_manifest(message: &'static str) -> Error {

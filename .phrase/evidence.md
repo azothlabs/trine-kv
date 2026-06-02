@@ -9142,6 +9142,76 @@ Record only evidence that can change planning or durable decisions.
 
 - Commit the naming fix and return to release-candidate verification.
 
+## 2026-06-02: Scan Flush Snapshot Ordering Review
+
+### Observation
+
+- Point reads capture active and immutable memtable sources before reading the
+  current LSM version, explicitly matching the flush order where a new L0 table
+  is published before the immutable memtable is removed.
+- Range and prefix scans read the current LSM version before cloning active and
+  immutable memtable sources.
+
+### Interpretation
+
+- A scan that reads the old version immediately before a flush publishes the new
+  L0 table can later clone the immutable queue after that flushed memtable was
+  removed, leaving neither source in the scan snapshot.
+- This is a scan/read-consistency issue rather than a WAL, manifest, or point
+  read issue.
+
+### Verification
+
+- Logic review only. No tests or code changes were run for this evidence item.
+
+### Recommended Next Action
+
+- Align scan source capture order with the point-read snapshot order, then add a
+  controlled flush/scan concurrency proof.
+
+## 2026-06-02: Logic Hardening Slice
+
+### Observation
+
+- Scan source capture now clones delta, active memtable, active range
+  tombstones, and immutable memtables before reading the current table version.
+- Commit publication now distinguishes failures before in-memory publication
+  from failures after partial in-memory publication.
+- WAL, manifest, SSTable, block, and blob checksum fields now use CRC-32C with
+  advanced pre-release storage format versions.
+- Pure internal modules were made crate-private where current tests and public
+  type reachability allowed it. Durable-format helper modules remain publicly
+  reachable but hidden from generated docs because integration tests inspect
+  on-disk files through them.
+
+### Interpretation
+
+- Range and prefix scans no longer have the reviewed flush publish/removal gap
+  that could miss committed rows or range tombstones.
+- A partial in-memory commit publication failure is treated as a fatal current
+  handle state instead of advancing visibility over partial data or leaving the
+  outcome unexplained. Persistent databases can recover by reopening and
+  replaying WAL.
+- The checksum change is a deliberate pre-release storage-format change, not a
+  compatible patch to older files.
+
+### Verification
+
+- `cargo test scan_snapshot --lib`
+- `cargo test partial_memtable_publication_failure_closes_database_handle --lib`
+- `cargo test crc32c_matches_standard_check_value --lib`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo fmt --check`
+- `cargo check --all-targets --all-features`
+- `git diff --check`
+
+### Recommended Next Action
+
+- Keep release-candidate verification focused on packaging and examples.
+- If API strictness becomes a blocker, first move durable-file inspection out of
+  public format modules and then make those modules crate-private.
+
 ## 2026-06-02: Path-First Persistent Open API
 
 ### Observation

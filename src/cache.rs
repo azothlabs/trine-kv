@@ -24,6 +24,7 @@ thread_local! {
         NEXT_CACHE_COUNTER_SHARD.fetch_add(1, Ordering::Relaxed) % CACHE_COUNTER_SHARD_COUNT;
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CacheKind {
     DataBlock,

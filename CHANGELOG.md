@@ -48,6 +48,8 @@ Initial packaged release candidate for the embedded LSM MVCC engine.
   succeeds.
 - WAL, manifest, and table decoders reject impossible count fields before large
   allocation.
+- WAL, manifest, SSTable, and blob checksum fields use CRC-32C, with storage
+  format versions advanced for the pre-release format.
 - Failed flush/compaction publish removes unpublished table/blob output files.
 - Recovery validates referenced table/blob files and fails closed on missing or
   corrupt storage files.

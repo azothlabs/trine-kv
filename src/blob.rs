@@ -19,7 +19,7 @@ use crate::{
 };
 
 pub const BLOB_FILE_EXTENSION: &str = "trineb";
-pub const BLOB_FILE_FORMAT_VERSION: u16 = 2;
+pub const BLOB_FILE_FORMAT_VERSION: u16 = 3;
 
 const BLOB_MAGIC: u32 = 0x5452_424c;
 const BLOB_FOOTER_MAGIC: u32 = 0x5452_4246;
@@ -1430,12 +1430,7 @@ fn invalid_blob(message: &'static str) -> Error {
 }
 
 fn checksum(bytes: &[u8]) -> u32 {
-    let mut hash = 0x811c_9dc5_u32;
-    for byte in bytes {
-        hash ^= u32::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    hash
+    crate::checksum::crc32c(bytes)
 }
 
 struct Cursor<'payload> {

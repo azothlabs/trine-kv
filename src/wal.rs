@@ -26,7 +26,7 @@ use crate::{
 };
 
 pub const WAL_MAGIC: u32 = 0x5452_574c;
-pub const WAL_FORMAT_VERSION: u16 = 1;
+pub const WAL_FORMAT_VERSION: u16 = 2;
 pub const WAL_FILE_NAME: &str = "trine.wal";
 pub const WAL_REWRITE_TMP_FILE_NAME: &str = "trine.wal.tmp";
 pub const DEFAULT_WAL_SHARD_COUNT: usize = 4;
@@ -1180,12 +1180,7 @@ fn header_checksum(payload_len: u32, payload_checksum: u32) -> u32 {
 }
 
 fn checksum(bytes: &[u8]) -> u32 {
-    let mut hash = 0x811c_9dc5_u32;
-    for byte in bytes {
-        hash ^= u32::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    hash
+    crate::checksum::crc32c(bytes)
 }
 
 fn invalid_wal(message: &'static str) -> Error {

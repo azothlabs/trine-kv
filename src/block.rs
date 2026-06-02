@@ -193,12 +193,7 @@ pub(crate) fn bounds(offset: u64, len: u64) -> Result<(usize, usize)> {
 }
 
 pub(crate) fn checksum(bytes: &[u8]) -> u32 {
-    let mut hash = 0x811c_9dc5_u32;
-    for byte in bytes {
-        hash ^= u32::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    hash
+    crate::checksum::crc32c(bytes)
 }
 
 fn checked_block_len(header: &[u8]) -> Result<usize> {

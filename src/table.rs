@@ -39,7 +39,7 @@ use crate::{
 
 pub const TABLE_FILE_EXTENSION: &str = "trinet";
 const TABLE_MAGIC: u32 = 0x5452_5442;
-const TABLE_VERSION: u16 = 5;
+const TABLE_VERSION: u16 = 6;
 const HEADER_LEN: usize = 14;
 const FOOTER_MAGIC: u32 = 0x5452_5446;
 const FOOTER_LEN: usize = 90;

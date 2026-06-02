@@ -3128,3 +3128,38 @@ sync-first.
 - Return to release-candidate verification and publish readiness. Keep primary
   async maintenance/WAL internals and an in-browser persistence fixture as
   follow-up hardening unless they become release blockers.
+
+### Phase 132: Logic Hardening Before Release
+
+**Status**: Complete
+
+**Goal**: Resolve the concrete logic risks found in release-candidate review
+before making stronger database-quality claims.
+
+**Entry Condition**: Review identifies a scan/flush consistency risk plus
+smaller hardening gaps in commit failure semantics, checksum strength, and
+public API boundary.
+
+**Acceptance Gate**:
+
+- Range and prefix scan snapshots cannot miss committed data across concurrent
+  flush publish/removal ordering.
+- Any commit failure after WAL accept or partial publication has an explicit
+  visible-sequence outcome.
+- Checksum hardening either lands without changing storage contracts silently or
+  is recorded as a deferred storage-format decision.
+- Public API boundary changes avoid exposing internals without breaking the
+  selected release scope.
+- Focused verification and the relevant release gate pass.
+
+**Major Out Of Scope**:
+
+- Replacing the LSM design or depending on another storage engine.
+- Changing public behavior beyond the reviewed hardening targets.
+- Publishing, tagging, or changing crate version metadata.
+
+### Recommended Next Action
+
+- Return to release-candidate package/example verification. If API strictness
+  becomes a blocker, first move durable-file inspection helpers out of public
+  format modules, then make those modules crate-private.

@@ -2,7 +2,7 @@ use std::{
     future::Future,
     ops::Bound,
     pin::Pin,
-    sync::{Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, atomic::Ordering},
     task::{Context, Poll, Waker},
 };
 
@@ -876,10 +876,11 @@ impl Db {
                     sequence,
                     delta_epoch_max_bytes,
                 ) {
-                    if !delta_publication_started {
-                        self.inner.commit_tracker.mark_skipped(slot)?;
-                    }
-                    return Err(error);
+                    return self.finish_failed_memtable_publication(
+                        slot,
+                        delta_publication_started,
+                        error,
+                    );
                 }
                 delta_publication_started = true;
                 continue;
@@ -890,10 +891,11 @@ impl Db {
                     sequence,
                     operation.batch_index,
                 ) {
-                    if !delta_publication_started {
-                        self.inner.commit_tracker.mark_skipped(slot)?;
-                    }
-                    return Err(error);
+                    return self.finish_failed_memtable_publication(
+                        slot,
+                        delta_publication_started,
+                        error,
+                    );
                 }
                 delta_publication_started = true;
             }
@@ -904,8 +906,10 @@ impl Db {
         {
             Ok(request_flush) => request_flush,
             Err(error) => {
-                self.inner.commit_tracker.mark_visible(slot)?;
-                return Err(error);
+                self.inner.maintenance.record_error(&Error::Corruption {
+                    message: format!("post-commit memtable freeze failed: {error}"),
+                });
+                false
             }
         };
         Ok(PublishedWrite::new(
@@ -913,6 +917,30 @@ impl Db {
             request_flush,
             Some(slot),
         ))
+    }
+
+    fn finish_failed_memtable_publication(
+        &self,
+        slot: CommitSlot,
+        publication_started: bool,
+        error: Error,
+    ) -> Result<PublishedWrite> {
+        if !publication_started {
+            self.inner.commit_tracker.mark_skipped(slot)?;
+            return Err(error);
+        }
+
+        let error = Error::Corruption {
+            message: format!(
+                "commit {} failed after partially publishing in-memory state: {error}; \
+                 database handle closed; reopen persistent databases to replay WAL",
+                slot.sequence().get()
+            ),
+        };
+        self.inner.closed.store(true, Ordering::Release);
+        self.inner.maintenance.record_error(&error);
+        self.inner.maintenance.shutdown();
+        Err(error)
     }
 
     fn preaccept_wal_front_door_if_ready(
@@ -1197,6 +1225,7 @@ const fn durability_rank(mode: DurabilityMode) -> u8 {
 mod tests {
     use std::{
         fs,
+        panic::{AssertUnwindSafe, catch_unwind},
         path::PathBuf,
         sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
@@ -1206,6 +1235,7 @@ mod tests {
         Db, WriteBatch,
         db::CommitTracker,
         error::Error,
+        lsm::LsmTree,
         options::{DbOptions, WriteOptions},
         transaction::{ReadKey, TransactionReadSet},
         types::Sequence,
@@ -1393,6 +1423,37 @@ mod tests {
             &prepared.deltas[0].state,
             &prepared.deltas[1].state
         ));
+    }
+
+    #[test]
+    fn partial_memtable_publication_failure_closes_database_handle() {
+        let path = temp_db_path("partial-publish-failure");
+        let db = Db::open_sync(DbOptions::new(&path)).expect("persistent db opens");
+        db.bucket_sync("events").expect("named bucket opens");
+        let events_state = db.bucket_state("events").expect("events bucket state");
+        poison_active_memtable_entries(&events_state);
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"default".to_vec(), b"v1".to_vec());
+        batch
+            .put_bucket("events", b"event".to_vec(), b"v2".to_vec())
+            .expect("stage named bucket write");
+
+        let error = db
+            .write_sync(batch, WriteOptions::default())
+            .expect_err("second bucket publish should fail");
+        match error {
+            Error::Corruption { message } => {
+                assert!(message.contains("partially publishing in-memory state"));
+                assert!(message.contains("database handle closed"));
+            }
+            other => panic!("expected corruption error, got {other:?}"),
+        }
+
+        assert!(matches!(db.get_sync(b"default"), Err(Error::Closed)));
+
+        drop(db);
+        cleanup_dir(&path);
     }
 
     #[test]
@@ -1733,6 +1794,21 @@ mod tests {
         assert_eq!(delta_stats.merged_epoch_count, 1);
         assert_eq!(delta_stats.max_shard_chain_len, 1);
         assert!(delta_stats.open_epoch_bytes > 0);
+    }
+
+    fn poison_active_memtable_entries(state: &LsmTree) {
+        let active_memtable = state
+            .active_memtable
+            .read()
+            .expect("active memtable pointer lock is not poisoned")
+            .clone();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _entries = active_memtable
+                .write_entries()
+                .expect("memtable entries lock starts healthy");
+            panic!("poison memtable entries for commit failure test");
+        }));
+        assert!(result.is_err());
     }
 
     fn temp_db_path(name: &str) -> PathBuf {

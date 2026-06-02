@@ -17,6 +17,8 @@ Durability in v1 means:
 - startup replays valid WAL records newer than the manifest replay floor;
 - table, manifest, WAL, and blob corruption is detected with checksums or
   format checks;
+- checksum fields use CRC-32C across WAL, manifest, SSTable, block, and blob
+  records;
 - uncertain formal storage files fail closed instead of being guessed into a
   live database state.
 

@@ -8,25 +8,34 @@
 
 #![allow(clippy::missing_errors_doc, clippy::module_name_repetitions)]
 
+#[doc(hidden)]
 pub mod blob;
 mod block;
 pub mod bucket;
-pub mod cache;
+#[allow(dead_code)]
+mod cache;
+mod checksum;
+#[doc(hidden)]
 pub mod codec;
-pub mod compaction;
+mod compaction;
 pub mod db;
 mod durability;
 pub mod error;
-pub mod filter;
+#[allow(dead_code)]
+mod filter;
+#[doc(hidden)]
 pub mod internal_key;
 mod io;
 pub mod iterator;
 mod lsm;
+#[doc(hidden)]
 pub mod manifest;
-pub mod memtable;
-pub mod mvcc;
+#[allow(dead_code)]
+mod memtable;
+#[allow(dead_code)]
+mod mvcc;
 pub mod options;
-pub mod point_value;
+mod point_value;
 pub mod prefix;
 mod range_tombstone;
 pub mod recovery;
@@ -35,10 +44,12 @@ pub mod search;
 pub mod snapshot;
 pub mod stats;
 mod storage;
+#[doc(hidden)]
 pub mod table;
 pub mod transaction;
 pub mod types;
-pub mod version;
+mod version;
+#[doc(hidden)]
 pub mod wal;
 pub mod write_batch;
 

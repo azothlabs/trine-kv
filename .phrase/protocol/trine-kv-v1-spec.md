@@ -94,7 +94,7 @@ Rules:
 
 - only one writer may open the same persistent database scope for writing;
 - startup must acquire an exclusive writer lease unless opened read-only;
-- all files include format version and checksum coverage;
+- all files include format version and CRC-32C checksum coverage;
 - manifest publish is atomic;
 - crash recovery must replay committed WAL records after the manifest snapshot.
 - the engine core must not call platform filesystem APIs directly;
@@ -418,7 +418,8 @@ requested mode.
 
 ## 12. WAL Format
 
-The WAL is append-only and contains framed batch records.
+The WAL is append-only and contains framed batch records. WAL format version 2
+uses CRC-32C for both header and payload checksum fields.
 
 Record frame:
 
@@ -469,7 +470,8 @@ structure, but the behavioral contract is the ordered internal-key table above.
 ## 14. SSTable Format
 
 An SSTable is immutable. It may live as a file in persistent mode or as a memory
-object in in-memory mode.
+object in in-memory mode. SSTable format version 6 uses CRC-32C for checked
+blocks, table payloads, and footer checksums.
 
 Logical sections:
 
@@ -701,6 +703,8 @@ BlobIndex {
 Small values stay inline. Values at or above `blob_threshold_bytes` may be
 stored in blob files. WAL records and memtables still store complete user
 values; separation happens when immutable data is written to SSTables.
+Blob file format version 3 uses CRC-32C for header, record, value, properties,
+and footer checksum fields.
 
 Rules:
 
@@ -720,7 +724,9 @@ Rules:
 
 ## 19. Manifest And VersionSet
 
-The manifest stores a sequence of version edits.
+The manifest stores a sequence of version edits. Manifest format version 8 uses
+CRC-32C. Earlier pre-release manifest versions are rejected instead of being
+decoded with the old checksum algorithm.
 
 Version edit operations:
 

@@ -6,67 +6,66 @@ Complete
 
 ## Goal
 
-Make database opening read like a normal database API before the first release
-candidate: passing a path opens a persistent database, and in-memory mode is an
-explicit option.
+Harden the release-candidate logic risks found during review, starting with the
+scan/flush consistency issue that can make a range or prefix scan miss committed
+data.
 
 ## Scope
 
-- Public `Db::open` and `Db::open_sync` inputs.
-- `DbOptions` constructors used by docs and examples.
-- README, usage guide, durability notes, changelog, examples, tests, and
-  benchmark call sites affected by open API naming.
-- No storage-format, WAL, manifest, compaction, MVCC, recovery, or transaction
-  semantic changes.
+- LSM scan source capture order across active memtable, immutable memtables,
+  delta mirrors, range tombstones, and the current table version.
+- Commit failure semantics after WAL accept or partial publication, if review
+  confirms a code path with unclear visible-sequence outcome.
+- Checksum strength for WAL/table/blob formats, limited to changes that are
+  either storage-compatible or explicitly recorded as a storage-format decision.
+- Public API boundary cleanup, limited to hiding internals that are not meant to
+  define the release contract.
 
 ## Out Of Scope
 
-- Removing host-specific `DbOptions::wasi_persistent` or
-  `DbOptions::browser_persistent`.
-- Changing durability guarantees beyond the existing safety-first native
-  persistent default.
-- Publishing, tagging, or changing crate version metadata.
+- Replacing the LSM MVCC engine design.
+- Depending on another storage engine.
+- Release publishing, tagging, or crate version metadata changes.
+- Browser persistence fixture automation unless it becomes necessary to verify
+  this phase.
 
 ## Acceptance Gate
 
-- `Db::open(path).await?` and `Db::open_sync(path)?` open persistent databases.
-- `Db::open(DbOptions::memory()).await?` and
-  `Db::open_sync(DbOptions::memory())?` are the explicit in-memory path.
-- Configured persistent opens use `DbOptions::new(path)`.
-- Mode-specific public open helpers are no longer part of the primary API.
-- README, usage docs, examples, tests, and benchmarks compile against the
-  path-first open API.
+- Scan snapshots cannot miss committed records when a flush publishes an L0
+  table before removing the flushed immutable memtable.
+- Focused regression coverage demonstrates the scan/flush ordering.
+- Any commit failure path touched in this phase has a clear caller-visible
+  result and does not leave the visible sequence stuck silently.
+- Checksum and public API changes are either landed with focused verification or
+  recorded as deferred decisions with a reason.
+- `cargo fmt --check`, focused tests, and `git diff --check` pass.
 
 ## Active Task Slice
 
 ```text
-task554 [x] goal:make open path-first persistent by default | scope:src/db.rs src/options.rs src/lib.rs | verify:cargo check --all-targets --all-features
-task555 [x] goal:update docs/examples/tests/benches for path-first open | scope:README.md docs examples tests benches CHANGELOG.md .phrase | verify:cargo fmt --check; cargo clippy --all-targets --all-features -- -D warnings; cargo test --all-targets --all-features; example gate
+task556 [x] goal:fix scan snapshot ordering across flush publish/removal | scope:src/lsm/scan.rs tests | verify:focused scan/flush test
+task557 [x] goal:classify and harden commit failure outcome | scope:src/db/commit.rs | verify:focused failure-path test
+task558 [x] goal:classify checksum and public API boundary hardening | scope:src/{wal,table,blob,lib}.rs .phrase | verify:CRC test plus full release-facing tests
 ```
 
 ## Known Residuals
 
-- `DbOptions::default()` remains an in-memory options value because a persistent
-  default requires a caller-provided path. Public docs use path input or
-  `DbOptions::new(path)` for ordinary persistent databases.
-- Host persistence remains selected through explicit WASI/browser options.
+- Format-check modules `blob`, `codec`, `manifest`, `table`, and `wal` remain
+  publicly reachable but hidden from generated docs because integration tests
+  currently use them to inspect durable files. Fully private format helpers
+  need a later test-boundary migration.
 
 ## Evidence
 
-- `cargo check --all-targets --all-features` passes after `Db::open` and
-  `Db::open_sync` accept path inputs.
-- `cargo fmt --check` and
-  `cargo clippy --all-targets --all-features -- -D warnings` pass.
-- `cargo test --test scaffold` passes with a path-open persistent smoke test.
-- `cargo test --all-targets --all-features` passes.
-- `cargo run --example quickstart`, `sync_quickstart`, `user_store`, and
-  `event_index` pass.
-- `cargo check --target wasm32-unknown-unknown --lib` and
-  `cargo check --target wasm32-wasip1 --lib` pass.
-- `cargo package --list --allow-dirty` and `git diff --check` pass.
-- Public docs/examples no longer use `open_persistent`, `open_memory`, or
-  `Db::memory` as the first-use open path.
+- `.phrase/evidence.md` records the scan/flush snapshot-ordering review.
+- `cargo test scan_snapshot --lib`, the partial commit failure regression, and
+  the CRC-32C check value test pass.
+- `cargo clippy --all-targets --all-features -- -D warnings`,
+  `cargo test --all-targets --all-features`, `cargo fmt --check`,
+  `cargo check --all-targets --all-features`, and `git diff --check` pass.
 
 ## Next Recommendation
 
-- Commit this API DX follow-up if the release-candidate scope looks right.
+- Keep the format-helper modules hidden from docs for this release candidate,
+  then migrate durable-file inspection helpers behind a dedicated internal test
+  boundary in a later phase if the public API needs to be made stricter.
