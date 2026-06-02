@@ -884,7 +884,42 @@ impl Drop for Db {
 }
 
 impl Db {
-    /// Opens a database synchronously from path-like input or explicit options.
+    /// Opens a database synchronously.
+    ///
+    /// The `options` argument accepts either [`DbOptions`] or any path-like
+    /// value such as `&str`, `Path`, or `PathBuf`. Path-like input is converted
+    /// with [`DbOptions::new`], so it opens a persistent native-filesystem
+    /// database and creates it when missing. Use [`DbOptions::memory`] for a
+    /// temporary in-memory database.
+    ///
+    /// Opening performs startup recovery checks before returning. Persistent
+    /// opens acquire the writer lease when the selected backend supports it,
+    /// load the current manifest, replay accepted WAL records, and rebuild the
+    /// in-memory bucket state. Browser persistence is only available through
+    /// the async [`Db::open`] path on browser WASM targets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidOptions`] for invalid paths or option
+    /// combinations, [`Error::UnsupportedBackend`] when the selected host
+    /// backend is unavailable on this target, [`Error::Corruption`] when
+    /// recovery detects unsafe durable state, or [`Error::Io`] for storage
+    /// failures.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use trine_kv::{Db, DbOptions};
+    ///
+    /// # fn main() -> trine_kv::Result<()> {
+    /// let persistent = Db::open_sync("target/doc-example-open-sync")?;
+    /// persistent.put_sync(b"k", b"v")?;
+    ///
+    /// let memory = Db::open_sync(DbOptions::memory())?;
+    /// memory.put_sync(b"session", b"only in memory")?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn open_sync(options: impl IntoOpenOptions) -> Result<Self> {
         let options = options.into_open_options();
         match &options.storage_mode {
@@ -1625,12 +1660,39 @@ impl Db {
     }
 
     /// Reads the newest committed value for `key` from the default bucket.
+    ///
+    /// The `key` parameter is compared as raw bytes. The returned value is an
+    /// owned `Vec<u8>` so callers can keep it after the database handle or
+    /// iterator state changes. `Ok(None)` means no visible value exists at the
+    /// newest committed sequence, either because the key was never written or
+    /// because the newest visible record is a delete.
+    ///
+    /// This method searches the active memtable, immutable memtables, and table
+    /// files in newest-to-oldest MVCC order. Large values stored in blob files
+    /// are read before the method returns.
+    ///
+    /// # Parameters
+    ///
+    /// - `key`: user key bytes in the built-in default bucket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`] if the handle is closed, plus storage or
+    /// format errors encountered while reading tables or blob files.
     pub fn get_sync(&self, key: &[u8]) -> Result<Option<Value>> {
         self.get_at_sequence(DEFAULT_BUCKET_NAME, key, self.last_committed_sequence())
     }
 
-    /// Reads `key` from the default bucket at the sequence pinned by
-    /// `snapshot`.
+    /// Reads `key` from the default bucket at the sequence pinned by `snapshot`.
+    ///
+    /// This is the repeatable-read form of [`Db::get_sync`]. Later commits do
+    /// not affect the result because visibility is capped at
+    /// `snapshot.read_sequence()`.
+    ///
+    /// # Parameters
+    ///
+    /// - `snapshot`: snapshot whose sequence defines read visibility.
+    /// - `key`: user key bytes in the built-in default bucket.
     pub fn get_at_sync(&self, snapshot: &Snapshot, key: &[u8]) -> Result<Option<Value>> {
         self.get_at_with_pin_state(
             DEFAULT_BUCKET_NAME,
@@ -1640,15 +1702,45 @@ impl Db {
         )
     }
 
-    /// Writes one key/value pair to the default bucket using default write
-    /// options.
+    /// Writes one key/value pair to the default bucket using default write options.
+    ///
+    /// The write is assigned the next commit sequence, appended to the WAL for
+    /// persistent databases, inserted into the active memtable, and then made
+    /// visible to future reads. The method returns after the configured default
+    /// durability has been requested.
+    ///
+    /// # Parameters
+    ///
+    /// - `key`: user key bytes. Empty keys are allowed unless the bucket
+    ///   options reject them.
+    /// - `value`: value bytes to store. Values at or above the bucket's blob
+    ///   threshold may be written to blob files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ReadOnly`] for read-only handles, [`Error::Closed`] for
+    /// closed handles, [`Error::InvalidOptions`] for invalid key/options, or
+    /// storage errors from WAL/blob writes.
     pub fn put_sync(&self, key: impl Into<Vec<u8>>, value: impl Into<Value>) -> Result<()> {
         self.put_with_options_sync(key, value, WriteOptions::default())
             .map(|_| ())
     }
 
-    /// Writes one key/value pair to the default bucket and returns commit
-    /// information.
+    /// Writes one key/value pair to the default bucket and returns commit information.
+    ///
+    /// This is the explicit-options form of [`Db::put_sync`]. Use it when a
+    /// specific write needs a different durability level than the database
+    /// default.
+    ///
+    /// # Parameters
+    ///
+    /// - `key`: user key bytes.
+    /// - `value`: value bytes to store.
+    /// - `options`: per-write durability options.
+    ///
+    /// # Returns
+    ///
+    /// Returns [`CommitInfo`] containing the sequence assigned to this commit.
     pub fn put_with_options_sync(
         &self,
         key: impl Into<Vec<u8>>,
@@ -1660,8 +1752,11 @@ impl Db {
         self.write_sync(batch, options)
     }
 
-    /// Adds a point delete for one default-bucket key using default write
-    /// options.
+    /// Adds a point delete for one default-bucket key using default write options.
+    ///
+    /// A point delete creates a new committed record that hides older values for
+    /// the same key at later read sequences. Existing snapshots may still see an
+    /// older value if their read sequence is before the delete.
     pub fn delete_sync(&self, key: impl Into<Vec<u8>>) -> Result<()> {
         self.delete_with_options_sync(key, WriteOptions::default())
             .map(|_| ())
@@ -1680,6 +1775,15 @@ impl Db {
     }
 
     /// Adds a range delete to the default bucket using default write options.
+    ///
+    /// A range delete hides keys in `range` for later read sequences. It is
+    /// committed atomically like a point write and participates in transaction
+    /// conflict checks. Existing snapshots can continue to see earlier values.
+    ///
+    /// # Parameters
+    ///
+    /// - `range`: user-key range to hide. Bounds follow `std::ops::Bound`
+    ///   semantics through [`KeyRange`].
     pub fn delete_range_sync(&self, range: KeyRange) -> Result<()> {
         self.delete_range_with_options_sync(range, WriteOptions::default())
             .map(|_| ())
@@ -1698,6 +1802,19 @@ impl Db {
     }
 
     /// Returns a forward iterator over default-bucket rows in `range`.
+    ///
+    /// The iterator yields owned [`crate::KeyValue`] rows in ascending byte
+    /// order. Each row is the newest value visible at the sequence captured
+    /// when the iterator is created. Point deletes and covering range deletes
+    /// are skipped.
+    ///
+    /// The returned iterator may read table blocks and blob files as iteration
+    /// advances. Use [`Db::range_lazy_sync`] when callers want keys first and
+    /// large values only on demand.
+    ///
+    /// # Parameters
+    ///
+    /// - `range`: user-key range to scan.
     pub fn range_sync(&self, range: &KeyRange) -> Result<Iter> {
         self.range_at_sequence(
             DEFAULT_BUCKET_NAME,
@@ -1707,8 +1824,13 @@ impl Db {
         )
     }
 
-    /// Returns a forward default-bucket iterator whose blob values are read on
-    /// demand.
+    /// Returns a forward default-bucket iterator whose blob values are read on demand.
+    ///
+    /// This has the same visibility and ordering rules as [`Db::range_sync`],
+    /// but yields [`crate::LazyKeyValue`] rows. Inline values are already
+    /// available; blob-backed values are read only when
+    /// [`crate::LazyValue::read_sync`] or [`crate::LazyValue::into_value_sync`]
+    /// is called.
     pub fn range_lazy_sync(&self, range: &KeyRange) -> Result<LazyIter> {
         self.range_lazy_at_sequence(
             DEFAULT_BUCKET_NAME,
@@ -1783,8 +1905,15 @@ impl Db {
         )
     }
 
-    /// Returns a forward iterator over default-bucket rows whose keys begin
-    /// with `prefix`.
+    /// Returns a forward iterator over default-bucket rows whose keys begin with `prefix`.
+    ///
+    /// Prefix scans use raw byte-prefix matching over user keys. The bucket's
+    /// configured [`crate::PrefixExtractor`] may let Trine skip table or block
+    /// reads, but it does not change which keys are returned.
+    ///
+    /// # Parameters
+    ///
+    /// - `prefix`: byte prefix that returned keys must start with.
     pub fn prefix_sync(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
         let prefix = prefix.into();
         self.prefix_at_sequence(
@@ -1890,6 +2019,27 @@ impl Db {
     }
 
     /// Persists pending WAL bytes according to `mode`.
+    ///
+    /// This function does not flush memtables into table files. It asks the WAL
+    /// storage backend to push already accepted WAL bytes to the durability
+    /// level represented by `mode`. In-memory databases have no durable WAL, so
+    /// this is a no-op.
+    ///
+    /// Use this when writes were committed with a weaker durability mode and
+    /// the application later reaches a checkpoint where those commits should be
+    /// made stronger. Backends may reject durability modes that they cannot
+    /// honestly provide.
+    ///
+    /// # Parameters
+    ///
+    /// - `mode`: durability level to request for pending WAL bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`] if the database is closed,
+    /// [`Error::UnsupportedDurability`] if the backend cannot provide `mode`,
+    /// [`Error::UnsupportedBackend`] for unsupported host backends, or
+    /// [`Error::Io`] for storage failures.
     pub fn persist_sync(&self, mode: DurabilityMode) -> Result<()> {
         self.ensure_open()?;
 
@@ -1970,6 +2120,23 @@ impl Db {
     }
 
     /// Flushes committed memtable data to persistent table files.
+    ///
+    /// Flush freezes the currently committed in-memory data up to a stable
+    /// sequence, writes immutable memtables to level-0 table files, publishes
+    /// the updated manifest, and then removes flushed immutable memtables from
+    /// the read path. Readers keep seeing a consistent snapshot while this
+    /// happens.
+    ///
+    /// In-memory databases have no table files, so this returns successfully
+    /// without doing storage work. Read-only handles reject flush because it can
+    /// publish new durable metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ReadOnly`] for read-only handles, [`Error::Closed`] for
+    /// closed handles, [`Error::UnsupportedBackend`] when the selected backend
+    /// requires the async maintenance path, or storage/recovery errors from the
+    /// flush and manifest publish steps.
     pub fn flush_sync(&self) -> Result<()> {
         self.ensure_open()?;
         if self.inner.options.read_only {
@@ -2017,6 +2184,26 @@ impl Db {
     // Keep the public shape aligned with the accepted v1 protocol:
     // `Db::compact_range_sync(range) -> Result<()>`.
     /// Compacts table files that overlap `range`.
+    ///
+    /// Compaction rewrites overlapping table files into lower levels according
+    /// to the current bucket options, drops overwritten point versions and
+    /// covered range-deleted data that are no longer visible to active
+    /// snapshots, and publishes a new manifest. It does not change the
+    /// caller-visible result of reads; it changes the on-disk layout and future
+    /// read cost.
+    ///
+    /// # Parameters
+    ///
+    /// - `range`: user-key range whose overlapping table files should be
+    ///   considered for compaction. Use [`KeyRange::all`] to compact the whole
+    ///   keyspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ReadOnly`] for read-only handles, [`Error::Closed`] for
+    /// closed handles, [`Error::UnsupportedBackend`] when this target requires
+    /// async maintenance, or storage/format errors from reading, rewriting, or
+    /// publishing table metadata.
     #[allow(clippy::needless_pass_by_value)]
     pub fn compact_range_sync(&self, range: KeyRange) -> Result<()> {
         self.take_background_maintenance_error()?;
@@ -2024,6 +2211,17 @@ impl Db {
     }
 
     /// Compacts table files that overlap `range` within `budget`.
+    ///
+    /// This is the cooperative form of [`Db::compact_range_sync`]. It performs
+    /// only the amount of compaction admitted by `budget` and reports whether
+    /// more eligible work remains.
+    ///
+    /// # Parameters
+    ///
+    /// - `range`: user-key range whose overlapping table files should be
+    ///   considered.
+    /// - `budget`: maximum flush and compaction inputs to process during this
+    ///   call. Zero limits are treated as one by [`MaintenanceBudget::new`].
     #[allow(clippy::needless_pass_by_value)]
     pub fn compact_range_with_budget_sync(
         &self,
@@ -2079,6 +2277,21 @@ impl Db {
     }
 
     /// Runs cooperative flush and compaction work within `budget`.
+    ///
+    /// This method lets applications do foreground maintenance in small pieces.
+    /// It first tries flush work, then compaction work, and returns a
+    /// [`MaintenanceOutcome`] describing completed work, budget exhaustion, or
+    /// contention with another maintenance worker.
+    ///
+    /// # Parameters
+    ///
+    /// - `budget`: limits how many flush and compaction inputs this call may
+    ///   process.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same categories as [`Db::flush_sync`] and
+    /// [`Db::compact_range_sync`].
     pub fn run_maintenance_with_budget_sync(
         &self,
         budget: MaintenanceBudget,
@@ -2267,6 +2480,11 @@ impl Db {
     }
 
     /// Creates a snapshot at the newest visible committed sequence.
+    ///
+    /// Reads through the returned [`Snapshot`] see the database as of the
+    /// sequence captured here, even if later writes commit before those reads
+    /// run. The snapshot keeps old versions needed by its reads alive until all
+    /// clones are dropped.
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
         self.inner
@@ -2275,6 +2493,15 @@ impl Db {
     }
 
     /// Creates an optimistic transaction over the newest visible sequence.
+    ///
+    /// The transaction records point and range reads against this sequence and
+    /// stages writes in memory. Commit succeeds only if no later committed write
+    /// conflicts with the recorded read set.
+    ///
+    /// # Parameters
+    ///
+    /// - `options`: commit options used when the transaction writes are
+    ///   accepted.
     #[must_use]
     pub fn transaction(&self, options: TransactionOptions) -> Transaction {
         Transaction::new(self.clone(), self.last_committed_sequence(), options)
@@ -5153,7 +5380,30 @@ impl Db {
 /// `*_sync` adapters above.
 #[allow(clippy::unused_async)]
 impl Db {
-    /// Opens a database asynchronously from path-like input or explicit options.
+    /// Opens a database asynchronously.
+    ///
+    /// This has the same input conversion and recovery behavior as
+    /// [`Db::open_sync`], but persistent storage work is driven through the
+    /// configured runtime. On browser WASM targets this is the required entry
+    /// point for browser persistence.
+    ///
+    /// # Parameters
+    ///
+    /// - `options`: either [`DbOptions`] or a path-like value converted through
+    ///   [`DbOptions::new`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use trine_kv::{Db, DbOptions};
+    ///
+    /// async fn example() -> trine_kv::Result<()> {
+    ///     let db = Db::open(DbOptions::memory()).await?;
+    ///     db.put(b"k", b"v").await?;
+    ///     assert_eq!(db.get(b"k").await?, Some(b"v".to_vec()));
+    ///     Ok(())
+    /// }
+    /// ```
     pub async fn open(options: impl IntoOpenOptions) -> Result<Self> {
         let options = options.into_open_options();
         match &options.storage_mode {
@@ -5171,17 +5421,40 @@ impl Db {
     }
 
     /// Returns a handle for the built-in default bucket.
+    ///
+    /// Direct `Db` methods such as [`Db::put`] and [`Db::get`] use this bucket
+    /// internally. Use the handle when code wants to pass a bucket-bound API to
+    /// another component or create a [`crate::BucketReader`].
     pub async fn default_bucket(&self) -> Result<Bucket> {
         self.default_bucket_sync()
     }
 
     /// Returns an existing named bucket or creates it with default options.
+    ///
+    /// Bucket creation is durable for persistent databases: Trine publishes the
+    /// bucket metadata before returning the handle. If the bucket already
+    /// exists, the existing options are reused.
+    ///
+    /// # Parameters
+    ///
+    /// - `name`: non-empty bucket name. The reserved default bucket name must
+    ///   be accessed with [`Db::default_bucket`].
     pub async fn bucket(&self, name: impl Into<BucketName>) -> Result<Bucket> {
         self.bucket_with_options(name, BucketOptions::default())
             .await
     }
 
     /// Returns an existing named bucket or creates it with explicit options.
+    ///
+    /// Bucket options are fixed at creation. Calling this for an existing
+    /// bucket with different options returns [`Error::InvalidOptions`] instead
+    /// of silently changing the bucket's storage behavior.
+    ///
+    /// # Parameters
+    ///
+    /// - `name`: non-empty bucket name.
+    /// - `options`: compression, filter, prefix, blob, and block settings used
+    ///   if the bucket is created.
     pub async fn bucket_with_options(
         &self,
         name: impl Into<BucketName>,
@@ -5198,6 +5471,13 @@ impl Db {
     }
 
     /// Reads the newest committed value for `key` from the default bucket.
+    ///
+    /// This is the async form of [`Db::get_sync`]. It returns owned value bytes,
+    /// or `Ok(None)` when no value is visible at the newest committed sequence.
+    ///
+    /// # Parameters
+    ///
+    /// - `key`: user key bytes in the built-in default bucket.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Value>> {
         self.get_at_sequence_async(DEFAULT_BUCKET_NAME, key, self.last_committed_sequence())
             .await
@@ -5215,6 +5495,15 @@ impl Db {
     }
 
     /// Writes one key/value pair to the default bucket using default write options.
+    ///
+    /// This is the async form of [`Db::put_sync`]. The write is appended to the
+    /// WAL for persistent databases, added to the memtable, and made visible to
+    /// later reads once the commit sequence is published.
+    ///
+    /// # Parameters
+    ///
+    /// - `key`: user key bytes.
+    /// - `value`: value bytes to store.
     pub async fn put(&self, key: impl Into<Vec<u8>>, value: impl Into<Value>) -> Result<()> {
         self.put_with_options(key, value, WriteOptions::default())
             .await
@@ -5222,6 +5511,15 @@ impl Db {
     }
 
     /// Writes one key/value pair to the default bucket and returns commit information.
+    ///
+    /// This is the async explicit-options form of [`Db::put`]. Use it when one
+    /// write needs different durability than the database default.
+    ///
+    /// # Parameters
+    ///
+    /// - `key`: user key bytes.
+    /// - `value`: value bytes to store.
+    /// - `options`: per-write durability options.
     pub async fn put_with_options(
         &self,
         key: impl Into<Vec<u8>>,
@@ -5270,6 +5568,14 @@ impl Db {
     }
 
     /// Returns a forward iterator over default-bucket rows in `range`.
+    ///
+    /// This is the async form of [`Db::range_sync`]. The returned iterator is
+    /// positioned over the newest committed sequence captured when this method
+    /// runs.
+    ///
+    /// # Parameters
+    ///
+    /// - `range`: user-key range to scan.
     pub async fn range(&self, range: &KeyRange) -> Result<Iter> {
         self.range_at_sequence_async(
             DEFAULT_BUCKET_NAME,
@@ -5470,6 +5776,15 @@ impl Db {
     }
 
     /// Persists pending WAL bytes according to `mode`.
+    ///
+    /// This is the async form of [`Db::persist_sync`]. Native persistent
+    /// databases run blocking persistence work through the configured runtime;
+    /// browser persistent databases use the browser storage path on supported
+    /// targets.
+    ///
+    /// # Parameters
+    ///
+    /// - `mode`: durability level to request for pending WAL bytes.
     pub async fn persist(&self, mode: DurabilityMode) -> Result<()> {
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         if matches!(
@@ -5492,6 +5807,10 @@ impl Db {
     }
 
     /// Flushes committed memtable data to persistent table files.
+    ///
+    /// This is the async form of [`Db::flush_sync`]. It can be used by async
+    /// applications to force committed memtable data into table files without
+    /// blocking the caller's executor thread on native persistent storage.
     pub async fn flush(&self) -> Result<()> {
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         if self.inner.options.storage_mode.is_browser_persistent() {

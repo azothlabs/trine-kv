@@ -47,11 +47,31 @@ impl From<String> for BucketName {
     }
 }
 
-/// Handle for an optional named bucket.
+/// Handle for one bucket.
 ///
 /// A bucket has its own options, memtables, `SSTables`, filters, and compaction
 /// state. Most applications can use the direct `Db` helpers instead, which
 /// target the built-in default bucket.
+///
+/// Named buckets are created through [`Db::bucket_sync`], [`Db::bucket`],
+/// [`Db::bucket_with_options_sync`], or [`Db::bucket_with_options`]. A bucket's
+/// options are fixed when it is created; reopening it with different options is
+/// rejected.
+///
+/// # Examples
+///
+/// ```rust
+/// use trine_kv::Db;
+///
+/// # fn main() -> trine_kv::Result<()> {
+/// let db = Db::open_sync(trine_kv::DbOptions::memory())?;
+/// let users = db.bucket_sync("users")?;
+///
+/// users.put_sync(b"1", b"Ada")?;
+/// assert_eq!(users.get_sync(b"1")?, Some(b"Ada".to_vec()));
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone)]
 pub struct Bucket {
     db: Db,
@@ -104,6 +124,13 @@ impl Bucket {
     }
 
     /// Reads the newest committed value for `key` from this bucket.
+    ///
+    /// This is the bucket-scoped form of [`Db::get_sync`]. It searches only
+    /// this bucket's memtables and table files and returns owned value bytes.
+    ///
+    /// # Parameters
+    ///
+    /// - `key`: user key bytes inside this bucket.
     pub fn get_sync(&self, key: &[u8]) -> Result<Option<Value>> {
         self.db.get_at_state_with_pin_state(
             &self.state,
@@ -125,8 +152,18 @@ impl Bucket {
 
     /// Creates a point-read handle for repeated reads under `snapshot`.
     ///
-    /// Use `BucketReader::get` when the caller can inspect bytes through
-    /// `PointValue::as_bytes` and does not need an owned `Vec<u8>`.
+    /// The reader captures the read sequence and a stable set of sources once,
+    /// then reuses them for many point reads. That reduces repeated lock
+    /// traffic for workloads that read many keys under one snapshot.
+    ///
+    /// Use [`BucketReader::get_sync`] or [`BucketReader::get`] when the caller
+    /// can inspect bytes through [`PointValue::as_bytes`] and does not need an
+    /// owned `Vec<u8>`.
+    ///
+    /// # Parameters
+    ///
+    /// - `snapshot`: snapshot that defines visibility for all reads made
+    ///   through the returned reader.
     pub fn reader<'snapshot>(
         &self,
         snapshot: &'snapshot Snapshot,
@@ -135,6 +172,15 @@ impl Bucket {
     }
 
     /// Writes one key/value pair to this bucket using default write options.
+    ///
+    /// The write is committed through the parent database as a one-operation
+    /// batch. Named bucket writes use the bucket name in WAL and manifest
+    /// metadata; default bucket writes use the built-in default bucket name.
+    ///
+    /// # Parameters
+    ///
+    /// - `key`: user key bytes in this bucket.
+    /// - `value`: value bytes to store.
     pub fn put_sync(&self, key: impl Into<Vec<u8>>, value: impl Into<Value>) -> Result<()> {
         self.put_with_options_sync(key, value, WriteOptions::default())
             .map(|_| ())
@@ -199,6 +245,14 @@ impl Bucket {
     }
 
     /// Returns a forward iterator over visible rows in `range`.
+    ///
+    /// This is the bucket-scoped form of [`Db::range_sync`]. Rows are returned
+    /// in ascending byte order and filtered to the newest value visible at the
+    /// sequence captured when the iterator is created.
+    ///
+    /// # Parameters
+    ///
+    /// - `range`: user-key range inside this bucket.
     pub fn range_sync(&self, range: &KeyRange) -> Result<Iter> {
         self.range_at_sequence(range, self.db.last_committed_sequence(), Direction::Forward)
     }

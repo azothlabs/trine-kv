@@ -37,6 +37,12 @@ Record only evidence that can change planning or durable decisions.
   have Rust documentation comments.
 - The crate root now enables `#![warn(missing_docs)]`, making missing public
   documentation visible during rustdoc builds.
+- Follow-up review found that passing the coverage gate was not enough for
+  strong user documentation. Core docs now include runnable examples plus
+  purpose, parameter, behavior, return, error, durability, snapshot, batch, and
+  transaction-conflict explanations for the primary user paths.
+- `AGENTS.md` and `.phrase/decision.md` now require public Rustdoc to be
+  written as user documentation, not as lint filler.
 
 ### Interpretation
 
@@ -44,14 +50,24 @@ Record only evidence that can change planning or durable decisions.
   missed comments.
 - The gap is now covered for the current public API surface without changing
   storage behavior or public function signatures.
+- The first pass solved rustdoc coverage but under-served users. The improved
+  docs are closer to an API guide for the core open/read/write/scan/batch/
+  transaction/options paths.
+- Future Rust API changes now have an explicit workflow constraint requiring
+  purpose, parameter, return, error, behavior, adjacent-API, and doctest
+  consideration before documentation work can be considered complete.
 
 ### Verification
 
 - `cargo rustdoc --all-features -- -D missing-docs` passed.
+- `cargo rustdoc --all-features -- -D warnings` passed.
+- `cargo test --doc --all-features` passed with 8 doctests.
 - `cargo fmt --check` passed.
 - `cargo check --all-targets --all-features` passed.
 - `cargo clippy --all-targets --all-features -- -D warnings` passed.
 - `git diff --check` passed.
+- `git diff --check` passed after adding the durable documentation-quality
+  constraint.
 
 ### Recommended Next Action
 

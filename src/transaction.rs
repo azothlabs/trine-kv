@@ -8,6 +8,10 @@ use crate::{
 };
 
 /// Options used by optimistic transactions.
+///
+/// The options are copied into the transaction when it is created. Changing a
+/// separate `TransactionOptions` value later does not affect an existing
+/// transaction.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TransactionOptions {
     /// Write options used when the transaction commits.
@@ -18,6 +22,32 @@ pub struct TransactionOptions {
 ///
 /// Methods without a bucket suffix read or write the built-in default bucket.
 /// Methods ending in `_bucket` operate on optional named buckets.
+///
+/// Reads are performed at the transaction's `read_sequence` and recorded in a
+/// read set. Writes are staged in memory through a [`WriteBatch`]. Commit checks
+/// whether any later committed point write, point delete, or range delete
+/// conflicts with the recorded reads; if so, commit returns
+/// [`crate::Error::Conflict`] and none of the staged writes are accepted.
+///
+/// # Examples
+///
+/// ```rust
+/// use trine_kv::{Db, TransactionOptions};
+///
+/// # fn main() -> trine_kv::Result<()> {
+/// let db = Db::open_sync(trine_kv::DbOptions::memory())?;
+/// db.put_sync(b"counter", b"0")?;
+///
+/// let mut tx = db.transaction(TransactionOptions::default());
+/// let current = tx.get_sync(b"counter")?;
+/// assert_eq!(current, Some(b"0".to_vec()));
+///
+/// tx.put(b"counter", b"1");
+/// let commit = tx.commit_sync()?;
+/// assert!(commit.sequence().get() > 0);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone)]
 pub struct Transaction {
     db: Db,
@@ -60,6 +90,9 @@ impl Transaction {
     }
 
     /// Returns the sequence used by this transaction's read snapshot.
+    ///
+    /// All transaction reads use this sequence, even if newer writes commit
+    /// before the transaction commits.
     #[must_use]
     pub const fn read_sequence(&self) -> Sequence {
         self.read_sequence
@@ -72,11 +105,24 @@ impl Transaction {
     }
 
     /// Reads a default-bucket key and tracks it for commit conflict checks.
+    ///
+    /// # Parameters
+    ///
+    /// - `key`: user key bytes in the built-in default bucket.
+    ///
+    /// The exact key is added to the read set after the read succeeds. Commit
+    /// fails if a later committed write or delete touches the key, or if a later
+    /// range delete covers it.
     pub fn get_sync(&mut self, key: &[u8]) -> Result<Option<Value>> {
         self.get_bucket_sync(DEFAULT_BUCKET_NAME, key)
     }
 
     /// Reads a named-bucket key and tracks it for commit conflict checks.
+    ///
+    /// # Parameters
+    ///
+    /// - `bucket`: target named bucket.
+    /// - `key`: user key bytes.
     pub fn get_bucket_sync(
         &mut self,
         bucket: impl Into<String>,
@@ -96,6 +142,13 @@ impl Transaction {
     }
 
     /// Reads a default-bucket range and tracks it for commit conflict checks.
+    ///
+    /// The range cursor is fully consumed before the range is accepted into the
+    /// read set. That means table or blob read errors are returned immediately
+    /// instead of being deferred until commit.
+    ///
+    /// Commit fails if a later committed point mutation falls inside the range
+    /// or if a later range delete overlaps it.
     pub fn read_range_sync(&mut self, range: KeyRange) -> Result<()> {
         self.read_range_bucket_sync(DEFAULT_BUCKET_NAME, range)
     }
@@ -128,6 +181,9 @@ impl Transaction {
     }
 
     /// Stages one key/value write for the default bucket.
+    ///
+    /// Staging only mutates the in-memory transaction batch. The write is not
+    /// visible and does not reserve a commit sequence until commit succeeds.
     pub fn put(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Value>) {
         self.writes.put(key, value);
     }
@@ -171,6 +227,21 @@ impl Transaction {
     }
 
     /// Commits the staged writes synchronously after conflict checks.
+    ///
+    /// Commit consumes the transaction. If conflict validation succeeds, Trine
+    /// commits all staged writes as one atomic batch using
+    /// `self.options().write_options`. If validation fails, the staged writes
+    /// are not accepted.
+    ///
+    /// # Returns
+    ///
+    /// Returns [`CommitInfo`] with the assigned commit sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::Conflict`] if the read set was invalidated, or
+    /// the same write errors as [`crate::Db::write_sync`] for storage,
+    /// durability, or closed/read-only handle failures.
     pub fn commit_sync(self) -> Result<CommitInfo> {
         let read_set = TransactionReadSet {
             point_reads: self.point_reads,

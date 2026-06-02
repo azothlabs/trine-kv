@@ -29,6 +29,10 @@ Evidence notes should separate:
 - Do not maintain mechanical per-file changelogs when the git diff is enough.
 - Write comments for non-obvious Rust engine invariants, especially lock order,
   MVCC visibility, batch atomicity, and storage-format assumptions.
+- Treat public Rustdoc as user documentation, not lint filler. Public API docs
+  must explain purpose, parameters, return semantics, errors, user-observable
+  behavior, adjacent API differences, and doctest examples for core or easily
+  misused entry points.
 - Prefer concrete storage-engine language in explanations and comments.
 - For platform I/O and storage backend work, Trine's own boundary must be the
   design subject. External crates, OS APIs, and libraries are implementation
@@ -97,5 +101,7 @@ A phase can close only when:
 - Static spec/plan/task/change bookkeeping for every session.
 - Treating stale plans as current truth after fresh evidence contradicts them.
 - Abstract jargon when plain engine terminology is clearer.
+- Rustdoc comments that merely silence `missing_docs` without teaching users
+  how to understand or call the API.
 - Letting an external backend crate become the architecture boundary instead
   of Trine's `io` and storage contracts.

@@ -17,6 +17,39 @@
 4. 如果实现过程中问题类型变化，必须补读新的 skill，并更新 receipt。
 5. 没有 Rust Skill Receipt，不得修改 Rust 代码。
 
+## Rust 文档注释质量门
+
+Rust 公共 API 文档不是“补几句注释”或“消除 `missing_docs` warning”。
+Rust 的 `///` 和 `//!` 会生成用户文档，因此写文档必须按用户文档标准执行。
+
+任何新增或修改公开 Rust API 的任务，必须同时检查是否需要更新
+Rustdoc。需要更新时，文档注释至少覆盖：
+
+- 函数、类型、字段或参数的作用。
+- 参数含义、单位、有效范围和特殊值。
+- 返回值语义，尤其是 `Option`、迭代器、快照、commit sequence 等。
+- 主要错误条件和调用者应如何理解这些错误。
+- 函数运作方式：例如 WAL、memtable、snapshot、transaction conflict、
+  durability、flush、compaction、range delete、blob lazy read 等用户可观察行为。
+- 与相邻 API 的区别：sync/async、default bucket/named bucket、
+  eager/lazy iterator、default options/explicit options。
+- 对核心入口和容易误用的 API，提供可编译 doctest 示例。
+
+禁止只为了通过 lint 写空泛短句。以下做法不合格：
+
+- 只把函数名改写成一句英文。
+- 只写“Returns ...”但不说明返回值何时为空、何时错误、何时可见。
+- 对参数不说明范围、单位、bucket、snapshot、durability 或持久化含义。
+- 对复杂 API 不说明运行方式或用户可观察边界。
+
+文档质量验证要求：
+
+- 至少运行 `cargo rustdoc --all-features -- -D warnings`。
+- 有 doctest 示例时运行 `cargo test --doc --all-features`。
+- 对只涉及文档注释的改动，也要运行 `cargo fmt --check` 和
+  `git diff --check`。
+- 如果只补了 coverage 但没有达到用户文档标准，不能声称文档任务完成。
+
 # SPEC-AGENTS v3：证据校准的 Agent 工作流
 
 在处理任何请求之前，先识别用户意图，然后按最轻可行协议执行。

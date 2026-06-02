@@ -186,6 +186,30 @@ pub enum FailOnCorruptionPolicy {
 }
 
 /// Options used when opening a database.
+///
+/// `DbOptions` controls where data is stored, whether missing storage is
+/// created, the default write durability, bucket defaults, runtime behavior,
+/// maintenance thresholds, and startup recovery policy. Path-like calls to
+/// [`crate::Db::open`] and [`crate::Db::open_sync`] are converted with
+/// [`DbOptions::new`], which selects persistent native filesystem storage.
+///
+/// # Examples
+///
+/// ```rust
+/// use trine_kv::{Db, DbOptions, DurabilityMode};
+///
+/// # fn main() -> trine_kv::Result<()> {
+/// let persistent = Db::open_sync(
+///     DbOptions::new("target/doc-example-options")
+///         .with_durability(DurabilityMode::SyncAll),
+/// )?;
+///
+/// let memory = Db::open_sync(DbOptions::memory())?;
+/// assert_eq!(persistent.options().read_only, false);
+/// assert_eq!(memory.options().read_only, false);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DbOptions {
     /// Storage location and host backend.
@@ -235,18 +259,33 @@ impl DbOptions {
     pub const DEFAULT_BLOB_GC_MIN_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
     /// Creates persistent database options for `path`.
+    ///
+    /// This is the path-first constructor used by `Db::open(path)` and
+    /// `Db::open_sync(path)`. It selects [`StorageMode::Persistent`], sets
+    /// safety-first default durability for confirmed writes, and leaves
+    /// `create_if_missing` enabled.
+    ///
+    /// # Parameters
+    ///
+    /// - `path`: native filesystem database directory.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self::persistent(path)
     }
 
     /// Creates in-memory database options.
+    ///
+    /// In-memory databases keep memtables, tables, metadata, and WAL state only
+    /// in process memory. Closing the handle drops all data. This is useful for
+    /// tests, temporary indexes, and caches that can be rebuilt.
     #[must_use]
     pub fn memory() -> Self {
         Self::default()
     }
 
     /// Creates persistent native-filesystem options for `path`.
+    ///
+    /// This is equivalent to [`DbOptions::new`].
     #[must_use]
     pub fn persistent(path: impl Into<PathBuf>) -> Self {
         Self {
@@ -303,6 +342,10 @@ impl DbOptions {
     }
 
     /// Sets the default durability for writes that do not pass `WriteOptions`.
+    ///
+    /// This affects helpers such as [`crate::Db::put_sync`] and
+    /// [`crate::Db::put`]. Calls that pass [`WriteOptions`] use their explicit
+    /// durability instead.
     #[must_use]
     pub const fn with_durability(mut self, durability: DurabilityMode) -> Self {
         self.durability = durability;
@@ -319,6 +362,9 @@ impl DbOptions {
     }
 
     /// Marks these options read-only and disables creation of missing storage.
+    ///
+    /// Read-only handles can read existing persistent data, but reject writes,
+    /// flushes, compactions, and repairs that would mutate storage.
     #[must_use]
     pub const fn read_only(mut self) -> Self {
         self.read_only = true;
@@ -485,6 +531,24 @@ impl Default for BucketOptions {
 }
 
 /// Per-write options passed to commit operations.
+///
+/// `WriteOptions` lets a single write or batch request a durability level
+/// different from the database default. The options are evaluated when the
+/// write is accepted; changing a `WriteOptions` value later has no effect on an
+/// already committed write.
+///
+/// # Examples
+///
+/// ```rust
+/// use trine_kv::{Db, WriteOptions};
+///
+/// # fn main() -> trine_kv::Result<()> {
+/// let db = Db::open_sync(trine_kv::DbOptions::memory())?;
+/// let commit = db.put_with_options_sync(b"k", b"v", WriteOptions::sync_all())?;
+/// assert!(commit.sequence().get() > 0);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WriteOptions {
     /// Durability requested for this write.
@@ -493,30 +557,47 @@ pub struct WriteOptions {
 
 impl WriteOptions {
     /// Creates write options with an explicit durability mode.
+    ///
+    /// # Parameters
+    ///
+    /// - `durability`: durability requested for the write or batch.
     #[must_use]
     pub const fn new(durability: DurabilityMode) -> Self {
         Self { durability }
     }
 
     /// Creates buffered write options.
+    ///
+    /// The write may return after bytes are accepted by the storage backend but
+    /// before a flush or sync is requested. This is the lowest-latency and
+    /// weakest durability mode.
     #[must_use]
     pub const fn buffered() -> Self {
         Self::new(DurabilityMode::Buffered)
     }
 
     /// Creates flush write options.
+    ///
+    /// The write requests a backend flush for accepted WAL bytes. Exact meaning
+    /// depends on the selected backend capabilities.
     #[must_use]
     pub const fn flush() -> Self {
         Self::new(DurabilityMode::Flush)
     }
 
     /// Creates data-sync write options.
+    ///
+    /// The write requests durable file data without requiring metadata sync
+    /// where the backend can distinguish those operations.
     #[must_use]
     pub const fn sync_data() -> Self {
         Self::new(DurabilityMode::SyncData)
     }
 
     /// Creates full-sync write options.
+    ///
+    /// The write requests the strongest durability mode supported by the
+    /// backend for WAL data and required metadata.
     #[must_use]
     pub const fn sync_all() -> Self {
         Self::new(DurabilityMode::SyncAll)

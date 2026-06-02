@@ -1,10 +1,48 @@
 //! Trine KV is an embedded LSM MVCC key-value database.
 //!
-//! The v1 API exposes a built-in default bucket for direct `Db` reads and
-//! writes, optional named buckets, atomic write batches, snapshots, optimistic
-//! transactions, range/prefix iteration, WAL recovery, `SSTable`
-//! flush/compaction, async-first host-storage entry points, explicit sync
-//! adapters, and live stats.
+//! Use Trine KV when an application needs a local key/value store with
+//! persistent storage, atomic batches, snapshots, range scans, prefix scans,
+//! and optimistic transactions. The primary API is async-first; synchronous
+//! callers use the explicit `*_sync` adapters.
+//!
+//! # Quick start
+//!
+//! `Db::open` and `Db::open_sync` are path-first. Passing a path opens a
+//! persistent database. Use `DbOptions::memory()` when the database should live
+//! only in memory.
+//!
+//! ```rust
+//! use trine_kv::Db;
+//!
+//! # fn main() -> trine_kv::Result<()> {
+//! let db = Db::open_sync("target/doc-example-basic")?;
+//! db.put_sync(b"user:1", b"Ada")?;
+//!
+//! let value = db.get_sync(b"user:1")?;
+//! assert_eq!(value, Some(b"Ada".to_vec()));
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Core concepts
+//!
+//! - [`Db`] is the database handle. Direct `Db` read and write methods operate
+//!   on the built-in default bucket.
+//! - [`Bucket`] is a handle for an optional named bucket with its own options,
+//!   memtables, tables, filters, and compaction state.
+//! - [`WriteBatch`] groups puts, point deletes, and range deletes into one
+//!   atomic commit.
+//! - [`Snapshot`] pins a committed sequence so repeated reads see a stable view
+//!   while newer writes continue.
+//! - [`Transaction`] records reads and stages writes, then rejects commit if a
+//!   later committed write conflicts with the read set.
+//!
+//! # Durability
+//!
+//! Persistent databases default to safety-first durability for confirmed
+//! writes. Lower durability modes such as [`DurabilityMode::Buffered`] are
+//! available through [`WriteOptions`] for data that can tolerate losing recent
+//! confirmed writes after a crash.
 
 #![warn(missing_docs)]
 #![allow(clippy::missing_errors_doc, clippy::module_name_repetitions)]
