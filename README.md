@@ -5,7 +5,7 @@ ordered local storage without running a separate server. It gives simple code a
 default bucket, and lets larger applications add named buckets with their own
 prefix, filter, compression, and large-value settings.
 
-The v1 engine is implemented and verified by the repository test suite,
+The `v0.1.0` crate is implemented and verified by the repository test suite,
 benchmark harness, and durability notes. To see the main path work end to end:
 
 ```text
@@ -57,8 +57,7 @@ Release packaging notes live in [docs/release.md](docs/release.md).
 
 ## Install
 
-Published releases use Semantic Versioning. The first packaged release
-candidate is `0.1.0`:
+Published releases use Semantic Versioning. The current release is `v0.1.0`:
 
 ```toml
 [dependencies]
@@ -161,7 +160,7 @@ cargo bench --bench v1_bench
 - [Usage guide](docs/usage.md)
 - [Durability notes](docs/durability.md)
 - [Release packaging](docs/release.md)
-- [V1 benchmark baseline](docs/benchmarks/v1-baseline.md)
+- [v0.1.0 benchmark baseline](docs/benchmarks/v1-baseline.md)
 - [Large-value direct read tuning](docs/benchmarks/v1-large-value-direct-read.md)
 - [Blob maintenance and lazy value benchmark](docs/benchmarks/v1-blob-level-merge-lazy-gc.md)
 
@@ -177,7 +176,7 @@ cargo bench --bench v1_bench
 - Browser persistence is async-only: use `Db::open` plus async mutation
   and maintenance methods. Synchronous browser persistent open, mutation, and
   maintenance `*_sync` APIs return typed unsupported errors.
-- Read-only open is for inspecting a stable directory state; v1 does not define
-  live multi-process reads against an active writer.
+- Read-only open is for inspecting a stable directory state; `v0.1.0` does not
+  define live multi-process reads against an active writer.
 - Repair is intentionally narrow and only removes known safe temporary files
   when explicitly requested.
