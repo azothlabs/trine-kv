@@ -96,44 +96,96 @@ impl Snapshot {
         self.pin.is_some()
     }
 
-    pub fn get(&self, bucket: &Bucket, key: &[u8]) -> Result<Option<Value>> {
-        bucket.get_at(self, key)
+    pub fn get_sync(&self, bucket: &Bucket, key: &[u8]) -> Result<Option<Value>> {
+        bucket.get_at_sync(self, key)
     }
 
-    pub fn range(&self, bucket: &Bucket, range: &KeyRange) -> Result<Iter> {
-        bucket.range_at(self, range)
+    pub fn range_sync(&self, bucket: &Bucket, range: &KeyRange) -> Result<Iter> {
+        bucket.range_at_sync(self, range)
     }
 
-    pub fn range_lazy(&self, bucket: &Bucket, range: &KeyRange) -> Result<LazyIter> {
-        bucket.range_lazy_at(self, range)
+    pub fn range_lazy_sync(&self, bucket: &Bucket, range: &KeyRange) -> Result<LazyIter> {
+        bucket.range_lazy_at_sync(self, range)
     }
 
-    pub fn range_reverse(&self, bucket: &Bucket, range: &KeyRange) -> Result<Iter> {
-        bucket.range_reverse_at(self, range)
+    pub fn range_reverse_sync(&self, bucket: &Bucket, range: &KeyRange) -> Result<Iter> {
+        bucket.range_reverse_at_sync(self, range)
     }
 
-    pub fn range_lazy_reverse(&self, bucket: &Bucket, range: &KeyRange) -> Result<LazyIter> {
-        bucket.range_lazy_reverse_at(self, range)
+    pub fn range_lazy_reverse_sync(&self, bucket: &Bucket, range: &KeyRange) -> Result<LazyIter> {
+        bucket.range_lazy_reverse_at_sync(self, range)
     }
 
-    pub fn prefix(&self, bucket: &Bucket, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
-        bucket.prefix_at(self, prefix)
+    pub fn prefix_sync(&self, bucket: &Bucket, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
+        bucket.prefix_at_sync(self, prefix)
     }
 
-    pub fn prefix_lazy(&self, bucket: &Bucket, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
-        bucket.prefix_lazy_at(self, prefix)
-    }
-
-    pub fn prefix_reverse(&self, bucket: &Bucket, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
-        bucket.prefix_reverse_at(self, prefix)
-    }
-
-    pub fn prefix_lazy_reverse(
+    pub fn prefix_lazy_sync(
         &self,
         bucket: &Bucket,
         prefix: impl Into<Vec<u8>>,
     ) -> Result<LazyIter> {
-        bucket.prefix_lazy_reverse_at(self, prefix)
+        bucket.prefix_lazy_at_sync(self, prefix)
+    }
+
+    pub fn prefix_reverse_sync(&self, bucket: &Bucket, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
+        bucket.prefix_reverse_at_sync(self, prefix)
+    }
+
+    pub fn prefix_lazy_reverse_sync(
+        &self,
+        bucket: &Bucket,
+        prefix: impl Into<Vec<u8>>,
+    ) -> Result<LazyIter> {
+        bucket.prefix_lazy_reverse_at_sync(self, prefix)
+    }
+
+    pub async fn get(&self, bucket: &Bucket, key: &[u8]) -> Result<Option<Value>> {
+        bucket.get_at(self, key).await
+    }
+
+    pub async fn range(&self, bucket: &Bucket, range: &KeyRange) -> Result<Iter> {
+        bucket.range_at(self, range).await
+    }
+
+    pub async fn range_lazy(&self, bucket: &Bucket, range: &KeyRange) -> Result<LazyIter> {
+        bucket.range_lazy_at(self, range).await
+    }
+
+    pub async fn range_reverse(&self, bucket: &Bucket, range: &KeyRange) -> Result<Iter> {
+        bucket.range_reverse_at(self, range).await
+    }
+
+    pub async fn range_lazy_reverse(&self, bucket: &Bucket, range: &KeyRange) -> Result<LazyIter> {
+        bucket.range_lazy_reverse_at(self, range).await
+    }
+
+    pub async fn prefix(&self, bucket: &Bucket, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
+        bucket.prefix_at(self, prefix).await
+    }
+
+    pub async fn prefix_lazy(
+        &self,
+        bucket: &Bucket,
+        prefix: impl Into<Vec<u8>>,
+    ) -> Result<LazyIter> {
+        bucket.prefix_lazy_at(self, prefix).await
+    }
+
+    pub async fn prefix_reverse(
+        &self,
+        bucket: &Bucket,
+        prefix: impl Into<Vec<u8>>,
+    ) -> Result<Iter> {
+        bucket.prefix_reverse_at(self, prefix).await
+    }
+
+    pub async fn prefix_lazy_reverse(
+        &self,
+        bucket: &Bucket,
+        prefix: impl Into<Vec<u8>>,
+    ) -> Result<LazyIter> {
+        bucket.prefix_lazy_reverse_at(self, prefix).await
     }
 }
 

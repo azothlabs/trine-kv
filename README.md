@@ -19,10 +19,12 @@ Release packaging notes live in [docs/release.md](docs/release.md).
 
 ## Common Capabilities
 
-- Direct default-bucket reads and writes with `Db::put`, `Db::get`, `Db::range`,
-  `Db::prefix`, and their async counterparts.
-- Optional named buckets through `db.bucket("users")?` when data needs logical
-  separation or independent tuning.
+- Async-first default-bucket reads and writes with `Db::put`, `Db::get`,
+  `Db::range`, and `Db::prefix`.
+- Explicit sync adapters with `*_sync` names, such as `Db::open_sync`,
+  `db.put_sync`, `bucket.get_sync`, and `db.flush_sync`.
+- Optional named buckets through `db.bucket("users").await?` when data needs
+  logical separation or independent tuning.
 - Atomic write batches across the default bucket and named buckets.
 - MVCC snapshots that keep old reads stable while newer writes commit.
 - Snapshot-bound point readers that can avoid copying inline table values when
@@ -50,7 +52,7 @@ Release packaging notes live in [docs/release.md](docs/release.md).
 - Live stats report table, cache, filter, blob read, blob byte, and blob GC
   counters.
 - Explicit WASI and browser persistent options. WASI uses a host-preopened
-  filesystem path on WASI targets and supports `Db::open_async` through the
+  filesystem path on WASI targets and supports `Db::open` through the
   host storage boundary. Browser persistence uses the async API and the browser
   persistent backend on `wasm32-unknown-unknown`.
 
@@ -76,44 +78,51 @@ trine-kv = { path = "../trine-kv" }
 ```rust
 use trine_kv::{Db, KeyRange, TransactionOptions, WriteBatch, WriteOptions};
 
-fn main() -> trine_kv::Result<()> {
-    let db = Db::open_memory()?;
+async fn run() -> trine_kv::Result<()> {
+    let db = Db::open_memory().await?;
 
     // Simple applications can use the built-in default bucket directly.
-    db.put(b"settings:theme", b"dark")?;
-    assert_eq!(db.get(b"settings:theme")?, Some(b"dark".to_vec()));
+    db.put(b"settings:theme", b"dark").await?;
+    assert_eq!(db.get(b"settings:theme").await?, Some(b"dark".to_vec()));
 
     // Named buckets are created on demand when you need logical separation.
-    let users = db.bucket("users")?;
-    users.put(b"user:001", b"Ada")?;
+    let users = db.bucket("users").await?;
+    users.put(b"user:001", b"Ada").await?;
 
     // Snapshots keep a stable read sequence while newer writes continue.
     let snapshot = db.snapshot();
-    users.put(b"user:002", b"Lin")?;
-    assert_eq!(snapshot.get(&users, b"user:002")?, None);
+    users.put(b"user:002", b"Lin").await?;
+    assert_eq!(snapshot.get(&users, b"user:002").await?, None);
 
     // Batches can atomically span buckets.
     let mut batch = WriteBatch::new();
     batch.put(b"audit:001", b"user-created");
     batch.put_bucket("users", b"user:003", b"Grace")?;
-    db.write(batch, WriteOptions::sync_all())?;
+    db.write(batch, WriteOptions::sync_all()).await?;
 
     // Transactions validate their read set when they commit.
     let mut txn = db.transaction(TransactionOptions::default());
-    assert_eq!(txn.get_bucket("users", b"user:001")?, Some(b"Ada".to_vec()));
+    assert_eq!(
+        txn.get_bucket("users", b"user:001").await?,
+        Some(b"Ada".to_vec())
+    );
     txn.put_bucket("users", b"user:004", b"Barbara")?;
-    txn.commit()?;
+    txn.commit().await?;
 
-    let rows = users
-        .range(&KeyRange::half_open(b"user:001", b"user:999"))?
-        .collect::<trine_kv::Result<Vec<_>>>()?;
-    assert_eq!(rows.len(), 4);
+    let mut rows = users
+        .range(&KeyRange::half_open(b"user:001", b"user:999"))
+        .await?;
+    let mut row_count = 0;
+    while rows.next().await?.is_some() {
+        row_count += 1;
+    }
+    assert_eq!(row_count, 4);
 
     Ok(())
 }
 ```
 
-For persistent open, flush, reopen, and stats in runnable programs, use:
+For runnable async and sync persistent paths, use:
 
 ```text
 cargo run --example quickstart
@@ -135,11 +144,10 @@ cargo bench --bench v1_bench
 
 ## Examples
 
-- `quickstart`: first pass through persistent open, buckets, scans,
-  transactions, flush, reopen, and stats.
-- `async_quickstart`: the same first pass through `Db::open_async`, async
-  writes, lazy scans, transaction commit, maintenance, read-only reopen, and
-  storage runtime stats.
+- `quickstart`: first pass through the explicit sync adapters, including
+  persistent open, buckets, scans, transactions, flush, reopen, and stats.
+- `async_quickstart`: first pass through `Db::open`, async writes, lazy scans,
+  transaction commit, maintenance, read-only reopen, and storage runtime stats.
 - `user_store`: wraps Trine KV behind a small repository-style API.
 - `event_index`: stores event payloads and a secondary account index with one
   atomic write batch.
@@ -159,12 +167,12 @@ cargo bench --bench v1_bench
 - `SyncAll` is the strongest WAL commit mode, subject to platform filesystem
   behavior.
 - WASI and browser persistent backends do not claim `SyncData` or `SyncAll`.
-- WASI persistent `Db::open_async` uses the host-preopened filesystem on WASI
+- WASI persistent `Db::open` uses the host-preopened filesystem on WASI
   targets; current WASI file work completes inline and does not advertise
   platform async I/O.
-- Browser persistence is async-only: use `Db::open_async` plus async mutation
+- Browser persistence is async-only: use `Db::open` plus async mutation
   and maintenance methods. Synchronous browser persistent open, mutation, and
-  maintenance APIs return typed unsupported errors.
+  maintenance `*_sync` APIs return typed unsupported errors.
 - Read-only open is for inspecting a stable directory state; v1 does not define
   live multi-process reads against an active writer.
 - Repair is intentionally narrow and only removes known safe temporary files

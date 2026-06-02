@@ -102,13 +102,13 @@ fn measure(name: &'static str, iterations: usize, mut run: impl FnMut() -> u64) 
 
 fn bench_single_key_put() -> BenchResult {
     measure("single-key put", OPS, || {
-        let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-        let bucket = db.default_bucket().expect("bucket opens");
+        let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
         let mut checksum = 0;
         for index in 0..OPS {
             let value = value(index);
             checksum += value.len() as u64;
-            bucket.put(key(index), value).expect("put succeeds");
+            bucket.put_sync(key(index), value).expect("put succeeds");
         }
         checksum
     })
@@ -116,13 +116,13 @@ fn bench_single_key_put() -> BenchResult {
 
 fn bench_batch_write() -> BenchResult {
     measure("batch write", ROWS, || {
-        let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-        db.default_bucket().expect("bucket opens");
+        let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+        db.default_bucket_sync().expect("bucket opens");
         let mut batch = WriteBatch::new();
         for index in 0..ROWS {
             batch.put(key(index), value(index));
         }
-        db.write(batch, WriteOptions::default())
+        db.write_sync(batch, WriteOptions::default())
             .expect("batch write succeeds");
         ROWS as u64
     })
@@ -130,7 +130,7 @@ fn bench_batch_write() -> BenchResult {
 
 fn bench_random_get() -> BenchResult {
     let db = populated_memory_db(ROWS);
-    let bucket = db.default_bucket().expect("bucket opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
     measure("random get", OPS, || {
         random_get_checksum(&bucket, ROWS, OPS, 0x1234_5678)
     })
@@ -138,7 +138,7 @@ fn bench_random_get() -> BenchResult {
 
 fn bench_missing_get() -> BenchResult {
     let db = populated_memory_db(ROWS);
-    let bucket = db.default_bucket().expect("bucket opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
     measure("missing get", OPS, || missing_get_checksum(&bucket, OPS))
 }
 
@@ -154,7 +154,7 @@ fn bench_active_memtable_random_get() -> BenchResult {
 
 fn bench_delta_backed_random_get() -> BenchResult {
     let db = populated_delta_memory_db(ROWS);
-    let bucket = db.default_bucket().expect("bucket opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
     measure("merged delta random get", OPS, || {
         random_get_checksum(&bucket, ROWS, OPS, 0x4ac7_1fe5)
     })
@@ -162,7 +162,7 @@ fn bench_delta_backed_random_get() -> BenchResult {
 
 fn bench_delta_backed_missing_get() -> BenchResult {
     let db = populated_delta_memory_db(ROWS);
-    let bucket = db.default_bucket().expect("bucket opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
     measure("merged delta missing get", OPS, || {
         missing_get_checksum(&bucket, OPS)
     })
@@ -170,7 +170,7 @@ fn bench_delta_backed_missing_get() -> BenchResult {
 
 fn bench_bounded_range_scan() -> BenchResult {
     let db = populated_memory_db(ROWS);
-    let bucket = db.default_bucket().expect("bucket opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
     measure("bounded range scan", 128, || {
         range_scan_checksum(&bucket, 128)
     })
@@ -188,7 +188,7 @@ fn bench_active_memtable_range_scan() -> BenchResult {
 
 fn bench_delta_backed_range_scan() -> BenchResult {
     let db = populated_delta_memory_db(ROWS);
-    let bucket = db.default_bucket().expect("bucket opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
     measure("merged delta range scan", 128, || {
         range_scan_checksum(&bucket, 128)
     })
@@ -196,12 +196,14 @@ fn bench_delta_backed_range_scan() -> BenchResult {
 
 fn bench_prefix_scan() -> BenchResult {
     let db = populated_prefix_db(ROWS, false);
-    let bucket = db.default_bucket().expect("bucket opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
     measure("prefix scan", 128, || {
         let mut checksum = 0;
         for tenant in 0..128 {
             let prefix = format!("tenant:{:02}:", tenant % 16);
-            let iter = bucket.prefix(prefix.as_bytes()).expect("prefix succeeds");
+            let iter = bucket
+                .prefix_sync(prefix.as_bytes())
+                .expect("prefix succeeds");
             checksum += iter
                 .map(|item| item.expect("prefix item").value.len() as u64)
                 .sum::<u64>();
@@ -214,20 +216,22 @@ fn bench_prefix_partition_scans() -> Vec<BenchResult> {
     let dir = temp_dir("prefix-partition");
     let mut options = DbOptions::persistent(&dir);
     options.default_bucket_options = prefix_options(true);
-    let db = Db::open(options).expect("persistent db opens");
-    let bucket = db.default_bucket().expect("bucket opens");
+    let db = Db::open_sync(options).expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
     for index in 0..ROWS {
         bucket
-            .put(prefix_key(index), value(index))
+            .put_sync(prefix_key(index), value(index))
             .expect("put succeeds");
     }
-    db.flush().expect("flush succeeds");
+    db.flush_sync().expect("flush succeeds");
 
     let matching = measure("prefix scan table partitions matching", 128, || {
         let mut checksum = 0;
         for tenant in 0..128 {
             let prefix = format!("tenant:{:02}:", tenant % 16);
-            let iter = bucket.prefix(prefix.as_bytes()).expect("prefix succeeds");
+            let iter = bucket
+                .prefix_sync(prefix.as_bytes())
+                .expect("prefix succeeds");
             checksum += iter
                 .map(|item| item.expect("prefix item").value.len() as u64)
                 .sum::<u64>();
@@ -238,7 +242,9 @@ fn bench_prefix_partition_scans() -> Vec<BenchResult> {
         let mut checksum = 0;
         for tenant in 0..128 {
             let prefix = format!("missing:{tenant:02}:");
-            let iter = bucket.prefix(prefix.as_bytes()).expect("prefix succeeds");
+            let iter = bucket
+                .prefix_sync(prefix.as_bytes())
+                .expect("prefix succeeds");
             checksum += iter.count() as u64;
         }
         checksum
@@ -251,15 +257,15 @@ fn bench_prefix_partition_scans() -> Vec<BenchResult> {
 fn bench_snapshot_read_under_writes() -> BenchResult {
     measure("snapshot read under concurrent writes", OPS, || {
         let db = populated_memory_db(ROWS);
-        let bucket = db.default_bucket().expect("bucket opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
         let snapshot = db.snapshot();
         let mut checksum = 0;
         for index in 0..OPS {
             bucket
-                .put(key(index % ROWS), value(index + ROWS))
+                .put_sync(key(index % ROWS), value(index + ROWS))
                 .expect("write succeeds");
             checksum += snapshot
-                .get(&bucket, &key(index % ROWS))
+                .get_sync(&bucket, &key(index % ROWS))
                 .expect("snapshot get succeeds")
                 .map_or(0, |value| value.len() as u64);
         }
@@ -274,11 +280,11 @@ fn bench_transaction_commit() -> BenchResult {
         for index in 0..512 {
             let mut txn = db.transaction(TransactionOptions::default());
             checksum += txn
-                .get(&key(index))
+                .get_sync(&key(index))
                 .expect("txn get succeeds")
                 .map_or(0, |value| value.len() as u64);
             txn.put(key(index + ROWS), value(index));
-            txn.commit().expect("txn commit succeeds");
+            txn.commit_sync().expect("txn commit succeeds");
         }
         checksum
     })
@@ -287,16 +293,16 @@ fn bench_transaction_commit() -> BenchResult {
 fn bench_transaction_conflict() -> BenchResult {
     measure("optimistic transaction conflict", 512, || {
         let db = populated_memory_db(ROWS);
-        let bucket = db.default_bucket().expect("bucket opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
         let mut conflicts = 0;
         for index in 0..512 {
             let mut txn = db.transaction(TransactionOptions::default());
-            txn.get(&key(index)).expect("txn get succeeds");
+            txn.get_sync(&key(index)).expect("txn get succeeds");
             bucket
-                .put(key(index), value(index + ROWS))
+                .put_sync(key(index), value(index + ROWS))
                 .expect("conflicting write succeeds");
             txn.put(key(index), value(index));
-            if txn.commit().is_err() {
+            if txn.commit_sync().is_err() {
                 conflicts += 1;
             }
         }
@@ -309,16 +315,18 @@ fn bench_wal_replay() -> BenchResult {
         let dir = temp_dir("wal-replay");
         let options = DbOptions::persistent(&dir);
         {
-            let db = Db::open(options.clone()).expect("persistent db opens");
-            let bucket = db.default_bucket().expect("bucket opens");
+            let db = Db::open_sync(options.clone()).expect("persistent db opens");
+            let bucket = db.default_bucket_sync().expect("bucket opens");
             for index in 0..ROWS {
-                bucket.put(key(index), value(index)).expect("put succeeds");
+                bucket
+                    .put_sync(key(index), value(index))
+                    .expect("put succeeds");
             }
         }
-        let db = Db::open(options).expect("persistent db reopens");
-        let bucket = db.default_bucket().expect("bucket reopens");
+        let db = Db::open_sync(options).expect("persistent db reopens");
+        let bucket = db.default_bucket_sync().expect("bucket reopens");
         let checksum = bucket
-            .get(&key(ROWS / 2))
+            .get_sync(&key(ROWS / 2))
             .expect("get succeeds")
             .map_or(0, |value| value.len() as u64);
         drop(db);
@@ -330,12 +338,14 @@ fn bench_wal_replay() -> BenchResult {
 fn bench_flush_throughput() -> BenchResult {
     measure("flush throughput", ROWS, || {
         let dir = temp_dir("flush");
-        let db = Db::open(DbOptions::persistent(&dir)).expect("persistent db opens");
-        let bucket = db.default_bucket().expect("bucket opens");
+        let db = Db::open_sync(DbOptions::persistent(&dir)).expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
         for index in 0..ROWS {
-            bucket.put(key(index), value(index)).expect("put succeeds");
+            bucket
+                .put_sync(key(index), value(index))
+                .expect("put succeeds");
         }
-        db.flush().expect("flush succeeds");
+        db.flush_sync().expect("flush succeeds");
         let stats = db.stats();
         drop(db);
         cleanup_dir(&dir);
@@ -346,16 +356,16 @@ fn bench_flush_throughput() -> BenchResult {
 fn bench_compaction_throughput() -> BenchResult {
     measure("compaction throughput", ROWS, || {
         let dir = temp_dir("compact");
-        let db = Db::open(DbOptions::persistent(&dir)).expect("persistent db opens");
-        let bucket = db.default_bucket().expect("bucket opens");
+        let db = Db::open_sync(DbOptions::persistent(&dir)).expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
         for chunk in 0..4 {
             for index in 0..(ROWS / 4) {
                 let row = chunk * (ROWS / 4) + index;
-                bucket.put(key(row), value(row)).expect("put succeeds");
+                bucket.put_sync(key(row), value(row)).expect("put succeeds");
             }
-            db.flush().expect("flush succeeds");
+            db.flush_sync().expect("flush succeeds");
         }
-        db.compact_range(KeyRange::all())
+        db.compact_range_sync(KeyRange::all())
             .expect("compaction succeeds");
         let stats = db.stats();
         drop(db);
@@ -366,17 +376,19 @@ fn bench_compaction_throughput() -> BenchResult {
 
 fn bench_large_inline_values() -> BenchResult {
     measure("large inline values", 256, || {
-        let db = Db::memory(
+        let db = Db::memory_sync(
             DbOptions::memory().with_default_bucket_options(BucketOptions {
                 blob_threshold_bytes: 128 * 1024,
                 ..BucketOptions::default()
             }),
         )
         .expect("memory db opens");
-        let bucket = db.default_bucket().expect("bucket opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
         let value = vec![b'x'; 16 * 1024];
         for index in 0..256 {
-            bucket.put(key(index), value.clone()).expect("put succeeds");
+            bucket
+                .put_sync(key(index), value.clone())
+                .expect("put succeeds");
         }
         256 * value.len() as u64
     })
@@ -385,19 +397,21 @@ fn bench_large_inline_values() -> BenchResult {
 fn bench_separated_blob_values() -> BenchResult {
     measure("separated blob values", 256, || {
         let dir = temp_dir("blob");
-        let db = Db::open(
-            DbOptions::persistent(&dir).with_default_bucket_options(BucketOptions {
+        let db = Db::open_sync(DbOptions::persistent(&dir).with_default_bucket_options(
+            BucketOptions {
                 blob_threshold_bytes: 4 * 1024,
                 ..BucketOptions::default()
-            }),
-        )
+            },
+        ))
         .expect("persistent db opens");
-        let bucket = db.default_bucket().expect("bucket opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
         let value = vec![b'x'; 16 * 1024];
         for index in 0..256 {
-            bucket.put(key(index), value.clone()).expect("put succeeds");
+            bucket
+                .put_sync(key(index), value.clone())
+                .expect("put succeeds");
         }
-        db.flush().expect("flush succeeds");
+        db.flush_sync().expect("flush succeeds");
         let stats = db.stats();
         drop(db);
         cleanup_dir(&dir);
@@ -414,7 +428,7 @@ fn bench_blob_point_read() -> BenchResult {
             seed = xorshift(seed);
             let index = seed_index(seed, LARGE_ROWS);
             checksum += bucket
-                .get(&key(index))
+                .get_sync(&key(index))
                 .expect("blob point get succeeds")
                 .map_or(0, |value| value.len() as u64);
         }
@@ -432,7 +446,7 @@ fn bench_blob_range_scan() -> BenchResult {
         for start in 0..32 {
             let first = (start * 3) % (LARGE_ROWS - 8);
             let iter = bucket
-                .range(&KeyRange::half_open(key(first), key(first + 8)))
+                .range_sync(&KeyRange::half_open(key(first), key(first + 8)))
                 .expect("blob range succeeds");
             checksum += iter
                 .map(|item| item.expect("blob range item").value.len() as u64)
@@ -452,7 +466,7 @@ fn bench_blob_range_lazy_keys() -> BenchResult {
         for start in 0..32 {
             let first = (start * 3) % (LARGE_ROWS - 8);
             let iter = bucket
-                .range_lazy(&KeyRange::half_open(key(first), key(first + 8)))
+                .range_lazy_sync(&KeyRange::half_open(key(first), key(first + 8)))
                 .expect("blob lazy range succeeds");
             checksum += iter
                 .map(|item| item.expect("blob lazy range item").key.len() as u64)
@@ -475,22 +489,22 @@ fn bench_blob_gc_rewrite() -> BenchResult {
             blob_level_merge_policy: BlobLevelMergePolicy::Disabled,
             ..large_blob_options()
         };
-        let db = Db::open(options).expect("persistent db opens");
-        let bucket = db.default_bucket().expect("bucket opens");
+        let db = Db::open_sync(options).expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
 
         for index in 0..LARGE_ROWS {
             bucket
-                .put(key(index), large_value(index))
+                .put_sync(key(index), large_value(index))
                 .expect("initial large put succeeds");
         }
-        db.flush().expect("initial blob flush succeeds");
+        db.flush_sync().expect("initial blob flush succeeds");
         for index in (0..LARGE_ROWS).step_by(2) {
             bucket
-                .put(key(index), large_value(index + LARGE_ROWS))
+                .put_sync(key(index), large_value(index + LARGE_ROWS))
                 .expect("overwrite large put succeeds");
         }
-        db.flush().expect("overwrite blob flush succeeds");
-        db.compact_range(KeyRange::all())
+        db.flush_sync().expect("overwrite blob flush succeeds");
+        db.compact_range_sync(KeyRange::all())
             .expect("blob GC compaction succeeds");
 
         let stats = db.stats();
@@ -513,22 +527,22 @@ fn bench_blob_level_merge() -> BenchResult {
             blob_level_merge_policy: BlobLevelMergePolicy::Always,
             ..large_blob_options()
         };
-        let db = Db::open(options).expect("persistent db opens");
-        let bucket = db.default_bucket().expect("bucket opens");
+        let db = Db::open_sync(options).expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
 
         for index in 0..LARGE_ROWS {
             bucket
-                .put(key(index), large_value(index))
+                .put_sync(key(index), large_value(index))
                 .expect("initial large put succeeds");
         }
-        db.flush().expect("initial blob flush succeeds");
+        db.flush_sync().expect("initial blob flush succeeds");
         for index in (0..LARGE_ROWS).step_by(2) {
             bucket
-                .put(key(index), large_value(index + LARGE_ROWS))
+                .put_sync(key(index), large_value(index + LARGE_ROWS))
                 .expect("overwrite large put succeeds");
         }
-        db.flush().expect("overwrite blob flush succeeds");
-        db.compact_range(KeyRange::all())
+        db.flush_sync().expect("overwrite blob flush succeeds");
+        db.compact_range_sync(KeyRange::all())
             .expect("level merge compaction succeeds");
 
         let checksum = db.stats().live_blob_bytes;
@@ -540,12 +554,14 @@ fn bench_blob_level_merge() -> BenchResult {
 
 fn bench_block_cache_warm_read() -> BenchResult {
     let (dir, db, bucket) = flushed_persistent_db("warm-read", ROWS, BucketOptions::default());
-    bucket.get(&key(ROWS / 2)).expect("warmup get succeeds");
+    bucket
+        .get_sync(&key(ROWS / 2))
+        .expect("warmup get succeeds");
     let result = measure("block cache warm read", OPS, || {
         let mut checksum = 0;
         for _ in 0..OPS {
             checksum += bucket
-                .get(&key(ROWS / 2))
+                .get_sync(&key(ROWS / 2))
                 .expect("get succeeds")
                 .map_or(0, |value| value.len() as u64);
         }
@@ -561,20 +577,22 @@ fn bench_cold_table_read() -> BenchResult {
         let dir = temp_dir("cold-read");
         let options = DbOptions::persistent(&dir);
         {
-            let db = Db::open(options.clone()).expect("persistent db opens");
-            let bucket = db.default_bucket().expect("bucket opens");
+            let db = Db::open_sync(options.clone()).expect("persistent db opens");
+            let bucket = db.default_bucket_sync().expect("bucket opens");
             for index in 0..ROWS {
-                bucket.put(key(index), value(index)).expect("put succeeds");
+                bucket
+                    .put_sync(key(index), value(index))
+                    .expect("put succeeds");
             }
-            db.flush().expect("flush succeeds");
+            db.flush_sync().expect("flush succeeds");
         }
 
         let mut checksum = 0;
         for _ in 0..32 {
-            let db = Db::open(options.clone()).expect("persistent db reopens");
-            let bucket = db.default_bucket().expect("bucket reopens");
+            let db = Db::open_sync(options.clone()).expect("persistent db reopens");
+            let bucket = db.default_bucket_sync().expect("bucket reopens");
             checksum += bucket
-                .get(&key(ROWS / 2))
+                .get_sync(&key(ROWS / 2))
                 .expect("get succeeds")
                 .map_or(0, |value| value.len() as u64);
         }
@@ -614,12 +632,14 @@ fn bench_runtime_block_decode_read(
         block_bytes: 512,
         ..BucketOptions::default()
     };
-    let db = Db::open(options).expect("persistent db opens");
-    let bucket = db.default_bucket().expect("bucket opens");
+    let db = Db::open_sync(options).expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
     for index in 0..ROWS {
-        bucket.put(key(index), value(index)).expect("put succeeds");
+        bucket
+            .put_sync(key(index), value(index))
+            .expect("put succeeds");
     }
-    db.flush().expect("flush succeeds");
+    db.flush_sync().expect("flush succeeds");
 
     let result = measure(name, OPS, || {
         let mut checksum = 0_u64;
@@ -629,7 +649,7 @@ fn bench_runtime_block_decode_read(
             let index = seed_index(seed, ROWS);
             checksum = checksum.saturating_add(
                 bucket
-                    .get(&key(index))
+                    .get_sync(&key(index))
                     .expect("get succeeds")
                     .map_or(0, |value| value.len() as u64),
             );
@@ -697,7 +717,7 @@ fn bench_index_seek_policy(
             for index in 0..OPS {
                 let row = (index * 17) % size;
                 checksum += bucket
-                    .get(&key(row))
+                    .get_sync(&key(row))
                     .expect("get succeeds")
                     .map_or(0, |value| value.len() as u64);
             }
@@ -718,23 +738,23 @@ fn bench_long_shared_prefix_get() -> BenchResult {
     };
     let mut options = DbOptions::persistent(&dir);
     options.default_bucket_options = bucket_options;
-    let db = Db::open(options).expect("persistent db opens");
-    let bucket = db.default_bucket().expect("bucket opens");
+    let db = Db::open_sync(options).expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
     let keys = (0..ROWS).map(long_shared_prefix_key).collect::<Vec<_>>();
 
     for (index, key) in keys.iter().enumerate() {
         bucket
-            .put(key.as_slice(), value(index))
+            .put_sync(key.as_slice(), value(index))
             .expect("put succeeds");
     }
-    db.flush().expect("flush succeeds");
+    db.flush_sync().expect("flush succeeds");
 
     let result = measure("long shared-prefix get", OPS, || {
         let mut checksum = 0;
         for index in 0..OPS {
             let row = (index * 17) % ROWS;
             checksum += bucket
-                .get(&keys[row])
+                .get_sync(&keys[row])
                 .expect("get succeeds")
                 .map_or(0, |value| value.len() as u64);
         }
@@ -823,10 +843,12 @@ fn bench_codec(
 }
 
 fn populated_memory_db(rows: usize) -> Db {
-    let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-    let bucket = db.default_bucket().expect("bucket opens");
+    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
     for index in 0..rows {
-        bucket.put(key(index), value(index)).expect("put succeeds");
+        bucket
+            .put_sync(key(index), value(index))
+            .expect("put succeeds");
     }
     db
 }
@@ -834,10 +856,12 @@ fn populated_memory_db(rows: usize) -> Db {
 fn populated_delta_memory_db(rows: usize) -> Db {
     let mut options = DbOptions::memory();
     options.write_buffer_bytes = 1;
-    let db = Db::memory(options).expect("memory db opens");
-    let bucket = db.default_bucket().expect("bucket opens");
+    let db = Db::memory_sync(options).expect("memory db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
     for index in 0..rows {
-        bucket.put(key(index), value(index)).expect("put succeeds");
+        bucket
+            .put_sync(key(index), value(index))
+            .expect("put succeeds");
     }
     assert_delta_backed_memory_stats(&db);
     db
@@ -848,10 +872,12 @@ fn populated_active_memtable_db(name: &str, rows: usize) -> (PathBuf, Db, trine_
     let mut options = DbOptions::persistent(&dir);
     options.background_worker_count = 0;
     options.write_buffer_bytes = 64 * 1024 * 1024;
-    let db = Db::open(options).expect("persistent db opens");
-    let bucket = db.default_bucket().expect("bucket opens");
+    let db = Db::open_sync(options).expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
     for index in 0..rows {
-        bucket.put(key(index), value(index)).expect("put succeeds");
+        bucket
+            .put_sync(key(index), value(index))
+            .expect("put succeeds");
     }
     assert_active_memtable_stats(&db);
     (dir, db, bucket)
@@ -892,11 +918,11 @@ fn assert_active_memtable_stats(db: &Db) {
 fn populated_prefix_db(rows: usize, filters: bool) -> Db {
     let mut options = DbOptions::memory();
     options.default_bucket_options = prefix_options(filters);
-    let db = Db::memory(options).expect("memory db opens");
-    let bucket = db.default_bucket().expect("bucket opens");
+    let db = Db::memory_sync(options).expect("memory db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
     for index in 0..rows {
         bucket
-            .put(prefix_key(index), value(index))
+            .put_sync(prefix_key(index), value(index))
             .expect("put succeeds");
     }
     db
@@ -908,7 +934,7 @@ fn random_get_checksum(bucket: &trine_kv::Bucket, rows: usize, ops: usize, mut s
         seed = xorshift(seed);
         let index = seed_index(seed, rows);
         checksum += bucket
-            .get(&key(index))
+            .get_sync(&key(index))
             .expect("get succeeds")
             .map_or(0, |value| value.len() as u64);
     }
@@ -919,7 +945,7 @@ fn missing_get_checksum(bucket: &trine_kv::Bucket, ops: usize) -> u64 {
     let mut checksum = 0;
     for index in 0..ops {
         checksum += bucket
-            .get(format!("missing-{index:04}").as_bytes())
+            .get_sync(format!("missing-{index:04}").as_bytes())
             .expect("missing get succeeds")
             .map_or(0, |value| value.len() as u64);
     }
@@ -931,7 +957,7 @@ fn range_scan_checksum(bucket: &trine_kv::Bucket, scans: usize) -> u64 {
     for start in 0..scans {
         let end = start + 32;
         let iter = bucket
-            .range(&KeyRange::half_open(key(start), key(end)))
+            .range_sync(&KeyRange::half_open(key(start), key(end)))
             .expect("range succeeds");
         checksum += iter
             .map(|item| item.expect("range item").value.len() as u64)
@@ -948,12 +974,14 @@ fn flushed_persistent_db(
     let dir = temp_dir(name);
     let mut options = DbOptions::persistent(&dir);
     options.default_bucket_options = bucket_options;
-    let db = Db::open(options).expect("persistent db opens");
-    let bucket = db.default_bucket().expect("bucket opens");
+    let db = Db::open_sync(options).expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
     for index in 0..rows {
-        bucket.put(key(index), value(index)).expect("put succeeds");
+        bucket
+            .put_sync(key(index), value(index))
+            .expect("put succeeds");
     }
-    db.flush().expect("flush succeeds");
+    db.flush_sync().expect("flush succeeds");
     (dir, db, bucket)
 }
 
@@ -961,14 +989,14 @@ fn large_blob_db(name: &str, rows: usize) -> (PathBuf, Db, trine_kv::Bucket) {
     let dir = temp_dir(name);
     let mut options = DbOptions::persistent(&dir);
     options.default_bucket_options = large_blob_options();
-    let db = Db::open(options).expect("persistent db opens");
-    let bucket = db.default_bucket().expect("bucket opens");
+    let db = Db::open_sync(options).expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
     for index in 0..rows {
         bucket
-            .put(key(index), large_value(index))
+            .put_sync(key(index), large_value(index))
             .expect("large put succeeds");
     }
-    db.flush().expect("large flush succeeds");
+    db.flush_sync().expect("large flush succeeds");
     (dir, db, bucket)
 }
 

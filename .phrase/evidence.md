@@ -9042,3 +9042,63 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Run the documented example gate and commit the documentation/example refresh.
+
+## 2026-06-02: Async-First Public API Rename
+
+### Observation
+
+- After async storage work landed, public names still made the crate read
+  sync-first: short names such as `Db::open`, `db.get`, and `db.put` were
+  synchronous, while async callers used suffixed names.
+- User review selected `sync` as the public adapter name instead of exposing
+  execution-mechanism language in the API.
+
+### Interpretation
+
+- The async-first decision requires async database, bucket, transaction,
+  snapshot, scan, and lazy-value operations to own primary public names.
+- Synchronous database/storage work should remain available as explicit
+  `*_sync` adapters.
+- Pure builders and staged in-memory mutation helpers should keep natural
+  names when they do not perform storage work.
+
+### Change
+
+- Renamed async public operations to primary names across `Db`, `Bucket`,
+  `BucketReader`, `Transaction`, `Snapshot`, `Iter`, `LazyIter`,
+  `LazyKeyValue`, `LazyValue`, and the database write path.
+- Renamed synchronous database/storage operations to explicit `*_sync`
+  adapters.
+- Renamed public `DbStats` sync-adapter fields from execution-mechanism
+  wording to `sync_adapter` wording.
+- Kept pure builder/staging APIs such as `WriteBatch::put` and staged
+  `Transaction::put` unchanged.
+- Updated README, usage docs, durability notes, changelog, examples, tests,
+  benchmarks, and phase documents to match the async-first surface.
+
+### Verification
+
+- `cargo check --all-targets --all-features`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo run --example quickstart`
+- `cargo run --example async_quickstart`
+- `cargo run --example user_store`
+- `cargo run --example event_index`
+- `cargo check --target wasm32-unknown-unknown --lib`
+- `cargo check --target wasm32-wasip1 --lib`
+- `cargo package --list --allow-dirty`
+- `git diff --check`
+- forbidden-term scan over README, docs, examples, tests, benches, src,
+  `.phrase`, and changelog
+
+### Remaining Risks
+
+- No storage semantics changed in this phase.
+- Primary async maintenance/WAL internals and an in-browser persistence fixture
+  remain follow-up hardening.
+
+### Recommended Next Action
+
+- Commit the rename and return to release-candidate verification.

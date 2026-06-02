@@ -3074,7 +3074,7 @@ fully reflected in the native public API surface.
   operations rather than delegating to blocking `Db::open`.
 - Public async methods that can wait either use primary async paths or have
   recorded blockers with focused tests.
-- Blocking native APIs are kept as adapter surface and do not define persistent
+- Sync native APIs are kept as adapter surface and do not define persistent
   engine semantics.
 - Native, WASI, and browser target verification passes.
 
@@ -3090,3 +3090,41 @@ fully reflected in the native public API surface.
 - Return to release-candidate verification, with primary async maintenance/WAL
   internals and an in-browser persistence fixture tracked as follow-up
   hardening rather than Phase 130 blockers.
+
+### Phase 131: Async-First Public API Rename
+
+**Status**: Complete
+
+**Goal**: Make the public API surface match the async-first decision by giving
+primary method names to async operations and moving synchronous database/storage
+work to explicit `*_sync` adapters.
+
+**Entry Condition**: User review identifies that, even after async storage
+paths were implemented, public method names still made the crate read
+sync-first.
+
+**Acceptance Gate**:
+
+- Async database, bucket, scan, lazy value, snapshot, and transaction
+  operations own primary public names.
+- Synchronous database/storage operations remain available through explicit
+  `*_sync` adapters.
+- Pure builder/state helpers keep natural names when they do not trigger
+  storage work.
+- Public stats fields use `sync_adapter` naming for sync-adapter observability.
+- README, usage docs, examples, tests, and benchmarks are aligned with the new
+  names.
+- Full native verification and release-facing example gates pass.
+
+**Major Out Of Scope**:
+
+- Storage format, MVCC, WAL, manifest, table, compaction, transaction, blob, or
+  recovery semantic changes.
+- Replacing synchronous maintenance/WAL internals with a primary async engine.
+- Browser fixture automation, release publishing, or tagging.
+
+### Recommended Next Action
+
+- Return to release-candidate verification and publish readiness. Keep primary
+  async maintenance/WAL internals and an in-browser persistence fixture as
+  follow-up hardening unless they become release blockers.

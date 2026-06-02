@@ -45,8 +45,8 @@ struct UserStore {
 
 impl UserStore {
     fn open(path: &Path) -> Result<Self> {
-        let db = Db::open(DbOptions::persistent(path).with_durability(DurabilityMode::Flush))?;
-        let users = db.bucket_with_options(
+        let db = Db::open_sync(DbOptions::persistent(path).with_durability(DurabilityMode::Flush))?;
+        let users = db.bucket_with_options_sync(
             "users",
             BucketOptions::default().with_prefix_extractor(PrefixExtractor::Separator(b':')),
         )?;
@@ -54,19 +54,19 @@ impl UserStore {
     }
 
     fn put_user(&self, user: &User) -> Result<()> {
-        self.users.put(user_key(&user.id), user.encode()?)
+        self.users.put_sync(user_key(&user.id), user.encode()?)
     }
 
     fn get_user(&self, id: &str) -> Result<Option<User>> {
         self.users
-            .get(&user_key(id))?
+            .get_sync(&user_key(id))?
             .map(|bytes| User::decode(&bytes))
             .transpose()
     }
 
     fn list_users(&self) -> Result<Vec<User>> {
         self.users
-            .prefix(b"user:")?
+            .prefix_sync(b"user:")?
             .map(|item| item.and_then(|key_value| User::decode(&key_value.value)))
             .collect()
     }
@@ -79,7 +79,7 @@ impl UserStore {
     ) -> Result<bool> {
         let key = user_key(id);
         let mut transaction = self.db.transaction(TransactionOptions::default());
-        let Some(bytes) = transaction.get_bucket("users", &key)? else {
+        let Some(bytes) = transaction.get_bucket_sync("users", &key)? else {
             return Ok(false);
         };
         let mut user = User::decode(&bytes)?;
@@ -89,12 +89,12 @@ impl UserStore {
 
         new_name.clone_into(&mut user.display_name);
         transaction.put_bucket("users", key, user.encode()?)?;
-        transaction.commit()?;
+        transaction.commit_sync()?;
         Ok(true)
     }
 
     fn flush(&self) -> Result<()> {
-        self.db.flush()
+        self.db.flush_sync()
     }
 }
 

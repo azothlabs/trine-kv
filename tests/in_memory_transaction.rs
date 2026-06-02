@@ -2,23 +2,23 @@ use trine_kv::{Db, DbOptions, Error, KeyRange, TransactionOptions, WriteBatch, W
 
 #[test]
 fn transaction_commits_staged_writes_without_reads() {
-    let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-    let bucket = db.default_bucket().expect("bucket opens");
+    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
     let mut txn = db.transaction(TransactionOptions::default());
 
     txn.put(b"a", b"txn");
-    let info = txn.commit().expect("transaction commits");
+    let info = txn.commit_sync().expect("transaction commits");
 
     assert_eq!(info.sequence().get(), 1);
     assert_eq!(
-        bucket.get(b"a").expect("committed value"),
+        bucket.get_sync(b"a").expect("committed value"),
         Some(b"txn".to_vec())
     );
 }
 
 #[test]
 fn named_transaction_methods_reject_reserved_default_bucket_name() {
-    let db = Db::memory(DbOptions::memory()).expect("memory db opens");
+    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
     let mut txn = db.transaction(TransactionOptions::default());
 
     let error = txn
@@ -34,81 +34,84 @@ fn named_transaction_methods_reject_reserved_default_bucket_name() {
 
 #[test]
 fn transaction_point_read_conflicts_with_later_point_write() {
-    let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-    let bucket = db.default_bucket().expect("bucket opens");
-    bucket.put(b"a", b"v1").expect("seed value");
+    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+    bucket.put_sync(b"a", b"v1").expect("seed value");
 
     let mut txn = db.transaction(TransactionOptions::default());
-    assert_eq!(txn.get(b"a").expect("txn read"), Some(b"v1".to_vec()));
-    bucket.put(b"a", b"v2").expect("concurrent write");
+    assert_eq!(txn.get_sync(b"a").expect("txn read"), Some(b"v1".to_vec()));
+    bucket.put_sync(b"a", b"v2").expect("concurrent write");
 
-    let error = txn.commit().expect_err("point read must conflict");
+    let error = txn.commit_sync().expect_err("point read must conflict");
     assert!(matches!(error, Error::Conflict { .. }));
 }
 
 #[test]
 fn transaction_point_read_conflicts_with_later_range_delete() {
-    let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-    let bucket = db.default_bucket().expect("bucket opens");
-    bucket.put(b"m", b"value").expect("seed value");
+    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+    bucket.put_sync(b"m", b"value").expect("seed value");
 
     let mut txn = db.transaction(TransactionOptions::default());
-    assert_eq!(txn.get(b"m").expect("txn read"), Some(b"value".to_vec()));
+    assert_eq!(
+        txn.get_sync(b"m").expect("txn read"),
+        Some(b"value".to_vec())
+    );
     bucket
-        .delete_range(KeyRange::half_open(b"a", b"z"))
+        .delete_range_sync(KeyRange::half_open(b"a", b"z"))
         .expect("concurrent range delete");
 
-    let error = txn.commit().expect_err("range delete must conflict");
+    let error = txn.commit_sync().expect_err("range delete must conflict");
     assert!(matches!(error, Error::Conflict { .. }));
 }
 
 #[test]
 fn transaction_range_read_conflicts_with_later_point_write_inside_range() {
-    let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-    let bucket = db.default_bucket().expect("bucket opens");
+    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
     let mut txn = db.transaction(TransactionOptions::default());
 
-    txn.read_range(KeyRange::half_open(b"a", b"m"))
+    txn.read_range_sync(KeyRange::half_open(b"a", b"m"))
         .expect("track range read");
-    bucket.put(b"b", b"new").expect("concurrent write");
+    bucket.put_sync(b"b", b"new").expect("concurrent write");
 
-    let error = txn.commit().expect_err("range read must conflict");
+    let error = txn.commit_sync().expect_err("range read must conflict");
     assert!(matches!(error, Error::Conflict { .. }));
 }
 
 #[test]
 fn transaction_range_read_conflicts_with_later_overlapping_range_delete() {
-    let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-    db.default_bucket().expect("bucket opens");
+    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    db.default_bucket_sync().expect("bucket opens");
     let mut txn = db.transaction(TransactionOptions::default());
 
-    txn.read_range(KeyRange::half_open(b"c", b"g"))
+    txn.read_range_sync(KeyRange::half_open(b"c", b"g"))
         .expect("track range read");
     let mut delete = WriteBatch::new();
     delete.delete_range(KeyRange::half_open(b"f", b"z"));
-    db.write(delete, WriteOptions::default())
+    db.write_sync(delete, WriteOptions::default())
         .expect("concurrent range delete");
 
     let error = txn
-        .commit()
+        .commit_sync()
         .expect_err("overlapping range delete must conflict");
     assert!(matches!(error, Error::Conflict { .. }));
 }
 
 #[test]
 fn transaction_range_read_allows_later_write_outside_range() {
-    let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-    let bucket = db.default_bucket().expect("bucket opens");
+    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
     let mut txn = db.transaction(TransactionOptions::default());
 
-    txn.read_range(KeyRange::half_open(b"a", b"m"))
+    txn.read_range_sync(KeyRange::half_open(b"a", b"m"))
         .expect("track range read");
-    bucket.put(b"z", b"outside").expect("outside write");
+    bucket.put_sync(b"z", b"outside").expect("outside write");
     txn.put(b"b", b"inside");
 
-    txn.commit().expect("outside write does not conflict");
+    txn.commit_sync().expect("outside write does not conflict");
     assert_eq!(
-        bucket.get(b"b").expect("txn write visible"),
+        bucket.get_sync(b"b").expect("txn write visible"),
         Some(b"inside".to_vec())
     );
 }

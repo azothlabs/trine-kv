@@ -19,22 +19,22 @@ fn persistent_snapshot_range_ignores_newer_point_delete() {
     let options = DbOptions::persistent(&path);
 
     {
-        let db = Db::open(options).expect("persistent db opens");
-        let bucket = db.default_bucket().expect("bucket opens");
-        bucket.put(b"key-06", b"value-06").expect("put");
-        db.flush().expect("flush table");
+        let db = Db::open_sync(options).expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
+        bucket.put_sync(b"key-06", b"value-06").expect("put");
+        db.flush_sync().expect("flush table");
 
         let snapshot = db.snapshot();
-        bucket.delete(b"key-06").expect("newer delete");
+        bucket.delete_sync(b"key-06").expect("newer delete");
 
         assert_eq!(
-            snapshot.get(&bucket, b"key-06").expect("snapshot get"),
+            snapshot.get_sync(&bucket, b"key-06").expect("snapshot get"),
             Some(b"value-06".to_vec())
         );
         assert_eq!(
             collect_rows(
                 snapshot
-                    .range(&bucket, &KeyRange::all())
+                    .range_sync(&bucket, &KeyRange::all())
                     .expect("snapshot range")
             ),
             vec![(b"key-06".to_vec(), b"value-06".to_vec())]
@@ -60,15 +60,15 @@ fn randomized_operations_match_mvcc_reference_across_reopen() {
     let mut model = BTreeMap::<Vec<u8>, Vec<u8>>::new();
 
     {
-        let db = Db::open(options.clone()).expect("persistent db opens");
-        let bucket = db.default_bucket().expect("bucket opens");
+        let db = Db::open_sync(options.clone()).expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
         let mut run = ModelRun::new(&db, &bucket, &keys, &mut rng, &mut model);
         run.run();
     }
 
     {
-        let db = Db::open(options).expect("persistent db reopens");
-        let bucket = db.default_bucket().expect("bucket reopens");
+        let db = Db::open_sync(options).expect("persistent db reopens");
+        let bucket = db.default_bucket_sync().expect("bucket reopens");
         assert_range(&bucket, &model);
     }
 
@@ -128,7 +128,9 @@ impl<'run> ModelRun<'run> {
     fn put_random_key(&mut self, step: usize) {
         let key = self.keys[self.rng.usize(self.keys.len())].clone();
         let value = format!("value-{step:03}-{}", String::from_utf8_lossy(&key)).into_bytes();
-        self.bucket.put(key.clone(), value.clone()).expect("put");
+        self.bucket
+            .put_sync(key.clone(), value.clone())
+            .expect("put");
         self.history.push(format!(
             "{step}: put {} -> {}",
             String::from_utf8_lossy(&key),
@@ -139,7 +141,7 @@ impl<'run> ModelRun<'run> {
 
     fn delete_random_key(&mut self, step: usize) {
         let key = self.keys[self.rng.usize(self.keys.len())].clone();
-        self.bucket.delete(key.clone()).expect("point delete");
+        self.bucket.delete_sync(key.clone()).expect("point delete");
         self.history
             .push(format!("{step}: delete {}", String::from_utf8_lossy(&key)));
         self.model.remove(&key);
@@ -148,7 +150,7 @@ impl<'run> ModelRun<'run> {
     fn delete_random_range(&mut self, step: usize) {
         let (start, end) = random_key_span(self.rng, self.keys);
         self.bucket
-            .delete_range(KeyRange::half_open(
+            .delete_range_sync(KeyRange::half_open(
                 self.keys[start].clone(),
                 self.keys[end].clone(),
             ))
@@ -201,11 +203,11 @@ impl<'run> ModelRun<'run> {
 
     fn flush_and_maybe_compact(&mut self, step: usize) {
         self.history.push(format!("{step}: flush"));
-        self.db.flush().expect("flush succeeds");
+        self.db.flush_sync().expect("flush succeeds");
         if self.rng.usize(2) == 0 {
             self.history.push(format!("{step}: compact_all"));
             self.db
-                .compact_range(KeyRange::all())
+                .compact_range_sync(KeyRange::all())
                 .expect("compaction succeeds");
         }
     }
@@ -229,9 +231,9 @@ impl<'run> ModelRun<'run> {
     fn assert_after_final_flush_and_compaction(&mut self) {
         assert_range(self.bucket, self.model);
         self.snapshots.clear();
-        self.db.flush().expect("final flush succeeds");
+        self.db.flush_sync().expect("final flush succeeds");
         self.db
-            .compact_range(KeyRange::all())
+            .compact_range_sync(KeyRange::all())
             .expect("final compaction succeeds");
         assert_range(self.bucket, self.model);
     }
@@ -247,7 +249,7 @@ fn assert_random_get(
 ) {
     let key = &keys[rng.usize(keys.len())];
     assert_eq!(
-        bucket.get(key).expect("point read"),
+        bucket.get_sync(key).expect("point read"),
         model.get(key).cloned(),
         "point mismatch at step {step} for key {:?}\n{}",
         String::from_utf8_lossy(key),
@@ -257,7 +259,7 @@ fn assert_random_get(
 
 fn assert_range(bucket: &Bucket, model: &BTreeMap<Vec<u8>, Vec<u8>>) {
     assert_eq!(
-        collect_rows(bucket.range(&KeyRange::all()).expect("range read")),
+        collect_rows(bucket.range_sync(&KeyRange::all()).expect("range read")),
         model_rows(model)
     );
 }
@@ -267,7 +269,7 @@ fn assert_snapshot(snapshot: &ModelSnapshot, bucket: &Bucket, keys: &[Vec<u8>], 
         assert_eq!(
             snapshot
                 .snapshot
-                .get(bucket, key)
+                .get_sync(bucket, key)
                 .expect("snapshot point read"),
             snapshot.model.get(key).cloned(),
             "snapshot point mismatch at step {step} for snapshot from step {} and key {:?}",
@@ -279,7 +281,7 @@ fn assert_snapshot(snapshot: &ModelSnapshot, bucket: &Bucket, keys: &[Vec<u8>], 
         collect_rows(
             snapshot
                 .snapshot
-                .range(bucket, &KeyRange::all())
+                .range_sync(bucket, &KeyRange::all())
                 .expect("snapshot range read")
         ),
         model_rows(&snapshot.model),

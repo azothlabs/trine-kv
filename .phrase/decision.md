@@ -55,8 +55,9 @@ Evidence notes should separate:
 - Do not change MVCC, WAL, SSTable, manifest, compaction, transaction,
   prefix-filter, compression, or search-policy behavior without updating the
   protocol spec or adding a follow-up ADR.
-- Trine's primary database API and storage boundary are async-first. Blocking
-  native APIs are adapters over the primary async engine.
+- Trine's primary database API and storage boundary are async-first. Sync
+  native APIs are adapters over the primary async engine and use explicit
+  `*_sync` public names.
 - `PlatformAsyncIo` must mean at least one current Trine storage operation is
   executed by a real OS async primitive for the selected target. A backend that
   only provides polling, thread-pool fallback, or lower-level primitives that

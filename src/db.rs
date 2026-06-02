@@ -846,9 +846,9 @@ impl Drop for Db {
 }
 
 impl Db {
-    pub fn open(options: DbOptions) -> Result<Self> {
+    pub fn open_sync(options: DbOptions) -> Result<Self> {
         match &options.storage_mode {
-            StorageMode::InMemory => Self::memory(options),
+            StorageMode::InMemory => Self::memory_sync(options),
             StorageMode::Persistent { .. } => Self::open_persistent_with_options(options),
             StorageMode::HostPersistent {
                 backend: HostStorageBackend::Wasi { .. },
@@ -861,12 +861,12 @@ impl Db {
         }
     }
 
-    pub fn open_wasi_persistent(path: impl Into<std::path::PathBuf>) -> Result<Self> {
-        Self::open(DbOptions::wasi_persistent(path))
+    pub fn open_wasi_persistent_sync(path: impl Into<std::path::PathBuf>) -> Result<Self> {
+        Self::open_sync(DbOptions::wasi_persistent(path))
     }
 
-    pub fn open_wasi_read_only(path: impl Into<std::path::PathBuf>) -> Result<Self> {
-        Self::open(DbOptions::wasi_persistent_read_only(path))
+    pub fn open_wasi_read_only_sync(path: impl Into<std::path::PathBuf>) -> Result<Self> {
+        Self::open_sync(DbOptions::wasi_persistent_read_only(path))
     }
 
     fn open_wasi_persistent_with_options(options: DbOptions) -> Result<Self> {
@@ -1114,23 +1114,23 @@ impl Db {
         validate_common_options(options)
     }
 
-    pub fn open_memory() -> Result<Self> {
-        Self::memory(DbOptions::memory())
+    pub fn open_memory_sync() -> Result<Self> {
+        Self::memory_sync(DbOptions::memory())
     }
 
-    pub fn open_persistent(path: impl Into<std::path::PathBuf>) -> Result<Self> {
-        Self::open(DbOptions::persistent(path))
+    pub fn open_persistent_sync(path: impl Into<std::path::PathBuf>) -> Result<Self> {
+        Self::open_sync(DbOptions::persistent(path))
     }
 
-    pub fn open_read_only(path: impl Into<std::path::PathBuf>) -> Result<Self> {
-        Self::open(DbOptions::persistent_read_only(path))
+    pub fn open_read_only_sync(path: impl Into<std::path::PathBuf>) -> Result<Self> {
+        Self::open_sync(DbOptions::persistent_read_only(path))
     }
 
     #[cfg_attr(
         all(target_arch = "wasm32", target_os = "unknown"),
         allow(clippy::arc_with_non_send_sync)
     )]
-    pub fn memory(mut options: DbOptions) -> Result<Self> {
+    pub fn memory_sync(mut options: DbOptions) -> Result<Self> {
         options.storage_mode = StorageMode::InMemory;
         validate_options(&options)?;
         let block_cache_bytes = options.block_cache_bytes;
@@ -1263,7 +1263,7 @@ impl Db {
     ) -> Result<Self> {
         validate_options(&options)?;
         if require_wait_support && !options.runtime.capabilities().blocking_adapter() {
-            return Err(Error::unsupported("runtime blocking adapter"));
+            return Err(Error::unsupported("runtime sync adapter"));
         }
 
         let runtime = Runtime::new(options.runtime);
@@ -1406,9 +1406,9 @@ impl Db {
 
     /// Returns a handle for the built-in default bucket.
     ///
-    /// Direct helpers such as `Db::put` and `Db::get` use this bucket without
+    /// Direct helpers such as `Db::put_sync` and `Db::get_sync` use this bucket without
     /// requiring callers to open it explicitly.
-    pub fn default_bucket(&self) -> Result<Bucket> {
+    pub fn default_bucket_sync(&self) -> Result<Bucket> {
         let state = self.bucket_state(DEFAULT_BUCKET_NAME)?;
         let options = state.options.clone();
         Ok(Bucket::new(
@@ -1423,10 +1423,10 @@ impl Db {
     /// `BucketOptions`.
     ///
     /// The built-in default bucket is reserved for direct `Db` helpers and
-    /// `Db::default_bucket`; using `"default"` as a named bucket returns an
+    /// `Db::default_bucket_sync`; using `"default"` as a named bucket returns an
     /// error.
-    pub fn bucket(&self, name: impl Into<BucketName>) -> Result<Bucket> {
-        self.bucket_with_options(name, BucketOptions::default())
+    pub fn bucket_sync(&self, name: impl Into<BucketName>) -> Result<Bucket> {
+        self.bucket_with_options_sync(name, BucketOptions::default())
     }
 
     /// Returns an existing named bucket or creates it with explicit options.
@@ -1434,7 +1434,7 @@ impl Db {
     /// Bucket options are fixed after creation. Calling this for an existing
     /// named bucket with different options returns an error. The built-in
     /// default bucket is configured through `DbOptions::default_bucket_options`.
-    pub fn bucket_with_options(
+    pub fn bucket_with_options_sync(
         &self,
         name: impl Into<BucketName>,
         options: BucketOptions,
@@ -1605,13 +1605,13 @@ impl Db {
     }
 
     /// Reads the newest committed value for `key` from the default bucket.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Value>> {
+    pub fn get_sync(&self, key: &[u8]) -> Result<Option<Value>> {
         self.get_at_sequence(DEFAULT_BUCKET_NAME, key, self.last_committed_sequence())
     }
 
     /// Reads `key` from the default bucket at the sequence pinned by
     /// `snapshot`.
-    pub fn get_at(&self, snapshot: &Snapshot, key: &[u8]) -> Result<Option<Value>> {
+    pub fn get_at_sync(&self, snapshot: &Snapshot, key: &[u8]) -> Result<Option<Value>> {
         self.get_at_with_pin_state(
             DEFAULT_BUCKET_NAME,
             key,
@@ -1622,14 +1622,14 @@ impl Db {
 
     /// Writes one key/value pair to the default bucket using default write
     /// options.
-    pub fn put(&self, key: impl Into<Vec<u8>>, value: impl Into<Value>) -> Result<()> {
-        self.put_with_options(key, value, WriteOptions::default())
+    pub fn put_sync(&self, key: impl Into<Vec<u8>>, value: impl Into<Value>) -> Result<()> {
+        self.put_with_options_sync(key, value, WriteOptions::default())
             .map(|_| ())
     }
 
     /// Writes one key/value pair to the default bucket and returns commit
     /// information.
-    pub fn put_with_options(
+    pub fn put_with_options_sync(
         &self,
         key: impl Into<Vec<u8>>,
         value: impl Into<Value>,
@@ -1637,48 +1637,48 @@ impl Db {
     ) -> Result<CommitInfo> {
         let mut batch = crate::WriteBatch::new();
         batch.put(key, value);
-        self.write(batch, options)
+        self.write_sync(batch, options)
     }
 
     /// Adds a point delete for one default-bucket key using default write
     /// options.
-    pub fn delete(&self, key: impl Into<Vec<u8>>) -> Result<()> {
-        self.delete_with_options(key, WriteOptions::default())
+    pub fn delete_sync(&self, key: impl Into<Vec<u8>>) -> Result<()> {
+        self.delete_with_options_sync(key, WriteOptions::default())
             .map(|_| ())
     }
 
     /// Adds a point delete for one default-bucket key and returns commit
     /// information.
-    pub fn delete_with_options(
+    pub fn delete_with_options_sync(
         &self,
         key: impl Into<Vec<u8>>,
         options: WriteOptions,
     ) -> Result<CommitInfo> {
         let mut batch = crate::WriteBatch::new();
         batch.delete(key);
-        self.write(batch, options)
+        self.write_sync(batch, options)
     }
 
     /// Adds a range delete to the default bucket using default write options.
-    pub fn delete_range(&self, range: KeyRange) -> Result<()> {
-        self.delete_range_with_options(range, WriteOptions::default())
+    pub fn delete_range_sync(&self, range: KeyRange) -> Result<()> {
+        self.delete_range_with_options_sync(range, WriteOptions::default())
             .map(|_| ())
     }
 
     /// Adds a range delete to the default bucket and returns commit
     /// information.
-    pub fn delete_range_with_options(
+    pub fn delete_range_with_options_sync(
         &self,
         range: KeyRange,
         options: WriteOptions,
     ) -> Result<CommitInfo> {
         let mut batch = crate::WriteBatch::new();
         batch.delete_range(range);
-        self.write(batch, options)
+        self.write_sync(batch, options)
     }
 
     /// Returns a forward iterator over default-bucket rows in `range`.
-    pub fn range(&self, range: &KeyRange) -> Result<Iter> {
+    pub fn range_sync(&self, range: &KeyRange) -> Result<Iter> {
         self.range_at_sequence(
             DEFAULT_BUCKET_NAME,
             range,
@@ -1689,7 +1689,7 @@ impl Db {
 
     /// Returns a forward default-bucket iterator whose blob values are read on
     /// demand.
-    pub fn range_lazy(&self, range: &KeyRange) -> Result<LazyIter> {
+    pub fn range_lazy_sync(&self, range: &KeyRange) -> Result<LazyIter> {
         self.range_lazy_at_sequence(
             DEFAULT_BUCKET_NAME,
             range,
@@ -1699,7 +1699,7 @@ impl Db {
     }
 
     /// Returns a forward default-bucket iterator over `range` at `snapshot`.
-    pub fn range_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<Iter> {
+    pub fn range_at_sync(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<Iter> {
         self.range_at_sequence(
             DEFAULT_BUCKET_NAME,
             range,
@@ -1709,7 +1709,7 @@ impl Db {
     }
 
     /// Returns a forward value-lazy default-bucket iterator at `snapshot`.
-    pub fn range_lazy_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<LazyIter> {
+    pub fn range_lazy_at_sync(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<LazyIter> {
         self.range_lazy_at_sequence(
             DEFAULT_BUCKET_NAME,
             range,
@@ -1719,7 +1719,7 @@ impl Db {
     }
 
     /// Returns a reverse iterator over default-bucket rows in `range`.
-    pub fn range_reverse(&self, range: &KeyRange) -> Result<Iter> {
+    pub fn range_reverse_sync(&self, range: &KeyRange) -> Result<Iter> {
         self.range_at_sequence(
             DEFAULT_BUCKET_NAME,
             range,
@@ -1730,7 +1730,7 @@ impl Db {
 
     /// Returns a reverse default-bucket iterator whose blob values are read on
     /// demand.
-    pub fn range_lazy_reverse(&self, range: &KeyRange) -> Result<LazyIter> {
+    pub fn range_lazy_reverse_sync(&self, range: &KeyRange) -> Result<LazyIter> {
         self.range_lazy_at_sequence(
             DEFAULT_BUCKET_NAME,
             range,
@@ -1740,7 +1740,7 @@ impl Db {
     }
 
     /// Returns a reverse default-bucket iterator over `range` at `snapshot`.
-    pub fn range_reverse_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<Iter> {
+    pub fn range_reverse_at_sync(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<Iter> {
         self.range_at_sequence(
             DEFAULT_BUCKET_NAME,
             range,
@@ -1750,7 +1750,11 @@ impl Db {
     }
 
     /// Returns a reverse value-lazy default-bucket iterator at `snapshot`.
-    pub fn range_lazy_reverse_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<LazyIter> {
+    pub fn range_lazy_reverse_at_sync(
+        &self,
+        snapshot: &Snapshot,
+        range: &KeyRange,
+    ) -> Result<LazyIter> {
         self.range_lazy_at_sequence(
             DEFAULT_BUCKET_NAME,
             range,
@@ -1761,7 +1765,7 @@ impl Db {
 
     /// Returns a forward iterator over default-bucket rows whose keys begin
     /// with `prefix`.
-    pub fn prefix(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
+    pub fn prefix_sync(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
         let prefix = prefix.into();
         self.prefix_at_sequence(
             DEFAULT_BUCKET_NAME,
@@ -1773,7 +1777,7 @@ impl Db {
 
     /// Returns a forward default-bucket prefix iterator whose blob values are
     /// read on demand.
-    pub fn prefix_lazy(&self, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
+    pub fn prefix_lazy_sync(&self, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
         let prefix = prefix.into();
         self.prefix_lazy_at_sequence(
             DEFAULT_BUCKET_NAME,
@@ -1784,7 +1788,7 @@ impl Db {
     }
 
     /// Returns a forward default-bucket prefix iterator at `snapshot`.
-    pub fn prefix_at(&self, snapshot: &Snapshot, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
+    pub fn prefix_at_sync(&self, snapshot: &Snapshot, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
         let prefix = prefix.into();
         self.prefix_at_sequence(
             DEFAULT_BUCKET_NAME,
@@ -1796,7 +1800,7 @@ impl Db {
 
     /// Returns a forward value-lazy default-bucket prefix iterator at
     /// `snapshot`.
-    pub fn prefix_lazy_at(
+    pub fn prefix_lazy_at_sync(
         &self,
         snapshot: &Snapshot,
         prefix: impl Into<Vec<u8>>,
@@ -1812,7 +1816,7 @@ impl Db {
 
     /// Returns a reverse iterator over default-bucket rows whose keys begin
     /// with `prefix`.
-    pub fn prefix_reverse(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
+    pub fn prefix_reverse_sync(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
         let prefix = prefix.into();
         self.prefix_at_sequence(
             DEFAULT_BUCKET_NAME,
@@ -1824,7 +1828,7 @@ impl Db {
 
     /// Returns a reverse default-bucket prefix iterator whose blob values are
     /// read on demand.
-    pub fn prefix_lazy_reverse(&self, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
+    pub fn prefix_lazy_reverse_sync(&self, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
         let prefix = prefix.into();
         self.prefix_lazy_at_sequence(
             DEFAULT_BUCKET_NAME,
@@ -1835,7 +1839,7 @@ impl Db {
     }
 
     /// Returns a reverse default-bucket prefix iterator at `snapshot`.
-    pub fn prefix_reverse_at(
+    pub fn prefix_reverse_at_sync(
         &self,
         snapshot: &Snapshot,
         prefix: impl Into<Vec<u8>>,
@@ -1851,7 +1855,7 @@ impl Db {
 
     /// Returns a reverse value-lazy default-bucket prefix iterator at
     /// `snapshot`.
-    pub fn prefix_lazy_reverse_at(
+    pub fn prefix_lazy_reverse_at_sync(
         &self,
         snapshot: &Snapshot,
         prefix: impl Into<Vec<u8>>,
@@ -1865,7 +1869,7 @@ impl Db {
         )
     }
 
-    pub fn persist(&self, mode: DurabilityMode) -> Result<()> {
+    pub fn persist_sync(&self, mode: DurabilityMode) -> Result<()> {
         self.ensure_open()?;
 
         if self.inner.options.storage_mode.is_wasi_persistent()
@@ -1944,7 +1948,7 @@ impl Db {
         wal.persist(&storage, Path::new(""), mode).await
     }
 
-    pub fn flush(&self) -> Result<()> {
+    pub fn flush_sync(&self) -> Result<()> {
         self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
@@ -1989,15 +1993,15 @@ impl Db {
     }
 
     // Keep the public shape aligned with the accepted v1 protocol:
-    // `Db::compact_range(range) -> Result<()>`.
+    // `Db::compact_range_sync(range) -> Result<()>`.
     #[allow(clippy::needless_pass_by_value)]
-    pub fn compact_range(&self, range: KeyRange) -> Result<()> {
+    pub fn compact_range_sync(&self, range: KeyRange) -> Result<()> {
         self.take_background_maintenance_error()?;
         self.compact_range_internal(range)
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    pub fn compact_range_with_budget(
+    pub fn compact_range_with_budget_sync(
         &self,
         range: KeyRange,
         budget: MaintenanceBudget,
@@ -2050,7 +2054,7 @@ impl Db {
         self.run_compaction_once_with_budget(&db_path, &range, false, budget)
     }
 
-    pub fn run_maintenance_with_budget(
+    pub fn run_maintenance_with_budget_sync(
         &self,
         budget: MaintenanceBudget,
     ) -> Result<MaintenanceOutcome> {
@@ -2378,25 +2382,20 @@ impl Db {
 
     fn add_storage_runtime_stats(&self, stats: &mut DbStats) {
         let storage_stats = self.inner.native_storage.stats();
-        stats.storage_uses_blocking_adapter = storage_stats.uses_blocking_adapter;
+        stats.storage_uses_sync_adapter = storage_stats.uses_blocking_adapter;
         stats.storage_uses_platform_async_io = storage_stats.uses_platform_async_io;
-        stats.storage_blocking_adapter_tasks = storage_stats.blocking_adapter_tasks;
-        stats.storage_blocking_adapter_queue_capacity =
-            storage_stats.blocking_adapter_queue_capacity;
-        stats.storage_blocking_adapter_queued_tasks = storage_stats.blocking_adapter_queued_tasks;
-        stats.storage_blocking_adapter_submitted_tasks =
-            storage_stats.blocking_adapter_submitted_tasks;
-        stats.storage_blocking_adapter_completed_tasks =
-            storage_stats.blocking_adapter_completed_tasks;
-        stats.storage_blocking_adapter_rejected_tasks =
-            storage_stats.blocking_adapter_rejected_tasks;
-        stats.storage_blocking_adapter_total_runtime_micros =
+        stats.storage_sync_adapter_tasks = storage_stats.blocking_adapter_tasks;
+        stats.storage_sync_adapter_queue_capacity = storage_stats.blocking_adapter_queue_capacity;
+        stats.storage_sync_adapter_queued_tasks = storage_stats.blocking_adapter_queued_tasks;
+        stats.storage_sync_adapter_submitted_tasks = storage_stats.blocking_adapter_submitted_tasks;
+        stats.storage_sync_adapter_completed_tasks = storage_stats.blocking_adapter_completed_tasks;
+        stats.storage_sync_adapter_rejected_tasks = storage_stats.blocking_adapter_rejected_tasks;
+        stats.storage_sync_adapter_total_runtime_micros =
             storage_stats.blocking_adapter_total_runtime_micros;
         stats.storage_platform_async_io_tasks = storage_stats.platform_async_io_tasks;
         stats.storage_platform_backend_fallback_tasks =
             storage_stats.platform_backend_fallback_tasks;
-        stats.storage_platform_blocking_fallback_tasks =
-            storage_stats.platform_blocking_fallback_tasks;
+        stats.storage_platform_sync_fallback_tasks = storage_stats.platform_blocking_fallback_tasks;
         stats.storage_inline_tasks = storage_stats.inline_tasks;
         stats.storage_operations = storage_stats.operations;
     }
@@ -2417,7 +2416,7 @@ impl Db {
             .oldest_active_or(self.last_committed_sequence())
     }
 
-    pub fn close(&self) {
+    pub fn close_sync(&self) {
         self.inner.closed.store(true, Ordering::Release);
         shutdown_background_workers(
             &self.inner.maintenance,
@@ -5119,13 +5118,13 @@ impl Db {
     }
 }
 
-/// Additive async compatibility methods for callers that want to begin using
-/// the accepted async-first API shape before blocking adapters are split out.
+/// Primary async database API. Synchronous callers can use the explicit
+/// `*_sync` adapters above.
 #[allow(clippy::unused_async)]
 impl Db {
-    pub async fn open_async(options: DbOptions) -> Result<Self> {
+    pub async fn open(options: DbOptions) -> Result<Self> {
         match &options.storage_mode {
-            StorageMode::InMemory => Self::memory(options),
+            StorageMode::InMemory => Self::memory_sync(options),
             StorageMode::Persistent { .. } => {
                 Self::open_persistent_with_options_async(options).await
             }
@@ -5138,32 +5137,40 @@ impl Db {
         }
     }
 
-    pub async fn open_memory_async() -> Result<Self> {
-        Self::open_memory()
+    pub async fn open_memory() -> Result<Self> {
+        Self::open_memory_sync()
     }
 
-    pub async fn open_persistent_async(path: impl Into<std::path::PathBuf>) -> Result<Self> {
-        Self::open_async(DbOptions::persistent(path)).await
+    pub async fn open_persistent(path: impl Into<std::path::PathBuf>) -> Result<Self> {
+        Self::open(DbOptions::persistent(path)).await
     }
 
-    pub async fn open_read_only_async(path: impl Into<std::path::PathBuf>) -> Result<Self> {
-        Self::open_async(DbOptions::persistent_read_only(path)).await
+    pub async fn open_read_only(path: impl Into<std::path::PathBuf>) -> Result<Self> {
+        Self::open(DbOptions::persistent_read_only(path)).await
     }
 
-    pub async fn memory_async(options: DbOptions) -> Result<Self> {
-        Self::memory(options)
+    pub async fn open_wasi_persistent(path: impl Into<std::path::PathBuf>) -> Result<Self> {
+        Self::open(DbOptions::wasi_persistent(path)).await
     }
 
-    pub async fn default_bucket_async(&self) -> Result<Bucket> {
-        self.default_bucket()
+    pub async fn open_wasi_read_only(path: impl Into<std::path::PathBuf>) -> Result<Self> {
+        Self::open(DbOptions::wasi_persistent_read_only(path)).await
     }
 
-    pub async fn bucket_async(&self, name: impl Into<BucketName>) -> Result<Bucket> {
-        self.bucket_with_options_async(name, BucketOptions::default())
+    pub async fn memory(options: DbOptions) -> Result<Self> {
+        Self::memory_sync(options)
+    }
+
+    pub async fn default_bucket(&self) -> Result<Bucket> {
+        self.default_bucket_sync()
+    }
+
+    pub async fn bucket(&self, name: impl Into<BucketName>) -> Result<Bucket> {
+        self.bucket_with_options(name, BucketOptions::default())
             .await
     }
 
-    pub async fn bucket_with_options_async(
+    pub async fn bucket_with_options(
         &self,
         name: impl Into<BucketName>,
         options: BucketOptions,
@@ -5175,15 +5182,15 @@ impl Db {
                 .await;
         }
 
-        self.bucket_with_options(name, options)
+        self.bucket_with_options_sync(name, options)
     }
 
-    pub async fn get_async(&self, key: &[u8]) -> Result<Option<Value>> {
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Value>> {
         self.get_at_sequence_async(DEFAULT_BUCKET_NAME, key, self.last_committed_sequence())
             .await
     }
 
-    pub async fn get_at_async(&self, snapshot: &Snapshot, key: &[u8]) -> Result<Option<Value>> {
+    pub async fn get_at(&self, snapshot: &Snapshot, key: &[u8]) -> Result<Option<Value>> {
         self.get_at_with_pin_state_async(
             DEFAULT_BUCKET_NAME,
             key,
@@ -5193,13 +5200,13 @@ impl Db {
         .await
     }
 
-    pub async fn put_async(&self, key: impl Into<Vec<u8>>, value: impl Into<Value>) -> Result<()> {
-        self.put_with_options_async(key, value, WriteOptions::default())
+    pub async fn put(&self, key: impl Into<Vec<u8>>, value: impl Into<Value>) -> Result<()> {
+        self.put_with_options(key, value, WriteOptions::default())
             .await
             .map(|_| ())
     }
 
-    pub async fn put_with_options_async(
+    pub async fn put_with_options(
         &self,
         key: impl Into<Vec<u8>>,
         value: impl Into<Value>,
@@ -5207,42 +5214,42 @@ impl Db {
     ) -> Result<CommitInfo> {
         let mut batch = crate::WriteBatch::new();
         batch.put(key, value);
-        self.write_async(batch, options).await
+        self.write(batch, options).await
     }
 
-    pub async fn delete_async(&self, key: impl Into<Vec<u8>>) -> Result<()> {
-        self.delete_with_options_async(key, WriteOptions::default())
+    pub async fn delete(&self, key: impl Into<Vec<u8>>) -> Result<()> {
+        self.delete_with_options(key, WriteOptions::default())
             .await
             .map(|_| ())
     }
 
-    pub async fn delete_with_options_async(
+    pub async fn delete_with_options(
         &self,
         key: impl Into<Vec<u8>>,
         options: WriteOptions,
     ) -> Result<CommitInfo> {
         let mut batch = crate::WriteBatch::new();
         batch.delete(key);
-        self.write_async(batch, options).await
+        self.write(batch, options).await
     }
 
-    pub async fn delete_range_async(&self, range: KeyRange) -> Result<()> {
-        self.delete_range_with_options_async(range, WriteOptions::default())
+    pub async fn delete_range(&self, range: KeyRange) -> Result<()> {
+        self.delete_range_with_options(range, WriteOptions::default())
             .await
             .map(|_| ())
     }
 
-    pub async fn delete_range_with_options_async(
+    pub async fn delete_range_with_options(
         &self,
         range: KeyRange,
         options: WriteOptions,
     ) -> Result<CommitInfo> {
         let mut batch = crate::WriteBatch::new();
         batch.delete_range(range);
-        self.write_async(batch, options).await
+        self.write(batch, options).await
     }
 
-    pub async fn range_async(&self, range: &KeyRange) -> Result<Iter> {
+    pub async fn range(&self, range: &KeyRange) -> Result<Iter> {
         self.range_at_sequence_async(
             DEFAULT_BUCKET_NAME,
             range,
@@ -5252,7 +5259,7 @@ impl Db {
         .await
     }
 
-    pub async fn range_lazy_async(&self, range: &KeyRange) -> Result<LazyIter> {
+    pub async fn range_lazy(&self, range: &KeyRange) -> Result<LazyIter> {
         self.range_lazy_at_sequence_async(
             DEFAULT_BUCKET_NAME,
             range,
@@ -5262,7 +5269,27 @@ impl Db {
         .await
     }
 
-    pub async fn range_reverse_async(&self, range: &KeyRange) -> Result<Iter> {
+    pub async fn range_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<Iter> {
+        self.range_at_sequence_async(
+            DEFAULT_BUCKET_NAME,
+            range,
+            snapshot.read_sequence(),
+            Direction::Forward,
+        )
+        .await
+    }
+
+    pub async fn range_lazy_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<LazyIter> {
+        self.range_lazy_at_sequence_async(
+            DEFAULT_BUCKET_NAME,
+            range,
+            snapshot.read_sequence(),
+            Direction::Forward,
+        )
+        .await
+    }
+
+    pub async fn range_reverse(&self, range: &KeyRange) -> Result<Iter> {
         self.range_at_sequence_async(
             DEFAULT_BUCKET_NAME,
             range,
@@ -5272,7 +5299,7 @@ impl Db {
         .await
     }
 
-    pub async fn range_lazy_reverse_async(&self, range: &KeyRange) -> Result<LazyIter> {
+    pub async fn range_lazy_reverse(&self, range: &KeyRange) -> Result<LazyIter> {
         self.range_lazy_at_sequence_async(
             DEFAULT_BUCKET_NAME,
             range,
@@ -5282,7 +5309,31 @@ impl Db {
         .await
     }
 
-    pub async fn prefix_async(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
+    pub async fn range_reverse_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<Iter> {
+        self.range_at_sequence_async(
+            DEFAULT_BUCKET_NAME,
+            range,
+            snapshot.read_sequence(),
+            Direction::Reverse,
+        )
+        .await
+    }
+
+    pub async fn range_lazy_reverse_at(
+        &self,
+        snapshot: &Snapshot,
+        range: &KeyRange,
+    ) -> Result<LazyIter> {
+        self.range_lazy_at_sequence_async(
+            DEFAULT_BUCKET_NAME,
+            range,
+            snapshot.read_sequence(),
+            Direction::Reverse,
+        )
+        .await
+    }
+
+    pub async fn prefix(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
         let prefix = prefix.into();
         self.prefix_at_sequence_async(
             DEFAULT_BUCKET_NAME,
@@ -5293,7 +5344,7 @@ impl Db {
         .await
     }
 
-    pub async fn prefix_lazy_async(&self, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
+    pub async fn prefix_lazy(&self, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
         let prefix = prefix.into();
         self.prefix_lazy_at_sequence_async(
             DEFAULT_BUCKET_NAME,
@@ -5304,7 +5355,33 @@ impl Db {
         .await
     }
 
-    pub async fn prefix_reverse_async(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
+    pub async fn prefix_at(&self, snapshot: &Snapshot, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
+        let prefix = prefix.into();
+        self.prefix_at_sequence_async(
+            DEFAULT_BUCKET_NAME,
+            &prefix,
+            snapshot.read_sequence(),
+            Direction::Forward,
+        )
+        .await
+    }
+
+    pub async fn prefix_lazy_at(
+        &self,
+        snapshot: &Snapshot,
+        prefix: impl Into<Vec<u8>>,
+    ) -> Result<LazyIter> {
+        let prefix = prefix.into();
+        self.prefix_lazy_at_sequence_async(
+            DEFAULT_BUCKET_NAME,
+            &prefix,
+            snapshot.read_sequence(),
+            Direction::Forward,
+        )
+        .await
+    }
+
+    pub async fn prefix_reverse(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
         let prefix = prefix.into();
         self.prefix_at_sequence_async(
             DEFAULT_BUCKET_NAME,
@@ -5315,7 +5392,7 @@ impl Db {
         .await
     }
 
-    pub async fn prefix_lazy_reverse_async(&self, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
+    pub async fn prefix_lazy_reverse(&self, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
         let prefix = prefix.into();
         self.prefix_lazy_at_sequence_async(
             DEFAULT_BUCKET_NAME,
@@ -5326,7 +5403,37 @@ impl Db {
         .await
     }
 
-    pub async fn persist_async(&self, mode: DurabilityMode) -> Result<()> {
+    pub async fn prefix_reverse_at(
+        &self,
+        snapshot: &Snapshot,
+        prefix: impl Into<Vec<u8>>,
+    ) -> Result<Iter> {
+        let prefix = prefix.into();
+        self.prefix_at_sequence_async(
+            DEFAULT_BUCKET_NAME,
+            &prefix,
+            snapshot.read_sequence(),
+            Direction::Reverse,
+        )
+        .await
+    }
+
+    pub async fn prefix_lazy_reverse_at(
+        &self,
+        snapshot: &Snapshot,
+        prefix: impl Into<Vec<u8>>,
+    ) -> Result<LazyIter> {
+        let prefix = prefix.into();
+        self.prefix_lazy_at_sequence_async(
+            DEFAULT_BUCKET_NAME,
+            &prefix,
+            snapshot.read_sequence(),
+            Direction::Reverse,
+        )
+        .await
+    }
+
+    pub async fn persist(&self, mode: DurabilityMode) -> Result<()> {
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         if matches!(
             self.inner.options.storage_mode,
@@ -5340,14 +5447,14 @@ impl Db {
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         if self.persistent_path().is_some() {
             return self
-                .run_native_blocking_task(move |db| db.persist(mode))
+                .run_native_blocking_task(move |db| db.persist_sync(mode))
                 .await;
         }
 
-        self.persist(mode)
+        self.persist_sync(mode)
     }
 
-    pub async fn flush_async(&self) -> Result<()> {
+    pub async fn flush(&self) -> Result<()> {
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         if self.inner.options.storage_mode.is_browser_persistent() {
             let db = self.clone();
@@ -5360,13 +5467,13 @@ impl Db {
 
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         if self.persistent_path().is_some() {
-            return self.run_native_blocking_task(|db| db.flush()).await;
+            return self.run_native_blocking_task(|db| db.flush_sync()).await;
         }
 
-        self.flush()
+        self.flush_sync()
     }
 
-    pub async fn compact_range_async(&self, range: KeyRange) -> Result<()> {
+    pub async fn compact_range(&self, range: KeyRange) -> Result<()> {
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         if self.inner.options.storage_mode.is_browser_persistent() {
             let db = self.clone();
@@ -5380,14 +5487,14 @@ impl Db {
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         if self.persistent_path().is_some() {
             return self
-                .run_native_blocking_task(move |db| db.compact_range(range))
+                .run_native_blocking_task(move |db| db.compact_range_sync(range))
                 .await;
         }
 
-        self.compact_range(range)
+        self.compact_range_sync(range)
     }
 
-    pub async fn compact_range_with_budget_async(
+    pub async fn compact_range_with_budget(
         &self,
         range: KeyRange,
         budget: MaintenanceBudget,
@@ -5408,14 +5515,16 @@ impl Db {
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         if self.persistent_path().is_some() {
             return self
-                .run_native_blocking_task(move |db| db.compact_range_with_budget(range, budget))
+                .run_native_blocking_task(move |db| {
+                    db.compact_range_with_budget_sync(range, budget)
+                })
                 .await;
         }
 
-        self.compact_range_with_budget(range, budget)
+        self.compact_range_with_budget_sync(range, budget)
     }
 
-    pub async fn run_maintenance_with_budget_async(
+    pub async fn run_maintenance_with_budget(
         &self,
         budget: MaintenanceBudget,
     ) -> Result<MaintenanceOutcome> {
@@ -5432,25 +5541,25 @@ impl Db {
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         if self.persistent_path().is_some() {
             return self
-                .run_native_blocking_task(move |db| db.run_maintenance_with_budget(budget))
+                .run_native_blocking_task(move |db| db.run_maintenance_with_budget_sync(budget))
                 .await;
         }
 
-        self.run_maintenance_with_budget(budget)
+        self.run_maintenance_with_budget_sync(budget)
     }
 
-    pub async fn close_async(&self) -> Result<()> {
+    pub async fn close(&self) -> Result<()> {
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         if self.persistent_path().is_some() {
             return self
                 .run_native_blocking_task(|db| {
-                    db.close();
+                    db.close_sync();
                     Ok(())
                 })
                 .await;
         }
 
-        self.close();
+        self.close_sync();
         Ok(())
     }
 }
@@ -6366,7 +6475,7 @@ mod tests {
         options.background_worker_count = 0;
         options.default_bucket_options =
             options.default_bucket_options.with_blob_threshold_bytes(4);
-        let db = Db::open(options).expect("persistent db opens");
+        let db = Db::open_sync(options).expect("persistent db opens");
 
         let capabilities = db.inner.native_storage.capabilities();
         assert!(capabilities.supports(StorageCapability::AsyncTasks));
@@ -6375,21 +6484,20 @@ mod tests {
         assert!(!capabilities.supports(StorageCapability::PlatformAsyncIo));
 
         let value = b"value-stored-through-blob".to_vec();
-        db.put(b"key", value.clone()).expect("write");
-        db.flush().expect("flush through db-owned native storage");
+        db.put_sync(b"key", value.clone()).expect("write");
+        db.flush_sync()
+            .expect("flush through db-owned native storage");
         assert_eq!(
-            db.get(b"key").expect("read after flush"),
+            db.get_sync(b"key").expect("read after flush"),
             Some(value.clone())
         );
         let stats = db.stats();
         assert_eq!(stats.live_blob_files, 1);
         assert!(stats.live_blob_bytes >= value.len() as u64);
-        assert!(stats.storage_uses_blocking_adapter);
+        assert!(stats.storage_uses_sync_adapter);
         assert!(!stats.storage_uses_platform_async_io);
-        assert_eq!(stats.storage_blocking_adapter_queue_capacity, 1024);
-        assert!(
-            stats.storage_blocking_adapter_submitted_tasks >= stats.storage_blocking_adapter_tasks
-        );
+        assert_eq!(stats.storage_sync_adapter_queue_capacity, 1024);
+        assert!(stats.storage_sync_adapter_submitted_tasks >= stats.storage_sync_adapter_tasks);
         assert!(stats.storage_operations.open_append.requests > 0);
         assert!(stats.storage_operations.write_object.requests > 0);
         assert_eq!(stats.storage_inline_tasks, 0);
@@ -6406,7 +6514,7 @@ mod tests {
         assert_eq!(options.runtime.mode, crate::runtime::RuntimeMode::Inline);
         assert_eq!(options.background_worker_count, 0);
 
-        let wasi_error = Db::open(options).expect_err("WASI backend requires WASI target");
+        let wasi_error = Db::open_sync(options).expect_err("WASI backend requires WASI target");
         assert!(matches!(wasi_error, Error::UnsupportedBackend { .. }));
         assert!(wasi_error.to_string().contains("WASI persistent"));
     }
@@ -6415,7 +6523,7 @@ mod tests {
     #[test]
     fn wasi_persistent_open_async_requires_wasi_target() {
         let path = temp_db_path("wasi-persistent-async-host-unsupported");
-        let error = block_on_test_future(Db::open_async(DbOptions::wasi_persistent(&path)))
+        let error = block_on_test_future(Db::open(DbOptions::wasi_persistent(&path)))
             .expect_err("WASI async open requires WASI target");
 
         assert!(matches!(error, Error::UnsupportedBackend { .. }));
@@ -6426,15 +6534,15 @@ mod tests {
     #[test]
     fn wasi_persistent_backend_uses_host_filesystem() {
         let path = temp_db_path("wasi-persistent-host");
-        let db = Db::open(DbOptions::wasi_persistent(&path)).expect("WASI db opens");
-        db.put(b"key", b"value").expect("WASI write succeeds");
-        db.flush().expect("WASI flush succeeds");
+        let db = Db::open_sync(DbOptions::wasi_persistent(&path)).expect("WASI db opens");
+        db.put_sync(b"key", b"value").expect("WASI write succeeds");
+        db.flush_sync().expect("WASI flush succeeds");
         drop(db);
 
-        let db = Db::open(DbOptions::wasi_persistent_read_only(&path))
+        let db = Db::open_sync(DbOptions::wasi_persistent_read_only(&path))
             .expect("WASI read-only db reopens");
         assert_eq!(
-            db.get(b"key").expect("WASI read succeeds"),
+            db.get_sync(b"key").expect("WASI read succeeds"),
             Some(b"value".to_vec())
         );
         drop(db);
@@ -6446,16 +6554,16 @@ mod tests {
     #[test]
     fn wasi_persistent_open_async_uses_host_filesystem() {
         let path = temp_db_path("wasi-persistent-async-host");
-        let db = block_on_test_future(Db::open_async(DbOptions::wasi_persistent(&path)))
+        let db = block_on_test_future(Db::open(DbOptions::wasi_persistent(&path)))
             .expect("WASI async db opens");
-        db.put(b"key", b"value").expect("WASI write succeeds");
-        db.flush().expect("WASI flush succeeds");
+        db.put_sync(b"key", b"value").expect("WASI write succeeds");
+        db.flush_sync().expect("WASI flush succeeds");
         drop(db);
 
-        let db = block_on_test_future(Db::open_async(DbOptions::wasi_persistent_read_only(&path)))
+        let db = block_on_test_future(Db::open(DbOptions::wasi_persistent_read_only(&path)))
             .expect("WASI async read-only db reopens");
         assert_eq!(
-            db.get(b"key").expect("WASI read succeeds"),
+            db.get_sync(b"key").expect("WASI read succeeds"),
             Some(b"value".to_vec())
         );
         drop(db);
@@ -6470,7 +6578,7 @@ mod tests {
         assert_eq!(options.background_worker_count, 0);
 
         let browser_error =
-            Db::open(options).expect_err("browser backend is not wired for sync open");
+            Db::open_sync(options).expect_err("browser backend is not wired for sync open");
         assert!(matches!(browser_error, Error::UnsupportedBackend { .. }));
         assert!(browser_error.to_string().contains("browser persistent"));
     }
@@ -6487,7 +6595,7 @@ mod tests {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     #[test]
     fn browser_persistent_open_async_requires_browser_target() {
-        let error = block_on_test_future(Db::open_async(DbOptions::browser_persistent_read_only()))
+        let error = block_on_test_future(Db::open(DbOptions::browser_persistent_read_only()))
             .expect_err("browser async open requires browser target");
         assert!(matches!(error, Error::UnsupportedBackend { .. }));
         assert!(error.to_string().contains("browser persistent"));
@@ -6548,8 +6656,8 @@ mod tests {
         let path = temp_db_path("flush-waits-for-existing-guard");
         let mut options = DbOptions::persistent(&path);
         options.background_worker_count = 0;
-        let db = Db::open(options).expect("open db");
-        db.put(b"key", b"value").expect("write");
+        let db = Db::open_sync(options).expect("open db");
+        db.put_sync(b"key", b"value").expect("write");
 
         let flush_guard = db
             .inner
@@ -6561,7 +6669,9 @@ mod tests {
         let (done_tx, done_rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             started_tx.send(()).expect("report flush thread start");
-            done_tx.send(thread_db.flush()).expect("send flush result");
+            done_tx
+                .send(thread_db.flush_sync())
+                .expect("send flush result");
         });
 
         started_rx
@@ -6593,14 +6703,14 @@ mod tests {
         let path = temp_db_path("flush-default-background-publishes");
         let mut options = DbOptions::persistent(&path);
         options.write_buffer_bytes = 128;
-        let db = Db::open(options).expect("open db");
+        let db = Db::open_sync(options).expect("open db");
 
         for index in 0..128_u32 {
             let key = format!("key-{index:04}");
-            db.put(key.as_bytes(), [b'x'; 96]).expect("write");
+            db.put_sync(key.as_bytes(), [b'x'; 96]).expect("write");
         }
 
-        db.flush().expect("public flush");
+        db.flush_sync().expect("public flush");
         let stats = db.stats();
         assert_eq!(stats.memtable_bytes, 0);
         assert_eq!(stats.immutable_memtables, 0);
@@ -6615,11 +6725,11 @@ mod tests {
         let path = temp_db_path("compact-range-waits-for-guard");
         let mut options = DbOptions::persistent(&path);
         options.background_worker_count = 0;
-        let db = Db::open(options).expect("open db");
-        db.put(b"a1", b"one").expect("write first");
-        db.flush().expect("flush first table");
-        db.put(b"a2", b"two").expect("write second");
-        db.flush().expect("flush second table");
+        let db = Db::open_sync(options).expect("open db");
+        db.put_sync(b"a1", b"one").expect("write first");
+        db.flush_sync().expect("flush first table");
+        db.put_sync(b"a2", b"two").expect("write second");
+        db.flush_sync().expect("flush second table");
 
         let compaction_guard = db
             .inner
@@ -6632,7 +6742,7 @@ mod tests {
         let handle = thread::spawn(move || {
             started_tx.send(()).expect("report compaction thread start");
             done_tx
-                .send(thread_db.compact_range(KeyRange::all()))
+                .send(thread_db.compact_range_sync(KeyRange::all()))
                 .expect("send compaction result");
         });
 

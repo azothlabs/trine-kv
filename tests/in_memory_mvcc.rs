@@ -4,10 +4,10 @@ use trine_kv::{Db, DbOptions, Error, WriteBatch, WriteOptions};
 fn write_buffer_budget_reads_delta_backed_in_memory_writes() {
     let mut options = DbOptions::memory();
     options.write_buffer_bytes = 1;
-    let db = Db::memory(options).expect("memory db opens");
-    let bucket = db.default_bucket().expect("bucket opens");
+    let db = Db::memory_sync(options).expect("memory db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
 
-    bucket.put(b"user:1", b"ada").expect("write user");
+    bucket.put_sync(b"user:1", b"ada").expect("write user");
 
     let stats = db.stats();
     assert!(
@@ -16,36 +16,36 @@ fn write_buffer_budget_reads_delta_backed_in_memory_writes() {
     );
     assert_eq!(stats.immutable_memtables, 0);
     assert_eq!(
-        bucket.get(b"user:1").expect("point read sees delta"),
+        bucket.get_sync(b"user:1").expect("point read sees delta"),
         Some(b"ada".to_vec())
     );
 }
 
 #[test]
 fn point_writes_deletes_and_snapshot_reads_are_mvcc_visible() {
-    let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-    let bucket = db.default_bucket().expect("bucket opens");
+    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
 
-    assert_eq!(bucket.get(b"a").expect("initial read"), None);
+    assert_eq!(bucket.get_sync(b"a").expect("initial read"), None);
 
-    bucket.put(b"a", b"v1").expect("first write");
+    bucket.put_sync(b"a", b"v1").expect("first write");
     let snapshot = db.snapshot();
 
-    bucket.put(b"a", b"v2").expect("second write");
+    bucket.put_sync(b"a", b"v2").expect("second write");
     assert_eq!(
-        bucket.get(b"a").expect("current read"),
+        bucket.get_sync(b"a").expect("current read"),
         Some(b"v2".to_vec())
     );
     assert_eq!(
-        snapshot.get(&bucket, b"a").expect("snapshot read"),
+        snapshot.get_sync(&bucket, b"a").expect("snapshot read"),
         Some(b"v1".to_vec())
     );
 
-    bucket.delete(b"a").expect("point delete");
-    assert_eq!(bucket.get(b"a").expect("deleted read"), None);
+    bucket.delete_sync(b"a").expect("point delete");
+    assert_eq!(bucket.get_sync(b"a").expect("deleted read"), None);
     assert_eq!(
         snapshot
-            .get(&bucket, b"a")
+            .get_sync(&bucket, b"a")
             .expect("snapshot survives delete"),
         Some(b"v1".to_vec())
     );
@@ -53,7 +53,7 @@ fn point_writes_deletes_and_snapshot_reads_are_mvcc_visible() {
 
 #[test]
 fn snapshots_pin_and_release_read_sequences() {
-    let db = Db::memory(DbOptions::memory()).expect("memory db opens");
+    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
     assert_eq!(db.stats().active_snapshots, 0);
 
     let snapshot = db.snapshot();
@@ -71,9 +71,9 @@ fn snapshots_pin_and_release_read_sequences() {
 
 #[test]
 fn write_batch_commits_multiple_buckets_at_one_sequence() {
-    let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-    let users = db.bucket("users").expect("users bucket opens");
-    let posts = db.bucket("posts").expect("posts bucket opens");
+    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let users = db.bucket_sync("users").expect("users bucket opens");
+    let posts = db.bucket_sync("posts").expect("posts bucket opens");
 
     let mut batch = WriteBatch::new();
     batch
@@ -84,12 +84,15 @@ fn write_batch_commits_multiple_buckets_at_one_sequence() {
         .expect("stage posts write");
 
     let info = db
-        .write(batch, WriteOptions::default())
+        .write_sync(batch, WriteOptions::default())
         .expect("batch commits");
     assert_eq!(info.sequence().get(), 1);
-    assert_eq!(users.get(b"1").expect("users read"), Some(b"ada".to_vec()));
     assert_eq!(
-        posts.get(b"1").expect("posts read"),
+        users.get_sync(b"1").expect("users read"),
+        Some(b"ada".to_vec())
+    );
+    assert_eq!(
+        posts.get_sync(b"1").expect("posts read"),
         Some(b"hello".to_vec())
     );
 }
@@ -112,8 +115,8 @@ fn named_batch_methods_reject_reserved_default_bucket_name() {
 
 #[test]
 fn failed_batch_does_not_partially_apply() {
-    let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-    let bucket = db.default_bucket().expect("bucket opens");
+    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
 
     let mut batch = WriteBatch::new();
     batch.put(b"a", b"visible only if batch commits");
@@ -122,31 +125,31 @@ fn failed_batch_does_not_partially_apply() {
         .expect("stage missing-bucket write");
 
     let error = db
-        .write(batch, WriteOptions::default())
+        .write_sync(batch, WriteOptions::default())
         .expect_err("missing bucket rejects whole batch");
     assert!(matches!(error, Error::BucketMissing { .. }));
-    assert_eq!(bucket.get(b"a").expect("no partial write"), None);
+    assert_eq!(bucket.get_sync(b"a").expect("no partial write"), None);
 }
 
 #[test]
 fn duplicate_keys_in_one_batch_use_later_operation() {
-    let db = Db::memory(DbOptions::memory()).expect("memory db opens");
-    let bucket = db.default_bucket().expect("bucket opens");
+    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
 
     let mut put_then_delete = WriteBatch::new();
     put_then_delete.put(b"a", b"v1");
     put_then_delete.delete(b"a");
-    db.write(put_then_delete, WriteOptions::default())
+    db.write_sync(put_then_delete, WriteOptions::default())
         .expect("batch commits");
-    assert_eq!(bucket.get(b"a").expect("later delete wins"), None);
+    assert_eq!(bucket.get_sync(b"a").expect("later delete wins"), None);
 
     let mut delete_then_put = WriteBatch::new();
     delete_then_put.delete(b"a");
     delete_then_put.put(b"a", b"v2");
-    db.write(delete_then_put, WriteOptions::default())
+    db.write_sync(delete_then_put, WriteOptions::default())
         .expect("batch commits");
     assert_eq!(
-        bucket.get(b"a").expect("later put wins"),
+        bucket.get_sync(b"a").expect("later put wins"),
         Some(b"v2".to_vec())
     );
 }

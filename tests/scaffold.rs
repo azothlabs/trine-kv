@@ -5,12 +5,13 @@ use trine_kv::{
 
 #[test]
 fn scaffold_exposes_v1_public_boundaries() {
-    let db = Db::open_memory().expect("memory db scaffold opens");
-    db.put(b"default-key", b"default-value")
+    let db = Db::open_memory_sync().expect("memory db scaffold opens");
+    db.put_sync(b"default-key", b"default-value")
         .expect("default bucket put works");
 
     assert_eq!(
-        db.get(b"default-key").expect("default bucket get works"),
+        db.get_sync(b"default-key")
+            .expect("default bucket get works"),
         Some(b"default-value".to_vec())
     );
     assert_eq!(db.snapshot().read_sequence(), Sequence::new(1));

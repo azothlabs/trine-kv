@@ -44,8 +44,10 @@ batch:
 `WriteOptions` can ask for a stronger mode, but cannot quietly weaken the mode
 selected at open time. With default options this floor is `Buffered`.
 
-`Db::persist(mode)` applies the same persistence request to the WAL. It does not
-force a memtable flush, run compaction, or rewrite already published tables.
+`Db::persist(mode).await` applies the same persistence request to the WAL
+through the primary async API. `Db::persist_sync(mode)` is the explicit sync
+adapter. Neither form forces a memtable flush, runs compaction, or rewrites
+already published tables.
 
 ## Host Persistent Backends
 
@@ -54,7 +56,7 @@ Host-selected persistent backends expose only the durability they can honestly
 provide:
 
 - WASI persistence uses the host-preopened filesystem path on WASI targets,
-  supports `Db::open_async` through that host boundary, and rejects `SyncData`
+  supports `Db::open` through that host boundary, and rejects `SyncData`
   and `SyncAll` until strict host sync guarantees are proven. Current WASI file
   work completes inline and does not advertise platform async I/O.
 - Browser persistence is async-only on `wasm32-unknown-unknown`. It accepts
@@ -62,8 +64,9 @@ provide:
   Locks writer lease for writable open, and uses WAL-backed async writes.
 
 Synchronous browser persistent open, mutation, bucket creation, and maintenance
-APIs return typed unsupported errors. Browser callers should use `Db::open_async`
-and the async write, bucket, flush, compaction, and maintenance methods.
+`*_sync` adapters return typed unsupported errors. Browser callers should use
+`Db::open` and the async write, bucket, flush, compaction, and maintenance
+methods.
 
 ## Commit Ordering
 
@@ -192,10 +195,12 @@ Automatic compaction may run after flush when L0 file pressure exceeds
 `DbOptions::max_l0_files`. Automatic L0 compaction can choose a local
 overlapping key span and leave unrelated L0 files for later passes. The same
 recovery and manifest-publish rules apply to manual and automatic compaction.
-`Db::flush()` is a foreground barrier for writes committed before the call:
-those writes must be published out of active and immutable memtables before the
-method returns `Ok(())`. `Db::compact_range()` waits for overlapping active
-compaction reservations instead of treating a busy maintenance guard as success.
+`Db::flush().await` and `Db::flush_sync()` are foreground barriers for writes
+committed before the call: those writes must be published out of active and
+immutable memtables before the method returns `Ok(())`.
+`Db::compact_range().await` and `Db::compact_range_sync()` wait for overlapping
+active compaction reservations instead of treating a busy maintenance guard as
+success.
 
 When immutable memtables or L0 files exceed configured limits, writes apply
 pressure handling before taking the writer coordinator. They may wait for the
@@ -244,9 +249,10 @@ not define live multi-process read coordination with a concurrent writer.
 
 - Use `SyncAll` for writes that must survive ordinary power loss as far as the
   platform can provide.
-- Call `Db::persist(SyncAll)` after a group of lower-durability writes when a
-  batch-level sync point is acceptable.
-- Call `Db::flush()` when reducing WAL replay time matters.
+- Call `Db::persist(SyncAll).await` or `Db::persist_sync(SyncAll)` after a group
+  of lower-durability writes when a batch-level sync point is acceptable.
+- Call `Db::flush().await` or `Db::flush_sync()` when reducing WAL replay time
+  matters.
 - Keep the whole database directory on one local filesystem.
 - Treat any fail-closed startup error as a signal to preserve the directory for
   inspection before deleting files.

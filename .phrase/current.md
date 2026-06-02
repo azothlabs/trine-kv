@@ -6,99 +6,72 @@ Complete
 
 ## Goal
 
-Close the async-first contract gap before release claims by making the primary
-persistent paths enter Trine through async storage operations, then narrowing or
-removing compatibility wrappers that still call blocking APIs.
+Make the public API read async-first before the first release candidate by
+giving primary names to async database, bucket, scan, lazy value, snapshot, and
+transaction operations, while keeping synchronous callers on explicit `*_sync`
+adapters.
 
 ## Scope
 
-- Phase 130: async contract closure.
-- Native persistent `Db::open_async` and recovery through async storage-trait
-  operations.
-- Native persistent async point reads, scans, lazy value reads, and maintenance
-  wrappers.
-- Public async compatibility audit for WASI host persistence and deeper
-  maintenance/WAL engine ownership.
-- Blocking native APIs remain available only as adapter surface.
+- Phase 131: async-first public API rename.
+- Public `Db`, `Bucket`, `BucketReader`, `Transaction`, `Snapshot`, `Iter`,
+  `LazyIter`, `LazyKeyValue`, and `LazyValue` method names.
+- Public `DbStats` sync-adapter field names.
+- README, usage docs, durability notes, changelog, examples, tests, and
+  benchmarks that demonstrate or depend on public API names.
+- No storage-format, MVCC, WAL, manifest, compaction, blob, recovery, or
+  transaction semantic changes.
 
 ## Out Of Scope
 
-- Changing table, WAL, manifest, MVCC, transaction, compaction, or blob storage
-  formats.
-- Reworking browser persistence behavior beyond keeping target checks green.
-- Publishing, tagging, or package release work.
-- Performance tuning unless async conversion exposes a blocking correctness
-  issue.
+- Replacing synchronous maintenance/WAL internals with a primary async engine.
+- Adding an in-browser runtime persistence fixture.
+- Publishing, tagging, or changing crate version metadata.
+- Changing pure in-memory builder APIs such as `WriteBatch::put` and staged
+  `Transaction::put`.
 
 ## Acceptance Gate
 
-- Native persistent `Db::open_async` does not delegate to blocking `Db::open`.
-- Native persistent async open uses async storage-trait operations for directory
-  creation, writer lease, safe temporary repair, manifest open/create, table
-  loading, recovery checks, and WAL recovery reads.
-- Persistent async open rejects runtimes that cannot provide wait support
-  instead of running blocking storage work inline.
-- Remaining async methods that can wait either use primary async paths or have
-  recorded blockers with tests proving the current behavior.
-- Native, WASI, and browser compile/clippy gates stay green.
+- Async operations own the primary public names, for example `Db::open`,
+  `db.put`, `db.get`, `db.flush`, `bucket.get`, `txn.commit`, `iter.next`, and
+  `value.read`.
+- Synchronous database/storage operations are available through explicit
+  `*_sync` adapters.
+- Pure builder/state helpers keep natural names when they do not trigger
+  storage work.
+- Public stats fields use `sync_adapter` naming for sync-adapter observability.
+- README, usage docs, examples, tests, and benchmarks compile against the new
+  names.
+- Full native verification and release-facing example gates pass.
 
 ## Active Task Slice
 
 ```text
-task546 [x] goal:route native persistent open_async through async storage path | scope:src/db.rs src/recovery.rs tests/async_api.rs | verify:cargo test --test async_api; cargo clippy --all-targets --all-features -- -D warnings; WASM target checks
-task547 [x] goal:convert native point/range async read wait boundaries | scope:src/db.rs src/bucket.rs src/transaction.rs src/iterator.rs src/lsm src/table.rs src/point_value.rs tests/async_api.rs | verify:cargo test --test async_api; cargo test --all-targets --all-features; WASM target checks
-task548 [x] goal:route native async maintenance wrappers through runtime blocking task boundary | scope:src/db.rs tests/async_api.rs | verify:cargo test --test async_api; cargo clippy --all-targets --all-features -- -D warnings
-task549 [x] goal:route WASI host persistent open_async away from blocking Db::open | scope:src/db.rs README.md docs/usage.md docs/durability.md CHANGELOG.md | verify:cargo test --lib; cargo test --all-targets --all-features; WASM target checks
-task550 [x] goal:classify primary async maintenance/WAL ownership boundary | scope:src/db.rs src/db/commit.rs src/wal.rs src/manifest.rs .phrase | verify:code audit plus full native/WASM gates
+task551 [x] goal:rename public API so async owns primary names | scope:src/db.rs src/bucket.rs src/transaction.rs src/snapshot.rs src/iterator.rs src/db/commit.rs | verify:cargo check --all-targets --all-features
+task552 [x] goal:update docs/examples/tests/benches to async-first names | scope:README.md docs examples tests benches CHANGELOG.md .phrase | verify:cargo fmt --check; cargo clippy --all-targets --all-features -- -D warnings; cargo test --all-targets --all-features; example gate
+task553 [x] goal:record phase evidence and commit | scope:.phrase/evidence.md git commit | verify:git diff --check; forbidden-term scan; clean staged diff
 ```
 
 ## Known Residuals
 
-- Native persistent async open still uses synchronous path metadata checks and
-  synchronous cleanup/background-worker startup after recovery has loaded.
-- Native `persist_async`, `flush_async`, compaction, maintenance, and
-  `close_async` now leave the caller thread through runtime blocking tasks, but
-  they still reuse synchronous engine internals rather than a primary async
-  maintenance/WAL implementation. This is recorded as follow-up hardening, not
-  a Phase 130 release blocker.
-- Native `persist_async` still reaches the synchronous WAL front door inside
-  the runtime task boundary.
-- The browser runtime fixture remains absent; browser coverage is still target
-  compilation and shared native tests.
+- Native async maintenance and WAL operations still use runtime task boundaries
+  over synchronous internals; this phase only fixes the public API contract.
+- Sync adapters intentionally remain for native and non-browser embeddings.
+- Browser runtime persistence still lacks an in-browser fixture.
 
 ## Evidence
 
-- Native persistent `Db::open_async` now creates directories, acquires writer
-  lease, repairs safe temporary files, opens/creates manifest state, loads
-  tables, runs recovery checks, and reads WAL recovery streams through async
-  storage-trait calls before building the same database state as blocking open.
-- `Db::open_persistent_async` and `Db::open_read_only_async` now route through
-  `Db::open_async`.
-- Persistent async open rejects inline runtime options with a typed unsupported
-  error before entering native storage waits.
-- Focused async tests cover WAL replay through persistent async reopen and
-  inline runtime rejection.
-- Native persistent async point reads, snapshot reads, bucket reads,
-  transaction reads, range scans, prefix scans, and lazy blob value reads now
-  await async table/blob storage helpers instead of delegating to blocking
-  public reads.
-- WASI host persistent `Db::open_async` now enters the same async
-  storage-trait persistent open path on WASI targets instead of delegating to
-  blocking `Db::open`; non-WASI targets still return `UnsupportedBackend`.
-- Native async maintenance wrappers now run their synchronous engine work on
-  runtime blocking tasks when a persistent native backend is present.
-- Native async write futures already submit accepted writes to the runtime
-  blocking task pool when the runtime supports it; this preserves the
-  unpolled-future no-side-effect rule and the polled-future owns-completion
-  rule covered by existing tests.
-- Focused async tests cover persistent lazy blob reads and native maintenance
-  wrapper task submission.
-- Verified with native clippy/tests and browser/WASI target checks, including
-  full `cargo test --all-targets --all-features`.
+- `cargo check --all-targets --all-features` passes after the public API rename.
+- `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings` pass.
+- `cargo test --all-targets --all-features` passes.
+- `cargo run --example quickstart`, `async_quickstart`, `user_store`, and
+  `event_index` pass.
+- `cargo check --target wasm32-unknown-unknown --lib` and
+  `cargo check --target wasm32-wasip1 --lib` pass.
+- `cargo package --list --allow-dirty`, `git diff --check`, and the
+  forbidden-term scan pass.
 
 ## Next Recommendation
 
-- Treat a primary async maintenance/WAL engine and an in-browser persistence
-  fixture as follow-up hardening, while keeping the current release claim
-  scoped to public async entry points, async storage reads/open, browser async
-  persistence, and native runtime task boundaries.
+- Commit the async-first public API rename, then return to release-candidate
+  verification and publish readiness.

@@ -145,14 +145,12 @@ impl LazyIter {
 }
 
 impl LazyKeyValue {
-    pub fn into_key_value(self) -> Result<KeyValue> {
-        Ok(KeyValue::new(self.key, self.value.into_value()?))
+    pub fn into_key_value_sync(self) -> Result<KeyValue> {
+        Ok(KeyValue::new(self.key, self.value.into_value_sync()?))
     }
-}
 
-impl LazyKeyValue {
-    pub async fn into_key_value_async(self) -> Result<KeyValue> {
-        let value = self.value.into_value_async().await?;
+    pub async fn into_key_value(self) -> Result<KeyValue> {
+        let value = self.value.into_value().await?;
         Ok(KeyValue::new(self.key, value))
     }
 }
@@ -163,7 +161,7 @@ impl LazyValue {
         matches!(self.inner, LazyValueInner::Inline(_))
     }
 
-    pub fn read(&self) -> Result<Value> {
+    pub fn read_sync(&self) -> Result<Value> {
         match &self.inner {
             LazyValueInner::Inline(bytes) => Ok(bytes.clone()),
             LazyValueInner::Blob {
@@ -184,7 +182,7 @@ impl LazyValue {
         }
     }
 
-    pub fn into_value(self) -> Result<Value> {
+    pub fn into_value_sync(self) -> Result<Value> {
         match self.inner {
             LazyValueInner::Inline(bytes) => Ok(bytes),
             LazyValueInner::Blob {
@@ -207,10 +205,8 @@ impl LazyValue {
             }
         }
     }
-}
 
-impl LazyValue {
-    pub async fn read_async(&self) -> Result<Value> {
+    pub async fn read(&self) -> Result<Value> {
         match &self.inner {
             LazyValueInner::Inline(bytes) => Ok(bytes.clone()),
             LazyValueInner::Blob {
@@ -236,11 +232,11 @@ impl LazyValue {
             LazyValueInner::Blob {
                 native_storage: None,
                 ..
-            } => self.read(),
+            } => self.read_sync(),
         }
     }
 
-    pub async fn into_value_async(self) -> Result<Value> {
+    pub async fn into_value(self) -> Result<Value> {
         match self.inner {
             LazyValueInner::Inline(bytes) => Ok(bytes),
             LazyValueInner::Blob {
@@ -286,17 +282,25 @@ impl LazyValue {
 }
 
 impl Iter {
-    pub async fn next_async(&mut self) -> Result<Option<KeyValue>> {
+    pub async fn next(&mut self) -> Result<Option<KeyValue>> {
         match &mut self.inner {
             IterInner::Items(items) => Ok(items.next()),
             IterInner::Lazy(scan) => scan.next_async().await,
         }
     }
+
+    pub fn next_sync(&mut self) -> Option<Result<KeyValue>> {
+        Iterator::next(self)
+    }
 }
 
 impl LazyIter {
-    pub async fn next_async(&mut self) -> Result<Option<LazyKeyValue>> {
+    pub async fn next(&mut self) -> Result<Option<LazyKeyValue>> {
         self.scan.next_lazy_async().await
+    }
+
+    pub fn next_sync(&mut self) -> Option<Result<LazyKeyValue>> {
+        Iterator::next(self)
     }
 }
 
@@ -336,14 +340,14 @@ struct LazyScan {
 impl LazyScan {
     fn next(&mut self) -> Option<Result<KeyValue>> {
         self.next_lazy()
-            .map(|item| item.and_then(LazyKeyValue::into_key_value))
+            .map(|item| item.and_then(LazyKeyValue::into_key_value_sync))
     }
 
     async fn next_async(&mut self) -> Result<Option<KeyValue>> {
         let Some(item) = self.next_lazy_async().await? else {
             return Ok(None);
         };
-        item.into_key_value_async().await.map(Some)
+        item.into_key_value().await.map(Some)
     }
 
     fn next_lazy(&mut self) -> Option<Result<LazyKeyValue>> {

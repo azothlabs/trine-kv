@@ -22,15 +22,16 @@ Initial packaged release candidate for the embedded LSM MVCC engine.
 - Read-only open, safe temporary file repair policy, durability notes, usage
   guide, quickstart examples, integration examples, release checklist, and
   benchmark baselines.
-- Async-compatible database, bucket, iterator, value, transaction, flush,
-  compaction, and maintenance APIs.
+- Async-first database, bucket, iterator, value, transaction, flush,
+  compaction, and maintenance APIs, with explicit `*_sync` adapters for
+  synchronous callers.
 - Runnable `async_quickstart` example covering async persistent open, writes,
   lazy scans, transaction commit, maintenance, read-only reopen, and storage
   runtime stats.
 - Native platform I/O capability reporting, fallback observability, bounded
-  blocking adapter stats, and cooperative maintenance budgets.
+  sync adapter stats, and cooperative maintenance budgets.
 - Explicit WASI persistent options for host-preopened filesystems on WASI
-  targets, including `Db::open_async` through the host storage boundary.
+  targets, including `Db::open` through the host storage boundary.
 - Browser persistent options backed by the async browser storage path on
   `wasm32-unknown-unknown`, including writable async open, Web Locks writer
   lease, WAL-backed async writes, async bucket creation, and async maintenance.

@@ -274,7 +274,7 @@ impl Runtime {
 
     pub(crate) fn spawn_blocking(&self, task: impl FnOnce() + Send + 'static) -> Result<()> {
         let Some(pool) = &self.blocking_pool else {
-            return Err(Error::unsupported("runtime blocking adapter"));
+            return Err(Error::unsupported("runtime sync adapter"));
         };
         pool.submit(Box::new(task))
     }
@@ -712,7 +712,7 @@ mod tests {
         assert!(matches!(error, Error::RuntimeBusy { .. }));
         let stats = runtime
             .blocking_adapter_stats()
-            .expect("blocking adapter stats exist");
+            .expect("sync adapter stats exist");
         assert_eq!(stats.worker_count, 1);
         assert_eq!(stats.queue_capacity, 1);
         assert_eq!(stats.queued_tasks, 1);
@@ -736,7 +736,7 @@ mod tests {
 
         let error = runtime
             .spawn_blocking(|| {})
-            .expect_err("inline runtime has no blocking adapter");
+            .expect_err("inline runtime has no sync adapter");
 
         assert!(matches!(error, Error::Unsupported { .. }));
     }
@@ -750,7 +750,7 @@ mod tests {
         ));
         let mut options = DbOptions::persistent(path.clone());
         options.runtime = RuntimeOptions::platform_io();
-        let error = Db::open(options).expect_err("platform I/O requires feature");
+        let error = Db::open_sync(options).expect_err("platform I/O requires feature");
 
         assert!(matches!(error, Error::UnsupportedBackend { .. }));
         let _ = std::fs::remove_dir_all(path);
@@ -766,7 +766,7 @@ mod tests {
         options.runtime = RuntimeOptions::inline();
         options.background_worker_count = 1;
 
-        let error = Db::open(options).expect_err("background threads are required");
+        let error = Db::open_sync(options).expect_err("background threads are required");
 
         assert!(matches!(error, Error::InvalidOptions { .. }));
     }

@@ -599,16 +599,16 @@ mod tests {
         );
 
         let first = iter
-            .next()
+            .next_sync()
             .expect("first row exists")
             .expect("first row reads");
         let second = iter
-            .next()
+            .next_sync()
             .expect("second row exists")
             .expect("second row reads");
         assert_eq!((first.key, first.value), (b"a".to_vec(), b"one".to_vec()));
         assert_eq!((second.key, second.value), (b"b".to_vec(), b"two".to_vec()));
-        assert!(iter.next().is_none());
+        assert!(iter.next_sync().is_none());
     }
 
     #[test]

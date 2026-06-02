@@ -44,9 +44,9 @@ struct EventLog {
 
 impl EventLog {
     fn open(path: &Path) -> Result<Self> {
-        let db = Db::open_persistent(path)?;
-        let events = db.bucket("events")?;
-        let by_account = db.bucket("events_by_account")?;
+        let db = Db::open_persistent_sync(path)?;
+        let events = db.bucket_sync("events")?;
+        let by_account = db.bucket_sync("events_by_account")?;
         Ok(Self {
             db,
             events,
@@ -62,30 +62,29 @@ impl EventLog {
             account_event_key(&event.account_id, &event.id),
             event.id.as_bytes(),
         )?;
-        self.db.write(batch, WriteOptions::sync_all())?;
+        self.db.write_sync(batch, WriteOptions::sync_all())?;
         Ok(())
     }
 
     fn events_for_account(&self, account_id: &str) -> Result<Vec<Event>> {
         self.by_account
-            .prefix(account_event_prefix(account_id))?
+            .prefix_sync(account_event_prefix(account_id))?
             .map(|item| {
                 let index = item?;
                 let event_id = std::str::from_utf8(&index.value)
                     .map_err(|_| invalid_event("index value is not UTF-8"))?;
-                let bytes =
-                    self.events
-                        .get(&event_key(event_id))?
-                        .ok_or_else(|| Error::Corruption {
-                            message: format!("event index points at missing event {event_id}"),
-                        })?;
+                let bytes = self.events.get_sync(&event_key(event_id))?.ok_or_else(|| {
+                    Error::Corruption {
+                        message: format!("event index points at missing event {event_id}"),
+                    }
+                })?;
                 Event::decode(&bytes)
             })
             .collect()
     }
 
     fn flush(&self) -> Result<()> {
-        self.db.flush()
+        self.db.flush_sync()
     }
 }
 

@@ -274,7 +274,7 @@ impl StorageCapability {
             Self::StrictMetadataSync => "strict metadata sync",
             Self::BackgroundThreads => "background threads",
             Self::AsyncTasks => "async tasks",
-            Self::BlockingAdapter => "blocking storage adapter",
+            Self::BlockingAdapter => "sync storage adapter",
             Self::PlatformAsyncIo => "platform async I/O",
             Self::CooperativeTasks => "cooperative tasks",
         }
@@ -4291,7 +4291,7 @@ mod tests {
             .open_read_blocking(table)
             .expect("read object opens without platform driver");
         let buffer = block_on_test_future(object.read_exact_at_owned(2, 3))
-            .expect("read completes through blocking adapter");
+            .expect("read completes through sync adapter");
         assert_eq!(buffer.offset(), 2);
         assert_eq!(&*buffer.into_bytes(), b"cde");
 

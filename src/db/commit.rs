@@ -511,7 +511,7 @@ impl Future for WriteFuture {
 }
 
 impl Db {
-    pub fn write(&self, batch: WriteBatch, options: WriteOptions) -> Result<CommitInfo> {
+    pub fn write_sync(&self, batch: WriteBatch, options: WriteOptions) -> Result<CommitInfo> {
         if self.inner.options.storage_mode.is_browser_persistent() {
             return Err(Error::unsupported_backend(
                 "browser persistent writes require async API",
@@ -522,7 +522,7 @@ impl Db {
 
     #[must_use = "write futures do nothing unless polled"]
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    pub fn write_async(
+    pub fn write(
         &self,
         batch: WriteBatch,
         options: WriteOptions,
@@ -531,7 +531,7 @@ impl Db {
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    pub fn write_async(
+    pub fn write(
         &self,
         batch: WriteBatch,
         options: WriteOptions,
@@ -1288,7 +1288,7 @@ mod tests {
 
     #[test]
     fn accepted_write_completion_delivers_success_result() {
-        let db = Db::open_memory().expect("memory db opens");
+        let db = Db::open_memory_sync().expect("memory db opens");
         let mut batch = WriteBatch::new();
         batch.put(b"k".to_vec(), b"v".to_vec());
         let request = WriteRequest::batch(batch, WriteOptions::default());
@@ -1299,7 +1299,7 @@ mod tests {
 
         assert_eq!(commit.sequence(), db.last_committed_sequence());
         assert_eq!(
-            db.get(b"k").expect("read committed key"),
+            db.get_sync(b"k").expect("read committed key"),
             Some(b"v".to_vec())
         );
     }
@@ -1308,7 +1308,7 @@ mod tests {
     fn accepted_write_completion_delivers_error_result() {
         let mut options = DbOptions::memory();
         options.read_only = true;
-        let db = Db::memory(options).expect("read-only memory db opens");
+        let db = Db::memory_sync(options).expect("read-only memory db opens");
         let mut batch = WriteBatch::new();
         batch.put(b"k".to_vec(), b"v".to_vec());
         let request = WriteRequest::batch(batch, WriteOptions::default());
@@ -1318,13 +1318,13 @@ mod tests {
         let error = waiter.wait().expect_err("waiter receives commit error");
 
         assert!(matches!(error, Error::ReadOnly));
-        assert_eq!(db.get(b"k").expect("read missing key"), None);
+        assert_eq!(db.get_sync(b"k").expect("read missing key"), None);
     }
 
     #[test]
     fn accepted_write_preflight_creates_writer_local_state_without_publication() {
-        let db = Db::open_memory().expect("memory db opens");
-        db.bucket("events").expect("named bucket opens");
+        let db = Db::open_memory_sync().expect("memory db opens");
+        db.bucket_sync("events").expect("named bucket opens");
         let mut batch = WriteBatch::new();
         batch.put(b"default".to_vec(), b"v1".to_vec());
         batch
@@ -1351,7 +1351,10 @@ mod tests {
             ["default", "events"]
         );
         assert_eq!(db.last_committed_sequence(), Sequence::ZERO);
-        assert_eq!(db.get(b"default").expect("preflight is not visible"), None);
+        assert_eq!(
+            db.get_sync(b"default").expect("preflight is not visible"),
+            None
+        );
 
         assert_eq!(prepared.deltas.len(), 2);
         assert_eq!(prepared.touched_states.len(), 2);
@@ -1394,7 +1397,7 @@ mod tests {
 
     #[test]
     fn writer_local_preparation_groups_same_bucket_delta_with_bounds() {
-        let db = Db::open_memory().expect("memory db opens");
+        let db = Db::open_memory_sync().expect("memory db opens");
         let mut batch = WriteBatch::new();
         batch.put(b"b".to_vec(), b"v".to_vec());
         batch.delete(b"a".to_vec());
@@ -1446,7 +1449,7 @@ mod tests {
         let path = temp_db_path("preaccept-wal");
         let mut options = DbOptions::persistent(&path).with_durability(DurabilityMode::Flush);
         options.background_worker_count = 0;
-        let db = Db::open(options).expect("persistent db opens");
+        let db = Db::open_sync(options).expect("persistent db opens");
         let mut batch = WriteBatch::new();
         batch.put(b"k".to_vec(), b"v".to_vec());
         let request = WriteRequest::batch(batch, WriteOptions::flush());
@@ -1469,7 +1472,7 @@ mod tests {
         ));
         assert_eq!(db.last_committed_sequence(), Sequence::ZERO);
         assert_eq!(
-            db.get(b"k").expect("preaccepted write is not visible"),
+            db.get_sync(b"k").expect("preaccepted write is not visible"),
             None
         );
         let wal_batches = wal::read_all_batches(&path).expect("WAL reads");
@@ -1491,7 +1494,7 @@ mod tests {
             .expect("mark preaccepted commit visible");
         assert_eq!(db.last_committed_sequence(), Sequence::new(1));
         assert_eq!(
-            db.get(b"k").expect("published write reads"),
+            db.get_sync(b"k").expect("published write reads"),
             Some(b"v".to_vec())
         );
 
@@ -1505,7 +1508,7 @@ mod tests {
         let path = temp_db_path("transaction-wal-after-sequence");
         let mut options = DbOptions::persistent(&path).with_durability(DurabilityMode::Flush);
         options.background_worker_count = 0;
-        let db = Db::open(options).expect("persistent db opens");
+        let db = Db::open_sync(options).expect("persistent db opens");
         let mut batch = WriteBatch::new();
         batch.put(b"k".to_vec(), b"txn".to_vec());
         let request = WriteRequest::transaction(
@@ -1557,7 +1560,7 @@ mod tests {
         assert_eq!(wal_batches.len(), 1);
         assert_eq!(wal_batches[0].sequence, Sequence::new(1));
         assert_eq!(
-            db.get(b"k")
+            db.get_sync(b"k")
                 .expect("WAL-accepted transaction is not visible"),
             None
         );
@@ -1578,7 +1581,7 @@ mod tests {
             .mark_visible(visible_slot)
             .expect("mark transaction visible");
         assert_eq!(
-            db.get(b"k").expect("transaction write is visible"),
+            db.get_sync(b"k").expect("transaction write is visible"),
             Some(b"txn".to_vec())
         );
 
@@ -1589,7 +1592,7 @@ mod tests {
 
     #[test]
     fn writer_local_state_publishes_under_memtable_lock_after_sequence() {
-        let db = Db::open_memory().expect("memory db opens");
+        let db = Db::open_memory_sync().expect("memory db opens");
         let mut batch = WriteBatch::new();
         batch.put(b"k".to_vec(), b"v".to_vec());
         let request = WriteRequest::batch(batch, WriteOptions::default());
@@ -1610,7 +1613,10 @@ mod tests {
         assert!(!published.request_flush);
         assert_eq!(published.commit_info.sequence(), Sequence::new(1));
         assert_eq!(db.last_committed_sequence(), Sequence::ZERO);
-        assert_eq!(db.get(b"k").expect("published slot is not visible"), None);
+        assert_eq!(
+            db.get_sync(b"k").expect("published slot is not visible"),
+            None
+        );
         let visible_slot = published.visible_slot.expect("published write has slot");
         db.inner
             .commit_tracker
@@ -1618,7 +1624,7 @@ mod tests {
             .expect("mark published write visible");
         assert_eq!(db.last_committed_sequence(), Sequence::new(1));
         assert_eq!(
-            db.get(b"k").expect("read committed key"),
+            db.get_sync(b"k").expect("read committed key"),
             Some(b"v".to_vec())
         );
         let state = db.bucket_state("default").expect("default bucket state");
@@ -1640,7 +1646,7 @@ mod tests {
 
     #[test]
     fn visible_sequence_waits_for_earlier_published_slot_completion() {
-        let db = Db::open_memory().expect("memory db opens");
+        let db = Db::open_memory_sync().expect("memory db opens");
         let mut first_batch = WriteBatch::new();
         first_batch.put(b"k".to_vec(), b"v1".to_vec());
         let first_request = WriteRequest::batch(first_batch, WriteOptions::default());
@@ -1672,7 +1678,7 @@ mod tests {
         assert_eq!(second_published.commit_info.sequence(), Sequence::new(2));
 
         assert_eq!(db.last_committed_sequence(), Sequence::ZERO);
-        assert_eq!(db.get(b"k").expect("published writes are gated"), None);
+        assert_eq!(db.get_sync(b"k").expect("published writes are gated"), None);
 
         db.inner
             .commit_tracker
@@ -1680,7 +1686,7 @@ mod tests {
             .expect("mark second slot visible");
         assert_eq!(db.last_committed_sequence(), Sequence::ZERO);
         assert_eq!(
-            db.get(b"k").expect("visible sequence waits for first"),
+            db.get_sync(b"k").expect("visible sequence waits for first"),
             None
         );
 
@@ -1690,7 +1696,7 @@ mod tests {
             .expect("mark first slot visible");
         assert_eq!(db.last_committed_sequence(), Sequence::new(2));
         assert_eq!(
-            db.get(b"k").expect("latest visible key"),
+            db.get_sync(b"k").expect("latest visible key"),
             Some(b"v2".to_vec())
         );
     }
@@ -1699,16 +1705,19 @@ mod tests {
     fn in_memory_write_budget_merges_deltas_without_active_mirror() {
         let mut options = DbOptions::memory();
         options.write_buffer_bytes = 1;
-        let db = Db::memory(options).expect("memory db opens");
+        let db = Db::memory_sync(options).expect("memory db opens");
 
-        db.put(b"k", b"v1").expect("first write");
+        db.put_sync(b"k", b"v1").expect("first write");
         let snapshot = db.snapshot();
-        db.put(b"k", b"v2").expect("second write");
+        db.put_sync(b"k", b"v2").expect("second write");
 
-        assert_eq!(db.get(b"k").expect("current read"), Some(b"v2".to_vec()));
+        assert_eq!(
+            db.get_sync(b"k").expect("current read"),
+            Some(b"v2".to_vec())
+        );
         assert_eq!(
             snapshot
-                .get(&db.default_bucket().expect("default bucket"), b"k")
+                .get_sync(&db.default_bucket_sync().expect("default bucket"), b"k")
                 .expect("snapshot read"),
             Some(b"v1".to_vec())
         );

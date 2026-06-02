@@ -68,12 +68,16 @@ impl Transaction {
     }
 
     /// Reads a default-bucket key and tracks it for commit conflict checks.
-    pub fn get(&mut self, key: &[u8]) -> Result<Option<Value>> {
-        self.get_bucket(DEFAULT_BUCKET_NAME, key)
+    pub fn get_sync(&mut self, key: &[u8]) -> Result<Option<Value>> {
+        self.get_bucket_sync(DEFAULT_BUCKET_NAME, key)
     }
 
     /// Reads a named-bucket key and tracks it for commit conflict checks.
-    pub fn get_bucket(&mut self, bucket: impl Into<String>, key: &[u8]) -> Result<Option<Value>> {
+    pub fn get_bucket_sync(
+        &mut self,
+        bucket: impl Into<String>,
+        key: &[u8],
+    ) -> Result<Option<Value>> {
         let bucket = bucket.into();
         let value = self.db.get_at_sequence(&bucket, key, self.read_sequence)?;
         // Record the exact user key read at the transaction's read sequence.
@@ -88,12 +92,16 @@ impl Transaction {
     }
 
     /// Reads a default-bucket range and tracks it for commit conflict checks.
-    pub fn read_range(&mut self, range: KeyRange) -> Result<()> {
-        self.read_range_bucket(DEFAULT_BUCKET_NAME, range)
+    pub fn read_range_sync(&mut self, range: KeyRange) -> Result<()> {
+        self.read_range_bucket_sync(DEFAULT_BUCKET_NAME, range)
     }
 
     /// Reads a named-bucket range and tracks it for commit conflict checks.
-    pub fn read_range_bucket(&mut self, bucket: impl Into<String>, range: KeyRange) -> Result<()> {
+    pub fn read_range_bucket_sync(
+        &mut self,
+        bucket: impl Into<String>,
+        range: KeyRange,
+    ) -> Result<()> {
         self.db.ensure_open()?;
         let bucket = bucket.into();
         let iter = self.db.range_at_sequence(
@@ -158,7 +166,7 @@ impl Transaction {
         self.writes.delete_range_bucket(bucket, range)
     }
 
-    pub fn commit(self) -> Result<CommitInfo> {
+    pub fn commit_sync(self) -> Result<CommitInfo> {
         let read_set = TransactionReadSet {
             point_reads: self.point_reads,
             range_reads: self.range_reads,
@@ -173,14 +181,15 @@ impl Transaction {
     }
 }
 
-/// Additive async compatibility methods for transaction callers.
+/// Primary async transaction read/commit API. Staged write builders stay
+/// synchronous because they only mutate the in-memory transaction batch.
 #[allow(clippy::unused_async)]
 impl Transaction {
-    pub async fn get_async(&mut self, key: &[u8]) -> Result<Option<Value>> {
-        self.get_bucket_async(DEFAULT_BUCKET_NAME, key).await
+    pub async fn get(&mut self, key: &[u8]) -> Result<Option<Value>> {
+        self.get_bucket(DEFAULT_BUCKET_NAME, key).await
     }
 
-    pub async fn get_bucket_async(
+    pub async fn get_bucket(
         &mut self,
         bucket: impl Into<String>,
         key: &[u8],
@@ -198,12 +207,11 @@ impl Transaction {
         Ok(value)
     }
 
-    pub async fn read_range_async(&mut self, range: KeyRange) -> Result<()> {
-        self.read_range_bucket_async(DEFAULT_BUCKET_NAME, range)
-            .await
+    pub async fn read_range(&mut self, range: KeyRange) -> Result<()> {
+        self.read_range_bucket(DEFAULT_BUCKET_NAME, range).await
     }
 
-    pub async fn read_range_bucket_async(
+    pub async fn read_range_bucket(
         &mut self,
         bucket: impl Into<String>,
         range: KeyRange,
@@ -219,13 +227,13 @@ impl Transaction {
                 crate::Direction::Forward,
             )
             .await?;
-        while iter.next_async().await?.is_some() {}
+        while iter.next().await?.is_some() {}
         self.range_reads.push(ReadRange { bucket, range });
 
         Ok(())
     }
 
-    pub async fn commit_async(self) -> Result<CommitInfo> {
+    pub async fn commit(self) -> Result<CommitInfo> {
         let read_set = TransactionReadSet {
             point_reads: self.point_reads,
             range_reads: self.range_reads,
