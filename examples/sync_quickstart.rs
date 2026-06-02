@@ -1,6 +1,4 @@
-use trine_kv::{
-    Db, DbOptions, DurabilityMode, KeyRange, TransactionOptions, WriteBatch, WriteOptions,
-};
+use trine_kv::{Db, DbOptions, KeyRange, TransactionOptions, WriteBatch, WriteOptions};
 
 fn main() -> trine_kv::Result<()> {
     let path =
@@ -9,15 +7,15 @@ fn main() -> trine_kv::Result<()> {
         std::fs::remove_dir_all(&path)?;
     }
 
-    let db = Db::open_sync(DbOptions::persistent(&path).with_durability(DurabilityMode::Flush))?;
+    let db = Db::open_sync(DbOptions::persistent(&path))?;
     let users = db.bucket_sync("users")?;
 
-    users.put_with_options_sync(b"user:001", b"Ada", WriteOptions::sync_all())?;
+    users.put_sync(b"user:001", b"Ada")?;
 
     let mut batch = WriteBatch::new();
     batch.put_bucket("users", b"user:002", b"Lin")?;
     batch.put_bucket("users", b"team:core", b"database")?;
-    db.write_sync(batch, WriteOptions::sync_all())?;
+    db.write_sync(batch, WriteOptions::default())?;
 
     assert_eq!(users.get_sync(b"user:001")?, Some(b"Ada".to_vec()));
 
@@ -48,7 +46,6 @@ fn main() -> trine_kv::Result<()> {
     txn.commit_sync()?;
 
     db.flush_sync()?;
-    db.persist_sync(DurabilityMode::SyncAll)?;
     drop(users);
     drop(snapshot);
     drop(db);

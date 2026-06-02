@@ -42,7 +42,11 @@ batch:
 
 `DbOptions::durability` is the database-level durability floor. Per-write
 `WriteOptions` can ask for a stronger mode, but cannot quietly weaken the mode
-selected at open time. With default options this floor is `Buffered`.
+selected at open time. Native persistent options default this floor to
+`SyncAll`, so ordinary `Db::open_persistent`/`DbOptions::persistent` callers get
+database-style durability for confirmed writes. `Buffered` is available only
+when callers explicitly choose it for data that can tolerate losing recent
+confirmed writes after a crash or power loss.
 
 `Db::persist(mode).await` applies the same persistence request to the WAL
 through the primary async API. `Db::persist_sync(mode)` is the explicit sync
@@ -56,12 +60,14 @@ Host-selected persistent backends expose only the durability they can honestly
 provide:
 
 - WASI persistence uses the host-preopened filesystem path on WASI targets,
-  supports `Db::open` through that host boundary, and rejects `SyncData`
-  and `SyncAll` until strict host sync guarantees are proven. Current WASI file
-  work completes inline and does not advertise platform async I/O.
+  supports `Db::open` through that host boundary, defaults to `Flush`, and
+  rejects `SyncData` and `SyncAll` until strict host sync guarantees are proven.
+  Current WASI file work completes inline and does not advertise platform async
+  I/O.
 - Browser persistence is async-only on `wasm32-unknown-unknown`. It accepts
-  `Buffered` and `Flush`, rejects `SyncData` and `SyncAll`, acquires a Web
-  Locks writer lease for writable open, and uses WAL-backed async writes.
+  `Buffered` and `Flush`, defaults to `Flush`, rejects `SyncData` and
+  `SyncAll`, acquires a Web Locks writer lease for writable open, and uses
+  WAL-backed async writes.
 
 Synchronous browser persistent open, mutation, bucket creation, and maintenance
 `*_sync` adapters return typed unsupported errors. Browser callers should use
@@ -247,10 +253,13 @@ not define live multi-process read coordination with a concurrent writer.
 
 ## Operational Guidance
 
-- Use `SyncAll` for writes that must survive ordinary power loss as far as the
-  platform can provide.
+- Native persistent open already defaults to `SyncAll`; keep that default for
+  ordinary database data.
+- Use `Buffered` only for caches, indexes, or other data that can tolerate
+  losing recent confirmed writes after a crash or power loss.
 - Call `Db::persist(SyncAll).await` or `Db::persist_sync(SyncAll)` after a group
-  of lower-durability writes when a batch-level sync point is acceptable.
+  of explicit lower-durability writes when a batch-level sync point is
+  acceptable.
 - Call `Db::flush().await` or `Db::flush_sync()` when reducing WAL replay time
   matters.
 - Keep the whole database directory on one local filesystem.

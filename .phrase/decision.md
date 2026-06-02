@@ -66,6 +66,9 @@ Evidence notes should separate:
 - Persistent storage behavior is governed by backend capabilities, including
   writer lease, manifest publish, durability strength, and background-work
   support.
+- Native persistent constructors default to safety-first durability for
+  confirmed writes. Lower durability modes such as `Buffered` are explicit
+  advanced choices for data that can tolerate losing recent confirmed writes.
 - WASI and browser persistence must be selected through explicit host backend
   options. WASI persistence may use the host-preopened filesystem on WASI
   targets; browser persistence must fail as `UnsupportedBackend` until its

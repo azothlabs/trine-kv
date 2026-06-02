@@ -62,7 +62,7 @@ impl EventLog {
             account_event_key(&event.account_id, &event.id),
             event.id.as_bytes(),
         )?;
-        self.db.write_sync(batch, WriteOptions::sync_all())?;
+        self.db.write_sync(batch, WriteOptions::default())?;
         Ok(())
     }
 

@@ -6,7 +6,7 @@ use std::{
 };
 
 use trine_kv::{
-    BlobGcRatio, BlobLevelMergePolicy, BucketOptions, Db, DbOptions, FilterPolicy,
+    BlobGcRatio, BlobLevelMergePolicy, BucketOptions, Db, DbOptions, DurabilityMode, FilterPolicy,
     IndexSearchPolicy, KeyRange, PrefixExtractor, PrefixFilterPolicy, RuntimeOptions,
     TransactionOptions, WriteBatch, WriteOptions,
     codec::{BlockCodec, FastLz4BlockCodec, NoneCodec},
@@ -98,6 +98,10 @@ fn measure(name: &'static str, iterations: usize, mut run: impl FnMut() -> u64) 
         elapsed: start.elapsed(),
         checksum,
     }
+}
+
+fn benchmark_persistent_options(path: impl Into<PathBuf>) -> DbOptions {
+    DbOptions::persistent(path).with_durability(DurabilityMode::Buffered)
 }
 
 fn bench_single_key_put() -> BenchResult {
@@ -214,7 +218,7 @@ fn bench_prefix_scan() -> BenchResult {
 
 fn bench_prefix_partition_scans() -> Vec<BenchResult> {
     let dir = temp_dir("prefix-partition");
-    let mut options = DbOptions::persistent(&dir);
+    let mut options = benchmark_persistent_options(&dir);
     options.default_bucket_options = prefix_options(true);
     let db = Db::open_sync(options).expect("persistent db opens");
     let bucket = db.default_bucket_sync().expect("bucket opens");
@@ -313,7 +317,7 @@ fn bench_transaction_conflict() -> BenchResult {
 fn bench_wal_replay() -> BenchResult {
     measure("WAL replay", ROWS, || {
         let dir = temp_dir("wal-replay");
-        let options = DbOptions::persistent(&dir);
+        let options = benchmark_persistent_options(&dir);
         {
             let db = Db::open_sync(options.clone()).expect("persistent db opens");
             let bucket = db.default_bucket_sync().expect("bucket opens");
@@ -338,7 +342,7 @@ fn bench_wal_replay() -> BenchResult {
 fn bench_flush_throughput() -> BenchResult {
     measure("flush throughput", ROWS, || {
         let dir = temp_dir("flush");
-        let db = Db::open_sync(DbOptions::persistent(&dir)).expect("persistent db opens");
+        let db = Db::open_sync(benchmark_persistent_options(&dir)).expect("persistent db opens");
         let bucket = db.default_bucket_sync().expect("bucket opens");
         for index in 0..ROWS {
             bucket
@@ -356,7 +360,7 @@ fn bench_flush_throughput() -> BenchResult {
 fn bench_compaction_throughput() -> BenchResult {
     measure("compaction throughput", ROWS, || {
         let dir = temp_dir("compact");
-        let db = Db::open_sync(DbOptions::persistent(&dir)).expect("persistent db opens");
+        let db = Db::open_sync(benchmark_persistent_options(&dir)).expect("persistent db opens");
         let bucket = db.default_bucket_sync().expect("bucket opens");
         for chunk in 0..4 {
             for index in 0..(ROWS / 4) {
@@ -397,12 +401,12 @@ fn bench_large_inline_values() -> BenchResult {
 fn bench_separated_blob_values() -> BenchResult {
     measure("separated blob values", 256, || {
         let dir = temp_dir("blob");
-        let db = Db::open_sync(DbOptions::persistent(&dir).with_default_bucket_options(
-            BucketOptions {
+        let db = Db::open_sync(
+            benchmark_persistent_options(&dir).with_default_bucket_options(BucketOptions {
                 blob_threshold_bytes: 4 * 1024,
                 ..BucketOptions::default()
-            },
-        ))
+            }),
+        )
         .expect("persistent db opens");
         let bucket = db.default_bucket_sync().expect("bucket opens");
         let value = vec![b'x'; 16 * 1024];
@@ -482,7 +486,7 @@ fn bench_blob_range_lazy_keys() -> BenchResult {
 fn bench_blob_gc_rewrite() -> BenchResult {
     measure("blob GC rewrite", LARGE_ROWS, || {
         let dir = temp_dir("blob-gc");
-        let mut options = DbOptions::persistent(&dir);
+        let mut options = benchmark_persistent_options(&dir);
         options.blob_gc_min_file_bytes = 1;
         options.blob_gc_discardable_ratio = BlobGcRatio::from_millionths(300_000);
         options.default_bucket_options = BucketOptions {
@@ -521,7 +525,7 @@ fn bench_blob_gc_rewrite() -> BenchResult {
 fn bench_blob_level_merge() -> BenchResult {
     measure("blob level merge", LARGE_ROWS, || {
         let dir = temp_dir("blob-level-merge");
-        let mut options = DbOptions::persistent(&dir);
+        let mut options = benchmark_persistent_options(&dir);
         options.blob_gc_enabled = false;
         options.default_bucket_options = BucketOptions {
             blob_level_merge_policy: BlobLevelMergePolicy::Always,
@@ -575,7 +579,7 @@ fn bench_block_cache_warm_read() -> BenchResult {
 fn bench_cold_table_read() -> BenchResult {
     measure("cold table read", 32, || {
         let dir = temp_dir("cold-read");
-        let options = DbOptions::persistent(&dir);
+        let options = benchmark_persistent_options(&dir);
         {
             let db = Db::open_sync(options.clone()).expect("persistent db opens");
             let bucket = db.default_bucket_sync().expect("bucket opens");
@@ -622,7 +626,7 @@ fn bench_runtime_block_decode_read(
     runtime: RuntimeOptions,
 ) -> BenchResult {
     let dir = temp_dir(dir_name);
-    let mut options = DbOptions::persistent(&dir);
+    let mut options = benchmark_persistent_options(&dir);
     options.runtime = runtime;
     options.block_cache_bytes = 0;
     if !runtime.capabilities().background_threads() {
@@ -736,7 +740,7 @@ fn bench_long_shared_prefix_get() -> BenchResult {
         block_bytes: 512,
         ..BucketOptions::default()
     };
-    let mut options = DbOptions::persistent(&dir);
+    let mut options = benchmark_persistent_options(&dir);
     options.default_bucket_options = bucket_options;
     let db = Db::open_sync(options).expect("persistent db opens");
     let bucket = db.default_bucket_sync().expect("bucket opens");
@@ -869,7 +873,7 @@ fn populated_delta_memory_db(rows: usize) -> Db {
 
 fn populated_active_memtable_db(name: &str, rows: usize) -> (PathBuf, Db, trine_kv::Bucket) {
     let dir = temp_dir(name);
-    let mut options = DbOptions::persistent(&dir);
+    let mut options = benchmark_persistent_options(&dir);
     options.background_worker_count = 0;
     options.write_buffer_bytes = 64 * 1024 * 1024;
     let db = Db::open_sync(options).expect("persistent db opens");
@@ -972,7 +976,7 @@ fn flushed_persistent_db(
     bucket_options: BucketOptions,
 ) -> (PathBuf, Db, trine_kv::Bucket) {
     let dir = temp_dir(name);
-    let mut options = DbOptions::persistent(&dir);
+    let mut options = benchmark_persistent_options(&dir);
     options.default_bucket_options = bucket_options;
     let db = Db::open_sync(options).expect("persistent db opens");
     let bucket = db.default_bucket_sync().expect("bucket opens");
@@ -987,7 +991,7 @@ fn flushed_persistent_db(
 
 fn large_blob_db(name: &str, rows: usize) -> (PathBuf, Db, trine_kv::Bucket) {
     let dir = temp_dir(name);
-    let mut options = DbOptions::persistent(&dir);
+    let mut options = benchmark_persistent_options(&dir);
     options.default_bucket_options = large_blob_options();
     let db = Db::open_sync(options).expect("persistent db opens");
     let bucket = db.default_bucket_sync().expect("bucket opens");

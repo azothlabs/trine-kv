@@ -74,21 +74,8 @@ let db = Db::open_persistent("./trine-data").await?;
 ```
 
 Persistent mode creates the directory when `create_if_missing` is true and the
-database is not opened read-only.
-
-Open with explicit options when the host wants Trine to expose storage waits as
-futures:
-
-```rust
-use trine_kv::{Db, DbOptions, DurabilityMode};
-
-let db = Db::open(
-    DbOptions::persistent("./trine-data").with_durability(DurabilityMode::Flush),
-)
-.await?;
-db.put(b"user:001".to_vec(), b"Ada".to_vec()).await?;
-db.flush().await?;
-```
+database is not opened read-only. On native targets, this default prioritizes
+database-style durability for confirmed writes.
 
 On native targets, async persistent open, point reads, scans, and lazy value
 reads enter Trine's storage boundary through async helpers. Native async writes
@@ -99,23 +86,21 @@ complete checked path.
 Synchronous callers can use explicit `*_sync` adapters:
 
 ```rust
-use trine_kv::{Db, DbOptions, DurabilityMode};
+use trine_kv::Db;
 
-let db = Db::open_sync(
-    DbOptions::persistent("./trine-data").with_durability(DurabilityMode::Flush),
-)?;
+let db = Db::open_persistent_sync("./trine-data")?;
 db.put_sync(b"user:001", b"Ada")?;
 db.flush_sync()?;
 ```
 
-Set a database-level durability floor when every write should be at least that
-durable:
+Use an explicit lower durability mode only when the data can tolerate losing
+recent confirmed writes after a crash or power loss:
 
 ```rust
-use trine_kv::DurabilityMode;
+use trine_kv::{Db, DbOptions, DurabilityMode};
 
 let db = Db::open(
-    DbOptions::persistent("./trine-data").with_durability(DurabilityMode::Flush),
+    DbOptions::persistent("./trine-data").with_durability(DurabilityMode::Buffered),
 )
 .await?;
 ```
@@ -161,7 +146,9 @@ let wasi_sync = Db::open_sync(DbOptions::wasi_persistent("./trine-data"))?;
 Strict sync durability is not claimed for WASI yet; `SyncData` and `SyncAll`
 return `UnsupportedDurability`. On non-WASI targets, the same option returns
 `UnsupportedBackend`. Current WASI file work completes inline through the host
-filesystem boundary, so it does not report `PlatformAsyncIo`.
+filesystem boundary, so it does not report `PlatformAsyncIo`. WASI persistent
+options default to `Flush`, the strongest currently accepted mode for that
+backend.
 
 Browser persistence is async-only on `wasm32-unknown-unknown`. Use `Db::open`
 and the async mutation and maintenance APIs:
@@ -178,7 +165,9 @@ WAL-backed async writes. Browser storage accepts `Buffered` and `Flush`;
 `SyncData` and `SyncAll` return `UnsupportedDurability`. Synchronous browser
 persistent open, synchronous mutation, synchronous bucket creation, and
 synchronous maintenance return typed unsupported errors. On non-browser targets,
-browser persistent async open returns `UnsupportedBackend`.
+browser persistent async open returns `UnsupportedBackend`. Browser persistent
+options default to `Flush`, the strongest currently accepted mode for that
+backend.
 
 Read-only browser open is also async:
 
@@ -253,14 +242,6 @@ users.put_sync(b"user:002", b"Lin")?;
 assert_eq!(users.get_sync(b"user:001")?, Some(b"Ada".to_vec()));
 ```
 
-Use `put_with_options` when a single-key helper needs explicit durability:
-
-```rust
-use trine_kv::WriteOptions;
-
-users.put_with_options_sync(b"user:003", b"Grace", WriteOptions::sync_all())?;
-```
-
 Deletes use the same bucket handle:
 
 ```rust
@@ -289,7 +270,7 @@ batch.delete_bucket("users", b"user:001")?;
 
 let commit = db.write_sync(
     batch,
-    WriteOptions::sync_all(),
+    WriteOptions::default(),
 )?;
 
 println!("committed sequence {}", commit.sequence().get());
@@ -411,7 +392,8 @@ same bucket-name validation used by `WriteBatch`.
 ## Durability
 
 For persistent databases, committed writes append to the WAL before becoming
-visible in memtables. Choose a durability mode per write:
+visible in memtables. Native persistent opens default to safety-first
+durability, so ordinary writes can use the default write options:
 
 ```rust
 use trine_kv::{WriteBatch, WriteOptions};
@@ -421,14 +403,14 @@ batch.put_bucket("users", b"user:006", b"Edsger")?;
 
 db.write_sync(
     batch,
-    WriteOptions::sync_all(),
+    WriteOptions::default(),
 )?;
 ```
 
 `DbOptions::durability` is a database-level floor. Per-write options can ask for
-a stronger mode, but they cannot weaken the mode chosen at open time.
-
-Use `Db::persist_sync` as an explicit WAL sync point:
+a stronger mode, but they cannot weaken the mode chosen at open time. If a
+database was explicitly opened with lower durability for rebuildable data, use
+`Db::persist_sync` as an explicit WAL sync point:
 
 ```rust
 use trine_kv::DurabilityMode;
@@ -436,7 +418,8 @@ use trine_kv::DurabilityMode;
 db.persist_sync(DurabilityMode::SyncAll)?;
 ```
 
-Read [durability.md](durability.md) before choosing a mode for production data.
+Read [durability.md](durability.md) before lowering durability for production
+data.
 
 ## Large Values And Blob GC
 

@@ -1,5 +1,6 @@
 use trine_kv::{
-    CompressionProfile, Db, Direction, KeyRange, PrefixExtractor, Sequence, WriteBatch,
+    CompressionProfile, Db, DbOptions, Direction, DurabilityMode, KeyRange, PrefixExtractor,
+    Sequence, WriteBatch,
     codec::{BlockCodec, CodecId, FastLz4BlockCodec, NoneCodec},
 };
 
@@ -47,4 +48,21 @@ fn prefix_and_none_codec_scaffold_are_usable() {
         .decode(&encoded, "fast block fast block fast block".len())
         .expect("lz4 codec decodes");
     assert_eq!(decoded, b"fast block fast block fast block");
+}
+
+#[test]
+fn persistent_options_default_to_safe_durability() {
+    assert_eq!(
+        DbOptions::persistent("trine-data").durability,
+        DurabilityMode::SyncAll
+    );
+    assert_eq!(
+        DbOptions::wasi_persistent("trine-data").durability,
+        DurabilityMode::Flush
+    );
+    assert_eq!(
+        DbOptions::browser_persistent().durability,
+        DurabilityMode::Flush
+    );
+    assert_eq!(DbOptions::memory().durability, DurabilityMode::Buffered);
 }

@@ -8,8 +8,7 @@ use std::{
 };
 
 use trine_kv::{
-    Db, DbOptions, DurabilityMode, KeyRange, LazyIter, Result, TransactionOptions, WriteBatch,
-    WriteOptions,
+    Db, DbOptions, KeyRange, LazyIter, Result, TransactionOptions, WriteBatch, WriteOptions,
 };
 
 fn main() -> Result<()> {
@@ -21,24 +20,18 @@ fn main() -> Result<()> {
 }
 
 async fn run(path: &Path) -> Result<()> {
-    let mut options = DbOptions::persistent(path).with_durability(DurabilityMode::Flush);
+    let mut options = DbOptions::persistent(path);
     options.background_worker_count = 0;
 
     let db = Db::open(options).await?;
     let users = db.bucket("users").await?;
 
-    users
-        .put_with_options(
-            b"user:001".to_vec(),
-            b"Ada".to_vec(),
-            WriteOptions::sync_all(),
-        )
-        .await?;
+    users.put(b"user:001".to_vec(), b"Ada".to_vec()).await?;
 
     let mut batch = WriteBatch::new();
     batch.put_bucket("users", b"user:002".to_vec(), b"Lin".to_vec())?;
     batch.put_bucket("users", b"team:core".to_vec(), b"database".to_vec())?;
-    db.write(batch, WriteOptions::sync_all()).await?;
+    db.write(batch, WriteOptions::default()).await?;
 
     assert_eq!(users.get(b"user:001").await?, Some(b"Ada".to_vec()));
 
@@ -73,7 +66,6 @@ async fn run(path: &Path) -> Result<()> {
     transaction.commit().await?;
 
     db.flush().await?;
-    db.persist(DurabilityMode::Flush).await?;
     drop(users);
     drop(snapshot);
     db.close().await?;

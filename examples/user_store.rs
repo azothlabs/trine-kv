@@ -1,8 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use trine_kv::{
-    Bucket, BucketOptions, Db, DbOptions, DurabilityMode, Error, PrefixExtractor, Result,
-    TransactionOptions,
+    Bucket, BucketOptions, Db, DbOptions, Error, PrefixExtractor, Result, TransactionOptions,
 };
 
 fn main() -> Result<()> {
@@ -45,7 +44,7 @@ struct UserStore {
 
 impl UserStore {
     fn open(path: &Path) -> Result<Self> {
-        let db = Db::open_sync(DbOptions::persistent(path).with_durability(DurabilityMode::Flush))?;
+        let db = Db::open_sync(DbOptions::persistent(path))?;
         let users = db.bucket_with_options_sync(
             "users",
             BucketOptions::default().with_prefix_extractor(PrefixExtractor::Separator(b':')),

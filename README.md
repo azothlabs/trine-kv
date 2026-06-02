@@ -33,8 +33,8 @@ Release packaging notes live in [docs/release.md](docs/release.md).
 - Value-lazy range and prefix scans for large-value workloads that need keys
   before reading blob bytes.
 - Persistent mode with WAL replay, manifest recovery, directory locking,
-  default background maintenance, backpressure, flush, compaction, and
-  read-only open.
+  safe native defaults, background maintenance, backpressure, flush,
+  compaction, and read-only open.
 - Async open/read/write/scan/transaction/maintenance entry points for hosts
   that need to drive storage cooperatively. Native async persistent APIs enter
   storage waits through Trine's storage boundary and use runtime task
@@ -96,7 +96,7 @@ async fn run() -> trine_kv::Result<()> {
     let mut batch = WriteBatch::new();
     batch.put(b"audit:001", b"user-created");
     batch.put_bucket("users", b"user:003", b"Grace")?;
-    db.write(batch, WriteOptions::sync_all()).await?;
+    db.write(batch, WriteOptions::default()).await?;
 
     // Transactions validate their read set when they commit.
     let mut txn = db.transaction(TransactionOptions::default());
@@ -167,8 +167,9 @@ cargo bench --bench v1_bench
 ## Current Boundaries
 
 - Persistent mode uses a single local database directory.
-- `SyncAll` is the strongest WAL commit mode, subject to platform filesystem
-  behavior.
+- Native persistent open defaults to `SyncAll` for confirmed writes. `Buffered`
+  is an explicit advanced mode for data that can tolerate losing recent writes
+  after a crash or power loss.
 - WASI and browser persistent backends do not claim `SyncData` or `SyncAll`.
 - WASI persistent `Db::open` uses the host-preopened filesystem on WASI
   targets; current WASI file work completes inline and does not advertise

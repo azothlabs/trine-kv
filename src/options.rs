@@ -178,6 +178,7 @@ impl DbOptions {
     pub fn persistent(path: impl Into<PathBuf>) -> Self {
         Self {
             storage_mode: StorageMode::Persistent { path: path.into() },
+            durability: DurabilityMode::SyncAll,
             ..Self::default()
         }
     }
@@ -189,6 +190,7 @@ impl DbOptions {
                 backend: HostStorageBackend::Wasi { path: path.into() },
             },
             background_worker_count: 0,
+            durability: DurabilityMode::Flush,
             runtime: RuntimeOptions::inline(),
             ..Self::default()
         }
@@ -206,6 +208,7 @@ impl DbOptions {
                 backend: HostStorageBackend::Browser,
             },
             background_worker_count: 0,
+            durability: DurabilityMode::Flush,
             runtime: RuntimeOptions::inline(),
             ..Self::default()
         }

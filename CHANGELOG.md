@@ -22,6 +22,9 @@ Initial packaged release candidate for the embedded LSM MVCC engine.
 - Read-only open, safe temporary file repair policy, durability notes, usage
   guide, quickstart examples, integration examples, release checklist, and
   benchmark baselines.
+- Native persistent open defaults to `SyncAll` for confirmed writes; `Buffered`
+  remains available as an explicit advanced mode for rebuildable or loss-tolerant
+  data.
 - Async-first database, bucket, iterator, value, transaction, flush,
   compaction, and maintenance APIs, with explicit `*_sync` adapters for
   synchronous callers.
