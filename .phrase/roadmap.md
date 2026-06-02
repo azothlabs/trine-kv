@@ -3224,5 +3224,4 @@ recommends returning to package/example verification.
 ### Recommended Next Action
 
 - Prepare the final release-candidate claim and decide separately whether to
-  commit this polish record plus the README release-facing copy, then tag or
-  publish.
+  tag or publish.

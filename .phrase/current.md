@@ -73,11 +73,13 @@ task566 [x] goal:remove stale release-facing wording/API references | scope:READ
 - Release-facing stale API/internal helper scans and project-forbidden wording
   scans found no matches.
 - `cargo fmt --check` and `git diff --check` pass.
-- The README "Why Trine KV" release-facing section is present and passed the
-  same wording/API scans.
+- The extra README explanatory section was removed after user review; remaining
+  release-facing README content passed the same wording/API scans.
+- CI follow-up changed the storage test accounting helper to borrow
+  `NativeFileStorageStats`; the all-target clippy gate and
+  `cargo test storage::tests --lib --all-features` pass.
 
 ## Next Recommendation
 
 - Prepare the final release-candidate claim and decide separately whether to
-  commit this polish record plus the README release-facing copy, then tag or
-  publish.
+  tag or publish.

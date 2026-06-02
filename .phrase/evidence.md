@@ -9351,8 +9351,8 @@ Record only evidence that can change planning or durable decisions.
   passed.
 - README/docs/examples/changelog/workflows have no stale path-first or
   async-first API drift in the release-facing scans.
-- The README has a release-facing "Why Trine KV" section that passed the same
-  stale API and wording scans.
+- The README had an extra explanatory section during the polish gate; it was
+  later removed after user review.
 
 ### Interpretation
 
@@ -9388,5 +9388,34 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Prepare the final release-candidate claim and decide separately whether to
-  commit this polish record plus the README release-facing copy, then tag or
-  publish.
+  tag or publish.
+
+## 2026-06-02: Release Polish Follow-Up
+
+### Observation
+
+- User review removed the extra README explanatory section from the release
+  surface.
+- CI reported `large_types_passed_by_value` for the storage test accounting
+  helper taking `NativeFileStorageStats` by value.
+
+### Interpretation
+
+- The README release surface is shorter and still aligned with the existing
+  usage/durability links.
+- The CI issue was a test-helper signature issue, not a storage behavior
+  change.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test storage::tests --lib --all-features`
+- `git diff --check`
+- project-forbidden wording scan over release-facing files, source, tests,
+  benches, `.github`, `.phrase`, and `Cargo.toml`
+
+### Recommended Next Action
+
+- Commit this follow-up after review, then continue with final release-candidate
+  claim or tag/publish decisions.

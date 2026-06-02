@@ -4109,7 +4109,7 @@ mod tests {
         );
 
         let stats = backend.stats();
-        assert_platform_task_accounting(stats, 4, 0);
+        assert_platform_task_accounting(&stats, 4, 0);
 
         std::fs::remove_dir_all(root).expect("test dir removes");
     }
@@ -4151,7 +4151,7 @@ mod tests {
 
     #[cfg(all(feature = "platform-io", target_os = "linux"))]
     fn assert_platform_task_accounting(
-        stats: NativeFileStorageStats,
+        stats: &NativeFileStorageStats,
         min_driver_tasks: u64,
         min_blocking_fallback_tasks: u64,
     ) {
@@ -4267,7 +4267,7 @@ mod tests {
         assert!(!table.path().exists(), "table object should be deleted");
 
         let stats = backend.stats();
-        assert_platform_task_accounting(stats, 11, 4);
+        assert_platform_task_accounting(&stats, 11, 4);
 
         std::fs::remove_dir_all(root).expect("test dir removes");
     }
