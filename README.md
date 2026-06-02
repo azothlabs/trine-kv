@@ -16,6 +16,20 @@ Then read [docs/usage.md](docs/usage.md) for the API path and
 [docs/durability.md](docs/durability.md) for persistence guarantees and limits.
 Release packaging notes live in [docs/release.md](docs/release.md).
 
+## Why Trine KV
+
+Trine KV is for Rust programs that need durable local state without turning
+storage into another service to deploy.
+
+Open a directory and use ordered keys, snapshots, write batches, transactions,
+and crash recovery through the same crate. Small applications can stay on the
+default bucket. Larger ones can split records into named buckets when different
+prefixes, filters, compression, or large-value policies matter.
+
+The shape is intentionally local. A Trine database is a single directory owned
+by the application, with explicit durability modes and documented limits for
+read-only open, WASI persistence, and browser persistence.
+
 ## Common Capabilities
 
 - Async-first default-bucket reads and writes with `Db::put`, `Db::get`,

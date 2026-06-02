@@ -9337,3 +9337,56 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Return to release-candidate package/example verification and release polish.
+
+## 2026-06-02: Release Candidate Polish Gate
+
+### Observation
+
+- `cargo package --list --allow-dirty` packaged 80 files and did not include
+  `.github/`, `.phrase/`, `.rust-skills/`, `.claude/`, or other local workflow
+  directories.
+- `cargo package --allow-dirty` initially hit the sandboxed proxy restriction
+  while updating the crates.io index; the same command passed after rerunning
+  outside that restriction, and `cargo package --allow-dirty --offline` also
+  passed.
+- README/docs/examples/changelog/workflows have no stale path-first or
+  async-first API drift in the release-facing scans.
+- The README has a release-facing "Why Trine KV" section that passed the same
+  stale API and wording scans.
+
+### Interpretation
+
+- The crate package and release-facing examples are coherent after the public
+  API boundary cleanup.
+- No code, storage, or public API behavior change was needed during this polish
+  pass.
+- Primary async maintenance/WAL internals and browser fixture automation remain
+  follow-up hardening rather than release blockers.
+
+### Verification
+
+- `cargo package --list --allow-dirty`
+- `cargo package --allow-dirty --offline`
+- `cargo package --allow-dirty`
+- `cargo run --example quickstart`
+- `cargo run --example sync_quickstart`
+- `cargo run --example user_store`
+- `cargo run --example event_index`
+- `cargo test --doc --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo check --target wasm32-unknown-unknown --lib`
+- `cargo check --target wasm32-wasip1 --lib`
+- `cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings`
+- stale API/internal helper scan over README, docs, examples, changelog, and
+  workflows
+- project-forbidden wording scan over release-facing files, source, tests,
+  benches, `.github`, `.phrase`, and `Cargo.toml`
+- `cargo fmt --check`
+- `git diff --check`
+
+### Recommended Next Action
+
+- Prepare the final release-candidate claim and decide separately whether to
+  commit this polish record plus the README release-facing copy, then tag or
+  publish.

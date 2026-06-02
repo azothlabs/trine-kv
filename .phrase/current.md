@@ -6,65 +6,78 @@ Complete
 
 ## Goal
 
-Make the public crate boundary strict before the first release candidate by
-removing durable-format and engine-internal helper modules from the crate root.
+Polish the release-candidate surface so the crate package, examples, README,
+docs, and public API presentation are coherent after the API boundary cleanup.
 
 ## Scope
 
-- Integration tests that currently inspect WAL, manifest, table, and blob files
-  through public hidden modules.
-- Benchmarks and scaffold tests that currently import internal codec helpers.
-- Crate root module visibility for durable-format and engine-internal modules.
-- Public user-facing re-exports that should remain stable.
+- Cargo package metadata and packaged file list.
+- README, docs, changelog, examples, and public first-use snippets.
+- Release-facing examples and doctests.
+- Scans for stale public API names, hidden internal helper references, and
+  project-forbidden wording.
 
 ## Out Of Scope
 
-- Storage format changes.
-- MVCC, WAL, manifest, table, blob, compaction, transaction, or recovery
-  behavior changes.
-- Public user-facing API renames.
-- Publishing, tagging, or crate version metadata changes.
+- Publishing, tagging, or changing crate version metadata unless verification
+  proves the metadata is invalid.
+- Storage format, MVCC, WAL, manifest, table, blob, compaction, transaction, or
+  recovery semantic changes.
+- New public API names or behavior changes.
+- Browser persistence fixture automation unless package/example verification
+  exposes it as a release blocker.
 
 ## Acceptance Gate
 
-- `blob`, `codec`, `internal_key`, `manifest`, `table`, and `wal` are not public
-  crate-root modules.
-- Durable-file inspection tests still run from crate-internal tests.
-- Integration tests and benchmarks compile through public user APIs or local
-  test/bench helpers only.
-- `cargo check --all-targets --all-features`, `cargo clippy --all-targets
-  --all-features -- -D warnings`, `cargo test --all-targets --all-features`,
-  rustdoc gates, and `git diff --check` pass.
+- `cargo package --list --allow-dirty` shows expected release-facing files and
+  no obvious local-only clutter.
+- `cargo package --allow-dirty`, release-facing examples, doctests, and full
+  native verification pass.
+- README/docs/examples align with path-first persistent open and async-first
+  public naming.
+- Scans find no stale public helper-module references or project-forbidden
+  wording in release-facing files.
+- `cargo fmt --check` and `git diff --check` pass.
 
 ## Active Task Slice
 
 ```text
-task561 [x] goal:migrate durable-format integration tests into crate-internal boundary | scope:tests/persistent_wal.rs src/lib.rs | verify:cargo test persistent_ --lib
-task562 [x] goal:remove remaining external imports of internal format helpers | scope:tests benches examples | verify:cargo check --all-targets --all-features
-task563 [x] goal:make format/helper modules crate-private | scope:src/lib.rs | verify:rustdoc and full native gate
+task564 [x] goal:audit package metadata and packaged file surface | scope:Cargo.toml README.md package list | verify:cargo package --list --allow-dirty
+task565 [x] goal:verify release-facing examples and docs | scope:examples README docs src docs | verify:cargo run examples + cargo test --doc --all-features
+task566 [x] goal:remove stale release-facing wording/API references | scope:README docs examples CHANGELOG src docs .phrase | verify:rg scans + cargo package --allow-dirty
 ```
 
 ## Known Residuals
 
-- Release polish still needs package/example/readme-facing verification after
-  this API boundary cleanup.
+- Primary async maintenance/WAL internals and browser persistence fixture
+  automation remain follow-up hardening; this phase did not find them to be
+  release blockers.
+- Publishing, tagging, and version bump decisions remain separate release
+  actions.
 
 ## Evidence
 
-- `tests/persistent_wal.rs` moved under `tests/internal/` and is included from
-  `src/lib.rs` under `cfg(test)`.
-- `blob`, `codec`, `internal_key`, `manifest`, `table`, and `wal` are now
-  crate-private modules in `src/lib.rs`.
-- External tests and benchmarks no longer import internal format helpers from
-  `trine_kv`.
-- `cargo check --all-targets --all-features`, `cargo test persistent_ --lib`,
-  `cargo clippy --all-targets --all-features -- -D warnings`,
-  `cargo test --all-targets --all-features`,
-  `cargo rustdoc --all-features -- -D missing-docs`,
-  `cargo rustdoc --all-features -- -D warnings`,
-  `cargo test --doc --all-features`, `cargo fmt --check`, and
-  `git diff --check` pass.
+- `cargo package --list --allow-dirty` packaged 80 files and did not include
+  `.github/`, `.phrase/`, `.rust-skills/`, `.claude/`, or other local workflow
+  directories.
+- `cargo package --allow-dirty` passed after rerunning outside the sandboxed
+  proxy restriction; `cargo package --allow-dirty --offline` also passed.
+- `cargo run --example quickstart`, `sync_quickstart`, `user_store`, and
+  `event_index` pass.
+- `cargo test --doc --all-features`, `cargo clippy --all-targets
+  --all-features -- -D warnings`, and `cargo test --all-targets
+  --all-features` pass.
+- `cargo check --target wasm32-unknown-unknown --lib`, `cargo check --target
+  wasm32-wasip1 --lib`, and `cargo clippy --target wasm32-unknown-unknown
+  --lib -- -D warnings` pass.
+- Release-facing stale API/internal helper scans and project-forbidden wording
+  scans found no matches.
+- `cargo fmt --check` and `git diff --check` pass.
+- The README "Why Trine KV" release-facing section is present and passed the
+  same wording/API scans.
 
 ## Next Recommendation
 
-- Return to release-candidate package/example verification and release polish.
+- Prepare the final release-candidate claim and decide separately whether to
+  commit this polish record plus the README release-facing copy, then tag or
+  publish.

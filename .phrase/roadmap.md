@@ -3192,3 +3192,37 @@ only because integration tests inspect durable files through them.
 ### Recommended Next Action
 
 - Return to release-candidate package/example verification and release polish.
+
+### Phase 134: Release Candidate Polish
+
+**Status**: Complete
+
+**Goal**: Polish the release-candidate surface so package contents, examples,
+README/docs, and public API presentation are coherent after the API boundary
+cleanup.
+
+**Entry Condition**: Phase 133 completes public API boundary strictness and
+recommends returning to package/example verification.
+
+**Acceptance Gate**:
+
+- Cargo package metadata and packaged file list have no obvious release-facing
+  gaps or local-only clutter.
+- Release-facing examples, doctests, and full native verification pass.
+- README/docs/examples align with path-first persistent open and async-first
+  public naming.
+- Stale internal helper references and project-forbidden wording are absent
+  from release-facing files.
+
+**Major Out Of Scope**:
+
+- Publishing, tagging, or changing crate version metadata unless verification
+  proves metadata is invalid.
+- Storage, MVCC, WAL, manifest, table, blob, compaction, transaction, recovery,
+  or browser persistence behavior changes.
+
+### Recommended Next Action
+
+- Prepare the final release-candidate claim and decide separately whether to
+  commit this polish record plus the README release-facing copy, then tag or
+  publish.
