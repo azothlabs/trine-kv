@@ -5,8 +5,8 @@ ordered local storage without running a separate server. It gives simple code a
 default bucket, and lets larger applications add named buckets with their own
 prefix, filter, compression, and large-value settings.
 
-The `v0.1.1` crate is implemented and verified by the repository test suite,
-benchmark harness, and durability notes. To see the main path work end to end:
+The crate is implemented and verified by the repository test suite, benchmark
+harness, and durability notes. To see the main path work end to end:
 
 ```text
 cargo run --example quickstart
@@ -59,20 +59,10 @@ Release packaging notes live in [docs/release.md](docs/release.md).
 
 ## Install
 
-Published releases use Semantic Versioning. The current release is
-[`v0.1.1`](https://crates.io/crates/trine-kv).
-
-For applications, add Trine KV as a library dependency:
+Add Trine KV from [crates.io](https://crates.io/crates/trine-kv):
 
 ```text
 cargo add trine-kv
-```
-
-Equivalent `Cargo.toml` entry:
-
-```toml
-[dependencies]
-trine-kv = "0.1"
 ```
 
 `cargo install` is for crates that provide command-line binaries. Trine KV is a
