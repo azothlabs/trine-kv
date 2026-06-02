@@ -136,7 +136,6 @@ pub enum TableSection {
     Filters,
     Indexes,
     Properties,
-    Footer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

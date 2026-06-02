@@ -8,9 +8,7 @@ use std::{
 use trine_kv::{
     BlobGcRatio, BlobLevelMergePolicy, BucketOptions, Db, DbOptions, DurabilityMode, FilterPolicy,
     IndexSearchPolicy, KeyRange, PrefixExtractor, PrefixFilterPolicy, RuntimeOptions,
-    TransactionOptions, WriteBatch, WriteOptions,
-    codec::{BlockCodec, FastLz4BlockCodec, NoneCodec},
-    search,
+    TransactionOptions, WriteBatch, WriteOptions, search,
 };
 
 const ROWS: usize = 1_024;
@@ -818,32 +816,57 @@ fn bench_codec_comparison() -> Vec<BenchResult> {
         ("Trine index blocks", index_block),
         ("Trine range tombstone blocks", tombstone_block),
     ] {
-        results.push(bench_codec("codec none", label, &NoneCodec, &bytes));
+        results.push(bench_codec("codec none", label, CodecBench::None, &bytes));
         results.push(bench_codec(
             "codec fast block compression",
             label,
-            &FastLz4BlockCodec,
+            CodecBench::FastLz4Block,
             &bytes,
         ));
     }
     results
 }
 
+#[derive(Debug, Clone, Copy)]
+enum CodecBench {
+    None,
+    FastLz4Block,
+}
+
 fn bench_codec(
     name: &'static str,
     label: &'static str,
-    codec: &impl BlockCodec,
+    codec: CodecBench,
     bytes: &[u8],
 ) -> BenchResult {
     measure(labelled(name, label), OPS, || {
         let mut checksum = 0;
         for _ in 0..OPS {
-            let encoded = codec.encode(bytes).expect("codec encodes");
-            let decoded = codec.decode(&encoded, bytes.len()).expect("codec decodes");
+            let encoded = encode_bench_block(codec, bytes);
+            let decoded = decode_bench_block(codec, &encoded, bytes.len());
             checksum += (encoded.len() + decoded.len()) as u64;
         }
         checksum
     })
+}
+
+fn encode_bench_block(codec: CodecBench, bytes: &[u8]) -> Vec<u8> {
+    match codec {
+        CodecBench::None => bytes.to_vec(),
+        CodecBench::FastLz4Block => lz4_flex::block::compress(bytes),
+    }
+}
+
+fn decode_bench_block(codec: CodecBench, bytes: &[u8], uncompressed_len: usize) -> Vec<u8> {
+    match codec {
+        CodecBench::None => {
+            assert_eq!(bytes.len(), uncompressed_len);
+            bytes.to_vec()
+        }
+        CodecBench::FastLz4Block => {
+            lz4_flex::block::decompress(bytes, uncompressed_len).expect("lz4 block decodes")
+        }
+    }
 }
 
 fn populated_memory_db(rows: usize) -> Db {

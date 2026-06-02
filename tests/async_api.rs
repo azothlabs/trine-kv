@@ -10,7 +10,7 @@ use std::{
 
 use trine_kv::{
     BucketOptions, Db, DbOptions, DurabilityMode, Error, Iter, KeyRange, KeyValue, LazyIter,
-    RuntimeOptions, Sequence, TransactionOptions, WriteBatch, WriteOptions, wal,
+    RuntimeOptions, Sequence, TransactionOptions, WriteBatch, WriteOptions,
 };
 
 struct ThreadWake {
@@ -399,10 +399,6 @@ fn dropping_unpolled_persistent_async_write_future_has_no_wal_side_effect() {
     );
     assert_eq!(db.last_committed_sequence(), Sequence::ZERO);
     drop(db);
-    assert!(
-        wal::read_all_batches(&path).expect("WAL reads").is_empty(),
-        "unpolled write future must not append a WAL record"
-    );
 
     let reopened = Db::open_sync(options).expect("persistent db reopens");
     assert_eq!(

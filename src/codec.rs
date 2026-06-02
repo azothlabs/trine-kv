@@ -34,8 +34,6 @@ impl CodecId {
 }
 
 pub trait BlockCodec: Send + Sync {
-    fn id(&self) -> CodecId;
-
     fn encode(&self, input: &[u8]) -> Result<Vec<u8>>;
 
     fn decode(&self, input: &[u8], uncompressed_len: usize) -> Result<Vec<u8>>;
@@ -45,10 +43,6 @@ pub trait BlockCodec: Send + Sync {
 pub struct NoneCodec;
 
 impl BlockCodec for NoneCodec {
-    fn id(&self) -> CodecId {
-        CodecId::None
-    }
-
     fn encode(&self, input: &[u8]) -> Result<Vec<u8>> {
         Ok(input.to_vec())
     }
@@ -68,10 +62,6 @@ impl BlockCodec for NoneCodec {
 pub struct FastLz4BlockCodec;
 
 impl BlockCodec for FastLz4BlockCodec {
-    fn id(&self) -> CodecId {
-        CodecId::FastLz4Block
-    }
-
     fn encode(&self, input: &[u8]) -> Result<Vec<u8>> {
         Ok(lz4_flex::block::compress(input))
     }

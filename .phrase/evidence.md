@@ -9300,3 +9300,40 @@ Record only evidence that can change planning or durable decisions.
 
 - Commit the path-first open API follow-up if the release-candidate scope looks
   right.
+
+## 2026-06-02: Public API Boundary Strictness
+
+### Observation
+
+- Durable-file inspection coverage moved from an external integration test file
+  to `tests/internal/persistent_wal.rs`, included from `src/lib.rs` under
+  `cfg(test)`.
+- External tests and benchmarks stopped importing internal format helpers from
+  `trine_kv`; codec comparison in the benchmark now uses local bench helpers.
+- `blob`, `codec`, `internal_key`, `manifest`, `table`, and `wal` are no longer
+  public crate-root modules.
+- Internal-only wrapper/helper functions that existed to support earlier public
+  module access were either made test-only or removed when they had no caller.
+
+### Interpretation
+
+- The release-facing crate root now exposes stable user APIs rather than
+  durable-format and engine helper modules.
+- Low-level format and recovery assertions still run, but from inside the crate
+  test boundary, so they no longer define the public API contract.
+
+### Verification
+
+- `cargo check --all-targets --all-features`
+- `cargo test persistent_ --lib`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo rustdoc --all-features -- -D missing-docs`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test --doc --all-features`
+- `cargo fmt --check`
+- `git diff --check`
+
+### Recommended Next Action
+
+- Return to release-candidate package/example verification and release polish.

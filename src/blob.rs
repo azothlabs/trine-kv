@@ -119,19 +119,6 @@ impl ValueRef {
             Self::Blob { len, .. } => *len,
         }
     }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    #[must_use]
-    pub fn inline_bytes(&self) -> Option<&[u8]> {
-        match self {
-            Self::Inline(bytes) => Some(bytes),
-            Self::BlobIndex(_) | Self::Blob { .. } => None,
-        }
-    }
 }
 
 #[must_use]

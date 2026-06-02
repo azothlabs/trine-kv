@@ -47,16 +47,14 @@
 #![warn(missing_docs)]
 #![allow(clippy::missing_errors_doc, clippy::module_name_repetitions)]
 
-#[doc(hidden)]
-pub mod blob;
+mod blob;
 mod block;
 /// Bucket handles and bucket-bound readers.
 pub mod bucket;
 #[allow(dead_code)]
 mod cache;
 mod checksum;
-#[doc(hidden)]
-pub mod codec;
+mod codec;
 mod compaction;
 /// Database open, read, write, scan, and maintenance APIs.
 pub mod db;
@@ -65,14 +63,12 @@ mod durability;
 pub mod error;
 #[allow(dead_code)]
 mod filter;
-#[doc(hidden)]
-pub mod internal_key;
+mod internal_key;
 mod io;
 /// Forward and reverse iterators over committed rows.
 pub mod iterator;
 mod lsm;
-#[doc(hidden)]
-pub mod manifest;
+mod manifest;
 #[allow(dead_code)]
 mod memtable;
 #[allow(dead_code)]
@@ -94,15 +90,13 @@ pub mod snapshot;
 /// Live database statistics exposed to callers.
 pub mod stats;
 mod storage;
-#[doc(hidden)]
-pub mod table;
+mod table;
 /// Optimistic transaction API.
 pub mod transaction;
 /// Core key, value, range, sequence, and commit types.
 pub mod types;
 mod version;
-#[doc(hidden)]
-pub mod wal;
+mod wal;
 /// Atomic write batch types.
 pub mod write_batch;
 
@@ -125,3 +119,10 @@ pub use stats::DbStats;
 pub use transaction::{Transaction, TransactionOptions};
 pub use types::{CommitInfo, KeyRange, KeyValue, Sequence, Value};
 pub use write_batch::WriteBatch;
+
+#[cfg(test)]
+mod persistent_wal_tests {
+    use crate as trine_kv;
+
+    include!("../tests/internal/persistent_wal.rs");
+}

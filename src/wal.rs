@@ -121,7 +121,8 @@ enum WalLaneCommand {
 }
 
 impl WalWriter {
-    pub fn open_append(path: &Path) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn open_append(path: &Path) -> Result<Self> {
         let backend = NativeFileBackend::new();
         Self::open_append_with_backend(&backend, path)
     }
@@ -135,7 +136,8 @@ impl WalWriter {
         })
     }
 
-    pub fn append_batch(
+    #[cfg(test)]
+    pub(crate) fn append_batch(
         &mut self,
         sequence: Sequence,
         operations: &[BatchOperation],
@@ -149,13 +151,8 @@ impl WalWriter {
         self.append.append_blocking(frame, durability)
     }
 
-    pub fn persist(&mut self, durability: DurabilityMode) -> Result<()> {
+    fn persist(&mut self, durability: DurabilityMode) -> Result<()> {
         self.append.persist_blocking(durability)
-    }
-
-    pub fn reopen_append(&mut self, path: &Path) -> Result<()> {
-        let backend = NativeFileBackend::new();
-        self.reopen_append_with_backend(&backend, path)
     }
 
     pub(crate) fn reopen_append_with_backend(
@@ -473,20 +470,13 @@ pub fn wal_shard_path(db_path: &Path, shard_index: usize) -> PathBuf {
     db_path.join(format!("{WAL_SHARD_FILE_PREFIX}{shard_index:0width$}"))
 }
 
-pub fn read_batches(path: &Path) -> Result<Vec<WalBatch>> {
-    read_batches_after(path, Sequence::ZERO)
-}
-
-pub fn read_all_batches(db_path: &Path) -> Result<Vec<WalBatch>> {
+#[cfg(test)]
+pub(crate) fn read_all_batches(db_path: &Path) -> Result<Vec<WalBatch>> {
     read_all_batches_after(db_path, Sequence::ZERO)
 }
 
-pub fn read_batches_after(path: &Path, replay_floor: Sequence) -> Result<Vec<WalBatch>> {
-    let backend = NativeFileBackend::new();
-    read_batches_after_with_backend(&backend, path, replay_floor)
-}
-
-pub fn read_all_batches_after(db_path: &Path, replay_floor: Sequence) -> Result<Vec<WalBatch>> {
+#[cfg(test)]
+fn read_all_batches_after(db_path: &Path, replay_floor: Sequence) -> Result<Vec<WalBatch>> {
     let backend = NativeFileBackend::new();
     let streams = read_recovery_streams_after_with_backend(&backend, db_path, replay_floor)?;
     merge_batch_streams_by_sequence(streams)
@@ -621,11 +611,6 @@ where
     }
 
     Ok(merged)
-}
-
-pub fn rewrite_batches_after(path: &Path, replay_floor: Sequence) -> Result<()> {
-    let backend = NativeFileBackend::new();
-    rewrite_batches_after_with_backend(&backend, path, replay_floor)
 }
 
 pub(crate) fn rewrite_batches_after_with_backend(

@@ -1,7 +1,6 @@
 use trine_kv::{
-    CompressionProfile, Db, DbOptions, Direction, DurabilityMode, KeyRange, PrefixExtractor,
-    Sequence, StorageMode, WriteBatch,
-    codec::{BlockCodec, CodecId, FastLz4BlockCodec, NoneCodec},
+    BucketOptions, CompressionProfile, Db, DbOptions, Direction, DurabilityMode, KeyRange,
+    PrefixExtractor, Sequence, StorageMode, WriteBatch,
 };
 
 #[test]
@@ -17,7 +16,7 @@ fn scaffold_exposes_v1_public_boundaries() {
     );
     assert_eq!(db.snapshot().read_sequence(), Sequence::new(1));
     assert_eq!(db.stats().live_buckets, 1);
-    assert_eq!(CompressionProfile::Fast.codec_id(), CodecId::FastLz4Block);
+    assert_eq!(CompressionProfile::default(), CompressionProfile::Fast);
 
     let mut batch = WriteBatch::new();
     batch.put(b"a", b"b");
@@ -29,25 +28,16 @@ fn scaffold_exposes_v1_public_boundaries() {
 }
 
 #[test]
-fn prefix_and_none_codec_scaffold_are_usable() {
+fn prefix_and_compression_profiles_are_usable() {
     let extractor = PrefixExtractor::Separator(b':');
     assert_eq!(extractor.extract(b"user:42"), Some(&b"user:"[..]));
 
-    let codec = NoneCodec;
-    let encoded = codec.encode(b"plain block").expect("none codec encodes");
-    let decoded = codec
-        .decode(&encoded, "plain block".len())
-        .expect("none codec decodes");
-    assert_eq!(decoded, b"plain block");
-
-    let fast_codec = FastLz4BlockCodec;
-    let encoded = fast_codec
-        .encode(b"fast block fast block fast block")
-        .expect("lz4 codec encodes");
-    let decoded = fast_codec
-        .decode(&encoded, "fast block fast block fast block".len())
-        .expect("lz4 codec decodes");
-    assert_eq!(decoded, b"fast block fast block fast block");
+    let options = BucketOptions {
+        compression: CompressionProfile::None,
+        ..BucketOptions::default()
+    };
+    assert_eq!(options.compression, CompressionProfile::None);
+    assert_eq!(CompressionProfile::Fast, CompressionProfile::default());
 }
 
 #[test]

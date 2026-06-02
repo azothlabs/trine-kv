@@ -36,29 +36,6 @@ const HEADER_LEN: usize = 14;
 const MIN_TABLE_PROPERTY_BYTES: usize = 45;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ManifestEdit {
-    CreateBucket {
-        name: String,
-        options: BucketOptions,
-    },
-    UpdateBucketOptions {
-        name: String,
-        options: BucketOptions,
-    },
-    AddTable {
-        bucket: String,
-        properties: TableProperties,
-    },
-    RemoveTable {
-        bucket: String,
-        table_id: TableId,
-    },
-    UpdateWalReplayFloor {
-        sequence: Sequence,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestState {
     wal_replay_floor: Sequence,
     buckets: BTreeMap<String, BucketOptions>,
@@ -144,7 +121,11 @@ pub(crate) struct PreparedManifestPublish {
 }
 
 impl ManifestStore {
-    pub fn open_or_create(path: impl Into<PathBuf>, create_if_missing: bool) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn open_or_create(
+        path: impl Into<PathBuf>,
+        create_if_missing: bool,
+    ) -> Result<Self> {
         Self::open_or_create_with_backend(path, create_if_missing, NativeFileBackend::new())
     }
 
@@ -311,21 +292,6 @@ impl ManifestStore {
         Ok(())
     }
 
-    pub fn update_bucket_options(&mut self, name: &str, options: BucketOptions) -> Result<()> {
-        let Some(existing) = self.state.buckets.get(name) else {
-            return Err(Error::Corruption {
-                message: format!("bucket options update references missing bucket: {name}"),
-            });
-        };
-        if existing == &options {
-            return Ok(());
-        }
-
-        let mut next_state = self.state.clone();
-        next_state.buckets.insert(name.to_owned(), options);
-        self.publish_next_state(next_state)
-    }
-
     pub fn next_table_id(&self) -> Result<TableId> {
         self.state.next_table_id()
     }
@@ -413,7 +379,8 @@ impl ManifestStore {
         })
     }
 
-    pub fn replace_tables(
+    #[cfg(test)]
+    pub(crate) fn replace_tables(
         &mut self,
         bucket: &str,
         removed_table_ids: &[TableId],
@@ -426,7 +393,8 @@ impl ManifestStore {
         )])
     }
 
-    pub fn replace_tables_batch(
+    #[cfg(test)]
+    fn replace_tables_batch(
         &mut self,
         replacements: Vec<(String, Vec<TableId>, Vec<TableProperties>)>,
     ) -> Result<()> {
@@ -578,12 +546,6 @@ impl ManifestStore {
         })
     }
 
-    pub fn update_wal_replay_floor(&mut self, sequence: Sequence) -> Result<()> {
-        let mut next_state = self.state.clone();
-        next_state.wal_replay_floor = sequence;
-        self.publish_next_state(next_state)
-    }
-
     fn publish_next_state(&mut self, next_state: ManifestState) -> Result<()> {
         // Manifest publish is the durable cutover point. Keep the in-memory
         // state unchanged until storage publish succeeds, so a failed create,
@@ -662,7 +624,8 @@ pub fn manifest_path(db_path: &Path) -> PathBuf {
     db_path.join(MANIFEST_FILE_NAME)
 }
 
-pub fn read_manifest(path: &Path) -> Result<ManifestState> {
+#[cfg(test)]
+pub(crate) fn read_manifest(path: &Path) -> Result<ManifestState> {
     let bytes = read_manifest_bytes(path)?.ok_or_else(|| {
         Error::Io(io::Error::new(
             io::ErrorKind::NotFound,
@@ -691,6 +654,7 @@ where
     decode_manifest(&bytes)
 }
 
+#[cfg(test)]
 fn read_manifest_bytes(path: &Path) -> Result<Option<Arc<[u8]>>> {
     let backend = NativeFileBackend::new();
     read_manifest_bytes_with_backend(&backend, path)

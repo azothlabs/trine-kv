@@ -3163,3 +3163,32 @@ public API boundary.
 - Return to release-candidate package/example verification. If API strictness
   becomes a blocker, first move durable-file inspection helpers out of public
   format modules, then make those modules crate-private.
+
+### Phase 133: Public API Boundary Strictness
+
+**Status**: Complete
+
+**Goal**: Remove durable-format and engine-internal helper modules from the
+public crate root before the first release candidate.
+
+**Entry Condition**: Phase 132 leaves format helper modules publicly reachable
+only because integration tests inspect durable files through them.
+
+**Acceptance Gate**:
+
+- Integration tests and benches no longer depend on hidden format helper modules
+  from the public crate root.
+- Durable-file inspection tests still run from a crate-internal test boundary.
+- `blob`, `codec`, `internal_key`, `manifest`, `table`, and `wal` are no
+  longer public crate-root modules.
+- Public user-facing re-exports remain available.
+- Full native verification and rustdoc gates pass.
+
+**Major Out Of Scope**:
+
+- Changing storage formats, recovery behavior, or public user-facing API names.
+- Publishing, tagging, or crate version metadata changes.
+
+### Recommended Next Action
+
+- Return to release-candidate package/example verification and release polish.

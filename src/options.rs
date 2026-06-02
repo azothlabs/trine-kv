@@ -115,9 +115,8 @@ pub enum CompressionProfile {
 }
 
 impl CompressionProfile {
-    /// Returns the storage-format codec identifier for this profile.
     #[must_use]
-    pub const fn codec_id(self) -> CodecId {
+    pub(crate) const fn codec_id(self) -> CodecId {
         match self {
             Self::None => CodecId::None,
             Self::Fast => CodecId::FastLz4Block,
