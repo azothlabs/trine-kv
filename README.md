@@ -170,7 +170,7 @@ cargo bench --bench v1_bench
 - [Usage guide](docs/usage.md)
 - [Durability notes](docs/durability.md)
 - [Release packaging](docs/release.md)
-- [v0.1.0 benchmark baseline](docs/benchmarks/v1-baseline.md)
+- [v0.1.0 benchmark baseline](docs/benchmarks/0.1-baseline.md)
 - [Large-value direct read tuning](docs/benchmarks/v1-large-value-direct-read.md)
 - [Blob maintenance and lazy value benchmark](docs/benchmarks/v1-blob-level-merge-lazy-gc.md)
 

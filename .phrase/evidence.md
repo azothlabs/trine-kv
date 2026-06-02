@@ -9419,3 +9419,32 @@ Record only evidence that can change planning or durable decisions.
 
 - Commit this follow-up after review, then continue with final release-candidate
   claim or tag/publish decisions.
+
+## 2026-06-02: 0.1 Benchmark Baseline Refresh
+
+### Observation
+
+- `cargo bench --bench v1_bench` passed in the Cargo bench release profile for
+  the current `0.1.0` release candidate.
+- The release-facing benchmark baseline moved from
+  `docs/benchmarks/v1-baseline.md` to `docs/benchmarks/0.1-baseline.md`.
+- README now links `v0.1.0 benchmark baseline` to
+  `docs/benchmarks/0.1-baseline.md`.
+
+### Interpretation
+
+- The benchmark document now reflects current release-candidate behavior rather
+  than the 2026-05-25/26 pre-release baseline.
+- File naming now separates the crate release line (`0.1`) from the internal v1
+  engine/protocol label used by the benchmark harness.
+
+### Verification
+
+- `cargo bench --bench v1_bench`
+- release-facing benchmark filename/link scan
+- `cargo fmt --check`
+- `git diff --check`
+
+### Recommended Next Action
+
+- Continue with final release-candidate claim or tag/publish decisions.

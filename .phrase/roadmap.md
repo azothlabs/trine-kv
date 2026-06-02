@@ -3225,3 +3225,30 @@ recommends returning to package/example verification.
 
 - Prepare the final release-candidate claim and decide separately whether to
   tag or publish.
+
+### Phase 135: 0.1 Benchmark Baseline Refresh
+
+**Status**: Complete
+
+**Goal**: Refresh the benchmark baseline for the `0.1` release candidate and
+name the release-facing baseline file with the crate SemVer line.
+
+**Entry Condition**: User review finds the existing `v0.1.0 benchmark
+baseline` document stale and named with the internal v1 engine label.
+
+**Acceptance Gate**:
+
+- `cargo bench --bench v1_bench` output is recorded for the current release
+  candidate.
+- The release-facing baseline file is named with the `0.1` release line.
+- README links to the refreshed baseline.
+- Link/name scans, `cargo fmt --check`, and `git diff --check` pass.
+
+**Major Out Of Scope**:
+
+- Changing benchmark harness behavior or storage/database semantics.
+- Publishing, tagging, or changing crate version metadata.
+
+### Recommended Next Action
+
+- Continue with final release-candidate claim or tag/publish decisions.
