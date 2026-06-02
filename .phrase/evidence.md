@@ -9448,3 +9448,39 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Continue with final release-candidate claim or tag/publish decisions.
+
+## 2026-06-02: Post-Publish Metadata Patch
+
+### Observation
+
+- `0.1.0` was published successfully, but crates.io did not show a GitHub
+  repository link because `Cargo.toml` did not include `repository`.
+- User confirmed the source repository link should be
+  `https://github.com/azothlabs/trine-kv`.
+- README install guidance showed only a dependency snippet and did not link the
+  crates.io package page.
+- The crate currently exposes a library API, so `cargo install trine-kv` is not
+  the normal application setup path.
+
+### Interpretation
+
+- The missing repository link requires a patch release because already
+  published crate metadata cannot be corrected in place for the same version.
+- This is a packaging/documentation correction, not an engine behavior or public
+  API behavior change.
+
+### Verification
+
+- `cargo package --allow-dirty --locked --offline` packaged 80 files and
+  verified `trine-kv v0.1.1`.
+- `cargo package --allow-dirty --locked` packaged 80 files, updated the
+  crates.io index, and verified `trine-kv v0.1.1`.
+- `cargo fmt --check`
+- README/Cargo metadata scan for crates.io link, `cargo add trine-kv`,
+  repository URL, and `v0.1.1`.
+- `git diff --check`
+
+### Recommended Next Action
+
+- Commit this metadata patch, tag `v0.1.1` after CI passes, then publish
+  `0.1.1`.

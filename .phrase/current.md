@@ -6,54 +6,59 @@ Complete
 
 ## Goal
 
-Refresh the `0.1` benchmark baseline before release and align the release-facing
-baseline filename with crate SemVer rather than the internal v1 engine label.
+Prepare a `0.1.1` patch release that corrects crates.io metadata and README
+installation guidance after the initial `0.1.0` publish.
 
 ## Scope
 
-- `cargo bench --bench v1_bench` output for the current release candidate.
-- Baseline benchmark document under `docs/benchmarks/`.
-- README benchmark baseline link.
-- Decision evidence for the refreshed baseline.
+- `Cargo.toml` package metadata and patch version.
+- `Cargo.lock` root package version alignment for locked publishing.
+- README install section and release-facing version references.
+- Changelog and release checklist wording for the patch release target.
+- Decision evidence for the metadata patch.
 
 ## Out Of Scope
 
-- Publishing, tagging, or changing crate version metadata.
-- Storage format, MVCC, WAL, manifest, table, blob, compaction, transaction, or
-  recovery semantic changes.
-- Benchmark harness behavior changes.
-- Renaming older tuning documents unless they are release-facing baseline links.
+- Storage format, MVCC, WAL, manifest, SSTable, blob, compaction, transaction,
+  recovery, or browser persistence behavior changes.
+- Public API behavior changes.
+- Benchmark harness or benchmark baseline changes.
+- Publishing, tagging, or pushing unless the user requests it separately.
 
 ## Acceptance Gate
 
-- Fresh benchmark output is recorded from `cargo bench --bench v1_bench`.
-- The release baseline file is named with the `0.1` release line.
-- README links to the refreshed baseline.
-- `cargo fmt --check`, release-facing link/name scans, and `git diff --check`
-  pass.
+- Crate metadata includes the GitHub repository URL.
+- README links the crates.io package page and shows `cargo add trine-kv` as the
+  dependency installation path.
+- README does not present `cargo install` as the normal path for this library
+  crate.
+- Package metadata and docs reflect the `0.1.1` patch release target.
+- `cargo package --allow-dirty --locked`, `cargo fmt --check`, and
+  `git diff --check` pass.
 
 ## Active Task Slice
 
 ```text
-task567 [x] goal:refresh 0.1 benchmark baseline | scope:benches/v1_bench.rs docs/benchmarks | verify:cargo bench --bench v1_bench
-task568 [x] goal:rename release baseline file and update links | scope:docs/benchmarks README.md | verify:rg benchmark link/name scan
-task569 [x] goal:record benchmark evidence | scope:.phrase/current.md .phrase/evidence.md .phrase/roadmap.md | verify:git diff --check
+task570 [x] goal:add repository metadata | scope:Cargo.toml | verify:cargo package --allow-dirty --locked
+task571 [x] goal:update install guidance | scope:README.md | verify:README install scan
+task572 [x] goal:record patch release intent | scope:CHANGELOG.md docs/release.md .phrase | verify:git diff --check
 ```
 
 ## Known Residuals
 
-- Benchmark numbers are local machine measurements and are suitable as a
-  repository baseline, not a cross-machine performance guarantee.
+- The already-published `0.1.0` crate page metadata cannot be corrected in
+  place; the repository link appears on crates.io after publishing `0.1.1`.
 
 ## Evidence
 
-- `cargo bench --bench v1_bench` passed on 2026-06-02 and produced the
-  refreshed local baseline.
-- The release-facing baseline moved from `docs/benchmarks/v1-baseline.md` to
-  `docs/benchmarks/0.1-baseline.md`.
-- README now links the `v0.1.0 benchmark baseline` text to
-  `docs/benchmarks/0.1-baseline.md`.
+- `0.1.0` was published successfully, but the crate metadata did not include a
+  `repository` URL, so crates.io had no GitHub link to show.
+- `Cargo.toml` now targets `0.1.1` and includes
+  `repository = "https://github.com/azothlabs/trine-kv"`.
+- README now links the crates.io package page and gives `cargo add trine-kv` as
+  the application dependency path.
 
 ## Next Recommendation
 
-- Continue with final release-candidate claim or tag/publish decisions.
+- Commit the metadata patch, tag `v0.1.1` after CI passes, then publish
+  `0.1.1`.

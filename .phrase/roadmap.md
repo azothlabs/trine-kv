@@ -3252,3 +3252,35 @@ baseline` document stale and named with the internal v1 engine label.
 ### Recommended Next Action
 
 - Continue with final release-candidate claim or tag/publish decisions.
+
+### Phase 136: Post-Publish Metadata Patch
+
+**Status**: Complete
+
+**Goal**: Prepare a `0.1.1` patch release that corrects crates.io metadata and
+README installation guidance after the initial `0.1.0` publish.
+
+**Entry Condition**: `0.1.0` is published, and user review observes that the
+crates.io page has no GitHub repository link and README install guidance needs
+a direct crates.io/dependency path.
+
+**Acceptance Gate**:
+
+- Cargo package metadata includes the GitHub repository URL.
+- README links the crates.io package page and shows `cargo add trine-kv` as the
+  application dependency path.
+- README makes clear that `cargo install` is not the normal path for the
+  current library crate.
+- Changelog and release docs reflect the `0.1.1` patch release target.
+- Package, formatting, and diff checks pass.
+
+**Major Out Of Scope**:
+
+- Storage, MVCC, WAL, manifest, table, blob, compaction, transaction, recovery,
+  browser persistence, benchmark, or public API behavior changes.
+- Publishing, tagging, or pushing unless requested separately.
+
+### Recommended Next Action
+
+- Commit the metadata patch, tag `v0.1.1` after CI passes, then publish
+  `0.1.1`.

@@ -2,6 +2,17 @@
 
 All public crate releases use Semantic Versioning.
 
+## 0.1.1 - 2026-06-02
+
+Patch release metadata correction after the initial `0.1.0` publish.
+
+### Fixed
+
+- Added the GitHub repository URL to crate metadata so crates.io can link back
+  to the source repository.
+- Updated README installation guidance with the crates.io package page and the
+  dependency-focused `cargo add trine-kv` path.
+
 ## 0.1.0 - 2026-06-01
 
 Initial packaged release candidate for the embedded LSM MVCC engine.
