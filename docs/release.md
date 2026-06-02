@@ -48,7 +48,7 @@ cargo check --target wasm32-unknown-unknown --lib
 cargo check --target wasm32-wasip1 --lib
 cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings
 cargo run --example quickstart
-cargo run --example async_quickstart
+cargo run --example sync_quickstart
 cargo run --example user_store
 cargo run --example event_index
 cargo package --list
@@ -78,7 +78,7 @@ The package list should not include `.github/`, `.phrase/`, `.rust-skills/`,
 - `cargo check --target wasm32-wasip1 --lib`
 - `cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings`
 - `cargo run --example quickstart`
-- `cargo run --example async_quickstart`
+- `cargo run --example sync_quickstart`
 - `cargo run --example user_store`
 - `cargo run --example event_index`
 - `cargo package --list` with a package-content guard

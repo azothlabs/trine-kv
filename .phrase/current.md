@@ -64,7 +64,7 @@ task553 [x] goal:record phase evidence and commit | scope:.phrase/evidence.md gi
 - `cargo check --all-targets --all-features` passes after the public API rename.
 - `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings` pass.
 - `cargo test --all-targets --all-features` passes.
-- `cargo run --example quickstart`, `async_quickstart`, `user_store`, and
+- `cargo run --example quickstart`, `sync_quickstart`, `user_store`, and
   `event_index` pass.
 - `cargo check --target wasm32-unknown-unknown --lib` and
   `cargo check --target wasm32-wasip1 --lib` pass.
@@ -73,5 +73,5 @@ task553 [x] goal:record phase evidence and commit | scope:.phrase/evidence.md gi
 
 ## Next Recommendation
 
-- Commit the async-first public API rename, then return to release-candidate
+- Commit the quickstart example naming fix, then return to release-candidate
   verification and publish readiness.

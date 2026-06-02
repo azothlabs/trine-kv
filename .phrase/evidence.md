@@ -9102,3 +9102,42 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Commit the rename and return to release-candidate verification.
+
+## 2026-06-02: Async-First Quickstart Naming
+
+### Observation
+
+- README still presented `quickstart` next to `async_quickstart`, which made
+  the async path read like an alternate example instead of the primary
+  quickstart.
+
+### Interpretation
+
+- After the public API rename, the runnable `quickstart` example should be the
+  async-first path.
+- The synchronous example should be named explicitly as a sync-adapter path.
+
+### Change
+
+- Renamed the async persistent example to `examples/quickstart.rs`.
+- Renamed the synchronous adapter example to `examples/sync_quickstart.rs`.
+- Updated README, usage docs, release docs, CI, publish workflow, changelog,
+  and phase evidence to use `quickstart` plus `sync_quickstart`.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo run --example quickstart`
+- `cargo run --example sync_quickstart`
+- `cargo check --all-targets --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo package --list --allow-dirty`
+- `git diff --check`
+- `rg -n 'async_quickstart' README.md docs CHANGELOG.md .github examples .phrase/current.md`
+- forbidden-term scan over README, docs, examples, tests, benches, src,
+  `.phrase`, changelog, and workflows
+
+### Recommended Next Action
+
+- Commit the naming fix and return to release-candidate verification.

@@ -7,7 +7,12 @@ Run the checked quickstart first:
 
 ```text
 cargo run --example quickstart
-cargo run --example async_quickstart
+```
+
+Run the sync-adapter quickstart when you need the explicit synchronous API:
+
+```text
+cargo run --example sync_quickstart
 ```
 
 Then look at the integration examples when you want to embed the database
@@ -88,7 +93,7 @@ db.flush().await?;
 On native targets, async persistent open, point reads, scans, and lazy value
 reads enter Trine's storage boundary through async helpers. Native async writes
 and maintenance use runtime task boundaries where the current engine internals
-are still synchronous. Run `cargo run --example async_quickstart` for a
+are still synchronous. Run `cargo run --example quickstart` for a
 complete checked path.
 
 Synchronous callers can use explicit `*_sync` adapters:
@@ -618,7 +623,7 @@ Use these commands before trusting a change to documentation or examples:
 
 ```text
 cargo run --example quickstart
-cargo run --example async_quickstart
+cargo run --example sync_quickstart
 cargo run --example user_store
 cargo run --example event_index
 cargo fmt --check

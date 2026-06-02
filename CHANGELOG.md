@@ -25,7 +25,7 @@ Initial packaged release candidate for the embedded LSM MVCC engine.
 - Async-first database, bucket, iterator, value, transaction, flush,
   compaction, and maintenance APIs, with explicit `*_sync` adapters for
   synchronous callers.
-- Runnable `async_quickstart` example covering async persistent open, writes,
+- Runnable `quickstart` example covering async persistent open, writes,
   lazy scans, transaction commit, maintenance, read-only reopen, and storage
   runtime stats.
 - Native platform I/O capability reporting, fallback observability, bounded

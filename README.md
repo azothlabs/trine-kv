@@ -10,7 +10,6 @@ benchmark harness, and durability notes. To see the main path work end to end:
 
 ```text
 cargo run --example quickstart
-cargo run --example async_quickstart
 ```
 
 Then read [docs/usage.md](docs/usage.md) for the API path and
@@ -122,11 +121,16 @@ async fn run() -> trine_kv::Result<()> {
 }
 ```
 
-For runnable async and sync persistent paths, use:
+For the runnable async-first persistent path, use:
 
 ```text
 cargo run --example quickstart
-cargo run --example async_quickstart
+```
+
+For the explicit sync-adapter path, use:
+
+```text
+cargo run --example sync_quickstart
 ```
 
 ## Common Commands
@@ -136,7 +140,7 @@ cargo fmt --check
 cargo clippy
 cargo test
 cargo run --example quickstart
-cargo run --example async_quickstart
+cargo run --example sync_quickstart
 cargo run --example user_store
 cargo run --example event_index
 cargo bench --bench v1_bench
@@ -144,10 +148,10 @@ cargo bench --bench v1_bench
 
 ## Examples
 
-- `quickstart`: first pass through the explicit sync adapters, including
-  persistent open, buckets, scans, transactions, flush, reopen, and stats.
-- `async_quickstart`: first pass through `Db::open`, async writes, lazy scans,
+- `quickstart`: first pass through `Db::open`, async writes, lazy scans,
   transaction commit, maintenance, read-only reopen, and storage runtime stats.
+- `sync_quickstart`: first pass through the explicit sync adapters, including
+  persistent open, buckets, scans, transactions, flush, reopen, and stats.
 - `user_store`: wraps Trine KV behind a small repository-style API.
 - `event_index`: stores event payloads and a secondary account index with one
   atomic write batch.
