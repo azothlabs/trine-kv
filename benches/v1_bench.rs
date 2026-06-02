@@ -101,12 +101,12 @@ fn measure(name: &'static str, iterations: usize, mut run: impl FnMut() -> u64) 
 }
 
 fn benchmark_persistent_options(path: impl Into<PathBuf>) -> DbOptions {
-    DbOptions::persistent(path).with_durability(DurabilityMode::Buffered)
+    DbOptions::new(path).with_durability(DurabilityMode::Buffered)
 }
 
 fn bench_single_key_put() -> BenchResult {
     measure("single-key put", OPS, || {
-        let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+        let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
         let bucket = db.default_bucket_sync().expect("bucket opens");
         let mut checksum = 0;
         for index in 0..OPS {
@@ -120,7 +120,7 @@ fn bench_single_key_put() -> BenchResult {
 
 fn bench_batch_write() -> BenchResult {
     measure("batch write", ROWS, || {
-        let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+        let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
         db.default_bucket_sync().expect("bucket opens");
         let mut batch = WriteBatch::new();
         for index in 0..ROWS {
@@ -380,7 +380,7 @@ fn bench_compaction_throughput() -> BenchResult {
 
 fn bench_large_inline_values() -> BenchResult {
     measure("large inline values", 256, || {
-        let db = Db::memory_sync(
+        let db = Db::open_sync(
             DbOptions::memory().with_default_bucket_options(BucketOptions {
                 blob_threshold_bytes: 128 * 1024,
                 ..BucketOptions::default()
@@ -847,7 +847,7 @@ fn bench_codec(
 }
 
 fn populated_memory_db(rows: usize) -> Db {
-    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     let bucket = db.default_bucket_sync().expect("bucket opens");
     for index in 0..rows {
         bucket
@@ -860,7 +860,7 @@ fn populated_memory_db(rows: usize) -> Db {
 fn populated_delta_memory_db(rows: usize) -> Db {
     let mut options = DbOptions::memory();
     options.write_buffer_bytes = 1;
-    let db = Db::memory_sync(options).expect("memory db opens");
+    let db = Db::open_sync(options).expect("memory db opens");
     let bucket = db.default_bucket_sync().expect("bucket opens");
     for index in 0..rows {
         bucket
@@ -922,7 +922,7 @@ fn assert_active_memtable_stats(db: &Db) {
 fn populated_prefix_db(rows: usize, filters: bool) -> Db {
     let mut options = DbOptions::memory();
     options.default_bucket_options = prefix_options(filters);
-    let db = Db::memory_sync(options).expect("memory db opens");
+    let db = Db::open_sync(options).expect("memory db opens");
     let bucket = db.default_bucket_sync().expect("bucket opens");
     for index in 0..rows {
         bucket

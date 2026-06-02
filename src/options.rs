@@ -170,6 +170,11 @@ impl DbOptions {
     pub const DEFAULT_BLOB_GC_MIN_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
     #[must_use]
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self::persistent(path)
+    }
+
+    #[must_use]
     pub fn memory() -> Self {
         Self::default()
     }

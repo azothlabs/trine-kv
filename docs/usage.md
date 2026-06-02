@@ -56,21 +56,21 @@ trine-kv = { version = "0.1", features = ["platform-io"] }
 
 ## Open A Database
 
-The primary database API is async-first. Use an in-memory database for tests
-and short-lived data:
+The primary database API is async-first. Passing a path opens a persistent
+database:
 
 ```rust
 use trine_kv::Db;
 
-let db = Db::open_memory().await?;
+let db = Db::open("./trine-data").await?;
 ```
 
-Use a persistent database when data should live in a directory:
+Use an in-memory database only when the data is intentionally short-lived:
 
 ```rust
-use trine_kv::Db;
+use trine_kv::{Db, DbOptions};
 
-let db = Db::open_persistent("./trine-data").await?;
+let db = Db::open(DbOptions::memory()).await?;
 ```
 
 Persistent mode creates the directory when `create_if_missing` is true and the
@@ -88,7 +88,7 @@ Synchronous callers can use explicit `*_sync` adapters:
 ```rust
 use trine_kv::Db;
 
-let db = Db::open_persistent_sync("./trine-data")?;
+let db = Db::open_sync("./trine-data")?;
 db.put_sync(b"user:001", b"Ada")?;
 db.flush_sync()?;
 ```
@@ -100,7 +100,7 @@ recent confirmed writes after a crash or power loss:
 use trine_kv::{Db, DbOptions, DurabilityMode};
 
 let db = Db::open(
-    DbOptions::persistent("./trine-data").with_durability(DurabilityMode::Buffered),
+    DbOptions::new("./trine-data").with_durability(DurabilityMode::Buffered),
 )
 .await?;
 ```
@@ -114,7 +114,7 @@ acquisition:
 ```rust
 use trine_kv::{Db, DbOptions, RuntimeOptions};
 
-let mut options = DbOptions::persistent("./trine-data");
+let mut options = DbOptions::new("./trine-data");
 options.runtime = RuntimeOptions::platform_io();
 let db = Db::open(options).await?;
 ```
@@ -203,7 +203,7 @@ use trine_kv::{BucketOptions, Db, DbOptions, PrefixExtractor};
 let options = DbOptions::memory().with_default_bucket_options(
     BucketOptions::default().with_prefix_extractor(PrefixExtractor::Separator(b':')),
 );
-let db = Db::memory_sync(options)?;
+let db = Db::open_sync(options)?;
 ```
 
 ## Create A Bucket
@@ -436,7 +436,7 @@ Configure the default bucket threshold and Level Merge policy through
 use trine_kv::{BlobLevelMergePolicy, BucketOptions, Db, DbOptions};
 
 let db = Db::open_sync(
-    DbOptions::persistent("./trine-data").with_default_bucket_options(
+    DbOptions::new("./trine-data").with_default_bucket_options(
         BucketOptions {
             blob_threshold_bytes: 64 * 1024,
             blob_level_merge_policy: BlobLevelMergePolicy::Auto,
@@ -476,7 +476,7 @@ Use database-level options to tune when GC is considered:
 ```rust
 use trine_kv::{BlobGcRatio, DbOptions};
 
-let mut options = DbOptions::persistent("./trine-data");
+let mut options = DbOptions::new("./trine-data");
 options.blob_gc_min_file_bytes = 64 * 1024 * 1024;
 options.blob_gc_discardable_ratio = BlobGcRatio::from_millionths(500_000);
 ```
@@ -572,7 +572,9 @@ println!(
 Use read-only open for inspecting a stable persistent directory:
 
 ```rust
-let db = Db::open_read_only("./trine-data")?;
+use trine_kv::{Db, DbOptions};
+
+let db = Db::open_sync(DbOptions::new("./trine-data").read_only())?;
 ```
 
 Read-only open does not take the writer lock and does not create a WAL writer.
@@ -588,9 +590,9 @@ formats, and unexpected formal storage files.
 Safe temporary files can be repaired only when explicitly requested:
 
 ```rust
-use trine_kv::FailOnCorruptionPolicy;
+use trine_kv::{DbOptions, FailOnCorruptionPolicy};
 
-let mut options = DbOptions::persistent("./trine-data");
+let mut options = DbOptions::new("./trine-data");
 options.fail_on_corruption = FailOnCorruptionPolicy::RepairSafeTemporaryFiles;
 
 let db = Db::open_sync(options)?;

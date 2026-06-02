@@ -22,7 +22,7 @@ fn collect_lazy(iter: LazyIter) -> Vec<(Vec<u8>, Vec<u8>, bool)> {
 
 #[test]
 fn range_iteration_returns_ordered_live_keys() {
-    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     let bucket = db.default_bucket_sync().expect("bucket opens");
 
     bucket.put_sync(b"b", b"b1").expect("write b1");
@@ -58,7 +58,7 @@ fn range_iteration_returns_ordered_live_keys() {
 
 #[test]
 fn bounded_range_and_reverse_iteration_obey_key_order() {
-    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     let bucket = db.default_bucket_sync().expect("bucket opens");
 
     for key in [b"a", b"b", b"c", b"d", b"e"] {
@@ -92,7 +92,7 @@ fn prefix_iteration_uses_snapshot_visibility() {
     };
     let mut db_options = DbOptions::memory();
     db_options.default_bucket_options = options;
-    let db = Db::memory_sync(db_options).expect("memory db opens");
+    let db = Db::open_sync(db_options).expect("memory db opens");
     let bucket = db.default_bucket_sync().expect("bucket opens");
 
     bucket.put_sync(b"user:1", b"old").expect("write old");
@@ -126,7 +126,7 @@ fn prefix_iteration_uses_snapshot_visibility() {
 
 #[test]
 fn value_lazy_iteration_works_in_memory_without_blob_files() {
-    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     let bucket = db.default_bucket_sync().expect("bucket opens");
 
     bucket.put_sync(b"a", b"a1").expect("write a1");
@@ -160,7 +160,7 @@ fn value_lazy_iteration_works_in_memory_without_blob_files() {
 
 #[test]
 fn opening_default_bucket_as_named_bucket_is_rejected() {
-    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     db.put_sync(b"already-written", b"value")
         .expect("default bucket write fixes options");
 

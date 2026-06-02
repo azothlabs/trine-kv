@@ -58,6 +58,9 @@ Evidence notes should separate:
 - Trine's primary database API and storage boundary are async-first. Sync
   native APIs are adapters over the primary async engine and use explicit
   `*_sync` public names.
+- Public database open is path-first and persistent by default:
+  `Db::open(path)` and `Db::open_sync(path)` open a persistent database, while
+  in-memory mode requires explicit `DbOptions::memory()`.
 - `PlatformAsyncIo` must mean at least one current Trine storage operation is
   executed by a real OS async primitive for the selected target. A backend that
   only provides polling, thread-pool fallback, or lower-level primitives that

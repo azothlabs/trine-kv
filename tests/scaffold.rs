@@ -1,12 +1,12 @@
 use trine_kv::{
     CompressionProfile, Db, DbOptions, Direction, DurabilityMode, KeyRange, PrefixExtractor,
-    Sequence, WriteBatch,
+    Sequence, StorageMode, WriteBatch,
     codec::{BlockCodec, CodecId, FastLz4BlockCodec, NoneCodec},
 };
 
 #[test]
 fn scaffold_exposes_v1_public_boundaries() {
-    let db = Db::open_memory_sync().expect("memory db scaffold opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db scaffold opens");
     db.put_sync(b"default-key", b"default-value")
         .expect("default bucket put works");
 
@@ -53,7 +53,7 @@ fn prefix_and_none_codec_scaffold_are_usable() {
 #[test]
 fn persistent_options_default_to_safe_durability() {
     assert_eq!(
-        DbOptions::persistent("trine-data").durability,
+        DbOptions::new("trine-data").durability,
         DurabilityMode::SyncAll
     );
     assert_eq!(
@@ -65,4 +65,25 @@ fn persistent_options_default_to_safe_durability() {
         DurabilityMode::Flush
     );
     assert_eq!(DbOptions::memory().durability, DurabilityMode::Buffered);
+}
+
+#[test]
+fn path_open_defaults_to_persistent_storage() {
+    let path = std::env::temp_dir().join(format!(
+        "trine-kv-path-open-scaffold-{}",
+        std::process::id()
+    ));
+    if path.exists() {
+        std::fs::remove_dir_all(&path).expect("old scaffold directory removed");
+    }
+
+    let db = Db::open_sync(&path).expect("path open defaults to persistent storage");
+    assert!(matches!(
+        &db.options().storage_mode,
+        StorageMode::Persistent { .. }
+    ));
+    assert_eq!(db.options().durability, DurabilityMode::SyncAll);
+    drop(db);
+
+    std::fs::remove_dir_all(path).expect("scaffold directory removed");
 }

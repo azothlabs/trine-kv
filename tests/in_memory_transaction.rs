@@ -2,7 +2,7 @@ use trine_kv::{Db, DbOptions, Error, KeyRange, TransactionOptions, WriteBatch, W
 
 #[test]
 fn transaction_commits_staged_writes_without_reads() {
-    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     let bucket = db.default_bucket_sync().expect("bucket opens");
     let mut txn = db.transaction(TransactionOptions::default());
 
@@ -18,7 +18,7 @@ fn transaction_commits_staged_writes_without_reads() {
 
 #[test]
 fn named_transaction_methods_reject_reserved_default_bucket_name() {
-    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     let mut txn = db.transaction(TransactionOptions::default());
 
     let error = txn
@@ -34,7 +34,7 @@ fn named_transaction_methods_reject_reserved_default_bucket_name() {
 
 #[test]
 fn transaction_point_read_conflicts_with_later_point_write() {
-    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     let bucket = db.default_bucket_sync().expect("bucket opens");
     bucket.put_sync(b"a", b"v1").expect("seed value");
 
@@ -48,7 +48,7 @@ fn transaction_point_read_conflicts_with_later_point_write() {
 
 #[test]
 fn transaction_point_read_conflicts_with_later_range_delete() {
-    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     let bucket = db.default_bucket_sync().expect("bucket opens");
     bucket.put_sync(b"m", b"value").expect("seed value");
 
@@ -67,7 +67,7 @@ fn transaction_point_read_conflicts_with_later_range_delete() {
 
 #[test]
 fn transaction_range_read_conflicts_with_later_point_write_inside_range() {
-    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     let bucket = db.default_bucket_sync().expect("bucket opens");
     let mut txn = db.transaction(TransactionOptions::default());
 
@@ -81,7 +81,7 @@ fn transaction_range_read_conflicts_with_later_point_write_inside_range() {
 
 #[test]
 fn transaction_range_read_conflicts_with_later_overlapping_range_delete() {
-    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     db.default_bucket_sync().expect("bucket opens");
     let mut txn = db.transaction(TransactionOptions::default());
 
@@ -100,7 +100,7 @@ fn transaction_range_read_conflicts_with_later_overlapping_range_delete() {
 
 #[test]
 fn transaction_range_read_allows_later_write_outside_range() {
-    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     let bucket = db.default_bucket_sync().expect("bucket opens");
     let mut txn = db.transaction(TransactionOptions::default());
 

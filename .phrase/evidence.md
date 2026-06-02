@@ -9141,3 +9141,43 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Commit the naming fix and return to release-candidate verification.
+
+## 2026-06-02: Path-First Persistent Open API
+
+### Observation
+
+- `Db::open(path)` and `Db::open_sync(path)` now accept path inputs and convert
+  them to native persistent options.
+- `DbOptions::new(path)` is the configured persistent constructor used by docs
+  and examples.
+- `DbOptions::memory()` remains the explicit in-memory path.
+- Mode-specific public open helpers were removed from the documented and public
+  call surface.
+
+### Interpretation
+
+- The first-use API now reads as database-open first, persistent by default, and
+  memory only when explicitly requested.
+- `DbOptions::default()` remains in-memory because a persistent default cannot
+  be complete without a caller-provided path.
+
+### Verification
+
+- `cargo fmt --check` passed.
+- `cargo check --all-targets --all-features` passed.
+- `cargo clippy --all-targets --all-features -- -D warnings` passed.
+- `cargo test --test scaffold` passed, including the path-open persistent smoke
+  test.
+- `cargo test --all-targets --all-features` passed.
+- `cargo run --example quickstart`, `sync_quickstart`, `user_store`, and
+  `event_index` passed.
+- `cargo check --target wasm32-unknown-unknown --lib` and
+  `cargo check --target wasm32-wasip1 --lib` passed.
+- `cargo package --list --allow-dirty` and `git diff --check` passed.
+- Public docs/examples no longer contain `open_persistent`, `open_memory`, or
+  `Db::memory` as first-use open calls.
+
+### Recommended Next Action
+
+- Commit the path-first open API follow-up if the release-candidate scope looks
+  right.

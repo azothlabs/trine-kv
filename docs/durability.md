@@ -42,8 +42,8 @@ batch:
 
 `DbOptions::durability` is the database-level durability floor. Per-write
 `WriteOptions` can ask for a stronger mode, but cannot quietly weaken the mode
-selected at open time. Native persistent options default this floor to
-`SyncAll`, so ordinary `Db::open_persistent`/`DbOptions::persistent` callers get
+selected at open time. Passing a path to `Db::open` uses native persistent
+options and defaults this floor to `SyncAll`, so ordinary callers get
 database-style durability for confirmed writes. `Buffered` is available only
 when callers explicitly choose it for data that can tolerate losing recent
 confirmed writes after a crash or power loss.

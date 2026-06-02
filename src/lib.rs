@@ -43,7 +43,7 @@ pub mod wal;
 pub mod write_batch;
 
 pub use bucket::{Bucket, BucketName, BucketReader};
-pub use db::{Db, MaintenanceBudget, MaintenanceOutcome};
+pub use db::{Db, IntoOpenOptions, MaintenanceBudget, MaintenanceOutcome};
 pub use error::{Error, Result};
 pub use iterator::{Direction, Iter, LazyIter, LazyKeyValue, LazyValue};
 pub use mvcc::SnapshotSequence;

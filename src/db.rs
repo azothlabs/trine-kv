@@ -63,6 +63,25 @@ pub struct Db {
     counts_as_user_handle: bool,
 }
 
+pub trait IntoOpenOptions {
+    fn into_open_options(self) -> DbOptions;
+}
+
+impl IntoOpenOptions for DbOptions {
+    fn into_open_options(self) -> DbOptions {
+        self
+    }
+}
+
+impl<P> IntoOpenOptions for P
+where
+    P: AsRef<Path>,
+{
+    fn into_open_options(self) -> DbOptions {
+        DbOptions::new(self.as_ref())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaintenanceBudget {
     max_flush_inputs: usize,
@@ -846,7 +865,8 @@ impl Drop for Db {
 }
 
 impl Db {
-    pub fn open_sync(options: DbOptions) -> Result<Self> {
+    pub fn open_sync(options: impl IntoOpenOptions) -> Result<Self> {
+        let options = options.into_open_options();
         match &options.storage_mode {
             StorageMode::InMemory => Self::memory_sync(options),
             StorageMode::Persistent { .. } => Self::open_persistent_with_options(options),
@@ -859,14 +879,6 @@ impl Db {
                 HostStorageBackend::Browser.as_str(),
             )),
         }
-    }
-
-    pub fn open_wasi_persistent_sync(path: impl Into<std::path::PathBuf>) -> Result<Self> {
-        Self::open_sync(DbOptions::wasi_persistent(path))
-    }
-
-    pub fn open_wasi_read_only_sync(path: impl Into<std::path::PathBuf>) -> Result<Self> {
-        Self::open_sync(DbOptions::wasi_persistent_read_only(path))
     }
 
     fn open_wasi_persistent_with_options(options: DbOptions) -> Result<Self> {
@@ -1114,23 +1126,11 @@ impl Db {
         validate_common_options(options)
     }
 
-    pub fn open_memory_sync() -> Result<Self> {
-        Self::memory_sync(DbOptions::memory())
-    }
-
-    pub fn open_persistent_sync(path: impl Into<std::path::PathBuf>) -> Result<Self> {
-        Self::open_sync(DbOptions::persistent(path))
-    }
-
-    pub fn open_read_only_sync(path: impl Into<std::path::PathBuf>) -> Result<Self> {
-        Self::open_sync(DbOptions::persistent_read_only(path))
-    }
-
     #[cfg_attr(
         all(target_arch = "wasm32", target_os = "unknown"),
         allow(clippy::arc_with_non_send_sync)
     )]
-    pub fn memory_sync(mut options: DbOptions) -> Result<Self> {
+    fn memory_sync(mut options: DbOptions) -> Result<Self> {
         options.storage_mode = StorageMode::InMemory;
         validate_options(&options)?;
         let block_cache_bytes = options.block_cache_bytes;
@@ -5122,7 +5122,8 @@ impl Db {
 /// `*_sync` adapters above.
 #[allow(clippy::unused_async)]
 impl Db {
-    pub async fn open(options: DbOptions) -> Result<Self> {
+    pub async fn open(options: impl IntoOpenOptions) -> Result<Self> {
+        let options = options.into_open_options();
         match &options.storage_mode {
             StorageMode::InMemory => Self::memory_sync(options),
             StorageMode::Persistent { .. } => {
@@ -5135,30 +5136,6 @@ impl Db {
                 backend: HostStorageBackend::Wasi { .. },
             } => Self::open_wasi_persistent_with_options_async(options).await,
         }
-    }
-
-    pub async fn open_memory() -> Result<Self> {
-        Self::open_memory_sync()
-    }
-
-    pub async fn open_persistent(path: impl Into<std::path::PathBuf>) -> Result<Self> {
-        Self::open(DbOptions::persistent(path)).await
-    }
-
-    pub async fn open_read_only(path: impl Into<std::path::PathBuf>) -> Result<Self> {
-        Self::open(DbOptions::persistent_read_only(path)).await
-    }
-
-    pub async fn open_wasi_persistent(path: impl Into<std::path::PathBuf>) -> Result<Self> {
-        Self::open(DbOptions::wasi_persistent(path)).await
-    }
-
-    pub async fn open_wasi_read_only(path: impl Into<std::path::PathBuf>) -> Result<Self> {
-        Self::open(DbOptions::wasi_persistent_read_only(path)).await
-    }
-
-    pub async fn memory(options: DbOptions) -> Result<Self> {
-        Self::memory_sync(options)
     }
 
     pub async fn default_bucket(&self) -> Result<Bucket> {

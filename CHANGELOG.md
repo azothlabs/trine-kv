@@ -22,7 +22,10 @@ Initial packaged release candidate for the embedded LSM MVCC engine.
 - Read-only open, safe temporary file repair policy, durability notes, usage
   guide, quickstart examples, integration examples, release checklist, and
   benchmark baselines.
-- Native persistent open defaults to `SyncAll` for confirmed writes; `Buffered`
+- Path-first `Db::open(path)` and `Db::open_sync(path)` APIs for ordinary
+  persistent databases, with `DbOptions::memory()` as the explicit in-memory
+  mode.
+- Native path-based open defaults to `SyncAll` for confirmed writes; `Buffered`
   remains available as an explicit advanced mode for rebuildable or loss-tolerant
   data.
 - Async-first database, bucket, iterator, value, transaction, flush,

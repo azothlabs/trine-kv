@@ -194,7 +194,7 @@ fn persistent_api_helpers_cover_open_options_and_bucket_writes() {
     }
 
     {
-        let db = Db::open_read_only_sync(&path).expect("read-only db opens");
+        let db = Db::open_sync(DbOptions::persistent_read_only(&path)).expect("read-only db opens");
         let bucket = db.default_bucket_sync().expect("read-only bucket opens");
         assert_eq!(
             bucket.get_sync(b"user:001").expect("user reads"),

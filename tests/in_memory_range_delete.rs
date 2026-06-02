@@ -10,7 +10,7 @@ fn collect(iter: Iter) -> Vec<(Vec<u8>, Vec<u8>)> {
 
 #[test]
 fn range_delete_hides_point_reads_and_scans_without_breaking_snapshots() {
-    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     let bucket = db.default_bucket_sync().expect("bucket opens");
 
     for (key, value) in [(b"a", b"a1"), (b"b", b"b1"), (b"c", b"c1"), (b"d", b"d1")] {
@@ -57,7 +57,7 @@ fn range_delete_hides_point_reads_and_scans_without_breaking_snapshots() {
 
 #[test]
 fn range_delete_participates_in_prefix_scans() {
-    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     let bucket = db.default_bucket_sync().expect("bucket opens");
 
     bucket.put_sync(b"user:1", b"old").expect("write user 1");
@@ -85,7 +85,7 @@ fn range_delete_participates_in_prefix_scans() {
 
 #[test]
 fn same_batch_order_decides_range_delete_conflicts() {
-    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     let bucket = db.default_bucket_sync().expect("bucket opens");
 
     let mut delete_then_put = WriteBatch::new();

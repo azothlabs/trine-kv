@@ -44,7 +44,7 @@ struct EventLog {
 
 impl EventLog {
     fn open(path: &Path) -> Result<Self> {
-        let db = Db::open_persistent_sync(path)?;
+        let db = Db::open_sync(path)?;
         let events = db.bucket_sync("events")?;
         let by_account = db.bucket_sync("events_by_account")?;
         Ok(Self {

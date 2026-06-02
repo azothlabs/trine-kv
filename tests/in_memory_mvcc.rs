@@ -4,7 +4,7 @@ use trine_kv::{Db, DbOptions, Error, WriteBatch, WriteOptions};
 fn write_buffer_budget_reads_delta_backed_in_memory_writes() {
     let mut options = DbOptions::memory();
     options.write_buffer_bytes = 1;
-    let db = Db::memory_sync(options).expect("memory db opens");
+    let db = Db::open_sync(options).expect("memory db opens");
     let bucket = db.default_bucket_sync().expect("bucket opens");
 
     bucket.put_sync(b"user:1", b"ada").expect("write user");
@@ -23,7 +23,7 @@ fn write_buffer_budget_reads_delta_backed_in_memory_writes() {
 
 #[test]
 fn point_writes_deletes_and_snapshot_reads_are_mvcc_visible() {
-    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     let bucket = db.default_bucket_sync().expect("bucket opens");
 
     assert_eq!(bucket.get_sync(b"a").expect("initial read"), None);
@@ -53,7 +53,7 @@ fn point_writes_deletes_and_snapshot_reads_are_mvcc_visible() {
 
 #[test]
 fn snapshots_pin_and_release_read_sequences() {
-    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     assert_eq!(db.stats().active_snapshots, 0);
 
     let snapshot = db.snapshot();
@@ -71,7 +71,7 @@ fn snapshots_pin_and_release_read_sequences() {
 
 #[test]
 fn write_batch_commits_multiple_buckets_at_one_sequence() {
-    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     let users = db.bucket_sync("users").expect("users bucket opens");
     let posts = db.bucket_sync("posts").expect("posts bucket opens");
 
@@ -115,7 +115,7 @@ fn named_batch_methods_reject_reserved_default_bucket_name() {
 
 #[test]
 fn failed_batch_does_not_partially_apply() {
-    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     let bucket = db.default_bucket_sync().expect("bucket opens");
 
     let mut batch = WriteBatch::new();
@@ -133,7 +133,7 @@ fn failed_batch_does_not_partially_apply() {
 
 #[test]
 fn duplicate_keys_in_one_batch_use_later_operation() {
-    let db = Db::memory_sync(DbOptions::memory()).expect("memory db opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     let bucket = db.default_bucket_sync().expect("bucket opens");
 
     let mut put_then_delete = WriteBatch::new();

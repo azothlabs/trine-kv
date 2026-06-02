@@ -1,4 +1,4 @@
-use trine_kv::{Db, DbOptions, KeyRange, TransactionOptions, WriteBatch, WriteOptions};
+use trine_kv::{Db, KeyRange, TransactionOptions, WriteBatch, WriteOptions};
 
 fn main() -> trine_kv::Result<()> {
     let path =
@@ -7,7 +7,7 @@ fn main() -> trine_kv::Result<()> {
         std::fs::remove_dir_all(&path)?;
     }
 
-    let db = Db::open_sync(DbOptions::persistent(&path))?;
+    let db = Db::open_sync(&path)?;
     let users = db.bucket_sync("users")?;
 
     users.put_sync(b"user:001", b"Ada")?;
@@ -50,7 +50,7 @@ fn main() -> trine_kv::Result<()> {
     drop(snapshot);
     drop(db);
 
-    let reopened = Db::open_sync(DbOptions::persistent(&path))?;
+    let reopened = Db::open_sync(&path)?;
     let users = reopened.bucket_sync("users")?;
     assert_eq!(users.get_sync(b"user:004")?, Some(b"Barbara".to_vec()));
 

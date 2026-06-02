@@ -365,7 +365,7 @@ fn persistent_async_maintenance_runs_on_runtime_blocking_task() {
 
 #[test]
 fn dropping_unpolled_async_write_future_has_no_side_effect() {
-    let db = Db::open_memory_sync().expect("memory db opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
 
     let write = db.put(b"cancelled".to_vec(), b"value".to_vec());
     drop(write);
@@ -416,7 +416,7 @@ fn dropping_unpolled_persistent_async_write_future_has_no_wal_side_effect() {
 
 #[test]
 fn polled_async_write_future_reaches_visible_terminal_commit() {
-    let db = Db::open_memory_sync().expect("memory db opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     let mut batch = WriteBatch::new();
     batch.put(b"accepted".to_vec(), b"value".to_vec());
 
@@ -432,7 +432,7 @@ fn polled_async_write_future_reaches_visible_terminal_commit() {
 
 #[test]
 fn dropping_polled_async_write_future_does_not_cancel_accepted_native_write() {
-    let db = Db::open_memory_sync().expect("memory db opens");
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     let mut batch = WriteBatch::new();
     batch.put(b"accepted-after-drop".to_vec(), b"value".to_vec());
 
@@ -499,7 +499,7 @@ fn dropping_polled_persistent_async_write_future_survives_reopen() {
 fn inline_runtime_async_write_completes_without_background_threads() {
     let mut options = DbOptions::memory();
     options.runtime = RuntimeOptions::inline();
-    let db = Db::memory_sync(options).expect("inline runtime memory db opens");
+    let db = Db::open_sync(options).expect("inline runtime memory db opens");
     let mut batch = WriteBatch::new();
     batch.put(b"inline".to_vec(), b"value".to_vec());
 

@@ -35,6 +35,8 @@ Release packaging notes live in [docs/release.md](docs/release.md).
 - Persistent mode with WAL replay, manifest recovery, directory locking,
   safe native defaults, background maintenance, backpressure, flush,
   compaction, and read-only open.
+- Explicit in-memory mode for tests, examples, and short-lived data that should
+  disappear when the `Db` is dropped.
 - Async open/read/write/scan/transaction/maintenance entry points for hosts
   that need to drive storage cooperatively. Native async persistent APIs enter
   storage waits through Trine's storage boundary and use runtime task
@@ -77,7 +79,7 @@ trine-kv = { path = "../trine-kv" }
 use trine_kv::{Db, KeyRange, TransactionOptions, WriteBatch, WriteOptions};
 
 async fn run() -> trine_kv::Result<()> {
-    let db = Db::open_memory().await?;
+    let db = Db::open("./trine-data").await?;
 
     // Simple applications can use the built-in default bucket directly.
     db.put(b"settings:theme", b"dark").await?;
@@ -124,6 +126,14 @@ For the runnable async-first persistent path, use:
 
 ```text
 cargo run --example quickstart
+```
+
+For tests or short-lived data, opt into memory mode explicitly:
+
+```rust
+use trine_kv::{Db, DbOptions};
+
+let db = Db::open(DbOptions::memory()).await?;
 ```
 
 For the explicit sync-adapter path, use:

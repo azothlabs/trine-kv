@@ -1288,7 +1288,7 @@ mod tests {
 
     #[test]
     fn accepted_write_completion_delivers_success_result() {
-        let db = Db::open_memory_sync().expect("memory db opens");
+        let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
         let mut batch = WriteBatch::new();
         batch.put(b"k".to_vec(), b"v".to_vec());
         let request = WriteRequest::batch(batch, WriteOptions::default());
@@ -1308,7 +1308,7 @@ mod tests {
     fn accepted_write_completion_delivers_error_result() {
         let mut options = DbOptions::memory();
         options.read_only = true;
-        let db = Db::memory_sync(options).expect("read-only memory db opens");
+        let db = Db::open_sync(options).expect("read-only memory db opens");
         let mut batch = WriteBatch::new();
         batch.put(b"k".to_vec(), b"v".to_vec());
         let request = WriteRequest::batch(batch, WriteOptions::default());
@@ -1323,7 +1323,7 @@ mod tests {
 
     #[test]
     fn accepted_write_preflight_creates_writer_local_state_without_publication() {
-        let db = Db::open_memory_sync().expect("memory db opens");
+        let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
         db.bucket_sync("events").expect("named bucket opens");
         let mut batch = WriteBatch::new();
         batch.put(b"default".to_vec(), b"v1".to_vec());
@@ -1397,7 +1397,7 @@ mod tests {
 
     #[test]
     fn writer_local_preparation_groups_same_bucket_delta_with_bounds() {
-        let db = Db::open_memory_sync().expect("memory db opens");
+        let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
         let mut batch = WriteBatch::new();
         batch.put(b"b".to_vec(), b"v".to_vec());
         batch.delete(b"a".to_vec());
@@ -1592,7 +1592,7 @@ mod tests {
 
     #[test]
     fn writer_local_state_publishes_under_memtable_lock_after_sequence() {
-        let db = Db::open_memory_sync().expect("memory db opens");
+        let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
         let mut batch = WriteBatch::new();
         batch.put(b"k".to_vec(), b"v".to_vec());
         let request = WriteRequest::batch(batch, WriteOptions::default());
@@ -1646,7 +1646,7 @@ mod tests {
 
     #[test]
     fn visible_sequence_waits_for_earlier_published_slot_completion() {
-        let db = Db::open_memory_sync().expect("memory db opens");
+        let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
         let mut first_batch = WriteBatch::new();
         first_batch.put(b"k".to_vec(), b"v1".to_vec());
         let first_request = WriteRequest::batch(first_batch, WriteOptions::default());
@@ -1705,7 +1705,7 @@ mod tests {
     fn in_memory_write_budget_merges_deltas_without_active_mirror() {
         let mut options = DbOptions::memory();
         options.write_buffer_bytes = 1;
-        let db = Db::memory_sync(options).expect("memory db opens");
+        let db = Db::open_sync(options).expect("memory db opens");
 
         db.put_sync(b"k", b"v1").expect("first write");
         let snapshot = db.snapshot();

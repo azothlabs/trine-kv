@@ -20,7 +20,7 @@ fn main() -> Result<()> {
 }
 
 async fn run(path: &Path) -> Result<()> {
-    let mut options = DbOptions::persistent(path);
+    let mut options = DbOptions::new(path);
     options.background_worker_count = 0;
 
     let db = Db::open(options).await?;
@@ -70,7 +70,7 @@ async fn run(path: &Path) -> Result<()> {
     drop(snapshot);
     db.close().await?;
 
-    let reopened = Db::open(DbOptions::persistent_read_only(path)).await?;
+    let reopened = Db::open(DbOptions::new(path).read_only()).await?;
     let users = reopened.bucket("users").await?;
     assert_eq!(users.get(b"user:004").await?, Some(b"Barbara".to_vec()));
 
