@@ -10,6 +10,7 @@ benchmark harness, and durability notes. To see the main path work end to end:
 
 ```text
 cargo run --example quickstart
+cargo run --example async_quickstart
 ```
 
 Then read [docs/usage.md](docs/usage.md) for the API path and
@@ -19,7 +20,7 @@ Release packaging notes live in [docs/release.md](docs/release.md).
 ## Common Capabilities
 
 - Direct default-bucket reads and writes with `Db::put`, `Db::get`, `Db::range`,
-  and `Db::prefix`.
+  `Db::prefix`, and their async counterparts.
 - Optional named buckets through `db.bucket("users")?` when data needs logical
   separation or independent tuning.
 - Atomic write batches across the default bucket and named buckets.
@@ -34,7 +35,9 @@ Release packaging notes live in [docs/release.md](docs/release.md).
   default background maintenance, backpressure, flush, compaction, and
   read-only open.
 - Async open/read/write/scan/transaction/maintenance entry points for hosts
-  that need to drive storage cooperatively.
+  that need to drive storage cooperatively. Native async persistent APIs enter
+  storage waits through Trine's storage boundary and use runtime task
+  boundaries for synchronous maintenance/WAL internals.
 - Block-based SSTables with partitioned index/filter blocks, data-block hash
   lookup for point reads, high-priority metadata caching, compression, and
   linear/binary/auto index seek policies.
@@ -110,10 +113,11 @@ fn main() -> trine_kv::Result<()> {
 }
 ```
 
-For persistent open, flush, reopen, and stats in one runnable program, use:
+For persistent open, flush, reopen, and stats in runnable programs, use:
 
 ```text
 cargo run --example quickstart
+cargo run --example async_quickstart
 ```
 
 ## Common Commands
@@ -123,6 +127,7 @@ cargo fmt --check
 cargo clippy
 cargo test
 cargo run --example quickstart
+cargo run --example async_quickstart
 cargo run --example user_store
 cargo run --example event_index
 cargo bench --bench v1_bench
@@ -132,6 +137,9 @@ cargo bench --bench v1_bench
 
 - `quickstart`: first pass through persistent open, buckets, scans,
   transactions, flush, reopen, and stats.
+- `async_quickstart`: the same first pass through `Db::open_async`, async
+  writes, lazy scans, transaction commit, maintenance, read-only reopen, and
+  storage runtime stats.
 - `user_store`: wraps Trine KV behind a small repository-style API.
 - `event_index`: stores event payloads and a secondary account index with one
   atomic write batch.

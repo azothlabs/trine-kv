@@ -8996,3 +8996,49 @@ Record only evidence that can change planning or durable decisions.
 - Return to release-candidate verification. Track primary async
   maintenance/WAL internals and an in-browser persistence fixture as follow-up
   hardening rather than Phase 130 blockers.
+
+## 2026-06-02: Async Docs And Quickstart Alignment
+
+### Observation
+
+- README and usage docs mentioned async APIs, but the runnable first-path
+  examples were still centered on synchronous persistent open.
+- Release and CI gates ran the synchronous quickstart and integration examples,
+  but not a runnable async persistent quickstart.
+
+### Interpretation
+
+- The async contract closure needed user-facing verification, not another
+  engine change.
+- A std-only async quickstart avoids adding a runtime dependency while still
+  proving native async open, writes, scans, transactions, maintenance, and
+  reopen.
+
+### Change
+
+- Added `examples/async_quickstart.rs`.
+- Updated README, usage docs, durability notes, release checklist, changelog,
+  and CI/publish workflows to include the async quickstart and current async
+  boundaries.
+
+### Verification
+
+- `cargo run --example quickstart`
+- `cargo run --example async_quickstart`
+- `cargo run --example user_store`
+- `cargo run --example event_index`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo fmt --check`
+- `git diff --check`
+- forbidden-term scan over README, docs, examples, `.phrase`, changelog, and
+  workflows
+- `cargo package --list --allow-dirty`
+
+### Remaining Blockers
+
+- No new engine blocker introduced by the documentation/example update.
+
+### Recommended Next Action
+
+- Run the documented example gate and commit the documentation/example refresh.

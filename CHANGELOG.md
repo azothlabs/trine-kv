@@ -24,6 +24,9 @@ Initial packaged release candidate for the embedded LSM MVCC engine.
   benchmark baselines.
 - Async-compatible database, bucket, iterator, value, transaction, flush,
   compaction, and maintenance APIs.
+- Runnable `async_quickstart` example covering async persistent open, writes,
+  lazy scans, transaction commit, maintenance, read-only reopen, and storage
+  runtime stats.
 - Native platform I/O capability reporting, fallback observability, bounded
   blocking adapter stats, and cooperative maintenance budgets.
 - Explicit WASI persistent options for host-preopened filesystems on WASI

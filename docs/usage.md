@@ -7,6 +7,7 @@ Run the checked quickstart first:
 
 ```text
 cargo run --example quickstart
+cargo run --example async_quickstart
 ```
 
 Then look at the integration examples when you want to embed the database
@@ -69,6 +70,26 @@ let db = Db::open_persistent("./trine-data")?;
 Persistent mode creates the directory when `create_if_missing` is true and the
 database is not opened read-only.
 
+Use the async open path when the host wants Trine to expose storage waits as
+futures:
+
+```rust
+use trine_kv::{Db, DbOptions, DurabilityMode};
+
+let db = Db::open_async(
+    DbOptions::persistent("./trine-data").with_durability(DurabilityMode::Flush),
+)
+.await?;
+db.put_async(b"user:001".to_vec(), b"Ada".to_vec()).await?;
+db.flush_async().await?;
+```
+
+On native targets, async persistent open, point reads, scans, and lazy value
+reads enter Trine's storage boundary through async helpers. Native async writes
+and maintenance use runtime task boundaries where the current engine internals
+are still synchronous. Run `cargo run --example async_quickstart` for a
+complete checked path.
+
 Set a database-level durability floor when every write should be at least that
 durable:
 
@@ -114,7 +135,7 @@ that path and defaults to inline runtime execution with no background worker
 threads:
 
 ```rust
-let wasi = Db::open(DbOptions::wasi_persistent("./trine-data"));
+let wasi = Db::open(DbOptions::wasi_persistent("./trine-data"))?;
 let wasi_async = Db::open_async(DbOptions::wasi_persistent("./trine-data")).await?;
 ```
 
@@ -581,6 +602,7 @@ Use these commands before trusting a change to documentation or examples:
 
 ```text
 cargo run --example quickstart
+cargo run --example async_quickstart
 cargo run --example user_store
 cargo run --example event_index
 cargo fmt --check
