@@ -46,6 +46,7 @@ data.
 task556 [x] goal:fix scan snapshot ordering across flush publish/removal | scope:src/lsm/scan.rs tests | verify:focused scan/flush test
 task557 [x] goal:classify and harden commit failure outcome | scope:src/db/commit.rs | verify:focused failure-path test
 task558 [x] goal:classify checksum and public API boundary hardening | scope:src/{wal,table,blob,lib}.rs .phrase | verify:CRC test plus full release-facing tests
+task559 [x] goal:close public Rustdoc coverage gap | scope:src public API .phrase | verify:cargo rustdoc --all-features -- -D missing-docs
 ```
 
 ## Known Residuals
@@ -58,14 +59,18 @@ task558 [x] goal:classify checksum and public API boundary hardening | scope:src
 ## Evidence
 
 - `.phrase/evidence.md` records the scan/flush snapshot-ordering review.
+- `.phrase/evidence.md` records the public Rustdoc coverage audit and gate.
 - `cargo test scan_snapshot --lib`, the partial commit failure regression, and
   the CRC-32C check value test pass.
 - `cargo clippy --all-targets --all-features -- -D warnings`,
   `cargo test --all-targets --all-features`, `cargo fmt --check`,
-  `cargo check --all-targets --all-features`, and `git diff --check` pass.
+  `cargo check --all-targets --all-features`,
+  `cargo rustdoc --all-features -- -D missing-docs`, and `git diff --check`
+  pass.
 
 ## Next Recommendation
 
 - Keep the format-helper modules hidden from docs for this release candidate,
   then migrate durable-file inspection helpers behind a dedicated internal test
   boundary in a later phase if the public API needs to be made stricter.
+- Keep missing public Rust documentation as a release-candidate gate.

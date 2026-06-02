@@ -17,31 +17,40 @@ use crate::{
     types::{KeyRange, KeyValue, Sequence, Value},
 };
 
+/// Scan direction for range and prefix iterators.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Direction {
+    /// Visit keys in ascending byte order.
     #[default]
     Forward,
+    /// Visit keys in descending byte order.
     Reverse,
 }
 
+/// Eager iterator that returns owned key/value rows.
 #[derive(Debug, Clone)]
 pub struct Iter {
     direction: Direction,
     inner: IterInner,
 }
 
+/// Iterator that can defer reading large blob values until requested.
 #[derive(Debug, Clone)]
 pub struct LazyIter {
     direction: Direction,
     scan: LazyScan,
 }
 
+/// Row returned by `LazyIter`.
 #[derive(Debug, Clone)]
 pub struct LazyKeyValue {
+    /// User key bytes.
     pub key: Vec<u8>,
+    /// Value handle that may defer reading blob bytes.
     pub value: LazyValue,
 }
 
+/// Value returned by `LazyIter`.
 #[derive(Debug, Clone)]
 pub struct LazyValue {
     inner: LazyValueInner,
@@ -78,11 +87,13 @@ pub(crate) struct ScanSourceInput {
 }
 
 impl Iter {
+    /// Creates an empty iterator with the requested direction.
     #[must_use]
     pub fn empty(direction: Direction) -> Self {
         Self::from_items(Vec::new(), direction)
     }
 
+    /// Creates an iterator from already-owned rows.
     #[must_use]
     pub fn from_items(mut items: Vec<KeyValue>, direction: Direction) -> Self {
         if direction == Direction::Reverse {
@@ -113,6 +124,7 @@ impl Iter {
         }
     }
 
+    /// Returns this iterator's scan direction.
     #[must_use]
     pub const fn direction(&self) -> Direction {
         self.direction
@@ -138,6 +150,7 @@ impl LazyIter {
         }
     }
 
+    /// Returns this iterator's scan direction.
     #[must_use]
     pub const fn direction(&self) -> Direction {
         self.direction
@@ -145,10 +158,12 @@ impl LazyIter {
 }
 
 impl LazyKeyValue {
+    /// Reads any deferred value bytes synchronously and returns an owned row.
     pub fn into_key_value_sync(self) -> Result<KeyValue> {
         Ok(KeyValue::new(self.key, self.value.into_value_sync()?))
     }
 
+    /// Reads any deferred value bytes asynchronously and returns an owned row.
     pub async fn into_key_value(self) -> Result<KeyValue> {
         let value = self.value.into_value().await?;
         Ok(KeyValue::new(self.key, value))
@@ -156,11 +171,13 @@ impl LazyKeyValue {
 }
 
 impl LazyValue {
+    /// Returns `true` if the value bytes are already inline.
     #[must_use]
     pub fn is_inline(&self) -> bool {
         matches!(self.inner, LazyValueInner::Inline(_))
     }
 
+    /// Reads the value bytes synchronously without consuming this handle.
     pub fn read_sync(&self) -> Result<Value> {
         match &self.inner {
             LazyValueInner::Inline(bytes) => Ok(bytes.clone()),
@@ -182,6 +199,7 @@ impl LazyValue {
         }
     }
 
+    /// Reads the value bytes synchronously and consumes this handle.
     pub fn into_value_sync(self) -> Result<Value> {
         match self.inner {
             LazyValueInner::Inline(bytes) => Ok(bytes),
@@ -206,6 +224,7 @@ impl LazyValue {
         }
     }
 
+    /// Reads the value bytes asynchronously without consuming this handle.
     pub async fn read(&self) -> Result<Value> {
         match &self.inner {
             LazyValueInner::Inline(bytes) => Ok(bytes.clone()),
@@ -236,6 +255,7 @@ impl LazyValue {
         }
     }
 
+    /// Reads the value bytes asynchronously and consumes this handle.
     pub async fn into_value(self) -> Result<Value> {
         match self.inner {
             LazyValueInner::Inline(bytes) => Ok(bytes),
@@ -282,6 +302,7 @@ impl LazyValue {
 }
 
 impl Iter {
+    /// Returns the next owned row, reading deferred sources asynchronously when needed.
     pub async fn next(&mut self) -> Result<Option<KeyValue>> {
         match &mut self.inner {
             IterInner::Items(items) => Ok(items.next()),
@@ -289,16 +310,19 @@ impl Iter {
         }
     }
 
+    /// Returns the next owned row using the synchronous iterator path.
     pub fn next_sync(&mut self) -> Option<Result<KeyValue>> {
         Iterator::next(self)
     }
 }
 
 impl LazyIter {
+    /// Returns the next lazy row, reading deferred metadata asynchronously when needed.
     pub async fn next(&mut self) -> Result<Option<LazyKeyValue>> {
         self.scan.next_lazy_async().await
     }
 
+    /// Returns the next lazy row using the synchronous iterator path.
     pub fn next_sync(&mut self) -> Option<Result<LazyKeyValue>> {
         Iterator::next(self)
     }

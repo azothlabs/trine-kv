@@ -7,8 +7,10 @@ use crate::{
     write_batch::WriteBatch,
 };
 
+/// Options used by optimistic transactions.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TransactionOptions {
+    /// Write options used when the transaction commits.
     pub write_options: WriteOptions,
 }
 
@@ -57,11 +59,13 @@ impl Transaction {
         }
     }
 
+    /// Returns the sequence used by this transaction's read snapshot.
     #[must_use]
     pub const fn read_sequence(&self) -> Sequence {
         self.read_sequence
     }
 
+    /// Returns this transaction's options.
     #[must_use]
     pub const fn options(&self) -> TransactionOptions {
         self.options
@@ -166,6 +170,7 @@ impl Transaction {
         self.writes.delete_range_bucket(bucket, range)
     }
 
+    /// Commits the staged writes synchronously after conflict checks.
     pub fn commit_sync(self) -> Result<CommitInfo> {
         let read_set = TransactionReadSet {
             point_reads: self.point_reads,
@@ -185,10 +190,12 @@ impl Transaction {
 /// synchronous because they only mutate the in-memory transaction batch.
 #[allow(clippy::unused_async)]
 impl Transaction {
+    /// Reads a default-bucket key and tracks it for commit conflict checks.
     pub async fn get(&mut self, key: &[u8]) -> Result<Option<Value>> {
         self.get_bucket(DEFAULT_BUCKET_NAME, key).await
     }
 
+    /// Reads a named-bucket key and tracks it for commit conflict checks.
     pub async fn get_bucket(
         &mut self,
         bucket: impl Into<String>,
@@ -207,10 +214,12 @@ impl Transaction {
         Ok(value)
     }
 
+    /// Reads a default-bucket range and tracks it for commit conflict checks.
     pub async fn read_range(&mut self, range: KeyRange) -> Result<()> {
         self.read_range_bucket(DEFAULT_BUCKET_NAME, range).await
     }
 
+    /// Reads a named-bucket range and tracks it for commit conflict checks.
     pub async fn read_range_bucket(
         &mut self,
         bucket: impl Into<String>,
@@ -233,6 +242,7 @@ impl Transaction {
         Ok(())
     }
 
+    /// Commits the staged writes asynchronously after conflict checks.
     pub async fn commit(self) -> Result<CommitInfo> {
         let read_set = TransactionReadSet {
             point_reads: self.point_reads,

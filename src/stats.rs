@@ -1,89 +1,167 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Snapshot of live database, storage, maintenance, cache, and read-path stats.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DbStats {
+    /// Number of bucket states currently loaded.
     pub live_buckets: usize,
+    /// Number of pinned snapshots.
     pub active_snapshots: usize,
+    /// Approximate bytes held by active memtables.
     pub memtable_bytes: u64,
+    /// Number of immutable memtables waiting for flush.
     pub immutable_memtables: usize,
+    /// Number of level-0 table files.
     pub l0_tables: usize,
+    /// Total number of table files across all levels.
     pub total_tables: usize,
+    /// Per-level table counts and byte sizes.
     pub level_tables: Vec<LevelStats>,
+    /// Total bytes held by table files.
     pub table_bytes: u64,
+    /// WAL bytes accepted but not yet synced according to the selected durability.
     pub wal_bytes_pending_sync: u64,
+    /// Number of blob files referenced by live records.
     pub live_blob_files: usize,
+    /// Bytes in blob files referenced by live records.
     pub live_blob_bytes: u64,
+    /// Number of blob files with discardable bytes.
     pub stale_blob_files: usize,
+    /// Discardable bytes in stale blob files.
     pub stale_blob_bytes: u64,
+    /// Number of blob files no longer referenced by live records.
     pub obsolete_blob_files: usize,
+    /// Bytes in obsolete blob files.
     pub obsolete_blob_bytes: u64,
+    /// Number of blob garbage-collection runs.
     pub blob_gc_runs: u64,
+    /// Input bytes scanned by blob garbage collection.
     pub blob_gc_input_bytes: u64,
+    /// Output bytes written by blob garbage collection.
     pub blob_gc_output_bytes: u64,
+    /// Bytes discarded by blob garbage collection.
     pub blob_gc_discarded_bytes: u64,
+    /// Number of blob value reads.
     pub blob_read_count: u64,
+    /// Bytes returned by blob value reads.
     pub blob_read_bytes: u64,
+    /// Number of compaction runs.
     pub compaction_runs: u64,
+    /// Table files read by compaction.
     pub compaction_input_tables: u64,
+    /// Table files written by compaction.
     pub compaction_output_tables: u64,
+    /// Table bytes read by compaction.
     pub compaction_input_bytes: u64,
+    /// Table bytes written by compaction.
     pub compaction_output_bytes: u64,
+    /// Commit sequences allocated by writers.
     pub commit_sequences_allocated: u64,
+    /// Highest commit sequence visible to readers.
     pub commit_visible_sequence: u64,
+    /// Commit slots allocated but not yet published or skipped.
     pub commit_open_slots: usize,
+    /// Commit slots skipped after failed publication.
     pub commit_skipped_slots: u64,
+    /// Number of WAL shards configured for the database.
     pub wal_shards: usize,
+    /// Number of WAL shards currently open.
     pub wal_open_shards: usize,
+    /// Per-shard WAL queue capacity.
     pub wal_queue_capacity: usize,
+    /// WAL records accepted by the writer path.
     pub wal_records_accepted: u64,
+    /// WAL bytes accepted by the writer path.
     pub wal_bytes_accepted: u64,
+    /// Whether storage work is using the runtime's sync adapter.
     pub storage_uses_sync_adapter: bool,
+    /// Whether storage work is using platform async I/O.
     pub storage_uses_platform_async_io: bool,
+    /// Blocking storage tasks accepted by the sync adapter.
     pub storage_sync_adapter_tasks: u64,
+    /// Sync-adapter queue capacity.
     pub storage_sync_adapter_queue_capacity: usize,
+    /// Sync-adapter tasks currently queued.
     pub storage_sync_adapter_queued_tasks: usize,
+    /// Sync-adapter tasks submitted.
     pub storage_sync_adapter_submitted_tasks: u64,
+    /// Sync-adapter tasks completed.
     pub storage_sync_adapter_completed_tasks: u64,
+    /// Sync-adapter tasks rejected because the queue was full or unavailable.
     pub storage_sync_adapter_rejected_tasks: u64,
+    /// Total runtime spent by sync-adapter tasks.
     pub storage_sync_adapter_total_runtime_micros: u64,
+    /// Storage tasks completed through platform async I/O.
     pub storage_platform_async_io_tasks: u64,
+    /// Storage tasks that used a backend fallback path.
     pub storage_platform_backend_fallback_tasks: u64,
+    /// Storage tasks that used a synchronous fallback path.
     pub storage_platform_sync_fallback_tasks: u64,
+    /// Storage tasks completed inline.
     pub storage_inline_tasks: u64,
+    /// Per-operation storage request counters and latency totals.
     pub storage_operations: StorageOperationStats,
+    /// Cooperative maintenance yields.
     pub maintenance_cooperative_yields: u64,
+    /// Maintenance runs stopped after exhausting their budget.
     pub maintenance_budget_exhaustions: u64,
+    /// Block-cache hits.
     pub block_cache_hits: u64,
+    /// Block-cache misses.
     pub block_cache_misses: u64,
+    /// Point-read path counters.
     pub read_path: ReadPathStats,
+    /// Filter hit, miss, and false-positive counters.
     pub filters: FilterStats,
 }
 
+/// Request count and total latency for one storage operation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StorageOperationMetric {
+    /// Number of operation requests.
     pub requests: u64,
+    /// Total operation latency in microseconds.
     pub total_latency_micros: u64,
 }
 
+/// Per-operation storage metrics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StorageOperationStats {
+    /// Opens of readable storage objects.
     pub open_read: StorageOperationMetric,
+    /// Length queries for readable storage objects.
     pub len: StorageOperationMetric,
+    /// Borrowed-buffer positioned reads.
     pub read_exact_at: StorageOperationMetric,
+    /// Owned-buffer positioned reads.
     pub read_exact_at_owned: StorageOperationMetric,
+    /// Whole-object byte reads.
     pub read_object_bytes: StorageOperationMetric,
+    /// Opens of appendable storage objects.
     pub open_append: StorageOperationMetric,
+    /// Appends to storage objects.
     pub append: StorageOperationMetric,
+    /// Persistence requests for storage objects.
     pub persist: StorageOperationMetric,
+    /// WAL rewrite operations.
     pub rewrite_wal: StorageOperationMetric,
+    /// Writer-lease acquisition requests.
     pub acquire_writer_lease: StorageOperationMetric,
+    /// Directory creation requests.
     pub create_directory_all: StorageOperationMetric,
+    /// Directory file-list requests.
     pub list_directory_files: StorageOperationMetric,
+    /// Directory sync requests after atomic renames.
     pub sync_directory_after_renames: StorageOperationMetric,
+    /// Reads of the current manifest pointer.
     pub read_current_manifest: StorageOperationMetric,
+    /// Manifest publish operations.
     pub publish_manifest: StorageOperationMetric,
+    /// Whole-object writes.
     pub write_object: StorageOperationMetric,
+    /// Object delete requests.
     pub delete_object: StorageOperationMetric,
+    /// Object list requests.
     pub list_objects: StorageOperationMetric,
 }
 
@@ -107,35 +185,58 @@ impl BlobReadMetrics {
     }
 }
 
+/// Table count and byte size for one LSM level.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LevelStats {
+    /// LSM level number.
     pub level: u32,
+    /// Number of table files in the level.
     pub tables: usize,
+    /// Total bytes in the level's table files.
     pub bytes: u64,
 }
 
+/// Filter counters for table-level and block-level filters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FilterStats {
+    /// Table key-filter positive results for point reads.
     pub table_point_hits: u64,
+    /// Table key-filter negative results for point reads.
     pub table_point_misses: u64,
+    /// Table key-filter positives that did not contain the key.
     pub table_point_false_positives: u64,
+    /// Table prefix-filter positive results for prefix reads.
     pub table_prefix_hits: u64,
+    /// Table prefix-filter negative results for prefix reads.
     pub table_prefix_misses: u64,
+    /// Table prefix-filter positives that did not contain the prefix.
     pub table_prefix_false_positives: u64,
+    /// Block key-filter positive results for point reads.
     pub block_point_hits: u64,
+    /// Block key-filter negative results for point reads.
     pub block_point_misses: u64,
+    /// Block key-filter positives that did not contain the key.
     pub block_point_false_positives: u64,
+    /// Block prefix-filter positive results for prefix reads.
     pub block_prefix_hits: u64,
+    /// Block prefix-filter negative results for prefix reads.
     pub block_prefix_misses: u64,
+    /// Block prefix-filter positives that did not contain the prefix.
     pub block_prefix_false_positives: u64,
 }
 
+/// Point-read counters that describe how far reads travel through table metadata.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReadPathStats {
+    /// Table files considered by point reads.
     pub point_table_probes: u64,
+    /// Index partitions considered by point reads.
     pub point_index_partition_probes: u64,
+    /// Data-block metadata entries considered by point reads.
     pub point_block_metadata_probes: u64,
+    /// Data blocks read by point reads.
     pub point_data_block_reads: u64,
+    /// Point reads skipped because filters ruled out a table or block.
     pub point_filter_misses: u64,
 }
 

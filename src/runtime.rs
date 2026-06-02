@@ -18,19 +18,26 @@ use crate::{
     options::StorageMode,
 };
 
+/// Runtime strategy used by async-first database operations.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RuntimeMode {
+    /// Use native threads for background and blocking work.
     #[default]
     NativeThreads,
+    /// Prefer platform async I/O when the target and feature set support it.
     PlatformIo,
+    /// Run supported work inline on the caller's thread.
     Inline,
 }
 
+/// Runtime configuration for a database handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeOptions {
+    /// Selected runtime strategy.
     pub mode: RuntimeMode,
 }
 
+/// Capabilities exposed by a selected runtime configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeCapabilities {
     flags: u8,
@@ -97,6 +104,7 @@ struct BlockingTaskQueue {
     shutdown: bool,
 }
 
+/// Shareable flag used to request cancellation of cooperative work.
 #[derive(Debug, Clone, Default)]
 pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
@@ -114,6 +122,7 @@ pub(crate) struct RuntimeBlockingAdapterStats {
 }
 
 impl RuntimeOptions {
+    /// Uses native threads for background work and blocking adapters.
     #[must_use]
     pub const fn native_threads() -> Self {
         Self {
@@ -121,6 +130,7 @@ impl RuntimeOptions {
         }
     }
 
+    /// Runs supported work inline without background threads.
     #[must_use]
     pub const fn inline() -> Self {
         Self {
@@ -128,6 +138,7 @@ impl RuntimeOptions {
         }
     }
 
+    /// Requests platform async I/O support when available.
     #[must_use]
     pub const fn platform_io() -> Self {
         Self {
@@ -135,6 +146,7 @@ impl RuntimeOptions {
         }
     }
 
+    /// Returns the capabilities implied by these runtime options.
     #[must_use]
     pub const fn capabilities(self) -> RuntimeCapabilities {
         const NATIVE_THREAD_FLAGS: u8 = BACKGROUND_THREADS
@@ -161,15 +173,18 @@ impl Default for RuntimeOptions {
 }
 
 impl CancellationToken {
+    /// Creates a token in the not-cancelled state.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Marks the token as cancelled.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
 
+    /// Returns whether cancellation has been requested.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
@@ -181,31 +196,37 @@ impl RuntimeCapabilities {
         Self { flags }
     }
 
+    /// Returns whether the runtime can spawn background threads.
     #[must_use]
     pub const fn background_threads(self) -> bool {
         self.has(BACKGROUND_THREADS)
     }
 
+    /// Returns whether the runtime can cooperatively run maintenance tasks.
     #[must_use]
     pub const fn cooperative_tasks(self) -> bool {
         self.has(COOPERATIVE_TASKS)
     }
 
+    /// Returns whether the runtime can adapt blocking storage work.
     #[must_use]
     pub const fn blocking_adapter(self) -> bool {
         self.has(BLOCKING_ADAPTER)
     }
 
+    /// Returns whether cancellation tokens are supported.
     #[must_use]
     pub const fn cancellation_tokens(self) -> bool {
         self.has(CANCELLATION_TOKENS)
     }
 
+    /// Returns whether spawned tasks can be joined.
     #[must_use]
     pub const fn task_join(self) -> bool {
         self.has(TASK_JOIN)
     }
 
+    /// Returns whether at least one Trine storage operation uses platform async I/O.
     #[must_use]
     pub const fn platform_async_io(self) -> bool {
         self.has(PLATFORM_ASYNC_IO)

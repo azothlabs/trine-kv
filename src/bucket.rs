@@ -22,11 +22,13 @@ pub(crate) const DEFAULT_BUCKET_NAME: &str = "default";
 pub struct BucketName(String);
 
 impl BucketName {
+    /// Creates a bucket name wrapper.
     #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into())
     }
 
+    /// Returns the bucket name as a string slice.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -367,6 +369,7 @@ impl Bucket {
 /// `*_sync` adapters above.
 #[allow(clippy::unused_async)]
 impl Bucket {
+    /// Reads the newest committed value for `key` from this bucket.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Value>> {
         self.db
             .get_at_state_with_pin_state_async(
@@ -378,6 +381,7 @@ impl Bucket {
             .await
     }
 
+    /// Reads `key` at the sequence pinned by `snapshot`.
     pub async fn get_at(&self, snapshot: &Snapshot, key: &[u8]) -> Result<Option<Value>> {
         self.db
             .get_at_state_with_pin_state_async(
@@ -389,12 +393,14 @@ impl Bucket {
             .await
     }
 
+    /// Writes one key/value pair to this bucket using default write options.
     pub async fn put(&self, key: impl Into<Vec<u8>>, value: impl Into<Value>) -> Result<()> {
         self.put_with_options(key, value, WriteOptions::default())
             .await
             .map(|_| ())
     }
 
+    /// Writes one key/value pair and returns the commit information.
     pub async fn put_with_options(
         &self,
         key: impl Into<Vec<u8>>,
@@ -410,12 +416,14 @@ impl Bucket {
         self.db.write(batch, options).await
     }
 
+    /// Adds a point delete for one key using default write options.
     pub async fn delete(&self, key: impl Into<Vec<u8>>) -> Result<()> {
         self.delete_with_options(key, WriteOptions::default())
             .await
             .map(|_| ())
     }
 
+    /// Adds a point delete and returns the commit information.
     pub async fn delete_with_options(
         &self,
         key: impl Into<Vec<u8>>,
@@ -430,12 +438,14 @@ impl Bucket {
         self.db.write(batch, options).await
     }
 
+    /// Adds a range delete using default write options.
     pub async fn delete_range(&self, range: KeyRange) -> Result<()> {
         self.delete_range_with_options(range, WriteOptions::default())
             .await
             .map(|_| ())
     }
 
+    /// Adds a range delete and returns the commit information.
     pub async fn delete_range_with_options(
         &self,
         range: KeyRange,
@@ -450,6 +460,7 @@ impl Bucket {
         self.db.write(batch, options).await
     }
 
+    /// Returns a forward iterator over visible rows in `range`.
     pub async fn range(&self, range: &KeyRange) -> Result<Iter> {
         self.db
             .range_at_sequence_async(
@@ -461,6 +472,7 @@ impl Bucket {
             .await
     }
 
+    /// Returns a forward iterator whose blob values are read on demand.
     pub async fn range_lazy(&self, range: &KeyRange) -> Result<LazyIter> {
         self.db
             .range_lazy_at_sequence_async(
@@ -472,6 +484,7 @@ impl Bucket {
             .await
     }
 
+    /// Returns a forward iterator over `range` at `snapshot`.
     pub async fn range_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<Iter> {
         self.db
             .range_at_sequence_async(
@@ -483,6 +496,7 @@ impl Bucket {
             .await
     }
 
+    /// Returns a forward value-lazy iterator at `snapshot`.
     pub async fn range_lazy_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<LazyIter> {
         self.db
             .range_lazy_at_sequence_async(
@@ -494,6 +508,7 @@ impl Bucket {
             .await
     }
 
+    /// Returns a reverse iterator over visible rows in `range`.
     pub async fn range_reverse(&self, range: &KeyRange) -> Result<Iter> {
         self.db
             .range_at_sequence_async(
@@ -505,6 +520,7 @@ impl Bucket {
             .await
     }
 
+    /// Returns a reverse iterator whose blob values are read on demand.
     pub async fn range_lazy_reverse(&self, range: &KeyRange) -> Result<LazyIter> {
         self.db
             .range_lazy_at_sequence_async(
@@ -516,6 +532,7 @@ impl Bucket {
             .await
     }
 
+    /// Returns a reverse iterator over `range` at `snapshot`.
     pub async fn range_reverse_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<Iter> {
         self.db
             .range_at_sequence_async(
@@ -527,6 +544,7 @@ impl Bucket {
             .await
     }
 
+    /// Returns a reverse value-lazy iterator at `snapshot`.
     pub async fn range_lazy_reverse_at(
         &self,
         snapshot: &Snapshot,
@@ -542,6 +560,7 @@ impl Bucket {
             .await
     }
 
+    /// Returns a forward iterator over rows whose keys begin with `prefix`.
     pub async fn prefix(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
         let prefix = prefix.into();
         self.db
@@ -554,6 +573,7 @@ impl Bucket {
             .await
     }
 
+    /// Returns a forward prefix iterator whose blob values are read on demand.
     pub async fn prefix_lazy(&self, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
         let prefix = prefix.into();
         self.db
@@ -566,6 +586,7 @@ impl Bucket {
             .await
     }
 
+    /// Returns a forward prefix iterator at `snapshot`.
     pub async fn prefix_at(&self, snapshot: &Snapshot, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
         let prefix = prefix.into();
         self.db
@@ -578,6 +599,7 @@ impl Bucket {
             .await
     }
 
+    /// Returns a forward value-lazy prefix iterator at `snapshot`.
     pub async fn prefix_lazy_at(
         &self,
         snapshot: &Snapshot,
@@ -594,6 +616,7 @@ impl Bucket {
             .await
     }
 
+    /// Returns a reverse iterator over rows whose keys begin with `prefix`.
     pub async fn prefix_reverse(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
         let prefix = prefix.into();
         self.db
@@ -606,6 +629,7 @@ impl Bucket {
             .await
     }
 
+    /// Returns a reverse prefix iterator whose blob values are read on demand.
     pub async fn prefix_lazy_reverse(&self, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
         let prefix = prefix.into();
         self.db
@@ -618,6 +642,7 @@ impl Bucket {
             .await
     }
 
+    /// Returns a reverse prefix iterator at `snapshot`.
     pub async fn prefix_reverse_at(
         &self,
         snapshot: &Snapshot,
@@ -634,6 +659,7 @@ impl Bucket {
             .await
     }
 
+    /// Returns a reverse value-lazy prefix iterator at `snapshot`.
     pub async fn prefix_lazy_reverse_at(
         &self,
         snapshot: &Snapshot,
@@ -693,6 +719,10 @@ impl BucketReader<'_> {
             .transpose()
     }
 
+    /// Reads `key` using the sources pinned when this reader was created.
+    ///
+    /// This returns a `PointValue` so inline table values can be inspected
+    /// without first copying them into an owned `Vec<u8>`.
     pub async fn get(&self, key: &[u8]) -> Result<Option<PointValue>> {
         self.db
             .get_value_at_state_snapshot_with_pin_state_async(
@@ -705,6 +735,10 @@ impl BucketReader<'_> {
             .await
     }
 
+    /// Reads `key` and returns an owned value.
+    ///
+    /// Use this when the caller needs the same owned-value shape as
+    /// `Db::get_sync` or `Bucket::get_sync`.
     pub async fn get_owned(&self, key: &[u8]) -> Result<Option<Value>> {
         self.get(key)
             .await?

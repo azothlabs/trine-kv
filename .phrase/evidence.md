@@ -26,6 +26,39 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-06-02: Public Rustdoc Coverage Gate
+
+### Observation
+
+- `cargo rustdoc --all-features -- -W missing-docs` initially reported 466
+  missing public documentation warnings.
+- Public modules, exported API types, options, errors, statistics, iterators,
+  snapshots, buckets, database methods, transactions, and write batches now
+  have Rust documentation comments.
+- The crate root now enables `#![warn(missing_docs)]`, making missing public
+  documentation visible during rustdoc builds.
+
+### Interpretation
+
+- The release candidate had a broad public API documentation gap, not isolated
+  missed comments.
+- The gap is now covered for the current public API surface without changing
+  storage behavior or public function signatures.
+
+### Verification
+
+- `cargo rustdoc --all-features -- -D missing-docs` passed.
+- `cargo fmt --check` passed.
+- `cargo check --all-targets --all-features` passed.
+- `cargo clippy --all-targets --all-features -- -D warnings` passed.
+- `git diff --check` passed.
+
+### Recommended Next Action
+
+- Keep `missing_docs` enabled and include rustdoc verification in
+  release-candidate checks so new public API additions must carry
+  documentation.
+
 ## 2026-05-25: V1 Spec Baseline
 
 ### Observation

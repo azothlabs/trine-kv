@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 
 use crate::options::IndexSearchPolicy;
 
+/// Returns the first index whose item is greater than or equal to `target`.
 #[must_use]
 pub fn seek_ge<T: Ord>(items: &[T], target: &T) -> Option<usize> {
     match items.binary_search(target) {
@@ -11,18 +12,21 @@ pub fn seek_ge<T: Ord>(items: &[T], target: &T) -> Option<usize> {
     }
 }
 
+/// Returns the first index whose item is greater than `target`.
 #[must_use]
 pub fn seek_gt<T: Ord>(items: &[T], target: &T) -> Option<usize> {
     let index = items.partition_point(|item| item <= target);
     (index < items.len()).then_some(index)
 }
 
+/// Returns the last index whose item is less than or equal to `target`.
 #[must_use]
 pub fn seek_le<T: Ord>(items: &[T], target: &T) -> Option<usize> {
     let index = items.partition_point(|item| item <= target);
     index.checked_sub(1)
 }
 
+/// Advances from `current` to the first index greater than or equal to `target`.
 #[must_use]
 pub fn advance_to<T: Ord>(items: &[T], current: usize, target: &T) -> Option<usize> {
     if current >= items.len() {

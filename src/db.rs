@@ -57,13 +57,16 @@ use crate::{
 
 mod commit;
 
+/// Database handle for reads, writes, snapshots, buckets, and maintenance.
 #[derive(Debug)]
 pub struct Db {
     inner: Arc<DbInner>,
     counts_as_user_handle: bool,
 }
 
+/// Converts common open inputs into `DbOptions`.
 pub trait IntoOpenOptions {
+    /// Converts this value into database open options.
     fn into_open_options(self) -> DbOptions;
 }
 
@@ -82,6 +85,7 @@ where
     }
 }
 
+/// Cooperative maintenance work budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaintenanceBudget {
     max_flush_inputs: usize,
@@ -89,9 +93,12 @@ pub struct MaintenanceBudget {
 }
 
 impl MaintenanceBudget {
+    /// Default number of immutable memtables to flush per maintenance call.
     pub const DEFAULT_MAX_FLUSH_INPUTS: usize = 1;
+    /// Default number of compaction inputs to process per maintenance call.
     pub const DEFAULT_MAX_COMPACTION_INPUTS: usize = 1;
 
+    /// Creates a maintenance budget, treating zero limits as one.
     #[must_use]
     pub const fn new(max_flush_inputs: usize, max_compaction_inputs: usize) -> Self {
         let max_flush_inputs = if max_flush_inputs == 0 {
@@ -110,6 +117,7 @@ impl MaintenanceBudget {
         }
     }
 
+    /// Creates the default one-unit maintenance budget.
     #[must_use]
     pub const fn single_unit() -> Self {
         Self::new(
@@ -118,16 +126,19 @@ impl MaintenanceBudget {
         )
     }
 
+    /// Creates a budget that does not intentionally limit maintenance inputs.
     #[must_use]
     pub const fn unbounded() -> Self {
         Self::new(usize::MAX, usize::MAX)
     }
 
+    /// Returns the maximum number of flush inputs.
     #[must_use]
     pub const fn max_flush_inputs(self) -> usize {
         self.max_flush_inputs
     }
 
+    /// Returns the maximum number of compaction inputs.
     #[must_use]
     pub const fn max_compaction_inputs(self) -> usize {
         self.max_compaction_inputs
@@ -148,25 +159,33 @@ impl Default for MaintenanceBudget {
     }
 }
 
+/// Result of a cooperative maintenance call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MaintenanceOutcome {
+    /// Number of flushes completed.
     pub flushes: usize,
+    /// Number of compactions completed.
     pub compactions: usize,
+    /// Whether the supplied budget stopped more available work.
     pub budget_exhausted: bool,
+    /// Whether maintenance was already running elsewhere.
     pub busy: bool,
 }
 
 impl MaintenanceOutcome {
+    /// Returns `true` when at least one flush or compaction completed.
     #[must_use]
     pub const fn made_progress(self) -> bool {
         self.flushes != 0 || self.compactions != 0
     }
 
+    /// Returns whether the supplied budget stopped more available work.
     #[must_use]
     pub const fn budget_exhausted(self) -> bool {
         self.budget_exhausted
     }
 
+    /// Returns whether maintenance was already running elsewhere.
     #[must_use]
     pub const fn busy(self) -> bool {
         self.busy
@@ -865,6 +884,7 @@ impl Drop for Db {
 }
 
 impl Db {
+    /// Opens a database synchronously from path-like input or explicit options.
     pub fn open_sync(options: impl IntoOpenOptions) -> Result<Self> {
         let options = options.into_open_options();
         match &options.storage_mode {
@@ -1869,6 +1889,7 @@ impl Db {
         )
     }
 
+    /// Persists pending WAL bytes according to `mode`.
     pub fn persist_sync(&self, mode: DurabilityMode) -> Result<()> {
         self.ensure_open()?;
 
@@ -1948,6 +1969,7 @@ impl Db {
         wal.persist(&storage, Path::new(""), mode).await
     }
 
+    /// Flushes committed memtable data to persistent table files.
     pub fn flush_sync(&self) -> Result<()> {
         self.ensure_open()?;
         if self.inner.options.read_only {
@@ -1994,12 +2016,14 @@ impl Db {
 
     // Keep the public shape aligned with the accepted v1 protocol:
     // `Db::compact_range_sync(range) -> Result<()>`.
+    /// Compacts table files that overlap `range`.
     #[allow(clippy::needless_pass_by_value)]
     pub fn compact_range_sync(&self, range: KeyRange) -> Result<()> {
         self.take_background_maintenance_error()?;
         self.compact_range_internal(range)
     }
 
+    /// Compacts table files that overlap `range` within `budget`.
     #[allow(clippy::needless_pass_by_value)]
     pub fn compact_range_with_budget_sync(
         &self,
@@ -2054,6 +2078,7 @@ impl Db {
         self.run_compaction_once_with_budget(&db_path, &range, false, budget)
     }
 
+    /// Runs cooperative flush and compaction work within `budget`.
     pub fn run_maintenance_with_budget_sync(
         &self,
         budget: MaintenanceBudget,
@@ -2241,6 +2266,7 @@ impl Db {
         Ok(outcome)
     }
 
+    /// Creates a snapshot at the newest visible committed sequence.
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
         self.inner
@@ -2248,11 +2274,13 @@ impl Db {
             .pinned_snapshot(self.last_committed_sequence())
     }
 
+    /// Creates an optimistic transaction over the newest visible sequence.
     #[must_use]
     pub fn transaction(&self, options: TransactionOptions) -> Transaction {
         Transaction::new(self.clone(), self.last_committed_sequence(), options)
     }
 
+    /// Returns a point-in-time copy of live database statistics.
     #[must_use]
     pub fn stats(&self) -> DbStats {
         let mut stats = DbStats {
@@ -2400,11 +2428,13 @@ impl Db {
         stats.storage_operations = storage_stats.operations;
     }
 
+    /// Returns the options used to open this database handle.
     #[must_use]
     pub fn options(&self) -> &DbOptions {
         &self.inner.options
     }
 
+    /// Returns the newest commit sequence visible to readers.
     #[must_use]
     pub fn last_committed_sequence(&self) -> Sequence {
         self.inner.commit_tracker.visible_sequence()
@@ -2416,6 +2446,7 @@ impl Db {
             .oldest_active_or(self.last_committed_sequence())
     }
 
+    /// Closes this handle synchronously and stops background workers.
     pub fn close_sync(&self) {
         self.inner.closed.store(true, Ordering::Release);
         shutdown_background_workers(
@@ -5122,6 +5153,7 @@ impl Db {
 /// `*_sync` adapters above.
 #[allow(clippy::unused_async)]
 impl Db {
+    /// Opens a database asynchronously from path-like input or explicit options.
     pub async fn open(options: impl IntoOpenOptions) -> Result<Self> {
         let options = options.into_open_options();
         match &options.storage_mode {
@@ -5138,15 +5170,18 @@ impl Db {
         }
     }
 
+    /// Returns a handle for the built-in default bucket.
     pub async fn default_bucket(&self) -> Result<Bucket> {
         self.default_bucket_sync()
     }
 
+    /// Returns an existing named bucket or creates it with default options.
     pub async fn bucket(&self, name: impl Into<BucketName>) -> Result<Bucket> {
         self.bucket_with_options(name, BucketOptions::default())
             .await
     }
 
+    /// Returns an existing named bucket or creates it with explicit options.
     pub async fn bucket_with_options(
         &self,
         name: impl Into<BucketName>,
@@ -5162,11 +5197,13 @@ impl Db {
         self.bucket_with_options_sync(name, options)
     }
 
+    /// Reads the newest committed value for `key` from the default bucket.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Value>> {
         self.get_at_sequence_async(DEFAULT_BUCKET_NAME, key, self.last_committed_sequence())
             .await
     }
 
+    /// Reads `key` from the default bucket at the sequence pinned by `snapshot`.
     pub async fn get_at(&self, snapshot: &Snapshot, key: &[u8]) -> Result<Option<Value>> {
         self.get_at_with_pin_state_async(
             DEFAULT_BUCKET_NAME,
@@ -5177,12 +5214,14 @@ impl Db {
         .await
     }
 
+    /// Writes one key/value pair to the default bucket using default write options.
     pub async fn put(&self, key: impl Into<Vec<u8>>, value: impl Into<Value>) -> Result<()> {
         self.put_with_options(key, value, WriteOptions::default())
             .await
             .map(|_| ())
     }
 
+    /// Writes one key/value pair to the default bucket and returns commit information.
     pub async fn put_with_options(
         &self,
         key: impl Into<Vec<u8>>,
@@ -5194,12 +5233,14 @@ impl Db {
         self.write(batch, options).await
     }
 
+    /// Adds a point delete for one default-bucket key using default write options.
     pub async fn delete(&self, key: impl Into<Vec<u8>>) -> Result<()> {
         self.delete_with_options(key, WriteOptions::default())
             .await
             .map(|_| ())
     }
 
+    /// Adds a point delete for one default-bucket key and returns commit information.
     pub async fn delete_with_options(
         &self,
         key: impl Into<Vec<u8>>,
@@ -5210,12 +5251,14 @@ impl Db {
         self.write(batch, options).await
     }
 
+    /// Adds a range delete to the default bucket using default write options.
     pub async fn delete_range(&self, range: KeyRange) -> Result<()> {
         self.delete_range_with_options(range, WriteOptions::default())
             .await
             .map(|_| ())
     }
 
+    /// Adds a range delete to the default bucket and returns commit information.
     pub async fn delete_range_with_options(
         &self,
         range: KeyRange,
@@ -5226,6 +5269,7 @@ impl Db {
         self.write(batch, options).await
     }
 
+    /// Returns a forward iterator over default-bucket rows in `range`.
     pub async fn range(&self, range: &KeyRange) -> Result<Iter> {
         self.range_at_sequence_async(
             DEFAULT_BUCKET_NAME,
@@ -5236,6 +5280,7 @@ impl Db {
         .await
     }
 
+    /// Returns a forward default-bucket iterator whose blob values are read on demand.
     pub async fn range_lazy(&self, range: &KeyRange) -> Result<LazyIter> {
         self.range_lazy_at_sequence_async(
             DEFAULT_BUCKET_NAME,
@@ -5246,6 +5291,7 @@ impl Db {
         .await
     }
 
+    /// Returns a forward default-bucket iterator over `range` at `snapshot`.
     pub async fn range_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<Iter> {
         self.range_at_sequence_async(
             DEFAULT_BUCKET_NAME,
@@ -5256,6 +5302,7 @@ impl Db {
         .await
     }
 
+    /// Returns a forward value-lazy default-bucket iterator at `snapshot`.
     pub async fn range_lazy_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<LazyIter> {
         self.range_lazy_at_sequence_async(
             DEFAULT_BUCKET_NAME,
@@ -5266,6 +5313,7 @@ impl Db {
         .await
     }
 
+    /// Returns a reverse iterator over default-bucket rows in `range`.
     pub async fn range_reverse(&self, range: &KeyRange) -> Result<Iter> {
         self.range_at_sequence_async(
             DEFAULT_BUCKET_NAME,
@@ -5276,6 +5324,7 @@ impl Db {
         .await
     }
 
+    /// Returns a reverse default-bucket iterator whose blob values are read on demand.
     pub async fn range_lazy_reverse(&self, range: &KeyRange) -> Result<LazyIter> {
         self.range_lazy_at_sequence_async(
             DEFAULT_BUCKET_NAME,
@@ -5286,6 +5335,7 @@ impl Db {
         .await
     }
 
+    /// Returns a reverse default-bucket iterator over `range` at `snapshot`.
     pub async fn range_reverse_at(&self, snapshot: &Snapshot, range: &KeyRange) -> Result<Iter> {
         self.range_at_sequence_async(
             DEFAULT_BUCKET_NAME,
@@ -5296,6 +5346,7 @@ impl Db {
         .await
     }
 
+    /// Returns a reverse value-lazy default-bucket iterator at `snapshot`.
     pub async fn range_lazy_reverse_at(
         &self,
         snapshot: &Snapshot,
@@ -5310,6 +5361,7 @@ impl Db {
         .await
     }
 
+    /// Returns a forward iterator over default-bucket rows whose keys begin with `prefix`.
     pub async fn prefix(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
         let prefix = prefix.into();
         self.prefix_at_sequence_async(
@@ -5321,6 +5373,7 @@ impl Db {
         .await
     }
 
+    /// Returns a forward default-bucket prefix iterator whose blob values are read on demand.
     pub async fn prefix_lazy(&self, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
         let prefix = prefix.into();
         self.prefix_lazy_at_sequence_async(
@@ -5332,6 +5385,7 @@ impl Db {
         .await
     }
 
+    /// Returns a forward default-bucket prefix iterator at `snapshot`.
     pub async fn prefix_at(&self, snapshot: &Snapshot, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
         let prefix = prefix.into();
         self.prefix_at_sequence_async(
@@ -5343,6 +5397,7 @@ impl Db {
         .await
     }
 
+    /// Returns a forward value-lazy default-bucket prefix iterator at `snapshot`.
     pub async fn prefix_lazy_at(
         &self,
         snapshot: &Snapshot,
@@ -5358,6 +5413,7 @@ impl Db {
         .await
     }
 
+    /// Returns a reverse iterator over default-bucket rows whose keys begin with `prefix`.
     pub async fn prefix_reverse(&self, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
         let prefix = prefix.into();
         self.prefix_at_sequence_async(
@@ -5369,6 +5425,7 @@ impl Db {
         .await
     }
 
+    /// Returns a reverse default-bucket prefix iterator whose blob values are read on demand.
     pub async fn prefix_lazy_reverse(&self, prefix: impl Into<Vec<u8>>) -> Result<LazyIter> {
         let prefix = prefix.into();
         self.prefix_lazy_at_sequence_async(
@@ -5380,6 +5437,7 @@ impl Db {
         .await
     }
 
+    /// Returns a reverse default-bucket prefix iterator at `snapshot`.
     pub async fn prefix_reverse_at(
         &self,
         snapshot: &Snapshot,
@@ -5395,6 +5453,7 @@ impl Db {
         .await
     }
 
+    /// Returns a reverse value-lazy default-bucket prefix iterator at `snapshot`.
     pub async fn prefix_lazy_reverse_at(
         &self,
         snapshot: &Snapshot,
@@ -5410,6 +5469,7 @@ impl Db {
         .await
     }
 
+    /// Persists pending WAL bytes according to `mode`.
     pub async fn persist(&self, mode: DurabilityMode) -> Result<()> {
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         if matches!(
@@ -5431,6 +5491,7 @@ impl Db {
         self.persist_sync(mode)
     }
 
+    /// Flushes committed memtable data to persistent table files.
     pub async fn flush(&self) -> Result<()> {
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         if self.inner.options.storage_mode.is_browser_persistent() {
@@ -5450,6 +5511,7 @@ impl Db {
         self.flush_sync()
     }
 
+    /// Compacts table files that overlap `range`.
     pub async fn compact_range(&self, range: KeyRange) -> Result<()> {
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         if self.inner.options.storage_mode.is_browser_persistent() {
@@ -5471,6 +5533,7 @@ impl Db {
         self.compact_range_sync(range)
     }
 
+    /// Compacts table files that overlap `range` within `budget`.
     pub async fn compact_range_with_budget(
         &self,
         range: KeyRange,
@@ -5501,6 +5564,7 @@ impl Db {
         self.compact_range_with_budget_sync(range, budget)
     }
 
+    /// Runs cooperative flush and compaction work within `budget`.
     pub async fn run_maintenance_with_budget(
         &self,
         budget: MaintenanceBudget,
@@ -5525,6 +5589,7 @@ impl Db {
         self.run_maintenance_with_budget_sync(budget)
     }
 
+    /// Closes this handle asynchronously and stops background workers.
     pub async fn close(&self) -> Result<()> {
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         if self.persistent_path().is_some() {

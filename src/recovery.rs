@@ -24,6 +24,7 @@ use crate::{
     wal,
 };
 
+/// File name used for the human-readable startup recovery report.
 pub const RECOVERY_REPORT_FILE_NAME: &str = "RECOVERY_REPORT";
 pub(crate) const PROCESS_LOCK_FILE_NAME: &str = "LOCK";
 
@@ -70,28 +71,33 @@ impl ProcessLock {
     }
 }
 
+/// Report describing safe temporary files repaired during startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryReport {
     repaired_temporary_files: Vec<String>,
 }
 
 impl RecoveryReport {
+    /// Returns temporary file names removed during safe startup repair.
     #[must_use]
     pub fn repaired_temporary_files(&self) -> &[String] {
         &self.repaired_temporary_files
     }
 
+    /// Returns `true` when startup recovery did not repair any files.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.repaired_temporary_files.is_empty()
     }
 }
 
+/// Returns the path of the recovery report for a database directory.
 #[must_use]
 pub fn recovery_report_path(db_path: &Path) -> PathBuf {
     db_path.join(RECOVERY_REPORT_FILE_NAME)
 }
 
+/// Reads and decodes the startup recovery report for a database directory.
 pub fn read_recovery_report(db_path: &Path) -> Result<RecoveryReport> {
     let path = recovery_report_path(db_path);
     let bytes = read_recovery_report_bytes(&path)?;

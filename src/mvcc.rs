@@ -1,5 +1,6 @@
 use crate::types::Sequence;
 
+/// Sequence number pinned by a snapshot.
 pub type SnapshotSequence = Sequence;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

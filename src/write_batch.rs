@@ -7,22 +7,33 @@ use crate::{
 /// One operation inside an atomic write batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BatchOperation {
+    /// Insert or replace one key/value pair.
     Put {
+        /// Target bucket name.
         bucket: String,
+        /// User key bytes.
         key: Vec<u8>,
+        /// Value bytes to store.
         value: Value,
     },
+    /// Delete one key.
     Delete {
+        /// Target bucket name.
         bucket: String,
+        /// User key bytes.
         key: Vec<u8>,
     },
+    /// Delete all visible keys in a range.
     DeleteRange {
+        /// Target bucket name.
         bucket: String,
+        /// User-key range to delete.
         range: KeyRange,
     },
 }
 
 impl BatchOperation {
+    /// Returns the bucket targeted by this operation.
     #[must_use]
     pub fn bucket(&self) -> &str {
         match self {
@@ -121,21 +132,25 @@ impl WriteBatch {
         Ok(())
     }
 
+    /// Returns the operations in insertion order.
     #[must_use]
     pub fn operations(&self) -> &[BatchOperation] {
         &self.operations
     }
 
+    /// Consumes the batch and returns its operations in insertion order.
     #[must_use]
     pub fn into_operations(self) -> Vec<BatchOperation> {
         self.operations
     }
 
+    /// Returns the number of operations in the batch.
     #[must_use]
     pub fn len(&self) -> usize {
         self.operations.len()
     }
 
+    /// Returns `true` when the batch contains no operations.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.operations.is_empty()

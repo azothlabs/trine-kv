@@ -511,6 +511,7 @@ impl Future for WriteFuture {
 }
 
 impl Db {
+    /// Commits an atomic write batch synchronously with explicit write options.
     pub fn write_sync(&self, batch: WriteBatch, options: WriteOptions) -> Result<CommitInfo> {
         if self.inner.options.storage_mode.is_browser_persistent() {
             return Err(Error::unsupported_backend(
@@ -522,6 +523,7 @@ impl Db {
 
     #[must_use = "write futures do nothing unless polled"]
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    /// Commits an atomic write batch asynchronously with explicit write options.
     pub fn write(
         &self,
         batch: WriteBatch,
@@ -531,6 +533,7 @@ impl Db {
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    /// Commits an atomic write batch asynchronously with explicit write options.
     pub fn write(
         &self,
         batch: WriteBatch,

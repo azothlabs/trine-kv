@@ -2,16 +2,32 @@ use std::path::{Path, PathBuf};
 
 use crate::{codec::CodecId, prefix::PrefixExtractor, runtime::RuntimeOptions};
 
+/// Storage location and host backend selected for a database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageMode {
+    /// Keep all data in memory and discard it when the handle closes.
     InMemory,
-    Persistent { path: PathBuf },
-    HostPersistent { backend: HostStorageBackend },
+    /// Store data in a native filesystem directory.
+    Persistent {
+        /// Native filesystem database directory.
+        path: PathBuf,
+    },
+    /// Store data through an explicit host-provided backend.
+    HostPersistent {
+        /// Host backend used for persistent storage.
+        backend: HostStorageBackend,
+    },
 }
 
+/// Host storage backend selected for non-native persistent modes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostStorageBackend {
-    Wasi { path: PathBuf },
+    /// Use a WASI preopened filesystem path.
+    Wasi {
+        /// WASI preopened filesystem path.
+        path: PathBuf,
+    },
+    /// Use browser storage.
     Browser,
 }
 
@@ -63,12 +79,17 @@ impl Default for StorageMode {
     }
 }
 
+/// Durability requested for committed writes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DurabilityMode {
+    /// Accept writes after buffering them in the storage backend.
     #[default]
     Buffered,
+    /// Flush buffered bytes to the backend.
     Flush,
+    /// Sync file data without requiring metadata sync where the backend allows it.
     SyncData,
+    /// Sync file data and metadata where the backend allows it.
     SyncAll,
 }
 
@@ -83,14 +104,18 @@ impl DurabilityMode {
     }
 }
 
+/// Compression codec profile used for table blocks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CompressionProfile {
+    /// Store table blocks without compression.
     None,
+    /// Use the v1 fast LZ4 block codec.
     #[default]
     Fast,
 }
 
 impl CompressionProfile {
+    /// Returns the storage-format codec identifier for this profile.
     #[must_use]
     pub const fn codec_id(self) -> CodecId {
         match self {
@@ -100,10 +125,16 @@ impl CompressionProfile {
     }
 }
 
+/// Point-read filter policy for table keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterPolicy {
+    /// Do not write table key filters.
     Disabled,
-    Bloom { bits_per_key: u8 },
+    /// Write Bloom filters with the requested bit budget per key.
+    Bloom {
+        /// Bloom-filter bit budget per key.
+        bits_per_key: u8,
+    },
 }
 
 impl Default for FilterPolicy {
@@ -112,10 +143,16 @@ impl Default for FilterPolicy {
     }
 }
 
+/// Prefix-read filter policy for extracted key prefixes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrefixFilterPolicy {
+    /// Do not write prefix filters.
     Disabled,
-    Bloom { bits_per_prefix: u8 },
+    /// Write Bloom filters with the requested bit budget per prefix.
+    Bloom {
+        /// Bloom-filter bit budget per extracted prefix.
+        bits_per_prefix: u8,
+    },
 }
 
 impl Default for PrefixFilterPolicy {
@@ -126,59 +163,90 @@ impl Default for PrefixFilterPolicy {
     }
 }
 
+/// Search strategy used inside table indexes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum IndexSearchPolicy {
+    /// Scan index entries linearly.
     Linear,
+    /// Search index entries with binary search.
     Binary,
+    /// Let Trine choose based on index size.
     #[default]
     Auto,
 }
 
+/// Startup policy when repairable temporary files are found.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FailOnCorruptionPolicy {
+    /// Report the files as corruption and leave them untouched.
     #[default]
     FailClosed,
+    /// Delete safe temporary files and write a recovery report.
     RepairSafeTemporaryFiles,
 }
 
+/// Options used when opening a database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DbOptions {
+    /// Storage location and host backend.
     pub storage_mode: StorageMode,
+    /// Create the database directory and metadata when missing.
     pub create_if_missing: bool,
+    /// Open without allowing writes or maintenance that mutates storage.
     pub read_only: bool,
     /// Options used when the built-in default bucket is first created.
     pub default_bucket_options: BucketOptions,
+    /// Default durability used by write helpers that do not pass `WriteOptions`.
     pub durability: DurabilityMode,
+    /// Active memtable target size before flush.
     pub write_buffer_bytes: usize,
+    /// Maximum queued immutable memtables before writes apply backpressure.
     pub max_immutable_memtables: usize,
+    /// Target size for newly written table files.
     pub target_table_bytes: usize,
+    /// Per-level size multiplier used by compaction.
     pub level_size_multiplier: usize,
+    /// Maximum L0 table count before compaction is requested.
     pub max_l0_files: usize,
+    /// Approximate bytes reserved for cached table blocks.
     pub block_cache_bytes: usize,
+    /// Number of background workers used by maintenance-capable runtimes.
     pub background_worker_count: usize,
+    /// Runtime used for async, blocking, and background work.
     pub runtime: RuntimeOptions,
+    /// Startup policy for safe temporary files left by interrupted writes.
     pub fail_on_corruption: FailOnCorruptionPolicy,
+    /// Enable garbage collection of obsolete blob bytes.
     pub blob_gc_enabled: bool,
+    /// Minimum discardable-byte ratio required before a blob file is collected.
     pub blob_gc_discardable_ratio: BlobGcRatio,
+    /// Minimum blob file size considered for garbage collection.
     pub blob_gc_min_file_bytes: u64,
 }
 
 impl DbOptions {
+    /// Default active memtable target size.
     pub const DEFAULT_WRITE_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+    /// Default target size for table files.
     pub const DEFAULT_TARGET_TABLE_BYTES: usize = 64 * 1024 * 1024;
+    /// Default block-cache byte budget.
     pub const DEFAULT_BLOCK_CACHE_BYTES: usize = 256 * 1024 * 1024;
+    /// Default minimum blob file size for garbage collection.
     pub const DEFAULT_BLOB_GC_MIN_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
+    /// Creates persistent database options for `path`.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self::persistent(path)
     }
 
+    /// Creates in-memory database options.
     #[must_use]
     pub fn memory() -> Self {
         Self::default()
     }
 
+    /// Creates persistent native-filesystem options for `path`.
     #[must_use]
     pub fn persistent(path: impl Into<PathBuf>) -> Self {
         Self {
@@ -188,6 +256,7 @@ impl DbOptions {
         }
     }
 
+    /// Creates persistent WASI host-filesystem options for `path`.
     #[must_use]
     pub fn wasi_persistent(path: impl Into<PathBuf>) -> Self {
         Self {
@@ -201,11 +270,13 @@ impl DbOptions {
         }
     }
 
+    /// Creates read-only WASI host-filesystem options for `path`.
     #[must_use]
     pub fn wasi_persistent_read_only(path: impl Into<PathBuf>) -> Self {
         Self::wasi_persistent(path).read_only()
     }
 
+    /// Creates browser persistent options.
     #[must_use]
     pub fn browser_persistent() -> Self {
         Self {
@@ -219,16 +290,19 @@ impl DbOptions {
         }
     }
 
+    /// Creates read-only browser persistent options.
     #[must_use]
     pub fn browser_persistent_read_only() -> Self {
         Self::browser_persistent().read_only()
     }
 
+    /// Creates read-only native-filesystem options for `path`.
     #[must_use]
     pub fn persistent_read_only(path: impl Into<PathBuf>) -> Self {
         Self::persistent(path).read_only()
     }
 
+    /// Sets the default durability for writes that do not pass `WriteOptions`.
     #[must_use]
     pub const fn with_durability(mut self, durability: DurabilityMode) -> Self {
         self.durability = durability;
@@ -244,6 +318,7 @@ impl DbOptions {
         self
     }
 
+    /// Marks these options read-only and disables creation of missing storage.
     #[must_use]
     pub const fn read_only(mut self) -> Self {
         self.read_only = true;
@@ -276,24 +351,29 @@ impl Default for DbOptions {
     }
 }
 
+/// Ratio threshold used by blob garbage collection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlobGcRatio {
     millionths: u32,
 }
 
 impl BlobGcRatio {
+    /// A 50% discardable-byte threshold.
     pub const HALF: Self = Self {
         millionths: 500_000,
     };
+    /// A 100% discardable-byte threshold.
     pub const FULL: Self = Self {
         millionths: 1_000_000,
     };
 
+    /// Creates a ratio from millionths, where `1_000_000` means 100%.
     #[must_use]
     pub const fn from_millionths(millionths: u32) -> Self {
         Self { millionths }
     }
 
+    /// Returns this ratio in millionths.
     #[must_use]
     pub const fn millionths(self) -> u32 {
         self.millionths
@@ -314,49 +394,69 @@ impl Default for BlobGcRatio {
     }
 }
 
+/// Policy for merging blob values back into table levels during compaction.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum BlobLevelMergePolicy {
+    /// Keep blob values in blob files during compaction.
     Disabled,
+    /// Let Trine decide based on level and value size.
     #[default]
     Auto,
+    /// Always merge blob values back into table files when compacting.
     Always,
 }
 
+/// Options fixed for a bucket when the bucket is created.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketOptions {
+    /// Allow empty user keys.
     pub allow_empty_keys: bool,
+    /// Compression profile used for table blocks.
     pub compression: CompressionProfile,
+    /// Target uncompressed data-block size.
     pub block_bytes: usize,
+    /// Point-read filter policy for table keys.
     pub filter_policy: FilterPolicy,
+    /// Prefix extractor used by prefix filters.
     pub prefix_extractor: PrefixExtractor,
+    /// Prefix-read filter policy.
     pub prefix_filter_policy: PrefixFilterPolicy,
+    /// Search strategy used inside table indexes.
     pub index_search_policy: IndexSearchPolicy,
+    /// Values at or above this size are stored in blob files.
     pub blob_threshold_bytes: usize,
+    /// Policy for merging blob values during compaction.
     pub blob_level_merge_policy: BlobLevelMergePolicy,
 }
 
 impl BucketOptions {
+    /// Default target data-block size.
     pub const DEFAULT_BLOCK_BYTES: usize = 16 * 1024;
+    /// Default threshold for storing values in blob files.
     pub const DEFAULT_BLOB_THRESHOLD_BYTES: usize = 1024 * 1024;
 
+    /// Sets the prefix extractor for this bucket.
     #[must_use]
     pub fn with_prefix_extractor(mut self, prefix_extractor: PrefixExtractor) -> Self {
         self.prefix_extractor = prefix_extractor;
         self
     }
 
+    /// Sets the value-size threshold for blob storage.
     #[must_use]
     pub const fn with_blob_threshold_bytes(mut self, blob_threshold_bytes: usize) -> Self {
         self.blob_threshold_bytes = blob_threshold_bytes;
         self
     }
 
+    /// Sets the blob-level merge policy.
     #[must_use]
     pub const fn with_blob_level_merge_policy(mut self, policy: BlobLevelMergePolicy) -> Self {
         self.blob_level_merge_policy = policy;
         self
     }
 
+    /// Enables or disables blob-level merge with a boolean convenience flag.
     #[must_use]
     pub const fn with_blob_level_merge_enabled(mut self, enabled: bool) -> Self {
         self.blob_level_merge_policy = if enabled {
@@ -384,32 +484,39 @@ impl Default for BucketOptions {
     }
 }
 
+/// Per-write options passed to commit operations.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WriteOptions {
+    /// Durability requested for this write.
     pub durability: DurabilityMode,
 }
 
 impl WriteOptions {
+    /// Creates write options with an explicit durability mode.
     #[must_use]
     pub const fn new(durability: DurabilityMode) -> Self {
         Self { durability }
     }
 
+    /// Creates buffered write options.
     #[must_use]
     pub const fn buffered() -> Self {
         Self::new(DurabilityMode::Buffered)
     }
 
+    /// Creates flush write options.
     #[must_use]
     pub const fn flush() -> Self {
         Self::new(DurabilityMode::Flush)
     }
 
+    /// Creates data-sync write options.
     #[must_use]
     pub const fn sync_data() -> Self {
         Self::new(DurabilityMode::SyncData)
     }
 
+    /// Creates full-sync write options.
     #[must_use]
     pub const fn sync_all() -> Self {
         Self::new(DurabilityMode::SyncAll)

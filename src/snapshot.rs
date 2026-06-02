@@ -71,6 +71,7 @@ struct SnapshotPin {
     tracker: Arc<SnapshotTracker>,
 }
 
+/// Repeatable-read handle pinned to a committed sequence.
 #[derive(Debug)]
 pub struct Snapshot {
     read_sequence: Sequence,
@@ -78,6 +79,7 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Creates an untracked snapshot at `read_sequence`.
     #[must_use]
     pub const fn new(read_sequence: Sequence) -> Self {
         Self {
@@ -86,6 +88,7 @@ impl Snapshot {
         }
     }
 
+    /// Returns the sequence visible through this snapshot.
     #[must_use]
     pub const fn read_sequence(&self) -> Sequence {
         self.read_sequence
@@ -96,30 +99,37 @@ impl Snapshot {
         self.pin.is_some()
     }
 
+    /// Synchronously reads `key` from `bucket` at this snapshot.
     pub fn get_sync(&self, bucket: &Bucket, key: &[u8]) -> Result<Option<Value>> {
         bucket.get_at_sync(self, key)
     }
 
+    /// Synchronously scans `range` forward at this snapshot.
     pub fn range_sync(&self, bucket: &Bucket, range: &KeyRange) -> Result<Iter> {
         bucket.range_at_sync(self, range)
     }
 
+    /// Synchronously scans `range` forward with lazy value reads at this snapshot.
     pub fn range_lazy_sync(&self, bucket: &Bucket, range: &KeyRange) -> Result<LazyIter> {
         bucket.range_lazy_at_sync(self, range)
     }
 
+    /// Synchronously scans `range` in reverse at this snapshot.
     pub fn range_reverse_sync(&self, bucket: &Bucket, range: &KeyRange) -> Result<Iter> {
         bucket.range_reverse_at_sync(self, range)
     }
 
+    /// Synchronously scans `range` in reverse with lazy value reads at this snapshot.
     pub fn range_lazy_reverse_sync(&self, bucket: &Bucket, range: &KeyRange) -> Result<LazyIter> {
         bucket.range_lazy_reverse_at_sync(self, range)
     }
 
+    /// Synchronously scans keys beginning with `prefix` at this snapshot.
     pub fn prefix_sync(&self, bucket: &Bucket, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
         bucket.prefix_at_sync(self, prefix)
     }
 
+    /// Synchronously scans keys beginning with `prefix` with lazy value reads.
     pub fn prefix_lazy_sync(
         &self,
         bucket: &Bucket,
@@ -128,10 +138,12 @@ impl Snapshot {
         bucket.prefix_lazy_at_sync(self, prefix)
     }
 
+    /// Synchronously scans keys beginning with `prefix` in reverse.
     pub fn prefix_reverse_sync(&self, bucket: &Bucket, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
         bucket.prefix_reverse_at_sync(self, prefix)
     }
 
+    /// Synchronously scans keys beginning with `prefix` in reverse with lazy value reads.
     pub fn prefix_lazy_reverse_sync(
         &self,
         bucket: &Bucket,
@@ -140,30 +152,37 @@ impl Snapshot {
         bucket.prefix_lazy_reverse_at_sync(self, prefix)
     }
 
+    /// Asynchronously reads `key` from `bucket` at this snapshot.
     pub async fn get(&self, bucket: &Bucket, key: &[u8]) -> Result<Option<Value>> {
         bucket.get_at(self, key).await
     }
 
+    /// Asynchronously scans `range` forward at this snapshot.
     pub async fn range(&self, bucket: &Bucket, range: &KeyRange) -> Result<Iter> {
         bucket.range_at(self, range).await
     }
 
+    /// Asynchronously scans `range` forward with lazy value reads at this snapshot.
     pub async fn range_lazy(&self, bucket: &Bucket, range: &KeyRange) -> Result<LazyIter> {
         bucket.range_lazy_at(self, range).await
     }
 
+    /// Asynchronously scans `range` in reverse at this snapshot.
     pub async fn range_reverse(&self, bucket: &Bucket, range: &KeyRange) -> Result<Iter> {
         bucket.range_reverse_at(self, range).await
     }
 
+    /// Asynchronously scans `range` in reverse with lazy value reads at this snapshot.
     pub async fn range_lazy_reverse(&self, bucket: &Bucket, range: &KeyRange) -> Result<LazyIter> {
         bucket.range_lazy_reverse_at(self, range).await
     }
 
+    /// Asynchronously scans keys beginning with `prefix` at this snapshot.
     pub async fn prefix(&self, bucket: &Bucket, prefix: impl Into<Vec<u8>>) -> Result<Iter> {
         bucket.prefix_at(self, prefix).await
     }
 
+    /// Asynchronously scans keys beginning with `prefix` with lazy value reads.
     pub async fn prefix_lazy(
         &self,
         bucket: &Bucket,
@@ -172,6 +191,7 @@ impl Snapshot {
         bucket.prefix_lazy_at(self, prefix).await
     }
 
+    /// Asynchronously scans keys beginning with `prefix` in reverse.
     pub async fn prefix_reverse(
         &self,
         bucket: &Bucket,
@@ -180,6 +200,7 @@ impl Snapshot {
         bucket.prefix_reverse_at(self, prefix).await
     }
 
+    /// Asynchronously scans keys beginning with `prefix` in reverse with lazy value reads.
     pub async fn prefix_lazy_reverse(
         &self,
         bucket: &Bucket,
