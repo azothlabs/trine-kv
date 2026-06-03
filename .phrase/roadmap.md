@@ -3513,3 +3513,35 @@ writable reopen fixed cost.
 
 - If cold-read work continues, target shared read-only open costs such as
   manifest/table metadata reads or WAL replay/read-object reduction.
+
+### Phase 144: Read-Only Cold Open Breakdown
+
+**Status**: Complete
+
+**Goal**: Split read-only cold reopen cost into open-time work and first-read
+work so the next optimization target is evidence-backed.
+
+**Entry Condition**: Phase 143 complete and read-only cold reopen still has
+shared open/read cost after writer-lease acquisition is removed.
+
+**Acceptance Gate**:
+
+- Benchmark rows distinguish total reopen/get, open phase, and first-read
+  phase counters for writable and read-only opens.
+- Existing cold table read rows remain comparable.
+- Evidence recommends one next cold-read target.
+- Focused checks, benchmark evidence, formatting, clippy, full tests, diff
+  checks, and scans pass.
+
+**Major Out Of Scope**:
+
+- Storage format, MVCC, WAL frame format, table format, manifest format,
+  compaction, transaction, blob layout, browser persistence, or release
+  metadata changes.
+- Weakening writer-lease protection for writable opens.
+- Batched point-read internals.
+
+### Recommended Next Action
+
+- Start clean-WAL read-only open work only if the implementation can prove that
+  skipping WAL shard reads cannot hide replayable committed records.

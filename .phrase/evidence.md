@@ -408,6 +408,60 @@ Record only evidence that can change planning or durable decisions.
 - If cold-read work continues, target shared read-only open costs rather than
   writer-lease behavior.
 
+## 2026-06-03: Phase 144 Read-Only Cold Open Breakdown
+
+### Observation
+
+- Added benchmark diagnostics that split cold reopen/get costs into open phase
+  and first-read phase for both writable and read-only opens.
+- Release-profile benchmark run recorded `cold table read` at 202052 us and
+  `cold table read-only` at 94942 us.
+- Read-only open phase recorded 128 whole-object reads across 32 opens, 32
+  current-manifest reads, 0 writer-lease acquisitions, and 32 directory-list
+  requests.
+- Read-only first-read phase recorded 32 point data-block reads, 64 positioned
+  owned reads, and 0 whole-object reads.
+- Code inspection maps current-manifest reads through `manifest.rs`, WAL shard
+  reads through `wal.rs`, and lazy table data-block reads through the table
+  read path.
+
+### Interpretation
+
+- The remaining read-only fixed open cost is not the first point read; it is
+  open-time whole-object work.
+- One whole-object read per open is the current manifest. The remaining
+  whole-object reads match WAL shard reads.
+- The next cold-read optimization target should be a clean-WAL read-only open
+  path that skips WAL shard reads only when manifest/WAL state proves there are
+  no replayable records.
+- Lazy table data-block reads are a separate first-read cost and should not be
+  mixed into open-time optimization.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q read_only --lib`
+- `cargo test -q --bench v1_bench`
+- `cargo bench --bench v1_bench`, output redirected and only key rows
+  inspected.
+- `cargo clippy --all-targets --all-features -- -D warnings`, output
+  redirected to `/tmp/trine-clippy-phase144.txt`
+- `cargo test -q --all-targets --all-features`, output redirected to
+  `/tmp/trine-test-phase144.txt`
+- `git diff --check`
+- Forbidden-term and source-name scans over source, benches, docs, README, and
+  touched `.phrase` files found no matches.
+
+### Remaining Blockers
+
+- No phase blocker remains.
+
+### Recommended Next Action
+
+- Finish the local gate and commit the split diagnostics.
+- Start clean-WAL read-only open work only if it can prove that skipping WAL
+  shard reads cannot hide replayable committed records.
+
 ## 2026-06-02: Public Rustdoc Coverage Gate
 
 ### Observation

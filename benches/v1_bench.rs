@@ -724,8 +724,13 @@ fn extend_cold_table_read_diagnostics(results: &mut Vec<BenchResult>, read_only:
         options
     };
     let mut diagnostics = ColdReadDiagnostics::default();
+    let mut open_diagnostics = ColdReadDiagnostics::default();
+    let mut first_read_diagnostics = ColdReadDiagnostics::default();
     for _ in 0..32 {
         let db = Db::open_sync(open_options.clone()).expect("persistent db reopens");
+        let open_stats = db.stats();
+        open_diagnostics.record(&open_stats);
+
         let bucket = db.default_bucket_sync().expect("bucket reopens");
         let value_len = bucket
             .get_sync(&key(ROWS / 2))
@@ -734,10 +739,13 @@ fn extend_cold_table_read_diagnostics(results: &mut Vec<BenchResult>, read_only:
         assert!(value_len > 0, "cold-read diagnostic must read a value");
         let stats = db.stats();
         diagnostics.record(&stats);
+        first_read_diagnostics.record_delta(&open_stats, &stats);
     }
     cleanup_dir(&dir);
 
     diagnostics.push_results(results, read_only);
+    open_diagnostics.push_phase_results(results, read_only, "open");
+    first_read_diagnostics.push_phase_results(results, read_only, "first read");
 }
 
 #[derive(Default)]
@@ -849,12 +857,226 @@ impl ColdReadDiagnostics {
             .saturating_add(stats.storage_operations.list_objects.total_latency_micros);
     }
 
+    fn record_delta(&mut self, before: &trine_kv::DbStats, after: &trine_kv::DbStats) {
+        self.record_read_path_delta(before, after);
+        self.record_storage_request_delta(before, after);
+        self.record_storage_latency_delta(before, after);
+    }
+
+    fn record_read_path_delta(&mut self, before: &trine_kv::DbStats, after: &trine_kv::DbStats) {
+        self.table_probes = self.table_probes.saturating_add(
+            after
+                .read_path
+                .point_table_probes
+                .saturating_sub(before.read_path.point_table_probes),
+        );
+        self.block_metadata_probes = self.block_metadata_probes.saturating_add(
+            after
+                .read_path
+                .point_block_metadata_probes
+                .saturating_sub(before.read_path.point_block_metadata_probes),
+        );
+        self.data_block_reads = self.data_block_reads.saturating_add(
+            after
+                .read_path
+                .point_data_block_reads
+                .saturating_sub(before.read_path.point_data_block_reads),
+        );
+        self.filter_misses = self.filter_misses.saturating_add(
+            after
+                .read_path
+                .point_filter_misses
+                .saturating_sub(before.read_path.point_filter_misses),
+        );
+        self.cache_misses = self.cache_misses.saturating_add(
+            after
+                .block_cache_misses
+                .saturating_sub(before.block_cache_misses),
+        );
+    }
+
+    fn record_storage_request_delta(
+        &mut self,
+        before: &trine_kv::DbStats,
+        after: &trine_kv::DbStats,
+    ) {
+        self.open_read_requests = self.open_read_requests.saturating_add(
+            after
+                .storage_operations
+                .open_read
+                .requests
+                .saturating_sub(before.storage_operations.open_read.requests),
+        );
+        self.len_requests = self.len_requests.saturating_add(
+            after
+                .storage_operations
+                .len
+                .requests
+                .saturating_sub(before.storage_operations.len.requests),
+        );
+        self.read_exact_at_owned_requests = self.read_exact_at_owned_requests.saturating_add(
+            after
+                .storage_operations
+                .read_exact_at_owned
+                .requests
+                .saturating_sub(before.storage_operations.read_exact_at_owned.requests),
+        );
+        self.read_object_bytes_requests = self.read_object_bytes_requests.saturating_add(
+            after
+                .storage_operations
+                .read_object_bytes
+                .requests
+                .saturating_sub(before.storage_operations.read_object_bytes.requests),
+        );
+        self.read_current_manifest_requests = self.read_current_manifest_requests.saturating_add(
+            after
+                .storage_operations
+                .read_current_manifest
+                .requests
+                .saturating_sub(before.storage_operations.read_current_manifest.requests),
+        );
+        self.open_append_requests = self.open_append_requests.saturating_add(
+            after
+                .storage_operations
+                .open_append
+                .requests
+                .saturating_sub(before.storage_operations.open_append.requests),
+        );
+        self.acquire_writer_lease_requests = self.acquire_writer_lease_requests.saturating_add(
+            after
+                .storage_operations
+                .acquire_writer_lease
+                .requests
+                .saturating_sub(before.storage_operations.acquire_writer_lease.requests),
+        );
+        self.list_directory_files_requests = self.list_directory_files_requests.saturating_add(
+            after
+                .storage_operations
+                .list_directory_files
+                .requests
+                .saturating_sub(before.storage_operations.list_directory_files.requests),
+        );
+        self.list_objects_requests = self.list_objects_requests.saturating_add(
+            after
+                .storage_operations
+                .list_objects
+                .requests
+                .saturating_sub(before.storage_operations.list_objects.requests),
+        );
+    }
+
+    fn record_storage_latency_delta(
+        &mut self,
+        before: &trine_kv::DbStats,
+        after: &trine_kv::DbStats,
+    ) {
+        self.open_read_micros = self.open_read_micros.saturating_add(
+            after
+                .storage_operations
+                .open_read
+                .total_latency_micros
+                .saturating_sub(before.storage_operations.open_read.total_latency_micros),
+        );
+        self.len_micros = self.len_micros.saturating_add(
+            after
+                .storage_operations
+                .len
+                .total_latency_micros
+                .saturating_sub(before.storage_operations.len.total_latency_micros),
+        );
+        self.read_exact_at_owned_micros = self.read_exact_at_owned_micros.saturating_add(
+            after
+                .storage_operations
+                .read_exact_at_owned
+                .total_latency_micros
+                .saturating_sub(
+                    before
+                        .storage_operations
+                        .read_exact_at_owned
+                        .total_latency_micros,
+                ),
+        );
+        self.read_object_bytes_micros = self.read_object_bytes_micros.saturating_add(
+            after
+                .storage_operations
+                .read_object_bytes
+                .total_latency_micros
+                .saturating_sub(
+                    before
+                        .storage_operations
+                        .read_object_bytes
+                        .total_latency_micros,
+                ),
+        );
+        self.read_current_manifest_micros = self.read_current_manifest_micros.saturating_add(
+            after
+                .storage_operations
+                .read_current_manifest
+                .total_latency_micros
+                .saturating_sub(
+                    before
+                        .storage_operations
+                        .read_current_manifest
+                        .total_latency_micros,
+                ),
+        );
+        self.acquire_writer_lease_micros = self.acquire_writer_lease_micros.saturating_add(
+            after
+                .storage_operations
+                .acquire_writer_lease
+                .total_latency_micros
+                .saturating_sub(
+                    before
+                        .storage_operations
+                        .acquire_writer_lease
+                        .total_latency_micros,
+                ),
+        );
+        self.list_directory_files_micros = self.list_directory_files_micros.saturating_add(
+            after
+                .storage_operations
+                .list_directory_files
+                .total_latency_micros
+                .saturating_sub(
+                    before
+                        .storage_operations
+                        .list_directory_files
+                        .total_latency_micros,
+                ),
+        );
+        self.list_objects_micros = self.list_objects_micros.saturating_add(
+            after
+                .storage_operations
+                .list_objects
+                .total_latency_micros
+                .saturating_sub(before.storage_operations.list_objects.total_latency_micros),
+        );
+    }
+
     fn push_results(&self, results: &mut Vec<BenchResult>, read_only: bool) {
         let label = if read_only {
             "read pruning cold read-only"
         } else {
             "read pruning cold"
         };
+        self.push_results_with_label(results, label);
+    }
+
+    fn push_phase_results(
+        &self,
+        results: &mut Vec<BenchResult>,
+        read_only: bool,
+        phase: &'static str,
+    ) {
+        let label = if read_only {
+            labelled3("read pruning cold read-only", phase, "phase")
+        } else {
+            labelled3("read pruning cold", phase, "phase")
+        };
+        self.push_results_with_label(results, label);
+    }
+
+    fn push_results_with_label(&self, results: &mut Vec<BenchResult>, label: &'static str) {
         results.push(BenchResult::diagnostic(
             labelled(label, "point table probes"),
             self.table_probes,
