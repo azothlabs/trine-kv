@@ -3444,3 +3444,39 @@ over further cold reopen work.
   browser persistence, or release metadata changes.
 - Cross-bucket batching.
 - Input-key reordering or deduplication.
+
+### Recommended Next Action
+
+- Test whether small internal batched point-read changes can make the existing
+  APIs faster before considering deeper changes.
+
+### Phase 142: Batched Point-Read Internal Experiments
+
+**Status**: Closed: No Kept Code
+
+**Goal**: Test whether smaller internal changes can make the existing batched
+point-read APIs faster without changing public API or storage behavior.
+
+**Entry Condition**: Phase 141 complete and benchmark evidence remains mixed
+for batched point reads.
+
+**Acceptance Gate**:
+
+- Existing `get_many` semantics remain unchanged.
+- Benchmark evidence shows whether the attempted internal reuse is worth
+  keeping.
+- Negative benchmark evidence causes the experiment to be reverted instead of
+  kept.
+- Diff checks and forbidden-term scans pass for kept files.
+
+**Major Out Of Scope**:
+
+- New public API surface.
+- Storage format, MVCC, WAL, table, blob, compaction, transaction, recovery,
+  browser persistence, writer-lease, or cold reopen behavior changes.
+- Cross-bucket batching or input-key semantic changes.
+
+### Recommended Next Action
+
+- Prefer cold reopen/read-only open work next, unless batched point-read work
+  first gets a locality-focused benchmark and deeper table grouping design.

@@ -2,78 +2,70 @@
 
 ## Status
 
-Complete
+Closed: No Kept Code
 
 ## Goal
 
-Add and measure batched point-read APIs that reuse one point-read snapshot for
-many keys while preserving per-key visibility, ordering, and missing-key
-semantics.
+Test whether smaller internal changes can make the existing batched point-read
+APIs faster without changing public API or storage behavior.
 
 ## Scope
 
-- Default-bucket and bucket-scoped current-value batched point reads.
-- Snapshot-bound repeated point reads through `BucketReader`.
-- Benchmark rows comparing sequential point reads with batched point reads.
-- Rustdoc for new public APIs.
+- Internal point-read path experiments for `BucketReader::get_many_sync`,
+  `BucketReader::get_many_owned_sync`, and their async forms.
+- Existing sequential vs batched point-read benchmark rows.
+- Evidence about whether the attempted changes should be kept.
 
 ## Out Of Scope
 
-- Storage format, MVCC, WAL, table, blob, compaction, transaction, recovery,
-  browser persistence, or release metadata changes.
+- New public API surface.
+- Storage format, MVCC rules, WAL, manifest, compaction, recovery,
+  transaction, blob layout, writer-lease, or cold reopen behavior changes.
 - Cross-bucket batching.
-- Reordering input keys, deduplicating keys, or returning unordered maps.
-- Writer-lease or cold reopen changes.
+- Input-key semantic changes.
 
 ## Acceptance Gate
 
-- Public API returns results in the same order as input keys and uses `None`
-  for missing or deleted keys.
-- Batched point reads capture one read sequence and reuse one point-read source
-  snapshot for the batch.
-- Benchmark evidence compares sequential and batched point reads.
-- Focused API/benchmark checks pass.
-- Rustdoc, doctests, formatting, clippy, full tests, diff checks, and
-  forbidden-term scans pass.
+- Existing `get_many` results still preserve input order, duplicates, and
+  `None` for missing or deleted keys.
+- Benchmark evidence shows whether the attempted internal reuse is worth
+  keeping.
+- If benchmark evidence is negative, revert the experiment instead of keeping
+  complexity.
+- Diff checks and forbidden-term scans pass for kept files.
 
 ## Active Task Slice
 
 ```text
-task587 [x] goal:add batched point-read APIs | scope:src/db.rs src/bucket.rs | verify:cargo test -q get_many --lib
-task588 [x] goal:add benchmark rows | scope:benches/v1_bench.rs docs/benchmarks | verify:cargo bench --bench v1_bench
-task589 [x] goal:record phase evidence | scope:.phrase docs README.md | verify:git diff --check
-task590 [x] goal:finish local verification | scope:full workspace | verify:cargo rustdoc/test/clippy/diff checks
+task591 [x] goal:test batch-local point-read reuse | scope:src/lsm/read.rs src/db.rs src/bucket.rs | verify:cargo test -q get_many --lib
+task592 [x] goal:measure attempted internal changes | scope:benches/v1_bench.rs | verify:cargo bench --bench v1_bench
+task593 [x] goal:revert unhelpful code experiment | scope:source and bench files | verify:git status --short
+task594 [x] goal:record discovery evidence | scope:.phrase | verify:git diff --check
 ```
 
 ## Known Residuals
 
-- Phase 140 left writer-lease acquisition intact because it is a safety
-  boundary.
-- Existing `BucketReader` already captures one point-read snapshot for repeated
-  point reads under a caller snapshot.
-- Benchmark timing is mixed. Persistent flushed point reads showed a small
-  batch-size-4 improvement in one run; in-memory random point reads are not a
-  stable win yet.
+- Phase 141 left batched point-read benchmark timing mixed.
+- This phase did not find a small internal change worth keeping.
 
 ## Evidence
 
-- Earlier benchmark rows include ordinary point reads, missing point reads,
-  delta-backed point reads, and long shared-prefix point reads, but no batched
-  point-read row.
-- The current API has `get_sync`/`get` for one key and `BucketReader` for
-  repeated snapshot-bound reads.
-- Phase 141 added `get_many_sync`/`get_many` to `Db` and `Bucket`, plus
-  batched `BucketReader` methods.
-- The second batch-size-4 release run showed persistent flushed point reads at
-  1485 us sequential vs 1391 us batched, while memory random point reads were
-  1069 us sequential vs 2444 us batched.
-- `cargo rustdoc --all-features -- -D warnings` and
-  `cargo test --doc --all-features` passed after adding public API docs.
-- `cargo clippy --all-targets --all-features -- -D warnings` and
-  `cargo test -q --all-targets --all-features` passed with output redirected
-  to temporary files.
+- Tested a batch path that reused one memtable range-tombstone index per batch.
+- Tested single-pass owned batch conversion to avoid an intermediate
+  `Vec<Option<PointValue>>`.
+- Tested batch memtable candidate collection that locks each memtable source
+  once per batch.
+- Tested a no-table/no-range-tombstone fast path for memory point reads.
+- Batch size 4 remained slower for memory random point reads after the
+  experiments. One run showed 1047 us sequential vs 2521 us batched.
+- Batch size 16 was worse for memory and did not produce a stable persistent
+  win.
+- All source and benchmark experiments were reverted.
 
 ## Next Recommendation
 
-- Commit this API and mixed benchmark evidence. Further speed work should
-  target deeper table/delta grouping before adding more public surface.
+- Do not continue with small `get_many` internals under the current random-key
+  benchmark shape.
+- The next useful phase should either target cold reopen/read-only open cost,
+  or first redesign the batched point-read benchmark around locality and table
+  grouping before implementing deeper changes.

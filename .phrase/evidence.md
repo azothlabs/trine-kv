@@ -303,6 +303,54 @@ Record only evidence that can change planning or durable decisions.
 - If more speed is needed, optimize deeper table/delta grouping inside the
   point-read path before adding more public surface.
 
+## 2026-06-03: Phase 142 Batched Point-Read Internal Experiments
+
+### Observation
+
+- Tried a batch path that reused one memtable range-tombstone index per batch.
+- Tried single-pass owned batch conversion so `get_many_owned_sync` did not
+  build an intermediate `Vec<Option<PointValue>>`.
+- Tried batch memtable candidate collection that locks each memtable source
+  once per batch.
+- Tried a no-table/no-range-tombstone fast path for memory point reads.
+- Focused `cargo test -q get_many --lib` passed during the experiments.
+- Release-profile benchmark evidence stayed negative for memory random point
+  reads. The final batch-size-4 experiment recorded 1047 us sequential vs
+  2521 us batched for memory, and 1917 us sequential vs 2407 us batched for
+  persistent.
+- A batch-size-16 probe was worse for memory and did not produce a stable
+  persistent win.
+- The experimental source and benchmark changes were reverted.
+
+### Interpretation
+
+- The current random-key benchmark is dominated by batch API overhead and
+  source setup costs that small internal reuse does not overcome.
+- Keeping the attempted internal changes would add complexity without accepted
+  performance evidence.
+- Further batched point-read work needs a different slice: either table/block
+  grouping with a locality-focused benchmark, or no more `get_many` work for
+  now.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q get_many --lib`
+- `cargo test -q --bench v1_bench`
+- `cargo bench --bench v1_bench`, output redirected and only key rows
+  inspected.
+- `git status --short` confirmed source and benchmark experiments were
+  reverted, leaving only `.phrase` updates.
+
+### Remaining Blockers
+
+- No kept batched point-read internal optimization met the evidence bar.
+
+### Recommended Next Action
+
+- Prefer cold reopen/read-only open work next, unless the batched point-read
+  benchmark is first redesigned around key locality and deeper table grouping.
+
 ## 2026-06-02: Public Rustdoc Coverage Gate
 
 ### Observation
