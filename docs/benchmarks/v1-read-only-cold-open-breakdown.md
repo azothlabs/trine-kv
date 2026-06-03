@@ -6,6 +6,7 @@ Command:
 
 ```text
 cargo bench --bench v1_bench > /tmp/trine-v1-bench-phase144-breakdown.txt
+cargo bench --bench v1_bench > /tmp/trine-v1-bench-clean-wal.txt
 ```
 
 Harness inputs:
@@ -43,19 +44,38 @@ After adding split diagnostics:
 | read pruning cold read-only first read phase point data block reads | 1 | 0 | 0 | 32 |
 | read pruning cold read-only first read phase storage read object bytes requests | 1 | 0 | 0 | 0 |
 
+After the clean-WAL read-only open change:
+
+| name | iterations | elapsed_us | units_per_sec | checksum |
+| --- | ---: | ---: | ---: | ---: |
+| cold table read | 32 | 211282 | 151 | 640 |
+| cold table read-only | 32 | 91081 | 351 | 640 |
+| read pruning cold read-only open phase storage open read requests | 1 | 0 | 0 | 32 |
+| read pruning cold read-only open phase storage len requests | 1 | 0 | 0 | 32 |
+| read pruning cold read-only open phase storage read owned requests | 1 | 0 | 0 | 32 |
+| read pruning cold read-only open phase storage read object bytes requests | 1 | 0 | 0 | 0 |
+| read pruning cold read-only open phase storage current manifest requests | 1 | 0 | 0 | 32 |
+| read pruning cold read-only open phase storage list directory files requests | 1 | 0 | 0 | 32 |
+| read pruning cold read-only first read phase storage read object bytes requests | 1 | 0 | 0 | 0 |
+
 ## Interpretation
 
 - Read-only cold reopen remains faster than writable cold reopen because it
   still avoids writer-lease acquisition.
-- Open phase carries the remaining whole-object reads. One whole-object read
-  per open is the current manifest; code inspection maps the remaining
-  whole-object reads to WAL shard reads.
+- Before the clean-WAL change, open phase carried 128 whole-object reads across
+  32 read-only opens. One whole-object read per open was the current manifest;
+  code inspection mapped the remaining whole-object reads to WAL shard reads.
+- Clean-WAL read-only open now uses the directory listing's file length when it
+  is available and skips WAL shard content reads only when every discovered WAL
+  shard has zero bytes. The measured read-only open phase now reports zero
+  whole-object reads without increasing open-read or length request counts.
 - First read phase does not add whole-object reads. It adds table probes, block
   metadata probes, one data-block read per operation, and positioned reads for
   the lazy table data block.
-- The next useful cold-read target is the clean-WAL read-only open path:
-  avoid reading WAL shard objects when manifest and WAL state prove there are
-  no replayable records.
+- The release row moved from `cold table read-only` at 94942 us in the split
+  diagnostic run to 91081 us after clean-WAL read-only open. Local cold-read
+  elapsed time remains noisy, so the request-count reduction is the stronger
+  evidence.
 - Table data-block work is still visible, but it belongs to first point read
   rather than open-time fixed cost.
 

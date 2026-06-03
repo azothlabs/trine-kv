@@ -9920,3 +9920,55 @@ Record only evidence that can change planning or durable decisions.
 
 - Commit this metadata patch, tag `v0.1.1` after CI passes, then publish
   `0.1.1`.
+
+## 2026-06-03: Clean-WAL Read-Only Open
+
+### Observation
+
+- Phase 144 split diagnostics showed read-only open phase whole-object reads at
+  128 requests across 32 opens, with 32 current-manifest requests.
+- Sync native directory entries now retain file byte length when it is available
+  from the existing directory listing.
+- Native read-only persistent open now skips WAL shard content reads only when
+  every discovered WAL shard file has length zero.
+- Focused tests cover both sides: clean flushed read-only open performs zero
+  whole-object reads, while a read-only reopen with non-empty WAL still replays
+  the committed value.
+- Release-profile `cargo bench --bench v1_bench` recorded `cold table
+  read-only` at 91081 us and read-only open phase whole-object reads at zero.
+
+### Interpretation
+
+- The kept change removes clean-WAL shard content reads without changing WAL
+  format, manifest format, writable open, writer-lease behavior, or public API.
+- Directory length reuse matters: a first attempt using separate open+len calls
+  removed whole-object reads but inflated open/len request counts, so it was
+  replaced before keeping the change.
+- Remaining read-only cold work is now manifest/table open plus the first lazy
+  table data-block read.
+
+### Verification
+
+- `cargo fmt`
+- `cargo fmt --check`
+- `cargo test -q read_only --lib`
+- `cargo test -q native_file_backend_lists_directory_files --lib`
+- `cargo test -q --bench v1_bench`
+- `cargo bench --bench v1_bench`, output redirected to
+  `/tmp/trine-v1-bench-clean-wal.txt`
+- `cargo clippy --all-targets --all-features -- -D warnings`, output
+  redirected to `/tmp/trine-clippy-clean-wal.txt`
+- `cargo test -q --all-targets --all-features`, output redirected to
+  `/tmp/trine-test-clean-wal.txt`
+- `git diff --check`
+- Forbidden-term and source-name scans over touched source, benchmark docs, and
+  phase files.
+
+### Remaining Blockers
+
+- No current blocker for this phase.
+
+### Recommended Next Action
+
+- Commit the clean-WAL change and choose the next target from manifest/table
+  open metadata or first-read table data-block work.

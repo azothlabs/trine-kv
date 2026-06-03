@@ -1286,11 +1286,20 @@ impl Db {
         let wal_paths = wal::discover_wal_paths_from_directory_entries(
             directory_files.iter().map(|file| file.path().to_path_buf()),
         )?;
-        let wal_streams = wal::read_recovery_streams_after_paths_with_backend(
-            &native_storage,
-            &wal_paths,
-            replay_floor,
-        )?;
+        let wal_streams = if options.read_only
+            && wal::discovered_wal_paths_are_empty_with_backend(
+                &native_storage,
+                &wal_paths,
+                &directory_files,
+            )? {
+            Vec::new()
+        } else {
+            wal::read_recovery_streams_after_paths_with_backend(
+                &native_storage,
+                &wal_paths,
+                replay_floor,
+            )?
+        };
         let batches = wal::merge_batch_streams_by_sequence(wal_streams)?;
         let wal = if options.read_only {
             None
@@ -7020,9 +7029,35 @@ mod tests {
             db.put_sync(b"other", b"value"),
             Err(Error::ReadOnly)
         ));
+        assert_eq!(db.stats().storage_operations.read_object_bytes.requests, 0);
         assert_eq!(
             db.stats().storage_operations.acquire_writer_lease.requests,
             0
+        );
+
+        drop(db);
+        fs::remove_dir_all(path).expect("cleanup test db");
+    }
+
+    #[test]
+    fn native_read_only_open_replays_non_empty_wal() {
+        let path = temp_db_path("native-read-only-open-wal-replay");
+        let mut writable_options = DbOptions::persistent(&path);
+        writable_options.background_worker_count = 0;
+        {
+            let db = Db::open_sync(writable_options.clone()).expect("persistent db opens");
+            db.put_sync(b"key", b"value").expect("write succeeds");
+        }
+
+        let db = Db::open_sync(writable_options.read_only()).expect("read-only db opens");
+
+        assert_eq!(
+            db.get_sync(b"key").expect("read-only WAL read succeeds"),
+            Some(b"value".to_vec())
+        );
+        assert!(
+            db.stats().storage_operations.read_object_bytes.requests > 0,
+            "read-only open must read non-empty WAL shards"
         );
 
         drop(db);

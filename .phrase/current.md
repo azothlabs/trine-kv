@@ -6,14 +6,16 @@ Complete
 
 ## Goal
 
-Break down read-only cold reopen cost into open-time and first-read work so the
-next optimization target is chosen from evidence.
+Reduce read-only cold open work when WAL shards are provably empty after a clean
+flush.
 
 ## Scope
 
-- Benchmark diagnostics for cold writable and read-only reopen.
-- Split open-time storage/read-path counters from the first point-read delta.
-- Phase evidence and benchmark documentation for the next target decision.
+- Native persistent read-only open.
+- WAL replay discovery after manifest load.
+- Skip WAL content reads only when every discovered WAL shard object has length
+  zero.
+- Focused tests and benchmark evidence for the clean-WAL path.
 
 ## Out Of Scope
 
@@ -22,49 +24,50 @@ next optimization target is chosen from evidence.
   metadata changes.
 - Weakening writer-lease protection for writable opens.
 - Changing read-only public API semantics.
-- Batched point-read internals.
+- Batched point-read internals or table read-path changes.
+- Skipping WAL checks when any WAL shard has bytes.
 
 ## Backend Boundary Receipt
 
-- Trine operation names: persistent open, read-only persistent open, cold point
-  read, manifest load, WAL discovery/replay, table open, lazy data-block read,
-  directory listing, writer lease acquisition.
-- Owned interface: benchmark harness diagnostics plus existing `DbOptions` and
-  `Db::open(_sync)` paths.
-- Chosen backend: existing native filesystem storage backend only.
-- Known backend limits: diagnostics must not change read/write/recovery
-  behavior; read-only opens still cannot mutate files.
-- Leak-check scope: benchmark/documentation names describe Trine operations,
-  not OS-specific backend implementation details.
-- Verification gate: benchmark smoke, release benchmark key rows, focused
-  read-only tests, clippy, full tests, diff checks, forbidden-term/source-name
-  scans.
+- Trine operation names: read-only persistent open, manifest load, WAL shard
+  discovery, WAL shard length proof, WAL replay, table open.
+- Owned interface: existing `DbOptions::read_only` and `Db::open(_sync)` paths;
+  no new public API.
+- Chosen backend: existing native filesystem storage backend.
+- Known backend limits: directory listing returns paths, not sizes, so the proof
+  uses existing read-object length calls.
+- Leak-check scope: documentation and benchmark labels use Trine operation
+  names only.
+- Verification gate: focused read-only/WAL recovery tests, benchmark smoke,
+  full local quiet gate, diff checks, forbidden-term/source-name scans.
 
 ## Acceptance Gate
 
-- Benchmark rows distinguish open-time counters from first-read delta counters.
-- Existing cold table read and read-only benchmark rows remain comparable.
-- No public API or storage behavior changes are required for the diagnostic
-  phase.
-- Evidence recommends one next target: manifest/table metadata, WAL replay, or
-  lazy point-read data-block work.
+- Read-only persistent open skips WAL content reads only when all discovered WAL
+  shard files are empty.
+- Read-only open still replays non-empty WAL shards and preserves committed
+  records.
+- Writable open behavior is unchanged.
+- Release benchmark evidence records whether the optimization lowers read-only
+  cold open whole-object reads or latency.
 - Focused checks, formatting, clippy, full tests, diff checks, and scans pass.
 
 ## Active Task Slice
 
 ```text
-task599 [x] goal:add open-vs-first-read cold diagnostics | scope:benches/v1_bench.rs | verify:cargo test -q --bench v1_bench
-task600 [x] goal:measure release benchmark key rows | scope:benches/v1_bench.rs docs/benchmarks | verify:cargo bench --bench v1_bench
-task601 [x] goal:record phase evidence and next target | scope:.phrase docs README.md | verify:git diff --check
-task602 [x] goal:finish local gate | scope:full workspace | verify:clippy/test/diff scans
+task603 [x] goal:add empty-WAL proof helper | scope:src/wal.rs | verify:cargo test -q read_only --lib
+task604 [x] goal:use helper in read-only persistent open | scope:src/db.rs | verify:cargo test -q read_only --lib
+task605 [x] goal:measure clean-WAL read-only cold open | scope:benches/v1_bench.rs docs/benchmarks | verify:cargo bench --bench v1_bench
+task606 [x] goal:record evidence and finish gate | scope:.phrase docs full workspace | verify:quiet full gate
 ```
 
 ## Known Residuals
 
-- Phase 143 showed read-only cold reopen avoids writer-lease acquisition and is
-  much faster than writable cold reopen in the measured run.
-- Remaining read-only cold cost includes shared open work and one lazy
-  point-read data-block load.
+- Directory entries now carry file length for the native filesystem path, so
+  clean-WAL read-only open avoids WAL content reads without extra open/len
+  requests in the measured sync native path.
+- Async native open still discovers WAL paths through its separate async
+  directory-list path and can reuse this strategy in a later slice.
 
 ## Evidence
 
@@ -79,9 +82,11 @@ task602 [x] goal:finish local gate | scope:full workspace | verify:clippy/test/d
   block reads, and zero whole-object reads.
 - Code inspection maps the non-manifest open-phase whole-object reads to WAL
   shard reads.
+- Phase 144 committed the open-vs-first-read diagnostic split as `79079a9`.
+- Phase 145 release-profile benchmark recorded `cold table read-only` at 91081
+  us and read-only open phase whole-object reads at zero.
 
 ## Next Recommendation
 
-- Commit the split diagnostics. If cold-read work continues, start a clean-WAL
-  read-only open phase that avoids WAL shard reads only when manifest/WAL state
-  proves there are no replayable records.
+- Commit the clean-WAL read-only open change. If cold-read work continues, move
+  next to manifest/table open metadata or first-read table data-block work.

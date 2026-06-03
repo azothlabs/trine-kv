@@ -16,10 +16,11 @@ use crate::{
     storage::{
         BlockingStorageAppendBackend, BlockingStorageAppendObject,
         BlockingStorageDirectoryListBackend, BlockingStorageObjectReadBackend,
-        BlockingStorageWalRewriteBackend, NativeFileAppendObject, NativeFileBackend,
-        StorageAppendBackend, StorageAppendObject, StorageCapability, StorageDirectoryId,
-        StorageDirectoryListBackend, StorageObjectId, StorageObjectKind, StorageObjectReadBackend,
-        StorageReadBackend, StorageWalRewriteBackend,
+        BlockingStorageReadBackend, BlockingStorageReadObject, BlockingStorageWalRewriteBackend,
+        NativeFileAppendObject, NativeFileBackend, StorageAppendBackend, StorageAppendObject,
+        StorageCapability, StorageDirectoryFile, StorageDirectoryId, StorageDirectoryListBackend,
+        StorageObjectId, StorageObjectKind, StorageObjectReadBackend, StorageReadBackend,
+        StorageWalRewriteBackend,
     },
     types::{KeyRange, Sequence},
     write_batch::BatchOperation,
@@ -536,6 +537,32 @@ pub(crate) fn read_recovery_streams_after_paths_with_backend(
         )?);
     }
     Ok(streams)
+}
+
+pub(crate) fn discovered_wal_paths_are_empty_with_backend(
+    backend: &NativeFileBackend,
+    paths: &[PathBuf],
+    directory_files: &[StorageDirectoryFile],
+) -> Result<bool> {
+    for path in paths {
+        let byte_len = if let Some(byte_len) = directory_files
+            .iter()
+            .find(|file| file.path() == path)
+            .and_then(StorageDirectoryFile::byte_len)
+        {
+            byte_len
+        } else {
+            backend
+                .capabilities()
+                .require(StorageCapability::RandomRead)?;
+            let object = backend.open_read_blocking(wal_storage_object(path))?;
+            object.len_blocking()?
+        };
+        if byte_len != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[allow(dead_code)]

@@ -109,15 +109,31 @@ impl StorageDirectoryId {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct StorageDirectoryFile {
     path: PathBuf,
+    byte_len: Option<u64>,
 }
 
 impl StorageDirectoryFile {
+    #[allow(dead_code)]
     pub(crate) fn native_file(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            byte_len: None,
+        }
+    }
+
+    pub(crate) fn native_file_with_len(path: impl Into<PathBuf>, byte_len: u64) -> Self {
+        Self {
+            path: path.into(),
+            byte_len: Some(byte_len),
+        }
     }
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) const fn byte_len(&self) -> Option<u64> {
+        self.byte_len
     }
 }
 
@@ -3431,10 +3447,14 @@ fn list_native_file_directory_files(
     let mut files = Vec::new();
     for entry in fs::read_dir(directory.path())? {
         let entry = entry?;
-        if !entry.file_type()?.is_file() {
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() {
             continue;
         }
-        files.push(StorageDirectoryFile::native_file(entry.path()));
+        files.push(StorageDirectoryFile::native_file_with_len(
+            entry.path(),
+            metadata.len(),
+        ));
     }
 
     files.sort_unstable();
@@ -5100,6 +5120,11 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(names, vec!["MANIFEST.tmp", "trine.wal.tmp"]);
+        let lengths = files
+            .iter()
+            .map(|file| file.byte_len().expect("native listing records byte length"))
+            .collect::<Vec<_>>();
+        assert_eq!(lengths, vec![8, 3]);
 
         std::fs::remove_dir_all(root).expect("test dir removes");
     }
