@@ -189,6 +189,63 @@ Record only evidence that can change planning or durable decisions.
 - Commit this phase and choose the next target from current-manifest/open
   overhead or batched point reads.
 
+## 2026-06-03: Phase 140 Cold Manifest/Open Reopen
+
+### Observation
+
+- Added cold-read diagnostic rows for whole-object reads, writer-lease
+  acquisition, directory file-list requests, object-list requests, and latency
+  totals.
+- Before the kept change, 32 reopen/get operations performed 96 directory
+  file-list requests and 64 object-list requests.
+- The before-change discovery run recorded `cold table read` at 177971 us,
+  writer-lease acquisition at 72826 us, directory file-list latency at 2056 us,
+  and object-list latency at 1087 us.
+- Sync persistent open now reads the native database directory once after
+  acquiring the writer lease and reuses that snapshot for safe temporary-file
+  repair, WAL path discovery, and unreferenced table/blob checks.
+- After the kept change, 32 reopen/get operations performed 32 directory
+  file-list requests and zero object-list requests.
+- The after-change release-profile `cold table read` row was 168137 us.
+
+### Interpretation
+
+- The kept change reduced cold reopen directory scans from five to one per
+  reopen/get without changing writer-lease acquisition, manifest decoding, WAL
+  frame reads, table loading, or recovery failure conditions.
+- Writer-lease acquisition remains the largest measured fixed cost for writable
+  cold reopen, but it is a safety boundary and was intentionally left intact.
+- Local elapsed time remains noisy, so request-count reduction is the stronger
+  evidence.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q recovery --lib`
+- `cargo test -q wal --lib`
+- `cargo test -q persistent --lib`
+- `cargo test -q --bench v1_bench`
+- `cargo bench --bench v1_bench`, output redirected and only key rows
+  inspected.
+- `cargo clippy --all-targets --all-features -- -D warnings`, output
+  redirected to `/tmp/trine-clippy-phase140.txt`
+- `cargo test -q --all-targets --all-features`, output redirected to
+  `/tmp/trine-test-phase140.txt`
+- `git diff --check`
+- Forbidden-term scan over source, benches, docs, README, and touched `.phrase`
+  files found no matches.
+- Source-name scan over performance design and benchmark records found no
+  source-system or broad execution-model wording.
+
+### Remaining Blockers
+
+- The next implementation target is not yet chosen.
+
+### Recommended Next Action
+
+- Commit this phase, then choose whether to continue cold reopen work around
+  writer-lease cost or switch to batched point reads.
+
 ## 2026-06-02: Public Rustdoc Coverage Gate
 
 ### Observation

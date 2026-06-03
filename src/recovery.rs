@@ -15,7 +15,7 @@ use crate::{
         BlockingStorageObjectDeleteBackend, BlockingStorageObjectReadBackend,
         BlockingStorageObjectWriteBackend, BlockingStorageReadBackend,
         BlockingStorageWriterLeaseBackend, NativeFileBackend, NativeFileWriterLease,
-        StorageCapability, StorageDirectoryId, StorageDirectoryListBackend,
+        StorageCapability, StorageDirectoryFile, StorageDirectoryId, StorageDirectoryListBackend,
         StorageObjectDeleteBackend, StorageObjectId, StorageObjectKind, StorageObjectListBackend,
         StorageObjectReadBackend, StorageObjectWriteBackend, StorageReadBackend,
         StorageWriterLeaseBackend,
@@ -125,6 +125,25 @@ pub(crate) fn repair_safe_temporary_files_with_backend(
     policy: FailOnCorruptionPolicy,
 ) -> Result<Option<RecoveryReport>> {
     let temporary_files = safe_temporary_files_with_backend(backend, db_path)?;
+    repair_safe_temporary_files_with_temporary_files(backend, db_path, policy, temporary_files)
+}
+
+pub(crate) fn repair_safe_temporary_files_from_directory_files_with_backend(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+    policy: FailOnCorruptionPolicy,
+    directory_files: &[StorageDirectoryFile],
+) -> Result<Option<RecoveryReport>> {
+    let temporary_files = safe_temporary_files_from_directory_files(directory_files)?;
+    repair_safe_temporary_files_with_temporary_files(backend, db_path, policy, temporary_files)
+}
+
+fn repair_safe_temporary_files_with_temporary_files(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+    policy: FailOnCorruptionPolicy,
+    temporary_files: Vec<TemporaryFile>,
+) -> Result<Option<RecoveryReport>> {
     if temporary_files.is_empty() {
         return Ok(None);
     }
@@ -215,6 +234,30 @@ pub(crate) fn fail_on_unreferenced_storage_files_with_backend(
     let unreferenced_files = unreferenced_storage_files_with_backend(
         backend,
         db_path,
+        referenced_table_ids,
+        referenced_blob_ids,
+    )?;
+    if unreferenced_files.is_empty() {
+        return Ok(());
+    }
+
+    Err(Error::Corruption {
+        message: format!(
+            "unreferenced table/blob files require operator review: {}",
+            unreferenced_files.join(", ")
+        ),
+    })
+}
+
+pub(crate) fn fail_on_unreferenced_storage_files_from_directory_files(
+    db_path: &Path,
+    directory_files: &[StorageDirectoryFile],
+    referenced_table_ids: &BTreeSet<TableId>,
+    referenced_blob_ids: &BTreeSet<u64>,
+) -> Result<()> {
+    let unreferenced_files = unreferenced_storage_files_from_directory_files(
+        db_path,
+        directory_files,
         referenced_table_ids,
         referenced_blob_ids,
     )?;
@@ -572,6 +615,12 @@ fn safe_temporary_files_with_backend(
         Err(error) => return Err(error),
     };
 
+    safe_temporary_files_from_directory_files(&directory_files)
+}
+
+fn safe_temporary_files_from_directory_files(
+    directory_files: &[StorageDirectoryFile],
+) -> Result<Vec<TemporaryFile>> {
     let mut files = Vec::new();
     for directory_file in directory_files {
         let path = directory_file.path().to_path_buf();
@@ -694,6 +743,34 @@ fn unreferenced_storage_files_with_backend(
     for blob_id in blob::list_blob_file_ids_with_backend(backend, db_path)? {
         if !referenced_blob_ids.contains(&blob_id) {
             files.push(storage_file_name(&blob::blob_path(db_path, blob_id))?);
+        }
+    }
+
+    files.sort();
+    Ok(files)
+}
+
+fn unreferenced_storage_files_from_directory_files(
+    db_path: &Path,
+    directory_files: &[StorageDirectoryFile],
+    referenced_table_ids: &BTreeSet<TableId>,
+    referenced_blob_ids: &BTreeSet<u64>,
+) -> Result<Vec<String>> {
+    let mut files = Vec::new();
+
+    for directory_file in directory_files {
+        let path = directory_file.path();
+        if let Some(table_id) = table::table_file_id_from_path(path)? {
+            if !referenced_table_ids.contains(&table_id) {
+                files.push(storage_file_name(&table::table_path(db_path, table_id))?);
+            }
+            continue;
+        }
+
+        if let Some(blob_id) = blob::blob_file_id_from_path(path)? {
+            if !referenced_blob_ids.contains(&blob_id) {
+                files.push(storage_file_name(&blob::blob_path(db_path, blob_id))?);
+            }
         }
     }
 

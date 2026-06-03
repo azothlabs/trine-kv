@@ -661,10 +661,20 @@ struct ColdReadDiagnostics {
     open_read_requests: u64,
     len_requests: u64,
     read_exact_at_owned_requests: u64,
+    read_object_bytes_requests: u64,
     read_current_manifest_requests: u64,
     open_append_requests: u64,
+    acquire_writer_lease_requests: u64,
+    list_directory_files_requests: u64,
+    list_objects_requests: u64,
+    open_read_micros: u64,
+    len_micros: u64,
     read_exact_at_owned_micros: u64,
+    read_object_bytes_micros: u64,
     read_current_manifest_micros: u64,
+    acquire_writer_lease_micros: u64,
+    list_directory_files_micros: u64,
+    list_objects_micros: u64,
 }
 
 impl ColdReadDiagnostics {
@@ -691,16 +701,40 @@ impl ColdReadDiagnostics {
         self.read_exact_at_owned_requests = self
             .read_exact_at_owned_requests
             .saturating_add(stats.storage_operations.read_exact_at_owned.requests);
+        self.read_object_bytes_requests = self
+            .read_object_bytes_requests
+            .saturating_add(stats.storage_operations.read_object_bytes.requests);
         self.read_current_manifest_requests = self
             .read_current_manifest_requests
             .saturating_add(stats.storage_operations.read_current_manifest.requests);
         self.open_append_requests = self
             .open_append_requests
             .saturating_add(stats.storage_operations.open_append.requests);
+        self.acquire_writer_lease_requests = self
+            .acquire_writer_lease_requests
+            .saturating_add(stats.storage_operations.acquire_writer_lease.requests);
+        self.list_directory_files_requests = self
+            .list_directory_files_requests
+            .saturating_add(stats.storage_operations.list_directory_files.requests);
+        self.list_objects_requests = self
+            .list_objects_requests
+            .saturating_add(stats.storage_operations.list_objects.requests);
+        self.open_read_micros = self
+            .open_read_micros
+            .saturating_add(stats.storage_operations.open_read.total_latency_micros);
+        self.len_micros = self
+            .len_micros
+            .saturating_add(stats.storage_operations.len.total_latency_micros);
         self.read_exact_at_owned_micros = self.read_exact_at_owned_micros.saturating_add(
             stats
                 .storage_operations
                 .read_exact_at_owned
+                .total_latency_micros,
+        );
+        self.read_object_bytes_micros = self.read_object_bytes_micros.saturating_add(
+            stats
+                .storage_operations
+                .read_object_bytes
                 .total_latency_micros,
         );
         self.read_current_manifest_micros = self.read_current_manifest_micros.saturating_add(
@@ -709,6 +743,21 @@ impl ColdReadDiagnostics {
                 .read_current_manifest
                 .total_latency_micros,
         );
+        self.acquire_writer_lease_micros = self.acquire_writer_lease_micros.saturating_add(
+            stats
+                .storage_operations
+                .acquire_writer_lease
+                .total_latency_micros,
+        );
+        self.list_directory_files_micros = self.list_directory_files_micros.saturating_add(
+            stats
+                .storage_operations
+                .list_directory_files
+                .total_latency_micros,
+        );
+        self.list_objects_micros = self
+            .list_objects_micros
+            .saturating_add(stats.storage_operations.list_objects.total_latency_micros);
     }
 
     fn push_results(&self, results: &mut Vec<BenchResult>) {
@@ -745,6 +794,10 @@ impl ColdReadDiagnostics {
             self.read_exact_at_owned_requests,
         ));
         results.push(BenchResult::diagnostic(
+            "read pruning cold storage read object bytes requests",
+            self.read_object_bytes_requests,
+        ));
+        results.push(BenchResult::diagnostic(
             "read pruning cold storage current manifest requests",
             self.read_current_manifest_requests,
         ));
@@ -753,12 +806,48 @@ impl ColdReadDiagnostics {
             self.open_append_requests,
         ));
         results.push(BenchResult::diagnostic(
+            "read pruning cold storage acquire writer lease requests",
+            self.acquire_writer_lease_requests,
+        ));
+        results.push(BenchResult::diagnostic(
+            "read pruning cold storage list directory files requests",
+            self.list_directory_files_requests,
+        ));
+        results.push(BenchResult::diagnostic(
+            "read pruning cold storage list objects requests",
+            self.list_objects_requests,
+        ));
+        results.push(BenchResult::diagnostic(
+            "read pruning cold storage open read micros",
+            self.open_read_micros,
+        ));
+        results.push(BenchResult::diagnostic(
+            "read pruning cold storage len micros",
+            self.len_micros,
+        ));
+        results.push(BenchResult::diagnostic(
             "read pruning cold storage read owned micros",
             self.read_exact_at_owned_micros,
         ));
         results.push(BenchResult::diagnostic(
+            "read pruning cold storage read object bytes micros",
+            self.read_object_bytes_micros,
+        ));
+        results.push(BenchResult::diagnostic(
             "read pruning cold storage current manifest micros",
             self.read_current_manifest_micros,
+        ));
+        results.push(BenchResult::diagnostic(
+            "read pruning cold storage acquire writer lease micros",
+            self.acquire_writer_lease_micros,
+        ));
+        results.push(BenchResult::diagnostic(
+            "read pruning cold storage list directory files micros",
+            self.list_directory_files_micros,
+        ));
+        results.push(BenchResult::diagnostic(
+            "read pruning cold storage list objects micros",
+            self.list_objects_micros,
         ));
     }
 }

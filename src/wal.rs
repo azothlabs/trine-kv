@@ -179,6 +179,19 @@ impl WalFrontDoor {
         db_path: &Path,
         shard_count: usize,
     ) -> Result<Self> {
+        let paths = discover_wal_paths_with_backend(backend, db_path)?;
+        Self::open_sharded_with_discovered_paths(backend, db_path, shard_count, paths)
+    }
+
+    pub(crate) fn open_sharded_with_discovered_paths<I>(
+        backend: &NativeFileBackend,
+        db_path: &Path,
+        shard_count: usize,
+        discovered_paths: I,
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
         if shard_count == 0 {
             return Err(Error::invalid_options("WAL shard count must be non-zero"));
         }
@@ -187,7 +200,7 @@ impl WalFrontDoor {
         for shard_index in 0..shard_count {
             paths.insert(shard_index, wal_shard_path(db_path, shard_index));
         }
-        for path in discover_wal_paths_with_backend(backend, db_path)? {
+        for path in discovered_paths {
             let shard_index = wal_shard_index_from_path(&path)?;
             paths.insert(shard_index, path);
         }
@@ -478,7 +491,8 @@ pub(crate) fn read_all_batches(db_path: &Path) -> Result<Vec<WalBatch>> {
 #[cfg(test)]
 fn read_all_batches_after(db_path: &Path, replay_floor: Sequence) -> Result<Vec<WalBatch>> {
     let backend = NativeFileBackend::new();
-    let streams = read_recovery_streams_after_with_backend(&backend, db_path, replay_floor)?;
+    let paths = discover_wal_paths_with_backend(&backend, db_path)?;
+    let streams = read_recovery_streams_after_paths_with_backend(&backend, &paths, replay_floor)?;
     merge_batch_streams_by_sequence(streams)
 }
 
@@ -508,16 +522,16 @@ where
     decode_frames_after(bytes.as_ref(), replay_floor)
 }
 
-pub(crate) fn read_recovery_streams_after_with_backend(
+pub(crate) fn read_recovery_streams_after_paths_with_backend(
     backend: &NativeFileBackend,
-    db_path: &Path,
+    paths: &[PathBuf],
     replay_floor: Sequence,
 ) -> Result<Vec<Vec<WalBatch>>> {
     let mut streams = Vec::new();
-    for path in discover_wal_paths_with_backend(backend, db_path)? {
+    for path in paths {
         streams.push(read_batches_after_with_backend(
             backend,
-            &path,
+            path,
             replay_floor,
         )?);
     }
@@ -572,7 +586,7 @@ where
     )
 }
 
-fn discover_wal_paths_from_directory_entries<I>(files: I) -> Result<Vec<PathBuf>>
+pub(crate) fn discover_wal_paths_from_directory_entries<I>(files: I) -> Result<Vec<PathBuf>>
 where
     I: IntoIterator<Item = PathBuf>,
 {

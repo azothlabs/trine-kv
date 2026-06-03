@@ -3382,4 +3382,33 @@ miss per reopen/get.
 
 ### Recommended Next Action
 
-- Finish full local verification, then choose the next benchmark-backed target.
+- Choose the next benchmark-backed target from current-manifest/open overhead
+  or batched point reads.
+
+### Phase 140: Cold Manifest/Open Reopen
+
+**Status**: Complete
+
+**Goal**: Measure and reduce the remaining cold persistent reopen overhead
+around manifest and open operations, without changing storage format, recovery
+rules, or public API behavior.
+
+**Entry Condition**: Phase 139 complete and cold-read diagnostics show
+remaining current-manifest/open work after small table-open metadata reads were
+reduced.
+
+**Acceptance Gate**:
+
+- Before-change evidence identifies the remaining cold-read storage request
+  shape.
+- One kept change reduces a measured cold reopen/open cost.
+- Recovery, persistence semantics, table data-block laziness, and public API
+  behavior remain unchanged.
+- Focused checks, benchmark evidence, formatting, clippy, full tests, diff
+  checks, and forbidden-term scans pass.
+
+**Major Out Of Scope**:
+
+- Public API additions such as batched point reads.
+- Storage format, MVCC, WAL, table, blob, compaction, transaction, recovery,
+  browser persistence, or release metadata changes.

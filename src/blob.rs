@@ -173,7 +173,15 @@ fn blob_file_ids_from_objects(
     Ok(file_ids)
 }
 
-fn blob_file_id_from_path(path: &Path) -> Result<Option<u64>> {
+pub(crate) fn blob_file_id_from_path(path: &Path) -> Result<Option<u64>> {
+    let has_blob_extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(BLOB_FILE_EXTENSION));
+    if !has_blob_extension {
+        return Ok(None);
+    }
+
     let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
         return Ok(None);
     };

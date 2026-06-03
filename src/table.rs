@@ -3212,31 +3212,35 @@ fn table_file_ids_from_objects(
 ) -> Result<BTreeSet<TableId>> {
     let mut table_ids = BTreeSet::new();
     for object in objects {
-        let path = object.path();
-        let has_table_extension = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case(TABLE_FILE_EXTENSION));
-        if !has_table_extension {
-            continue;
+        if let Some(table_id) = table_file_id_from_path(object.path())? {
+            table_ids.insert(table_id);
         }
-
-        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            continue;
-        };
-        let Some(table_id) = stem.strip_prefix("table-") else {
-            continue;
-        };
-        let table_id = table_id
-            .parse::<u64>()
-            .map(TableId)
-            .map_err(|_| Error::Corruption {
-                message: format!("invalid table file name: {}", path.display()),
-            })?;
-        table_ids.insert(table_id);
     }
 
     Ok(table_ids)
+}
+
+pub(crate) fn table_file_id_from_path(path: &Path) -> Result<Option<TableId>> {
+    let has_table_extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(TABLE_FILE_EXTENSION));
+    if !has_table_extension {
+        return Ok(None);
+    }
+
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return Ok(None);
+    };
+    let Some(table_id) = stem.strip_prefix("table-") else {
+        return Ok(None);
+    };
+    table_id
+        .parse::<u64>()
+        .map(|id| Some(TableId(id)))
+        .map_err(|_| Error::Corruption {
+            message: format!("invalid table file name: {}", path.display()),
+        })
 }
 
 #[allow(dead_code)]

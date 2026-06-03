@@ -6,66 +6,72 @@ Complete
 
 ## Goal
 
-Reduce cold point-read table-open I/O for small persistent tables without
-changing lazy data-block read behavior.
+Measure and reduce the remaining cold persistent reopen overhead around
+manifest and open operations, without changing table contents, recovery rules,
+or public API behavior.
 
 ## Scope
 
-- Cold-read diagnostic rows for storage operation request counts and latency
+- Cold-read benchmark diagnostics for manifest/open request counts and latency
   totals.
-- Sync table-open behavior for small table files.
-- Benchmark evidence in `docs/benchmarks/v1-cold-table-open-read.md`.
+- Native persistent reopen path only, selected by measured cold-read evidence.
+- Documentation of before/after benchmark evidence for the kept change.
 
 ## Out Of Scope
 
-- Rust code changes.
-- Public API behavior changes.
-- Storage format, MVCC, WAL, manifest, SSTable, blob, compaction, transaction,
-  recovery, or browser persistence behavior changes.
-- Data-block eager loading for large table files.
-- Publishing, tagging, pushing, or release metadata changes.
+- Public API additions such as batched point reads.
+- Storage format, MVCC, WAL, table, blob, compaction, transaction, recovery,
+  browser persistence, or release metadata changes.
+- Async/browser backend behavior changes unless required to preserve shared
+  semantics.
+- Large table data-block eager loading.
 
 ## Acceptance Gate
 
-- Cold-read diagnostics expose storage operation request counts.
-- Small sync table open reduces positioned owned read requests for the measured
-  cold point-read workload.
-- Persistent tables still keep data blocks lazy after sync open.
-- Focused table and benchmark checks pass.
-- Formatting, clippy, full tests, and diff checks pass.
+- Before-change evidence identifies the remaining cold-read storage request
+  shape.
+- The kept change reduces one measured cold reopen/open cost without changing
+  recovery or persistence semantics.
+- Focused storage/manifest/table and benchmark checks pass.
+- Formatting, clippy, full tests, diff checks, and forbidden-term scans pass.
 
 ## Active Task Slice
 
 ```text
-task579 [x] goal:add cold storage diagnostics | scope:benches/v1_bench.rs | verify:cargo test -q --bench v1_bench
-task580 [x] goal:buffer small table open metadata | scope:src/table.rs | verify:cargo test -q table --lib
-task581 [x] goal:record cold-read evidence | scope:docs/benchmarks/v1-cold-table-open-read.md .phrase | verify:cargo bench --bench v1_bench
-task582 [x] goal:finish local verification | scope:full workspace | verify:cargo clippy/test/diff checks
+task583 [x] goal:record cold manifest/open baseline | scope:benches/v1_bench.rs docs/benchmarks | verify:cargo bench --bench v1_bench
+task584 [x] goal:apply one measured reopen/open optimization | scope:src | verify:focused cargo test -q
+task585 [x] goal:record before-after evidence | scope:docs/benchmarks .phrase | verify:cargo bench --bench v1_bench
+task586 [x] goal:finish local verification | scope:full workspace | verify:cargo clippy/test/diff checks
 ```
 
 ## Known Residuals
 
-- Small sync table open now decodes metadata from a temporary whole-file buffer
-  only when the table file is at or below 256 KiB.
-- The opened table still keeps its native file handle and leaves data blocks
-  lazy, so large-table behavior and block-cache read behavior remain bounded.
-- Full clippy/test/diff verification passed after documentation was updated.
+- Phase 139 reduced positioned owned reads from 288 to 96 for 32 reopen/get
+  operations.
+- Phase 140 leaves writer-lease acquisition intact. The diagnostic run showed
+  it is the largest fixed cost for writable cold reopen, but it is a safety
+  boundary.
+- Remaining cold-read cost includes writer-lease acquisition, WAL whole-object
+  reads, current-manifest reads, table open, and one lazy data-block read per
+  reopened database.
 
 ## Evidence
 
-- Before the table-open change, 32 reopen/get operations performed 288
-  positioned owned reads.
-- After the table-open change, the same diagnostic workload performed 96
-  positioned owned reads.
-- Release-profile `cold table read` was 174933 us in the first after-change run
-  and 167430 us in the second after-change run. The `0.1` baseline was 183876
-  us.
-- `cargo test -q table --lib` and `cargo test -q --bench v1_bench` passed.
+- Phase 139 release-profile cold table read after-change runs were 174933 us
+  and 167430 us, with the same 96 positioned owned read requests.
+- Phase 139 diagnostics recorded current-manifest read latency at 461 us and
+  493 us across the two after-change release-profile runs.
+- Phase 140 before-change discovery showed 96 directory file-list requests and
+  64 object-list requests across 32 reopen/get operations.
+- After directory snapshot reuse, the same diagnostic shape showed 32 directory
+  file-list requests and zero object-list requests.
+- The after-change release-profile `cold table read` row was 168137 us.
+- Focused recovery, WAL, persistent, and benchmark harness checks passed.
 - `cargo clippy --all-targets --all-features -- -D warnings` and
   `cargo test -q --all-targets --all-features` passed with output redirected
   to temporary files.
 
 ## Next Recommendation
 
-- Commit the cold table-open optimization, then choose whether the next target
-  is current-manifest/open overhead or batched point reads.
+- Commit the directory snapshot reuse, then choose whether to continue cold
+  reopen work around writer-lease cost or switch to batched point reads.
