@@ -6997,6 +6997,38 @@ mod tests {
         fs::remove_dir_all(path).expect("cleanup test db");
     }
 
+    #[test]
+    fn native_read_only_open_skips_writer_lease_and_rejects_writes() {
+        let path = temp_db_path("native-read-only-open");
+        let mut writable_options = DbOptions::persistent(&path);
+        writable_options.background_worker_count = 0;
+        {
+            let db = Db::open_sync(writable_options.clone()).expect("persistent db opens");
+            db.put_sync(b"key", b"value").expect("write succeeds");
+            db.flush_sync().expect("flush succeeds");
+        }
+
+        let db = Db::open_sync(writable_options.read_only()).expect("read-only db opens");
+
+        assert!(db.options().read_only);
+        assert!(db.inner.wal.is_none());
+        assert_eq!(
+            db.get_sync(b"key").expect("read-only read succeeds"),
+            Some(b"value".to_vec())
+        );
+        assert!(matches!(
+            db.put_sync(b"other", b"value"),
+            Err(Error::ReadOnly)
+        ));
+        assert_eq!(
+            db.stats().storage_operations.acquire_writer_lease.requests,
+            0
+        );
+
+        drop(db);
+        fs::remove_dir_all(path).expect("cleanup test db");
+    }
+
     #[cfg(not(target_os = "wasi"))]
     #[test]
     fn wasi_persistent_backend_requires_wasi_target() {

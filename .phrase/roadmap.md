@@ -3480,3 +3480,36 @@ for batched point reads.
 
 - Prefer cold reopen/read-only open work next, unless batched point-read work
   first gets a locality-focused benchmark and deeper table grouping design.
+
+### Phase 143: Read-Only Cold Reopen Measurement
+
+**Status**: Complete
+
+**Goal**: Verify and measure the native read-only open path as the explicit
+low-cost cold reopen option for read-only workloads.
+
+**Entry Condition**: Phase 142 closed with no kept batched point-read internal
+optimization, and cold-read evidence still shows writer-lease cost as the main
+writable reopen fixed cost.
+
+**Acceptance Gate**:
+
+- Native read-only open skips writer-lease acquisition only when explicitly
+  selected.
+- Writable open safety remains unchanged.
+- Read-only open rejects writes and does not create a WAL writer.
+- Benchmark rows compare writable and read-only cold table reads.
+- Focused checks, benchmark evidence, formatting, clippy, full tests, diff
+  checks, and scans pass.
+
+**Major Out Of Scope**:
+
+- Storage format, MVCC, WAL, table, blob, compaction, transaction, recovery,
+  browser persistence, or release metadata changes.
+- Weakening writer-lease protection for writable opens.
+- Batched point-read internals.
+
+### Recommended Next Action
+
+- If cold-read work continues, target shared read-only open costs such as
+  manifest/table metadata reads or WAL replay/read-object reduction.

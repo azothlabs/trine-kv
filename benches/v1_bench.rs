@@ -56,6 +56,7 @@ fn main() {
     results.push(bench_blob_level_merge());
     results.push(bench_block_cache_warm_read());
     results.push(bench_cold_table_read());
+    results.push(bench_cold_table_read_only());
     results.extend(bench_read_pruning_diagnostics());
     results.extend(bench_runtime_block_decode_reads());
     results.extend(bench_index_seek_policies());
@@ -660,15 +661,51 @@ fn bench_cold_table_read() -> BenchResult {
     })
 }
 
+fn bench_cold_table_read_only() -> BenchResult {
+    measure("cold table read-only", 32, || {
+        let dir = temp_dir("cold-read-only");
+        let options = benchmark_persistent_options(&dir);
+        {
+            let db = Db::open_sync(options.clone()).expect("persistent db opens");
+            let bucket = db.default_bucket_sync().expect("bucket opens");
+            for index in 0..ROWS {
+                bucket
+                    .put_sync(key(index), value(index))
+                    .expect("put succeeds");
+            }
+            db.flush_sync().expect("flush succeeds");
+        }
+
+        let read_only_options = options.read_only();
+        let mut checksum = 0;
+        for _ in 0..32 {
+            let db =
+                Db::open_sync(read_only_options.clone()).expect("read-only persistent db reopens");
+            let bucket = db.default_bucket_sync().expect("bucket reopens");
+            checksum += bucket
+                .get_sync(&key(ROWS / 2))
+                .expect("get succeeds")
+                .map_or(0, |value| value.len() as u64);
+        }
+        cleanup_dir(&dir);
+        checksum
+    })
+}
+
 fn bench_read_pruning_diagnostics() -> Vec<BenchResult> {
     let mut results = Vec::new();
-    extend_cold_table_read_diagnostics(&mut results);
+    extend_cold_table_read_diagnostics(&mut results, false);
+    extend_cold_table_read_diagnostics(&mut results, true);
     extend_prefix_partition_diagnostics(&mut results);
     results
 }
 
-fn extend_cold_table_read_diagnostics(results: &mut Vec<BenchResult>) {
-    let dir = temp_dir("read-pruning-cold-read");
+fn extend_cold_table_read_diagnostics(results: &mut Vec<BenchResult>, read_only: bool) {
+    let dir = if read_only {
+        temp_dir("read-pruning-cold-read-only")
+    } else {
+        temp_dir("read-pruning-cold-read")
+    };
     let options = benchmark_persistent_options(&dir);
     {
         let db = Db::open_sync(options.clone()).expect("persistent db opens");
@@ -681,9 +718,14 @@ fn extend_cold_table_read_diagnostics(results: &mut Vec<BenchResult>) {
         db.flush_sync().expect("flush succeeds");
     }
 
+    let open_options = if read_only {
+        options.read_only()
+    } else {
+        options
+    };
     let mut diagnostics = ColdReadDiagnostics::default();
     for _ in 0..32 {
-        let db = Db::open_sync(options.clone()).expect("persistent db reopens");
+        let db = Db::open_sync(open_options.clone()).expect("persistent db reopens");
         let bucket = db.default_bucket_sync().expect("bucket reopens");
         let value_len = bucket
             .get_sync(&key(ROWS / 2))
@@ -695,7 +737,7 @@ fn extend_cold_table_read_diagnostics(results: &mut Vec<BenchResult>) {
     }
     cleanup_dir(&dir);
 
-    diagnostics.push_results(results);
+    diagnostics.push_results(results, read_only);
 }
 
 #[derive(Default)]
@@ -807,93 +849,98 @@ impl ColdReadDiagnostics {
             .saturating_add(stats.storage_operations.list_objects.total_latency_micros);
     }
 
-    fn push_results(&self, results: &mut Vec<BenchResult>) {
+    fn push_results(&self, results: &mut Vec<BenchResult>, read_only: bool) {
+        let label = if read_only {
+            "read pruning cold read-only"
+        } else {
+            "read pruning cold"
+        };
         results.push(BenchResult::diagnostic(
-            "read pruning cold point table probes",
+            labelled(label, "point table probes"),
             self.table_probes,
         ));
         results.push(BenchResult::diagnostic(
-            "read pruning cold point block metadata probes",
+            labelled(label, "point block metadata probes"),
             self.block_metadata_probes,
         ));
         results.push(BenchResult::diagnostic(
-            "read pruning cold point data block reads",
+            labelled(label, "point data block reads"),
             self.data_block_reads,
         ));
         results.push(BenchResult::diagnostic(
-            "read pruning cold point filter skips",
+            labelled(label, "point filter skips"),
             self.filter_misses,
         ));
         results.push(BenchResult::diagnostic(
-            "read pruning cold point cache misses",
+            labelled(label, "point cache misses"),
             self.cache_misses,
         ));
         results.push(BenchResult::diagnostic(
-            "read pruning cold storage open read requests",
+            labelled(label, "storage open read requests"),
             self.open_read_requests,
         ));
         results.push(BenchResult::diagnostic(
-            "read pruning cold storage len requests",
+            labelled(label, "storage len requests"),
             self.len_requests,
         ));
         results.push(BenchResult::diagnostic(
-            "read pruning cold storage read owned requests",
+            labelled(label, "storage read owned requests"),
             self.read_exact_at_owned_requests,
         ));
         results.push(BenchResult::diagnostic(
-            "read pruning cold storage read object bytes requests",
+            labelled(label, "storage read object bytes requests"),
             self.read_object_bytes_requests,
         ));
         results.push(BenchResult::diagnostic(
-            "read pruning cold storage current manifest requests",
+            labelled(label, "storage current manifest requests"),
             self.read_current_manifest_requests,
         ));
         results.push(BenchResult::diagnostic(
-            "read pruning cold storage open append requests",
+            labelled(label, "storage open append requests"),
             self.open_append_requests,
         ));
         results.push(BenchResult::diagnostic(
-            "read pruning cold storage acquire writer lease requests",
+            labelled(label, "storage acquire writer lease requests"),
             self.acquire_writer_lease_requests,
         ));
         results.push(BenchResult::diagnostic(
-            "read pruning cold storage list directory files requests",
+            labelled(label, "storage list directory files requests"),
             self.list_directory_files_requests,
         ));
         results.push(BenchResult::diagnostic(
-            "read pruning cold storage list objects requests",
+            labelled(label, "storage list objects requests"),
             self.list_objects_requests,
         ));
         results.push(BenchResult::diagnostic(
-            "read pruning cold storage open read micros",
+            labelled(label, "storage open read micros"),
             self.open_read_micros,
         ));
         results.push(BenchResult::diagnostic(
-            "read pruning cold storage len micros",
+            labelled(label, "storage len micros"),
             self.len_micros,
         ));
         results.push(BenchResult::diagnostic(
-            "read pruning cold storage read owned micros",
+            labelled(label, "storage read owned micros"),
             self.read_exact_at_owned_micros,
         ));
         results.push(BenchResult::diagnostic(
-            "read pruning cold storage read object bytes micros",
+            labelled(label, "storage read object bytes micros"),
             self.read_object_bytes_micros,
         ));
         results.push(BenchResult::diagnostic(
-            "read pruning cold storage current manifest micros",
+            labelled(label, "storage current manifest micros"),
             self.read_current_manifest_micros,
         ));
         results.push(BenchResult::diagnostic(
-            "read pruning cold storage acquire writer lease micros",
+            labelled(label, "storage acquire writer lease micros"),
             self.acquire_writer_lease_micros,
         ));
         results.push(BenchResult::diagnostic(
-            "read pruning cold storage list directory files micros",
+            labelled(label, "storage list directory files micros"),
             self.list_directory_files_micros,
         ));
         results.push(BenchResult::diagnostic(
-            "read pruning cold storage list objects micros",
+            labelled(label, "storage list objects micros"),
             self.list_objects_micros,
         ));
     }

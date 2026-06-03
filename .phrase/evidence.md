@@ -351,6 +351,63 @@ Record only evidence that can change planning or durable decisions.
 - Prefer cold reopen/read-only open work next, unless the batched point-read
   benchmark is first redesigned around key locality and deeper table grouping.
 
+## 2026-06-03: Phase 143 Read-Only Cold Reopen Measurement
+
+### Observation
+
+- Native `DbOptions::persistent_read_only(path)` and `DbOptions::read_only()`
+  already selected read-only open semantics.
+- Native read-only open already skipped writer-lease acquisition, skipped WAL
+  writer creation, avoided background workers, and forced temporary-file repair
+  policy to fail closed.
+- Added a native regression test that writes/flushed data with a writable
+  handle, reopens read-only, reads the value, rejects a write as
+  `Error::ReadOnly`, and reports zero writer-lease acquisition requests.
+- Added `cold table read-only` and matching cold-read diagnostic benchmark
+  rows.
+- Release-profile benchmark run recorded `cold table read` at 215780 us and
+  `cold table read-only` at 93188 us.
+- Diagnostic rows recorded writable writer-lease requests at 32 and read-only
+  writer-lease requests at 0.
+
+### Interpretation
+
+- The native read-only path is already the right explicit mechanism for
+  inspection workloads that do not need writes.
+- The kept work is benchmark and regression coverage, not an open-path behavior
+  change.
+- The request-count evidence confirms read-only cold reopen removes the largest
+  previously measured fixed cost while preserving writable open safety.
+- Remaining read-only cold cost is in shared open/read work such as manifest
+  read, table open, directory listing, WAL replay into memory, and the lazy
+  point-read data-block load.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q read_only --lib`
+- `cargo test -q --bench v1_bench`
+- `cargo bench --bench v1_bench`, output redirected and only key rows
+  inspected.
+- `cargo clippy --all-targets --all-features -- -D warnings`, output
+  redirected to `/tmp/trine-clippy-phase143.txt`
+- `cargo test -q --all-targets --all-features`, output redirected to
+  `/tmp/trine-test-phase143.txt`
+- `git diff --check`
+- Forbidden-term and source-name scans over source, benches, docs, README, and
+  touched `.phrase` files found no matches.
+
+### Remaining Blockers
+
+- No phase blocker remains.
+
+### Recommended Next Action
+
+- Finish the local gate and commit the read-only cold reopen benchmark/test
+  evidence.
+- If cold-read work continues, target shared read-only open costs rather than
+  writer-lease behavior.
+
 ## 2026-06-02: Public Rustdoc Coverage Gate
 
 ### Observation
