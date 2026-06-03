@@ -3315,3 +3315,37 @@ the current benchmark baseline.
 ### Recommended Next Action
 
 - Run read-pruning measurement before selecting the next implementation target.
+
+### Phase 138: Read-Pruning Measurement And Prefix Cursor Fix
+
+**Status**: Complete
+
+**Goal**: Add read-pruning measurement for cold point and prefix workloads, then
+keep the first measured prefix-scan metadata reduction.
+
+**Entry Condition**: Phase 137 complete and the performance design names
+read-pruning measurement as the next lowest-risk phase.
+
+**Acceptance Gate**:
+
+- `DbStats::read_path` exposes prefix table probes, block metadata probes,
+  data-block reads, and filter skips.
+- The v1 benchmark emits diagnostic rows for cold point reads and persistent
+  prefix scans.
+- Benchmark evidence identifies one source cost and records before/after
+  measurement for the kept fix.
+- Storage format, MVCC, recovery, public API shape, and filter semantics remain
+  unchanged.
+- Focused range/prefix/table tests, benchmark build/run, formatting, clippy,
+  full tests, diff checks, and forbidden-term scan pass.
+
+**Major Out Of Scope**:
+
+- Storage format changes.
+- Public API additions such as `multi_get`.
+- Compaction policy, blob maintenance policy, WAL, manifest, transaction,
+  recovery, browser persistence, or release metadata changes.
+
+### Recommended Next Action
+
+- Finish full local verification, then choose the next benchmark-backed target.

@@ -152,7 +152,9 @@ impl LsmTree {
         let query_range = selector_query_range(selector);
         for table in version.range_scan_tables(&query_range) {
             if let Some(prefix) = selector.prefix() {
+                table.record_prefix_table_probe();
                 if !table.may_contain_prefix(prefix, &self.options.prefix_extractor) {
+                    table.record_prefix_filter_miss();
                     continue;
                 }
             }

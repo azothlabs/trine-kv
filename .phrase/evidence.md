@@ -72,6 +72,67 @@ Record only evidence that can change planning or durable decisions.
 - Start the read-pruning measurement phase from
   `.phrase/protocol/performance-research-design.md`.
 
+## 2026-06-03: Phase 138 Read-Pruning Measurement And Prefix Cursor Fix
+
+### Observation
+
+- Read-path stats already covered point reads, but prefix scans did not expose
+  table probes, block metadata probes, data-block reads, or filter skips.
+- Added prefix read-pruning counters to `DbStats::read_path` and diagnostic
+  benchmark rows for cold point reads plus matching and nonmatching persistent
+  prefix scans.
+- The first diagnostic benchmark run before the cursor fix showed matching
+  prefix scans at 8664 block metadata probes for 152 data-block reads.
+- Table cursors now keep consuming records from an already-loaded block without
+  rechecking block-state metadata and filters until they advance to a different
+  block.
+- Release-profile `cargo bench --bench v1_bench` reported matching prefix
+  scans at 472 block metadata probes for the same 152 data-block reads.
+- The `prefix scan table partitions matching` row improved from the `0.1`
+  baseline's 3551 us to 2959 us in this local run. `prefix scan` improved from
+  9571 us to 7455 us. `cold table read` improved from 183876 us to 165814 us,
+  though the new diagnostics suggest cold point reads are not filter-pruning
+  bound.
+
+### Interpretation
+
+- The first measured prefix-scan source cost was repeated block-state metadata
+  checks inside a loaded block, not data-block reads.
+- The kept fix reduces metadata rechecks without changing table format, MVCC,
+  recovery, public API shape, or filter semantics.
+- Matching prefix scans still touch 128 table candidates in this benchmark
+  shape. Future prefix work should measure whether table candidate selection or
+  batched prefix scans matter for application workloads.
+- Cold table reads now show one table probe, one block metadata probe, one
+  data-block read, and one cache miss per reopen/read, so the next cold-read
+  target is likely open/read I/O or cache warmup behavior.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q table --lib`
+- `cargo test -q --test async_api persistent_async_range_and_prefix_advance_flushed_tables`
+- `cargo test -q persistent_prefix_filter_keeps_range_tombstones_authoritative`
+- `cargo test -q --bench v1_bench`
+- `cargo bench --bench v1_bench`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test -q --all-targets --all-features`
+- `cargo fmt --check`
+- `git diff --check`
+- Forbidden-term scan over source, benches, docs, README, and touched `.phrase`
+  files found no matches.
+- Source-name scan over the performance design records found no source-system
+  or broad execution-model wording.
+
+### Remaining Blockers
+
+- The next implementation target is not yet chosen.
+
+### Recommended Next Action
+
+- Commit this phase and choose the next target from cold table read I/O/warmup
+  or batched point reads.
+
 ## 2026-06-02: Public Rustdoc Coverage Gate
 
 ### Observation

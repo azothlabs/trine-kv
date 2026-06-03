@@ -17,6 +17,19 @@
 4. 如果实现过程中问题类型变化，必须补读新的 skill，并更新 receipt。
 5. 没有 Rust Skill Receipt，不得修改 Rust 代码。
 
+## 验证输出节流
+
+为了避免测试和 check 输出消耗过多上下文，默认使用 quiet / 摘要式验证：
+
+- 通过类命令优先使用低噪声形式，例如 `cargo test -q`。
+- `cargo fmt --check`、`git diff --check` 只需要记录是否通过；失败时再展开相关片段。
+- 官方 sqllogictest targeted run 优先写 JSON report 文件；后续只读取
+  `passed` / `failed`、`by_error_kind` 和少量 `top_failure_shapes`。
+- 不把完整 `--nocapture` 输出纳入上下文，除非正在诊断失败根因。
+- 每个小任务只跑相关 parser / compatibility 单测和一个 targeted official
+  file；batch 收口时再跑一次本地 full gate。
+- 常规命令设置较小输出上限；只有失败分析或用户明确要求时才放大输出。
+
 ## Rust 文档注释质量门
 
 Rust 公共 API 文档不是“补几句注释”或“消除 `missing_docs` warning”。

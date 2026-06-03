@@ -225,7 +225,7 @@ pub struct FilterStats {
     pub block_prefix_false_positives: u64,
 }
 
-/// Point-read counters that describe how far reads travel through table metadata.
+/// Read-path counters that describe how far reads travel through table metadata.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReadPathStats {
     /// Table files considered by point reads.
@@ -238,6 +238,14 @@ pub struct ReadPathStats {
     pub point_data_block_reads: u64,
     /// Point reads skipped because filters ruled out a table or block.
     pub point_filter_misses: u64,
+    /// Table files considered by prefix scans.
+    pub prefix_table_probes: u64,
+    /// Data-block metadata entries considered by prefix scans.
+    pub prefix_block_metadata_probes: u64,
+    /// Data blocks read by prefix scans.
+    pub prefix_data_block_reads: u64,
+    /// Prefix scan work skipped because filters ruled out a table or block.
+    pub prefix_filter_misses: u64,
 }
 
 impl ReadPathStats {
@@ -257,6 +265,18 @@ impl ReadPathStats {
         self.point_filter_misses = self
             .point_filter_misses
             .saturating_add(other.point_filter_misses);
+        self.prefix_table_probes = self
+            .prefix_table_probes
+            .saturating_add(other.prefix_table_probes);
+        self.prefix_block_metadata_probes = self
+            .prefix_block_metadata_probes
+            .saturating_add(other.prefix_block_metadata_probes);
+        self.prefix_data_block_reads = self
+            .prefix_data_block_reads
+            .saturating_add(other.prefix_data_block_reads);
+        self.prefix_filter_misses = self
+            .prefix_filter_misses
+            .saturating_add(other.prefix_filter_misses);
     }
 }
 

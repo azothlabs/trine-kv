@@ -51,6 +51,7 @@ fn main() {
     results.push(bench_blob_level_merge());
     results.push(bench_block_cache_warm_read());
     results.push(bench_cold_table_read());
+    results.extend(bench_read_pruning_diagnostics());
     results.extend(bench_runtime_block_decode_reads());
     results.extend(bench_index_seek_policies());
     results.push(bench_long_shared_prefix_get());
@@ -77,6 +78,15 @@ struct BenchResult {
 }
 
 impl BenchResult {
+    const fn diagnostic(name: &'static str, value: u64) -> Self {
+        Self {
+            name,
+            iterations: 1,
+            elapsed: Duration::ZERO,
+            checksum: value,
+        }
+    }
+
     fn units_per_second(&self) -> u64 {
         let nanos = self.elapsed.as_nanos();
         if nanos == 0 {
@@ -603,6 +613,171 @@ fn bench_cold_table_read() -> BenchResult {
     })
 }
 
+fn bench_read_pruning_diagnostics() -> Vec<BenchResult> {
+    let mut results = Vec::new();
+    extend_cold_table_read_diagnostics(&mut results);
+    extend_prefix_partition_diagnostics(&mut results);
+    results
+}
+
+fn extend_cold_table_read_diagnostics(results: &mut Vec<BenchResult>) {
+    let dir = temp_dir("read-pruning-cold-read");
+    let options = benchmark_persistent_options(&dir);
+    {
+        let db = Db::open_sync(options.clone()).expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
+        for index in 0..ROWS {
+            bucket
+                .put_sync(key(index), value(index))
+                .expect("put succeeds");
+        }
+        db.flush_sync().expect("flush succeeds");
+    }
+
+    let mut table_probes = 0_u64;
+    let mut block_metadata_probes = 0_u64;
+    let mut data_block_reads = 0_u64;
+    let mut filter_misses = 0_u64;
+    let mut cache_misses = 0_u64;
+    for _ in 0..32 {
+        let db = Db::open_sync(options.clone()).expect("persistent db reopens");
+        let bucket = db.default_bucket_sync().expect("bucket reopens");
+        let value_len = bucket
+            .get_sync(&key(ROWS / 2))
+            .expect("get succeeds")
+            .map_or(0, |value| value.len());
+        assert!(value_len > 0, "cold-read diagnostic must read a value");
+        let stats = db.stats();
+        table_probes = table_probes.saturating_add(stats.read_path.point_table_probes);
+        block_metadata_probes =
+            block_metadata_probes.saturating_add(stats.read_path.point_block_metadata_probes);
+        data_block_reads = data_block_reads.saturating_add(stats.read_path.point_data_block_reads);
+        filter_misses = filter_misses.saturating_add(stats.read_path.point_filter_misses);
+        cache_misses = cache_misses.saturating_add(stats.block_cache_misses);
+    }
+    cleanup_dir(&dir);
+
+    results.push(BenchResult::diagnostic(
+        "read pruning cold point table probes",
+        table_probes,
+    ));
+    results.push(BenchResult::diagnostic(
+        "read pruning cold point block metadata probes",
+        block_metadata_probes,
+    ));
+    results.push(BenchResult::diagnostic(
+        "read pruning cold point data block reads",
+        data_block_reads,
+    ));
+    results.push(BenchResult::diagnostic(
+        "read pruning cold point filter skips",
+        filter_misses,
+    ));
+    results.push(BenchResult::diagnostic(
+        "read pruning cold point cache misses",
+        cache_misses,
+    ));
+}
+
+fn extend_prefix_partition_diagnostics(results: &mut Vec<BenchResult>) {
+    let dir = temp_dir("read-pruning-prefix");
+    let mut options = benchmark_persistent_options(&dir);
+    options.default_bucket_options = prefix_options(true);
+    let db = Db::open_sync(options).expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+    for index in 0..ROWS {
+        bucket
+            .put_sync(prefix_key(index), value(index))
+            .expect("put succeeds");
+    }
+    db.flush_sync().expect("flush succeeds");
+
+    let before = db.stats();
+    let matching_checksum = prefix_scan_checksum(&bucket, 128, false);
+    assert!(
+        matching_checksum > 0,
+        "matching prefix diagnostic must return rows"
+    );
+    let after_matching = db.stats();
+    push_prefix_diagnostics(
+        results,
+        "read pruning prefix matching",
+        &before,
+        &after_matching,
+    );
+
+    let nonmatching_checksum = prefix_scan_checksum(&bucket, 128, true);
+    assert_eq!(
+        nonmatching_checksum, 0,
+        "nonmatching prefix diagnostic must skip all rows"
+    );
+    let after_nonmatching = db.stats();
+    push_prefix_diagnostics(
+        results,
+        "read pruning prefix nonmatching",
+        &after_matching,
+        &after_nonmatching,
+    );
+    drop(db);
+    cleanup_dir(&dir);
+}
+
+fn push_prefix_diagnostics(
+    results: &mut Vec<BenchResult>,
+    name_prefix: &'static str,
+    before: &trine_kv::DbStats,
+    after: &trine_kv::DbStats,
+) {
+    results.push(BenchResult::diagnostic(
+        labelled(name_prefix, "table probes"),
+        after
+            .read_path
+            .prefix_table_probes
+            .saturating_sub(before.read_path.prefix_table_probes),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(name_prefix, "block metadata probes"),
+        after
+            .read_path
+            .prefix_block_metadata_probes
+            .saturating_sub(before.read_path.prefix_block_metadata_probes),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(name_prefix, "data block reads"),
+        after
+            .read_path
+            .prefix_data_block_reads
+            .saturating_sub(before.read_path.prefix_data_block_reads),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(name_prefix, "filter skips"),
+        after
+            .read_path
+            .prefix_filter_misses
+            .saturating_sub(before.read_path.prefix_filter_misses),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(name_prefix, "table filter misses"),
+        after
+            .filters
+            .table_prefix_misses
+            .saturating_sub(before.filters.table_prefix_misses),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(name_prefix, "block filter misses"),
+        after
+            .filters
+            .block_prefix_misses
+            .saturating_sub(before.filters.block_prefix_misses),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(name_prefix, "cache misses"),
+        after
+            .block_cache_misses
+            .saturating_sub(before.block_cache_misses),
+    ));
+}
+
 fn bench_runtime_block_decode_reads() -> Vec<BenchResult> {
     vec![
         bench_runtime_block_decode_read(
@@ -988,6 +1163,24 @@ fn range_scan_checksum(bucket: &trine_kv::Bucket, scans: usize) -> u64 {
             .expect("range succeeds");
         checksum += iter
             .map(|item| item.expect("range item").value.len() as u64)
+            .sum::<u64>();
+    }
+    checksum
+}
+
+fn prefix_scan_checksum(bucket: &trine_kv::Bucket, scans: usize, missing: bool) -> u64 {
+    let mut checksum = 0;
+    for tenant in 0..scans {
+        let prefix = if missing {
+            format!("missing:{tenant:02}:")
+        } else {
+            format!("tenant:{:02}:", tenant % 16)
+        };
+        let iter = bucket
+            .prefix_sync(prefix.as_bytes())
+            .expect("prefix succeeds");
+        checksum += iter
+            .map(|item| item.expect("prefix item").value.len() as u64)
             .sum::<u64>();
     }
     checksum

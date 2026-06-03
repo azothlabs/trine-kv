@@ -556,11 +556,15 @@ struct TableReadPathStats {
 #[derive(Debug, Default)]
 #[repr(align(64))]
 struct TableReadPathStatsShard {
-    table_probes: AtomicU64,
-    index_partition_probes: AtomicU64,
-    block_metadata_probes: AtomicU64,
-    data_block_reads: AtomicU64,
-    filter_misses: AtomicU64,
+    point_table_probes: AtomicU64,
+    point_index_partition_probes: AtomicU64,
+    point_block_metadata_probes: AtomicU64,
+    point_data_block_reads: AtomicU64,
+    point_filter_misses: AtomicU64,
+    prefix_table_probes: AtomicU64,
+    prefix_block_metadata_probes: AtomicU64,
+    prefix_data_block_reads: AtomicU64,
+    prefix_filter_misses: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -602,47 +606,87 @@ impl TableReadPathStats {
         for shard in self.shards.iter() {
             stats.point_table_probes = stats
                 .point_table_probes
-                .saturating_add(shard.table_probes.load(Ordering::Acquire));
+                .saturating_add(shard.point_table_probes.load(Ordering::Acquire));
             stats.point_index_partition_probes = stats
                 .point_index_partition_probes
-                .saturating_add(shard.index_partition_probes.load(Ordering::Acquire));
+                .saturating_add(shard.point_index_partition_probes.load(Ordering::Acquire));
             stats.point_block_metadata_probes = stats
                 .point_block_metadata_probes
-                .saturating_add(shard.block_metadata_probes.load(Ordering::Acquire));
+                .saturating_add(shard.point_block_metadata_probes.load(Ordering::Acquire));
             stats.point_data_block_reads = stats
                 .point_data_block_reads
-                .saturating_add(shard.data_block_reads.load(Ordering::Acquire));
+                .saturating_add(shard.point_data_block_reads.load(Ordering::Acquire));
             stats.point_filter_misses = stats
                 .point_filter_misses
-                .saturating_add(shard.filter_misses.load(Ordering::Acquire));
+                .saturating_add(shard.point_filter_misses.load(Ordering::Acquire));
+            stats.prefix_table_probes = stats
+                .prefix_table_probes
+                .saturating_add(shard.prefix_table_probes.load(Ordering::Acquire));
+            stats.prefix_block_metadata_probes = stats
+                .prefix_block_metadata_probes
+                .saturating_add(shard.prefix_block_metadata_probes.load(Ordering::Acquire));
+            stats.prefix_data_block_reads = stats
+                .prefix_data_block_reads
+                .saturating_add(shard.prefix_data_block_reads.load(Ordering::Acquire));
+            stats.prefix_filter_misses = stats
+                .prefix_filter_misses
+                .saturating_add(shard.prefix_filter_misses.load(Ordering::Acquire));
         }
         stats
     }
 
     fn record_point_table_probe(&self) {
-        self.shard().table_probes.fetch_add(1, Ordering::Relaxed);
+        self.shard()
+            .point_table_probes
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_point_index_partition_probe(&self) {
         self.shard()
-            .index_partition_probes
+            .point_index_partition_probes
             .fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_point_block_metadata_probe(&self) {
         self.shard()
-            .block_metadata_probes
+            .point_block_metadata_probes
             .fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_point_data_block_read(&self) {
         self.shard()
-            .data_block_reads
+            .point_data_block_reads
             .fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_point_filter_miss(&self) {
-        self.shard().filter_misses.fetch_add(1, Ordering::Relaxed);
+        self.shard()
+            .point_filter_misses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_prefix_table_probe(&self) {
+        self.shard()
+            .prefix_table_probes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_prefix_block_metadata_probe(&self) {
+        self.shard()
+            .prefix_block_metadata_probes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_prefix_data_block_read(&self) {
+        self.shard()
+            .prefix_data_block_reads
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_prefix_filter_miss(&self) {
+        self.shard()
+            .prefix_filter_misses
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn shard(&self) -> &TableReadPathStatsShard {
@@ -1071,6 +1115,14 @@ impl Table {
         self.read_path_stats.record_point_table_probe();
     }
 
+    pub(crate) fn record_prefix_table_probe(&self) {
+        self.read_path_stats.record_prefix_table_probe();
+    }
+
+    pub(crate) fn record_prefix_filter_miss(&self) {
+        self.read_path_stats.record_prefix_filter_miss();
+    }
+
     pub(crate) fn with_manifest_properties(mut self, manifest: &TableProperties) -> Result<Self> {
         // Table files keep their original creation level. A manifest entry owns
         // the live level after a direct table move, but every other property
@@ -1439,6 +1491,7 @@ impl Table {
         let mut records = Vec::new();
         let mut block_index = start;
         while block_index < self.data_block_count {
+            self.read_path_stats.record_prefix_block_metadata_probe();
             let decision = self.with_data_block_metadata(block_index, block_cache, |block| {
                 if !block.prefix_bounds_may_overlap(prefix) {
                     return Ok(PrefixBlockDecision::Done);
@@ -1446,6 +1499,9 @@ impl Table {
                 let (allowed, had_filter) =
                     self.block_prefix_filter_allows(block, prefix, extractor);
                 if !allowed {
+                    if had_filter {
+                        self.read_path_stats.record_prefix_filter_miss();
+                    }
                     return Ok(PrefixBlockDecision::Skip);
                 }
                 Ok(PrefixBlockDecision::Read { had_filter })
@@ -1457,6 +1513,7 @@ impl Table {
                 block_index += 1;
                 continue;
             };
+            self.read_path_stats.record_prefix_data_block_read();
             let block = self.load_data_block(block_index, block_cache)?;
             let block_records = data_block_point_records_with_prefix(&block, prefix, policy)?;
             if had_filter && block_records.is_empty() {
@@ -2267,15 +2324,17 @@ impl TablePointCursor {
             let Some(block_index) = self.block_index else {
                 return Ok(None);
             };
-            match self.forward_block_state(block_index)? {
-                CursorBlockState::Scan => {}
-                CursorBlockState::Skip => {
-                    self.move_to_next_block();
-                    continue;
-                }
-                CursorBlockState::Done => {
-                    self.exhausted = true;
-                    return Ok(None);
+            if !self.current_block_is(block_index) {
+                match self.forward_block_state(block_index)? {
+                    CursorBlockState::Scan => {}
+                    CursorBlockState::Skip => {
+                        self.move_to_next_block();
+                        continue;
+                    }
+                    CursorBlockState::Done => {
+                        self.exhausted = true;
+                        return Ok(None);
+                    }
                 }
             }
 
@@ -2309,15 +2368,17 @@ impl TablePointCursor {
             let Some(block_index) = self.block_index else {
                 return Ok(None);
             };
-            match self.forward_block_state_async(block_index).await? {
-                CursorBlockState::Scan => {}
-                CursorBlockState::Skip => {
-                    self.move_to_next_block();
-                    continue;
-                }
-                CursorBlockState::Done => {
-                    self.exhausted = true;
-                    return Ok(None);
+            if !self.current_block_is(block_index) {
+                match self.forward_block_state_async(block_index).await? {
+                    CursorBlockState::Scan => {}
+                    CursorBlockState::Skip => {
+                        self.move_to_next_block();
+                        continue;
+                    }
+                    CursorBlockState::Done => {
+                        self.exhausted = true;
+                        return Ok(None);
+                    }
                 }
             }
 
@@ -2353,15 +2414,17 @@ impl TablePointCursor {
             let Some(block_index) = self.block_index else {
                 return Ok(None);
             };
-            match self.reverse_block_state(block_index)? {
-                CursorBlockState::Scan => {}
-                CursorBlockState::Skip => {
-                    self.move_to_previous_block();
-                    continue;
-                }
-                CursorBlockState::Done => {
-                    self.exhausted = true;
-                    return Ok(None);
+            if !self.current_block_is(block_index) {
+                match self.reverse_block_state(block_index)? {
+                    CursorBlockState::Scan => {}
+                    CursorBlockState::Skip => {
+                        self.move_to_previous_block();
+                        continue;
+                    }
+                    CursorBlockState::Done => {
+                        self.exhausted = true;
+                        return Ok(None);
+                    }
                 }
             }
 
@@ -2396,15 +2459,17 @@ impl TablePointCursor {
             let Some(block_index) = self.block_index else {
                 return Ok(None);
             };
-            match self.reverse_block_state_async(block_index).await? {
-                CursorBlockState::Scan => {}
-                CursorBlockState::Skip => {
-                    self.move_to_previous_block();
-                    continue;
-                }
-                CursorBlockState::Done => {
-                    self.exhausted = true;
-                    return Ok(None);
+            if !self.current_block_is(block_index) {
+                match self.reverse_block_state_async(block_index).await? {
+                    CursorBlockState::Scan => {}
+                    CursorBlockState::Skip => {
+                        self.move_to_previous_block();
+                        continue;
+                    }
+                    CursorBlockState::Done => {
+                        self.exhausted = true;
+                        return Ok(None);
+                    }
                 }
             }
 
@@ -2437,6 +2502,11 @@ impl TablePointCursor {
     }
 
     fn forward_block_state(&self, block_index: usize) -> Result<CursorBlockState> {
+        if self.selector.prefix().is_some() {
+            self.table
+                .read_path_stats
+                .record_prefix_block_metadata_probe();
+        }
         self.table
             .with_data_block_metadata(
                 block_index,
@@ -2473,6 +2543,7 @@ impl TablePointCursor {
                             if allowed {
                                 Ok(CursorBlockState::Scan)
                             } else {
+                                self.table.read_path_stats.record_prefix_filter_miss();
                                 Ok(CursorBlockState::Skip)
                             }
                         }
@@ -2482,6 +2553,11 @@ impl TablePointCursor {
     }
 
     async fn forward_block_state_async(&self, block_index: usize) -> Result<CursorBlockState> {
+        if self.selector.prefix().is_some() {
+            self.table
+                .read_path_stats
+                .record_prefix_block_metadata_probe();
+        }
         self.table
             .with_data_block_metadata_async(block_index, self.block_cache.as_deref(), |block| {
                 match &self.selector {
@@ -2516,6 +2592,7 @@ impl TablePointCursor {
                             if allowed {
                                 Ok(CursorBlockState::Scan)
                             } else {
+                                self.table.read_path_stats.record_prefix_filter_miss();
                                 Ok(CursorBlockState::Skip)
                             }
                         }
@@ -2526,6 +2603,11 @@ impl TablePointCursor {
     }
 
     fn reverse_block_state(&self, block_index: usize) -> Result<CursorBlockState> {
+        if self.selector.prefix().is_some() {
+            self.table
+                .read_path_stats
+                .record_prefix_block_metadata_probe();
+        }
         self.table
             .with_data_block_metadata(
                 block_index,
@@ -2561,6 +2643,7 @@ impl TablePointCursor {
                             if allowed {
                                 Ok(CursorBlockState::Scan)
                             } else {
+                                self.table.read_path_stats.record_prefix_filter_miss();
                                 Ok(CursorBlockState::Skip)
                             }
                         }
@@ -2570,6 +2653,11 @@ impl TablePointCursor {
     }
 
     async fn reverse_block_state_async(&self, block_index: usize) -> Result<CursorBlockState> {
+        if self.selector.prefix().is_some() {
+            self.table
+                .read_path_stats
+                .record_prefix_block_metadata_probe();
+        }
         self.table
             .with_data_block_metadata_async(block_index, self.block_cache.as_deref(), |block| {
                 match &self.selector {
@@ -2603,6 +2691,7 @@ impl TablePointCursor {
                             if allowed {
                                 Ok(CursorBlockState::Scan)
                             } else {
+                                self.table.read_path_stats.record_prefix_filter_miss();
                                 Ok(CursorBlockState::Skip)
                             }
                         }
@@ -2634,18 +2723,20 @@ impl TablePointCursor {
     }
 
     fn ensure_current_block(&mut self, block_index: usize) -> Result<()> {
-        if self
-            .current_block
-            .as_ref()
-            .is_some_and(|(current_index, _)| *current_index == block_index)
-        {
+        if self.current_block_is(block_index) {
             return Ok(());
         }
 
+        if self.selector.prefix().is_some() {
+            self.table.read_path_stats.record_prefix_data_block_read();
+        }
         let block = self
             .table
             .load_data_block(block_index, self.block_cache.as_deref())?;
         if let ScanSelector::Prefix(prefix) = &self.selector {
+            self.table
+                .read_path_stats
+                .record_prefix_block_metadata_probe();
             if self.table.with_data_block_metadata(
                 block_index,
                 self.block_cache.as_deref(),
@@ -2670,19 +2761,21 @@ impl TablePointCursor {
     }
 
     async fn ensure_current_block_async(&mut self, block_index: usize) -> Result<()> {
-        if self
-            .current_block
-            .as_ref()
-            .is_some_and(|(current_index, _)| *current_index == block_index)
-        {
+        if self.current_block_is(block_index) {
             return Ok(());
         }
 
+        if self.selector.prefix().is_some() {
+            self.table.read_path_stats.record_prefix_data_block_read();
+        }
         let block = self
             .table
             .load_data_block_async(block_index, self.block_cache.as_deref())
             .await?;
         if let ScanSelector::Prefix(prefix) = &self.selector {
+            self.table
+                .read_path_stats
+                .record_prefix_block_metadata_probe();
             if self
                 .table
                 .with_data_block_metadata_async(
@@ -2724,6 +2817,12 @@ impl TablePointCursor {
             .current_block
             .as_ref()
             .map_or(0, |(_, block)| block.record_count()))
+    }
+
+    fn current_block_is(&self, block_index: usize) -> bool {
+        self.current_block
+            .as_ref()
+            .is_some_and(|(current_index, _)| *current_index == block_index)
     }
 
     fn current_block_record(
