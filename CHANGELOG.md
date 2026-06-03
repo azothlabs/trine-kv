@@ -2,6 +2,41 @@
 
 All public crate releases use Semantic Versioning.
 
+## 0.2.0 - 2026-06-03
+
+Compatible API and performance release for the pre-`1.0` crate line.
+
+### Added
+
+- Added batched point-read APIs for default buckets, named buckets, and
+  bucket readers:
+  - `Db::get_many` and `Db::get_many_sync`;
+  - `Bucket::get_many` and `Bucket::get_many_sync`;
+  - `BucketReader::get_many`, `BucketReader::get_many_sync`,
+    `BucketReader::get_many_owned`, and `BucketReader::get_many_owned_sync`.
+
+### Improved
+
+- Improved internal `get_many` point-read batching by deduplicating batch keys,
+  preserving duplicate output positions, grouping table lookups, and sharing
+  same-block persistent reads.
+- Reduced repeated block metadata checks during prefix scans that continue
+  within an already-loaded table block.
+- Reduced cold table open positioned reads by decoding small table metadata from
+  one temporary table-file buffer while keeping data-block reads lazy.
+- Reused one native directory listing during cold reopen recovery checks and
+  WAL discovery.
+- Reduced clean read-only reopen work by skipping WAL shard content reads when
+  every discovered shard is empty, while preserving WAL replay for non-empty
+  shards.
+- Reused native directory listing metadata across sync and async open paths for
+  temporary-file checks, recovery checks, WAL discovery, and clean-WAL proof.
+
+### Documentation
+
+- Added benchmark notes for read-only cold-open breakdown and batched point
+  reads.
+
 ## 0.1.1 - 2026-06-02
 
 Patch release metadata correction after the initial `0.1.0` publish.

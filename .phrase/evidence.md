@@ -10021,6 +10021,54 @@ Record only evidence that can change planning or durable decisions.
 - Commit async-native clean-WAL parity. Do not start another cold-read phase
   without a fresh measured hotspot.
 
+## 2026-06-03: 0.2.0 Release Prep
+
+### Observation
+
+- Commits after `v0.1.1` include compatible performance work and the public
+  batched point-read API addition from `e423bc6 Add batched point reads`.
+- The release target was corrected from `0.1.2` to `0.2.0` because
+  `docs/release.md` says compatible public API additions use a minor release.
+- `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, and `docs/release.md` now agree
+  on `0.2.0`.
+- `CHANGELOG.md` records the new `get_many` APIs, prefix-scan metadata
+  reduction, cold table open read reduction, cold reopen directory-list reuse,
+  clean-WAL read-only open, and async-native parity.
+
+### Interpretation
+
+- `0.2.0` is the correct SemVer-formatted pre-`1.0` release for the current
+  change set.
+- No storage-format or recovery-contract version bump is required for this
+  release prep.
+
+### Verification
+
+- `cargo check -q`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`, output
+  redirected to `/tmp/trine-clippy-release-0.2.0.txt`
+- `cargo test -q --all-targets --all-features`, output redirected to
+  `/tmp/trine-test-release-0.2.0.txt`
+- `cargo package --list --allow-dirty --locked --offline`, output redirected to
+  `/tmp/trine-package-list-0.2.0.txt`
+- `cargo package --allow-dirty --locked --offline`, output redirected to
+  `/tmp/trine-package-0.2.0.txt`
+- `cargo publish --dry-run --locked --allow-dirty`, output redirected to
+  `/tmp/trine-publish-dry-run-0.2.0.txt`
+- `git diff --check`
+- Forbidden-term and source-name scans over release-prep files.
+- Package-list guard found no repository-only workflow directories.
+
+### Remaining Blockers
+
+- No current blocker for release prep.
+
+### Recommended Next Action
+
+- Commit the `0.2.0` release-prep changes, then run CI and the manual publish
+  workflow.
+
 ## 2026-06-03: Get-Many Internal Batching
 
 ### Observation

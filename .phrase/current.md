@@ -6,62 +6,58 @@ Complete
 
 ## Goal
 
-Implement true internal batching for `get_many` point reads.
+Prepare the compatible `0.2.0` minor release.
 
 ## Scope
 
-- Default-bucket and bucket-reader `get_many` sync/async internals.
-- Batch-local key deduplication with duplicate output scatter.
-- LSM table lookup grouping across the keys in one batch.
-- Persistent table point-read grouping by data block.
-- Focused regression coverage and benchmark evidence.
+- Version metadata for the crate package.
+- Changelog and release checklist target version.
+- Package lockfile consistency.
+- Local release-prep verification.
 
 ## Out Of Scope
 
-- Public API shape changes.
-- Storage format, manifest format, WAL format, MVCC visibility rules,
-  compaction policy, blob layout, or recovery contract changes.
-- Claiming random small-batch workloads as the target win when benchmark
-  evidence does not support that.
+- Public API, storage format, recovery contract, and runtime behavior changes.
+- Publishing to crates.io.
+- Creating or pushing a release tag.
 
 ## Acceptance Gate
 
-- `get_many` preserves input order, missing-key `None` behavior, duplicate keys,
-  tombstones, range tombstones, blob values, and snapshot visibility.
-- Persistent keys in the same data block share one data-block read in the batch
-  path.
-- Small batches with no duplicates can still use the existing single-key path
-  to avoid planning overhead.
-- Focused tests, formatting, clippy, full tests, bench smoke, release
-  benchmark, and diff checks pass.
+- `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, and `docs/release.md` agree on
+  `0.2.0`.
+- Release notes describe the compatible `get_many` API addition and performance
+  fixes without claiming storage-format changes.
+- Package verification passes locally, or any external-network blocker is
+  recorded.
+- Formatting, diff checks, and release-surface scans pass.
 
 ## Active Task Slice
 
 ```text
-task610 [x] goal:batch point reads internally | scope:src/bucket.rs src/db.rs src/lsm/read.rs src/lsm/version.rs src/table.rs | verify:cargo test -q get_many --lib
-task611 [x] goal:prove same-block persistent grouping | scope:src/db.rs | verify:get_many_sync_groups_persistent_keys_by_data_block
-task612 [x] goal:record benchmark evidence | scope:benches/v1_bench.rs docs/benchmarks README .phrase | verify:cargo bench --bench v1_bench
+task613 [x] goal:bump minor release metadata | scope:Cargo.toml Cargo.lock docs/release.md | verify:version scan
+task614 [x] goal:write 0.2.0 changelog | scope:CHANGELOG.md | verify:changelog scan
+task615 [x] goal:run local release-prep gate | scope:package/release surface | verify:cargo package --allow-dirty --locked --offline
 ```
 
 ## Evidence
 
-- The batch path deduplicates input keys, keeps duplicate positions, and scatters
-  resolved values back to input order.
-- The version reader groups batch keys by table while preserving LSM table read
-  order.
-- Table point reads group keys by data block so one metadata/data-block pass can
-  serve multiple requested keys in the same block.
-- Release-profile benchmark evidence shows the locality-focused persistent
-  batch row improved, while the old random four-key persistent row remains mixed.
+- Recent compatible performance commits:
+  - `db8e116 Reduce prefix scan metadata rechecks`
+  - `b2ca66e Reduce cold table open reads`
+  - `b8f0b3f Reuse cold reopen directory listing`
+  - `e423bc6 Add batched point reads`
+  - `a66cc75 Optimize get_many internal batching`
+  - `4a1db01 Reuse clean WAL proof in async native open`
+  - `3219a11 Skip clean WAL reads on read-only open`
+- `get_many` is a compatible public API addition, so the correct release target
+  is `0.2.0` rather than `0.1.2`.
 
 ## Known Residuals
 
-- Random small batches are still not the strong workload for this optimization.
-- Further point-read work should use a measured locality, cache, or table-open
-  hotspot before adding complexity.
+- Publish workflow still needs CI, a release-prep commit, and the final manual
+  crates.io publish action.
 
 ## Next Recommendation
 
-- Commit the internal batching change with its benchmark record.
-- If point-read speed remains the next target, measure cache-warm locality and
-  cross-table locality before changing the table path again.
+- Commit the `0.2.0` release-prep changes, then run CI and the manual publish
+  workflow for `0.2.0`.
