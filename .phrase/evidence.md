@@ -9972,3 +9972,51 @@ Record only evidence that can change planning or durable decisions.
 
 - Commit the clean-WAL change and choose the next target from manifest/table
   open metadata or first-read table data-block work.
+
+## 2026-06-03: Async Native Clean-WAL Open Parity
+
+### Observation
+
+- Async native persistent open previously repaired safe temporary files, ran
+  unreferenced-file checks, and discovered WAL paths through separate directory
+  or object-list work.
+- Async native open now lists directory files once after the writer lease step
+  and reuses that list for safe temporary-file repair, unreferenced-file
+  checks, WAL path discovery, and clean-WAL length proof.
+- The async WAL recovery helper can now read recovery streams from already
+  discovered paths.
+- Focused async tests show read-only open after a clean flush performs zero
+  whole-object reads, while read-only open with non-empty WAL still replays the
+  committed value.
+
+### Interpretation
+
+- Async native read-only open now has the same clean-WAL safety boundary as the
+  sync native path: skip WAL content reads only when every discovered shard has
+  zero bytes.
+- Writable async open still opens WAL shards and preserves writer-lease
+  behavior.
+- The older generic async WAL discovery helper remains useful for backends that
+  do not already have directory files in hand.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q persistent_read_only_open_async --test async_api`
+- `cargo clippy --all-targets --all-features -- -D warnings`, output
+  redirected to `/tmp/trine-clippy-async-clean-wal.txt`
+- `cargo test -q read_only --lib`
+- `cargo test -q --all-targets --all-features`, output redirected to
+  `/tmp/trine-test-async-clean-wal.txt`
+- `git diff --check`
+- Forbidden-term and source-name scans over touched source, tests, benchmark
+  docs, and phase files.
+
+### Remaining Blockers
+
+- No current blocker for this phase.
+
+### Recommended Next Action
+
+- Commit async-native clean-WAL parity. Do not start another cold-read phase
+  without a fresh measured hotspot.

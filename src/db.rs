@@ -1359,7 +1359,14 @@ impl Db {
 
         let process_lock =
             acquire_persistent_process_lock_async(&native_storage, path, &options).await?;
-        repair_safe_temporary_files_for_open_async(&native_storage, path, &options).await?;
+        let directory_files = list_persistent_directory_files_async(&native_storage, path).await?;
+        repair_safe_temporary_files_for_open_from_directory_files_async(
+            &native_storage,
+            path,
+            &options,
+            &directory_files,
+        )
+        .await?;
 
         let manifest_path = manifest::manifest_path(path);
         let mut manifest = ManifestStore::open_or_create_with_backend_async(
@@ -1373,22 +1380,43 @@ impl Db {
         let mut buckets =
             buckets_from_manifest_async(&native_storage, path, manifest.state(), false).await?;
         ensure_default_bucket_loaded(&mut buckets, &options)?;
-        run_persistent_recovery_checks_async(&native_storage, path, manifest.state()).await?;
-
-        let wal_streams = wal::read_recovery_streams_after_with_backend_async(
+        run_persistent_recovery_checks_from_directory_files_async(
             &native_storage,
             path,
-            replay_floor,
+            manifest.state(),
+            &directory_files,
         )
         .await?;
+
+        let wal_paths = wal::discover_wal_paths_from_directory_entries(
+            directory_files.iter().map(|file| file.path().to_path_buf()),
+        )?;
+        let wal_streams = if options.read_only
+            && wal::discovered_wal_paths_are_empty_with_backend_async(
+                &native_storage,
+                &wal_paths,
+                &directory_files,
+            )
+            .await?
+        {
+            Vec::new()
+        } else {
+            wal::read_recovery_streams_after_paths_with_backend_async(
+                &native_storage,
+                &wal_paths,
+                replay_floor,
+            )
+            .await?
+        };
         let batches = wal::merge_batch_streams_by_sequence(wal_streams)?;
         let wal = if options.read_only {
             None
         } else {
-            Some(WalFrontDoor::open_sharded_with_backend(
+            Some(WalFrontDoor::open_sharded_with_discovered_paths(
                 &native_storage,
                 path,
                 wal::DEFAULT_WAL_SHARD_COUNT,
+                wal_paths,
             )?)
         };
 
@@ -6162,6 +6190,18 @@ fn list_persistent_directory_files(
     backend.list_directory_files_blocking(StorageDirectoryId::native_file(db_path))
 }
 
+async fn list_persistent_directory_files_async(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+) -> Result<Vec<StorageDirectoryFile>> {
+    backend
+        .capabilities()
+        .require(StorageCapability::DirectoryListing)?;
+    backend
+        .list_directory_files(StorageDirectoryId::native_file(db_path))
+        .await
+}
+
 fn repair_safe_temporary_files_for_open(
     backend: &NativeFileBackend,
     db_path: &Path,
@@ -6182,17 +6222,24 @@ fn repair_safe_temporary_files_for_open(
     Ok(())
 }
 
-async fn repair_safe_temporary_files_for_open_async(
+async fn repair_safe_temporary_files_for_open_from_directory_files_async(
     backend: &NativeFileBackend,
     db_path: &Path,
     options: &DbOptions,
+    directory_files: &[StorageDirectoryFile],
 ) -> Result<()> {
     let policy = if options.read_only {
         FailOnCorruptionPolicy::FailClosed
     } else {
         options.fail_on_corruption
     };
-    recovery::repair_safe_temporary_files_with_backend_async(backend, db_path, policy).await?;
+    recovery::repair_safe_temporary_files_from_directory_files_with_backend_async(
+        backend,
+        db_path,
+        policy,
+        directory_files,
+    )
+    .await?;
     Ok(())
 }
 
@@ -6210,6 +6257,33 @@ fn run_persistent_recovery_checks(
         &referenced_blob_ids,
     )?;
     recovery::fail_on_invalid_referenced_blob_files_with_backend(backend, db_path, manifest)?;
+    recovery::fail_on_unreferenced_storage_files_from_directory_files(
+        db_path,
+        directory_files,
+        &referenced_table_file_ids(manifest),
+        &allowed_blob_ids,
+    )
+}
+
+async fn run_persistent_recovery_checks_from_directory_files_async<B>(
+    backend: &B,
+    db_path: &Path,
+    manifest: &ManifestState,
+    directory_files: &[StorageDirectoryFile],
+) -> Result<()>
+where
+    B: StorageReadBackend + StorageObjectReadBackend,
+{
+    let referenced_blob_ids = referenced_blob_file_ids_from_manifest(manifest);
+    let allowed_blob_ids = allowed_blob_file_ids_from_manifest(manifest);
+    recovery::fail_on_missing_referenced_blob_files_with_backend_async(
+        backend,
+        db_path,
+        &referenced_blob_ids,
+    )
+    .await?;
+    recovery::fail_on_invalid_referenced_blob_files_with_backend_async(backend, db_path, manifest)
+        .await?;
     recovery::fail_on_unreferenced_storage_files_from_directory_files(
         db_path,
         directory_files,

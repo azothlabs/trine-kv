@@ -270,6 +270,59 @@ fn persistent_open_replays_wal() {
 }
 
 #[test]
+fn persistent_read_only_open_async_skips_clean_wal_reads() {
+    let path = temp_db_path("persistent-read-only-async-clean-wal");
+    let mut options = DbOptions::persistent(&path);
+    options.background_worker_count = 0;
+    {
+        let db = block_on(Db::open(options.clone())).expect("persistent async open");
+        block_on(db.put(b"key".to_vec(), b"value".to_vec())).expect("async put succeeds");
+        block_on(db.flush()).expect("async flush succeeds");
+    }
+
+    let db = block_on(Db::open(options.read_only())).expect("read-only async open");
+
+    assert_eq!(
+        block_on(db.get(b"key")).expect("read-only async read succeeds"),
+        Some(b"value".to_vec())
+    );
+    assert_eq!(db.stats().storage_operations.read_object_bytes.requests, 0);
+    assert_eq!(
+        db.stats().storage_operations.acquire_writer_lease.requests,
+        0
+    );
+    cleanup_dir(&path);
+}
+
+#[test]
+fn persistent_read_only_open_async_replays_non_empty_wal() {
+    let path = temp_db_path("persistent-read-only-async-wal-replay");
+    let mut options = DbOptions::persistent(&path).with_durability(DurabilityMode::Flush);
+    options.background_worker_count = 0;
+    {
+        let db = block_on(Db::open(options.clone())).expect("persistent async open");
+        block_on(db.put_with_options(
+            b"wal-key".to_vec(),
+            b"wal-value".to_vec(),
+            WriteOptions::flush(),
+        ))
+        .expect("async write appends WAL");
+    }
+
+    let db = block_on(Db::open(options.read_only())).expect("read-only async open");
+
+    assert_eq!(
+        block_on(db.get(b"wal-key")).expect("read-only async WAL read succeeds"),
+        Some(b"wal-value".to_vec())
+    );
+    assert!(
+        db.stats().storage_operations.read_object_bytes.requests > 0,
+        "read-only async open must read non-empty WAL shards"
+    );
+    cleanup_dir(&path);
+}
+
+#[test]
 fn persistent_open_rejects_inline_runtime() {
     let path = temp_db_path("persistent-open-inline-runtime");
     let mut options = DbOptions::persistent(&path);

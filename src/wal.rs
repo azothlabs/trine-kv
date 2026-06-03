@@ -20,7 +20,7 @@ use crate::{
         NativeFileAppendObject, NativeFileBackend, StorageAppendBackend, StorageAppendObject,
         StorageCapability, StorageDirectoryFile, StorageDirectoryId, StorageDirectoryListBackend,
         StorageObjectId, StorageObjectKind, StorageObjectReadBackend, StorageReadBackend,
-        StorageWalRewriteBackend,
+        StorageReadObject, StorageWalRewriteBackend,
     },
     types::{KeyRange, Sequence},
     write_batch::BatchOperation,
@@ -175,6 +175,7 @@ impl WalFrontDoor {
         Self::from_shard_paths(backend, 1, [(0_usize, path.to_path_buf())])
     }
 
+    #[allow(dead_code)]
     pub(crate) fn open_sharded_with_backend(
         backend: &NativeFileBackend,
         db_path: &Path,
@@ -539,6 +540,21 @@ pub(crate) fn read_recovery_streams_after_paths_with_backend(
     Ok(streams)
 }
 
+pub(crate) async fn read_recovery_streams_after_paths_with_backend_async<B>(
+    backend: &B,
+    paths: &[PathBuf],
+    replay_floor: Sequence,
+) -> Result<Vec<Vec<WalBatch>>>
+where
+    B: StorageObjectReadBackend,
+{
+    let mut streams = Vec::new();
+    for path in paths {
+        streams.push(read_batches_after_with_backend_async(backend, path, replay_floor).await?);
+    }
+    Ok(streams)
+}
+
 pub(crate) fn discovered_wal_paths_are_empty_with_backend(
     backend: &NativeFileBackend,
     paths: &[PathBuf],
@@ -565,6 +581,35 @@ pub(crate) fn discovered_wal_paths_are_empty_with_backend(
     Ok(true)
 }
 
+pub(crate) async fn discovered_wal_paths_are_empty_with_backend_async<B>(
+    backend: &B,
+    paths: &[PathBuf],
+    directory_files: &[StorageDirectoryFile],
+) -> Result<bool>
+where
+    B: StorageReadBackend,
+{
+    for path in paths {
+        let byte_len = if let Some(byte_len) = directory_files
+            .iter()
+            .find(|file| file.path() == path)
+            .and_then(StorageDirectoryFile::byte_len)
+        {
+            byte_len
+        } else {
+            backend
+                .capabilities()
+                .require(StorageCapability::RandomRead)?;
+            let object = backend.open_read(wal_storage_object(path)).await?;
+            object.len().await?
+        };
+        if byte_len != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 #[allow(dead_code)]
 pub(crate) async fn read_recovery_streams_after_with_backend_async<B>(
     backend: &B,
@@ -574,13 +619,11 @@ pub(crate) async fn read_recovery_streams_after_with_backend_async<B>(
 where
     B: StorageDirectoryListBackend + StorageObjectReadBackend,
 {
-    let mut streams = Vec::new();
-    for path in discover_wal_paths_with_backend_async(backend, db_path).await? {
-        streams.push(read_batches_after_with_backend_async(backend, &path, replay_floor).await?);
-    }
-    Ok(streams)
+    let paths = discover_wal_paths_with_backend_async(backend, db_path).await?;
+    read_recovery_streams_after_paths_with_backend_async(backend, &paths, replay_floor).await
 }
 
+#[allow(dead_code)]
 pub(crate) fn discover_wal_paths_with_backend(
     backend: &NativeFileBackend,
     db_path: &Path,

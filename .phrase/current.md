@@ -6,16 +6,17 @@ Complete
 
 ## Goal
 
-Reduce read-only cold open work when WAL shards are provably empty after a clean
-flush.
+Extend clean-WAL read-only open reuse to the async native open path.
 
 ## Scope
 
-- Native persistent read-only open.
+- Async native persistent read-only open.
 - WAL replay discovery after manifest load.
 - Skip WAL content reads only when every discovered WAL shard object has length
   zero.
-- Focused tests and benchmark evidence for the clean-WAL path.
+- Reuse one directory listing for async native temporary-file repair, recovery
+  checks, WAL discovery, and WAL shard length proof.
+- Focused tests and benchmark evidence for the async clean-WAL path.
 
 ## Out Of Scope
 
@@ -26,48 +27,49 @@ flush.
 - Changing read-only public API semantics.
 - Batched point-read internals or table read-path changes.
 - Skipping WAL checks when any WAL shard has bytes.
+- Browser and WASI persistence behavior.
 
 ## Backend Boundary Receipt
 
-- Trine operation names: read-only persistent open, manifest load, WAL shard
-  discovery, WAL shard length proof, WAL replay, table open.
+- Trine operation names: async read-only persistent open, manifest load, WAL
+  shard discovery, WAL shard length proof, WAL replay, table open, recovery
+  checks.
 - Owned interface: existing `DbOptions::read_only` and `Db::open(_sync)` paths;
   no new public API.
 - Chosen backend: existing native filesystem storage backend.
-- Known backend limits: directory listing returns paths, not sizes, so the proof
-  uses existing read-object length calls.
+- Known backend limits: native directory listing now returns file lengths; other
+  async storage backends may still return path-only entries.
 - Leak-check scope: documentation and benchmark labels use Trine operation
   names only.
-- Verification gate: focused read-only/WAL recovery tests, benchmark smoke,
-  full local quiet gate, diff checks, forbidden-term/source-name scans.
+- Verification gate: focused async read-only/WAL recovery tests, benchmark
+  smoke, full local quiet gate, diff checks, forbidden-term/source-name scans.
 
 ## Acceptance Gate
 
-- Read-only persistent open skips WAL content reads only when all discovered WAL
-  shard files are empty.
-- Read-only open still replays non-empty WAL shards and preserves committed
-  records.
+- Async read-only persistent open skips WAL content reads only when all
+  discovered WAL shard files are empty.
+- Async read-only open still replays non-empty WAL shards and preserves
+  committed records.
 - Writable open behavior is unchanged.
-- Release benchmark evidence records whether the optimization lowers read-only
-  cold open whole-object reads or latency.
+- Sync read-only open behavior remains unchanged from the previous phase.
 - Focused checks, formatting, clippy, full tests, diff checks, and scans pass.
 
 ## Active Task Slice
 
 ```text
-task603 [x] goal:add empty-WAL proof helper | scope:src/wal.rs | verify:cargo test -q read_only --lib
-task604 [x] goal:use helper in read-only persistent open | scope:src/db.rs | verify:cargo test -q read_only --lib
-task605 [x] goal:measure clean-WAL read-only cold open | scope:benches/v1_bench.rs docs/benchmarks | verify:cargo bench --bench v1_bench
-task606 [x] goal:record evidence and finish gate | scope:.phrase docs full workspace | verify:quiet full gate
+task607 [x] goal:reuse directory files in async native open | scope:src/db.rs | verify:cargo test -q persistent_read_only_open_async --test async_api
+task608 [x] goal:add async empty-WAL recovery coverage | scope:tests/async_api.rs src/wal.rs | verify:cargo test -q persistent_read_only_open_async --test async_api
+task609 [x] goal:record evidence and finish gate | scope:.phrase docs full workspace | verify:quiet full gate
 ```
 
 ## Known Residuals
 
-- Directory entries now carry file length for the native filesystem path, so
-  clean-WAL read-only open avoids WAL content reads without extra open/len
-  requests in the measured sync native path.
-- Async native open still discovers WAL paths through its separate async
-  directory-list path and can reuse this strategy in a later slice.
+- The previous phase proved the sync native path can avoid clean-WAL content
+  reads without extra open/len requests by reusing directory entry lengths.
+- Async native open now reuses one directory file list for repair, unreferenced
+  file checks, WAL path discovery, and clean-WAL length proof.
+- The older generic async WAL discovery helper remains available for other
+  backends and tests.
 
 ## Evidence
 
@@ -85,8 +87,10 @@ task606 [x] goal:record evidence and finish gate | scope:.phrase docs full works
 - Phase 144 committed the open-vs-first-read diagnostic split as `79079a9`.
 - Phase 145 release-profile benchmark recorded `cold table read-only` at 91081
   us and read-only open phase whole-object reads at zero.
+- Async native read-only focused tests now cover both clean-WAL skip and
+  non-empty WAL replay.
 
 ## Next Recommendation
 
-- Commit the clean-WAL read-only open change. If cold-read work continues, move
-  next to manifest/table open metadata or first-read table data-block work.
+- Commit async-native parity for clean-WAL read-only open. Further cold-read
+  work should wait for a new measured hotspot.

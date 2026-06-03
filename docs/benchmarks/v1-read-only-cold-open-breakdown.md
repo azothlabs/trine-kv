@@ -76,6 +76,10 @@ After the clean-WAL read-only open change:
   diagnostic run to 91081 us after clean-WAL read-only open. Local cold-read
   elapsed time remains noisy, so the request-count reduction is the stronger
   evidence.
+- The async native open path now reuses the same directory file list for safe
+  temporary-file repair, unreferenced-file checks, WAL shard discovery, and
+  clean-WAL length proof. Focused async tests cover both zero whole-object
+  reads after a clean flush and normal replay when WAL shards are non-empty.
 - Table data-block work is still visible, but it belongs to first point read
   rather than open-time fixed cost.
 

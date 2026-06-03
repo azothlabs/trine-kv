@@ -209,6 +209,44 @@ where
 }
 
 #[allow(dead_code)]
+pub(crate) async fn repair_safe_temporary_files_from_directory_files_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+    policy: FailOnCorruptionPolicy,
+    directory_files: &[StorageDirectoryFile],
+) -> Result<Option<RecoveryReport>>
+where
+    B: StorageObjectDeleteBackend + StorageObjectWriteBackend,
+{
+    let temporary_files = safe_temporary_files_from_directory_files(directory_files)?;
+    if temporary_files.is_empty() {
+        return Ok(None);
+    }
+
+    if matches!(policy, FailOnCorruptionPolicy::FailClosed) {
+        let names = temporary_files
+            .iter()
+            .map(|file| file.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(Error::Corruption {
+            message: format!("safe temporary files require explicit repair: {names}"),
+        });
+    }
+
+    for temporary_file in &temporary_files {
+        delete_safe_temporary_file_with_backend_async(backend, &temporary_file.path).await?;
+    }
+
+    let report = RecoveryReport {
+        repaired_temporary_files: temporary_files.into_iter().map(|file| file.name).collect(),
+    };
+    write_recovery_report_with_backend_async(backend, db_path, &report).await?;
+
+    Ok(Some(report))
+}
+
+#[allow(dead_code)]
 pub(crate) fn fail_on_unreferenced_storage_files(
     db_path: &Path,
     referenced_table_ids: &BTreeSet<TableId>,
