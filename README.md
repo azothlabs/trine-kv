@@ -176,6 +176,7 @@ cargo bench --bench v1_bench
 - [Large-value direct read tuning](docs/benchmarks/v1-large-value-direct-read.md)
 - [Blob maintenance and lazy value benchmark](docs/benchmarks/v1-blob-level-merge-lazy-gc.md)
 - [Read-pruning measurement](docs/benchmarks/v1-read-pruning-measurement.md)
+- [Cold table open read](docs/benchmarks/v1-cold-table-open-read.md)
 
 ## Current Boundaries
 

@@ -133,6 +133,62 @@ Record only evidence that can change planning or durable decisions.
 - Commit this phase and choose the next target from cold table read I/O/warmup
   or batched point reads.
 
+## 2026-06-03: Phase 139 Cold Table Open Read
+
+### Observation
+
+- Phase 138 cold-read diagnostics showed one table probe, one block metadata
+  probe, one data-block read, and one cache miss per reopen/get, so the next
+  target was open/read I/O rather than filter pruning.
+- Added cold-read storage diagnostic rows for operation request counts and
+  selected latency totals.
+- Before the table-open change, 32 reopen/get operations performed 288
+  positioned owned reads.
+- Sync table open now reads table files at or below 256 KiB into a temporary
+  buffer and decodes metadata, filters, and index metadata from that buffer.
+- The table handle still keeps the native file handle and leaves data blocks
+  lazy, preserving persistent table read shape for point/range reads.
+- After the table-open change, 32 reopen/get operations performed 96 positioned
+  owned reads.
+- Release-profile `cold table read` was 174933 us in the first after-change run
+  and 167430 us in the second after-change run. The `0.1` baseline was 183876
+  us.
+
+### Interpretation
+
+- The strongest evidence is the request-count reduction: positioned owned reads
+  dropped from 9 to 3 per reopen/get.
+- Local cold-read elapsed time is noisy, but both after-change release runs
+  stayed below the `0.1` baseline.
+- Remaining cold-read cost includes current-manifest reads, table open, and one
+  lazy data-block read per reopened database.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q table --lib`
+- `cargo test -q --bench v1_bench`
+- `cargo bench --bench v1_bench` twice, with output redirected and only key
+  rows inspected.
+- `cargo clippy --all-targets --all-features -- -D warnings`, output
+  redirected to `/tmp/trine-clippy-phase139.txt`
+- `cargo test -q --all-targets --all-features`, output redirected to
+  `/tmp/trine-test-phase139.txt`
+- `git diff --check`
+- Forbidden-term scan over source, benches, docs, README, and touched `.phrase`
+  files found no matches.
+- Source-name scan over performance design and benchmark records found no
+  source-system or broad execution-model wording.
+
+### Remaining Blockers
+
+- The next implementation target is not yet chosen.
+
+### Recommended Next Action
+
+- Commit this phase and choose the next target from current-manifest/open
+  overhead or batched point reads.
+
 ## 2026-06-02: Public Rustdoc Coverage Gate
 
 ### Observation

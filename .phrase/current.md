@@ -6,16 +6,15 @@ Complete
 
 ## Goal
 
-Add read-pruning measurement for point and prefix workloads, then keep the
-first measured prefix-scan metadata reduction.
+Reduce cold point-read table-open I/O for small persistent tables without
+changing lazy data-block read behavior.
 
 ## Scope
 
-- `DbStats::read_path` counters for prefix-scan table probes, block metadata
-  probes, data-block reads, and filter skips.
-- Benchmark diagnostic rows for cold point reads and persistent prefix scans.
-- Cursor behavior inside already-loaded table data blocks.
-- Benchmark evidence in `docs/benchmarks/v1-read-pruning-measurement.md`.
+- Cold-read diagnostic rows for storage operation request counts and latency
+  totals.
+- Sync table-open behavior for small table files.
+- Benchmark evidence in `docs/benchmarks/v1-cold-table-open-read.md`.
 
 ## Out Of Scope
 
@@ -23,51 +22,50 @@ first measured prefix-scan metadata reduction.
 - Public API behavior changes.
 - Storage format, MVCC, WAL, manifest, SSTable, blob, compaction, transaction,
   recovery, or browser persistence behavior changes.
-- Storage format changes.
-- Compaction, blob, WAL, manifest, transaction, recovery, browser persistence,
-  or release metadata changes.
+- Data-block eager loading for large table files.
 - Publishing, tagging, pushing, or release metadata changes.
 
 ## Acceptance Gate
 
-- Benchmark diagnostics expose table probes, block metadata probes, data-block
-  reads, filter skips, and cache misses for cold point and prefix workloads.
-- Prefix scan cursor advancement no longer rechecks block-state metadata while
-  returning records from the current loaded block.
-- Focused range/prefix/table tests pass.
-- `cargo bench --bench v1_bench` records the measurement rows.
+- Cold-read diagnostics expose storage operation request counts.
+- Small sync table open reduces positioned owned read requests for the measured
+  cold point-read workload.
+- Persistent tables still keep data blocks lazy after sync open.
+- Focused table and benchmark checks pass.
 - Formatting, clippy, full tests, and diff checks pass.
 
 ## Active Task Slice
 
 ```text
-task575 [x] goal:add prefix read-pruning counters | scope:src/stats.rs src/table.rs src/lsm/scan.rs | verify:cargo test -q table --lib
-task576 [x] goal:add diagnostic benchmark rows | scope:benches/v1_bench.rs | verify:cargo test -q --bench v1_bench
-task577 [x] goal:keep first measured prefix cursor fix | scope:src/table.rs | verify:cargo bench --bench v1_bench
-task578 [x] goal:finish local verification | scope:full workspace | verify:cargo clippy/test/diff checks
+task579 [x] goal:add cold storage diagnostics | scope:benches/v1_bench.rs | verify:cargo test -q --bench v1_bench
+task580 [x] goal:buffer small table open metadata | scope:src/table.rs | verify:cargo test -q table --lib
+task581 [x] goal:record cold-read evidence | scope:docs/benchmarks/v1-cold-table-open-read.md .phrase | verify:cargo bench --bench v1_bench
+task582 [x] goal:finish local verification | scope:full workspace | verify:cargo clippy/test/diff checks
 ```
 
 ## Known Residuals
 
-- Nonmatching prefix diagnostics report zero table probes in the benchmark
-  shape because the query range is rejected before table bounds overlap.
-- Cold point diagnostics show one table probe, one block metadata probe, one
-  data-block read, and one cache miss per reopen/read; further cold-read work
-  should look at open/read I/O or warmup behavior.
+- Small sync table open now decodes metadata from a temporary whole-file buffer
+  only when the table file is at or below 256 KiB.
+- The opened table still keeps its native file handle and leaves data blocks
+  lazy, so large-table behavior and block-cache read behavior remain bounded.
 - Full clippy/test/diff verification passed after documentation was updated.
 
 ## Evidence
 
-- The first diagnostic run before the cursor fix showed matching prefix scans
-  at 8664 block metadata probes for 152 data-block reads.
-- After the cursor fix, `cargo bench --bench v1_bench` reported matching prefix
-  scans at 472 block metadata probes for the same 152 data-block reads.
-- The release-profile benchmark row for `prefix scan table partitions
-  matching` improved from the `0.1` baseline's 3551 us to 2959 us in this run.
+- Before the table-open change, 32 reopen/get operations performed 288
+  positioned owned reads.
+- After the table-open change, the same diagnostic workload performed 96
+  positioned owned reads.
+- Release-profile `cold table read` was 174933 us in the first after-change run
+  and 167430 us in the second after-change run. The `0.1` baseline was 183876
+  us.
+- `cargo test -q table --lib` and `cargo test -q --bench v1_bench` passed.
 - `cargo clippy --all-targets --all-features -- -D warnings` and
-  `cargo test -q --all-targets --all-features` passed.
+  `cargo test -q --all-targets --all-features` passed with output redirected
+  to temporary files.
 
 ## Next Recommendation
 
-- Commit the read-pruning measurement and prefix cursor fix, then choose
-  whether the next target is cold table read I/O/warmup or batched point reads.
+- Commit the cold table-open optimization, then choose whether the next target
+  is current-manifest/open overhead or batched point reads.

@@ -3348,4 +3348,38 @@ read-pruning measurement as the next lowest-risk phase.
 
 ### Recommended Next Action
 
+- Choose the next benchmark-backed target from current-manifest/open overhead
+  or batched point reads.
+
+### Phase 139: Cold Table Open Read
+
+**Status**: Complete
+
+**Goal**: Reduce cold point-read table-open I/O for small persistent tables
+without changing lazy data-block read behavior.
+
+**Entry Condition**: Phase 138 complete and cold point-read diagnostics show
+one table probe, one block metadata probe, one data-block read, and one cache
+miss per reopen/get.
+
+**Acceptance Gate**:
+
+- Cold-read diagnostics expose storage operation request counts.
+- Small sync table open reduces positioned owned read requests for the measured
+  cold point-read workload.
+- Persistent tables still keep data blocks lazy after sync open.
+- Storage format, public API behavior, MVCC, recovery, and block-cache read
+  semantics remain unchanged.
+- Focused table and benchmark checks, formatting, clippy, full tests, diff
+  checks, and forbidden-term scan pass.
+
+**Major Out Of Scope**:
+
+- Data-block eager loading for large table files.
+- Public API additions.
+- Storage format, compaction policy, blob maintenance policy, WAL, manifest,
+  transaction, recovery, browser persistence, or release metadata changes.
+
+### Recommended Next Action
+
 - Finish full local verification, then choose the next benchmark-backed target.

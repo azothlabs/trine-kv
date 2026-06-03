@@ -634,11 +634,7 @@ fn extend_cold_table_read_diagnostics(results: &mut Vec<BenchResult>) {
         db.flush_sync().expect("flush succeeds");
     }
 
-    let mut table_probes = 0_u64;
-    let mut block_metadata_probes = 0_u64;
-    let mut data_block_reads = 0_u64;
-    let mut filter_misses = 0_u64;
-    let mut cache_misses = 0_u64;
+    let mut diagnostics = ColdReadDiagnostics::default();
     for _ in 0..32 {
         let db = Db::open_sync(options.clone()).expect("persistent db reopens");
         let bucket = db.default_bucket_sync().expect("bucket reopens");
@@ -648,35 +644,123 @@ fn extend_cold_table_read_diagnostics(results: &mut Vec<BenchResult>) {
             .map_or(0, |value| value.len());
         assert!(value_len > 0, "cold-read diagnostic must read a value");
         let stats = db.stats();
-        table_probes = table_probes.saturating_add(stats.read_path.point_table_probes);
-        block_metadata_probes =
-            block_metadata_probes.saturating_add(stats.read_path.point_block_metadata_probes);
-        data_block_reads = data_block_reads.saturating_add(stats.read_path.point_data_block_reads);
-        filter_misses = filter_misses.saturating_add(stats.read_path.point_filter_misses);
-        cache_misses = cache_misses.saturating_add(stats.block_cache_misses);
+        diagnostics.record(&stats);
     }
     cleanup_dir(&dir);
 
-    results.push(BenchResult::diagnostic(
-        "read pruning cold point table probes",
-        table_probes,
-    ));
-    results.push(BenchResult::diagnostic(
-        "read pruning cold point block metadata probes",
-        block_metadata_probes,
-    ));
-    results.push(BenchResult::diagnostic(
-        "read pruning cold point data block reads",
-        data_block_reads,
-    ));
-    results.push(BenchResult::diagnostic(
-        "read pruning cold point filter skips",
-        filter_misses,
-    ));
-    results.push(BenchResult::diagnostic(
-        "read pruning cold point cache misses",
-        cache_misses,
-    ));
+    diagnostics.push_results(results);
+}
+
+#[derive(Default)]
+struct ColdReadDiagnostics {
+    table_probes: u64,
+    block_metadata_probes: u64,
+    data_block_reads: u64,
+    filter_misses: u64,
+    cache_misses: u64,
+    open_read_requests: u64,
+    len_requests: u64,
+    read_exact_at_owned_requests: u64,
+    read_current_manifest_requests: u64,
+    open_append_requests: u64,
+    read_exact_at_owned_micros: u64,
+    read_current_manifest_micros: u64,
+}
+
+impl ColdReadDiagnostics {
+    fn record(&mut self, stats: &trine_kv::DbStats) {
+        self.table_probes = self
+            .table_probes
+            .saturating_add(stats.read_path.point_table_probes);
+        self.block_metadata_probes = self
+            .block_metadata_probes
+            .saturating_add(stats.read_path.point_block_metadata_probes);
+        self.data_block_reads = self
+            .data_block_reads
+            .saturating_add(stats.read_path.point_data_block_reads);
+        self.filter_misses = self
+            .filter_misses
+            .saturating_add(stats.read_path.point_filter_misses);
+        self.cache_misses = self.cache_misses.saturating_add(stats.block_cache_misses);
+        self.open_read_requests = self
+            .open_read_requests
+            .saturating_add(stats.storage_operations.open_read.requests);
+        self.len_requests = self
+            .len_requests
+            .saturating_add(stats.storage_operations.len.requests);
+        self.read_exact_at_owned_requests = self
+            .read_exact_at_owned_requests
+            .saturating_add(stats.storage_operations.read_exact_at_owned.requests);
+        self.read_current_manifest_requests = self
+            .read_current_manifest_requests
+            .saturating_add(stats.storage_operations.read_current_manifest.requests);
+        self.open_append_requests = self
+            .open_append_requests
+            .saturating_add(stats.storage_operations.open_append.requests);
+        self.read_exact_at_owned_micros = self.read_exact_at_owned_micros.saturating_add(
+            stats
+                .storage_operations
+                .read_exact_at_owned
+                .total_latency_micros,
+        );
+        self.read_current_manifest_micros = self.read_current_manifest_micros.saturating_add(
+            stats
+                .storage_operations
+                .read_current_manifest
+                .total_latency_micros,
+        );
+    }
+
+    fn push_results(&self, results: &mut Vec<BenchResult>) {
+        results.push(BenchResult::diagnostic(
+            "read pruning cold point table probes",
+            self.table_probes,
+        ));
+        results.push(BenchResult::diagnostic(
+            "read pruning cold point block metadata probes",
+            self.block_metadata_probes,
+        ));
+        results.push(BenchResult::diagnostic(
+            "read pruning cold point data block reads",
+            self.data_block_reads,
+        ));
+        results.push(BenchResult::diagnostic(
+            "read pruning cold point filter skips",
+            self.filter_misses,
+        ));
+        results.push(BenchResult::diagnostic(
+            "read pruning cold point cache misses",
+            self.cache_misses,
+        ));
+        results.push(BenchResult::diagnostic(
+            "read pruning cold storage open read requests",
+            self.open_read_requests,
+        ));
+        results.push(BenchResult::diagnostic(
+            "read pruning cold storage len requests",
+            self.len_requests,
+        ));
+        results.push(BenchResult::diagnostic(
+            "read pruning cold storage read owned requests",
+            self.read_exact_at_owned_requests,
+        ));
+        results.push(BenchResult::diagnostic(
+            "read pruning cold storage current manifest requests",
+            self.read_current_manifest_requests,
+        ));
+        results.push(BenchResult::diagnostic(
+            "read pruning cold storage open append requests",
+            self.open_append_requests,
+        ));
+        results.push(BenchResult::diagnostic(
+            "read pruning cold storage read owned micros",
+            self.read_exact_at_owned_micros,
+        ));
+        results.push(BenchResult::diagnostic(
+            "read pruning cold storage current manifest micros",
+            self.read_current_manifest_micros,
+        ));
+    }
 }
 
 fn extend_prefix_partition_diagnostics(results: &mut Vec<BenchResult>) {

@@ -32,7 +32,8 @@ use crate::{
         BlockingStorageReadBackend, BlockingStorageReadObject, MemoryStorageBackend,
         NativeFileBackend, NativeFileObject, NativeFileReadSource, StorageCapability,
         StorageObjectId, StorageObjectKind, StorageObjectListBackend, StorageObjectListRequest,
-        StorageObjectWriteBackend, StorageReadBackend, StorageReadObject, StorageReadSource,
+        StorageObjectWriteBackend, StorageReadBackend, StorageReadBuffer, StorageReadObject,
+        StorageReadSource,
     },
     types::{KeyRange, Sequence},
 };
@@ -46,6 +47,7 @@ const FOOTER_LEN: usize = 90;
 const DATA_BLOCK_RESTART_INTERVAL: usize = 16;
 const INDEX_PARTITION_TARGET_ENTRIES: usize = 128;
 const PINNED_READ_METADATA_MAX_LEVEL: u32 = 1;
+const WHOLE_TABLE_SYNC_OPEN_MAX_BYTES: u64 = 256 * 1024;
 
 const VALUE_KIND_PUT: u8 = 1;
 const VALUE_KIND_POINT_DELETE: u8 = 2;
@@ -540,6 +542,36 @@ impl ValueRefView<'_> {
                 checksum,
             },
         }
+    }
+}
+
+struct BufferedBlockReadSource<'src> {
+    bytes: &'src [u8],
+}
+
+impl BlockReadSource for BufferedBlockReadSource<'_> {
+    fn read_exact_at(&self, offset: usize, bytes: &mut [u8]) -> Result<()> {
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or_else(|| invalid_table("read offset overflow"))?;
+        let source = self
+            .bytes
+            .get(offset..end)
+            .ok_or_else(|| invalid_table("read past end"))?;
+        bytes.copy_from_slice(source);
+        Ok(())
+    }
+
+    fn read_exact_at_owned(&self, offset: usize, len: usize) -> Result<StorageReadBuffer> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| invalid_table("read offset overflow"))?;
+        let bytes = self
+            .bytes
+            .get(offset..end)
+            .ok_or_else(|| invalid_table("read past end"))?
+            .to_vec();
+        Ok(StorageReadBuffer::from_vec(offset, bytes))
     }
 }
 
@@ -3447,9 +3479,35 @@ pub(crate) fn read_table_with_backend(backend: &NativeFileBackend, path: &Path) 
         .require(StorageCapability::RandomRead)?;
     let object = table_storage_object(path);
     let table_file = Arc::new(backend.open_read_blocking(object)?);
-    let source = StorageReadSource::new(table_file.as_ref());
+    let file_len = table_file.len_blocking()?;
+    if file_len <= WHOLE_TABLE_SYNC_OPEN_MAX_BYTES {
+        let len = usize::try_from(file_len)
+            .map_err(|_| Error::invalid_options("table file length exceeds usize"))?;
+        let bytes = table_file
+            .read_exact_at_owned_blocking(0, len)
+            .map_err(|error| Error::Corruption {
+                message: format!(
+                    "referenced table {} cannot be read: {error}",
+                    path.display()
+                ),
+            })?;
+        let source = BufferedBlockReadSource {
+            bytes: bytes.as_slice(),
+        };
+        return read_table_metadata_from_source(path, &source, Some(table_file), file_len);
+    }
 
-    let header = read_table_header(path, &source)?;
+    let source = StorageReadSource::new(table_file.as_ref());
+    read_table_metadata_from_source(path, &source, Some(Arc::clone(&table_file)), file_len)
+}
+
+fn read_table_metadata_from_source(
+    path: &Path,
+    source: &impl BlockReadSource,
+    file: Option<Arc<NativeFileObject>>,
+    file_len: u64,
+) -> Result<Table> {
+    let header = read_table_header(path, source)?;
     let magic = read_u32_at(&header, 0)?;
     let version = read_u16_at(&header, 4)?;
     let payload_len = read_u32_at(&header, 6)? as usize;
@@ -3463,7 +3521,6 @@ pub(crate) fn read_table_with_backend(backend: &NativeFileBackend, path: &Path) 
             message: format!("unsupported table version {version}"),
         });
     }
-    let file_len = table_file.len_blocking()?;
     let expected_len = usize_to_u64(
         HEADER_LEN
             .checked_add(payload_len)
@@ -3476,24 +3533,24 @@ pub(crate) fn read_table_with_backend(backend: &NativeFileBackend, path: &Path) 
         });
     }
 
-    let footer = read_footer_from_source(&source, payload_len)?;
+    let footer = read_footer_from_source(source, payload_len)?;
     validate_footer_sections_by_len(payload_len, &footer)?;
 
     let (properties_codec, properties_payload) =
-        read_single_block_section_from_source(&source, payload_len, footer.properties)?;
+        read_single_block_section_from_source(source, payload_len, footer.properties)?;
     let properties = decode_properties_block(&properties_payload)?;
     validate_block_codec(properties_codec, properties.codec, TableSection::Properties)?;
 
     let (top_level_block, index_codec, index_payload) =
-        read_first_block_in_section_from_source(&source, payload_len, footer.indexes)?;
+        read_first_block_in_section_from_source(source, payload_len, footer.indexes)?;
     validate_index_top_level_codec(index_codec, properties.codec)?;
     let index_partitions = decode_index_top_level(&index_payload)?;
     let data_block_count =
         validate_index_top_level(top_level_block, &index_partitions, footer.indexes)?;
     let (point_key_filter, prefix_filter) =
-        read_pinned_table_filters(&source, payload_len, footer.filters, &properties)?;
+        read_pinned_table_filters(source, payload_len, footer.filters, &properties)?;
     let index_partition_cache = Arc::new(RwLock::new(read_pinned_index_partitions(
-        &source,
+        source,
         payload_len,
         footer.data_blocks,
         &index_partitions,
@@ -3502,7 +3559,7 @@ pub(crate) fn read_table_with_backend(backend: &NativeFileBackend, path: &Path) 
     )?));
     Ok(Table {
         path: Some(path.to_path_buf()),
-        file: Some(table_file),
+        file,
         payload_len,
         footer,
         properties,
