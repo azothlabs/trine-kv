@@ -3284,3 +3284,34 @@ a direct crates.io/dependency path.
 
 - Commit the metadata patch, tag `v0.1.1` after CI passes, then publish
   `0.1.1`.
+
+### Phase 137: Performance Research Design
+
+**Status**: Complete
+
+**Goal**: Capture the post-`0.1` performance research design before starting
+another implementation slice.
+
+**Entry Condition**: User asks to preserve the performance design after
+reviewing external performance references, LSM-tree research directions, and
+the current benchmark baseline.
+
+**Acceptance Gate**:
+
+- `.phrase/protocol/performance-research-design.md` maps external reference
+  ideas to Trine benchmark rows.
+- The next phase order is recorded without pre-committing to a storage behavior
+  change.
+- High-risk or mismatched directions are explicitly rejected for now.
+- `git diff --check` passes.
+
+**Major Out Of Scope**:
+
+- Rust code changes.
+- Public API, storage format, MVCC, WAL, manifest, table, blob, compaction,
+  transaction, recovery, browser persistence, benchmark harness, or release
+  metadata changes.
+
+### Recommended Next Action
+
+- Run read-pruning measurement before selecting the next implementation target.

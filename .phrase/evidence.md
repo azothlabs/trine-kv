@@ -26,6 +26,52 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-06-03: Performance Research Design Captured
+
+### Observation
+
+- User asked to preserve the overall performance design before moving into
+  implementation.
+- The current `0.1` benchmark baseline shows ordinary point reads are already
+  in a reasonable local range, while cold table read, prefix scan, snapshot
+  reads under writes, WAL replay, flush, compaction, blob write/GC/level merge,
+  and shared-prefix reads remain the sharper workload rows.
+- Performance references suggest batched execution, small work units, MVCC,
+  and prefix/radix indexing. LSM and RocksDB references suggest level-aware
+  filters, batched point reads, key-value separation maintenance, and
+  compaction tradeoff research.
+- `.phrase/protocol/performance-research-design.md` now records the proposed
+  phase order and rejects mismatched or high-risk directions for now.
+
+### Interpretation
+
+- The next performance step should not directly change storage behavior.
+- The lowest-risk first phase is read-pruning measurement: table probes, filter
+  checks, useful filter skips, data-block reads, and cache misses for point,
+  missing, prefix, and cold table read workloads.
+- Blob maintenance, batched point reads, in-memory prefix indexing, and
+  compaction policy remain useful follow-up directions, but each needs its own
+  benchmark gate.
+
+### Verification
+
+- Design review against `docs/benchmarks/0.1-baseline.md`,
+  `docs/benchmarks/v1-blob-level-merge-lazy-gc.md`, and
+  `docs/benchmarks/v1-delta-read-chain-budget.md`.
+- `git diff --check` passed after recording the design.
+- Forbidden-term scan over the touched phase/protocol/evidence/roadmap files
+  found no matches.
+
+### Remaining Blockers
+
+- Fresh benchmark evidence is still needed before choosing an implementation
+  target.
+
+### Recommended Next Action
+
+- Start the read-pruning measurement phase from
+  `.phrase/protocol/performance-research-design.md`.
+
 ## 2026-06-02: Public Rustdoc Coverage Gate
 
 ### Observation
