@@ -96,6 +96,22 @@ impl LsmTree {
         self.point_read_snapshot_with_deltas(delta_snapshot)
     }
 
+    pub(crate) fn point_read_snapshot_for_keys<K>(
+        &self,
+        keys: &[K],
+        read_sequence: Sequence,
+    ) -> Result<LsmPointReadSnapshot>
+    where
+        K: AsRef<[u8]>,
+    {
+        let delta_snapshot = if self.delta_mirror_covers(read_sequence) {
+            DeltaSnapshot::default()
+        } else {
+            self.delta_snapshot_for_keys(keys.iter().map(AsRef::as_ref))?
+        };
+        self.point_read_snapshot_with_deltas(delta_snapshot)
+    }
+
     fn point_read_snapshot_with_deltas(
         &self,
         delta_snapshot: DeltaSnapshot,

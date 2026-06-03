@@ -143,6 +143,25 @@ impl DeltaShardSet {
         })
     }
 
+    fn snapshot_for_keys<'key, I>(&self, keys: I) -> Result<DeltaSnapshot>
+    where
+        I: IntoIterator<Item = &'key [u8]>,
+    {
+        let mut selected = vec![false; self.shards.len()];
+        for key in keys {
+            let shard_index = self.shard_index_for_key(key);
+            selected[shard_index] = true;
+        }
+
+        let mut deltas = Vec::new();
+        for (shard, selected) in self.shards.iter().zip(selected) {
+            if selected {
+                deltas.extend(shard.snapshot()?);
+            }
+        }
+        Ok(DeltaSnapshot { deltas })
+    }
+
     fn estimated_bytes(&self) -> Result<u64> {
         let mut bytes = 0_u64;
         for shard in &self.shards {
@@ -407,6 +426,13 @@ impl LsmTree {
 
     pub(crate) fn delta_snapshot_for_key(&self, key: &[u8]) -> Result<DeltaSnapshot> {
         self.delta_shards.snapshot_for_key(key)
+    }
+
+    pub(crate) fn delta_snapshot_for_keys<'key, I>(&self, keys: I) -> Result<DeltaSnapshot>
+    where
+        I: IntoIterator<Item = &'key [u8]>,
+    {
+        self.delta_shards.snapshot_for_keys(keys)
     }
 
     pub(crate) fn delta_mirror_covers(&self, read_sequence: Sequence) -> bool {

@@ -140,6 +140,61 @@ impl Bucket {
         )
     }
 
+    /// Reads many newest committed values from this bucket.
+    ///
+    /// The returned vector has exactly one entry for each input key, in input
+    /// order. `Ok(None)` at a position means that key has no value visible at
+    /// the read sequence captured for this batch, either because it was never
+    /// written or because its newest visible record is a delete. Duplicate
+    /// input keys produce duplicate result entries; this method does not
+    /// reorder or deduplicate keys.
+    ///
+    /// A batch captures one committed read sequence and one set of point-read
+    /// sources before reading the first key. That gives all keys a consistent
+    /// view and avoids rebuilding the bucket read state for each key. Large
+    /// blob-backed values are read before the method returns.
+    ///
+    /// # Parameters
+    ///
+    /// - `keys`: user key bytes inside this bucket. The slice may be empty; an
+    ///   empty input returns an empty vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`](crate::Error::Closed) if the parent database
+    /// is closed, plus storage or format errors encountered while reading
+    /// tables or blob files. Any such error fails the whole batch.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use trine_kv::{Db, DbOptions};
+    ///
+    /// # fn main() -> trine_kv::Result<()> {
+    /// let db = Db::open_sync(DbOptions::memory())?;
+    /// let users = db.bucket_sync("users")?;
+    /// users.put_sync(b"ada", b"Ada")?;
+    /// users.put_sync(b"grace", b"Grace")?;
+    ///
+    /// let keys = [b"ada".as_slice(), b"missing".as_slice(), b"grace".as_slice()];
+    /// let values = users.get_many_sync(&keys)?;
+    /// assert_eq!(values, vec![Some(b"Ada".to_vec()), None, Some(b"Grace".to_vec())]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn get_many_sync<K>(&self, keys: &[K]) -> Result<Vec<Option<Value>>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let reader = self.db.reader_for_state_keys_at_sequence(
+            &self.state,
+            keys,
+            self.db.last_committed_sequence(),
+            false,
+        )?;
+        reader.get_many_owned_sync(keys)
+    }
+
     /// Reads `key` at the sequence pinned by `snapshot`.
     pub fn get_at_sync(&self, snapshot: &Snapshot, key: &[u8]) -> Result<Option<Value>> {
         self.db.get_at_state_with_pin_state(
@@ -433,6 +488,38 @@ impl Bucket {
                 false,
             )
             .await
+    }
+
+    /// Reads many newest committed values from this bucket.
+    ///
+    /// This is the async form of [`Bucket::get_many_sync`]. It preserves input
+    /// order, returns `None` for missing or deleted keys, and fails the whole
+    /// batch on storage or format errors. The batch captures one committed read
+    /// sequence and one set of point-read sources before reading the first key,
+    /// so all returned values share one consistent view.
+    ///
+    /// # Parameters
+    ///
+    /// - `keys`: user key bytes inside this bucket. Empty input returns an
+    ///   empty vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`](crate::Error::Closed) if the parent database
+    /// is closed, plus storage or format errors encountered while reading
+    /// tables or blob files. Any such error fails the whole batch.
+    ///
+    pub async fn get_many<K>(&self, keys: &[K]) -> Result<Vec<Option<Value>>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let reader = self.db.reader_for_state_keys_at_sequence(
+            &self.state,
+            keys,
+            self.db.last_committed_sequence(),
+            false,
+        )?;
+        reader.get_many_owned(keys).await
     }
 
     /// Reads `key` at the sequence pinned by `snapshot`.
@@ -773,6 +860,88 @@ impl BucketReader<'_> {
             .transpose()
     }
 
+    /// Reads many keys using the sources pinned when this reader was created.
+    ///
+    /// The returned vector has exactly one entry for each input key, in input
+    /// order. `Ok(None)` at a position means that key has no value visible at
+    /// this reader's snapshot sequence. Duplicate input keys produce duplicate
+    /// result entries.
+    ///
+    /// This method returns [`PointValue`] so inline table values can be
+    /// inspected without first copying them into owned `Vec<u8>` values. Use
+    /// [`BucketReader::get_many_owned_sync`] when the caller needs owned value
+    /// bytes. The reader's snapshot sequence is fixed when
+    /// [`Bucket::reader`] creates it, so later commits do not affect this
+    /// method's results.
+    ///
+    /// # Parameters
+    ///
+    /// - `keys`: user key bytes inside this reader's bucket. Empty input
+    ///   returns an empty vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage or format errors encountered while reading tables or
+    /// blob files. Any such error fails the whole batch.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use trine_kv::{Db, DbOptions};
+    ///
+    /// # fn main() -> trine_kv::Result<()> {
+    /// let db = Db::open_sync(DbOptions::memory())?;
+    /// let bucket = db.default_bucket_sync()?;
+    /// bucket.put_sync(b"a", b"one")?;
+    /// let snapshot = db.snapshot();
+    /// let reader = bucket.reader(&snapshot)?;
+    /// bucket.put_sync(b"a", b"new")?;
+    ///
+    /// let keys = [b"a".as_slice()];
+    /// let values = reader.get_many_sync(&keys)?;
+    /// assert_eq!(values[0].as_ref().map(|value| value.as_bytes()), Some(b"one".as_slice()));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn get_many_sync<K>(&self, keys: &[K]) -> Result<Vec<Option<PointValue>>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let mut values = Vec::with_capacity(keys.len());
+        for key in keys {
+            values.push(self.get_sync(key.as_ref())?);
+        }
+        Ok(values)
+    }
+
+    /// Reads many keys and returns owned values.
+    ///
+    /// This is the owned-value form of [`BucketReader::get_many_sync`]. Values
+    /// already owned by the read path are moved directly; values backed by
+    /// shared table-block bytes are copied into `Vec<u8>`. The returned vector
+    /// preserves input order and uses `None` for keys that are not visible at
+    /// the reader's snapshot sequence.
+    ///
+    /// # Parameters
+    ///
+    /// - `keys`: user key bytes inside this reader's bucket. Empty input
+    ///   returns an empty vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage or format errors encountered while reading tables or
+    /// blob files. Any such error fails the whole batch.
+    pub fn get_many_owned_sync<K>(&self, keys: &[K]) -> Result<Vec<Option<Value>>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let mut values = Vec::with_capacity(keys.len());
+        for key in keys {
+            values.push(self.get_sync(key.as_ref())?.map(PointValue::into_value));
+        }
+        Ok(values)
+    }
+
     /// Reads `key` using the sources pinned when this reader was created.
     ///
     /// This returns a `PointValue` so inline table values can be inspected
@@ -798,5 +967,58 @@ impl BucketReader<'_> {
             .await?
             .map(|value| Ok(value.into_value()))
             .transpose()
+    }
+
+    /// Reads many keys using the sources pinned when this reader was created.
+    ///
+    /// This is the async form of [`BucketReader::get_many_sync`]. It preserves
+    /// input order and returns `None` for keys that are not visible at the
+    /// reader's snapshot sequence.
+    ///
+    /// # Parameters
+    ///
+    /// - `keys`: user key bytes inside this reader's bucket. Empty input
+    ///   returns an empty vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage or format errors encountered while reading tables or
+    /// blob files. Any such error fails the whole batch.
+    pub async fn get_many<K>(&self, keys: &[K]) -> Result<Vec<Option<PointValue>>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let mut values = Vec::with_capacity(keys.len());
+        for key in keys {
+            values.push(self.get(key.as_ref()).await?);
+        }
+        Ok(values)
+    }
+
+    /// Reads many keys and returns owned values.
+    ///
+    /// This is the async owned-value form of
+    /// [`BucketReader::get_many_owned_sync`]. It preserves input order and
+    /// returns `None` for keys that are not visible at the reader's snapshot
+    /// sequence.
+    ///
+    /// # Parameters
+    ///
+    /// - `keys`: user key bytes inside this reader's bucket. Empty input
+    ///   returns an empty vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage or format errors encountered while reading tables or
+    /// blob files. Any such error fails the whole batch.
+    pub async fn get_many_owned<K>(&self, keys: &[K]) -> Result<Vec<Option<Value>>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let mut values = Vec::with_capacity(keys.len());
+        for key in keys {
+            values.push(self.get(key.as_ref()).await?.map(PointValue::into_value));
+        }
+        Ok(values)
     }
 }

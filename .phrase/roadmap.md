@@ -3412,3 +3412,35 @@ reduced.
 - Public API additions such as batched point reads.
 - Storage format, MVCC, WAL, table, blob, compaction, transaction, recovery,
   browser persistence, or release metadata changes.
+
+### Recommended Next Action
+
+- Start batched point-read measurement and API work.
+
+### Phase 141: Batched Point Reads
+
+**Status**: Complete
+
+**Goal**: Add and measure batched point-read APIs that reuse one point-read
+snapshot for many keys while preserving input order and missing-key semantics.
+
+**Entry Condition**: Phase 140 complete and user selects batched point reads
+over further cold reopen work.
+
+**Acceptance Gate**:
+
+- Public API returns one result per input key in input order.
+- Missing and deleted keys return `None`; storage/format errors fail the whole
+  batch.
+- Batch reads capture one read sequence and one point-read source snapshot for
+  the batch.
+- Benchmark evidence compares sequential and batched point reads.
+- Focused checks, Rustdoc/doctests, formatting, clippy, full tests, diff
+  checks, and forbidden-term scans pass.
+
+**Major Out Of Scope**:
+
+- Storage format, MVCC, WAL, table, blob, compaction, transaction, recovery,
+  browser persistence, or release metadata changes.
+- Cross-bucket batching.
+- Input-key reordering or deduplication.

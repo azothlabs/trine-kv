@@ -246,6 +246,63 @@ Record only evidence that can change planning or durable decisions.
 - Commit this phase, then choose whether to continue cold reopen work around
   writer-lease cost or switch to batched point reads.
 
+## 2026-06-03: Phase 141 Batched Point Reads
+
+### Observation
+
+- Added default-bucket and bucket-scoped `get_many_sync` / `get_many` APIs.
+- Added `BucketReader` batched methods for snapshot-bound repeated point reads.
+- Public methods return one result per input key in input order, preserve
+  duplicates, and use `None` for missing or deleted keys.
+- Storage or format errors fail the whole batch.
+- The first release run with batch size 16 was slower for both memory and
+  persistent benchmark rows.
+- The implementation was adjusted so batch snapshots capture only delta shards
+  touched by the input keys.
+- With batch size 4, one run recorded memory at 3501 us sequential vs 3304 us
+  batched, and persistent at 1439 us sequential vs 1502 us batched.
+- A second batch-size-4 run recorded memory at 1069 us sequential vs 2444 us
+  batched, and persistent at 1485 us sequential vs 1391 us batched.
+
+### Interpretation
+
+- The API behavior is useful and tested, but benchmark timing is mixed rather
+  than a broad performance win.
+- Persistent flushed point reads can benefit from batch-scoped source reuse.
+- In-memory random point reads still need deeper delta/table grouping to avoid
+  unrelated per-key work inside a batch.
+- Further public API expansion is not justified by this evidence yet.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q get_many --lib`
+- `cargo test -q --bench v1_bench`
+- `cargo check --all-targets --all-features`
+- `cargo bench --bench v1_bench`, output redirected and only key rows
+  inspected.
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test --doc --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`, output
+  redirected to `/tmp/trine-clippy-phase141.txt`
+- `cargo test -q --all-targets --all-features`, output redirected to
+  `/tmp/trine-test-phase141.txt`
+- `git diff --check`
+- Forbidden-term scan over source, benches, docs, README, and touched `.phrase`
+  files found no matches.
+- Source-name scan over performance design and benchmark records found no
+  source-system or broad execution-model wording.
+
+### Remaining Blockers
+
+- The next implementation target is not yet chosen.
+
+### Recommended Next Action
+
+- Commit the API and mixed benchmark evidence.
+- If more speed is needed, optimize deeper table/delta grouping inside the
+  point-read path before adding more public surface.
+
 ## 2026-06-02: Public Rustdoc Coverage Gate
 
 ### Observation

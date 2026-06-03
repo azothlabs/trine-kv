@@ -6,72 +6,74 @@ Complete
 
 ## Goal
 
-Measure and reduce the remaining cold persistent reopen overhead around
-manifest and open operations, without changing table contents, recovery rules,
-or public API behavior.
+Add and measure batched point-read APIs that reuse one point-read snapshot for
+many keys while preserving per-key visibility, ordering, and missing-key
+semantics.
 
 ## Scope
 
-- Cold-read benchmark diagnostics for manifest/open request counts and latency
-  totals.
-- Native persistent reopen path only, selected by measured cold-read evidence.
-- Documentation of before/after benchmark evidence for the kept change.
+- Default-bucket and bucket-scoped current-value batched point reads.
+- Snapshot-bound repeated point reads through `BucketReader`.
+- Benchmark rows comparing sequential point reads with batched point reads.
+- Rustdoc for new public APIs.
 
 ## Out Of Scope
 
-- Public API additions such as batched point reads.
 - Storage format, MVCC, WAL, table, blob, compaction, transaction, recovery,
   browser persistence, or release metadata changes.
-- Async/browser backend behavior changes unless required to preserve shared
-  semantics.
-- Large table data-block eager loading.
+- Cross-bucket batching.
+- Reordering input keys, deduplicating keys, or returning unordered maps.
+- Writer-lease or cold reopen changes.
 
 ## Acceptance Gate
 
-- Before-change evidence identifies the remaining cold-read storage request
-  shape.
-- The kept change reduces one measured cold reopen/open cost without changing
-  recovery or persistence semantics.
-- Focused storage/manifest/table and benchmark checks pass.
-- Formatting, clippy, full tests, diff checks, and forbidden-term scans pass.
+- Public API returns results in the same order as input keys and uses `None`
+  for missing or deleted keys.
+- Batched point reads capture one read sequence and reuse one point-read source
+  snapshot for the batch.
+- Benchmark evidence compares sequential and batched point reads.
+- Focused API/benchmark checks pass.
+- Rustdoc, doctests, formatting, clippy, full tests, diff checks, and
+  forbidden-term scans pass.
 
 ## Active Task Slice
 
 ```text
-task583 [x] goal:record cold manifest/open baseline | scope:benches/v1_bench.rs docs/benchmarks | verify:cargo bench --bench v1_bench
-task584 [x] goal:apply one measured reopen/open optimization | scope:src | verify:focused cargo test -q
-task585 [x] goal:record before-after evidence | scope:docs/benchmarks .phrase | verify:cargo bench --bench v1_bench
-task586 [x] goal:finish local verification | scope:full workspace | verify:cargo clippy/test/diff checks
+task587 [x] goal:add batched point-read APIs | scope:src/db.rs src/bucket.rs | verify:cargo test -q get_many --lib
+task588 [x] goal:add benchmark rows | scope:benches/v1_bench.rs docs/benchmarks | verify:cargo bench --bench v1_bench
+task589 [x] goal:record phase evidence | scope:.phrase docs README.md | verify:git diff --check
+task590 [x] goal:finish local verification | scope:full workspace | verify:cargo rustdoc/test/clippy/diff checks
 ```
 
 ## Known Residuals
 
-- Phase 139 reduced positioned owned reads from 288 to 96 for 32 reopen/get
-  operations.
-- Phase 140 leaves writer-lease acquisition intact. The diagnostic run showed
-  it is the largest fixed cost for writable cold reopen, but it is a safety
+- Phase 140 left writer-lease acquisition intact because it is a safety
   boundary.
-- Remaining cold-read cost includes writer-lease acquisition, WAL whole-object
-  reads, current-manifest reads, table open, and one lazy data-block read per
-  reopened database.
+- Existing `BucketReader` already captures one point-read snapshot for repeated
+  point reads under a caller snapshot.
+- Benchmark timing is mixed. Persistent flushed point reads showed a small
+  batch-size-4 improvement in one run; in-memory random point reads are not a
+  stable win yet.
 
 ## Evidence
 
-- Phase 139 release-profile cold table read after-change runs were 174933 us
-  and 167430 us, with the same 96 positioned owned read requests.
-- Phase 139 diagnostics recorded current-manifest read latency at 461 us and
-  493 us across the two after-change release-profile runs.
-- Phase 140 before-change discovery showed 96 directory file-list requests and
-  64 object-list requests across 32 reopen/get operations.
-- After directory snapshot reuse, the same diagnostic shape showed 32 directory
-  file-list requests and zero object-list requests.
-- The after-change release-profile `cold table read` row was 168137 us.
-- Focused recovery, WAL, persistent, and benchmark harness checks passed.
+- Earlier benchmark rows include ordinary point reads, missing point reads,
+  delta-backed point reads, and long shared-prefix point reads, but no batched
+  point-read row.
+- The current API has `get_sync`/`get` for one key and `BucketReader` for
+  repeated snapshot-bound reads.
+- Phase 141 added `get_many_sync`/`get_many` to `Db` and `Bucket`, plus
+  batched `BucketReader` methods.
+- The second batch-size-4 release run showed persistent flushed point reads at
+  1485 us sequential vs 1391 us batched, while memory random point reads were
+  1069 us sequential vs 2444 us batched.
+- `cargo rustdoc --all-features -- -D warnings` and
+  `cargo test --doc --all-features` passed after adding public API docs.
 - `cargo clippy --all-targets --all-features -- -D warnings` and
   `cargo test -q --all-targets --all-features` passed with output redirected
   to temporary files.
 
 ## Next Recommendation
 
-- Commit the directory snapshot reuse, then choose whether to continue cold
-  reopen work around writer-lease cost or switch to batched point reads.
+- Commit this API and mixed benchmark evidence. Further speed work should
+  target deeper table/delta grouping before adding more public surface.

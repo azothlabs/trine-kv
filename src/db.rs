@@ -1692,6 +1692,54 @@ impl Db {
         self.get_at_sequence(DEFAULT_BUCKET_NAME, key, self.last_committed_sequence())
     }
 
+    /// Reads many newest committed values from the default bucket.
+    ///
+    /// The returned vector has exactly one entry for each input key, in input
+    /// order. `Ok(None)` at a position means that key has no value visible at
+    /// the read sequence captured for this batch, either because it was never
+    /// written or because its newest visible record is a delete. Duplicate
+    /// input keys produce duplicate result entries; this method does not
+    /// reorder or deduplicate keys.
+    ///
+    /// A batch captures one committed read sequence and one set of point-read
+    /// sources before reading the first key. That gives all keys a consistent
+    /// view and avoids rebuilding the default bucket read state for each key.
+    /// Large blob-backed values are read before the method returns.
+    ///
+    /// # Parameters
+    ///
+    /// - `keys`: user key bytes in the built-in default bucket. The slice may
+    ///   be empty; an empty input returns an empty vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`] if the handle is closed, plus storage or
+    /// format errors encountered while reading tables or blob files. Any such
+    /// error fails the whole batch.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use trine_kv::{Db, DbOptions};
+    ///
+    /// # fn main() -> trine_kv::Result<()> {
+    /// let db = Db::open_sync(DbOptions::memory())?;
+    /// db.put_sync(b"a", b"one")?;
+    /// db.put_sync(b"b", b"two")?;
+    ///
+    /// let keys = [b"a".as_slice(), b"missing".as_slice(), b"b".as_slice()];
+    /// let values = db.get_many_sync(&keys)?;
+    /// assert_eq!(values, vec![Some(b"one".to_vec()), None, Some(b"two".to_vec())]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn get_many_sync<K>(&self, keys: &[K]) -> Result<Vec<Option<Value>>>
+    where
+        K: AsRef<[u8]>,
+    {
+        self.default_bucket_sync()?.get_many_sync(keys)
+    }
+
     /// Reads `key` from the default bucket at the sequence pinned by `snapshot`.
     ///
     /// This is the repeatable-read form of [`Db::get_sync`]. Later commits do
@@ -2992,11 +3040,42 @@ impl Db {
         state: &Arc<LsmTree>,
         snapshot: &'snapshot Snapshot,
     ) -> Result<BucketReader<'snapshot>> {
+        self.reader_for_state_at_sequence(state, snapshot.read_sequence(), snapshot.is_pinned())
+    }
+
+    pub(crate) fn reader_for_state_at_sequence<'snapshot>(
+        &self,
+        state: &Arc<LsmTree>,
+        read_sequence: Sequence,
+        read_pin_held: bool,
+    ) -> Result<BucketReader<'snapshot>> {
         self.ensure_open()?;
-        let read_sequence = snapshot.read_sequence();
         let read_pin =
-            (!snapshot.is_pinned()).then(|| self.inner.snapshots.pinned_snapshot(read_sequence));
+            (!read_pin_held).then(|| self.inner.snapshots.pinned_snapshot(read_sequence));
         let read_snapshot = state.point_read_snapshot(read_sequence)?;
+        Ok(BucketReader::new(
+            self.clone(),
+            Arc::clone(state),
+            read_snapshot,
+            read_sequence,
+            read_pin,
+        ))
+    }
+
+    pub(crate) fn reader_for_state_keys_at_sequence<'snapshot, K>(
+        &self,
+        state: &Arc<LsmTree>,
+        keys: &[K],
+        read_sequence: Sequence,
+        read_pin_held: bool,
+    ) -> Result<BucketReader<'snapshot>>
+    where
+        K: AsRef<[u8]>,
+    {
+        self.ensure_open()?;
+        let read_pin =
+            (!read_pin_held).then(|| self.inner.snapshots.pinned_snapshot(read_sequence));
+        let read_snapshot = state.point_read_snapshot_for_keys(keys, read_sequence)?;
         Ok(BucketReader::new(
             self.clone(),
             Arc::clone(state),
@@ -5492,6 +5571,31 @@ impl Db {
             .await
     }
 
+    /// Reads many newest committed values from the default bucket.
+    ///
+    /// This is the async form of [`Db::get_many_sync`]. It preserves input
+    /// order, returns `None` for missing or deleted keys, and fails the whole
+    /// batch on storage or format errors. The batch captures one committed read
+    /// sequence and one set of point-read sources before reading the first key,
+    /// so all returned values share one consistent view of the default bucket.
+    ///
+    /// # Parameters
+    ///
+    /// - `keys`: user key bytes in the built-in default bucket. Empty input
+    ///   returns an empty vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`] if the handle is closed, plus storage or
+    /// format errors encountered while reading tables or blob files. Any such
+    /// error fails the whole batch.
+    pub async fn get_many<K>(&self, keys: &[K]) -> Result<Vec<Option<Value>>>
+    where
+        K: AsRef<[u8]>,
+    {
+        self.default_bucket().await?.get_many(keys).await
+    }
+
     /// Reads `key` from the default bucket at the sequence pinned by `snapshot`.
     pub async fn get_at(&self, snapshot: &Snapshot, key: &[u8]) -> Result<Option<Value>> {
         self.get_at_with_pin_state_async(
@@ -6977,6 +7081,97 @@ mod tests {
         assert!(!options.create_if_missing);
         assert_eq!(options.runtime.mode, crate::runtime::RuntimeMode::Inline);
         assert_eq!(options.background_worker_count, 0);
+    }
+
+    #[test]
+    fn get_many_sync_preserves_order_missing_deletes_and_duplicates() {
+        let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
+        db.put_sync(b"a", b"one").expect("first write");
+        db.put_sync(b"b", b"two").expect("second write");
+        db.delete_sync(b"deleted").expect("delete writes");
+
+        let keys = [
+            b"b".as_slice(),
+            b"missing".as_slice(),
+            b"a".as_slice(),
+            b"b".as_slice(),
+            b"deleted".as_slice(),
+        ];
+        let values = db.get_many_sync(&keys).expect("batch reads");
+
+        assert_eq!(
+            values,
+            vec![
+                Some(b"two".to_vec()),
+                None,
+                Some(b"one".to_vec()),
+                Some(b"two".to_vec()),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn bucket_get_many_sync_reads_named_bucket_only() {
+        let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
+        db.put_sync(b"same", b"default").expect("default write");
+        let users = db.bucket_sync("users").expect("named bucket opens");
+        users.put_sync(b"same", b"named").expect("named write");
+
+        let keys = [b"same".as_slice(), b"missing".as_slice()];
+        let values = users.get_many_sync(&keys).expect("named batch reads");
+
+        assert_eq!(values, vec![Some(b"named".to_vec()), None]);
+        assert_eq!(
+            db.get_many_sync(&keys).expect("default batch reads"),
+            vec![Some(b"default".to_vec()), None]
+        );
+    }
+
+    #[test]
+    fn bucket_reader_get_many_sync_keeps_snapshot_view() {
+        let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
+        let bucket = db.default_bucket_sync().expect("default bucket opens");
+        bucket.put_sync(b"a", b"one").expect("first write");
+        bucket.put_sync(b"b", b"two").expect("second write");
+        let snapshot = db.snapshot();
+        let reader = bucket.reader(&snapshot).expect("reader opens");
+
+        bucket.put_sync(b"a", b"new").expect("new write");
+        bucket.put_sync(b"c", b"three").expect("third write");
+
+        let keys = [b"a".as_slice(), b"c".as_slice(), b"b".as_slice()];
+        let values = reader
+            .get_many_owned_sync(&keys)
+            .expect("snapshot batch reads");
+
+        assert_eq!(
+            values,
+            vec![Some(b"one".to_vec()), None, Some(b"two".to_vec())]
+        );
+        assert_eq!(
+            bucket.get_many_sync(&keys).expect("current batch reads"),
+            vec![
+                Some(b"new".to_vec()),
+                Some(b"three".to_vec()),
+                Some(b"two".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn get_many_async_preserves_order() {
+        let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
+        db.put_sync(b"a", b"one").expect("first write");
+        db.put_sync(b"b", b"two").expect("second write");
+
+        let keys = [b"b".as_slice(), b"missing".as_slice(), b"a".as_slice()];
+        let values = block_on_test_future(db.get_many(&keys)).expect("async batch reads");
+
+        assert_eq!(
+            values,
+            vec![Some(b"two".to_vec()), None, Some(b"one".to_vec())]
+        );
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]

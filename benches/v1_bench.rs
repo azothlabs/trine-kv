@@ -13,6 +13,7 @@ use trine_kv::{
 
 const ROWS: usize = 1_024;
 const OPS: usize = 2_048;
+const POINT_READ_BATCH: usize = 4;
 const LARGE_ROWS: usize = 128;
 const LARGE_OPS: usize = 256;
 const LARGE_VALUE_BYTES: usize = 16 * 1024;
@@ -27,6 +28,10 @@ fn main() {
         bench_batch_write(),
         bench_random_get(),
         bench_missing_get(),
+        bench_memory_sequential_point_batch(),
+        bench_memory_batched_point_read(),
+        bench_persistent_sequential_point_batch(),
+        bench_persistent_batched_point_read(),
         bench_active_memtable_random_get(),
         bench_delta_backed_random_get(),
         bench_delta_backed_missing_get(),
@@ -152,6 +157,48 @@ fn bench_missing_get() -> BenchResult {
     let db = populated_memory_db(ROWS);
     let bucket = db.default_bucket_sync().expect("bucket opens");
     measure("missing get", OPS, || missing_get_checksum(&bucket, OPS))
+}
+
+fn bench_memory_sequential_point_batch() -> BenchResult {
+    let db = populated_memory_db(ROWS);
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+    let keys = point_read_keys(ROWS, OPS, 0x55aa_1001);
+    measure("sequential point batch memory", OPS, || {
+        sequential_point_batch_checksum(&bucket, &keys)
+    })
+}
+
+fn bench_memory_batched_point_read() -> BenchResult {
+    let db = populated_memory_db(ROWS);
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+    let keys = point_read_keys(ROWS, OPS, 0x55aa_1001);
+    measure("batched point read memory", OPS, || {
+        batched_point_read_checksum(&bucket, &keys, POINT_READ_BATCH)
+    })
+}
+
+fn bench_persistent_sequential_point_batch() -> BenchResult {
+    let (dir, db, bucket) =
+        flushed_persistent_db("sequential-point-batch", ROWS, BucketOptions::default());
+    let keys = point_read_keys(ROWS, OPS, 0x55aa_2002);
+    let result = measure("sequential point batch persistent", OPS, || {
+        sequential_point_batch_checksum(&bucket, &keys)
+    });
+    drop(db);
+    cleanup_dir(&dir);
+    result
+}
+
+fn bench_persistent_batched_point_read() -> BenchResult {
+    let (dir, db, bucket) =
+        flushed_persistent_db("batched-point-read", ROWS, BucketOptions::default());
+    let keys = point_read_keys(ROWS, OPS, 0x55aa_2002);
+    let result = measure("batched point read persistent", OPS, || {
+        batched_point_read_checksum(&bucket, &keys, POINT_READ_BATCH)
+    });
+    drop(db);
+    cleanup_dir(&dir);
+    result
 }
 
 fn bench_active_memtable_random_get() -> BenchResult {
@@ -1325,6 +1372,43 @@ fn missing_get_checksum(bucket: &trine_kv::Bucket, ops: usize) -> u64 {
             .map_or(0, |value| value.len() as u64);
     }
     checksum
+}
+
+fn sequential_point_batch_checksum(bucket: &trine_kv::Bucket, keys: &[Vec<u8>]) -> u64 {
+    let mut checksum = 0;
+    for key in keys {
+        checksum += bucket
+            .get_sync(key)
+            .expect("sequential batch point read succeeds")
+            .map_or(0, |value| value.len() as u64);
+    }
+    checksum
+}
+
+fn batched_point_read_checksum(
+    bucket: &trine_kv::Bucket,
+    keys: &[Vec<u8>],
+    batch_size: usize,
+) -> u64 {
+    let mut checksum = 0;
+    for batch in keys.chunks(batch_size) {
+        checksum += bucket
+            .get_many_sync(batch)
+            .expect("batched point read succeeds")
+            .into_iter()
+            .map(|value| value.map_or(0, |value| value.len() as u64))
+            .sum::<u64>();
+    }
+    checksum
+}
+
+fn point_read_keys(rows: usize, ops: usize, mut seed: u64) -> Vec<Vec<u8>> {
+    let mut keys = Vec::with_capacity(ops);
+    for _ in 0..ops {
+        seed = xorshift(seed);
+        keys.push(key(seed_index(seed, rows)));
+    }
+    keys
 }
 
 fn range_scan_checksum(bucket: &trine_kv::Bucket, scans: usize) -> u64 {
