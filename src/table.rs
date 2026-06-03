@@ -1384,6 +1384,127 @@ impl Table {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn newest_visible_point_value_records_for_keys_with_cache(
+        &self,
+        keys: &[&[u8]],
+        read_sequence: Sequence,
+        policy: IndexSearchPolicy,
+        block_cache: Option<&BlockCache>,
+    ) -> Result<Vec<Option<TablePointValueRecord>>> {
+        let mut records = Vec::with_capacity(keys.len());
+        records.resize_with(keys.len(), || None);
+        let mut scans = Vec::new();
+        let mut saw_point_key = vec![false; keys.len()];
+
+        for (key_index, key) in keys.iter().enumerate() {
+            if let Some(block_index) = self.first_block_for_key(key, policy, block_cache)? {
+                scans.push(PointBatchScan {
+                    key_index,
+                    block_index,
+                });
+            }
+        }
+
+        while !scans.is_empty() {
+            scans.sort_unstable_by_key(|scan| scan.block_index);
+            let mut next_scans = Vec::new();
+            let mut scan_index = 0;
+            while scan_index < scans.len() {
+                let block_index = scans[scan_index].block_index;
+                let group_start = scan_index;
+                while scan_index < scans.len() && scans[scan_index].block_index == block_index {
+                    scan_index += 1;
+                }
+
+                self.read_path_stats.record_point_block_metadata_probe();
+                let mut reads = Vec::new();
+                self.with_data_block_metadata(block_index, block_cache, |block| {
+                    for scan in &scans[group_start..scan_index] {
+                        let key = keys[scan.key_index];
+                        if block.smallest_internal_key.user_key() > key {
+                            continue;
+                        }
+                        let had_filter = block.point_key_filter.is_some();
+                        if !self.block_point_filter_allows(block, key) {
+                            if had_filter {
+                                self.read_path_stats.record_point_filter_miss();
+                            }
+                            if let Some(block_index) =
+                                next_point_batch_block(scan.block_index, self.data_block_count)
+                            {
+                                next_scans.push(PointBatchScan {
+                                    key_index: scan.key_index,
+                                    block_index,
+                                });
+                            }
+                            continue;
+                        }
+                        reads.push(PointBatchRead {
+                            key_index: scan.key_index,
+                            block_index: scan.block_index,
+                            had_filter,
+                        });
+                    }
+                    Ok(())
+                })?;
+
+                if reads.is_empty() {
+                    continue;
+                }
+
+                self.read_path_stats.record_point_data_block_read();
+                let block = self.load_data_block(block_index, block_cache)?;
+                for read in reads {
+                    let key = keys[read.key_index];
+                    let (block_has_key, record) =
+                        data_block_newest_visible_point_value_record_for_key(
+                            &block,
+                            key,
+                            read_sequence,
+                            policy,
+                        )?;
+                    if !block_has_key {
+                        if read.had_filter {
+                            self.filter_stats.record_block_point_false_positive();
+                        }
+                        if let Some(block_index) =
+                            next_point_batch_block(read.block_index, self.data_block_count)
+                        {
+                            next_scans.push(PointBatchScan {
+                                key_index: read.key_index,
+                                block_index,
+                            });
+                        }
+                        continue;
+                    }
+                    saw_point_key[read.key_index] = true;
+                    if let Some(record) = record {
+                        records[read.key_index] = Some(record);
+                    } else if let Some(block_index) =
+                        next_point_batch_block(read.block_index, self.data_block_count)
+                    {
+                        next_scans.push(PointBatchScan {
+                            key_index: read.key_index,
+                            block_index,
+                        });
+                    }
+                }
+            }
+            scans = next_scans;
+        }
+
+        if self.point_key_filter.is_some() {
+            for saw_point_key in saw_point_key {
+                if !saw_point_key {
+                    self.filter_stats.record_table_point_false_positive();
+                }
+            }
+        }
+
+        Ok(records)
+    }
+
     pub(crate) async fn newest_visible_point_value_record_for_key_with_cache_async(
         &self,
         key: &[u8],
@@ -1450,6 +1571,131 @@ impl Table {
             self.filter_stats.record_table_point_false_positive();
         }
         Ok(None)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn newest_visible_point_value_records_for_keys_with_cache_async(
+        &self,
+        keys: &[&[u8]],
+        read_sequence: Sequence,
+        policy: IndexSearchPolicy,
+        block_cache: Option<&BlockCache>,
+    ) -> Result<Vec<Option<TablePointValueRecord>>> {
+        let mut records = Vec::with_capacity(keys.len());
+        records.resize_with(keys.len(), || None);
+        let mut scans = Vec::new();
+        let mut saw_point_key = vec![false; keys.len()];
+
+        for (key_index, key) in keys.iter().enumerate() {
+            if let Some(block_index) = self
+                .first_block_for_key_async(key, policy, block_cache)
+                .await?
+            {
+                scans.push(PointBatchScan {
+                    key_index,
+                    block_index,
+                });
+            }
+        }
+
+        while !scans.is_empty() {
+            scans.sort_unstable_by_key(|scan| scan.block_index);
+            let mut next_scans = Vec::new();
+            let mut scan_index = 0;
+            while scan_index < scans.len() {
+                let block_index = scans[scan_index].block_index;
+                let group_start = scan_index;
+                while scan_index < scans.len() && scans[scan_index].block_index == block_index {
+                    scan_index += 1;
+                }
+
+                self.read_path_stats.record_point_block_metadata_probe();
+                let mut reads = Vec::new();
+                self.with_data_block_metadata_async(block_index, block_cache, |block| {
+                    for scan in &scans[group_start..scan_index] {
+                        let key = keys[scan.key_index];
+                        if block.smallest_internal_key.user_key() > key {
+                            continue;
+                        }
+                        let had_filter = block.point_key_filter.is_some();
+                        if !self.block_point_filter_allows(block, key) {
+                            if had_filter {
+                                self.read_path_stats.record_point_filter_miss();
+                            }
+                            if let Some(block_index) =
+                                next_point_batch_block(scan.block_index, self.data_block_count)
+                            {
+                                next_scans.push(PointBatchScan {
+                                    key_index: scan.key_index,
+                                    block_index,
+                                });
+                            }
+                            continue;
+                        }
+                        reads.push(PointBatchRead {
+                            key_index: scan.key_index,
+                            block_index: scan.block_index,
+                            had_filter,
+                        });
+                    }
+                    Ok(())
+                })
+                .await?;
+
+                if reads.is_empty() {
+                    continue;
+                }
+
+                self.read_path_stats.record_point_data_block_read();
+                let block = self.load_data_block_async(block_index, block_cache).await?;
+                for read in reads {
+                    let key = keys[read.key_index];
+                    let (block_has_key, record) =
+                        data_block_newest_visible_point_value_record_for_key(
+                            &block,
+                            key,
+                            read_sequence,
+                            policy,
+                        )?;
+                    if !block_has_key {
+                        if read.had_filter {
+                            self.filter_stats.record_block_point_false_positive();
+                        }
+                        if let Some(block_index) =
+                            next_point_batch_block(read.block_index, self.data_block_count)
+                        {
+                            next_scans.push(PointBatchScan {
+                                key_index: read.key_index,
+                                block_index,
+                            });
+                        }
+                        continue;
+                    }
+                    saw_point_key[read.key_index] = true;
+                    if let Some(record) = record {
+                        records[read.key_index] = Some(record);
+                    } else if let Some(block_index) =
+                        next_point_batch_block(read.block_index, self.data_block_count)
+                    {
+                        next_scans.push(PointBatchScan {
+                            key_index: read.key_index,
+                            block_index,
+                        });
+                    }
+                }
+            }
+            scans = next_scans;
+        }
+
+        if self.point_key_filter.is_some() {
+            for saw_point_key in saw_point_key {
+                if !saw_point_key {
+                    self.filter_stats.record_table_point_false_positive();
+                }
+            }
+        }
+
+        Ok(records)
     }
 
     #[cfg(test)]
@@ -2889,6 +3135,24 @@ enum PointBlockDecision {
     Done,
     Skip,
     Read { had_filter: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PointBatchScan {
+    key_index: usize,
+    block_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PointBatchRead {
+    key_index: usize,
+    block_index: usize,
+    had_filter: bool,
+}
+
+fn next_point_batch_block(block_index: usize, data_block_count: usize) -> Option<usize> {
+    let next = block_index.checked_add(1)?;
+    (next < data_block_count).then_some(next)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

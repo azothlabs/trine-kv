@@ -104,6 +104,67 @@ impl LsmVersion {
         Ok(())
     }
 
+    pub(crate) fn for_each_point_lookup_table_for_keys(
+        &self,
+        keys: &[Vec<u8>],
+        mut should_probe: impl FnMut(&Table, usize) -> bool,
+        mut visit: impl FnMut(&Arc<Table>, &[usize]) -> Result<()>,
+    ) -> Result<()> {
+        for level in &self.levels {
+            if level.level == TableLevel::ZERO {
+                for table in &level.tables {
+                    let mut key_indices = Vec::new();
+                    for (key_index, key) in keys.iter().enumerate() {
+                        if !should_probe(table, key_index) {
+                            continue;
+                        }
+                        table.record_point_table_probe();
+                        if table.may_contain_key(key) {
+                            key_indices.push(key_index);
+                        }
+                    }
+                    if !key_indices.is_empty() {
+                        visit(table, &key_indices)?;
+                    }
+                }
+                continue;
+            }
+
+            let mut current_table: Option<Arc<Table>> = None;
+            let mut key_indices = Vec::new();
+            for (key_index, key) in keys.iter().enumerate() {
+                let Some(table) = level.table_for_key(key) else {
+                    continue;
+                };
+                if !should_probe(table, key_index) {
+                    continue;
+                }
+                table.record_point_table_probe();
+                if !table.may_contain_key(key) {
+                    continue;
+                }
+                if current_table
+                    .as_ref()
+                    .is_some_and(|current| current.properties().id != table.properties().id)
+                {
+                    let table = current_table
+                        .take()
+                        .expect("current table exists when key indices exist");
+                    visit(&table, &key_indices)?;
+                    key_indices.clear();
+                }
+                if current_table.is_none() {
+                    current_table = Some(Arc::clone(table));
+                }
+                key_indices.push(key_index);
+            }
+            if let Some(table) = current_table {
+                visit(&table, &key_indices)?;
+            }
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub(crate) fn range_tombstone_tables_for_key(&self, key: &[u8]) -> Vec<Arc<Table>> {
         let mut tables = Vec::new();

@@ -14,6 +14,7 @@ use trine_kv::{
 const ROWS: usize = 1_024;
 const OPS: usize = 2_048;
 const POINT_READ_BATCH: usize = 4;
+const LOCALIZED_POINT_READ_BATCH: usize = 16;
 const LARGE_ROWS: usize = 128;
 const LARGE_OPS: usize = 256;
 const LARGE_VALUE_BYTES: usize = 16 * 1024;
@@ -32,6 +33,8 @@ fn main() {
         bench_memory_batched_point_read(),
         bench_persistent_sequential_point_batch(),
         bench_persistent_batched_point_read(),
+        bench_persistent_localized_sequential_point_batch(),
+        bench_persistent_localized_batched_point_read(),
         bench_active_memtable_random_get(),
         bench_delta_backed_random_get(),
         bench_delta_backed_missing_get(),
@@ -196,6 +199,36 @@ fn bench_persistent_batched_point_read() -> BenchResult {
     let keys = point_read_keys(ROWS, OPS, 0x55aa_2002);
     let result = measure("batched point read persistent", OPS, || {
         batched_point_read_checksum(&bucket, &keys, POINT_READ_BATCH)
+    });
+    drop(db);
+    cleanup_dir(&dir);
+    result
+}
+
+fn bench_persistent_localized_sequential_point_batch() -> BenchResult {
+    let (dir, db, bucket) = flushed_persistent_db(
+        "localized-sequential-point-batch",
+        ROWS,
+        BucketOptions::default(),
+    );
+    let keys = localized_point_read_keys(ROWS, OPS);
+    let result = measure("localized sequential point batch persistent", OPS, || {
+        sequential_point_batch_checksum(&bucket, &keys)
+    });
+    drop(db);
+    cleanup_dir(&dir);
+    result
+}
+
+fn bench_persistent_localized_batched_point_read() -> BenchResult {
+    let (dir, db, bucket) = flushed_persistent_db(
+        "localized-batched-point-read",
+        ROWS,
+        BucketOptions::default(),
+    );
+    let keys = localized_point_read_keys(ROWS, OPS);
+    let result = measure("localized batched point read persistent", OPS, || {
+        batched_point_read_checksum(&bucket, &keys, LOCALIZED_POINT_READ_BATCH)
     });
     drop(db);
     cleanup_dir(&dir);
@@ -1678,6 +1711,10 @@ fn point_read_keys(rows: usize, ops: usize, mut seed: u64) -> Vec<Vec<u8>> {
         keys.push(key(seed_index(seed, rows)));
     }
     keys
+}
+
+fn localized_point_read_keys(rows: usize, ops: usize) -> Vec<Vec<u8>> {
+    (0..ops).map(|index| key(index % rows)).collect()
 }
 
 fn range_scan_checksum(bucket: &trine_kv::Bucket, scans: usize) -> u64 {

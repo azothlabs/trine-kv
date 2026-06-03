@@ -3042,6 +3042,34 @@ impl Db {
         )
     }
 
+    pub(crate) fn get_values_at_state_snapshot_with_pin_state<K>(
+        &self,
+        state: &LsmTree,
+        read_snapshot: &LsmPointReadSnapshot,
+        keys: &[K],
+        read_sequence: Sequence,
+        read_pin_held: bool,
+    ) -> Result<Vec<Option<PointValue>>>
+    where
+        K: AsRef<[u8]>,
+    {
+        self.ensure_open()?;
+        let _read_pin = if read_pin_held {
+            None
+        } else {
+            Some(self.inner.snapshots.pinned_snapshot(read_sequence))
+        };
+
+        state.read_visible_point_values_in_snapshot(
+            read_snapshot,
+            keys,
+            read_sequence,
+            self.persistent_path(),
+            Some(self.inner.block_cache.as_ref()),
+            Some(self.inner.blob_reads.as_ref()),
+        )
+    }
+
     pub(crate) async fn get_value_at_state_snapshot_with_pin_state_async(
         &self,
         state: &LsmTree,
@@ -3061,6 +3089,39 @@ impl Db {
             .read_visible_point_value_in_snapshot_async(
                 read_snapshot,
                 key,
+                read_sequence,
+                AsyncPointReadIo::new(
+                    &self.inner.native_storage,
+                    self.persistent_path(),
+                    Some(self.inner.block_cache.as_ref()),
+                    Some(self.inner.blob_reads.as_ref()),
+                ),
+            )
+            .await
+    }
+
+    pub(crate) async fn get_values_at_state_snapshot_with_pin_state_async<K>(
+        &self,
+        state: &LsmTree,
+        read_snapshot: &LsmPointReadSnapshot,
+        keys: &[K],
+        read_sequence: Sequence,
+        read_pin_held: bool,
+    ) -> Result<Vec<Option<PointValue>>>
+    where
+        K: AsRef<[u8]>,
+    {
+        self.ensure_open()?;
+        let _read_pin = if read_pin_held {
+            None
+        } else {
+            Some(self.inner.snapshots.pinned_snapshot(read_sequence))
+        };
+
+        state
+            .read_visible_point_values_in_snapshot_async(
+                read_snapshot,
+                keys,
                 read_sequence,
                 AsyncPointReadIo::new(
                     &self.inner.native_storage,
@@ -6978,7 +7039,7 @@ mod tests {
     };
     use crate::{
         bucket::DEFAULT_BUCKET_NAME,
-        options::DbOptions,
+        options::{BucketOptions, DbOptions},
         runtime::CancellationToken,
         storage::{StorageCapability, StorageReadBackend},
         types::KeyRange,
@@ -7313,6 +7374,54 @@ mod tests {
             values,
             vec![Some(b"two".to_vec()), None, Some(b"one".to_vec())]
         );
+    }
+
+    #[test]
+    fn get_many_sync_groups_persistent_keys_by_data_block() {
+        let path = temp_db_path("get-many-block-grouping");
+        let options = DbOptions::persistent(&path).with_default_bucket_options(BucketOptions {
+            block_bytes: 4096,
+            ..BucketOptions::default()
+        });
+        let db = Db::open_sync(options).expect("persistent db opens");
+        for index in 0..8 {
+            let key = format!("key-{index:02}");
+            let value = format!("value-{index:02}");
+            db.put_sync(key.as_bytes(), value.as_bytes())
+                .expect("write key");
+        }
+        db.flush_sync().expect("flush table");
+
+        let before = db.stats();
+        let keys = [
+            b"key-01".as_slice(),
+            b"key-02".as_slice(),
+            b"key-03".as_slice(),
+            b"key-01".as_slice(),
+        ];
+        let values = db.get_many_sync(&keys).expect("batch reads");
+        let after = db.stats();
+
+        assert_eq!(
+            values,
+            vec![
+                Some(b"value-01".to_vec()),
+                Some(b"value-02".to_vec()),
+                Some(b"value-03".to_vec()),
+                Some(b"value-01".to_vec()),
+            ]
+        );
+        assert_eq!(
+            after
+                .read_path
+                .point_data_block_reads
+                .saturating_sub(before.read_path.point_data_block_reads),
+            1,
+            "batch keys in one data block should share the block read"
+        );
+
+        drop(db);
+        fs::remove_dir_all(path).expect("cleanup test db");
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]

@@ -907,11 +907,13 @@ impl BucketReader<'_> {
     where
         K: AsRef<[u8]>,
     {
-        let mut values = Vec::with_capacity(keys.len());
-        for key in keys {
-            values.push(self.get_sync(key.as_ref())?);
-        }
-        Ok(values)
+        self.db.get_values_at_state_snapshot_with_pin_state(
+            &self.state,
+            &self.read_snapshot,
+            keys,
+            self.read_sequence,
+            true,
+        )
     }
 
     /// Reads many keys and returns owned values.
@@ -935,11 +937,12 @@ impl BucketReader<'_> {
     where
         K: AsRef<[u8]>,
     {
-        let mut values = Vec::with_capacity(keys.len());
-        for key in keys {
-            values.push(self.get_sync(key.as_ref())?.map(PointValue::into_value));
-        }
-        Ok(values)
+        self.get_many_sync(keys).map(|values| {
+            values
+                .into_iter()
+                .map(|value| value.map(PointValue::into_value))
+                .collect()
+        })
     }
 
     /// Reads `key` using the sources pinned when this reader was created.
@@ -988,11 +991,15 @@ impl BucketReader<'_> {
     where
         K: AsRef<[u8]>,
     {
-        let mut values = Vec::with_capacity(keys.len());
-        for key in keys {
-            values.push(self.get(key.as_ref()).await?);
-        }
-        Ok(values)
+        self.db
+            .get_values_at_state_snapshot_with_pin_state_async(
+                &self.state,
+                &self.read_snapshot,
+                keys,
+                self.read_sequence,
+                true,
+            )
+            .await
     }
 
     /// Reads many keys and returns owned values.
@@ -1015,10 +1022,11 @@ impl BucketReader<'_> {
     where
         K: AsRef<[u8]>,
     {
-        let mut values = Vec::with_capacity(keys.len());
-        for key in keys {
-            values.push(self.get(key.as_ref()).await?.map(PointValue::into_value));
-        }
-        Ok(values)
+        self.get_many(keys).await.map(|values| {
+            values
+                .into_iter()
+                .map(|value| value.map(PointValue::into_value))
+                .collect()
+        })
     }
 }

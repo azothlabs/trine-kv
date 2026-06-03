@@ -1,5 +1,6 @@
 use std::{
     cell::Cell,
+    collections::BTreeMap,
     ops::Bound,
     path::Path,
     sync::{Arc, atomic::Ordering},
@@ -319,6 +320,114 @@ impl LsmTree {
         }
     }
 
+    pub(crate) fn read_visible_point_values_in_snapshot<K>(
+        &self,
+        snapshot: &LsmPointReadSnapshot,
+        keys: &[K],
+        read_sequence: Sequence,
+        db_path: Option<&Path>,
+        block_cache: Option<&cache::BlockCache>,
+        blob_reads: Option<&BlobReadMetrics>,
+    ) -> Result<Vec<Option<PointValue>>>
+    where
+        K: AsRef<[u8]>,
+    {
+        let batch = PointReadBatch::from_keys(keys);
+        if batch.unique_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        if batch.prefers_single_key_path() {
+            let mut values = Vec::with_capacity(keys.len());
+            for key in keys {
+                values.push(self.read_visible_point_value_in_snapshot(
+                    snapshot,
+                    key.as_ref(),
+                    read_sequence,
+                    db_path,
+                    block_cache,
+                    blob_reads,
+                )?);
+            }
+            return Ok(values);
+        }
+
+        let mut candidates = Vec::with_capacity(batch.unique_keys.len());
+        candidates.resize_with(batch.unique_keys.len(), || None);
+        for (index, key) in batch.unique_keys.iter().enumerate() {
+            candidates[index] = Self::newest_visible_memtable_point_candidate_in_snapshot(
+                snapshot,
+                key,
+                read_sequence,
+            )?;
+        }
+
+        let newest_candidate_sequences = candidates
+            .iter()
+            .map(|candidate| {
+                Cell::new(
+                    candidate
+                        .as_ref()
+                        .map(|candidate| candidate.internal_key.sequence()),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        snapshot.version.for_each_point_lookup_table_for_keys(
+            &batch.unique_keys,
+            |table, key_index| {
+                table_may_have_newer_point_record(
+                    table,
+                    newest_candidate_sequences[key_index].get(),
+                )
+            },
+            |table, key_indices| {
+                let table_keys = key_indices
+                    .iter()
+                    .map(|key_index| batch.unique_keys[*key_index].as_slice())
+                    .collect::<Vec<_>>();
+                let records = table.newest_visible_point_value_records_for_keys_with_cache(
+                    &table_keys,
+                    read_sequence,
+                    self.options.index_search_policy,
+                    block_cache,
+                )?;
+                for (local_index, record) in records.into_iter().enumerate() {
+                    let Some(record) = record else {
+                        continue;
+                    };
+                    let key_index = key_indices[local_index];
+                    keep_newer_point_candidate_owned(
+                        &mut candidates[key_index],
+                        record.internal_key,
+                        record.value,
+                    );
+                    newest_candidate_sequences[key_index].set(
+                        candidates[key_index]
+                            .as_ref()
+                            .map(|candidate| candidate.internal_key.sequence()),
+                    );
+                }
+                Ok(())
+            },
+        )?;
+
+        let memtable_range_tombstones = memtable_range_tombstones_in_snapshot(snapshot);
+        let mut unique_values = Vec::with_capacity(batch.unique_keys.len());
+        for (key_index, candidate) in candidates.into_iter().enumerate() {
+            unique_values.push(resolve_point_candidate(
+                snapshot,
+                &memtable_range_tombstones,
+                &batch.unique_keys[key_index],
+                candidate,
+                read_sequence,
+                db_path,
+                blob_reads,
+            )?);
+        }
+
+        Ok(batch.scatter(&unique_values))
+    }
+
     pub(crate) async fn read_visible_point_value_in_snapshot_async<B>(
         &self,
         snapshot: &LsmPointReadSnapshot,
@@ -408,6 +517,129 @@ impl LsmTree {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn read_visible_point_values_in_snapshot_async<B, K>(
+        &self,
+        snapshot: &LsmPointReadSnapshot,
+        keys: &[K],
+        read_sequence: Sequence,
+        io: AsyncPointReadIo<'_, B>,
+    ) -> Result<Vec<Option<PointValue>>>
+    where
+        B: StorageReadBackend,
+        K: AsRef<[u8]>,
+    {
+        let batch = PointReadBatch::from_keys(keys);
+        if batch.unique_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        if batch.prefers_single_key_path() {
+            let mut values = Vec::with_capacity(keys.len());
+            for key in keys {
+                values.push(
+                    self.read_visible_point_value_in_snapshot_async(
+                        snapshot,
+                        key.as_ref(),
+                        read_sequence,
+                        AsyncPointReadIo::new(
+                            io.backend,
+                            io.db_path,
+                            io.block_cache,
+                            io.blob_reads,
+                        ),
+                    )
+                    .await?,
+                );
+            }
+            return Ok(values);
+        }
+
+        let mut candidates = Vec::with_capacity(batch.unique_keys.len());
+        candidates.resize_with(batch.unique_keys.len(), || None);
+        for (index, key) in batch.unique_keys.iter().enumerate() {
+            candidates[index] = Self::newest_visible_memtable_point_candidate_in_snapshot(
+                snapshot,
+                key,
+                read_sequence,
+            )?;
+        }
+
+        let newest_candidate_sequences = candidates
+            .iter()
+            .map(|candidate| {
+                Cell::new(
+                    candidate
+                        .as_ref()
+                        .map(|candidate| candidate.internal_key.sequence()),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut table_groups = Vec::new();
+        snapshot.version.for_each_point_lookup_table_for_keys(
+            &batch.unique_keys,
+            |table, key_index| {
+                table_may_have_newer_point_record(
+                    table,
+                    newest_candidate_sequences[key_index].get(),
+                )
+            },
+            |table, key_indices| {
+                table_groups.push((Arc::clone(table), key_indices.to_vec()));
+                Ok(())
+            },
+        )?;
+
+        for (table, key_indices) in table_groups {
+            let table_keys = key_indices
+                .iter()
+                .map(|key_index| batch.unique_keys[*key_index].as_slice())
+                .collect::<Vec<_>>();
+            let records = table
+                .newest_visible_point_value_records_for_keys_with_cache_async(
+                    &table_keys,
+                    read_sequence,
+                    self.options.index_search_policy,
+                    io.block_cache,
+                )
+                .await?;
+            for (local_index, record) in records.into_iter().enumerate() {
+                let Some(record) = record else {
+                    continue;
+                };
+                let key_index = key_indices[local_index];
+                keep_newer_point_candidate_owned(
+                    &mut candidates[key_index],
+                    record.internal_key,
+                    record.value,
+                );
+                newest_candidate_sequences[key_index].set(
+                    candidates[key_index]
+                        .as_ref()
+                        .map(|candidate| candidate.internal_key.sequence()),
+                );
+            }
+        }
+
+        let memtable_range_tombstones = memtable_range_tombstones_in_snapshot(snapshot);
+        let mut unique_values = Vec::with_capacity(batch.unique_keys.len());
+        for (key_index, candidate) in candidates.into_iter().enumerate() {
+            unique_values.push(
+                resolve_point_candidate_async(
+                    &io,
+                    snapshot,
+                    &memtable_range_tombstones,
+                    &batch.unique_keys[key_index],
+                    candidate,
+                    read_sequence,
+                )
+                .await?,
+            );
+        }
+
+        Ok(batch.scatter(&unique_values))
+    }
+
     pub(crate) fn memtable_range_tombstones_for_read_sequence(
         &self,
         read_sequence: Sequence,
@@ -489,6 +721,201 @@ impl LsmTree {
         }
 
         Ok(candidate)
+    }
+}
+
+#[derive(Debug)]
+struct PointReadBatch {
+    unique_keys: Vec<Vec<u8>>,
+    positions: Vec<Vec<usize>>,
+    input_len: usize,
+}
+
+const POINT_READ_BATCH_GROUPING_MIN_KEYS: usize = 8;
+const POINT_READ_BATCH_LINEAR_DEDUP_MAX_KEYS: usize = 32;
+
+impl PointReadBatch {
+    fn from_keys<K>(keys: &[K]) -> Self
+    where
+        K: AsRef<[u8]>,
+    {
+        if keys.len() <= POINT_READ_BATCH_LINEAR_DEDUP_MAX_KEYS {
+            return Self::from_keys_linear(keys);
+        }
+
+        let mut unique_indices = BTreeMap::<Vec<u8>, usize>::new();
+        let mut unique_keys = Vec::new();
+        let mut positions: Vec<Vec<usize>> = Vec::new();
+
+        for (position, key) in keys.iter().enumerate() {
+            let key = key.as_ref();
+            if let Some(&index) = unique_indices.get(key) {
+                positions[index].push(position);
+                continue;
+            }
+
+            let index = unique_keys.len();
+            unique_indices.insert(key.to_vec(), index);
+            unique_keys.push(key.to_vec());
+            positions.push(vec![position]);
+        }
+
+        Self {
+            unique_keys,
+            positions,
+            input_len: keys.len(),
+        }
+    }
+
+    fn from_keys_linear<K>(keys: &[K]) -> Self
+    where
+        K: AsRef<[u8]>,
+    {
+        let mut unique_keys: Vec<Vec<u8>> = Vec::new();
+        let mut positions: Vec<Vec<usize>> = Vec::new();
+
+        for (position, key) in keys.iter().enumerate() {
+            let key = key.as_ref();
+            if let Some(index) = unique_keys
+                .iter()
+                .position(|unique_key| unique_key.as_slice() == key)
+            {
+                positions[index].push(position);
+                continue;
+            }
+
+            unique_keys.push(key.to_vec());
+            positions.push(vec![position]);
+        }
+
+        Self {
+            unique_keys,
+            positions,
+            input_len: keys.len(),
+        }
+    }
+
+    fn scatter(&self, unique_values: &[Option<PointValue>]) -> Vec<Option<PointValue>> {
+        debug_assert_eq!(unique_values.len(), self.unique_keys.len());
+        let mut values = Vec::with_capacity(self.input_len);
+        values.resize_with(self.input_len, || None);
+        for (unique_index, positions) in self.positions.iter().enumerate() {
+            for position in positions {
+                values[*position].clone_from(&unique_values[unique_index]);
+            }
+        }
+        values
+    }
+
+    fn prefers_single_key_path(&self) -> bool {
+        self.input_len < POINT_READ_BATCH_GROUPING_MIN_KEYS
+            && self.unique_keys.len() == self.input_len
+    }
+}
+
+fn resolve_point_candidate(
+    snapshot: &LsmPointReadSnapshot,
+    memtable_range_tombstones: &RangeTombstoneIndex<RangeTombstone>,
+    key: &[u8],
+    candidate: Option<PointRecordCandidate>,
+    read_sequence: Sequence,
+    db_path: Option<&Path>,
+    blob_reads: Option<&BlobReadMetrics>,
+) -> Result<Option<PointValue>> {
+    let Some(candidate) = candidate else {
+        return Ok(None);
+    };
+    let PointRecordCandidate {
+        internal_key,
+        value,
+    } = candidate;
+
+    match internal_key.kind() {
+        ValueKind::Put => {
+            let covered_by_memtable_tombstone = range_tombstones_cover(
+                memtable_range_tombstones,
+                key,
+                internal_key.sequence(),
+                internal_key.batch_index(),
+                read_sequence,
+            );
+            let mut covered_by_table_tombstone = false;
+            if !covered_by_memtable_tombstone {
+                for table in snapshot.version.range_tombstone_tables_for_key(key) {
+                    covered_by_table_tombstone = table.range_tombstone_covers_visible_point(
+                        key,
+                        internal_key.sequence(),
+                        internal_key.batch_index(),
+                        read_sequence,
+                    )?;
+                    if covered_by_table_tombstone {
+                        break;
+                    }
+                }
+            }
+            if covered_by_memtable_tombstone || covered_by_table_tombstone {
+                Ok(None)
+            } else {
+                point_value(value, &internal_key, db_path, blob_reads).map(Some)
+            }
+        }
+        ValueKind::PointDelete | ValueKind::RangeDelete => Ok(None),
+    }
+}
+
+async fn resolve_point_candidate_async<B>(
+    io: &AsyncPointReadIo<'_, B>,
+    snapshot: &LsmPointReadSnapshot,
+    memtable_range_tombstones: &RangeTombstoneIndex<RangeTombstone>,
+    key: &[u8],
+    candidate: Option<PointRecordCandidate>,
+    read_sequence: Sequence,
+) -> Result<Option<PointValue>>
+where
+    B: StorageReadBackend,
+{
+    let Some(candidate) = candidate else {
+        return Ok(None);
+    };
+    let PointRecordCandidate {
+        internal_key,
+        value,
+    } = candidate;
+
+    match internal_key.kind() {
+        ValueKind::Put => {
+            let covered_by_memtable_tombstone = range_tombstones_cover(
+                memtable_range_tombstones,
+                key,
+                internal_key.sequence(),
+                internal_key.batch_index(),
+                read_sequence,
+            );
+            let mut covered_by_table_tombstone = false;
+            if !covered_by_memtable_tombstone {
+                for table in snapshot.version.range_tombstone_tables_for_key(key) {
+                    covered_by_table_tombstone = table
+                        .range_tombstone_covers_visible_point_async(
+                            key,
+                            internal_key.sequence(),
+                            internal_key.batch_index(),
+                            read_sequence,
+                        )
+                        .await?;
+                    if covered_by_table_tombstone {
+                        break;
+                    }
+                }
+            }
+            if covered_by_memtable_tombstone || covered_by_table_tombstone {
+                Ok(None)
+            } else {
+                point_value_async(io.backend, value, &internal_key, io.db_path, io.blob_reads)
+                    .await
+                    .map(Some)
+            }
+        }
+        ValueKind::PointDelete | ValueKind::RangeDelete => Ok(None),
     }
 }
 

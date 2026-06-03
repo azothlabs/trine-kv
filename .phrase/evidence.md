@@ -10020,3 +10020,56 @@ Record only evidence that can change planning or durable decisions.
 
 - Commit async-native clean-WAL parity. Do not start another cold-read phase
   without a fresh measured hotspot.
+
+## 2026-06-03: Get-Many Internal Batching
+
+### Observation
+
+- `BucketReader::get_many_sync` and async `get_many` now call an internal batch
+  point-read path instead of looping over single-key reads.
+- The batch path deduplicates input keys, preserves duplicate positions, and
+  scatters results back to the original input order.
+- LSM table lookup now groups the keys in a batch by candidate table while
+  preserving table read order.
+- Persistent table point reads now group keys by data block, so keys in one
+  block share one metadata/data-block pass.
+- A focused regression test writes several keys into one persistent table block
+  and observes one point data-block read for a batch with duplicate output.
+- Release-profile `cargo bench --bench v1_bench` recorded:
+  `localized sequential point batch persistent` at 2753 us and
+  `localized batched point read persistent` at 1212 us.
+- The same run recorded the old random four-key persistent rows at 1290 us
+  sequential and 1500 us batched.
+
+### Interpretation
+
+- True internal batching now exists below the public `get_many` API.
+- The kept optimization is evidence-backed for locality-friendly persistent
+  batches where several requested keys land in the same table data block.
+- Random four-key batches are still not a proven win and should not be used as
+  the headline claim.
+- The implementation preserves public API and storage contracts while changing
+  only read-path planning.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q get_many --lib`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test -q --all-targets --all-features`
+- `cargo test -q --bench v1_bench`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo bench --bench v1_bench`, output redirected to
+  `/tmp/trine-get-many-batch-bench.txt`
+- `git diff --check`
+
+### Remaining Blockers
+
+- No blocker for the internal batching slice.
+- Further random small-batch improvement needs a new measured hotspot.
+
+### Recommended Next Action
+
+- Commit the internal batching change with its benchmark document.
+- If continuing point-read work, benchmark cache-warm locality and table-open
+  locality before changing more read-path code.

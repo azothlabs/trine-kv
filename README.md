@@ -181,6 +181,7 @@ cargo bench --bench v1_bench
 - [Read-only cold reopen](docs/benchmarks/v1-read-only-cold-reopen.md)
 - [Read-only cold open breakdown](docs/benchmarks/v1-read-only-cold-open-breakdown.md)
 - [Batched point reads](docs/benchmarks/v1-batched-point-reads.md)
+- [Get-many internal batching](docs/benchmarks/v1-get-many-internal-batching.md)
 
 ## Current Boundaries
 
