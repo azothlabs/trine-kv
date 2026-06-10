@@ -359,17 +359,44 @@ stands as the Band-2 dispatch type for where a single backend value is needed.
       enum can now dispatch object-store byte IO; the `DbInner` *field reroute*
       (concrete `native_storage` → `StorageBackend`) is folded into 2c-4c since it
       only makes sense alongside the open path that constructs an object-store DB.
-    - **2c-4c — `DbInner` reroute + object-store async open path + options
-      (REMAINING; the largest remaining piece).** (1) Change
-      `DbInner.native_storage: NativeFileBackend` → `storage: StorageBackend` and
-      reroute the ~15 runtime `self.inner.native_storage` sites + 3 construction
-      sites + `Drop`/stats (filesystem stays `StorageBackend::Native(..)`,
-      byte-identical — a 2b③-scale surgery). (2) A distinct
-      `open_object_store_async` (bootstrap: acquire `ObjectWriterLease`, read
-      manifest via `ObjectManifestStore`, list table/blob objects → buckets, build
-      `DbInner` with `substrate = ObjectStore`, byte backend = object store, no WAL)
-      + `options::HostStorageBackend::ObjectStore` selection + open dispatch +
-      integration tests vs `InMemoryObjectStore`.
+    - **2c-4c — object-store async orchestration path + open + options (REMAINING;
+      the largest piece). PROBE FINDING (2026-06-10) — it is NOT a bounded field
+      reroute; it is a parallel async path like the browser backend's.** Tracing
+      db.rs's flush/compaction/cleanup showed they call **concrete
+      `&NativeFileBackend` helpers** with filesystem semantics
+      (`table_file_bytes`, `remove_storage_files`, `sync_storage_directory_after_renames`,
+      `write_blob_gc_replacement_tables`, …) — they are *not* generic over the
+      backend trait. And the browser backend (async + non-filesystem, the **same
+      shape as object storage**) does not reuse them: it has a **full parallel set
+      of `_browser_async` methods** (`flush_browser_async`,
+      `run_flush_once_with_budget_browser_async`, `write_flush_inputs_browser_async`,
+      `run_compaction_once_with_budget_browser_async`, `compact_range_browser_async`,
+      `cleanup_*_browser_async`, `persist_browser_async`,
+      `bucket_with_options_browser_async`, …) dispatched by
+      `if storage_mode.is_browser_persistent()`. **So an object-store DB needs its
+      own parallel `_object_store_async` orchestration** (open / flush / compaction
+      / cleanup), NOT a swap of the `DbInner.native_storage` field. The byte IO it
+      needs is *already* generic (`*_with_backend_async<B>` with
+      `B = ObjectStoreBackend`); only the orchestration layer is missing. Concretely:
+      - `DbInner` still holds `native_storage: NativeFileBackend` (filesystem path
+        keeps using the concrete helpers unchanged). Add an
+        `object_storage: Option<ObjectStoreBackend>` field (mirroring
+        `browser_storage`), plus the `substrate = ObjectStore` (2c-3) and the
+        object-backed `ManifestStore` (2c-4a) it already supports.
+      - Parallel `_object_store_async` methods for open (acquire `ObjectWriterLease`,
+        manifest via `open_object_store_async`, list objects → buckets), flush,
+        compaction, cleanup — modeled on the `_browser_async` set. Consider first
+        refactoring the `_browser_async` orchestration to be backend-agnostic
+        (`<B: StorageObjectWriteBackend + …>`) so browser + object store share one
+        async path instead of duplicating ~15 methods; the byte helpers are already
+        generic, so this may be tractable and is the cleaner long-term shape.
+      - `options::HostStorageBackend::ObjectStore` selection + `Db::open`/open-async
+        dispatch + integration tests vs `InMemoryObjectStore` (open → put → flush →
+        reopen → read; two-writer manifest conflict).
+      **The `StorageBackend` enum (2c-4b) still has value** for any byte site that
+      becomes generic/enum-dispatched, but threading it through the *concrete*
+      filesystem helpers is the wrong move (the original 2b probe lesson) — the
+      object path forks instead.
   - **2c-5:** orphan-object GC (objects unreferenced by the published manifest).
 
 ## Why this is safe to pursue
