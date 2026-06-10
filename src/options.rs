@@ -29,6 +29,9 @@ pub enum HostStorageBackend {
     },
     /// Use browser storage.
     Browser,
+    /// Use object storage (S3 and compatible). The object-store client is
+    /// supplied at open time, not encoded here. Async-only.
+    ObjectStore,
 }
 
 impl HostStorageBackend {
@@ -36,6 +39,7 @@ impl HostStorageBackend {
         match self {
             Self::Wasi { .. } => "WASI persistent storage backend",
             Self::Browser => "browser persistent storage backend",
+            Self::ObjectStore => "object-store persistent storage backend",
         }
     }
 }
@@ -49,7 +53,7 @@ impl StorageMode {
             } => Some(path.as_path()),
             Self::InMemory
             | Self::HostPersistent {
-                backend: HostStorageBackend::Browser,
+                backend: HostStorageBackend::Browser | HostStorageBackend::ObjectStore,
             } => None,
         }
     }
@@ -68,6 +72,15 @@ impl StorageMode {
             self,
             Self::HostPersistent {
                 backend: HostStorageBackend::Browser
+            }
+        )
+    }
+
+    pub(crate) const fn is_object_store_persistent(&self) -> bool {
+        matches!(
+            self,
+            Self::HostPersistent {
+                backend: HostStorageBackend::ObjectStore
             }
         )
     }
@@ -320,6 +333,22 @@ impl DbOptions {
         Self {
             storage_mode: StorageMode::HostPersistent {
                 backend: HostStorageBackend::Browser,
+            },
+            background_worker_count: 0,
+            durability: DurabilityMode::Flush,
+            runtime: RuntimeOptions::inline(),
+            ..Self::default()
+        }
+    }
+
+    /// Creates object-storage persistent options (async-only). The object-store
+    /// client is supplied to the async open, not encoded here.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn object_store() -> Self {
+        Self {
+            storage_mode: StorageMode::HostPersistent {
+                backend: HostStorageBackend::ObjectStore,
             },
             background_worker_count: 0,
             durability: DurabilityMode::Flush,

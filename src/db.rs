@@ -23,6 +23,7 @@ use crate::{
         LsmPointReadSnapshot, LsmTree,
     },
     manifest::{self, ManifestState, ManifestStore},
+    object_store::{ObjectClient, ObjectStoreBackend},
     options::{
         BlobLevelMergePolicy, BucketOptions, DbOptions, DurabilityMode, FailOnCorruptionPolicy,
         FilterPolicy, HostStorageBackend, PrefixFilterPolicy, StorageMode, WriteOptions,
@@ -40,7 +41,9 @@ use crate::{
         StorageDirectoryListBackend, StorageManifestReadBackend, StorageObjectId,
         StorageObjectKind, StorageObjectListBackend, StorageObjectReadBackend, StorageReadBackend,
     },
-    substrate::{DurabilitySubstrate, FilesystemSubstrate},
+    substrate::{
+        DurabilitySubstrate, FilesystemSubstrate, ObjectStoreSubstrate, ObjectWriterLease,
+    },
     table::{self, Table},
     transaction::{Transaction, TransactionOptions},
     types::{CommitInfo, KeyRange, Sequence, Value},
@@ -239,6 +242,10 @@ pub(crate) struct DbInner {
     maintenance_cooperative_yields: AtomicU64,
     maintenance_budget_exhaustions: AtomicU64,
     native_storage: NativeFileBackend,
+    /// Object-storage byte backend for object-store databases (async-only),
+    /// mirroring `browser_storage`. `None` for every other backend; when set,
+    /// `native_storage` is an unused default and `substrate` is `ObjectStore`.
+    object_storage: Option<ObjectStoreBackend>,
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     browser_storage: Option<BrowserStorageBackend>,
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -938,6 +945,11 @@ impl Db {
             } => Err(Error::unsupported_backend(
                 HostStorageBackend::Browser.as_str(),
             )),
+            StorageMode::HostPersistent {
+                backend: HostStorageBackend::ObjectStore,
+            } => Err(Error::unsupported_backend(
+                "object-store databases are async-only; use the async open with a client",
+            )),
         }
     }
 
@@ -1133,6 +1145,7 @@ impl Db {
                 maintenance_cooperative_yields: AtomicU64::new(0),
                 maintenance_budget_exhaustions: AtomicU64::new(0),
                 native_storage: NativeFileBackend::new(),
+                object_storage: None,
                 browser_storage: Some(storage),
                 browser_writer_lease: writer_lease,
                 browser_wal,
@@ -1146,6 +1159,109 @@ impl Db {
         };
         db.replay_wal_batches(batches, replay_floor)?;
         Ok(db)
+    }
+
+    /// Open an object-storage database (async-only). Internal until a public
+    /// object-store client API lands; tested with the in-memory `ObjectClient`.
+    ///
+    /// The byte IO, the manifest (CAS publish), and the writer lease all ride
+    /// `client`. There is no WAL — a commit is durable once its memtable is
+    /// flushed to objects and the manifest CAS publishes them — so the recovered
+    /// visible sequence is the maximum `largest_sequence` across the manifest's
+    /// tables.
+    #[allow(dead_code)]
+    pub(crate) async fn open_object_store_async(
+        client: Arc<dyn ObjectClient>,
+        options: DbOptions,
+    ) -> Result<Self> {
+        if !options.storage_mode.is_object_store_persistent() {
+            return Err(Error::invalid_options(
+                "object-store open requires the object-store storage mode",
+            ));
+        }
+        validate_common_options(&options)?;
+
+        let backend = ObjectStoreBackend::new(Arc::clone(&client));
+        let db_path = Path::new("");
+        let manifest_key = manifest::manifest_path(db_path)
+            .to_string_lossy()
+            .into_owned();
+
+        let mut manifest =
+            ManifestStore::open_object_store_async(Arc::clone(&client), manifest_key).await?;
+        ensure_default_bucket_in_manifest_async(&mut manifest, &options).await?;
+
+        let mut buckets =
+            buckets_from_manifest_async(&backend, db_path, manifest.state(), true).await?;
+        ensure_default_bucket_loaded(&mut buckets, &options)?;
+
+        // No WAL: the durable visible boundary is the newest sequence already
+        // flushed into the manifest's tables.
+        let visible_sequence = manifest
+            .state()
+            .tables()
+            .values()
+            .flatten()
+            .map(|properties| properties.largest_sequence)
+            .max()
+            .unwrap_or(Sequence::ZERO);
+
+        let substrate = if options.read_only {
+            DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(None, None))
+        } else {
+            let lease_key = db_path
+                .join(recovery::PROCESS_LOCK_FILE_NAME)
+                .to_string_lossy()
+                .into_owned();
+            let lease = ObjectWriterLease::acquire(Arc::clone(&client), lease_key).await?;
+            DurabilitySubstrate::ObjectStore(ObjectStoreSubstrate::new(lease))
+        };
+
+        let block_cache_bytes = options.block_cache_bytes;
+        let runtime = Runtime::new(options.runtime);
+        Ok(Self {
+            inner: Arc::new(DbInner {
+                options,
+                user_handles: AtomicUsize::new(1),
+                commit_tracker: CommitTracker::new(visible_sequence),
+                closed: AtomicBool::new(false),
+                publish_barrier: PublishBarrier::new(),
+                memtable_publish_lock: Mutex::new(()),
+                buckets: RwLock::new(buckets),
+                snapshots: Arc::new(SnapshotTracker::default()),
+                pending_obsolete_table_ids: Mutex::new(BTreeSet::new()),
+                manifest: Some(Mutex::new(manifest)),
+                substrate,
+                block_cache: Arc::new(cache::BlockCache::new(block_cache_bytes)),
+                compaction_runs: AtomicU64::new(0),
+                compaction_input_tables: AtomicU64::new(0),
+                compaction_output_tables: AtomicU64::new(0),
+                compaction_input_bytes: AtomicU64::new(0),
+                compaction_output_bytes: AtomicU64::new(0),
+                blob_gc_runs: AtomicU64::new(0),
+                blob_gc_input_bytes: AtomicU64::new(0),
+                blob_gc_output_bytes: AtomicU64::new(0),
+                blob_gc_discarded_bytes: AtomicU64::new(0),
+                blob_reads: Arc::new(BlobReadMetrics::default()),
+                maintenance_cooperative_yields: AtomicU64::new(0),
+                maintenance_budget_exhaustions: AtomicU64::new(0),
+                native_storage: NativeFileBackend::new(),
+                object_storage: Some(backend),
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                browser_storage: None,
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                browser_writer_lease: None,
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                browser_wal: None,
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                browser_manifest_async_lock: futures::lock::Mutex::new(()),
+                runtime,
+                runtime_shutdown: CancellationToken::new(),
+                maintenance: Arc::new(MaintenanceCoordinator::new()),
+                background_workers: Mutex::new(Vec::new()),
+            }),
+            counts_as_user_handle: true,
+        })
     }
 
     #[cfg_attr(
@@ -1231,6 +1347,7 @@ impl Db {
                 maintenance_cooperative_yields: AtomicU64::new(0),
                 maintenance_budget_exhaustions: AtomicU64::new(0),
                 native_storage: NativeFileBackend::new(),
+                object_storage: None,
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
                 browser_storage: None,
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -1488,6 +1605,7 @@ impl Db {
                 maintenance_cooperative_yields: AtomicU64::new(0),
                 maintenance_budget_exhaustions: AtomicU64::new(0),
                 native_storage,
+                object_storage: None,
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
                 browser_storage: None,
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -2175,6 +2293,111 @@ impl Db {
             })
     }
 
+    fn object_storage(&self) -> Result<ObjectStoreBackend> {
+        self.inner
+            .object_storage
+            .clone()
+            .ok_or_else(|| Error::Corruption {
+                message: "object-store database is missing storage backend".to_owned(),
+            })
+    }
+
+    /// Flush all immutable memtables to objects and publish them via the manifest
+    /// CAS (the WAL-less durability point for object storage).
+    ///
+    /// NOTE: this holds the manifest mutex across the async CAS publish, so the
+    /// returned future is not `Send` (fine for the current async-only,
+    /// single-writer object-store path; a prepare/publish/install split — like
+    /// the browser backend — is the Send-hardening follow-up).
+    async fn flush_object_store_async(&self) -> Result<()> {
+        self.ensure_open()?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+        let db_path = Path::new("");
+        let target_sequence = self.freeze_public_flush_target()?;
+        while self.has_immutable_memtables_at_or_below(target_sequence)? {
+            let Some(_flush_guard) = self.inner.maintenance.try_start_flush() else {
+                return Err(Error::runtime_busy("object-store flush is already active"));
+            };
+            let (flush_inputs, _budget_exhausted) =
+                self.collect_flush_inputs_with_budget(MaintenanceBudget::unbounded())?;
+            if flush_inputs.is_empty() {
+                break;
+            }
+            self.write_flush_inputs_object_store_async(db_path, &flush_inputs)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn write_flush_inputs_object_store_async(
+        &self,
+        db_path: &Path,
+        flush_inputs: &[NamedFlushInput],
+    ) -> Result<()> {
+        if flush_inputs.is_empty() {
+            return Ok(());
+        }
+        let flush_sequence = flush_inputs
+            .iter()
+            .map(|input| input.input.freeze_sequence)
+            .max()
+            .expect("non-empty flush input list has a max sequence");
+        let backend = self.object_storage()?;
+        let mut written_tables = Vec::with_capacity(flush_inputs.len());
+        for input in flush_inputs {
+            let table_path = table::table_path(db_path, input.input.table_id);
+            // A write failure leaves the freshly-PUT objects unreferenced by the
+            // manifest; they are reclaimed by orphan-object GC (2c-5).
+            let table = table::write_table_with_backend_async(
+                &backend,
+                &table_path,
+                input.input.table_id,
+                input.input.table_level,
+                &input.input.table_options,
+                &input.input.point_records,
+                &input.input.range_tombstones,
+                DurabilityMode::Flush,
+            )
+            .await?;
+            written_tables.push((input.bucket.clone(), Arc::new(table)));
+        }
+
+        let _publish = self.inner.publish_barrier.enter()?;
+        self.publish_flushed_tables_object_store_async(&written_tables, flush_sequence)
+            .await?;
+        Self::install_flushed_tables(flush_inputs, written_tables)?;
+        // No WAL to rewrite: object-store databases are WAL-less.
+        Ok(())
+    }
+
+    // Holds the manifest mutex across the async CAS publish (single-writer,
+    // async-only object store). The Send-safe prepare/publish/install split — like
+    // the browser backend — is the documented hardening follow-up.
+    #[allow(clippy::await_holding_lock)]
+    async fn publish_flushed_tables_object_store_async(
+        &self,
+        tables: &[(String, Arc<Table>)],
+        flush_sequence: Sequence,
+    ) -> Result<()> {
+        let edits = tables
+            .iter()
+            .map(|(bucket, table)| (bucket.clone(), table.properties().clone()))
+            .collect::<Vec<_>>();
+        let manifest = self
+            .inner
+            .manifest
+            .as_ref()
+            .ok_or_else(|| Error::Corruption {
+                message: "object-store database is missing manifest store".to_owned(),
+            })?;
+        let mut manifest = manifest
+            .lock()
+            .map_err(|_| lock_poisoned("manifest store"))?;
+        manifest.add_tables_async(edits, flush_sequence).await
+    }
+
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     async fn run_owned_browser_task<T>(
         label: &'static str,
@@ -2245,6 +2468,11 @@ impl Db {
         if self.inner.options.storage_mode.is_browser_persistent() {
             return Err(Error::unsupported_backend(
                 "browser persistent flush requires async maintenance",
+            ));
+        }
+        if self.inner.options.storage_mode.is_object_store_persistent() {
+            return Err(Error::unsupported_backend(
+                "object-store flush requires the async API",
             ));
         }
 
@@ -5603,6 +5831,11 @@ impl Db {
             StorageMode::HostPersistent {
                 backend: HostStorageBackend::Wasi { .. },
             } => Self::open_wasi_persistent_with_options_async(options).await,
+            StorageMode::HostPersistent {
+                backend: HostStorageBackend::ObjectStore,
+            } => Err(Error::unsupported_backend(
+                "object-store databases must be opened with an object-store client",
+            )),
         }
     }
 
@@ -6023,6 +6256,10 @@ impl Db {
     /// applications to force committed memtable data into table files without
     /// blocking the caller's executor thread on native persistent storage.
     pub async fn flush(&self) -> Result<()> {
+        if self.inner.options.storage_mode.is_object_store_persistent() {
+            return self.flush_object_store_async().await;
+        }
+
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         if self.inner.options.storage_mode.is_browser_persistent() {
             let db = self.clone();
@@ -7074,6 +7311,65 @@ mod tests {
                 Poll::Pending => thread::park_timeout(Duration::from_secs(1)),
             }
         }
+    }
+
+    #[test]
+    fn object_store_database_persists_across_reopen() {
+        use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+        let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+
+        {
+            let db = block_on_test_future(Db::open_object_store_async(
+                Arc::clone(&client),
+                DbOptions::object_store(),
+            ))
+            .expect("open object-store database");
+            db.put_sync(b"alpha", b"one").expect("put alpha");
+            db.put_sync(b"beta", b"two").expect("put beta");
+            assert_eq!(
+                db.get_sync(b"alpha").expect("get alpha").as_deref(),
+                Some(b"one".as_slice())
+            );
+            // Durable flush: memtables -> SSTable objects + manifest CAS publish.
+            block_on_test_future(db.flush()).expect("flush to object storage");
+        }
+
+        // Reopen from the same object store. There is no WAL: recovery comes from
+        // the manifest (read via CAS store) + the flushed SSTable objects.
+        let db = block_on_test_future(Db::open_object_store_async(
+            client,
+            DbOptions::object_store(),
+        ))
+        .expect("reopen object-store database");
+        assert_eq!(
+            db.get_sync(b"alpha")
+                .expect("get alpha after reopen")
+                .as_deref(),
+            Some(b"one".as_slice())
+        );
+        assert_eq!(
+            db.get_sync(b"beta")
+                .expect("get beta after reopen")
+                .as_deref(),
+            Some(b"two".as_slice())
+        );
+    }
+
+    #[test]
+    fn object_store_flush_is_rejected_synchronously() {
+        use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+        let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+        let db = block_on_test_future(Db::open_object_store_async(
+            client,
+            DbOptions::object_store(),
+        ))
+        .expect("open object-store database");
+        assert!(
+            db.flush_sync().is_err(),
+            "object-store flush must require the async API"
+        );
     }
 
     #[test]
