@@ -92,6 +92,8 @@ pub(crate) struct ObjectMeta {
 ///   key or an out-of-bounds range.
 /// - `delete` is idempotent (deleting an absent key succeeds).
 /// - `list` returns objects whose key starts with the prefix, in key order.
+/// - `head` returns an object's metadata (size + `ETag`) without its bytes, or
+///   `None` when the key is absent (like S3 `HEAD`).
 /// - `put_if` applies the write only when the precondition holds, otherwise
 ///   reports [`PutIf::PreconditionFailed`] with the current `ETag`.
 pub(crate) trait ObjectClient: Send + Sync {
@@ -104,6 +106,8 @@ pub(crate) trait ObjectClient: Send + Sync {
     fn delete<'op>(&'op self, key: &str) -> ObjectFuture<'op, ()>;
 
     fn list<'op>(&'op self, prefix: &str) -> ObjectFuture<'op, Vec<ObjectMeta>>;
+
+    fn head<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<ObjectMeta>>;
 
     fn put_if<'op>(
         &'op self,
@@ -203,6 +207,14 @@ impl InMemoryObjectStore {
             .collect())
     }
 
+    fn head_inner(&self, key: &str) -> Result<Option<ObjectMeta>> {
+        Ok(self.lock()?.get(key).map(|object| ObjectMeta {
+            key: key.to_owned(),
+            size: object.bytes.len() as u64,
+            etag: object.etag.clone(),
+        }))
+    }
+
     fn put_if_inner(
         &self,
         key: &str,
@@ -257,6 +269,11 @@ impl ObjectClient for InMemoryObjectStore {
         Box::pin(async move { self.list_inner(&prefix) })
     }
 
+    fn head<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<ObjectMeta>> {
+        let key = key.to_owned();
+        Box::pin(async move { self.head_inner(&key) })
+    }
+
     fn put_if<'op>(
         &'op self,
         key: &str,
@@ -265,6 +282,44 @@ impl ObjectClient for InMemoryObjectStore {
     ) -> ObjectFuture<'op, PutIf> {
         let key = key.to_owned();
         Box::pin(async move { self.put_if_inner(&key, bytes, &precondition) })
+    }
+}
+
+/// A shared [`ObjectClient`] is itself an `ObjectClient`, so several components
+/// (e.g. the manifest store and the byte backend) can share one client by
+/// holding `Arc<C>` clones.
+impl<C: ObjectClient + ?Sized> ObjectClient for Arc<C> {
+    fn get<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<Arc<[u8]>>> {
+        (**self).get(key)
+    }
+
+    fn get_range<'op>(&'op self, key: &str, offset: u64, len: u64) -> ObjectFuture<'op, Arc<[u8]>> {
+        (**self).get_range(key, offset, len)
+    }
+
+    fn put<'op>(&'op self, key: &str, bytes: Arc<[u8]>) -> ObjectFuture<'op, ETag> {
+        (**self).put(key, bytes)
+    }
+
+    fn delete<'op>(&'op self, key: &str) -> ObjectFuture<'op, ()> {
+        (**self).delete(key)
+    }
+
+    fn list<'op>(&'op self, prefix: &str) -> ObjectFuture<'op, Vec<ObjectMeta>> {
+        (**self).list(prefix)
+    }
+
+    fn head<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<ObjectMeta>> {
+        (**self).head(key)
+    }
+
+    fn put_if<'op>(
+        &'op self,
+        key: &str,
+        bytes: Arc<[u8]>,
+        precondition: Precondition,
+    ) -> ObjectFuture<'op, PutIf> {
+        (**self).put_if(key, bytes, precondition)
     }
 }
 
@@ -346,6 +401,17 @@ mod tests {
         assert_eq!(keys, ["wal/1", "wal/2"], "prefix-filtered, key-ordered");
         assert_eq!(listed[0].size, 2);
         assert_eq!(listed[1].size, 1);
+    }
+
+    #[test]
+    fn head_returns_metadata_without_bytes_and_none_when_absent() {
+        let store = InMemoryObjectStore::new();
+        assert!(block_on(store.head("k")).unwrap().is_none());
+        let etag = block_on(store.put("k", bytes(b"hello"))).unwrap();
+        let meta = block_on(store.head("k")).unwrap().expect("present");
+        assert_eq!(meta.key, "k");
+        assert_eq!(meta.size, 5);
+        assert_eq!(meta.etag, etag);
     }
 
     #[test]

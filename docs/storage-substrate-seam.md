@@ -288,6 +288,49 @@ stands as the Band-2 dispatch type for where a single backend value is needed.
   Wire `HostStorageBackend::ObjectStore`. Validate against the in-memory
   `ObjectClient` fake + the recovery/durability suites.
 
+  **Forks resolved before slicing 2c:**
+  1. *Sync vs async substrate.* Everything object-storage is async, but the
+     `DurabilitySubstrate` methods are sync (the filesystem WAL accept is sync via
+     lane channels). Resolution: the object store is **WAL-less**, so its
+     substrate WAL methods are no-ops (`accept_commit`/`persist_wal` → `Ok(())`,
+     `wal_stats` → `None`) — no async needed there. The genuinely-async work
+     (write SSTable objects, CAS-publish the manifest) happens on the **existing
+     async flush + async manifest-publish paths**, not through the sync substrate.
+     So adding the object store does **not** require async substrate methods.
+  2. *Manifest CAS integration.* The existing `publish_manifest` byte trait is
+     keyed by `StorageObjectId` + bytes with no `ETag` — it cannot express
+     conditional-PUT. Rather than contort it, object-storage manifest publishing
+     gets its own small primitive (`ObjectManifestStore`) that tracks the object
+     `ETag` and CAS-publishes via `put_if`, returning `PublishOutcome`. A later
+     slice makes it a `ManifestStoreBackend::ObjectStore` variant.
+
+  **2c sub-slices (dependency order):**
+  - **2c-1 DONE** (`manifest.rs` + `object_store.rs`): the conflict-aware manifest
+    CAS primitive. Added `ObjectClient::head` (S3-HEAD: metadata/`ETag` without
+    bytes) + an `impl ObjectClient for Arc<C>` blanket (so the manifest store and
+    byte backend can share one client). Added `ObjectManifestStore<C: ObjectClient>`:
+    `open` (head+get → state+`ETag`), `state`, `try_publish` (encode →
+    `put_if` If-None-Match to create / If-Match to advance; on `Stored` advance
+    cached state+`ETag` and return `Published`; on `PreconditionFailed` refresh
+    from the store and return `Conflict { current }`). **This is where slice 2b ①'s
+    `PublishOutcome::Conflict` is finally constructed** (variant `#[allow(dead_code)]`
+    dropped; only the `current` field stays annotated until the rebase-retry loop
+    reads it). Dead-code + 3 unit tests vs `InMemoryObjectStore` incl. a real
+    two-writer create-race → conflict → rebase → retry-succeeds. 351 tests green
+    native + wasm `cargo check` + clippy clean.
+  - **2c-2 (next):** object-store byte backend — `ObjectStoreBackend` implementing
+    the async `Storage*Backend` byte traits over `ObjectClient` (SSTable/blob
+    read/write/list/delete), so flush/compaction can write objects via the
+    already-generic async helpers.
+  - **2c-3:** `ObjectStoreSubstrate` variant — WAL-less (no-op WAL methods) +
+    object-lease/fencing writer lease; add to the `DurabilitySubstrate` enum.
+  - **2c-4:** open/bootstrap over object storage (read manifest via
+    `ObjectManifestStore`, list objects, acquire lease) + wire
+    `ManifestStoreBackend::ObjectStore` with the rebase-retry loop (reads
+    `Conflict.current`) + `options::HostStorageBackend::ObjectStore` selection +
+    open dispatch.
+  - **2c-5:** orphan-object GC.
+
 ## Why this is safe to pursue
 
 The probe converted "unknown, possibly-everything refactor" into a bounded one:

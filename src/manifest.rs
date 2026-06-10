@@ -9,6 +9,7 @@ use crate::{
     codec::CodecId,
     error::{Error, Result},
     internal_key::{InternalKey, ValueKind},
+    object_store::{ETag, ObjectClient, Precondition, PutIf},
     options::{
         BlobLevelMergePolicy, BucketOptions, CompressionProfile, DurabilityMode, FilterPolicy,
         IndexSearchPolicy, PrefixFilterPolicy,
@@ -124,11 +125,16 @@ enum ManifestStoreBackend {
 pub(crate) enum PublishOutcome {
     /// The new state is now the durable manifest.
     Published,
-    /// Another writer published first. `current` is the winning manifest state.
-    // Constructed only by the (not-yet-wired) object-storage substrate; the
-    // filesystem path never produces it.
-    #[allow(dead_code)]
-    Conflict { current: ManifestState },
+    /// Another writer published first. `current` is the winning manifest state,
+    /// so the caller can rebase its edit and retry. Constructed by
+    /// [`ObjectManifestStore::try_publish`] (object-storage CAS); the filesystem
+    /// path never produces it.
+    Conflict {
+        // Read by the object-storage rebase-and-retry loop (wired in a later 2c
+        // slice); `published_or_err` and the filesystem path ignore it.
+        #[allow(dead_code)]
+        current: ManifestState,
+    },
 }
 
 impl PublishOutcome {
@@ -136,14 +142,102 @@ impl PublishOutcome {
     ///
     /// Used by publish sites that do not (yet) implement rebase-and-retry. On the
     /// filesystem path this is always `Ok(())` because publish never conflicts;
-    /// the object-storage substrate (slice 2c) replaces these call sites with an
-    /// actual retry loop instead of collapsing the conflict to an error.
+    /// the object-storage substrate (slice 2c) drives [`ObjectManifestStore`] in
+    /// an actual retry loop instead of collapsing the conflict to an error.
     fn published_or_err(self) -> Result<()> {
         match self {
             Self::Published => Ok(()),
             Self::Conflict { .. } => Err(Error::Conflict {
                 message: "manifest publish lost a concurrent CAS race".to_owned(),
             }),
+        }
+    }
+}
+
+/// Conflict-aware manifest publishing over an object store — the durable commit
+/// point for the object-storage substrate (slice 2c).
+///
+/// The manifest object is the single source of truth. Publishing a new state is
+/// a conditional PUT ([`ObjectClient::put_if`]): `If-None-Match` to create the
+/// first manifest, `If-Match <etag>` to advance an existing one. Losing the CAS
+/// means a concurrent writer published first; rather than clobber them,
+/// [`Self::try_publish`] refreshes the cached state + `ETag` from the store and
+/// reports [`PublishOutcome::Conflict`] carrying the winning state, so the caller
+/// can rebase its edit and retry. This is where the conflict-aware result
+/// introduced in slice 2b ① is finally constructed.
+///
+/// Unlike [`ManifestStore`], the manifest *state machine* (validation, edit
+/// shapes) is not duplicated here: this owns only the read / encode / CAS-publish
+/// of `ManifestState` bytes. A later slice wires it into the open path + the
+/// object-storage substrate as the manifest backend.
+// Landed with unit tests but not yet wired into the open path / object-storage
+// substrate (a later 2c slice); only the tests construct it so far.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct ObjectManifestStore<C: ObjectClient> {
+    client: C,
+    key: String,
+    /// `ETag` of the manifest object we last observed, or `None` when it does
+    /// not exist yet (the first publish creates it with `If-None-Match`).
+    etag: Option<ETag>,
+    state: ManifestState,
+}
+
+#[allow(dead_code)]
+impl<C: ObjectClient> ObjectManifestStore<C> {
+    /// Open by reading the current manifest object (if any) and its `ETag`.
+    pub(crate) async fn open(client: C, key: impl Into<String>) -> Result<Self> {
+        let key = key.into();
+        let (state, etag) = Self::read_current(&client, &key).await?;
+        Ok(Self {
+            client,
+            key,
+            etag,
+            state,
+        })
+    }
+
+    /// The most recently observed manifest state (after `open` or a publish).
+    pub(crate) fn state(&self) -> &ManifestState {
+        &self.state
+    }
+
+    async fn read_current(client: &C, key: &str) -> Result<(ManifestState, Option<ETag>)> {
+        match client.head(key).await? {
+            None => Ok((ManifestState::empty(), None)),
+            Some(meta) => {
+                let bytes = client.get(key).await?.ok_or_else(|| Error::Corruption {
+                    message: format!("manifest object {key} vanished between head and get"),
+                })?;
+                Ok((decode_manifest(&bytes)?, Some(meta.etag)))
+            }
+        }
+    }
+
+    /// Attempt one conditional publish of `next`.
+    ///
+    /// On success, advance the cached state + `ETag` and return
+    /// [`PublishOutcome::Published`]. On a lost CAS, refresh the cached state +
+    /// `ETag` from the store (so the caller sees the winning state) and return
+    /// [`PublishOutcome::Conflict`] without advancing past it.
+    pub(crate) async fn try_publish(&mut self, next: ManifestState) -> Result<PublishOutcome> {
+        let bytes = encode_manifest_bytes(&next)?;
+        let precondition = match &self.etag {
+            Some(etag) => Precondition::IfMatch(etag.clone()),
+            None => Precondition::IfNoneMatch,
+        };
+        match self.client.put_if(&self.key, bytes, precondition).await? {
+            PutIf::Stored { etag } => {
+                self.state = next;
+                self.etag = Some(etag);
+                Ok(PublishOutcome::Published)
+            }
+            PutIf::PreconditionFailed { .. } => {
+                let (current, etag) = Self::read_current(&self.client, &self.key).await?;
+                self.state = current.clone();
+                self.etag = etag;
+                Ok(PublishOutcome::Conflict { current })
+            }
         }
     }
 }
@@ -1603,6 +1697,94 @@ mod tests {
         assert!(
             !store.state().buckets().contains_key("users"),
             "failed publish must not advance in-memory manifest state"
+        );
+    }
+
+    fn object_manifest_state(floor: u64) -> super::ManifestState {
+        let mut state = super::ManifestState::empty();
+        state.wal_replay_floor = crate::types::Sequence::new(floor);
+        state
+    }
+
+    #[test]
+    fn object_manifest_creates_then_advances_via_cas() {
+        use crate::object_store::InMemoryObjectStore;
+
+        let store = std::sync::Arc::new(InMemoryObjectStore::new());
+        let mut manifest =
+            poll_ready(super::ObjectManifestStore::open(store, "MANIFEST")).expect("open empty");
+        assert_eq!(
+            manifest.state().wal_replay_floor(),
+            crate::types::Sequence::ZERO,
+            "absent manifest opens empty"
+        );
+
+        // First publish creates the object (If-None-Match).
+        assert!(matches!(
+            poll_ready(manifest.try_publish(object_manifest_state(5))).expect("create"),
+            super::PublishOutcome::Published
+        ));
+        assert_eq!(
+            manifest.state().wal_replay_floor(),
+            crate::types::Sequence::new(5)
+        );
+
+        // Second publish advances the existing object (If-Match).
+        assert!(matches!(
+            poll_ready(manifest.try_publish(object_manifest_state(9))).expect("advance"),
+            super::PublishOutcome::Published
+        ));
+        assert_eq!(
+            manifest.state().wal_replay_floor(),
+            crate::types::Sequence::new(9)
+        );
+    }
+
+    #[test]
+    fn object_manifest_reports_conflict_then_rebases() {
+        use crate::object_store::InMemoryObjectStore;
+
+        let store = std::sync::Arc::new(InMemoryObjectStore::new());
+        // Two writers that both observed the (empty) manifest.
+        let mut writer_a = poll_ready(super::ObjectManifestStore::open(
+            std::sync::Arc::clone(&store),
+            "MANIFEST",
+        ))
+        .expect("open A");
+        let mut writer_b = poll_ready(super::ObjectManifestStore::open(
+            std::sync::Arc::clone(&store),
+            "MANIFEST",
+        ))
+        .expect("open B");
+
+        // A wins the create race.
+        assert!(matches!(
+            poll_ready(writer_a.try_publish(object_manifest_state(5))).expect("A creates"),
+            super::PublishOutcome::Published
+        ));
+
+        // B's create loses the CAS; it learns A's winning state and does not
+        // advance past it.
+        match poll_ready(writer_b.try_publish(object_manifest_state(7))).expect("B conflicts") {
+            super::PublishOutcome::Conflict { current } => {
+                assert_eq!(current.wal_replay_floor(), crate::types::Sequence::new(5));
+            }
+            super::PublishOutcome::Published => panic!("B must lose the create race"),
+        }
+        assert_eq!(
+            writer_b.state().wal_replay_floor(),
+            crate::types::Sequence::new(5),
+            "B refreshed to the winning state, ready to rebase"
+        );
+
+        // After rebasing onto A's state, B's If-Match publish now succeeds.
+        assert!(matches!(
+            poll_ready(writer_b.try_publish(object_manifest_state(7))).expect("B retries"),
+            super::PublishOutcome::Published
+        ));
+        assert_eq!(
+            writer_b.state().wal_replay_floor(),
+            crate::types::Sequence::new(7)
         );
     }
 
