@@ -166,23 +166,46 @@ Recommendation: **WAL-less first** for the object-store substrate (simplest,
 fewest objects, aligns with the manifest-CAS-as-commit-point model already in
 `object-storage-backend.md`); revisit segmented WAL if commit latency demands it.
 
+## Band 2 finding: the async byte path is already generic; the sync path is filesystem-coupled
+
+A second probe (attempting to genericize the sync byte helpers) found that
+Band 2 is **not** a uniform "flip table/blob to one backend type":
+
+- **Async byte helpers are ALREADY generic** over the byte traits
+  (`read_table_with_backend_async<B: StorageReadBackend>`,
+  `write_table_with_backend_async<B>`, the `*_blob_*_async<B>` family, list).
+  They read whole objects eagerly (`decode_table_bytes`, `Table.file = None`).
+- **Sync byte helpers are filesystem-coupled via lazy reads.**
+  `read_table_with_backend` (sync) stores `Table.file: Some(Arc<NativeFileObject>)`
+  and serves blocks lazily through it; `LazyValue::Blob` likewise holds a
+  concrete `NativeFileBackend`. Genericizing the sync read path would either
+  regress that lazy optimization (not behavior-preserving) or make `Table`
+  itself generic over the read-object type (viral). So the sync+lazy path is
+  **inherently the filesystem path**, not portable Band 2.
+
+Consequence: the **object-storage backend is async and rides the
+already-generic async byte helpers — Band 2 is effectively already satisfied for
+it.** The sync+lazy path stays `NativeFileBackend`-only. Therefore *which* byte
+path (sync+lazy vs async+eager) to use is a **per-substrate choice**, which means
+it belongs to Band 3, not a standalone Band-2 refactor.
+
 ## Re-sliced plan
 
-The earlier "slice 2a step 1" (the `StorageBackend` byte-dispatch enum, commit
-`4993d09`) stands — it is exactly the Band-2 seam.
+The "slice 2a step 1" `StorageBackend` byte-dispatch enum (commit `4993d09`)
+stands as the Band-2 dispatch type for where a single backend value is needed.
 
-- **2a (Band 2, byte IO):** flip `table.rs`/`blob.rs` byte helpers to the
-  `StorageBackend` enum (generic-over-traits preferred so existing tests pass
-  unchanged). Behavior-identical; tests are the net.
+- **~~2a (genericize sync byte helpers)~~ — DROPPED.** The Band-2 finding above
+  shows it is unnecessary (object store uses the already-generic async path) and
+  wrong (sync+lazy is filesystem-specific). Folded into 2b.
 - **2b (Band 3 seam, filesystem impl):** define `DurabilitySubstrate`; implement
-  `FilesystemSubstrate` by delegating to current wal/recovery/manifest code;
-  route `DbInner` + open/commit/flush through it. Behavior-identical; tests are
-  the net. This is the db.rs surgery.
+  `FilesystemSubstrate` by delegating to current wal/recovery/manifest code (and
+  its sync+lazy byte path); route `DbInner` + open/commit/flush through it.
+  Behavior-identical; tests are the net. This is the db.rs surgery.
 - **2c (object-store impl):** `ObjectStoreSubstrate` over `ObjectClient` (slice
   1): WAL-less durability, conflict-aware manifest CAS (`put_if`), lease+fencing,
-  orphan-object GC; `Band 2` byte IO via `ObjectStoreBackend`. Wire
-  `HostStorageBackend::ObjectStore`. Validate against the in-memory `ObjectClient`
-  fake + the recovery/durability suites.
+  orphan-object GC; byte IO via the **async generic helpers** + `ObjectStoreBackend`.
+  Wire `HostStorageBackend::ObjectStore`. Validate against the in-memory
+  `ObjectClient` fake + the recovery/durability suites.
 
 ## Why this is safe to pursue
 
