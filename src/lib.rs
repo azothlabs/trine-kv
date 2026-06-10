@@ -73,7 +73,10 @@ mod manifest;
 mod memtable;
 #[allow(dead_code)]
 mod mvcc;
-mod object_store;
+/// Provider-agnostic object-store client ("bring your own object store"): the
+/// [`object_store::ObjectClient`] trait, its `ETag`/conditional-write types, and
+/// an in-memory fake. Implement it for S3 and open with [`Db::open_object_store`].
+pub mod object_store;
 /// Database, bucket, write, storage, runtime, and durability options.
 pub mod options;
 mod point_value;
@@ -107,6 +110,9 @@ pub use db::{Db, IntoOpenOptions, MaintenanceBudget, MaintenanceOutcome};
 pub use error::{Error, Result};
 pub use iterator::{Direction, Iter, LazyIter, LazyKeyValue, LazyValue};
 pub use mvcc::SnapshotSequence;
+pub use object_store::{
+    ETag, InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta, Precondition, PutIf,
+};
 pub use options::{
     BlobGcRatio, BlobLevelMergePolicy, BucketOptions, CompressionProfile, DbOptions,
     DurabilityMode, FailOnCorruptionPolicy, FilterPolicy, HostStorageBackend, IndexSearchPolicy,

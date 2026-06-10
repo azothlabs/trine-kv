@@ -13,9 +13,11 @@
 //! when the current `ETag` matches. A failed precondition reports the current
 //! `ETag` so a compare-and-swap caller (the manifest commit) can retry.
 //!
-//! The trait and fake are not yet consumed (the object-storage backend that
-//! uses them is a later slice), so the surface is allowed to be dead for now.
-#![allow(dead_code)]
+//! This trait is the public "bring your own object store" seam: implement
+//! [`ObjectClient`] for your provider (S3 and compatible) and open a database
+//! with [`crate::Db::open_object_store`]. The crate's manifest commit relies on
+//! `put_if` providing a real conditional write (compare-and-swap); a backend that
+//! cannot honor `If-None-Match` / `If-Match` is unsafe for concurrent writers.
 
 use std::{
     collections::BTreeMap,
@@ -41,27 +43,35 @@ use crate::storage::{
 /// methods return a boxed future rather than `async fn`. The `Send` bound is
 /// dropped only on the single-threaded wasm target, matching `StorageFuture`.
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-pub(crate) type ObjectFuture<'op, T> = Pin<Box<dyn Future<Output = Result<T>> + 'op>>;
+pub type ObjectFuture<'op, T> = Pin<Box<dyn Future<Output = Result<T>> + 'op>>;
 
 /// See the wasm variant above.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) type ObjectFuture<'op, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'op>>;
+pub type ObjectFuture<'op, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'op>>;
 
 /// An opaque entity tag identifying a specific stored version of an object. A
 /// new value is minted on every store, so an unchanged `ETag` means the object
 /// has not been overwritten since it was observed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct ETag(Arc<str>);
+pub struct ETag(Arc<str>);
 
 impl ETag {
-    pub(crate) fn as_str(&self) -> &str {
+    /// Wraps a provider's entity-tag string (e.g. an S3 `ETag` response header).
+    #[must_use]
+    pub fn new(tag: impl Into<Arc<str>>) -> Self {
+        Self(tag.into())
+    }
+
+    /// The underlying entity-tag string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
 /// Precondition for a conditional write ([`ObjectClient::put_if`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Precondition {
+pub enum Precondition {
     /// Store only if the object does not exist (create). `If-None-Match: *`.
     IfNoneMatch,
     /// Store only if the object exists and its current `ETag` equals this one
@@ -74,19 +84,28 @@ pub(crate) enum Precondition {
 /// carries the current `ETag` (or `None` when the object is absent) so the caller
 /// can re-read and retry.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PutIf {
+pub enum PutIf {
     /// The write was applied; the object now has this `ETag`.
-    Stored { etag: ETag },
+    Stored {
+        /// The new entity tag of the stored object.
+        etag: ETag,
+    },
     /// The precondition did not hold; the object was left unchanged.
-    PreconditionFailed { current: Option<ETag> },
+    PreconditionFailed {
+        /// The object's current entity tag, or `None` if it does not exist.
+        current: Option<ETag>,
+    },
 }
 
-/// Metadata for one object returned by [`ObjectClient::list`].
+/// Metadata for one object returned by [`ObjectClient::list`] / [`ObjectClient::head`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ObjectMeta {
-    pub(crate) key: String,
-    pub(crate) size: u64,
-    pub(crate) etag: ETag,
+pub struct ObjectMeta {
+    /// Object key.
+    pub key: String,
+    /// Object size in bytes.
+    pub size: u64,
+    /// Current entity tag.
+    pub etag: ETag,
 }
 
 /// A flat key/value object store: keys are strings, values are immutable byte
@@ -103,19 +122,30 @@ pub(crate) struct ObjectMeta {
 ///   `None` when the key is absent (like S3 `HEAD`).
 /// - `put_if` applies the write only when the precondition holds, otherwise
 ///   reports [`PutIf::PreconditionFailed`] with the current `ETag`.
-pub(crate) trait ObjectClient: Send + Sync {
+pub trait ObjectClient: Send + Sync {
+    /// Reads the whole object, or `None` when the key is absent.
     fn get<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<Arc<[u8]>>>;
 
+    /// Reads `len` bytes starting at `offset`; errors for an absent key or an
+    /// out-of-bounds range.
     fn get_range<'op>(&'op self, key: &str, offset: u64, len: u64) -> ObjectFuture<'op, Arc<[u8]>>;
 
+    /// Stores the object unconditionally, returning its new `ETag`.
     fn put<'op>(&'op self, key: &str, bytes: Arc<[u8]>) -> ObjectFuture<'op, ETag>;
 
+    /// Deletes the object (idempotent: deleting an absent key succeeds).
     fn delete<'op>(&'op self, key: &str) -> ObjectFuture<'op, ()>;
 
+    /// Lists objects whose key starts with `prefix`, in key order.
     fn list<'op>(&'op self, prefix: &str) -> ObjectFuture<'op, Vec<ObjectMeta>>;
 
+    /// Returns the object's metadata (size + `ETag`) without its bytes, or `None`
+    /// when the key is absent (like S3 `HEAD`).
     fn head<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<ObjectMeta>>;
 
+    /// Conditional write (compare-and-swap): stores `bytes` only if `precondition`
+    /// holds, otherwise reports [`PutIf::PreconditionFailed`] with the current
+    /// `ETag`. This is the manifest commit point; it must be a real CAS.
     fn put_if<'op>(
         &'op self,
         key: &str,
@@ -135,13 +165,15 @@ struct StoredObject {
 /// semantics, for building and testing the object-storage backend without a
 /// cloud dependency.
 #[derive(Debug, Default)]
-pub(crate) struct InMemoryObjectStore {
+pub struct InMemoryObjectStore {
     objects: Mutex<BTreeMap<String, StoredObject>>,
     next_etag: AtomicU64,
 }
 
 impl InMemoryObjectStore {
-    pub(crate) fn new() -> Self {
+    /// Creates an empty in-memory object store.
+    #[must_use]
+    pub fn new() -> Self {
         Self::default()
     }
 

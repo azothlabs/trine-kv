@@ -1164,16 +1164,22 @@ impl Db {
         Ok(db)
     }
 
-    /// Open an object-storage database (async-only). Internal until a public
-    /// object-store client API lands; tested with the in-memory `ObjectClient`.
+    /// Opens an object-storage database backed by `client` (async-only).
     ///
-    /// The byte IO, the manifest (CAS publish), and the writer lease all ride
-    /// `client`. There is no WAL — a commit is durable once its memtable is
+    /// Provide any [`ObjectClient`] implementation (S3 and compatible, or the
+    /// in-memory fake) and object-store options ([`DbOptions::object_store`]).
+    /// The byte IO, the manifest (conditional-PUT CAS), and the writer lease all
+    /// ride `client`. There is no WAL — a commit is durable once its memtable is
     /// flushed to objects and the manifest CAS publishes them — so the recovered
     /// visible sequence is the maximum `largest_sequence` across the manifest's
     /// tables.
-    #[allow(dead_code)]
-    pub(crate) async fn open_object_store_async(
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidOptions`] when `options` is not object-store mode,
+    /// or storage/`ObjectClient` errors from reading the manifest and acquiring
+    /// the writer lease.
+    pub async fn open_object_store(
         client: Arc<dyn ObjectClient>,
         options: DbOptions,
     ) -> Result<Self> {
@@ -2573,6 +2579,7 @@ impl Db {
     /// async compaction, but publishes the table replacement via the object-store
     /// manifest CAS and leaves the now-unreferenced input table objects + obsolete
     /// blobs to orphan GC (which is snapshot-safe), rather than deleting inline.
+    #[allow(clippy::too_many_lines)] // faithful mirror of the browser compaction orchestration
     async fn run_compaction_once_object_store_async(
         &self,
         db_path: &Path,
@@ -7758,7 +7765,7 @@ mod tests {
         let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
 
         {
-            let db = block_on_test_future(Db::open_object_store_async(
+            let db = block_on_test_future(Db::open_object_store(
                 Arc::clone(&client),
                 DbOptions::object_store(),
             ))
@@ -7780,11 +7787,8 @@ mod tests {
 
         // Reopen from the same object store. There is no WAL: recovery comes from
         // the manifest (read via CAS store) + the flushed SSTable objects.
-        let db = block_on_test_future(Db::open_object_store_async(
-            client,
-            DbOptions::object_store(),
-        ))
-        .expect("reopen object-store database");
+        let db = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+            .expect("reopen object-store database");
         assert_eq!(
             db.get_sync(b"alpha")
                 .expect("get alpha after reopen")
@@ -7810,7 +7814,7 @@ mod tests {
         use crate::object_store::{InMemoryObjectStore, ObjectClient};
 
         let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
-        let db = block_on_test_future(Db::open_object_store_async(
+        let db = block_on_test_future(Db::open_object_store(
             Arc::clone(&client),
             DbOptions::object_store(),
         ))
@@ -7843,11 +7847,8 @@ mod tests {
 
         // The referenced table object survived GC: reopen and read it back.
         drop(db);
-        let db = block_on_test_future(Db::open_object_store_async(
-            client,
-            DbOptions::object_store(),
-        ))
-        .expect("reopen");
+        let db = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+            .expect("reopen");
         assert_eq!(
             db.get_sync(b"k").expect("get after gc").as_deref(),
             Some(b"v".as_slice())
@@ -7859,7 +7860,7 @@ mod tests {
         use crate::object_store::{InMemoryObjectStore, ObjectClient};
 
         let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
-        let db = block_on_test_future(Db::open_object_store_async(
+        let db = block_on_test_future(Db::open_object_store(
             Arc::clone(&client),
             DbOptions::object_store(),
         ))
@@ -7889,11 +7890,8 @@ mod tests {
 
         // Reopen: the compacted tables are durable and reads are still correct.
         drop(db);
-        let db = block_on_test_future(Db::open_object_store_async(
-            client,
-            DbOptions::object_store(),
-        ))
-        .expect("reopen");
+        let db = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+            .expect("reopen");
         assert_eq!(
             db.get_sync(b"a").expect("get a after reopen").as_deref(),
             Some(b"1b".as_slice())
@@ -7911,11 +7909,8 @@ mod tests {
         fn assert_send<T: Send>(_: T) {}
 
         let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
-        let db = block_on_test_future(Db::open_object_store_async(
-            client,
-            DbOptions::object_store(),
-        ))
-        .expect("open object-store database");
+        let db = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+            .expect("open object-store database");
         // Compile-time guarantee: the object-store flush future is Send, so it can
         // be spawned on a multi-threaded executor (the manifest CAS no longer holds
         // the std mutex across the await).
@@ -7928,11 +7923,8 @@ mod tests {
         use crate::object_store::{InMemoryObjectStore, ObjectClient};
 
         let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
-        let db = block_on_test_future(Db::open_object_store_async(
-            client,
-            DbOptions::object_store(),
-        ))
-        .expect("open object-store database");
+        let db = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+            .expect("open object-store database");
         assert!(
             db.flush_sync().is_err(),
             "object-store flush must require the async API"
