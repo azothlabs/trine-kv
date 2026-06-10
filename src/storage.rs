@@ -21,6 +21,7 @@ use crate::{
         BlockingAdapterIoDriver, InlineIoDriver, IoAppendObject, IoCompletion, IoDriver,
         IoDriverInfo, IoReadObject,
     },
+    object_store::{ObjectStoreBackend, ObjectStoreReadObject},
     options::DurabilityMode,
     runtime::Runtime,
     stats::{StorageOperationMetric, StorageOperationStats},
@@ -3612,6 +3613,12 @@ fn sync_native_file_for_durability(file: &File, durability: DurabilityMode) -> R
 #[derive(Debug, Clone)]
 pub(crate) enum StorageBackend {
     Native(NativeFileBackend),
+    /// Object storage (async-only). Only the byte ops (read/write/delete/list)
+    /// are supported; append, WAL rewrite, writer lease, directory ops, and
+    /// manifest publish return `unsupported` — object-store databases are
+    /// WAL-less and publish the manifest via `ObjectManifestStore`, so they never
+    /// drive those through this enum.
+    ObjectStore(ObjectStoreBackend),
 }
 
 /// A read handle opened from a [`StorageBackend`], dispatched to the active
@@ -3620,6 +3627,7 @@ pub(crate) enum StorageBackend {
 #[derive(Debug)]
 pub(crate) enum BackendReadObject {
     Native(NativeFileObject),
+    ObjectStore(ObjectStoreReadObject),
 }
 
 /// An append handle opened from a [`StorageBackend`].
@@ -3637,12 +3645,19 @@ pub(crate) enum BackendWriterLease {
     Native(NativeFileWriterLease),
 }
 
+/// Error for a synchronous/blocking call against the async-only object-store
+/// backend.
+fn object_store_sync_unsupported() -> Error {
+    Error::unsupported_backend("object-store backend is async-only")
+}
+
 impl StorageReadBackend for StorageBackend {
     type ReadObject = BackendReadObject;
 
     fn capabilities(&self) -> StorageCapabilities {
         match self {
             StorageBackend::Native(backend) => backend.capabilities(),
+            StorageBackend::ObjectStore(backend) => backend.capabilities(),
         }
     }
 
@@ -3653,6 +3668,11 @@ impl StorageReadBackend for StorageBackend {
                     async move { Ok(BackendReadObject::Native(backend.open_read(object).await?)) },
                 )
             }
+            StorageBackend::ObjectStore(backend) => Box::pin(async move {
+                Ok(BackendReadObject::ObjectStore(
+                    backend.open_read(object).await?,
+                ))
+            }),
         }
     }
 }
@@ -3663,6 +3683,7 @@ impl BlockingStorageReadBackend for StorageBackend {
             StorageBackend::Native(backend) => Ok(BackendReadObject::Native(
                 backend.open_read_blocking(object)?,
             )),
+            StorageBackend::ObjectStore(_) => Err(object_store_sync_unsupported()),
         }
     }
 }
@@ -3671,6 +3692,7 @@ impl StorageObjectReadBackend for StorageBackend {
     fn read_object_bytes(&self, object: StorageObjectId) -> StorageFuture<'_, Option<Arc<[u8]>>> {
         match self {
             StorageBackend::Native(backend) => backend.read_object_bytes(object),
+            StorageBackend::ObjectStore(backend) => backend.read_object_bytes(object),
         }
     }
 }
@@ -3679,6 +3701,7 @@ impl BlockingStorageObjectReadBackend for StorageBackend {
     fn read_object_bytes_blocking(&self, object: StorageObjectId) -> Result<Option<Arc<[u8]>>> {
         match self {
             StorageBackend::Native(backend) => backend.read_object_bytes_blocking(object),
+            StorageBackend::ObjectStore(_) => Err(object_store_sync_unsupported()),
         }
     }
 }
@@ -3691,6 +3714,11 @@ impl StorageAppendBackend for StorageBackend {
             StorageBackend::Native(backend) => Box::pin(async move {
                 Ok(BackendAppendObject::Native(
                     backend.open_append(object).await?,
+                ))
+            }),
+            StorageBackend::ObjectStore(_) => Box::pin(async move {
+                Err(Error::unsupported_backend(
+                    "object-store backend has no appendable objects",
                 ))
             }),
         }
@@ -3711,6 +3739,11 @@ impl StorageWalRewriteBackend for StorageBackend {
             StorageBackend::Native(backend) => {
                 backend.rewrite_wal(object, temporary_object, bytes, durability)
             }
+            StorageBackend::ObjectStore(_) => Box::pin(async move {
+                Err(Error::unsupported_backend(
+                    "object-store backend is WAL-less",
+                ))
+            }),
         }
     }
 }
@@ -3730,6 +3763,11 @@ impl StorageWriterLeaseBackend for StorageBackend {
                     backend.acquire_writer_lease(object).await?,
                 ))
             }),
+            StorageBackend::ObjectStore(_) => Box::pin(async move {
+                Err(Error::unsupported_backend(
+                    "object-store writer lease is held by the durability substrate, not this backend",
+                ))
+            }),
         }
     }
 }
@@ -3740,6 +3778,11 @@ impl StorageDirectoryCreateBackend for StorageBackend {
     fn create_directory_all(&self, directory: StorageDirectoryId) -> StorageFuture<'_, ()> {
         match self {
             StorageBackend::Native(backend) => backend.create_directory_all(directory),
+            StorageBackend::ObjectStore(_) => Box::pin(async move {
+                Err(Error::unsupported_backend(
+                    "object-store backend has no directories",
+                ))
+            }),
         }
     }
 }
@@ -3753,6 +3796,11 @@ impl StorageDirectoryListBackend for StorageBackend {
     ) -> StorageFuture<'_, Vec<StorageDirectoryFile>> {
         match self {
             StorageBackend::Native(backend) => backend.list_directory_files(directory),
+            StorageBackend::ObjectStore(_) => Box::pin(async move {
+                Err(Error::unsupported_backend(
+                    "object-store backend has no directories",
+                ))
+            }),
         }
     }
 }
@@ -3763,6 +3811,11 @@ impl StorageDirectorySyncBackend for StorageBackend {
     fn sync_directory_after_renames(&self, directory: StorageDirectoryId) -> StorageFuture<'_, ()> {
         match self {
             StorageBackend::Native(backend) => backend.sync_directory_after_renames(directory),
+            StorageBackend::ObjectStore(_) => Box::pin(async move {
+                Err(Error::unsupported_backend(
+                    "object-store backend has no directories",
+                ))
+            }),
         }
     }
 }
@@ -3776,6 +3829,11 @@ impl StorageManifestReadBackend for StorageBackend {
     ) -> StorageFuture<'_, Option<Arc<[u8]>>> {
         match self {
             StorageBackend::Native(backend) => backend.read_current_manifest(object),
+            StorageBackend::ObjectStore(_) => Box::pin(async move {
+                Err(Error::unsupported_backend(
+                    "object-store manifest is read via ObjectManifestStore",
+                ))
+            }),
         }
     }
 }
@@ -3791,6 +3849,11 @@ impl StorageManifestPublishBackend for StorageBackend {
     ) -> StorageFuture<'_, ()> {
         match self {
             StorageBackend::Native(backend) => backend.publish_manifest(object, bytes, durability),
+            StorageBackend::ObjectStore(_) => Box::pin(async move {
+                Err(Error::unsupported_backend(
+                    "object-store manifest is published via ObjectManifestStore CAS",
+                ))
+            }),
         }
     }
 }
@@ -3806,6 +3869,7 @@ impl StorageObjectWriteBackend for StorageBackend {
     ) -> StorageFuture<'_, ()> {
         match self {
             StorageBackend::Native(backend) => backend.write_object(object, bytes, durability),
+            StorageBackend::ObjectStore(backend) => backend.write_object(object, bytes, durability),
         }
     }
 }
@@ -3816,6 +3880,7 @@ impl StorageObjectDeleteBackend for StorageBackend {
     fn delete_object(&self, object: StorageObjectId) -> StorageFuture<'_, ()> {
         match self {
             StorageBackend::Native(backend) => backend.delete_object(object),
+            StorageBackend::ObjectStore(backend) => backend.delete_object(object),
         }
     }
 }
@@ -3829,6 +3894,7 @@ impl StorageObjectListBackend for StorageBackend {
     ) -> StorageFuture<'_, Vec<StorageObjectId>> {
         match self {
             StorageBackend::Native(backend) => backend.list_objects(request),
+            StorageBackend::ObjectStore(backend) => backend.list_objects(request),
         }
     }
 }
@@ -3839,12 +3905,14 @@ impl StorageReadObject for BackendReadObject {
     fn object(&self) -> &StorageObjectId {
         match self {
             BackendReadObject::Native(object) => object.object(),
+            BackendReadObject::ObjectStore(object) => object.object(),
         }
     }
 
     fn len(&self) -> StorageReadFuture<'_, u64> {
         match self {
             BackendReadObject::Native(object) => object.len(),
+            BackendReadObject::ObjectStore(object) => object.len(),
         }
     }
 
@@ -3855,6 +3923,7 @@ impl StorageReadObject for BackendReadObject {
     ) -> StorageReadFuture<'op, ()> {
         match self {
             BackendReadObject::Native(object) => object.read_exact_at(offset, bytes),
+            BackendReadObject::ObjectStore(object) => object.read_exact_at(offset, bytes),
         }
     }
 }
@@ -3863,12 +3932,14 @@ impl BlockingStorageReadObject for BackendReadObject {
     fn len_blocking(&self) -> Result<u64> {
         match self {
             BackendReadObject::Native(object) => object.len_blocking(),
+            BackendReadObject::ObjectStore(_) => Err(object_store_sync_unsupported()),
         }
     }
 
     fn read_exact_at_blocking(&self, offset: usize, bytes: &mut [u8]) -> Result<()> {
         match self {
             BackendReadObject::Native(object) => object.read_exact_at_blocking(offset, bytes),
+            BackendReadObject::ObjectStore(_) => Err(object_store_sync_unsupported()),
         }
     }
 }
@@ -3918,6 +3989,49 @@ mod storage_backend_tests {
             direct
                 .capabilities()
                 .supports(StorageCapability::ObjectWrite)
+        );
+    }
+
+    #[test]
+    fn object_store_variant_dispatches_byte_ops_and_rejects_the_rest() {
+        use crate::object_store::InMemoryObjectStore;
+
+        let backend = StorageBackend::ObjectStore(ObjectStoreBackend::new(Arc::new(
+            InMemoryObjectStore::new(),
+        )));
+        let id = StorageObjectId::native_file(StorageObjectKind::Table, "/db/0001.trinet");
+
+        // Byte ops dispatch to the object-store backend.
+        poll_ready_storage_future(backend.write_object(
+            id.clone(),
+            Arc::from(b"hi".as_slice()),
+            DurabilityMode::Flush,
+        ))
+        .expect("write");
+        assert_eq!(
+            poll_ready_storage_future(backend.read_object_bytes(id.clone()))
+                .expect("read")
+                .as_deref(),
+            Some(b"hi".as_slice())
+        );
+        assert!(
+            backend
+                .capabilities()
+                .supports(StorageCapability::ObjectWrite)
+        );
+        assert!(!backend.capabilities().supports(StorageCapability::Append));
+
+        // Non-byte ops are unsupported (object-store DBs are WAL-less, async-only,
+        // and publish the manifest via ObjectManifestStore).
+        assert!(
+            poll_ready_storage_future(
+                backend.create_directory_all(StorageDirectoryId::native_file("/db"))
+            )
+            .is_err()
+        );
+        assert!(
+            backend.open_read_blocking(id).is_err(),
+            "object store is async-only"
         );
     }
 }
