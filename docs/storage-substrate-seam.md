@@ -262,11 +262,26 @@ stands as the Band-2 dispatch type for where a single backend value is needed.
     drive it against a real temp-dir WAL+lease exactly as commit/flush/close will
     (and the no-WAL/read-only case). Unconsumed (`#![allow(dead_code)]`) until ③;
     behavior byte-identical (348 tests green native + wasm `cargo check`, clippy
-    clean). **Next: 2b ③** — replace `DbInner`'s `wal` + `process_lock`
-    (+ `browser_wal`/`browser_writer_lease`) with a `DurabilitySubstrate` the open
-    path constructs and commit/flush/close drive (`accept_wal_front_door`,
-    `has_wal_front_door`, the flush rewrite, `Db::close`'s lease drop). That is the
-    invasive hot-path reroute; 348 tests guard byte-identical behavior.
+    clean).
+  - **2b ③ DONE** (`db.rs` + `db/commit.rs`): `DbInner` now holds
+    `substrate: DurabilitySubstrate` in place of the `wal: Option<WalFrontDoor>`
+    and `process_lock: Mutex<Option<ProcessLock>>` fields. All three construction
+    sites build it (native/WASI persistent = `Filesystem(wal, process_lock)`;
+    in-memory and the browser path = `Filesystem(None, None)`, inert — browser
+    durability still rides the untouched `browser_*` fields). The commit / flush /
+    close call sites route through the substrate: `accept_wal_front_door`,
+    `can_preaccept_wal_front_door`, `has_wal_front_door` (WAL presence), the sync
+    WAL persist, `add_wal_stats`, `rewrite_wal_after_replay_floor`, and
+    `close_sync`'s lease release. `#![allow(dead_code)]` removed (substrate fully
+    consumed; no dead-code warnings native or wasm). Behavior byte-identical: 348
+    tests green native (persistent suite stable across repeated runs), wasm
+    `cargo check` clean, clippy clean. **The 2b filesystem substrate is complete.**
+    **Next: 2c** — `ObjectStoreSubstrate` as a second `DurabilitySubstrate` variant
+    over `ObjectClient` (WAL-less, conflict-aware manifest CAS via `put_if` —
+    `PublishOutcome::Conflict` finally gets constructed and `published_or_err`
+    becomes a rebase-retry loop — lease+fencing, orphan-object GC); wire
+    `HostStorageBackend::ObjectStore`; validate vs the in-memory `ObjectClient`
+    fake + recovery/durability suites.
 - **2c (object-store impl):** `ObjectStoreSubstrate` over `ObjectClient` (slice
   1): WAL-less durability, conflict-aware manifest CAS (`put_if`), lease+fencing,
   orphan-object GC; byte IO via the **async generic helpers** + `ObjectStoreBackend`.

@@ -973,12 +973,12 @@ impl Db {
     fn can_preaccept_wal_front_door(&self, prepared: &PreparedCommit) -> bool {
         prepared.operation_count() != 0
             && prepared.transaction_reads.is_none()
-            && self.inner.wal.is_some()
+            && self.inner.substrate.wal_is_present()
             && self.inner.options.storage_mode.persistent_path().is_some()
     }
 
     fn has_wal_front_door(&self) -> bool {
-        self.inner.wal.is_some() || {
+        self.inner.substrate.wal_is_present() || {
             #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
             {
                 self.inner.browser_wal.is_some()
@@ -1071,12 +1071,9 @@ impl Db {
         operations: &[BatchOperation],
         durability: DurabilityMode,
     ) -> Result<()> {
-        if let Some(wal) = &self.inner.wal {
-            let accepted = wal.accept_commit(sequence, operations, durability)?;
-            debug_assert_eq!(accepted.sequence(), sequence);
-        }
-
-        Ok(())
+        self.inner
+            .substrate
+            .accept_commit(sequence, operations, durability)
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]

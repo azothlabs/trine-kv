@@ -40,6 +40,7 @@ use crate::{
         StorageDirectoryListBackend, StorageManifestReadBackend, StorageObjectId,
         StorageObjectKind, StorageObjectListBackend, StorageObjectReadBackend, StorageReadBackend,
     },
+    substrate::{DurabilitySubstrate, FilesystemSubstrate},
     table::{self, Table},
     transaction::{Transaction, TransactionOptions},
     types::{CommitInfo, KeyRange, Sequence, Value},
@@ -215,12 +216,15 @@ pub(crate) struct DbInner {
     closed: AtomicBool,
     publish_barrier: PublishBarrier,
     memtable_publish_lock: Mutex<()>,
-    process_lock: Mutex<Option<recovery::ProcessLock>>,
     buckets: RwLock<BTreeMap<String, Arc<LsmTree>>>,
     snapshots: Arc<SnapshotTracker>,
     pending_obsolete_table_ids: Mutex<BTreeSet<table::TableId>>,
     manifest: Option<Mutex<ManifestStore>>,
-    wal: Option<WalFrontDoor>,
+    // The write-ahead log + single-writer lease behind the Band 3 durability
+    // substrate (see `src/substrate.rs`). The native/WASI persistent path holds a
+    // filesystem WAL + LOCK lease here; in-memory and the browser path hold an
+    // inert substrate (browser durability still rides the `browser_*` fields).
+    substrate: DurabilitySubstrate,
     block_cache: Arc<cache::BlockCache>,
     compaction_runs: AtomicU64,
     compaction_input_tables: AtomicU64,
@@ -1108,12 +1112,13 @@ impl Db {
                 closed: AtomicBool::new(false),
                 publish_barrier: PublishBarrier::new(),
                 memtable_publish_lock: Mutex::new(()),
-                process_lock: Mutex::new(None),
                 buckets: RwLock::new(buckets),
                 snapshots: Arc::new(SnapshotTracker::default()),
                 pending_obsolete_table_ids: Mutex::new(BTreeSet::new()),
                 manifest: Some(Mutex::new(manifest)),
-                wal: None,
+                // Browser durability rides the `browser_*` fields; the substrate
+                // is inert here.
+                substrate: DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(None, None)),
                 block_cache: Arc::new(cache::BlockCache::new(block_cache_bytes)),
                 compaction_runs: AtomicU64::new(0),
                 compaction_input_tables: AtomicU64::new(0),
@@ -1206,12 +1211,12 @@ impl Db {
                 closed: AtomicBool::new(false),
                 publish_barrier: PublishBarrier::new(),
                 memtable_publish_lock: Mutex::new(()),
-                process_lock: Mutex::new(None),
                 buckets: RwLock::new(buckets),
                 snapshots: Arc::new(SnapshotTracker::default()),
                 pending_obsolete_table_ids: Mutex::new(BTreeSet::new()),
                 manifest: None,
-                wal: None,
+                // In-memory: no WAL, no lease.
+                substrate: DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(None, None)),
                 block_cache: Arc::new(cache::BlockCache::new(block_cache_bytes)),
                 compaction_runs: AtomicU64::new(0),
                 compaction_input_tables: AtomicU64::new(0),
@@ -1461,12 +1466,14 @@ impl Db {
                 closed: AtomicBool::new(false),
                 publish_barrier: PublishBarrier::new(),
                 memtable_publish_lock: Mutex::new(()),
-                process_lock: Mutex::new(process_lock),
                 buckets: RwLock::new(buckets),
                 snapshots: Arc::new(SnapshotTracker::default()),
                 pending_obsolete_table_ids: Mutex::new(BTreeSet::new()),
                 manifest: Some(Mutex::new(manifest)),
-                wal,
+                substrate: DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(
+                    wal,
+                    process_lock,
+                )),
                 block_cache: Arc::new(cache::BlockCache::new(block_cache_bytes)),
                 compaction_runs: AtomicU64::new(0),
                 compaction_input_tables: AtomicU64::new(0),
@@ -2149,9 +2156,7 @@ impl Db {
             | StorageMode::HostPersistent {
                 backend: HostStorageBackend::Wasi { .. },
             } => {
-                if let Some(wal) = &self.inner.wal {
-                    wal.persist(mode)?;
-                }
+                self.inner.substrate.persist_wal(mode)?;
                 Ok(())
             }
             StorageMode::HostPersistent { backend } => {
@@ -2710,8 +2715,7 @@ impl Db {
     }
 
     fn add_wal_stats(&self, stats: &mut DbStats) {
-        if let Some(wal) = &self.inner.wal {
-            let wal_stats = wal.stats();
+        if let Some(wal_stats) = self.inner.substrate.wal_stats() {
             stats.wal_shards = wal_stats.shards;
             stats.wal_open_shards = wal_stats.open_shards;
             stats.wal_queue_capacity = wal_stats.queue_capacity;
@@ -2785,9 +2789,7 @@ impl Db {
             let _ = self.cleanup_pending_obsolete_table_files(&db_path);
             let _ = self.cleanup_pending_obsolete_blob_files(&db_path);
         }
-        if let Ok(mut process_lock) = self.inner.process_lock.lock() {
-            process_lock.take();
-        }
+        self.inner.substrate.release_writer_lease();
     }
 
     pub(crate) fn ensure_open(&self) -> Result<()> {
@@ -5156,11 +5158,9 @@ impl Db {
     }
 
     fn rewrite_wal_after_replay_floor(&self, replay_floor: Sequence) -> Result<()> {
-        let Some(wal) = &self.inner.wal else {
-            return Ok(());
-        };
-
-        wal.rewrite_after_replay_floor(replay_floor)
+        self.inner
+            .substrate
+            .rewrite_wal_after_replay_floor(replay_floor)
     }
 
     fn install_flushed_tables(
@@ -7155,7 +7155,7 @@ mod tests {
         let db = Db::open_sync(writable_options.read_only()).expect("read-only db opens");
 
         assert!(db.options().read_only);
-        assert!(db.inner.wal.is_none());
+        assert!(!db.inner.substrate.wal_is_present());
         assert_eq!(
             db.get_sync(b"key").expect("read-only read succeeds"),
             Some(b"value".to_vec())

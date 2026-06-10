@@ -26,7 +26,6 @@
 //! the filesystem variant against a real WAL + lease so the delegation is
 //! validated against the actual `WalFrontDoor` / `ProcessLock` code, not just
 //! the types.
-#![allow(dead_code)]
 
 use std::sync::Mutex;
 
