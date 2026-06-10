@@ -73,6 +73,7 @@ mod manifest;
 mod memtable;
 #[allow(dead_code)]
 mod mvcc;
+mod object_store;
 /// Database, bucket, write, storage, runtime, and durability options.
 pub mod options;
 mod point_value;
