@@ -110,6 +110,10 @@ enum ManifestStoreBackend {
     Native(NativeFileBackend),
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     Browser(BrowserStorageBackend),
+    /// Object storage: publishing is a conditional-PUT CAS via
+    /// [`ObjectManifestStore`] (async only). Constructed by
+    /// `ManifestStore::open_object_store_async`.
+    ObjectStore(ObjectManifestStore<Arc<dyn ObjectClient>>),
 }
 
 /// Outcome of attempting to publish a new manifest state at the durable cutover
@@ -170,10 +174,11 @@ impl PublishOutcome {
 /// shapes) is not duplicated here: this owns only the read / encode / CAS-publish
 /// of `ManifestState` bytes. A later slice wires it into the open path + the
 /// object-storage substrate as the manifest backend.
-// Landed with unit tests but not yet wired into the open path / object-storage
-// substrate (a later 2c slice); only the tests construct it so far.
+// Held by `ManifestStoreBackend::ObjectStore`; the object-store open path that
+// constructs it lands in 2c-4c. `Debug` is hand-written because the backend uses
+// it over `Arc<dyn ObjectClient>`, which is not `Debug`.
 #[allow(dead_code)]
-#[derive(Debug)]
+#[derive(Clone)]
 pub(crate) struct ObjectManifestStore<C: ObjectClient> {
     client: C,
     key: String,
@@ -181,6 +186,16 @@ pub(crate) struct ObjectManifestStore<C: ObjectClient> {
     /// not exist yet (the first publish creates it with `If-None-Match`).
     etag: Option<ETag>,
     state: ManifestState,
+}
+
+impl<C: ObjectClient> std::fmt::Debug for ObjectManifestStore<C> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ObjectManifestStore")
+            .field("key", &self.key)
+            .field("etag", &self.etag)
+            .finish_non_exhaustive()
+    }
 }
 
 #[allow(dead_code)]
@@ -343,6 +358,26 @@ impl ManifestStore {
         })
     }
 
+    /// Open a manifest backed by object storage (async only).
+    ///
+    /// Reads the current manifest object (if any) and its `ETag` via
+    /// [`ObjectManifestStore`]; subsequent publishes are conditional-PUT CAS, and
+    /// the mutating `*_async` methods retry against the winning state on conflict.
+    #[allow(dead_code)] // constructed by the object-store open path in 2c-4c
+    pub(crate) async fn open_object_store_async(
+        client: Arc<dyn ObjectClient>,
+        key: impl Into<String>,
+    ) -> Result<Self> {
+        let object = ObjectManifestStore::open(client, key).await?;
+        Ok(Self {
+            // Unused for the object store (the key lives in `ObjectManifestStore`);
+            // publishing never touches `self.path` on this backend.
+            path: PathBuf::new(),
+            state: object.state().clone(),
+            storage: ManifestStoreBackend::ObjectStore(object),
+        })
+    }
+
     #[must_use]
     pub const fn state(&self) -> &ManifestState {
         &self.state
@@ -370,21 +405,21 @@ impl ManifestStore {
         name: String,
         options: BucketOptions,
     ) -> Result<()> {
-        if let Some(existing) = self.state.buckets.get(&name) {
-            if existing == &options {
-                return Ok(());
+        self.commit_edit_async(|state| {
+            if let Some(existing) = state.buckets.get(&name) {
+                if existing == &options {
+                    return Ok(None);
+                }
+                return Err(Error::invalid_options(
+                    "existing bucket options do not match requested options",
+                ));
             }
-            return Err(Error::invalid_options(
-                "existing bucket options do not match requested options",
-            ));
-        }
-
-        let mut next_state = self.state.clone();
-        next_state.buckets.insert(name.clone(), options);
-        next_state.tables.entry(name).or_default();
-        self.publish_next_state_async(next_state)
-            .await?
-            .published_or_err()
+            let mut next_state = state.clone();
+            next_state.buckets.insert(name.clone(), options.clone());
+            next_state.tables.entry(name.clone()).or_default();
+            Ok(Some(next_state))
+        })
+        .await
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -462,26 +497,26 @@ impl ManifestStore {
         tables: Vec<(String, TableProperties)>,
         wal_replay_floor: Sequence,
     ) -> Result<()> {
-        for (bucket, _) in &tables {
-            if !self.state.buckets.contains_key(bucket) {
-                return Err(Error::Corruption {
-                    message: format!("table references missing bucket: {bucket}"),
-                });
+        self.commit_edit_async(|state| {
+            for (bucket, _) in &tables {
+                if !state.buckets.contains_key(bucket) {
+                    return Err(Error::Corruption {
+                        message: format!("table references missing bucket: {bucket}"),
+                    });
+                }
             }
-        }
-
-        let mut next_state = self.state.clone();
-        for (bucket, properties) in tables {
-            next_state
-                .tables
-                .entry(bucket)
-                .or_default()
-                .push(properties);
-        }
-        next_state.wal_replay_floor = wal_replay_floor;
-        self.publish_next_state_async(next_state)
-            .await?
-            .published_or_err()
+            let mut next_state = state.clone();
+            for (bucket, properties) in &tables {
+                next_state
+                    .tables
+                    .entry(bucket.clone())
+                    .or_default()
+                    .push(properties.clone());
+            }
+            next_state.wal_replay_floor = wal_replay_floor;
+            Ok(Some(next_state))
+        })
+        .await
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -698,6 +733,11 @@ impl ManifestStore {
                     "browser manifest publish requires async API",
                 ));
             }
+            ManifestStoreBackend::ObjectStore(_) => {
+                return Err(Error::unsupported_backend(
+                    "object-store manifest publish requires async API",
+                ));
+            }
         };
         // Only advance once the durable manifest actually cut over. A lost CAS
         // race (object-storage substrate) leaves the state untouched so the
@@ -712,31 +752,66 @@ impl ManifestStore {
         &mut self,
         next_state: ManifestState,
     ) -> Result<PublishOutcome> {
-        let outcome = match &self.storage {
+        match &mut self.storage {
             ManifestStoreBackend::Native(native_storage) => {
-                publish_manifest_with_backend_async(
+                let outcome = publish_manifest_with_backend_async(
                     native_storage,
                     &self.path,
                     &next_state,
                     DurabilityMode::SyncAll,
                 )
-                .await?
+                .await?;
+                if matches!(outcome, PublishOutcome::Published) {
+                    self.state = next_state;
+                }
+                Ok(outcome)
             }
             #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
             ManifestStoreBackend::Browser(storage) => {
-                publish_manifest_with_backend_async(
+                let outcome = publish_manifest_with_backend_async(
                     storage,
                     &self.path,
                     &next_state,
                     DurabilityMode::Flush,
                 )
-                .await?
+                .await?;
+                if matches!(outcome, PublishOutcome::Published) {
+                    self.state = next_state;
+                }
+                Ok(outcome)
             }
-        };
-        if matches!(outcome, PublishOutcome::Published) {
-            self.state = next_state;
+            ManifestStoreBackend::ObjectStore(object) => {
+                // Delegate to the conflict-aware CAS primitive; after it returns,
+                // its cached state is authoritative (the published state on
+                // `Published`, or the winning state on `Conflict`).
+                let outcome = object.try_publish(next_state).await?;
+                self.state = object.state().clone();
+                Ok(outcome)
+            }
         }
-        Ok(outcome)
+    }
+
+    /// Apply a manifest edit and publish it, retrying on a lost object-store CAS.
+    ///
+    /// `edit` receives the current state and returns the next state, or `None`
+    /// when the edit is already satisfied (a no-op — e.g. creating a bucket that
+    /// already exists). On an object-store conflict, `publish_next_state_async`
+    /// has already refreshed `self.state` to the winning manifest, so the loop
+    /// re-runs `edit` to rebase its validation + mutation onto it and retries.
+    /// The filesystem/memory publish never conflicts, so the loop runs once.
+    async fn commit_edit_async(
+        &mut self,
+        edit: impl Fn(&ManifestState) -> Result<Option<ManifestState>>,
+    ) -> Result<()> {
+        loop {
+            let Some(next_state) = edit(&self.state)? else {
+                return Ok(());
+            };
+            match self.publish_next_state_async(next_state).await? {
+                PublishOutcome::Published => return Ok(()),
+                PublishOutcome::Conflict { .. } => {}
+            }
+        }
     }
 }
 
@@ -761,6 +836,11 @@ impl PreparedManifestPublish {
                     DurabilityMode::Flush,
                 )
                 .await?
+            }
+            ManifestStoreBackend::ObjectStore(_) => {
+                return Err(Error::unsupported_backend(
+                    "object-store manifest publish does not use prepared publish",
+                ));
             }
         };
         outcome.published_or_err()
@@ -1785,6 +1865,80 @@ mod tests {
         assert_eq!(
             writer_b.state().wal_replay_floor(),
             crate::types::Sequence::new(7)
+        );
+    }
+
+    #[test]
+    fn object_store_manifest_create_bucket_rebases_on_conflict() {
+        use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+        let client: std::sync::Arc<dyn ObjectClient> =
+            std::sync::Arc::new(InMemoryObjectStore::new());
+        let mut writer_a = poll_ready(ManifestStore::open_object_store_async(
+            std::sync::Arc::clone(&client),
+            "MANIFEST",
+        ))
+        .expect("open A");
+        let mut writer_b = poll_ready(ManifestStore::open_object_store_async(
+            std::sync::Arc::clone(&client),
+            "MANIFEST",
+        ))
+        .expect("open B");
+
+        // A creates "alpha" (first publish = If-None-Match create).
+        poll_ready(writer_a.create_bucket_async("alpha".to_owned(), BucketOptions::default()))
+            .expect("A creates alpha");
+        assert!(writer_a.state().buckets().contains_key("alpha"));
+
+        // B still believes the manifest is empty; creating "beta" loses the
+        // initial CAS, rebases onto A's winning state (which has alpha), re-runs
+        // the edit, and retries — ending with both buckets.
+        poll_ready(writer_b.create_bucket_async("beta".to_owned(), BucketOptions::default()))
+            .expect("B creates beta after rebase");
+        assert!(
+            writer_b.state().buckets().contains_key("alpha"),
+            "B rebased onto A's winning state"
+        );
+        assert!(writer_b.state().buckets().contains_key("beta"));
+
+        // A fresh open sees both — the durable manifest holds the merged result.
+        let reopened =
+            poll_ready(ManifestStore::open_object_store_async(client, "MANIFEST")).expect("reopen");
+        assert!(reopened.state().buckets().contains_key("alpha"));
+        assert!(reopened.state().buckets().contains_key("beta"));
+    }
+
+    #[test]
+    fn object_store_manifest_create_bucket_is_idempotent() {
+        use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+        let client: std::sync::Arc<dyn ObjectClient> =
+            std::sync::Arc::new(InMemoryObjectStore::new());
+        let mut manifest =
+            poll_ready(ManifestStore::open_object_store_async(client, "MANIFEST")).expect("open");
+        poll_ready(manifest.create_bucket_async("alpha".to_owned(), BucketOptions::default()))
+            .expect("create");
+        // Re-creating with identical options is a no-op (the edit returns None).
+        poll_ready(manifest.create_bucket_async("alpha".to_owned(), BucketOptions::default()))
+            .expect("idempotent re-create");
+        assert_eq!(manifest.state().buckets().len(), 1);
+    }
+
+    #[test]
+    fn object_store_manifest_rejects_sync_publish() {
+        use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+        let client: std::sync::Arc<dyn ObjectClient> =
+            std::sync::Arc::new(InMemoryObjectStore::new());
+        let mut manifest =
+            poll_ready(ManifestStore::open_object_store_async(client, "MANIFEST")).expect("open");
+        // The sync API is unsupported for object storage (it cannot await a CAS).
+        let error = manifest
+            .create_bucket("alpha".to_owned(), BucketOptions::default())
+            .expect_err("sync create must be rejected");
+        assert!(
+            error.to_string().contains("async API"),
+            "unexpected error: {error}"
         );
     }
 
