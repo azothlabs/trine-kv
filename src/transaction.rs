@@ -197,7 +197,11 @@ impl Transaction {
     /// transaction's read sequence; iteration errors surface as the caller
     /// drives the returned cursor. Commit fails if a later committed point
     /// mutation falls inside the range or a later range delete overlaps it.
-    pub fn range_bucket_sync(&mut self, bucket: impl Into<String>, range: KeyRange) -> Result<Iter> {
+    pub fn range_bucket_sync(
+        &mut self,
+        bucket: impl Into<String>,
+        range: KeyRange,
+    ) -> Result<Iter> {
         self.db.ensure_open()?;
         let bucket = bucket.into();
         let iter = self.db.range_at_sequence(
