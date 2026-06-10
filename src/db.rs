@@ -1730,6 +1730,82 @@ impl Db {
         Ok(Bucket::new(self.clone(), name, bucket_options, state))
     }
 
+    // Holds the manifest mutex across the async CAS create (see
+    // `publish_flushed_tables_object_store_async` for the Send-hardening note).
+    #[allow(clippy::await_holding_lock)]
+    async fn bucket_with_options_object_store_async(
+        &self,
+        name: BucketName,
+        options: BucketOptions,
+    ) -> Result<Bucket> {
+        self.ensure_open()?;
+        if name.as_str().is_empty() {
+            return Err(Error::invalid_options("bucket name cannot be empty"));
+        }
+        if name.as_str() == DEFAULT_BUCKET_NAME {
+            return Err(Error::invalid_options(
+                "default bucket is accessed through Db helpers",
+            ));
+        }
+        validate_bucket_options(&options)?;
+
+        if let Some(existing_state) = self.bucket_state_if_exists(name.as_str())? {
+            let existing_options = existing_state.options.clone();
+            if existing_options != options {
+                return Err(Error::invalid_options(
+                    "existing bucket options do not match requested options",
+                ));
+            }
+            return Ok(Bucket::new(
+                self.clone(),
+                name,
+                existing_options,
+                existing_state,
+            ));
+        }
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+
+        {
+            let manifest = self
+                .inner
+                .manifest
+                .as_ref()
+                .ok_or_else(|| Error::Corruption {
+                    message: "object-store database is missing manifest store".to_owned(),
+                })?;
+            let mut manifest = manifest
+                .lock()
+                .map_err(|_| lock_poisoned("manifest store"))?;
+            manifest
+                .create_bucket_async(name.as_str().to_owned(), options.clone())
+                .await?;
+        }
+
+        let (bucket_options, state) = {
+            let mut buckets = self
+                .inner
+                .buckets
+                .write()
+                .map_err(|_| lock_poisoned("bucket registry"))?;
+            if let Some(state) = buckets.get(name.as_str()) {
+                if state.options != options {
+                    return Err(Error::invalid_options(
+                        "existing bucket options do not match requested options",
+                    ));
+                }
+                (state.options.clone(), Arc::clone(state))
+            } else {
+                let bucket_options = options.clone();
+                let state = Arc::new(LsmTree::new(options, Vec::new())?);
+                buckets.insert(name.as_str().to_owned(), Arc::clone(&state));
+                (bucket_options, state)
+            }
+        };
+        Ok(Bucket::new(self.clone(), name, bucket_options, state))
+    }
+
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     async fn bucket_with_options_browser_async(
         &self,
@@ -2269,7 +2345,12 @@ impl Db {
         }
 
         match &self.inner.options.storage_mode {
-            StorageMode::InMemory => Ok(()),
+            // In-memory has no durable layer; object storage is WAL-less (each PUT
+            // is durable on ack, so there is nothing to persist short of a flush).
+            StorageMode::InMemory
+            | StorageMode::HostPersistent {
+                backend: HostStorageBackend::ObjectStore,
+            } => Ok(()),
             StorageMode::Persistent { .. }
             | StorageMode::HostPersistent {
                 backend: HostStorageBackend::Wasi { .. },
@@ -2570,6 +2651,11 @@ impl Db {
                 "browser persistent compaction requires async maintenance",
             ));
         }
+        if self.inner.options.storage_mode.is_object_store_persistent() {
+            return Err(Error::unsupported_backend(
+                "object-store compaction is not yet supported",
+            ));
+        }
 
         let Some(path) = self.persistent_path() else {
             return Ok(());
@@ -2593,6 +2679,11 @@ impl Db {
         if self.inner.options.storage_mode.is_browser_persistent() {
             return Err(Error::unsupported_backend(
                 "browser persistent compaction requires async maintenance",
+            ));
+        }
+        if self.inner.options.storage_mode.is_object_store_persistent() {
+            return Err(Error::unsupported_backend(
+                "object-store compaction is not yet supported",
             ));
         }
 
@@ -2631,6 +2722,11 @@ impl Db {
         if self.inner.options.storage_mode.is_browser_persistent() {
             return Err(Error::unsupported_backend(
                 "browser persistent maintenance requires async maintenance",
+            ));
+        }
+        if self.inner.options.storage_mode.is_object_store_persistent() {
+            return Err(Error::unsupported_backend(
+                "object-store maintenance is not yet supported",
             ));
         }
 
@@ -5879,6 +5975,12 @@ impl Db {
         name: impl Into<BucketName>,
         options: BucketOptions,
     ) -> Result<Bucket> {
+        if self.inner.options.storage_mode.is_object_store_persistent() {
+            return self
+                .bucket_with_options_object_store_async(name.into(), options)
+                .await;
+        }
+
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         if self.inner.options.storage_mode.is_browser_persistent() {
             return self
@@ -7331,6 +7433,11 @@ mod tests {
                 db.get_sync(b"alpha").expect("get alpha").as_deref(),
                 Some(b"one".as_slice())
             );
+            // A non-default bucket created post-open (manifest CAS create).
+            let docs =
+                block_on_test_future(db.bucket_with_options("docs", BucketOptions::default()))
+                    .expect("create docs bucket");
+            docs.put_sync(b"title", b"trine").expect("put into docs");
             // Durable flush: memtables -> SSTable objects + manifest CAS publish.
             block_on_test_future(db.flush()).expect("flush to object storage");
         }
@@ -7353,6 +7460,12 @@ mod tests {
                 .expect("get beta after reopen")
                 .as_deref(),
             Some(b"two".as_slice())
+        );
+        let docs = block_on_test_future(db.bucket_with_options("docs", BucketOptions::default()))
+            .expect("reopen docs bucket");
+        assert_eq!(
+            docs.get_sync(b"title").expect("get docs title").as_deref(),
+            Some(b"trine".as_slice())
         );
     }
 
