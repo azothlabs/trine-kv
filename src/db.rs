@@ -2569,6 +2569,203 @@ impl Db {
         Ok(deleted)
     }
 
+    /// Compact object-store tables overlapping `range` once. Mirrors the browser
+    /// async compaction, but publishes the table replacement via the object-store
+    /// manifest CAS and leaves the now-unreferenced input table objects + obsolete
+    /// blobs to orphan GC (which is snapshot-safe), rather than deleting inline.
+    async fn run_compaction_once_object_store_async(
+        &self,
+        db_path: &Path,
+        range: &KeyRange,
+        local_l0_compaction: bool,
+        budget: MaintenanceBudget,
+    ) -> Result<MaintenanceOutcome> {
+        let oldest_active_snapshot = self.oldest_active_snapshot_sequence();
+        let compaction_inputs =
+            self.collect_compaction_inputs(range, oldest_active_snapshot, local_l0_compaction)?;
+        if compaction_inputs.is_empty() {
+            return Ok(MaintenanceOutcome::default());
+        }
+
+        let reservations = compaction_inputs
+            .iter()
+            .map(|input| CompactionReservation {
+                bucket: input.bucket.clone(),
+                range: input.input.compaction_range.clone(),
+            })
+            .collect::<Vec<_>>();
+        let Some(compaction_guard) = self.inner.maintenance.reserve_compactions(reservations)
+        else {
+            return Ok(MaintenanceOutcome::busy_outcome());
+        };
+        let mut compaction_inputs = compaction_inputs
+            .into_iter()
+            .filter(|input| compaction_guard.contains(&input.bucket, &input.input.compaction_range))
+            .collect::<Vec<_>>();
+        if compaction_inputs.is_empty() {
+            return Ok(MaintenanceOutcome::busy_outcome());
+        }
+        let limit = budget.compaction_input_limit();
+        let budget_exhausted = compaction_inputs.len() > limit;
+        compaction_inputs.truncate(limit);
+        if compaction_inputs.is_empty() {
+            return Ok(MaintenanceOutcome::default());
+        }
+
+        let PendingCompactionOutputs {
+            outputs: written_tables,
+            written_table_ids: _,
+        } = self
+            .build_compaction_outputs_object_store_async(
+                db_path,
+                oldest_active_snapshot,
+                &compaction_inputs,
+            )
+            .await?;
+
+        let output_tables = written_tables
+            .iter()
+            .flat_map(|output| output.output.tables.iter().cloned())
+            .collect::<Vec<_>>();
+        let input_tables = compaction_inputs
+            .iter()
+            .flat_map(|input| input.input.input_tables.iter().cloned())
+            .collect::<Vec<_>>();
+        let obsolete_blob_ids =
+            self.obsolete_blob_ids_for_compaction(&compaction_inputs, &written_tables)?;
+
+        match self.validate_compacted_tables(&written_tables) {
+            Ok(()) => {}
+            // Output objects left unreferenced are reclaimed by orphan GC.
+            Err(error) if is_level_layout_compaction_error(&error) => {
+                return Ok(MaintenanceOutcome::default());
+            }
+            Err(error) => return Err(error),
+        }
+
+        let edits = written_tables
+            .iter()
+            .map(|output| {
+                (
+                    output.bucket.clone(),
+                    output.output.input_table_ids.clone(),
+                    output
+                        .output
+                        .tables
+                        .iter()
+                        .map(|table| table.properties().clone())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let pending_deletion_sequence = self.last_committed_sequence();
+        {
+            let (mut object, _serialize) = self.checkout_object_manifest().await?;
+            object
+                .replace_tables_batch_and_mark_blob_deletions(
+                    edits,
+                    obsolete_blob_ids,
+                    pending_deletion_sequence,
+                )
+                .await?;
+            self.install_object_manifest(object)?;
+        }
+
+        self.install_compacted_tables(written_tables)?;
+        self.record_compaction_stats_from_tables(
+            compaction_inputs.len(),
+            &input_tables,
+            &output_tables,
+        );
+        // The replaced input table objects and obsolete blob objects are now
+        // unreferenced by the manifest; orphan GC reclaims them snapshot-safely.
+
+        let outcome = MaintenanceOutcome {
+            compactions: compaction_inputs.len(),
+            budget_exhausted,
+            ..MaintenanceOutcome::default()
+        };
+        if outcome.budget_exhausted {
+            self.record_maintenance_budget_exhaustion();
+        }
+        Ok(outcome)
+    }
+
+    /// Build compaction output table objects (object-store backend). On error the
+    /// freshly-written objects are left for orphan GC. Mirrors the browser version.
+    async fn build_compaction_outputs_object_store_async(
+        &self,
+        db_path: &Path,
+        oldest_active_snapshot: Sequence,
+        compaction_inputs: &[NamedCompactionInput],
+    ) -> Result<PendingCompactionOutputs> {
+        let backend = self.object_storage()?;
+        let mut outputs = Vec::with_capacity(compaction_inputs.len());
+        let mut written_table_ids = Vec::new();
+        let mut next_table_id = self.next_table_id()?;
+
+        for input in compaction_inputs {
+            let force_rewrite_trivial =
+                input.tree.options.blob_level_merge_policy == BlobLevelMergePolicy::Always;
+            if input.input.trivial_move && !force_rewrite_trivial {
+                outputs.push(NamedCompactionOutput {
+                    bucket: input.bucket.clone(),
+                    output: LsmCompactionOutput {
+                        input_table_ids: input.input.input_table_ids.clone(),
+                        tables: vec![input.input.moved_table()?],
+                    },
+                });
+                continue;
+            }
+
+            let payloads = input.tree.build_compaction_table_payloads(
+                &input.input,
+                &input.input.compaction_range,
+                oldest_active_snapshot,
+                self.inner.options.target_table_bytes,
+            )?;
+            let mut table_options = input.input.table_options.clone();
+            table_options.rewrite_blob_indexes = should_rewrite_blob_indexes_for_compaction(
+                &input.input,
+                &payloads,
+                input.tree.options.blob_level_merge_policy,
+            );
+            let mut output_tables = Vec::with_capacity(payloads.len());
+            for payload in payloads {
+                let table_id = next_table_id;
+                next_table_id = next_table_id.next().ok_or_else(|| Error::Corruption {
+                    message: "table id counter overflow".to_owned(),
+                })?;
+                let table_path = table::table_path(db_path, table_id);
+                written_table_ids.push(table_id);
+                let table = table::write_table_with_backend_async(
+                    &backend,
+                    &table_path,
+                    table_id,
+                    input.input.table_level,
+                    &table_options,
+                    &payload.point_records,
+                    &payload.range_tombstones,
+                    DurabilityMode::Flush,
+                )
+                .await?;
+                output_tables.push(Arc::new(table));
+            }
+            outputs.push(NamedCompactionOutput {
+                bucket: input.bucket.clone(),
+                output: LsmCompactionOutput {
+                    input_table_ids: input.input.input_table_ids.clone(),
+                    tables: output_tables,
+                },
+            });
+        }
+
+        Ok(PendingCompactionOutputs {
+            outputs,
+            written_table_ids,
+        })
+    }
+
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     async fn run_owned_browser_task<T>(
         label: &'static str,
@@ -2743,7 +2940,7 @@ impl Db {
         }
         if self.inner.options.storage_mode.is_object_store_persistent() {
             return Err(Error::unsupported_backend(
-                "object-store compaction is not yet supported",
+                "object-store compaction requires the async API",
             ));
         }
 
@@ -2773,7 +2970,7 @@ impl Db {
         }
         if self.inner.options.storage_mode.is_object_store_persistent() {
             return Err(Error::unsupported_backend(
-                "object-store compaction is not yet supported",
+                "object-store compaction requires the async API",
             ));
         }
 
@@ -2816,7 +3013,7 @@ impl Db {
         }
         if self.inner.options.storage_mode.is_object_store_persistent() {
             return Err(Error::unsupported_backend(
-                "object-store maintenance is not yet supported",
+                "object-store maintenance requires the async API",
             ));
         }
 
@@ -5940,7 +6137,7 @@ impl Db {
             .fetch_add(output_bytes, Ordering::AcqRel);
     }
 
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    // Used by the async (browser + object-store) compaction paths.
     fn record_compaction_stats_from_tables(
         &self,
         runs: usize,
@@ -6472,6 +6669,21 @@ impl Db {
 
     /// Compacts table files that overlap `range`.
     pub async fn compact_range(&self, range: KeyRange) -> Result<()> {
+        if self.inner.options.storage_mode.is_object_store_persistent() {
+            self.ensure_open()?;
+            if self.inner.options.read_only {
+                return Err(Error::ReadOnly);
+            }
+            self.run_compaction_once_object_store_async(
+                Path::new(""),
+                &range,
+                false,
+                MaintenanceBudget::unbounded(),
+            )
+            .await?;
+            return Ok(());
+        }
+
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         if self.inner.options.storage_mode.is_browser_persistent() {
             let db = self.clone();
@@ -6498,6 +6710,16 @@ impl Db {
         range: KeyRange,
         budget: MaintenanceBudget,
     ) -> Result<MaintenanceOutcome> {
+        if self.inner.options.storage_mode.is_object_store_persistent() {
+            self.ensure_open()?;
+            if self.inner.options.read_only {
+                return Err(Error::ReadOnly);
+            }
+            return self
+                .run_compaction_once_object_store_async(Path::new(""), &range, false, budget)
+                .await;
+        }
+
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         if self.inner.options.storage_mode.is_browser_persistent() {
             let db = self.clone();
@@ -6529,11 +6751,27 @@ impl Db {
         budget: MaintenanceBudget,
     ) -> Result<MaintenanceOutcome> {
         if self.inner.options.storage_mode.is_object_store_persistent() {
-            // Object-store maintenance is orphan-object GC for now (compaction is
-            // a scoped follow-up). The budget does not apply to a delete sweep.
-            let _ = budget;
+            self.ensure_open()?;
+            if self.inner.options.read_only {
+                return Err(Error::ReadOnly);
+            }
+            // Object-store maintenance: flush immutable memtables, compact, then
+            // reclaim orphaned/obsolete objects (snapshot-safe GC).
+            let mut outcome = MaintenanceOutcome::default();
+            if self.has_immutable_memtables()? {
+                self.flush_object_store_async().await?;
+            }
+            let compaction = self
+                .run_compaction_once_object_store_async(
+                    Path::new(""),
+                    &KeyRange::all(),
+                    false,
+                    budget,
+                )
+                .await?;
+            outcome.add_assign(compaction);
             self.cleanup_object_store_orphans_async().await?;
-            return Ok(MaintenanceOutcome::default());
+            return Ok(outcome);
         }
 
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -7471,8 +7709,8 @@ mod tests {
     };
 
     use super::{
-        CompactionReservation, Db, Error, MaintenanceCoordinator, compaction_reservations_conflict,
-        record_maintenance_success, shutdown_background_workers,
+        CompactionReservation, Db, Error, MaintenanceBudget, MaintenanceCoordinator,
+        compaction_reservations_conflict, record_maintenance_success, shutdown_background_workers,
     };
     use crate::{
         bucket::DEFAULT_BUCKET_NAME,
@@ -7613,6 +7851,56 @@ mod tests {
         assert_eq!(
             db.get_sync(b"k").expect("get after gc").as_deref(),
             Some(b"v".as_slice())
+        );
+    }
+
+    #[test]
+    fn object_store_compaction_merges_tables_and_reclaims_objects() {
+        use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+        let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+        let db = block_on_test_future(Db::open_object_store_async(
+            Arc::clone(&client),
+            DbOptions::object_store(),
+        ))
+        .expect("open object-store database");
+
+        // Three flushed tables, including an overwrite of `a`.
+        db.put_sync(b"a", b"1").expect("put a");
+        block_on_test_future(db.flush()).expect("flush 1");
+        db.put_sync(b"b", b"2").expect("put b");
+        block_on_test_future(db.flush()).expect("flush 2");
+        db.put_sync(b"a", b"1b").expect("overwrite a");
+        block_on_test_future(db.flush()).expect("flush 3");
+
+        // Compact, then reclaim the now-obsolete input table objects.
+        block_on_test_future(db.compact_range(KeyRange::all())).expect("compact");
+        assert_eq!(
+            db.get_sync(b"a").expect("get a").as_deref(),
+            Some(b"1b".as_slice()),
+            "newest value wins after compaction"
+        );
+        assert_eq!(
+            db.get_sync(b"b").expect("get b").as_deref(),
+            Some(b"2".as_slice())
+        );
+        block_on_test_future(db.run_maintenance_with_budget(MaintenanceBudget::unbounded()))
+            .expect("maintenance reclaims obsolete objects");
+
+        // Reopen: the compacted tables are durable and reads are still correct.
+        drop(db);
+        let db = block_on_test_future(Db::open_object_store_async(
+            client,
+            DbOptions::object_store(),
+        ))
+        .expect("reopen");
+        assert_eq!(
+            db.get_sync(b"a").expect("get a after reopen").as_deref(),
+            Some(b"1b".as_slice())
+        );
+        assert_eq!(
+            db.get_sync(b"b").expect("get b after reopen").as_deref(),
+            Some(b"2".as_slice())
         );
     }
 

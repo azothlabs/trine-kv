@@ -326,6 +326,56 @@ impl<C: ObjectClient> ObjectManifestStore<C> {
         })
         .await
     }
+
+    /// Replace compaction-input tables with their outputs and mark obsolete blob
+    /// files pending deletion, CAS-published with rebase-retry.
+    pub(crate) async fn replace_tables_batch_and_mark_blob_deletions(
+        &mut self,
+        replacements: Vec<(String, Vec<TableId>, Vec<TableProperties>)>,
+        pending_blob_deletions: Vec<u64>,
+        pending_deletion_sequence: Sequence,
+    ) -> Result<()> {
+        self.commit_edit(|state| {
+            for (bucket, removed_table_ids, _) in &replacements {
+                let tables = state.tables.get(bucket).ok_or_else(|| Error::Corruption {
+                    message: format!("compaction references missing bucket: {bucket}"),
+                })?;
+                for table_id in removed_table_ids {
+                    if !tables.iter().any(|properties| properties.id == *table_id) {
+                        return Err(Error::Corruption {
+                            message: format!(
+                                "compaction input table is missing: {}",
+                                table_id.get()
+                            ),
+                        });
+                    }
+                }
+            }
+
+            let mut next_state = state.clone();
+            for (bucket, removed_table_ids, replacement_tables) in &replacements {
+                let tables =
+                    next_state
+                        .tables
+                        .get_mut(bucket)
+                        .ok_or_else(|| Error::Corruption {
+                            message: format!("manifest is missing table list for bucket: {bucket}"),
+                        })?;
+                tables.retain(|properties| !removed_table_ids.contains(&properties.id));
+                for replacement in replacement_tables {
+                    tables.push(replacement.clone());
+                }
+            }
+            for file_id in &pending_blob_deletions {
+                next_state
+                    .pending_blob_deletions
+                    .entry(*file_id)
+                    .or_insert(pending_deletion_sequence);
+            }
+            Ok(Some(next_state))
+        })
+        .await
+    }
 }
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
