@@ -231,7 +231,20 @@ stands as the Band-2 dispatch type for where a single backend value is needed.
 - **2b (Band 3 seam, filesystem impl):** define `DurabilitySubstrate`; implement
   `FilesystemSubstrate` by delegating to current wal/recovery/manifest code (and
   its sync+lazy byte path); route `DbInner` + open/commit/flush through it.
-  Behavior-identical; tests are the net. This is the db.rs surgery.
+  Behavior-identical; tests are the net. This is the db.rs surgery. Entry order:
+  ① conflict-aware publish chokepoint → ② substrate around WAL+bootstrap+lease →
+  ③ route `DbInner`+open/commit/flush.
+  - **2b ① DONE** (`manifest.rs`): the publish chokepoint is now conflict-aware.
+    New `pub(crate) enum PublishOutcome { Published, Conflict { current } }`;
+    `publish_manifest_with_backend[_async]`, `publish_next_state[_async]`, and the
+    wasm `publish_async` all return it; `ManifestStore` advances its in-memory
+    `state` **only** on `Published` (a lost CAS leaves state untouched for rebase).
+    The filesystem path (temp-write + atomic rename) can't lose a race → always
+    `Published`, so every public `ManifestStore` method keeps its `Result<()>`
+    signature via `?.published_or_err()` and `db.rs` is untouched — behavior
+    byte-identical (346 tests green native + wasm `cargo check`). `published_or_err`
+    is the placeholder 2c replaces with a rebase-and-retry loop; the `Conflict`
+    variant is `#[allow(dead_code)]` until the object-store substrate constructs it.
 - **2c (object-store impl):** `ObjectStoreSubstrate` over `ObjectClient` (slice
   1): WAL-less durability, conflict-aware manifest CAS (`put_if`), lease+fencing,
   orphan-object GC; byte IO via the **async generic helpers** + `ObjectStoreBackend`.

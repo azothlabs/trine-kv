@@ -111,6 +111,43 @@ enum ManifestStoreBackend {
     Browser(BrowserStorageBackend),
 }
 
+/// Outcome of attempting to publish a new manifest state at the durable cutover
+/// point.
+///
+/// Filesystem publish is temp-write + atomic `rename`: it cannot lose a race, so
+/// it always reports [`PublishOutcome::Published`]. The conflict-aware variant
+/// exists for the object-storage substrate, whose publish is a conditional-write
+/// CAS that can lose to another writer; it then reports
+/// [`PublishOutcome::Conflict`] carrying the manifest that is now current, so the
+/// caller can rebase its edit onto the winner and retry.
+#[derive(Debug)]
+pub(crate) enum PublishOutcome {
+    /// The new state is now the durable manifest.
+    Published,
+    /// Another writer published first. `current` is the winning manifest state.
+    // Constructed only by the (not-yet-wired) object-storage substrate; the
+    // filesystem path never produces it.
+    #[allow(dead_code)]
+    Conflict { current: ManifestState },
+}
+
+impl PublishOutcome {
+    /// Collapse to `Result<()>`, mapping a lost CAS race to a conflict error.
+    ///
+    /// Used by publish sites that do not (yet) implement rebase-and-retry. On the
+    /// filesystem path this is always `Ok(())` because publish never conflicts;
+    /// the object-storage substrate (slice 2c) replaces these call sites with an
+    /// actual retry loop instead of collapsing the conflict to an error.
+    fn published_or_err(self) -> Result<()> {
+        match self {
+            Self::Published => Ok(()),
+            Self::Conflict { .. } => Err(Error::Conflict {
+                message: "manifest publish lost a concurrent CAS race".to_owned(),
+            }),
+        }
+    }
+}
+
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedManifestPublish {
@@ -139,7 +176,7 @@ impl ManifestStore {
             decode_manifest(&bytes)?
         } else if create_if_missing {
             let state = ManifestState::empty();
-            publish_manifest_with_backend(&native_storage, &path, &state)?;
+            publish_manifest_with_backend(&native_storage, &path, &state)?.published_or_err()?;
             state
         } else {
             ManifestState::empty()
@@ -171,7 +208,8 @@ impl ManifestStore {
                 &state,
                 DurabilityMode::SyncAll,
             )
-            .await?;
+            .await?
+            .published_or_err()?;
             state
         } else {
             ManifestState::empty()
@@ -197,7 +235,8 @@ impl ManifestStore {
             } else if create_if_missing {
                 let state = ManifestState::empty();
                 publish_manifest_with_backend_async(&storage, &path, &state, DurabilityMode::Flush)
-                    .await?;
+                    .await?
+                    .published_or_err()?;
                 state
             } else {
                 ManifestState::empty()
@@ -228,7 +267,7 @@ impl ManifestStore {
         let mut next_state = self.state.clone();
         next_state.buckets.insert(name.clone(), options);
         next_state.tables.entry(name).or_default();
-        self.publish_next_state(next_state)
+        self.publish_next_state(next_state)?.published_or_err()
     }
 
     #[allow(dead_code)]
@@ -249,7 +288,9 @@ impl ManifestStore {
         let mut next_state = self.state.clone();
         next_state.buckets.insert(name.clone(), options);
         next_state.tables.entry(name).or_default();
-        self.publish_next_state_async(next_state).await
+        self.publish_next_state_async(next_state)
+            .await?
+            .published_or_err()
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -318,7 +359,7 @@ impl ManifestStore {
                 .push(properties);
         }
         next_state.wal_replay_floor = wal_replay_floor;
-        self.publish_next_state(next_state)
+        self.publish_next_state(next_state)?.published_or_err()
     }
 
     #[allow(dead_code)]
@@ -344,7 +385,9 @@ impl ManifestStore {
                 .push(properties);
         }
         next_state.wal_replay_floor = wal_replay_floor;
-        self.publish_next_state_async(next_state).await
+        self.publish_next_state_async(next_state)
+            .await?
+            .published_or_err()
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -452,7 +495,7 @@ impl ManifestStore {
                 .or_insert(pending_deletion_sequence);
         }
 
-        self.publish_next_state(next_state)
+        self.publish_next_state(next_state)?.published_or_err()
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -522,7 +565,7 @@ impl ManifestStore {
         for file_id in file_ids {
             next_state.pending_blob_deletions.remove(file_id);
         }
-        self.publish_next_state(next_state)
+        self.publish_next_state(next_state)?.published_or_err()
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -546,14 +589,14 @@ impl ManifestStore {
         })
     }
 
-    fn publish_next_state(&mut self, next_state: ManifestState) -> Result<()> {
+    fn publish_next_state(&mut self, next_state: ManifestState) -> Result<PublishOutcome> {
         // Manifest publish is the durable cutover point. Keep the in-memory
         // state unchanged until storage publish succeeds, so a failed create,
         // flush, or compaction cannot make later operations believe an edit was
         // committed when the durable manifest never advanced.
-        match &self.storage {
+        let outcome = match &self.storage {
             ManifestStoreBackend::Native(native_storage) => {
-                publish_manifest_with_backend(native_storage, &self.path, &next_state)?;
+                publish_manifest_with_backend(native_storage, &self.path, &next_state)?
             }
             #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
             ManifestStoreBackend::Browser(_) => {
@@ -561,13 +604,21 @@ impl ManifestStore {
                     "browser manifest publish requires async API",
                 ));
             }
+        };
+        // Only advance once the durable manifest actually cut over. A lost CAS
+        // race (object-storage substrate) leaves the state untouched so the
+        // caller can rebase onto the winner and retry.
+        if matches!(outcome, PublishOutcome::Published) {
+            self.state = next_state;
         }
-        self.state = next_state;
-        Ok(())
+        Ok(outcome)
     }
 
-    async fn publish_next_state_async(&mut self, next_state: ManifestState) -> Result<()> {
-        match &self.storage {
+    async fn publish_next_state_async(
+        &mut self,
+        next_state: ManifestState,
+    ) -> Result<PublishOutcome> {
+        let outcome = match &self.storage {
             ManifestStoreBackend::Native(native_storage) => {
                 publish_manifest_with_backend_async(
                     native_storage,
@@ -575,7 +626,7 @@ impl ManifestStore {
                     &next_state,
                     DurabilityMode::SyncAll,
                 )
-                .await?;
+                .await?
             }
             #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
             ManifestStoreBackend::Browser(storage) => {
@@ -585,18 +636,20 @@ impl ManifestStore {
                     &next_state,
                     DurabilityMode::Flush,
                 )
-                .await?;
+                .await?
             }
+        };
+        if matches!(outcome, PublishOutcome::Published) {
+            self.state = next_state;
         }
-        self.state = next_state;
-        Ok(())
+        Ok(outcome)
     }
 }
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 impl PreparedManifestPublish {
     pub(crate) async fn publish_async(&self) -> Result<()> {
-        match &self.storage {
+        let outcome = match &self.storage {
             ManifestStoreBackend::Native(native_storage) => {
                 publish_manifest_with_backend_async(
                     native_storage,
@@ -604,7 +657,7 @@ impl PreparedManifestPublish {
                     &self.next_state,
                     DurabilityMode::SyncAll,
                 )
-                .await
+                .await?
             }
             ManifestStoreBackend::Browser(storage) => {
                 publish_manifest_with_backend_async(
@@ -613,9 +666,10 @@ impl PreparedManifestPublish {
                     &self.next_state,
                     DurabilityMode::Flush,
                 )
-                .await
+                .await?
             }
-        }
+        };
+        outcome.published_or_err()
     }
 }
 
@@ -683,10 +737,13 @@ fn publish_manifest_with_backend(
     backend: &NativeFileBackend,
     path: &Path,
     state: &ManifestState,
-) -> Result<()> {
+) -> Result<PublishOutcome> {
     let bytes = encode_manifest_bytes(state)?;
     let object = manifest_storage_object(path);
-    backend.publish_manifest_blocking(object, bytes, DurabilityMode::SyncAll)
+    backend.publish_manifest_blocking(object, bytes, DurabilityMode::SyncAll)?;
+    // Temp-write + atomic rename cannot lose a CAS race, so the filesystem
+    // manifest always advances.
+    Ok(PublishOutcome::Published)
 }
 
 async fn publish_manifest_with_backend_async<B>(
@@ -694,13 +751,14 @@ async fn publish_manifest_with_backend_async<B>(
     path: &Path,
     state: &ManifestState,
     durability: DurabilityMode,
-) -> Result<()>
+) -> Result<PublishOutcome>
 where
     B: StorageManifestPublishBackend,
 {
     let bytes = encode_manifest_bytes(state)?;
     let object = manifest_storage_object(path);
-    backend.publish_manifest(object, bytes, durability).await
+    backend.publish_manifest(object, bytes, durability).await?;
+    Ok(PublishOutcome::Published)
 }
 
 fn encode_manifest_bytes(state: &ManifestState) -> Result<Arc<[u8]>> {
