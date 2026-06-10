@@ -244,6 +244,11 @@ pub(crate) struct DbInner {
     /// mirroring `browser_storage`. `None` for every other backend; when set,
     /// `native_storage` is an unused default and `substrate` is `ObjectStore`.
     object_storage: Option<ObjectStoreBackend>,
+    /// Key prefix for an object-store database, used as the `db_path` for all of
+    /// its object keys (`<prefix>/MANIFEST`, `<prefix>/LOCK`,
+    /// `<prefix>/table-*.trinet`, …) so multiple databases can share one bucket.
+    /// Empty (bucket root) for the default open and for every other backend.
+    object_storage_prefix: PathBuf,
     /// Serializes object-store manifest publishes so the CAS clone -> commit ->
     /// write-back stays atomic without holding the (std) manifest mutex across
     /// the await. Mirrors `browser_manifest_async_lock`; unused by other backends.
@@ -1148,6 +1153,7 @@ impl Db {
                 maintenance_budget_exhaustions: AtomicU64::new(0),
                 native_storage: NativeFileBackend::new(),
                 object_storage: None,
+                object_storage_prefix: PathBuf::new(),
                 object_manifest_async_lock: futures::lock::Mutex::new(()),
                 browser_storage: Some(storage),
                 browser_writer_lease: writer_lease,
@@ -1164,10 +1170,30 @@ impl Db {
         Ok(db)
     }
 
-    /// Opens an object-storage database backed by `client` (async-only).
+    /// Opens an object-storage database at the bucket root (async-only).
+    ///
+    /// Equivalent to [`Db::open_object_store_at`] with an empty key prefix. Use
+    /// the prefixed form to host several databases in one bucket.
+    ///
+    /// # Errors
+    ///
+    /// See [`Db::open_object_store_at`].
+    pub async fn open_object_store(
+        client: Arc<dyn ObjectClient>,
+        options: DbOptions,
+    ) -> Result<Self> {
+        Self::open_object_store_at(client, "", options).await
+    }
+
+    /// Opens an object-storage database under a key `prefix` (async-only).
     ///
     /// Provide any [`ObjectClient`] implementation (S3 and compatible, or the
     /// in-memory fake) and object-store options ([`DbOptions::object_store`]).
+    /// All of the database's object keys live under `prefix`
+    /// (`<prefix>/MANIFEST`, `<prefix>/LOCK`, `<prefix>/table-*.trinet`, …), so
+    /// several databases can share one bucket. An empty `prefix` uses the bucket
+    /// root.
+    ///
     /// The byte IO, the manifest (conditional-PUT CAS), and the writer lease all
     /// ride `client`. There is no WAL — a commit is durable once its memtable is
     /// flushed to objects and the manifest CAS publishes them — so the recovered
@@ -1179,8 +1205,9 @@ impl Db {
     /// Returns [`Error::InvalidOptions`] when `options` is not object-store mode,
     /// or storage/`ObjectClient` errors from reading the manifest and acquiring
     /// the writer lease.
-    pub async fn open_object_store(
+    pub async fn open_object_store_at(
         client: Arc<dyn ObjectClient>,
+        prefix: impl Into<String>,
         options: DbOptions,
     ) -> Result<Self> {
         if !options.storage_mode.is_object_store_persistent() {
@@ -1191,8 +1218,8 @@ impl Db {
         validate_common_options(&options)?;
 
         let backend = ObjectStoreBackend::new(Arc::clone(&client));
-        let db_path = Path::new("");
-        let manifest_key = manifest::manifest_path(db_path)
+        let db_path = PathBuf::from(prefix.into());
+        let manifest_key = manifest::manifest_path(&db_path)
             .to_string_lossy()
             .into_owned();
 
@@ -1201,7 +1228,7 @@ impl Db {
         ensure_default_bucket_in_manifest_async(&mut manifest, &options).await?;
 
         let mut buckets =
-            buckets_from_manifest_async(&backend, db_path, manifest.state(), true).await?;
+            buckets_from_manifest_async(&backend, &db_path, manifest.state(), true).await?;
         ensure_default_bucket_loaded(&mut buckets, &options)?;
 
         // No WAL: the durable visible boundary is the newest sequence already
@@ -1256,6 +1283,7 @@ impl Db {
                 maintenance_budget_exhaustions: AtomicU64::new(0),
                 native_storage: NativeFileBackend::new(),
                 object_storage: Some(backend),
+                object_storage_prefix: db_path,
                 object_manifest_async_lock: futures::lock::Mutex::new(()),
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
                 browser_storage: None,
@@ -1358,6 +1386,7 @@ impl Db {
                 maintenance_budget_exhaustions: AtomicU64::new(0),
                 native_storage: NativeFileBackend::new(),
                 object_storage: None,
+                object_storage_prefix: PathBuf::new(),
                 object_manifest_async_lock: futures::lock::Mutex::new(()),
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
                 browser_storage: None,
@@ -1617,6 +1646,7 @@ impl Db {
                 maintenance_budget_exhaustions: AtomicU64::new(0),
                 native_storage,
                 object_storage: None,
+                object_storage_prefix: PathBuf::new(),
                 object_manifest_async_lock: futures::lock::Mutex::new(()),
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
                 browser_storage: None,
@@ -2382,6 +2412,12 @@ impl Db {
             })
     }
 
+    /// The key prefix (as a `db_path`) under which this object-store database's
+    /// keys live; empty for a bucket-root database.
+    fn object_store_db_path(&self) -> &Path {
+        &self.inner.object_storage_prefix
+    }
+
     /// Flush all immutable memtables to objects and publish them via the manifest
     /// CAS (the WAL-less durability point for object storage).
     ///
@@ -2394,7 +2430,7 @@ impl Db {
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
-        let db_path = Path::new("");
+        let db_path = self.object_store_db_path();
         let target_sequence = self.freeze_public_flush_target()?;
         while self.has_immutable_memtables_at_or_below(target_sequence)? {
             let Some(_flush_guard) = self.inner.maintenance.try_start_flush() else {
@@ -2530,7 +2566,7 @@ impl Db {
             ));
         };
         let backend = self.object_storage()?;
-        let db_path = Path::new("");
+        let db_path = self.object_store_db_path();
 
         let (referenced_tables, referenced_blobs) = {
             let manifest = self
@@ -6682,7 +6718,7 @@ impl Db {
                 return Err(Error::ReadOnly);
             }
             self.run_compaction_once_object_store_async(
-                Path::new(""),
+                self.object_store_db_path(),
                 &range,
                 false,
                 MaintenanceBudget::unbounded(),
@@ -6723,7 +6759,12 @@ impl Db {
                 return Err(Error::ReadOnly);
             }
             return self
-                .run_compaction_once_object_store_async(Path::new(""), &range, false, budget)
+                .run_compaction_once_object_store_async(
+                    self.object_store_db_path(),
+                    &range,
+                    false,
+                    budget,
+                )
                 .await;
         }
 
@@ -6770,7 +6811,7 @@ impl Db {
             }
             let compaction = self
                 .run_compaction_once_object_store_async(
-                    Path::new(""),
+                    self.object_store_db_path(),
                     &KeyRange::all(),
                     false,
                     budget,
@@ -7756,6 +7797,55 @@ mod tests {
                 Poll::Pending => thread::park_timeout(Duration::from_secs(1)),
             }
         }
+    }
+
+    #[test]
+    fn object_store_prefix_isolates_databases_in_one_bucket() {
+        use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+        let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+
+        // Two databases sharing one object store under different key prefixes.
+        let a = block_on_test_future(Db::open_object_store_at(
+            Arc::clone(&client),
+            "app/a",
+            DbOptions::object_store(),
+        ))
+        .expect("open a");
+        let b = block_on_test_future(Db::open_object_store_at(
+            Arc::clone(&client),
+            "app/b",
+            DbOptions::object_store(),
+        ))
+        .expect("open b");
+        a.put_sync(b"k", b"from-a").expect("put a");
+        b.put_sync(b"k", b"from-b").expect("put b");
+        block_on_test_future(a.flush()).expect("flush a");
+        block_on_test_future(b.flush()).expect("flush b");
+        drop(a);
+        drop(b);
+
+        // Reopen each by prefix: fully isolated, each sees only its own value.
+        let a = block_on_test_future(Db::open_object_store_at(
+            Arc::clone(&client),
+            "app/a",
+            DbOptions::object_store(),
+        ))
+        .expect("reopen a");
+        let b = block_on_test_future(Db::open_object_store_at(
+            client,
+            "app/b",
+            DbOptions::object_store(),
+        ))
+        .expect("reopen b");
+        assert_eq!(
+            a.get_sync(b"k").expect("get a").as_deref(),
+            Some(b"from-a".as_slice())
+        );
+        assert_eq!(
+            b.get_sync(b"k").expect("get b").as_deref(),
+            Some(b"from-b".as_slice())
+        );
     }
 
     #[test]

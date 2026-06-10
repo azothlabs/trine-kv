@@ -374,7 +374,6 @@ mod tests {
     #[ignore = "requires real S3/R2 credentials; run with --features s3 -- --ignored"]
     async fn s3_live_database_round_trip() {
         use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
-        use object_store::prefix::PrefixStore;
 
         let Ok(bucket) = std::env::var("TRINE_S3_BUCKET") else {
             eprintln!(
@@ -395,21 +394,26 @@ mod tests {
         }
         let s3 = builder.build().expect("build R2/S3 client");
 
+        let client: Arc<dyn ObjectClient> = Arc::new(ObjectStoreClient::new(Arc::new(s3)));
+
+        // Isolate this run under a unique key prefix (also exercises the native
+        // prefix feature) so it can safely share a real bucket.
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let prefix = format!("trine-it/{}-{nonce}", std::process::id());
-        let client: Arc<dyn ObjectClient> = Arc::new(ObjectStoreClient::new(Arc::new(
-            PrefixStore::new(s3, prefix),
-        )));
 
         // open -> put (default + named bucket) -> flush -> reopen -> read, all
         // against real R2.
         {
-            let db = Db::open_object_store(Arc::clone(&client), DbOptions::object_store())
-                .await
-                .expect("open over R2");
+            let db = Db::open_object_store_at(
+                Arc::clone(&client),
+                prefix.clone(),
+                DbOptions::object_store(),
+            )
+            .await
+            .expect("open over R2");
             db.put_sync(b"alpha", b"one").expect("put alpha");
             let docs = db
                 .bucket_with_options("docs", crate::options::BucketOptions::default())
@@ -421,9 +425,13 @@ mod tests {
                 .expect("flush to R2 (objects + manifest CAS)");
         }
 
-        let db = Db::open_object_store(Arc::clone(&client), DbOptions::object_store())
-            .await
-            .expect("reopen over R2");
+        let db = Db::open_object_store_at(
+            Arc::clone(&client),
+            prefix.clone(),
+            DbOptions::object_store(),
+        )
+        .await
+        .expect("reopen over R2");
         assert_eq!(
             db.get_sync(b"alpha").expect("get alpha").as_deref(),
             Some(b"one".as_slice()),
@@ -440,7 +448,7 @@ mod tests {
         drop(db);
 
         // Best-effort cleanup: remove everything this run wrote under the prefix.
-        if let Ok(metas) = client.list("").await {
+        if let Ok(metas) = client.list(&prefix).await {
             for meta in metas {
                 let _ = client.delete(&meta.key).await;
             }
