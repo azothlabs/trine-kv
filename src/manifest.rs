@@ -255,6 +255,77 @@ impl<C: ObjectClient> ObjectManifestStore<C> {
             }
         }
     }
+
+    /// Apply a manifest edit and CAS-publish it, retrying against the winning
+    /// state on conflict. `edit` returns the next state, or `None` for a no-op.
+    /// This owns `self`, so the caller can run it without holding any external
+    /// lock across the await (the Send-safe path for the database's manifest).
+    async fn commit_edit(
+        &mut self,
+        edit: impl Fn(&ManifestState) -> Result<Option<ManifestState>>,
+    ) -> Result<()> {
+        loop {
+            let Some(next_state) = edit(&self.state)? else {
+                return Ok(());
+            };
+            match self.try_publish(next_state).await? {
+                PublishOutcome::Published => return Ok(()),
+                // `try_publish` refreshed `self.state` to the winner; rebase.
+                PublishOutcome::Conflict { .. } => {}
+            }
+        }
+    }
+
+    /// Create a bucket (idempotent), CAS-published with rebase-retry.
+    pub(crate) async fn create_bucket(
+        &mut self,
+        name: String,
+        options: BucketOptions,
+    ) -> Result<()> {
+        self.commit_edit(|state| {
+            if let Some(existing) = state.buckets.get(&name) {
+                if existing == &options {
+                    return Ok(None);
+                }
+                return Err(Error::invalid_options(
+                    "existing bucket options do not match requested options",
+                ));
+            }
+            let mut next_state = state.clone();
+            next_state.buckets.insert(name.clone(), options.clone());
+            next_state.tables.entry(name.clone()).or_default();
+            Ok(Some(next_state))
+        })
+        .await
+    }
+
+    /// Add flushed tables to their buckets, CAS-published with rebase-retry.
+    pub(crate) async fn add_tables(
+        &mut self,
+        tables: Vec<(String, TableProperties)>,
+        wal_replay_floor: Sequence,
+    ) -> Result<()> {
+        self.commit_edit(|state| {
+            for (bucket, _) in &tables {
+                if !state.buckets.contains_key(bucket) {
+                    return Err(Error::Corruption {
+                        message: format!("table references missing bucket: {bucket}"),
+                    });
+                }
+            }
+            let mut next_state = state.clone();
+            for (bucket, properties) in &tables {
+                next_state
+                    .tables
+                    .entry(bucket.clone())
+                    .or_default()
+                    .push(properties.clone());
+            }
+            next_state.wal_replay_floor = wal_replay_floor;
+            Ok(Some(next_state))
+        })
+        .await
+    }
 }
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -376,6 +447,47 @@ impl ManifestStore {
             state: object.state().clone(),
             storage: ManifestStoreBackend::ObjectStore(object),
         })
+    }
+
+    /// Clone the object-store manifest handle so a caller can run a CAS publish
+    /// on the owned clone without holding the database's manifest mutex across
+    /// the await (then `install_object_manifest` writes the result back). Errors
+    /// for non-object-store backends.
+    pub(crate) fn clone_object_manifest(
+        &self,
+    ) -> Result<ObjectManifestStore<Arc<dyn ObjectClient>>> {
+        match &self.storage {
+            ManifestStoreBackend::ObjectStore(object) => Ok(object.clone()),
+            ManifestStoreBackend::Native(_) => Err(Error::unsupported_backend(
+                "manifest backend is not object storage",
+            )),
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            ManifestStoreBackend::Browser(_) => Err(Error::unsupported_backend(
+                "manifest backend is not object storage",
+            )),
+        }
+    }
+
+    /// Write back an object-store manifest handle after a CAS publish, syncing
+    /// the cached state. Errors for non-object-store backends.
+    pub(crate) fn install_object_manifest(
+        &mut self,
+        object: ObjectManifestStore<Arc<dyn ObjectClient>>,
+    ) -> Result<()> {
+        match &mut self.storage {
+            ManifestStoreBackend::ObjectStore(slot) => {
+                self.state = object.state().clone();
+                *slot = object;
+                Ok(())
+            }
+            ManifestStoreBackend::Native(_) => Err(Error::unsupported_backend(
+                "manifest backend is not object storage",
+            )),
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            ManifestStoreBackend::Browser(_) => Err(Error::unsupported_backend(
+                "manifest backend is not object storage",
+            )),
+        }
     }
 
     #[must_use]

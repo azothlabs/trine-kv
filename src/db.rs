@@ -244,6 +244,10 @@ pub(crate) struct DbInner {
     /// mirroring `browser_storage`. `None` for every other backend; when set,
     /// `native_storage` is an unused default and `substrate` is `ObjectStore`.
     object_storage: Option<ObjectStoreBackend>,
+    /// Serializes object-store manifest publishes so the CAS clone -> commit ->
+    /// write-back stays atomic without holding the (std) manifest mutex across
+    /// the await. Mirrors `browser_manifest_async_lock`; unused by other backends.
+    object_manifest_async_lock: futures::lock::Mutex<()>,
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     browser_storage: Option<BrowserStorageBackend>,
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -1144,6 +1148,7 @@ impl Db {
                 maintenance_budget_exhaustions: AtomicU64::new(0),
                 native_storage: NativeFileBackend::new(),
                 object_storage: None,
+                object_manifest_async_lock: futures::lock::Mutex::new(()),
                 browser_storage: Some(storage),
                 browser_writer_lease: writer_lease,
                 browser_wal,
@@ -1245,6 +1250,7 @@ impl Db {
                 maintenance_budget_exhaustions: AtomicU64::new(0),
                 native_storage: NativeFileBackend::new(),
                 object_storage: Some(backend),
+                object_manifest_async_lock: futures::lock::Mutex::new(()),
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
                 browser_storage: None,
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -1346,6 +1352,7 @@ impl Db {
                 maintenance_budget_exhaustions: AtomicU64::new(0),
                 native_storage: NativeFileBackend::new(),
                 object_storage: None,
+                object_manifest_async_lock: futures::lock::Mutex::new(()),
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
                 browser_storage: None,
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -1604,6 +1611,7 @@ impl Db {
                 maintenance_budget_exhaustions: AtomicU64::new(0),
                 native_storage,
                 object_storage: None,
+                object_manifest_async_lock: futures::lock::Mutex::new(()),
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
                 browser_storage: None,
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -1728,9 +1736,6 @@ impl Db {
         Ok(Bucket::new(self.clone(), name, bucket_options, state))
     }
 
-    // Holds the manifest mutex across the async CAS create (see
-    // `publish_flushed_tables_object_store_async` for the Send-hardening note).
-    #[allow(clippy::await_holding_lock)]
     async fn bucket_with_options_object_store_async(
         &self,
         name: BucketName,
@@ -1765,21 +1770,11 @@ impl Db {
             return Err(Error::ReadOnly);
         }
 
-        {
-            let manifest = self
-                .inner
-                .manifest
-                .as_ref()
-                .ok_or_else(|| Error::Corruption {
-                    message: "object-store database is missing manifest store".to_owned(),
-                })?;
-            let mut manifest = manifest
-                .lock()
-                .map_err(|_| lock_poisoned("manifest store"))?;
-            manifest
-                .create_bucket_async(name.as_str().to_owned(), options.clone())
-                .await?;
-        }
+        let (mut object, _serialize) = self.checkout_object_manifest().await?;
+        object
+            .create_bucket(name.as_str().to_owned(), options.clone())
+            .await?;
+        self.install_object_manifest(object)?;
 
         let (bucket_options, state) = {
             let mut buckets = self
@@ -2443,7 +2438,11 @@ impl Db {
             written_tables.push((input.bucket.clone(), Arc::new(table)));
         }
 
-        let _publish = self.inner.publish_barrier.enter()?;
+        // No publish barrier here: object-store manifest publishes are serialized
+        // by `object_manifest_async_lock` (held across the CAS await, Send-safe),
+        // and `close` is a no-op for object storage, so there is no publish-vs-close
+        // race to guard. Holding the barrier's std guard across the await would
+        // make this future `!Send`.
         self.publish_flushed_tables_object_store_async(&written_tables, flush_sequence)
             .await?;
         Self::install_flushed_tables(flush_inputs, written_tables)?;
@@ -2451,10 +2450,6 @@ impl Db {
         Ok(())
     }
 
-    // Holds the manifest mutex across the async CAS publish (single-writer,
-    // async-only object store). The Send-safe prepare/publish/install split — like
-    // the browser backend — is the documented hardening follow-up.
-    #[allow(clippy::await_holding_lock)]
     async fn publish_flushed_tables_object_store_async(
         &self,
         tables: &[(String, Arc<Table>)],
@@ -2464,6 +2459,22 @@ impl Db {
             .iter()
             .map(|(bucket, table)| (bucket.clone(), table.properties().clone()))
             .collect::<Vec<_>>();
+        let (mut object, _serialize) = self.checkout_object_manifest().await?;
+        object.add_tables(edits, flush_sequence).await?;
+        self.install_object_manifest(object)
+    }
+
+    /// Object-store manifest publishes run Send-safely as a checkout / mutate /
+    /// write-back: serialize via the async lock (held by the caller for the whole
+    /// sequence), clone the manifest handle out under a brief std lock, run the
+    /// awaiting CAS on the owned clone, then write it back. The std mutex is never
+    /// held across the await.
+    async fn checkout_object_manifest(
+        &self,
+    ) -> Result<(
+        crate::manifest::ObjectManifestStore<Arc<dyn ObjectClient>>,
+        futures::lock::MutexGuard<'_, ()>,
+    )> {
         let manifest = self
             .inner
             .manifest
@@ -2471,10 +2482,27 @@ impl Db {
             .ok_or_else(|| Error::Corruption {
                 message: "object-store database is missing manifest store".to_owned(),
             })?;
-        let mut manifest = manifest
+        let serialize = self.inner.object_manifest_async_lock.lock().await;
+        let object = manifest
             .lock()
-            .map_err(|_| lock_poisoned("manifest store"))?;
-        manifest.add_tables_async(edits, flush_sequence).await
+            .map_err(|_| lock_poisoned("manifest store"))?
+            .clone_object_manifest()?;
+        Ok((object, serialize))
+    }
+
+    fn install_object_manifest(
+        &self,
+        object: crate::manifest::ObjectManifestStore<Arc<dyn ObjectClient>>,
+    ) -> Result<()> {
+        self.inner
+            .manifest
+            .as_ref()
+            .ok_or_else(|| Error::Corruption {
+                message: "object-store database is missing manifest store".to_owned(),
+            })?
+            .lock()
+            .map_err(|_| lock_poisoned("manifest store"))?
+            .install_object_manifest(object)
     }
 
     /// Delete object-store table/blob objects the published manifest does not
@@ -7586,6 +7614,25 @@ mod tests {
             db.get_sync(b"k").expect("get after gc").as_deref(),
             Some(b"v".as_slice())
         );
+    }
+
+    #[test]
+    fn object_store_flush_future_is_send() {
+        use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+        fn assert_send<T: Send>(_: T) {}
+
+        let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+        let db = block_on_test_future(Db::open_object_store_async(
+            client,
+            DbOptions::object_store(),
+        ))
+        .expect("open object-store database");
+        // Compile-time guarantee: the object-store flush future is Send, so it can
+        // be spawned on a multi-threaded executor (the manifest CAS no longer holds
+        // the std mutex across the await).
+        assert_send(db.flush());
+        assert_send(db.bucket_with_options("docs", BucketOptions::default()));
     }
 
     #[test]
