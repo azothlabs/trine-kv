@@ -415,13 +415,27 @@ stands as the Band-2 dispatch type for where a single backend value is needed.
       reject it; `flush()` routes to the object path, `flush_sync` rejects).
       Tested vs `InMemoryObjectStore`: open → put (default + named bucket) → flush →
       reopen → read, plus sync-flush rejection. 361 tests green, clippy + wasm clean.
-      **Scoped follow-ups (NOT part of the durable core, deliberately deferred):**
-      (a) **Send-hardening** — flush/bucket-create hold the manifest mutex across
-      the async CAS (`#[allow(clippy::await_holding_lock)]`), so those futures are
-      `!Send`; the prepare/publish/install split (like browser) fixes it.
-      (b) **object-store compaction + maintenance + blob-GC** — currently return a
-      clear "not yet supported" error (honest, not silent); the DB is correct and
-      durable without them (reads just scan more L0 tables).
+      **Follow-ups — now DONE:**
+      (a) **Send-hardening (`b7985f0`)** — object-store flush/bucket-create no
+      longer hold the std manifest mutex across the async CAS, so their futures are
+      `Send`. `ObjectManifestStore` gained `commit_edit`/`create_bucket`/`add_tables`
+      (owned rebase-retry); `Db::checkout_object_manifest` serializes via a
+      `futures::lock::Mutex` (Send across await), clones the handle out under a
+      brief std lock, runs the CAS on the owned clone, writes it back under a brief
+      std lock. `futures` promoted to a general dependency. Compile-time test
+      asserts `flush()`/`bucket_with_options()` are `Send`.
+      (b) **object-store compaction (`dad8cef`)** — `run_compaction_once_object_store_async`
+      + `build_compaction_outputs_object_store_async`; publish via
+      `ObjectManifestStore::replace_tables_batch_and_mark_blob_deletions` (CAS
+      rebase-retry); obsolete input/blob objects reclaimed by orphan GC
+      (snapshot-safe), not inline. `compact_range`/`compact_range_with_budget`
+      dispatch object storage; `run_maintenance_with_budget` = flush + compact + GC.
+      Test: 3 flushed tables (incl. overwrite) → compact → correct reads → GC →
+      reopen → correct.
+
+      **The object-storage backend (2c) is complete: open / put / get / flush /
+      reopen / named buckets / compaction / orphan GC, async-only, Send-safe,
+      tested vs `InMemoryObjectStore`. 364 tests green, clippy + wasm clean.**
   - **2c-5:** orphan-object GC (objects unreferenced by the published manifest).
 
 ## Why this is safe to pursue
