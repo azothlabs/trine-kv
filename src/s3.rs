@@ -49,7 +49,14 @@ impl ObjectStoreClient {
     ///
     /// Credentials are read from the environment (`AWS_ACCESS_KEY_ID`,
     /// `AWS_SECRET_ACCESS_KEY`, …). Pass `endpoint` to target an S3-compatible
-    /// service (MinIO/R2/Ceph); leave it `None` for AWS S3.
+    /// service (Cloudflare R2/MinIO/Ceph); leave it `None` for AWS S3. For R2 use
+    /// region `"auto"` and the `https://<account>.r2.cloudflarestorage.com`
+    /// endpoint.
+    ///
+    /// Conditional PUT (`ETagMatch`) is enabled explicitly: `object_store`
+    /// disables conditional writes for non-AWS endpoints by default, but the
+    /// manifest commit requires a real CAS, so a backend that cannot honor
+    /// `If-Match` / `If-None-Match` is unsupported.
     ///
     /// # Errors
     ///
@@ -59,11 +66,12 @@ impl ObjectStoreClient {
         region: impl Into<String>,
         endpoint: Option<String>,
     ) -> Result<Self> {
-        use object_store::aws::AmazonS3Builder;
+        use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 
         let mut builder = AmazonS3Builder::from_env()
             .with_bucket_name(bucket.into())
-            .with_region(region.into());
+            .with_region(region.into())
+            .with_conditional_put(S3ConditionalPut::ETagMatch);
         if let Some(endpoint) = endpoint {
             builder = builder.with_endpoint(endpoint).with_allow_http(true);
         }
@@ -341,5 +349,101 @@ mod tests {
             db.get_sync(b"k").expect("get after reopen").as_deref(),
             Some(b"v".as_slice())
         );
+    }
+
+    /// Live integration test against real S3-compatible storage (Cloudflare R2).
+    ///
+    /// Ignored by default — it makes real, billable network writes. Provide
+    /// credentials + target via the environment and run explicitly:
+    ///
+    /// ```text
+    /// export AWS_ACCESS_KEY_ID=...        # R2 API token access key
+    /// export AWS_SECRET_ACCESS_KEY=...    # R2 API token secret
+    /// export AWS_REGION=auto              # R2 uses "auto"
+    /// export AWS_ENDPOINT_URL=https://<account>.r2.cloudflarestorage.com
+    /// export TRINE_S3_BUCKET=<your-r2-bucket>
+    /// cargo test --features s3 -- --ignored s3_live_database_round_trip --nocapture
+    /// ```
+    ///
+    /// The run is isolated under a unique `trine-it/<pid>-<nonce>/` key prefix
+    /// (via `object_store`'s `PrefixStore`) and cleans up afterward, so it can
+    /// safely share a bucket. It exercises the one thing only a real backend can
+    /// confirm: that R2's conditional PUT (`If-None-Match` / `If-Match`) actually
+    /// backs the manifest commit CAS.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires real S3/R2 credentials; run with --features s3 -- --ignored"]
+    async fn s3_live_database_round_trip() {
+        use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+        use object_store::prefix::PrefixStore;
+
+        let Ok(bucket) = std::env::var("TRINE_S3_BUCKET") else {
+            eprintln!(
+                "skipping s3_live_database_round_trip: set TRINE_S3_BUCKET (+ AWS_* / \
+                 AWS_ENDPOINT_URL) to run it"
+            );
+            return;
+        };
+        let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "auto".to_owned());
+        let endpoint = std::env::var("AWS_ENDPOINT_URL").ok();
+
+        let mut builder = AmazonS3Builder::from_env()
+            .with_bucket_name(bucket)
+            .with_region(region)
+            .with_conditional_put(S3ConditionalPut::ETagMatch);
+        if let Some(endpoint) = endpoint {
+            builder = builder.with_endpoint(endpoint).with_allow_http(true);
+        }
+        let s3 = builder.build().expect("build R2/S3 client");
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let prefix = format!("trine-it/{}-{nonce}", std::process::id());
+        let client: Arc<dyn ObjectClient> = Arc::new(ObjectStoreClient::new(Arc::new(
+            PrefixStore::new(s3, prefix),
+        )));
+
+        // open -> put (default + named bucket) -> flush -> reopen -> read, all
+        // against real R2.
+        {
+            let db = Db::open_object_store(Arc::clone(&client), DbOptions::object_store())
+                .await
+                .expect("open over R2");
+            db.put_sync(b"alpha", b"one").expect("put alpha");
+            let docs = db
+                .bucket_with_options("docs", crate::options::BucketOptions::default())
+                .await
+                .expect("create docs bucket (manifest CAS)");
+            docs.put_sync(b"title", b"trine").expect("put into docs");
+            db.flush()
+                .await
+                .expect("flush to R2 (objects + manifest CAS)");
+        }
+
+        let db = Db::open_object_store(Arc::clone(&client), DbOptions::object_store())
+            .await
+            .expect("reopen over R2");
+        assert_eq!(
+            db.get_sync(b"alpha").expect("get alpha").as_deref(),
+            Some(b"one".as_slice()),
+            "value recovered from R2 after reopen"
+        );
+        let docs = db
+            .bucket_with_options("docs", crate::options::BucketOptions::default())
+            .await
+            .expect("reopen docs bucket");
+        assert_eq!(
+            docs.get_sync(b"title").expect("get docs title").as_deref(),
+            Some(b"trine".as_slice())
+        );
+        drop(db);
+
+        // Best-effort cleanup: remove everything this run wrote under the prefix.
+        if let Ok(metas) = client.list("").await {
+            for meta in metas {
+                let _ = client.delete(&meta.key).await;
+            }
+        }
     }
 }

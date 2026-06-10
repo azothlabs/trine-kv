@@ -42,6 +42,11 @@ lz4_flex = "0.13.1"
 # store used to test the ObjectClient adapter without a network.
 object_store = { version = "0.12", default-features = false, features = ["aws"], optional = true }
 
+[dev-dependencies]
+# Runtime for the ignored live S3/R2 integration test (object_store's S3 client
+# is reqwest/tokio-based, so its futures need a tokio reactor to drive network IO).
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+
 [[bench]]
 name = "v1_bench"
 harness = false
