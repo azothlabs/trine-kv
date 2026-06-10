@@ -318,18 +318,50 @@ stands as the Band-2 dispatch type for where a single backend value is needed.
     reads it). Dead-code + 3 unit tests vs `InMemoryObjectStore` incl. a real
     two-writer create-race → conflict → rebase → retry-succeeds. 351 tests green
     native + wasm `cargo check` + clippy clean.
-  - **2c-2 (next):** object-store byte backend — `ObjectStoreBackend` implementing
-    the async `Storage*Backend` byte traits over `ObjectClient` (SSTable/blob
-    read/write/list/delete), so flush/compaction can write objects via the
-    already-generic async helpers.
-  - **2c-3:** `ObjectStoreSubstrate` variant — WAL-less (no-op WAL methods) +
-    object-lease/fencing writer lease; add to the `DurabilitySubstrate` enum.
-  - **2c-4:** open/bootstrap over object storage (read manifest via
-    `ObjectManifestStore`, list objects, acquire lease) + wire
-    `ManifestStoreBackend::ObjectStore` with the rebase-retry loop (reads
-    `Conflict.current`) + `options::HostStorageBackend::ObjectStore` selection +
-    open dispatch.
-  - **2c-5:** orphan-object GC.
+  - **2c-2 DONE** (`object_store.rs`, `65385ce`): object-store byte backend —
+    `ObjectStoreBackend` implementing the async `Storage*Backend` byte traits over
+    `Arc<dyn ObjectClient>` (whole-object read via eager GET + in-memory random
+    access, write=PUT, delete, prefix-list→direct-children-by-extension), mapping
+    `StorageObjectId.path()`→object key. `StorageCapabilities::object_store()`
+    added. Dead-code + 2 tests.
+  - **2c-3 DONE** (`substrate.rs`, `d97aef8`): `DurabilitySubstrate::ObjectStore`
+    variant — WAL-less (all WAL methods no-op; `wal_is_present`=false), with
+    `ObjectWriterLease` modelled as a **fencing token** (acquire bumps a monotonic
+    epoch via CAS, doesn't fail-if-held; a stale holder is fenced at
+    manifest-publish time, wired in 2c-4). `release_writer_lease` is a no-op for
+    the object store (reclaimed by next epoch / TTL). Dead-code + 3 tests.
+  - **DECISION (2026-06-10): object-store DBs are async-only.** Confirmed with the
+    user. Object storage is network I/O and the manifest CAS publish is inherently
+    async (`put_if`); the sync `publish_next_state` can't `await`. So object-store
+    open/commit/flush use the async API only (like the browser backend);
+    filesystem/memory keep sync+async. This shapes all of 2c-4.
+  - **2c-4 (the integration mega-step — NOT a single commit; ~4 sub-commits).**
+    Probing it found real plumbing beyond the original one-liner:
+    - **2c-4a — `ManifestStore` object-store backend + rebase-retry.** Add
+      `ManifestStoreBackend::ObjectStore(ObjectManifestStore<Arc<dyn ObjectClient>>)`
+      (delegates to the 2c-1 primitive — no duplicate state machine). Needs manual
+      `Debug`/`Clone` for `ObjectManifestStore` over `dyn` (dyn isn't `Debug`). Add
+      `open_object_store_async`; the `publish_next_state_async` `ObjectStore` arm
+      delegates to `try_publish` and syncs `self.state` from the primitive. **The
+      rebase-retry loop lives at the public-method level** (`Conflict` → refresh →
+      re-run the mutation+validation → retry); since the sync API is gone for
+      object storage, the mutating methods (`create_bucket`, `add_tables`,
+      `replace_tables_batch_and_mark_blob_deletions`, `clear_pending_blob_deletions`)
+      need **async variants** (only `create_bucket_async`/`add_tables_async` exist
+      today; replace/clear are sync-only or wasm-prepared-only) — factor them
+      through one `commit_edit_async(|state| ...)` retry helper.
+    - **2c-4b — `DbInner` byte-IO dispatch.** `DbInner` holds concrete
+      `native_storage: NativeFileBackend` used at ~30 flush/compaction/read sites.
+      Object-store byte IO must dispatch to `ObjectStoreBackend`, so thread the
+      committed `StorageBackend` enum (`4993d09`; add an `ObjectStore` variant)
+      through `DbInner` — a 2b③-scale reroute. Filesystem stays byte-identical.
+    - **2c-4c — object-store async open path + options.** A distinct
+      `open_object_store_async` (bootstrap: acquire `ObjectWriterLease`, read
+      manifest via `ObjectManifestStore`, list table/blob objects → buckets, build
+      `DbInner` with `substrate = ObjectStore`, byte backend = object store, no WAL)
+      + `options::HostStorageBackend::ObjectStore` selection + open dispatch +
+      integration tests vs `InMemoryObjectStore`.
+  - **2c-5:** orphan-object GC (objects unreferenced by the published manifest).
 
 ## Why this is safe to pursue
 
