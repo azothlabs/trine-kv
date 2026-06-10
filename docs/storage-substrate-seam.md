@@ -132,6 +132,37 @@ trait DurabilitySubstrate {
 (Exact shape to be refined when implementing; this captures the operation set
 the probe found, with the conflict-aware manifest publish as the key change.)
 
+### Mapped surface (from tracing the actual fields)
+
+The concrete method surface of the three filesystem-shaped `DbInner` fields,
+found by tracing `db.rs` + `db/commit.rs` — this is what the substrate must
+cover, and it is **narrower than it looks** because the manifest *state* logic is
+backend-agnostic:
+
+- **`wal: Option<WalFrontDoor>`** — `accept_commit(..)` (the commit append),
+  `rewrite_after_replay_floor(..)` (truncate at checkpoint), `persist(..)`
+  (durability flush), `stats(..)`, presence (`is_some`). → substrate WAL ops, or
+  "no WAL" for the object store.
+- **`manifest: Option<Mutex<ManifestStore>>`** — read: `state/tables/buckets/pending_blob_deletions`;
+  mutate+publish: `create_bucket`, `prepare_create_bucket_publish`,
+  `prepare_add_tables_publish`, `prepare_replace_tables_batch_publish`,
+  `prepare_clear_pending_blob_deletions_publish`, `install_prepared_publish`.
+  **Crucially, all of these funnel through one chokepoint —
+  `publish_next_state` / `publish_next_state_async` → `publish_manifest_with_backend`
+  → the `publish_manifest` trait method.** So the manifest state machine stays as
+  is; only that chokepoint is backend-specific, and it is *already* trait-routed.
+  The one change needed there: make it **conflict-aware** (return
+  `Published | Conflict` instead of `Result<()>`; filesystem always `Published`).
+- **`process_lock`** — `take()`, `lock()`. → substrate writer-lease.
+
+**Implication for sequencing:** because the manifest publish already funnels
+through one trait-routed chokepoint, the cleanest *first* invasive move is to
+make that chokepoint (`publish_next_state` + `publish_manifest`) conflict-aware,
+then introduce the substrate around WAL + bootstrap + lease. But note every such
+move threads the commit/flush hot path — there is no tiny self-contained
+sub-step. 2b is one deliberate surgery, guarded by the 293 lib + integration
+tests (the filesystem path must stay byte-identical).
+
 ## db.rs surgery scope (the real cost)
 
 `DbInner` directly holds `manifest: Option<Mutex<ManifestStore>>`,
