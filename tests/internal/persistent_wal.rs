@@ -2189,6 +2189,50 @@ fn persistent_transaction_read_range_consumes_scan_before_tracking() {
 }
 
 #[test]
+fn persistent_transaction_range_bucket_returns_data_and_tracks_conflict() {
+    let path = temp_db_path("transaction-range-bucket-returns-data");
+    let options = DbOptions::persistent(&path);
+
+    {
+        let db = Db::open_sync(options).expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
+        bucket.put_sync(b"k1", b"v1").expect("write k1");
+        bucket.put_sync(b"k2", b"v2").expect("write k2");
+
+        // Unlike `read_range`, a transaction range read returns the data ...
+        let mut txn = db.transaction(TransactionOptions::default());
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = txn
+            .range_sync(KeyRange::all())
+            .expect("range read returns a cursor")
+            .map(|item| {
+                let kv = item.expect("row decodes");
+                (kv.key, kv.value)
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (b"k1".to_vec(), b"v1".to_vec()),
+                (b"k2".to_vec(), b"v2".to_vec()),
+            ]
+        );
+
+        // ... and the range is recorded in the read set, so a later committed
+        // write inside it makes this transaction's commit conflict.
+        bucket
+            .put_sync(b"k3", b"v3")
+            .expect("write inside the read range");
+        txn.put(b"k4", b"v4");
+        let error = txn
+            .commit_sync()
+            .expect_err("a committed write inside the read range conflicts");
+        assert!(matches!(error, Error::Conflict { .. }));
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_flush_preserves_snapshot_versions() {
     let path = temp_db_path("flush-snapshot");
     let options = DbOptions::persistent(&path);

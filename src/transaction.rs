@@ -2,6 +2,7 @@ use crate::{
     bucket::DEFAULT_BUCKET_NAME,
     db::Db,
     error::Result,
+    iterator::Iter,
     options::WriteOptions,
     types::{CommitInfo, KeyRange, Sequence, Value},
     write_batch::WriteBatch,
@@ -180,6 +181,36 @@ impl Transaction {
         Ok(())
     }
 
+    /// Reads the default-bucket range and returns its cursor, tracking the
+    /// range for commit conflict checks.
+    pub fn range_sync(&mut self, range: KeyRange) -> Result<Iter> {
+        self.range_bucket_sync(DEFAULT_BUCKET_NAME, range)
+    }
+
+    /// Reads a named-bucket range and returns its cursor, tracking the range for
+    /// commit conflict checks.
+    ///
+    /// Unlike [`read_range_bucket_sync`](Self::read_range_bucket_sync), the data
+    /// cursor is returned to the caller rather than consumed: this is the read
+    /// path for transactions that need the range's values (e.g. a scan), not
+    /// just conflict tracking. The range is recorded in the read set at the
+    /// transaction's read sequence; iteration errors surface as the caller
+    /// drives the returned cursor. Commit fails if a later committed point
+    /// mutation falls inside the range or a later range delete overlaps it.
+    pub fn range_bucket_sync(&mut self, bucket: impl Into<String>, range: KeyRange) -> Result<Iter> {
+        self.db.ensure_open()?;
+        let bucket = bucket.into();
+        let iter = self.db.range_at_sequence(
+            &bucket,
+            &range,
+            self.read_sequence,
+            crate::Direction::Forward,
+        )?;
+        self.range_reads.push(ReadRange { bucket, range });
+
+        Ok(iter)
+    }
+
     /// Stages one key/value write for the default bucket.
     ///
     /// Staging only mutates the in-memory transaction batch. The write is not
@@ -311,6 +342,36 @@ impl Transaction {
         self.range_reads.push(ReadRange { bucket, range });
 
         Ok(())
+    }
+
+    /// Reads the default-bucket range and returns its cursor, tracking the
+    /// range for commit conflict checks.
+    pub async fn range(&mut self, range: KeyRange) -> Result<Iter> {
+        self.range_bucket(DEFAULT_BUCKET_NAME, range).await
+    }
+
+    /// Reads a named-bucket range and returns its cursor, tracking the range for
+    /// commit conflict checks. The async counterpart of
+    /// [`range_bucket_sync`](Self::range_bucket_sync).
+    pub async fn range_bucket(
+        &mut self,
+        bucket: impl Into<String>,
+        range: KeyRange,
+    ) -> Result<Iter> {
+        self.db.ensure_open()?;
+        let bucket = bucket.into();
+        let iter = self
+            .db
+            .range_at_sequence_async(
+                &bucket,
+                &range,
+                self.read_sequence,
+                crate::Direction::Forward,
+            )
+            .await?;
+        self.range_reads.push(ReadRange { bucket, range });
+
+        Ok(iter)
     }
 
     /// Commits the staged writes asynchronously after conflict checks.
