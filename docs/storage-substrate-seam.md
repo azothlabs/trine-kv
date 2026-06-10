@@ -336,7 +336,8 @@ stands as the Band-2 dispatch type for where a single backend value is needed.
     open/commit/flush use the async API only (like the browser backend);
     filesystem/memory keep sync+async. This shapes all of 2c-4.
   - **2c-4 (the integration mega-step — NOT a single commit; ~4 sub-commits).**
-    Probing it found real plumbing beyond the original one-liner:
+    Probing it found real plumbing beyond the original one-liner.
+    **Progress: 2c-4a DONE (`937fbf6`), 2c-4b DONE (`ce8b6d7`); 2c-4c remaining.**
     - **2c-4a — `ManifestStore` object-store backend + rebase-retry.** Add
       `ManifestStoreBackend::ObjectStore(ObjectManifestStore<Arc<dyn ObjectClient>>)`
       (delegates to the 2c-1 primitive — no duplicate state machine). Needs manual
@@ -350,12 +351,20 @@ stands as the Band-2 dispatch type for where a single backend value is needed.
       need **async variants** (only `create_bucket_async`/`add_tables_async` exist
       today; replace/clear are sync-only or wasm-prepared-only) — factor them
       through one `commit_edit_async(|state| ...)` retry helper.
-    - **2c-4b — `DbInner` byte-IO dispatch.** `DbInner` holds concrete
-      `native_storage: NativeFileBackend` used at ~30 flush/compaction/read sites.
-      Object-store byte IO must dispatch to `ObjectStoreBackend`, so thread the
-      committed `StorageBackend` enum (`4993d09`; add an `ObjectStore` variant)
-      through `DbInner` — a 2b③-scale reroute. Filesystem stays byte-identical.
-    - **2c-4c — object-store async open path + options.** A distinct
+    - **2c-4b DONE (`ce8b6d7`) — `StorageBackend` enum gains `ObjectStore`.** Added
+      `StorageBackend::ObjectStore(ObjectStoreBackend)` + `BackendReadObject::ObjectStore`;
+      byte ops delegate, all non-byte ops (append/wal-rewrite/lease/dir/manifest)
+      + every blocking variant return `unsupported` (object-store DBs are WAL-less,
+      async-only, lease via the substrate, manifest via `ObjectManifestStore`). The
+      enum can now dispatch object-store byte IO; the `DbInner` *field reroute*
+      (concrete `native_storage` → `StorageBackend`) is folded into 2c-4c since it
+      only makes sense alongside the open path that constructs an object-store DB.
+    - **2c-4c — `DbInner` reroute + object-store async open path + options
+      (REMAINING; the largest remaining piece).** (1) Change
+      `DbInner.native_storage: NativeFileBackend` → `storage: StorageBackend` and
+      reroute the ~15 runtime `self.inner.native_storage` sites + 3 construction
+      sites + `Drop`/stats (filesystem stays `StorageBackend::Native(..)`,
+      byte-identical — a 2b③-scale surgery). (2) A distinct
       `open_object_store_async` (bootstrap: acquire `ObjectWriterLease`, read
       manifest via `ObjectManifestStore`, list table/blob objects → buckets, build
       `DbInner` with `substrate = ObjectStore`, byte backend = object store, no WAL)
