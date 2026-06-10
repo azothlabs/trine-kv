@@ -38,8 +38,9 @@ use crate::{
         BlockingStorageDirectorySyncBackend, BlockingStorageObjectDeleteBackend,
         BlockingStorageReadBackend, BlockingStorageReadObject, NativeFileBackend,
         StorageCapability, StorageDirectoryCreateBackend, StorageDirectoryFile, StorageDirectoryId,
-        StorageDirectoryListBackend, StorageManifestReadBackend, StorageObjectId,
-        StorageObjectKind, StorageObjectListBackend, StorageObjectReadBackend, StorageReadBackend,
+        StorageDirectoryListBackend, StorageManifestReadBackend, StorageObjectDeleteBackend,
+        StorageObjectId, StorageObjectKind, StorageObjectListBackend, StorageObjectReadBackend,
+        StorageReadBackend,
     },
     substrate::{
         DurabilitySubstrate, FilesystemSubstrate, ObjectStoreSubstrate, ObjectWriterLease,
@@ -53,10 +54,7 @@ use crate::{
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::{
-    storage::{
-        BrowserStorageBackend, BrowserWriterLease, StorageObjectDeleteBackend,
-        StorageWriterLeaseBackend,
-    },
+    storage::{BrowserStorageBackend, BrowserWriterLease, StorageWriterLeaseBackend},
     wal::BrowserWalFrontDoor,
 };
 
@@ -2477,6 +2475,70 @@ impl Db {
             .lock()
             .map_err(|_| lock_poisoned("manifest store"))?;
         manifest.add_tables_async(edits, flush_sequence).await
+    }
+
+    /// Delete object-store table/blob objects the published manifest does not
+    /// reference — orphans left by a flush that wrote objects but failed before
+    /// the manifest CAS published them. Returns the number of objects removed.
+    ///
+    /// Serialized with flush via the maintenance flush guard so it never removes
+    /// an object an in-flight flush just wrote (cross-process safety comes from
+    /// the single-writer lease). The manifest mutex is held only to snapshot the
+    /// referenced ids, not across the deletes.
+    async fn cleanup_object_store_orphans_async(&self) -> Result<usize> {
+        self.ensure_open()?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+        let Some(_flush_guard) = self.inner.maintenance.try_start_flush() else {
+            return Err(Error::runtime_busy(
+                "object-store orphan GC cannot run during a flush",
+            ));
+        };
+        let backend = self.object_storage()?;
+        let db_path = Path::new("");
+
+        let (referenced_tables, referenced_blobs) = {
+            let manifest = self
+                .inner
+                .manifest
+                .as_ref()
+                .ok_or_else(|| Error::Corruption {
+                    message: "object-store database is missing manifest store".to_owned(),
+                })?;
+            let manifest = manifest
+                .lock()
+                .map_err(|_| lock_poisoned("manifest store"))?;
+            (
+                referenced_table_file_ids(manifest.state()),
+                referenced_blob_file_ids_from_manifest(manifest.state()),
+            )
+        };
+
+        let mut deleted = 0_usize;
+        for table_id in table::list_table_file_ids_with_backend_async(&backend, db_path).await? {
+            if !referenced_tables.contains(&table_id) {
+                backend
+                    .delete_object(StorageObjectId::native_file(
+                        StorageObjectKind::Table,
+                        table::table_path(db_path, table_id),
+                    ))
+                    .await?;
+                deleted += 1;
+            }
+        }
+        for file_id in blob::list_blob_file_ids_with_backend_async(&backend, db_path).await? {
+            if !referenced_blobs.contains(&file_id) {
+                backend
+                    .delete_object(StorageObjectId::native_file(
+                        StorageObjectKind::Blob,
+                        blob::blob_path(db_path, file_id),
+                    ))
+                    .await?;
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -6438,6 +6500,14 @@ impl Db {
         &self,
         budget: MaintenanceBudget,
     ) -> Result<MaintenanceOutcome> {
+        if self.inner.options.storage_mode.is_object_store_persistent() {
+            // Object-store maintenance is orphan-object GC for now (compaction is
+            // a scoped follow-up). The budget does not apply to a delete sweep.
+            let _ = budget;
+            self.cleanup_object_store_orphans_async().await?;
+            return Ok(MaintenanceOutcome::default());
+        }
+
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         if self.inner.options.storage_mode.is_browser_persistent() {
             let db = self.clone();
@@ -7466,6 +7536,55 @@ mod tests {
         assert_eq!(
             docs.get_sync(b"title").expect("get docs title").as_deref(),
             Some(b"trine".as_slice())
+        );
+    }
+
+    #[test]
+    fn object_store_orphan_objects_are_collected() {
+        use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+        let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+        let db = block_on_test_future(Db::open_object_store_async(
+            Arc::clone(&client),
+            DbOptions::object_store(),
+        ))
+        .expect("open object-store database");
+        db.put_sync(b"k", b"v").expect("put");
+        block_on_test_future(db.flush()).expect("flush (writes a referenced table object)");
+
+        // Plant an orphan: a table object no manifest references, as a failed
+        // flush would leave behind.
+        let orphan_key =
+            crate::table::table_path(std::path::Path::new(""), crate::table::TableId(999_999))
+                .to_string_lossy()
+                .into_owned();
+        block_on_test_future(client.put(&orphan_key, Arc::from(b"junk".as_slice())))
+            .expect("plant orphan");
+        assert!(
+            block_on_test_future(client.head(&orphan_key))
+                .unwrap()
+                .is_some()
+        );
+
+        let deleted = block_on_test_future(db.cleanup_object_store_orphans_async()).expect("gc");
+        assert_eq!(deleted, 1, "only the unreferenced orphan object is removed");
+        assert!(
+            block_on_test_future(client.head(&orphan_key))
+                .unwrap()
+                .is_none(),
+            "orphan object removed"
+        );
+
+        // The referenced table object survived GC: reopen and read it back.
+        drop(db);
+        let db = block_on_test_future(Db::open_object_store_async(
+            client,
+            DbOptions::object_store(),
+        ))
+        .expect("reopen");
+        assert_eq!(
+            db.get_sync(b"k").expect("get after gc").as_deref(),
+            Some(b"v".as_slice())
         );
     }
 
