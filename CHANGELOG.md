@@ -2,6 +2,41 @@
 
 All public crate releases use Semantic Versioning.
 
+## 0.2.2 - 2026-06-10
+
+Adds an object-storage backend: run a Trine database on S3 / S3-compatible
+object storage (Cloudflare R2, MinIO, …) or any custom object store. Additive
+and backward compatible; existing native, in-memory, WASI, and browser backends
+are unchanged.
+
+### Added
+
+- Object-storage databases (async-only):
+  - `Db::open_object_store(client, options)` and
+    `Db::open_object_store_at(client, prefix, options)` (a key prefix lets
+    several databases share one bucket), with `DbOptions::object_store()`.
+  - Durability is WAL-less: a commit is durable once its memtable is flushed to
+    objects and the manifest is published via a conditional-PUT
+    compare-and-swap. Open, flush, reopen, named buckets, compaction, and
+    orphan-object GC are all supported.
+- Public `object_store` module — "bring your own object store": the
+  `ObjectClient` trait plus `ETag`, `Precondition`, `PutIf`, `ObjectMeta`,
+  `ObjectFuture`, and an `InMemoryObjectStore`. The manifest commit requires
+  `put_if` to be a real conditional write (compare-and-swap).
+- `s3` feature: `s3::ObjectStoreClient` adapts any `object_store::ObjectStore`
+  (S3, GCS, Azure, MinIO/R2/Ceph, local, in-memory) to `ObjectClient`, including
+  an `ObjectStoreClient::s3(bucket, region, endpoint)` convenience constructor
+  with conditional PUT (`ETagMatch`) enabled. Verified end to end against
+  Cloudflare R2.
+
+### Internal
+
+- Introduced a durability-substrate seam isolating the backend-divergent runtime
+  operations (write-ahead log lifecycle + single-writer lease), and made manifest
+  publishing conflict-aware (`PublishOutcome`), so the object store's
+  compare-and-swap commit and the filesystem's atomic-rename commit share one
+  code path. Filesystem behavior is byte-identical.
+
 ## 0.2.0 - 2026-06-03
 
 Compatible API and performance release for the pre-`1.0` crate line.
