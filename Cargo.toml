@@ -37,6 +37,10 @@ compio-runtime = { version = "0.7.0", default-features = false, features = ["io-
 # manifest publishes Send-safely). Available on every target.
 futures = "0.3.32"
 lz4_flex = "0.13.1"
+# Real object-storage backend (S3 and compatible) behind the `s3` feature. The
+# `aws` feature provides the S3 client builder; the core gives the in-memory
+# store used to test the ObjectClient adapter without a network.
+object_store = { version = "0.12", default-features = false, features = ["aws"], optional = true }
 
 [[bench]]
 name = "v1_bench"
@@ -51,6 +55,8 @@ pedantic = "warn"
 
 [features]
 platform-io = ["dep:compio", "dep:compio-driver", "dep:compio-fs", "dep:compio-runtime"]
+# Real object-storage `ObjectClient` (S3 and compatible) via the `object_store` crate.
+s3 = ["dep:object_store"]
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 js-sys = "0.3.99"

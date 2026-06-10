@@ -74,8 +74,9 @@ mod memtable;
 #[allow(dead_code)]
 mod mvcc;
 /// Provider-agnostic object-store client ("bring your own object store"): the
-/// [`object_store::ObjectClient`] trait, its `ETag`/conditional-write types, and
-/// an in-memory fake. Implement it for S3 and open with [`Db::open_object_store`].
+/// `ObjectClient` trait, its `ETag`/conditional-write types, and an in-memory
+/// fake. Implement it for S3 (or use the `s3` feature) and open with
+/// [`Db::open_object_store`].
 pub mod object_store;
 /// Database, bucket, write, storage, runtime, and durability options.
 pub mod options;
@@ -87,6 +88,10 @@ mod range_tombstone;
 pub mod recovery;
 /// Runtime selection, capabilities, and cancellation support.
 pub mod runtime;
+/// Real object-storage `ObjectClient` (S3 and compatible) via the `object_store`
+/// crate. Enabled by the `s3` feature.
+#[cfg(feature = "s3")]
+pub mod s3;
 /// Search policy helpers for table indexes.
 pub mod search;
 /// Snapshot handles for repeatable reads.
