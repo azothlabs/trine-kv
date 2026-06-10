@@ -1,0 +1,193 @@
+# Storage Substrate Seam
+
+Status: **Design (probe-driven).** This note records what an architecture probe
+of the open / commit / flush paths found, and redefines how the object-storage
+backend (see `object-storage-backend.md`) should plug in. It supersedes the
+naive "thread one backend enum through every helper" approach, which the probe
+showed to be both large *and* the wrong abstraction.
+
+## Why the naive approach is wrong
+
+The fine-grained `Storage*Backend` traits are good, but the **layers above them**
+(WAL, recovery/bootstrap, the open/commit orchestration) are written
+concretely against `NativeFileBackend` *and* encode **filesystem semantics that
+object storage cannot provide**:
+
+| Filesystem assumption | Used for | Object storage reality |
+|---|---|---|
+| Atomic `rename` | manifest publish (temp+rename), WAL rewrite | no rename; PUT new key + **conditional-write CAS** |
+| Appendable file + cheap fsync | WAL grows via append; ~ms durability | objects immutable, **no append**; PUT ~tens of ms; segment / group-commit |
+| Directory listing + per-file ops | recovery: scan dir, delete orphan temp, replay WAL files | prefix listing; **orphan-object GC** |
+| Local lock file (flock) | single-writer process lock | **lease object + TTL + fencing token** |
+
+Genericizing those helpers to `<B>` would *compile* for an object store but be
+**semantically wrong** (it would still assume rename, append, flock). So the
+seam must be drawn where semantics actually diverge — not at every function.
+
+## What the probe found: divergence is narrow
+
+Tracing `open_persistent_with_options`, the commit path (`db/commit.rs`), and
+the memtable-flush path, the operations split cleanly into three bands:
+
+**Band 1 — backend-agnostic LSM core (fully portable, no change):** memtable,
+SSTable/block format, compaction, MVCC, the manifest *state* logic, iterators,
+`wal::merge_batch_streams_by_sequence` (pure merge-by-sequence). These operate
+on bytes + manifest state and do not care where bytes live.
+
+**Band 2 — byte-level IO (portable; needs only the fine-grained traits):**
+`table.rs` / `blob.rs` read/write of SSTable and blob bytes, block reads,
+manifest byte read. These are ~30 functions currently typed `&NativeFileBackend`
+but are semantically just "put/get bytes of object X". The primitives they need
+are *already* trait methods (`read_object_bytes`, `write_object`, `open_read`,
+`list_objects`, …). They can take `&StorageBackend` (the dispatch enum already
+committed) unchanged in meaning.
+
+**Band 3 — durability substrate (genuinely divergent; needs two impls):** the
+probe localized *all* the real divergence to **two-and-a-half** places:
+
+1. **WAL lifecycle (hard divergence).** `WalFrontDoor` is "one append-growing
+   file per shard" and holds a `NativeFileBackend`; object storage has no
+   `Append` capability. The object-store substrate must either segment the WAL
+   into objects or drop the WAL entirely and rely on frequent memtable→SSTable
+   flush + manifest CAS (the object-store-LSM "WAL-less" lineage). Either way the
+   whole WAL write/replay path forks.
+2. **Manifest publish atomicity + conflict (hard divergence).** Filesystem:
+   write temp + `rename`. Object store: conditional-PUT CAS. Critically, the
+   current `publish_manifest` trait returns `Result<()>` — **no conflict
+   signal** — but the object store's optimistic concurrency needs publish to
+   report "lost the CAS → retry". The publish operation needs a conflict-aware
+   result.
+3. **Bootstrap temp-file semantics (half divergence).** `repair_safe_temporary_files`
+   assumes write-temp-then-rename orphans; `list`/`delete` primitives are
+   trait-expressible, but "what is a temp / orphan" needs per-substrate logic.
+
+Everything else is Band 1/2 (portable). **The divergence does not sprawl across
+the ~50 helpers — it concentrates in WAL + manifest-publish-conflict +
+bootstrap.** That is what makes a clean seam possible.
+
+## The two-seam architecture
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Band 1: LSM core (backend-agnostic, unchanged)             │
+│   memtable · SSTable/block · compaction · MVCC ·           │
+│   manifest state · iterators · WAL merge-by-sequence       │
+└───────────────┬───────────────────────┬────────────────────┘
+   Band 2: byte │ IO                     │ Band 3: durability substrate
+┌───────────────▼──────────┐   ┌─────────▼──────────────────────────┐
+│ trait-level byte IO        │   │ trait DurabilitySubstrate           │
+│ via StorageBackend enum    │   │   bootstrap: create/list/lease/     │
+│ (committed): SSTable/blob/  │   │              recover                 │
+│ block/manifest-bytes        │   │   wal:  open/append/replay/truncate │
+│ read & write                │   │   manifest: publish(state)          │
+│                             │   │            -> Published | Conflict   │
+│ NativeFileBackend           │   │   ├─ FilesystemSubstrate (rename,    │
+│ ObjectStoreBackend (2b)     │   │   │   append-file, dir-scan, flock)  │
+└─────────────────────────────┘   │   └─ ObjectStoreSubstrate (CAS,     │
+                                   │       segment/WAL-less, GC, lease)   │
+                                   └──────────────────────────────────────┘
+```
+
+- **Lower seam (Band 2)** = the already-committed `StorageBackend` enum. Flip the
+  byte-level `table.rs`/`blob.rs` helpers to accept `&StorageBackend` (or make
+  them generic over the byte traits). Mechanical, no semantic risk; tests that
+  pass `&NativeFileBackend` keep working if we go generic, or wrap in
+  `StorageBackend::Native(..)` if we go enum.
+- **Upper seam (Band 3)** = a new, **narrow** `DurabilitySubstrate` trait whose
+  methods are exactly the divergent operations the open/commit/flush
+  orchestration calls. Two implementations; the LSM core and `DbInner` talk to
+  the trait, not to `WalFrontDoor`/`ManifestStore`/`NativeFileBackend` directly.
+
+### Proposed `DurabilitySubstrate` surface (sketch)
+
+```rust
+/// Backend-specific durability + bootstrap. The LSM core is written against
+/// this; one impl per storage substrate. Byte-level SSTable/blob IO is NOT
+/// here — that stays on the fine-grained StorageBackend traits (Band 2).
+trait DurabilitySubstrate {
+    // --- bootstrap / recovery (open path) ---
+    fn open(location: &Location, opts: &OpenOptions) -> Result<Self>;
+    fn acquire_writer_lease(&self) -> Result<WriterLease>;   // flock | lease+fence
+    fn recover(&self) -> Result<RecoveredState>;             // dir-scan+temp-gc | list+orphan-gc
+    fn load_manifest(&self) -> Result<ManifestState>;
+
+    // --- WAL (commit path) ---
+    fn append_wal(&self, batch: &WalBatch, durability: DurabilityMode) -> Result<()>;
+    fn replay_wal(&self, after: Sequence) -> Result<Vec<WalBatch>>;
+    fn truncate_wal(&self, up_to: Sequence) -> Result<()>;
+    // (ObjectStoreSubstrate may implement these as segment objects, or as a
+    //  no-op WAL-less strategy where flush+manifest-CAS is the durability point.)
+
+    // --- manifest publish (flush/compaction path) — the atomic point ---
+    fn publish_manifest(&self, next: &ManifestState) -> Result<PublishOutcome>;
+    // PublishOutcome::{ Published, Conflict { current } }  <-- conflict-aware,
+    // unlike today's publish_manifest() -> Result<()>.
+
+    // --- table/blob object lifecycle that isn't pure byte IO ---
+    fn remove_objects(&self, ids: &[ObjectId]) -> Result<()>;   // delete | tombstone+GC
+    fn sync_after_publish(&self) -> Result<()>;                 // fsync dir | no-op
+}
+```
+
+(Exact shape to be refined when implementing; this captures the operation set
+the probe found, with the conflict-aware manifest publish as the key change.)
+
+## db.rs surgery scope (the real cost)
+
+`DbInner` directly holds `manifest: Option<Mutex<ManifestStore>>`,
+`wal: Option<WalFrontDoor>`, `process_lock`, and `native_storage`, and the
+open/commit/flush methods call substrate functions concretely. Extracting Band 3
+means moving those stateful, filesystem-shaped pieces **behind the substrate**:
+`DbInner` would hold `substrate: Box<dyn DurabilitySubstrate>` (or an enum) plus
+the byte-level `StorageBackend`. This is the genuine surgery.
+
+Mitigants found by the probe: `wal.rs` / `recovery.rs` / `manifest.rs` are
+*already* separate modules, and `ManifestStore` already carries an internal
+backend enum — so the substrate is "define a trait over operations that already
+have module boundaries, then have `FilesystemSubstrate` delegate to the existing
+code", not a rewrite. The 293 lib tests + integration tests are the safety net:
+the filesystem substrate must keep behavior byte-identical.
+
+## Open design question: keep a WAL on object storage, or go WAL-less?
+
+This is the one substrate-level decision worth settling early, because it shapes
+the `ObjectStoreSubstrate`:
+
+- **Segmented WAL**: each commit/group writes a `wal/<seq>` object; replay lists
+  + reads them; truncate deletes below the checkpoint. Preserves low-ish commit
+  latency via group commit; more objects + GC.
+- **WAL-less (flush-based)**: no WAL; a commit is durable only once the memtable
+  is flushed to an SSTable object and the manifest CAS publishes it. Simpler, far
+  fewer objects, but commit latency = flush cadence (mitigate with small frequent
+  flushes / group commit at the SSTable level). This is the common object-store
+  LSM choice.
+
+Recommendation: **WAL-less first** for the object-store substrate (simplest,
+fewest objects, aligns with the manifest-CAS-as-commit-point model already in
+`object-storage-backend.md`); revisit segmented WAL if commit latency demands it.
+
+## Re-sliced plan
+
+The earlier "slice 2a step 1" (the `StorageBackend` byte-dispatch enum, commit
+`4993d09`) stands — it is exactly the Band-2 seam.
+
+- **2a (Band 2, byte IO):** flip `table.rs`/`blob.rs` byte helpers to the
+  `StorageBackend` enum (generic-over-traits preferred so existing tests pass
+  unchanged). Behavior-identical; tests are the net.
+- **2b (Band 3 seam, filesystem impl):** define `DurabilitySubstrate`; implement
+  `FilesystemSubstrate` by delegating to current wal/recovery/manifest code;
+  route `DbInner` + open/commit/flush through it. Behavior-identical; tests are
+  the net. This is the db.rs surgery.
+- **2c (object-store impl):** `ObjectStoreSubstrate` over `ObjectClient` (slice
+  1): WAL-less durability, conflict-aware manifest CAS (`put_if`), lease+fencing,
+  orphan-object GC; `Band 2` byte IO via `ObjectStoreBackend`. Wire
+  `HostStorageBackend::ObjectStore`. Validate against the in-memory `ObjectClient`
+  fake + the recovery/durability suites.
+
+## Why this is safe to pursue
+
+The probe converted "unknown, possibly-everything refactor" into a bounded one:
+divergence is WAL + manifest-publish-conflict + bootstrap; the rest is portable
+or already trait-abstracted; the substrate concepts already have module
+boundaries; and every step before the object-store impl is behavior-preserving
+with 293 tests guarding it.
