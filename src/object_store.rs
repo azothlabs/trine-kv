@@ -20,6 +20,7 @@
 use std::{
     collections::BTreeMap,
     future::Future,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{
         Arc, Mutex, MutexGuard,
@@ -28,6 +29,12 @@ use std::{
 };
 
 use crate::error::{Error, Result};
+use crate::options::DurabilityMode;
+use crate::storage::{
+    StorageCapabilities, StorageFuture, StorageObjectDeleteBackend, StorageObjectId,
+    StorageObjectListBackend, StorageObjectListRequest, StorageObjectReadBackend,
+    StorageObjectWriteBackend, StorageReadBackend, StorageReadFuture, StorageReadObject,
+};
 
 /// Boxed future returned by [`ObjectClient`] methods. Mirrors the storage
 /// layer's `StorageFuture`: object stores are used through `dyn`, so the async
@@ -323,6 +330,174 @@ impl<C: ObjectClient + ?Sized> ObjectClient for Arc<C> {
     }
 }
 
+/// An object-storage **byte** backend: `SSTable` and blob object IO over an
+/// [`ObjectClient`].
+///
+/// It implements the async `Storage*Backend` byte traits the already-generic
+/// table/blob async helpers are written against, so flush, compaction, and reads
+/// work over object storage. The WAL, the manifest CAS, and the writer lease are
+/// deliberately **not** here — those are the object-storage durability
+/// substrate's job (manifest CAS lives in [`crate::manifest::ObjectManifestStore`]).
+///
+/// A [`StorageObjectId`]'s path is used directly as the object key, so keys are
+/// consistent across read / write / list / delete (the open path joins file
+/// names under the database's key prefix, mirroring the filesystem layout).
+#[derive(Clone)]
+pub(crate) struct ObjectStoreBackend {
+    client: Arc<dyn ObjectClient>,
+}
+
+impl std::fmt::Debug for ObjectStoreBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ObjectStoreBackend")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ObjectStoreBackend {
+    pub(crate) fn new(client: Arc<dyn ObjectClient>) -> Self {
+        Self { client }
+    }
+
+    fn object_key(object: &StorageObjectId) -> String {
+        object.path().to_string_lossy().into_owned()
+    }
+}
+
+/// A whole-object read handle: the bytes are fetched eagerly on `open_read`
+/// (object stores favour whole-object GETs) and random-access reads are served
+/// from the in-memory buffer — mirroring `MemoryStorageObject`.
+#[derive(Debug, Clone)]
+pub(crate) struct ObjectStoreReadObject {
+    object: StorageObjectId,
+    bytes: Arc<[u8]>,
+}
+
+impl ObjectStoreReadObject {
+    fn read_exact_at_offset(&self, offset: usize, out: &mut [u8]) -> Result<()> {
+        let end = offset
+            .checked_add(out.len())
+            .ok_or_else(|| Error::invalid_options("object read offset overflow"))?;
+        let source = self
+            .bytes
+            .get(offset..end)
+            .ok_or_else(|| Error::Corruption {
+                message: format!("object {} short read", self.object.path().display()),
+            })?;
+        out.copy_from_slice(source);
+        Ok(())
+    }
+}
+
+impl StorageReadObject for ObjectStoreReadObject {
+    fn object(&self) -> &StorageObjectId {
+        &self.object
+    }
+
+    fn len(&self) -> StorageReadFuture<'_, u64> {
+        let len = self.bytes.len();
+        Box::pin(async move {
+            u64::try_from(len).map_err(|_| Error::invalid_options("object length overflow"))
+        })
+    }
+
+    fn read_exact_at<'op>(
+        &'op self,
+        offset: usize,
+        bytes: &'op mut [u8],
+    ) -> StorageReadFuture<'op, ()> {
+        Box::pin(async move { self.read_exact_at_offset(offset, bytes) })
+    }
+}
+
+impl StorageReadBackend for ObjectStoreBackend {
+    type ReadObject = ObjectStoreReadObject;
+
+    fn capabilities(&self) -> StorageCapabilities {
+        StorageCapabilities::object_store()
+    }
+
+    fn open_read(&self, object: StorageObjectId) -> StorageReadFuture<'_, Self::ReadObject> {
+        Box::pin(async move {
+            let key = Self::object_key(&object);
+            let bytes = self
+                .client
+                .get(&key)
+                .await?
+                .ok_or_else(|| Error::Corruption {
+                    message: format!("referenced object {key} cannot be opened"),
+                })?;
+            Ok(ObjectStoreReadObject { object, bytes })
+        })
+    }
+}
+
+impl StorageObjectReadBackend for ObjectStoreBackend {
+    fn read_object_bytes(&self, object: StorageObjectId) -> StorageFuture<'_, Option<Arc<[u8]>>> {
+        Box::pin(async move { self.client.get(&Self::object_key(&object)).await })
+    }
+}
+
+impl StorageObjectWriteBackend for ObjectStoreBackend {
+    fn write_object(
+        &self,
+        object: StorageObjectId,
+        bytes: Arc<[u8]>,
+        _durability: DurabilityMode,
+    ) -> StorageFuture<'_, ()> {
+        // A PUT is durable once the store acknowledges it, so durability hints do
+        // not apply (there is no separate flush/fsync step).
+        Box::pin(async move {
+            self.client.put(&Self::object_key(&object), bytes).await?;
+            Ok(())
+        })
+    }
+}
+
+impl StorageObjectDeleteBackend for ObjectStoreBackend {
+    fn delete_object(&self, object: StorageObjectId) -> StorageFuture<'_, ()> {
+        Box::pin(async move { self.client.delete(&Self::object_key(&object)).await })
+    }
+}
+
+impl StorageObjectListBackend for ObjectStoreBackend {
+    fn list_objects(
+        &self,
+        request: StorageObjectListRequest,
+    ) -> StorageFuture<'_, Vec<StorageObjectId>> {
+        Box::pin(async move {
+            let root = request.root().to_path_buf();
+            let kind = request.kind();
+            let extension = request.file_extension();
+            // Prefix-list under the database root, then keep only the direct
+            // children matching the requested extension — mirroring the
+            // filesystem backend's non-recursive, extension-filtered listing.
+            let prefix = root.to_string_lossy().into_owned();
+            let mut objects: Vec<StorageObjectId> = self
+                .client
+                .list(&prefix)
+                .await?
+                .into_iter()
+                .map(|meta| PathBuf::from(meta.key))
+                .filter(|path| path.parent() == Some(root.as_path()))
+                .filter(|path| path_matches_extension(path, extension))
+                .map(|path| StorageObjectId::native_file(kind, path))
+                .collect();
+            objects.sort_unstable();
+            Ok(objects)
+        })
+    }
+}
+
+fn path_matches_extension(path: &Path, expected: Option<&str>) -> bool {
+    expected.is_none_or(|expected| {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,5 +644,71 @@ mod tests {
             PutIf::PreconditionFailed { current } => assert_eq!(current, None),
             PutIf::Stored { .. } => panic!("IfMatch cannot match a missing object"),
         }
+    }
+
+    #[test]
+    fn object_store_backend_round_trips_an_object() {
+        use crate::storage::StorageObjectKind;
+
+        let backend = ObjectStoreBackend::new(Arc::new(InMemoryObjectStore::new()));
+        let id = StorageObjectId::native_file(StorageObjectKind::Table, "/db/0001.trinet");
+
+        block_on(backend.write_object(id.clone(), bytes(b"hello world"), DurabilityMode::Flush))
+            .unwrap();
+
+        // Whole-object read.
+        assert_eq!(
+            block_on(backend.read_object_bytes(id.clone()))
+                .unwrap()
+                .as_deref(),
+            Some(b"hello world".as_slice())
+        );
+
+        // Random-access read via the eager read handle.
+        let object = block_on(backend.open_read(id.clone())).unwrap();
+        assert_eq!(block_on(StorageReadObject::len(&object)).unwrap(), 11);
+        let mut window = [0_u8; 5];
+        block_on(StorageReadObject::read_exact_at(&object, 6, &mut window)).unwrap();
+        assert_eq!(&window, b"world");
+
+        // Delete, then it is gone.
+        block_on(backend.delete_object(id.clone())).unwrap();
+        assert!(block_on(backend.read_object_bytes(id)).unwrap().is_none());
+    }
+
+    #[test]
+    fn object_store_backend_lists_direct_children_by_extension() {
+        use crate::storage::{StorageObjectKind, StorageObjectListRequest};
+
+        let backend = ObjectStoreBackend::new(Arc::new(InMemoryObjectStore::new()));
+        let write = |key: &'static str| {
+            block_on(backend.write_object(
+                StorageObjectId::native_file(StorageObjectKind::Table, key),
+                bytes(b"x"),
+                DurabilityMode::Flush,
+            ))
+            .unwrap();
+        };
+        write("/db/0002.trinet");
+        write("/db/0001.trinet");
+        write("/db/MANIFEST"); // wrong extension
+        write("/db/sub/9999.trinet"); // not a direct child of /db
+
+        let listed = block_on(
+            backend.list_objects(
+                StorageObjectListRequest::native_file(StorageObjectKind::Table, "/db")
+                    .with_file_extension("trinet"),
+            ),
+        )
+        .unwrap();
+        let paths: Vec<String> = listed
+            .iter()
+            .map(|id| id.path().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            paths,
+            ["/db/0001.trinet", "/db/0002.trinet"],
+            "only direct .trinet children, in key order"
+        );
     }
 }

@@ -166,7 +166,7 @@ impl StorageObjectListRequest {
         &self.root
     }
 
-    const fn file_extension(&self) -> Option<&'static str> {
+    pub(crate) const fn file_extension(&self) -> Option<&'static str> {
         self.file_extension
     }
 }
@@ -363,6 +363,21 @@ impl StorageCapabilities {
             .with(StorageCapability::Volatile)
             .with(StorageCapability::RandomRead)
             .with(StorageCapability::ObjectRead)
+    }
+
+    /// Byte-level capabilities of an object-storage backend: whole-object
+    /// get/put/delete + prefix listing. Append, atomic rename/WAL-rewrite, and
+    /// filesystem locking are deliberately absent — those diverge and are handled
+    /// by the object-storage durability substrate (segmented/WAL-less + manifest
+    /// CAS + lease object), not this byte backend.
+    pub(crate) const fn object_store() -> Self {
+        Self::empty()
+            .with(StorageCapability::Persistent)
+            .with(StorageCapability::RandomRead)
+            .with(StorageCapability::ObjectRead)
+            .with(StorageCapability::ObjectWrite)
+            .with(StorageCapability::ObjectDelete)
+            .with(StorageCapability::ObjectListing)
     }
 
     pub(crate) const fn with(self, capability: StorageCapability) -> Self {
