@@ -397,6 +397,31 @@ stands as the Band-2 dispatch type for where a single backend value is needed.
       becomes generic/enum-dispatched, but threading it through the *concrete*
       filesystem helpers is the wrong move (the original 2b probe lesson) — the
       object path forks instead.
+
+      **2c-4c DONE (`dbd281b` + `1fef3cc`) — object-store databases work end to
+      end.** Implemented exactly as the finding prescribed (parallel async path,
+      no field reroute): `DbInner` gained `object_storage: Option<ObjectStoreBackend>`
+      (native_storage stays an unused default); `Db::open_object_store_async(client,
+      options)` (acquire `ObjectWriterLease`, manifest via
+      `ManifestStore::open_object_store_async`, buckets via
+      `buckets_from_manifest_async<ObjectStoreBackend>`, recover visible sequence
+      from the manifest tables' `largest_sequence` — no WAL);
+      `flush_object_store_async` / `write_flush_inputs_object_store_async` /
+      `publish_flushed_tables_object_store_async` (write SSTable objects via the
+      generic async helpers, publish via `add_tables_async` rebase-retry CAS);
+      `bucket_with_options_object_store_async` (named-bucket create via
+      `create_bucket_async`). `options::HostStorageBackend::ObjectStore` +
+      `DbOptions::object_store()` + dispatch (sync open + the no-client async `open`
+      reject it; `flush()` routes to the object path, `flush_sync` rejects).
+      Tested vs `InMemoryObjectStore`: open → put (default + named bucket) → flush →
+      reopen → read, plus sync-flush rejection. 361 tests green, clippy + wasm clean.
+      **Scoped follow-ups (NOT part of the durable core, deliberately deferred):**
+      (a) **Send-hardening** — flush/bucket-create hold the manifest mutex across
+      the async CAS (`#[allow(clippy::await_holding_lock)]`), so those futures are
+      `!Send`; the prepare/publish/install split (like browser) fixes it.
+      (b) **object-store compaction + maintenance + blob-GC** — currently return a
+      clear "not yet supported" error (honest, not silent); the DB is correct and
+      durable without them (reads just scan more L0 tables).
   - **2c-5:** orphan-object GC (objects unreferenced by the published manifest).
 
 ## Why this is safe to pursue
