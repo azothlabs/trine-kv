@@ -245,6 +245,28 @@ stands as the Band-2 dispatch type for where a single backend value is needed.
     byte-identical (346 tests green native + wasm `cargo check`). `published_or_err`
     is the placeholder 2c replaces with a rebase-and-retry loop; the `Conflict`
     variant is `#[allow(dead_code)]` until the object-store substrate constructs it.
+  - **2b ② DONE** (`src/substrate.rs`, dead-code + smoke test). **Scope decision
+    refining the trait sketch above:** tracing `DbInner` showed the manifest
+    publish is *already* abstracted (`ManifestStore` + its backend enum + ① made
+    it conflict-aware), and that **bootstrap/recovery is open-time orchestration
+    that *constructs* the substrate, not a runtime op**. So the substrate covers
+    only the two runtime-divergent things still bound concretely to
+    `NativeFileBackend` with a parallel `browser_*` field: the **WAL lifecycle**
+    (`wal: Option<WalFrontDoor>`) and the **writer lease**
+    (`process_lock: Mutex<Option<ProcessLock>>`). Landed as
+    `pub(crate) enum DurabilitySubstrate { Filesystem(FilesystemSubstrate) }`
+    (enum dispatch, house style — not `dyn`), with methods `wal_is_present`,
+    `accept_commit`, `persist_wal`, `wal_stats`, `rewrite_wal_after_replay_floor`,
+    `release_writer_lease`. `FilesystemSubstrate` owns `Option<WalFrontDoor>` +
+    `Mutex<Option<ProcessLock>>` and delegates to existing code. Two smoke tests
+    drive it against a real temp-dir WAL+lease exactly as commit/flush/close will
+    (and the no-WAL/read-only case). Unconsumed (`#![allow(dead_code)]`) until ③;
+    behavior byte-identical (348 tests green native + wasm `cargo check`, clippy
+    clean). **Next: 2b ③** — replace `DbInner`'s `wal` + `process_lock`
+    (+ `browser_wal`/`browser_writer_lease`) with a `DurabilitySubstrate` the open
+    path constructs and commit/flush/close drive (`accept_wal_front_door`,
+    `has_wal_front_door`, the flush rewrite, `Db::close`'s lease drop). That is the
+    invasive hot-path reroute; 348 tests guard byte-identical behavior.
 - **2c (object-store impl):** `ObjectStoreSubstrate` over `ObjectClient` (slice
   1): WAL-less durability, conflict-aware manifest CAS (`put_if`), lease+fencing,
   orphan-object GC; byte IO via the **async generic helpers** + `ObjectStoreBackend`.

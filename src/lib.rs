@@ -91,6 +91,7 @@ pub mod snapshot;
 /// Live database statistics exposed to callers.
 pub mod stats;
 mod storage;
+mod substrate;
 mod table;
 /// Optimistic transaction API.
 pub mod transaction;
