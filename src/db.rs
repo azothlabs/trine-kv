@@ -1064,7 +1064,7 @@ impl Db {
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    #[allow(clippy::arc_with_non_send_sync)]
+    #[allow(clippy::arc_with_non_send_sync, clippy::too_many_lines)]
     async fn open_browser_persistent_with_options_async_inner(options: DbOptions) -> Result<Self> {
         Self::validate_browser_persistent_options(&options)?;
         let storage = BrowserStorageBackend::new().await?;
@@ -1207,6 +1207,10 @@ impl Db {
     /// Returns [`Error::InvalidOptions`] when `options` is not object-store mode,
     /// or storage/`ObjectClient` errors from reading the manifest and acquiring
     /// the writer lease.
+    #[cfg_attr(
+        all(target_arch = "wasm32", target_os = "unknown"),
+        allow(clippy::arc_with_non_send_sync)
+    )]
     pub async fn open_object_store_at(
         client: Arc<dyn ObjectClient>,
         prefix: impl Into<String>,
