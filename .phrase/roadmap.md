@@ -3545,3 +3545,50 @@ shared open/read cost after writer-lease acquisition is removed.
 
 - Start clean-WAL read-only open work only if the implementation can prove that
   skipping WAL shard reads cannot hide replayable committed records.
+
+### Phase 145: Read Version Public API Design
+
+**Status**: Complete
+
+**Goal**: Design and implement the first public historical-read API slice
+around `ReadVersion` without requiring callers to understand internal commit
+numbering.
+
+**Entry Condition**: Release-prep phase is complete and the user wants a
+long-term design for consistent historical reads.
+
+**Acceptance Gate**:
+
+- `.phrase/protocol/read-version-public-api.md` defines vocabulary, public API,
+  errors, retention, checkpoints, non-goals, and implementation gates.
+- The design preserves current latest-read behavior.
+- The design separates public `ReadVersion` semantics from internal sequence
+  mechanics.
+- The first implementation slice is verified with focused MVCC/read-version
+  tests, Rustdoc, doctests, clippy, full tests, diff checks, and scans.
+
+### Phase 146: Read Version Checkpoints And Retention
+
+**Status**: Complete
+
+**Goal**: Implement named checkpoint pins and configurable recent read-version
+retention without exposing internal commit-number mechanics.
+
+**Entry Condition**: Phase 145 completed the first `ReadVersion` slice and left
+checkpoint APIs plus configurable retention as the next accepted boundary.
+
+**Acceptance Gate**:
+
+- Protocol files record checkpoint and recent-retention semantics.
+- Manifest v9 stores checkpoint pins and v8 manifests decode with no
+  checkpoints.
+- Active snapshots, checkpoints, and configured recent retention all protect the
+  effective retained floor.
+- In-memory and durable public APIs expose the same checkpoint behavior.
+- Focused tests, Rustdoc, doctests, clippy, full tests, diff checks, and scans
+  pass.
+
+**Major Out Of Scope**:
+
+- Writable branches, merge, rebase, time-based retention, checkpoint
+  replacement, replication, or lineage mapping.

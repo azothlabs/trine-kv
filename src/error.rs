@@ -1,6 +1,6 @@
 use std::{error, fmt, io};
 
-use crate::options::DurabilityMode;
+use crate::{options::DurabilityMode, types::ReadVersion};
 
 /// Convenient result alias used by Trine KV APIs.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -35,6 +35,33 @@ pub enum Error {
     Conflict {
         /// Human-readable conflict detail.
         message: String,
+    },
+    /// The requested read version is newer than the latest visible database
+    /// state.
+    ReadVersionTooNew {
+        /// Read version requested by the caller.
+        requested: ReadVersion,
+        /// Newest read version visible to readers when the request was
+        /// checked.
+        latest: ReadVersion,
+    },
+    /// The requested read version is older than Trine's retained history.
+    ReadVersionExpired {
+        /// Read version requested by the caller.
+        requested: ReadVersion,
+        /// Oldest read version Trine promises to answer when the request was
+        /// checked.
+        oldest_retained: ReadVersion,
+    },
+    /// A checkpoint with the requested name already exists.
+    CheckpointAlreadyExists {
+        /// Existing checkpoint name.
+        name: String,
+    },
+    /// The requested checkpoint name was not found.
+    CheckpointNotFound {
+        /// Missing checkpoint name.
+        name: String,
     },
     /// The database was opened read-only and a write was requested.
     ReadOnly,
@@ -119,6 +146,25 @@ impl fmt::Display for Error {
             }
             Self::CodecUnavailable { codec } => write!(formatter, "codec unavailable: {codec}"),
             Self::Conflict { message } => write!(formatter, "transaction conflict: {message}"),
+            Self::ReadVersionTooNew { requested, latest } => write!(
+                formatter,
+                "read version {} is newer than latest read version {}",
+                requested.as_u64(),
+                latest.as_u64()
+            ),
+            Self::ReadVersionExpired {
+                requested,
+                oldest_retained,
+            } => write!(
+                formatter,
+                "read version {} is older than oldest retained read version {}",
+                requested.as_u64(),
+                oldest_retained.as_u64()
+            ),
+            Self::CheckpointAlreadyExists { name } => {
+                write!(formatter, "checkpoint already exists: {name}")
+            }
+            Self::CheckpointNotFound { name } => write!(formatter, "checkpoint not found: {name}"),
             Self::ReadOnly => formatter.write_str("database is read-only"),
             Self::Closed => formatter.write_str("database is closed"),
             Self::RuntimeBusy { message } => write!(formatter, "runtime busy: {message}"),

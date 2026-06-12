@@ -63,6 +63,9 @@ Rules:
 - **Internal key**: encoded key used inside memtables and SSTables.
 - **Sequence**: monotonic commit number assigned by Trine.
 - **Snapshot sequence**: read boundary for repeatable reads.
+- **ReadVersion**: public stable numeric cursor for a committed database state.
+  It is database-scoped and does not require callers to understand internal
+  sequence allocation.
 - **Default bucket**: built-in ordered KV namespace addressed directly through
   `Db`.
 - **Bucket**: optional named ordered KV namespace with independent options.
@@ -156,10 +159,17 @@ Db::flush().await -> Result<()>
 Db::compact_range(range).await -> Result<()>
 Db::close().await -> Result<()>
 Db::snapshot() -> Snapshot
+Db::snapshot_at(read_version) -> Result<Snapshot>
+Db::latest_read_version() -> ReadVersion
+Db::oldest_retained_read_version() -> ReadVersion
+Db::create_checkpoint(name).await -> Result<ReadVersion>
+Db::delete_checkpoint(name).await -> Result<()>
+Db::checkpoint_read_version(name).await -> Result<ReadVersion>
 Db::transaction(options) -> Transaction
 Db::stats() -> DbStats
 
 DbOptions::with_default_bucket_options(options) -> DbOptions
+DbOptions::with_keep_last_read_versions(count) -> DbOptions
 
 Bucket::get(key).await -> Result<Option<Value>>
 Bucket::put(key, value).await -> Result<()>
@@ -176,6 +186,8 @@ WriteBatch::put_bucket(bucket, key, value) -> Result<()>
 WriteBatch::delete_bucket(bucket, key) -> Result<()>
 WriteBatch::delete_range_bucket(bucket, range) -> Result<()>
 Db::write(batch, write_options).await -> Result<CommitInfo>
+CommitInfo::read_version() -> ReadVersion
+Snapshot::read_version() -> ReadVersion
 
 Transaction::get(key).await -> Result<Option<Value>>
 Transaction::put(key, value) -> Result<()>
@@ -289,9 +301,30 @@ Read visibility:
 Snapshot lifetime:
 
 - active snapshots pin their `read_seq`;
-- `oldest_active_snapshot_seq` controls compaction cleanup;
+- active snapshots, named checkpoints, and configured recent-history retention
+  together control compaction cleanup;
 - dropping a snapshot releases its pin;
-- no compaction may remove a version that an active snapshot could still read.
+- deleting a checkpoint releases its named pin;
+- no compaction may remove a version that a retained read version could still
+  read.
+
+Public read-version rules:
+
+- `ReadVersion` is the user-facing historical-read cursor for a database state;
+- `latest_read_version` returns the newest state visible to readers;
+- `oldest_retained_read_version` returns the oldest state Trine promises to
+  answer;
+- `snapshot_at(read_version)` validates the read version, pins it, and never
+  falls back to latest;
+- requesting a future read version returns `ReadVersionTooNew`;
+- requesting a read version below the retained floor returns
+  `ReadVersionExpired`;
+- an accepted empty write batch returns the current latest read version without
+  creating a new database state;
+- checkpoints are named read-version pins stored in manifest metadata for
+  durable storage modes;
+- `DbOptions::with_keep_last_read_versions(count)` retains a configured number
+  of recent read versions, with `count = 1` as the default latest-only window.
 
 ## 9. Transactions
 
@@ -797,9 +830,9 @@ Compaction must preserve:
 
 Version cleanup rules for a user key:
 
-- keep every version with `sequence > oldest_active_snapshot_seq`;
-- keep the newest version with `sequence <= oldest_active_snapshot_seq`;
-- drop older versions only when no active snapshot can read them;
+- keep every version with `sequence > oldest_retained_seq`;
+- keep the newest version with `sequence <= oldest_retained_seq`;
+- drop older versions only when no retained read version can read them;
 - drop point tombstones only when all older covered versions are removed from
   the live bucket, not merely from the selected input tables;
 - drop range tombstones only when all covered older versions are removed from
@@ -992,6 +1025,8 @@ Correctness tests:
 - atomic write batch success and failure;
 - cross-bucket batch atomicity;
 - snapshot repeatable read;
+- read-version latest, retained floor, empty-batch, too-new, and expired
+  behavior;
 - snapshot survives compaction;
 - optimistic transaction conflict on point read;
 - optimistic transaction conflict on range read;

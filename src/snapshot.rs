@@ -5,9 +5,9 @@ use std::{
 
 use crate::{
     bucket::Bucket,
-    error::Result,
+    error::{Error, Result},
     iterator::{Iter, LazyIter},
-    types::{KeyRange, Sequence, Value},
+    types::{KeyRange, ReadVersion, Sequence, Value},
 };
 
 #[derive(Debug, Default)]
@@ -24,6 +24,45 @@ impl SnapshotTracker {
                 tracker: Arc::clone(self),
             }),
         }
+    }
+
+    pub(crate) fn pinned_retained_snapshot(
+        self: &Arc<Self>,
+        read_sequence: Sequence,
+        latest_sequence: Sequence,
+        retained_floor: Sequence,
+    ) -> Result<Snapshot> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let oldest_retained = active
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or(latest_sequence)
+            .min(retained_floor);
+        let requested = ReadVersion::from_sequence(read_sequence);
+        if read_sequence > latest_sequence {
+            return Err(Error::ReadVersionTooNew {
+                requested,
+                latest: ReadVersion::from_sequence(latest_sequence),
+            });
+        }
+        if read_sequence < oldest_retained {
+            return Err(Error::ReadVersionExpired {
+                requested,
+                oldest_retained: ReadVersion::from_sequence(oldest_retained),
+            });
+        }
+
+        *active.entry(read_sequence).or_default() += 1;
+        Ok(Snapshot {
+            read_sequence,
+            pin: Some(SnapshotPin {
+                tracker: Arc::clone(self),
+            }),
+        })
     }
 
     pub(crate) fn oldest_active_or(&self, fallback: Sequence) -> Sequence {
@@ -92,6 +131,17 @@ impl Snapshot {
     #[must_use]
     pub const fn read_sequence(&self) -> Sequence {
         self.read_sequence
+    }
+
+    /// Returns the public read version visible through this snapshot.
+    ///
+    /// All point, range, and prefix reads made through this snapshot use this
+    /// same database-wide read boundary, even when newer writes commit before
+    /// the reads run. The snapshot keeps that retained version pinned until all
+    /// snapshot clones are dropped.
+    #[must_use]
+    pub const fn read_version(&self) -> ReadVersion {
+        ReadVersion::from_sequence(self.read_sequence)
     }
 
     #[must_use]

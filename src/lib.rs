@@ -32,7 +32,7 @@
 //!   memtables, tables, filters, and compaction state.
 //! - [`WriteBatch`] groups puts, point deletes, and range deletes into one
 //!   atomic commit.
-//! - [`Snapshot`] pins a committed sequence so repeated reads see a stable view
+//! - [`Snapshot`] pins a [`ReadVersion`] so repeated reads see a stable view
 //!   while newer writes continue.
 //! - [`Transaction`] records reads and stages writes, then rejects commit if a
 //!   later committed write conflicts with the read set.
@@ -130,7 +130,7 @@ pub use runtime::{CancellationToken, RuntimeCapabilities, RuntimeMode, RuntimeOp
 pub use snapshot::Snapshot;
 pub use stats::DbStats;
 pub use transaction::{Transaction, TransactionOptions};
-pub use types::{CommitInfo, KeyRange, KeyValue, Sequence, Value};
+pub use types::{CommitInfo, KeyRange, KeyValue, ReadVersion, Sequence, Value};
 pub use write_batch::WriteBatch;
 
 #[cfg(test)]

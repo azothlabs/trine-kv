@@ -47,7 +47,7 @@ use crate::{
     },
     table::{self, Table},
     transaction::{Transaction, TransactionOptions},
-    types::{CommitInfo, KeyRange, Sequence, Value},
+    types::{CommitInfo, KeyRange, ReadVersion, Sequence, Value},
     wal::{self, WalBatch, WalFrontDoor},
     write_batch::BatchOperation,
 };
@@ -219,6 +219,7 @@ pub(crate) struct DbInner {
     memtable_publish_lock: Mutex<()>,
     buckets: RwLock<BTreeMap<String, Arc<LsmTree>>>,
     snapshots: Arc<SnapshotTracker>,
+    checkpoints: Mutex<BTreeMap<String, Sequence>>,
     pending_obsolete_table_ids: Mutex<BTreeSet<table::TableId>>,
     manifest: Option<Mutex<ManifestStore>>,
     // The write-ahead log + single-writer lease behind the Band 3 durability
@@ -1133,6 +1134,7 @@ impl Db {
                 memtable_publish_lock: Mutex::new(()),
                 buckets: RwLock::new(buckets),
                 snapshots: Arc::new(SnapshotTracker::default()),
+                checkpoints: Mutex::new(BTreeMap::new()),
                 pending_obsolete_table_ids: Mutex::new(BTreeSet::new()),
                 manifest: Some(Mutex::new(manifest)),
                 // Browser durability rides the `browser_*` fields; the substrate
@@ -1265,6 +1267,7 @@ impl Db {
                 memtable_publish_lock: Mutex::new(()),
                 buckets: RwLock::new(buckets),
                 snapshots: Arc::new(SnapshotTracker::default()),
+                checkpoints: Mutex::new(BTreeMap::new()),
                 pending_obsolete_table_ids: Mutex::new(BTreeSet::new()),
                 manifest: Some(Mutex::new(manifest)),
                 substrate,
@@ -1367,6 +1370,7 @@ impl Db {
                 memtable_publish_lock: Mutex::new(()),
                 buckets: RwLock::new(buckets),
                 snapshots: Arc::new(SnapshotTracker::default()),
+                checkpoints: Mutex::new(BTreeMap::new()),
                 pending_obsolete_table_ids: Mutex::new(BTreeSet::new()),
                 manifest: None,
                 // In-memory: no WAL, no lease.
@@ -1625,6 +1629,7 @@ impl Db {
                 memtable_publish_lock: Mutex::new(()),
                 buckets: RwLock::new(buckets),
                 snapshots: Arc::new(SnapshotTracker::default()),
+                checkpoints: Mutex::new(BTreeMap::new()),
                 pending_obsolete_table_ids: Mutex::new(BTreeSet::new()),
                 manifest: Some(Mutex::new(manifest)),
                 substrate: DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(
@@ -2506,6 +2511,54 @@ impl Db {
         self.install_object_manifest(object)
     }
 
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    async fn create_checkpoint_browser_async(&self, name: &str) -> Result<ReadVersion> {
+        let _manifest_publish = self.inner.browser_manifest_async_lock.lock().await;
+        let sequence = self.last_committed_sequence();
+        let manifest = self
+            .inner
+            .manifest
+            .as_ref()
+            .ok_or_else(|| Error::Corruption {
+                message: "browser persistent database is missing manifest store".to_owned(),
+            })?;
+        let prepared_publish = {
+            let manifest = manifest
+                .lock()
+                .map_err(|_| lock_poisoned("manifest store"))?;
+            manifest.prepare_create_checkpoint_publish(name.to_owned(), sequence)?
+        };
+        prepared_publish.publish_async().await?;
+        manifest
+            .lock()
+            .map_err(|_| lock_poisoned("manifest store"))?
+            .install_prepared_publish(prepared_publish)?;
+        Ok(ReadVersion::from_sequence(sequence))
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    async fn delete_checkpoint_browser_async(&self, name: &str) -> Result<()> {
+        let _manifest_publish = self.inner.browser_manifest_async_lock.lock().await;
+        let manifest = self
+            .inner
+            .manifest
+            .as_ref()
+            .ok_or_else(|| Error::Corruption {
+                message: "browser persistent database is missing manifest store".to_owned(),
+            })?;
+        let prepared_publish = {
+            let manifest = manifest
+                .lock()
+                .map_err(|_| lock_poisoned("manifest store"))?;
+            manifest.prepare_delete_checkpoint_publish(name.to_owned())?
+        };
+        prepared_publish.publish_async().await?;
+        manifest
+            .lock()
+            .map_err(|_| lock_poisoned("manifest store"))?
+            .install_prepared_publish(prepared_publish)
+    }
+
     /// Object-store manifest publishes run Send-safely as a checkout / mutate /
     /// write-back: serialize via the async lock (held by the caller for the whole
     /// sequence), clone the manifest handle out under a brief std lock, run the
@@ -2623,7 +2676,7 @@ impl Db {
         local_l0_compaction: bool,
         budget: MaintenanceBudget,
     ) -> Result<MaintenanceOutcome> {
-        let oldest_active_snapshot = self.oldest_active_snapshot_sequence();
+        let oldest_active_snapshot = self.oldest_retained_sequence();
         let compaction_inputs =
             self.collect_compaction_inputs(range, oldest_active_snapshot, local_l0_compaction)?;
         if compaction_inputs.is_empty() {
@@ -3245,6 +3298,186 @@ impl Db {
             .pinned_snapshot(self.last_committed_sequence())
     }
 
+    /// Creates a snapshot at a retained read version.
+    ///
+    /// The returned snapshot pins `version`, so cleanup and compaction must keep
+    /// the data needed by its reads alive until all clones are dropped. The
+    /// read version is database-wide: reads through the snapshot see one
+    /// consistent state across the default bucket and all named buckets.
+    ///
+    /// # Parameters
+    ///
+    /// - `version`: read version previously obtained from this database
+    ///   lineage, such as [`Db::latest_read_version`] or
+    ///   [`CommitInfo::read_version`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`] if the database handle is closed,
+    /// [`Error::ReadVersionTooNew`] if `version` is newer than the latest
+    /// visible state, or [`Error::ReadVersionExpired`] if `version` is below
+    /// [`Db::oldest_retained_read_version`]. The method never falls back to the
+    /// latest state.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use trine_kv::{Db, DbOptions};
+    ///
+    /// # fn main() -> trine_kv::Result<()> {
+    /// let db = Db::open_sync(DbOptions::memory())?;
+    /// db.put_sync(b"k", b"v1")?;
+    /// let old = db.latest_read_version();
+    ///
+    /// let keep_old = db.snapshot_at(old)?;
+    /// db.put_sync(b"k", b"v2")?;
+    ///
+    /// let snapshot = db.snapshot_at(old)?;
+    /// assert_eq!(db.get_at_sync(&snapshot, b"k")?, Some(b"v1".to_vec()));
+    /// drop(keep_old);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn snapshot_at(&self, version: ReadVersion) -> Result<Snapshot> {
+        self.ensure_open()?;
+        let latest = self.last_committed_sequence();
+        let retained_floor = self.retained_floor_without_active_snapshots(latest);
+        self.inner
+            .snapshots
+            .pinned_retained_snapshot(version.to_sequence(), latest, retained_floor)
+    }
+
+    /// Creates a named checkpoint at the newest visible read version.
+    ///
+    /// A checkpoint is durable metadata for persistent databases and an
+    /// in-memory pin for in-memory databases. While it exists, Trine treats the
+    /// returned read version as retained: [`Db::snapshot_at`] can later validate
+    /// and pin that version even if it is older than the configured recent
+    /// retention window.
+    ///
+    /// # Parameters
+    ///
+    /// - `name`: non-empty checkpoint name. Names are database-local and must
+    ///   be unique until deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`] if the handle is closed, [`Error::ReadOnly`] if
+    /// the handle cannot mutate metadata, [`Error::InvalidOptions`] for an
+    /// empty name, or [`Error::CheckpointAlreadyExists`] when `name` already
+    /// exists.
+    pub fn create_checkpoint_sync(&self, name: &str) -> Result<ReadVersion> {
+        self.ensure_open()?;
+        validate_checkpoint_name(name)?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+
+        let sequence = self.last_committed_sequence();
+        if let Some(manifest) = &self.inner.manifest {
+            manifest
+                .lock()
+                .map_err(|_| lock_poisoned("manifest store"))?
+                .create_checkpoint(name.to_owned(), sequence)?;
+        } else {
+            let mut checkpoints = self
+                .inner
+                .checkpoints
+                .lock()
+                .map_err(|_| lock_poisoned("checkpoint registry"))?;
+            if checkpoints.insert(name.to_owned(), sequence).is_some() {
+                return Err(Error::CheckpointAlreadyExists {
+                    name: name.to_owned(),
+                });
+            }
+        }
+
+        Ok(ReadVersion::from_sequence(sequence))
+    }
+
+    /// Deletes a named checkpoint.
+    ///
+    /// Deleting a checkpoint removes its retained-version pin. Existing
+    /// snapshots opened from that checkpoint continue to pin their read version
+    /// until dropped, but future [`Db::snapshot_at`] calls must rely on another
+    /// checkpoint, an active snapshot, or the configured recent retention
+    /// window.
+    ///
+    /// # Parameters
+    ///
+    /// - `name`: checkpoint name previously passed to
+    ///   [`Db::create_checkpoint_sync`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`], [`Error::ReadOnly`],
+    /// [`Error::InvalidOptions`] for an empty name, or
+    /// [`Error::CheckpointNotFound`] if no checkpoint with that name exists.
+    pub fn delete_checkpoint_sync(&self, name: &str) -> Result<()> {
+        self.ensure_open()?;
+        validate_checkpoint_name(name)?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+
+        if let Some(manifest) = &self.inner.manifest {
+            manifest
+                .lock()
+                .map_err(|_| lock_poisoned("manifest store"))?
+                .delete_checkpoint(name.to_owned())?;
+        } else {
+            let mut checkpoints = self
+                .inner
+                .checkpoints
+                .lock()
+                .map_err(|_| lock_poisoned("checkpoint registry"))?;
+            if checkpoints.remove(name).is_none() {
+                return Err(Error::CheckpointNotFound {
+                    name: name.to_owned(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns the read version pinned by a named checkpoint.
+    ///
+    /// This does not create a snapshot. Call [`Db::snapshot_at`] with the
+    /// returned value before reading so Trine can validate and pin the retained
+    /// version for the lifetime of the read.
+    ///
+    /// # Parameters
+    ///
+    /// - `name`: checkpoint name to look up.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`], [`Error::InvalidOptions`] for an empty name,
+    /// or [`Error::CheckpointNotFound`] when the checkpoint does not exist.
+    pub fn checkpoint_read_version_sync(&self, name: &str) -> Result<ReadVersion> {
+        self.ensure_open()?;
+        validate_checkpoint_name(name)?;
+        let sequence = if let Some(manifest) = &self.inner.manifest {
+            manifest
+                .lock()
+                .map_err(|_| lock_poisoned("manifest store"))?
+                .checkpoint_sequence(name)
+        } else {
+            self.inner
+                .checkpoints
+                .lock()
+                .map_err(|_| lock_poisoned("checkpoint registry"))?
+                .get(name)
+                .copied()
+        }
+        .ok_or_else(|| Error::CheckpointNotFound {
+            name: name.to_owned(),
+        })?;
+
+        Ok(ReadVersion::from_sequence(sequence))
+    }
+
     /// Creates an optimistic transaction over the newest visible sequence.
     ///
     /// The transaction records point and range reads against this sequence and
@@ -3419,10 +3652,67 @@ impl Db {
         self.inner.commit_tracker.visible_sequence()
     }
 
-    fn oldest_active_snapshot_sequence(&self) -> Sequence {
+    /// Returns the newest read version visible to readers.
+    ///
+    /// Normal `get`, range, and prefix reads use this latest version unless the
+    /// caller explicitly reads through a [`Snapshot`]. An application can store
+    /// the returned value as a cursor and later call [`Db::snapshot_at`] to
+    /// read the same database state, as long as the version is still retained.
+    #[must_use]
+    pub fn latest_read_version(&self) -> ReadVersion {
+        ReadVersion::from_sequence(self.last_committed_sequence())
+    }
+
+    /// Returns the oldest read version Trine currently promises to answer.
+    ///
+    /// A read version below this floor is expired and
+    /// [`Db::snapshot_at`] returns [`Error::ReadVersionExpired`] instead of
+    /// reading whatever old bytes may still happen to exist. Active snapshots
+    /// can move this floor backward while they are alive; without older active
+    /// pins, the first implementation retains only the latest visible state.
+    #[must_use]
+    pub fn oldest_retained_read_version(&self) -> ReadVersion {
+        ReadVersion::from_sequence(self.oldest_retained_sequence())
+    }
+
+    fn oldest_retained_sequence(&self) -> Sequence {
+        let latest = self.last_committed_sequence();
         self.inner
             .snapshots
-            .oldest_active_or(self.last_committed_sequence())
+            .oldest_active_or(latest)
+            .min(self.retained_floor_without_active_snapshots(latest))
+    }
+
+    fn retained_floor_without_active_snapshots(&self, latest: Sequence) -> Sequence {
+        self.configured_retention_floor(latest)
+            .min(self.oldest_checkpoint_sequence_or(latest))
+    }
+
+    fn configured_retention_floor(&self, latest: Sequence) -> Sequence {
+        let keep = self.inner.options.keep_last_read_versions.saturating_sub(1);
+        Sequence::new(latest.get().saturating_sub(keep))
+    }
+
+    fn oldest_checkpoint_sequence_or(&self, fallback: Sequence) -> Sequence {
+        if let Some(manifest) = &self.inner.manifest {
+            return manifest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .state()
+                .checkpoints()
+                .values()
+                .copied()
+                .min()
+                .unwrap_or(fallback);
+        }
+        self.inner
+            .checkpoints
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .copied()
+            .min()
+            .unwrap_or(fallback)
     }
 
     /// Closes this handle synchronously and stops background workers.
@@ -4755,7 +5045,7 @@ impl Db {
         local_l0_compaction: bool,
         budget: MaintenanceBudget,
     ) -> Result<MaintenanceOutcome> {
-        let oldest_active_snapshot = self.oldest_active_snapshot_sequence();
+        let oldest_active_snapshot = self.oldest_retained_sequence();
         let compaction_inputs =
             self.collect_compaction_inputs(range, oldest_active_snapshot, local_l0_compaction)?;
         if compaction_inputs.is_empty() {
@@ -4873,7 +5163,7 @@ impl Db {
         local_l0_compaction: bool,
         budget: MaintenanceBudget,
     ) -> Result<MaintenanceOutcome> {
-        let oldest_active_snapshot = self.oldest_active_snapshot_sequence();
+        let oldest_active_snapshot = self.oldest_retained_sequence();
         let compaction_inputs =
             self.collect_compaction_inputs(range, oldest_active_snapshot, local_l0_compaction)?;
         if compaction_inputs.is_empty() {
@@ -6321,6 +6611,98 @@ impl Db {
         self.bucket_with_options_sync(name, options)
     }
 
+    /// Creates a named checkpoint at the newest visible read version.
+    ///
+    /// This is the async-first form of [`Db::create_checkpoint_sync`]. For
+    /// object-storage and browser-backed databases, the checkpoint metadata is
+    /// published through the backend's async manifest path.
+    ///
+    /// # Parameters
+    ///
+    /// - `name`: non-empty checkpoint name, unique within this database until
+    ///   deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`], [`Error::ReadOnly`],
+    /// [`Error::InvalidOptions`] for an empty name, or
+    /// [`Error::CheckpointAlreadyExists`] if `name` already exists.
+    pub async fn create_checkpoint(&self, name: &str) -> Result<ReadVersion> {
+        self.ensure_open()?;
+        validate_checkpoint_name(name)?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+
+        if self.inner.options.storage_mode.is_object_store_persistent() {
+            let sequence = self.last_committed_sequence();
+            let (mut object, _serialize) = self.checkout_object_manifest().await?;
+            object.create_checkpoint(name.to_owned(), sequence).await?;
+            self.install_object_manifest(object)?;
+            return Ok(ReadVersion::from_sequence(sequence));
+        }
+
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        if self.inner.options.storage_mode.is_browser_persistent() {
+            return self.create_checkpoint_browser_async(name).await;
+        }
+
+        self.create_checkpoint_sync(name)
+    }
+
+    /// Deletes a named checkpoint.
+    ///
+    /// This is the async-first form of [`Db::delete_checkpoint_sync`].
+    ///
+    /// # Parameters
+    ///
+    /// - `name`: checkpoint name to delete.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`], [`Error::ReadOnly`],
+    /// [`Error::InvalidOptions`] for an empty name, or
+    /// [`Error::CheckpointNotFound`] if `name` does not exist.
+    pub async fn delete_checkpoint(&self, name: &str) -> Result<()> {
+        self.ensure_open()?;
+        validate_checkpoint_name(name)?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+
+        if self.inner.options.storage_mode.is_object_store_persistent() {
+            let (mut object, _serialize) = self.checkout_object_manifest().await?;
+            object.delete_checkpoint(name.to_owned()).await?;
+            self.install_object_manifest(object)?;
+            return Ok(());
+        }
+
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        if self.inner.options.storage_mode.is_browser_persistent() {
+            return self.delete_checkpoint_browser_async(name).await;
+        }
+
+        self.delete_checkpoint_sync(name)
+    }
+
+    /// Returns the read version pinned by a named checkpoint.
+    ///
+    /// This is the async counterpart of [`Db::checkpoint_read_version_sync`].
+    /// The lookup itself does not pin a snapshot; call [`Db::snapshot_at`] with
+    /// the returned value before reading.
+    ///
+    /// # Parameters
+    ///
+    /// - `name`: checkpoint name to look up.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`], [`Error::InvalidOptions`] for an empty name,
+    /// or [`Error::CheckpointNotFound`] if `name` does not exist.
+    pub async fn checkpoint_read_version(&self, name: &str) -> Result<ReadVersion> {
+        self.checkpoint_read_version_sync(name)
+    }
+
     /// Reads the newest committed value for `key` from the default bucket.
     ///
     /// This is the async form of [`Db::get_sync`]. It returns owned value bytes,
@@ -6896,6 +7278,11 @@ fn validate_common_options(options: &DbOptions) -> Result<()> {
     if options.max_l0_files == 0 {
         return Err(Error::invalid_options("max L0 files must be non-zero"));
     }
+    if options.keep_last_read_versions == 0 {
+        return Err(Error::invalid_options(
+            "keep_last_read_versions must be non-zero",
+        ));
+    }
     let blob_gc_ratio = options.blob_gc_discardable_ratio.millionths();
     if blob_gc_ratio == 0 || blob_gc_ratio > 1_000_000 {
         return Err(Error::invalid_options(
@@ -6908,6 +7295,13 @@ fn validate_common_options(options: &DbOptions) -> Result<()> {
         ));
     }
 
+    Ok(())
+}
+
+fn validate_checkpoint_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::invalid_options("checkpoint name cannot be empty"));
+    }
     Ok(())
 }
 

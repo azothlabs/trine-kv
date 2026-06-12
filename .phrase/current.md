@@ -6,58 +6,75 @@ Complete
 
 ## Goal
 
-Prepare the compatible `0.2.0` minor release.
+Implement named checkpoints and configurable recent read-version retention.
 
 ## Scope
 
-- Version metadata for the crate package.
-- Changelog and release checklist target version.
-- Package lockfile consistency.
-- Local release-prep verification.
+- Checkpoint public APIs and typed errors.
+- Manifest-backed checkpoint metadata for durable storage modes.
+- In-memory checkpoint metadata with the same public semantics.
+- `DbOptions::with_keep_last_read_versions` and retained-floor integration.
+- Compaction cleanup boundary updated to use the effective retained floor.
 
 ## Out Of Scope
 
-- Public API, storage format, recovery contract, and runtime behavior changes.
-- Publishing to crates.io.
-- Creating or pushing a release tag.
+- Writable branches, merge, or rebase behavior.
+- Time-based retention.
+- Checkpoint replacement APIs.
+- Replication or lineage mapping.
 
 ## Acceptance Gate
 
-- `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, and `docs/release.md` agree on
-  `0.2.0`.
-- Release notes describe the compatible `get_many` API addition and performance
-  fixes without claiming storage-format changes.
-- Package verification passes locally, or any external-network blocker is
-  recorded.
-- Formatting, diff checks, and release-surface scans pass.
+- `.phrase/protocol/read-version-public-api.md` and
+  `.phrase/protocol/trine-kv-v1-spec.md` record the checkpoint and retention
+  boundary.
+- `snapshot_at` rejects unavailable versions and never falls back to latest.
+- Active snapshots, checkpoints, and configured recent retention all participate
+  in the effective retained floor.
+- Manifest v8 decodes with no checkpoints and v9 persists checkpoint pins.
+- Focused MVCC/read-version and manifest tests pass.
+- Rustdoc, doctests, clippy, full tests, diff checks, and forbidden-term scans
+  pass before closing.
 
 ## Active Task Slice
 
 ```text
-task613 [x] goal:bump minor release metadata | scope:Cargo.toml Cargo.lock docs/release.md | verify:version scan
-task614 [x] goal:write 0.2.0 changelog | scope:CHANGELOG.md | verify:changelog scan
-task615 [x] goal:run local release-prep gate | scope:package/release surface | verify:cargo package --allow-dirty --locked --offline
+task621 [x] goal:define durable checkpoint boundary | scope:manifest v9 + memory map | verify:protocol review
+task622 [x] goal:add retention option | scope:DbOptions retained floor | verify:focused MVCC test
+task623 [x] goal:add checkpoint APIs | scope:Db manifest errors | verify:focused checkpoint test
+task624 [x] goal:run full quality gate | scope:rustdoc doctest clippy full tests scans | verify:all pass
 ```
 
 ## Evidence
 
-- Recent compatible performance commits:
-  - `db8e116 Reduce prefix scan metadata rechecks`
-  - `b2ca66e Reduce cold table open reads`
-  - `b8f0b3f Reuse cold reopen directory listing`
-  - `e423bc6 Add batched point reads`
-  - `a66cc75 Optimize get_many internal batching`
-  - `4a1db01 Reuse clean WAL proof in async native open`
-  - `3219a11 Skip clean WAL reads on read-only open`
-- `get_many` is a compatible public API addition, so the correct release target
-  is `0.2.0` rather than `0.1.2`.
+- User chose `ReadVersion` as the public term and asked to finish the remaining
+  checkpoint/retention problems.
+- Current implementation keeps public `ReadVersion` separate from internal
+  commit-number mechanics.
+- Checkpoints are stored in manifest metadata for durable storage modes and in
+  process-local metadata for in-memory databases.
+- The retained floor is the oldest read version required by active snapshots,
+  named checkpoints, or the configured recent-retention window.
+
+## Backend Boundary Receipt
+
+- Trine operation names: `create_checkpoint`, `delete_checkpoint`,
+  `checkpoint_read_version`, `snapshot_at`, `oldest_retained_read_version`.
+- Owned interface: `Db` public API, `DbOptions`, `ManifestState`.
+- Chosen backend: manifest metadata for native/object/browser persistent
+  databases; in-memory map for `DbOptions::memory`.
+- Known backend limits: checkpoint names are database-local, non-empty, unique,
+  and not lineage-portable.
+- Leak-check scope: public docs and protocol must not expose internal commit
+  allocation as the user model.
+- Verification gate: focused checkpoint/retention tests plus full Rust gate.
 
 ## Known Residuals
 
-- Publish workflow still needs CI, a release-prep commit, and the final manual
-  crates.io publish action.
+- Decide later whether existing public `Sequence` methods become documented
+  lower-level aliases or are moved out of user-facing docs before `1.0`.
 
 ## Next Recommendation
 
-- Commit the `0.2.0` release-prep changes, then run CI and the manual publish
-  workflow for `0.2.0`.
+- Avoid extending historical-read scope unless user evidence calls for
+  checkpoint replacement, time-based retention, or lineage mapping.

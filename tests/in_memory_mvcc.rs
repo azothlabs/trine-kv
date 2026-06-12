@@ -1,4 +1,4 @@
-use trine_kv::{Db, DbOptions, Error, WriteBatch, WriteOptions};
+use trine_kv::{Db, DbOptions, Error, ReadVersion, WriteBatch, WriteOptions};
 
 #[test]
 fn write_buffer_budget_reads_delta_backed_in_memory_writes() {
@@ -95,6 +95,166 @@ fn write_batch_commits_multiple_buckets_at_one_sequence() {
         posts.get_sync(b"1").expect("posts read"),
         Some(b"hello".to_vec())
     );
+}
+
+#[test]
+fn read_versions_track_latest_and_empty_batches_do_not_advance() {
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
+    assert_eq!(db.latest_read_version(), ReadVersion::ZERO);
+    assert_eq!(db.oldest_retained_read_version(), ReadVersion::ZERO);
+
+    let empty = db
+        .write_sync(WriteBatch::new(), WriteOptions::default())
+        .expect("empty batch is accepted");
+    assert_eq!(empty.read_version(), ReadVersion::ZERO);
+    assert_eq!(db.latest_read_version(), ReadVersion::ZERO);
+
+    let first = db
+        .put_with_options_sync(b"a", b"v1", WriteOptions::default())
+        .expect("write commits");
+    assert_eq!(first.sequence().get(), 1);
+    assert_eq!(first.read_version(), ReadVersion::from_u64(1));
+    assert_eq!(db.latest_read_version(), first.read_version());
+    assert_eq!(db.oldest_retained_read_version(), first.read_version());
+}
+
+#[test]
+fn snapshot_at_validates_read_version_bounds_and_pins_history() {
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
+
+    let first = db
+        .put_with_options_sync(b"a", b"v1", WriteOptions::default())
+        .expect("first write commits");
+    let first_version = first.read_version();
+    let keep_first = db
+        .snapshot_at(first_version)
+        .expect("latest read version is retained");
+
+    let second = db
+        .put_with_options_sync(b"a", b"v2", WriteOptions::default())
+        .expect("second write commits");
+    let second_version = second.read_version();
+    assert_eq!(db.latest_read_version(), second_version);
+    assert_eq!(db.oldest_retained_read_version(), first_version);
+
+    let snapshot = db
+        .snapshot_at(first_version)
+        .expect("active pin keeps first version retained");
+    assert_eq!(snapshot.read_version(), first_version);
+    assert_eq!(
+        db.get_at_sync(&snapshot, b"a")
+            .expect("old snapshot reads old value"),
+        Some(b"v1".to_vec())
+    );
+
+    let too_new = ReadVersion::from_u64(second_version.as_u64() + 1);
+    let error = db
+        .snapshot_at(too_new)
+        .expect_err("future read version is rejected");
+    assert!(matches!(
+        error,
+        Error::ReadVersionTooNew {
+            requested,
+            latest
+        } if requested == too_new && latest == second_version
+    ));
+
+    drop(snapshot);
+    drop(keep_first);
+    assert_eq!(db.oldest_retained_read_version(), second_version);
+
+    let error = db
+        .snapshot_at(first_version)
+        .expect_err("unretained read version is expired");
+    assert!(matches!(
+        error,
+        Error::ReadVersionExpired {
+            requested,
+            oldest_retained
+        } if requested == first_version && oldest_retained == second_version
+    ));
+}
+
+#[test]
+fn read_version_retention_window_keeps_recent_history() {
+    let db = Db::open_sync(DbOptions::memory().with_keep_last_read_versions(2))
+        .expect("memory db opens");
+
+    let first = db
+        .put_with_options_sync(b"a", b"v1", WriteOptions::default())
+        .expect("first write");
+    let first_version = first.read_version();
+    let second = db
+        .put_with_options_sync(b"a", b"v2", WriteOptions::default())
+        .expect("second write");
+    let second_version = second.read_version();
+    assert_eq!(db.oldest_retained_read_version(), first_version);
+
+    let first_snapshot = db
+        .snapshot_at(first_version)
+        .expect("retention window keeps first version");
+    assert_eq!(
+        db.get_at_sync(&first_snapshot, b"a")
+            .expect("old version reads"),
+        Some(b"v1".to_vec())
+    );
+    drop(first_snapshot);
+
+    let third = db
+        .put_with_options_sync(b"a", b"v3", WriteOptions::default())
+        .expect("third write");
+    assert_eq!(db.oldest_retained_read_version(), second_version);
+    let error = db
+        .snapshot_at(first_version)
+        .expect_err("first version moved out of the retention window");
+    assert!(matches!(
+        error,
+        Error::ReadVersionExpired {
+            requested,
+            oldest_retained
+        } if requested == first_version && oldest_retained == second_version
+    ));
+    assert_eq!(db.latest_read_version(), third.read_version());
+}
+
+#[test]
+fn checkpoints_pin_named_read_versions_until_deleted() {
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
+
+    db.put_sync(b"a", b"v1").expect("first write");
+    let checkpoint = db
+        .create_checkpoint_sync("before-update")
+        .expect("checkpoint creates");
+    assert_eq!(
+        db.checkpoint_read_version_sync("before-update")
+            .expect("checkpoint reads back"),
+        checkpoint
+    );
+
+    db.put_sync(b"a", b"v2").expect("second write");
+    assert_eq!(db.oldest_retained_read_version(), checkpoint);
+    let snapshot = db
+        .snapshot_at(checkpoint)
+        .expect("checkpoint keeps old version");
+    assert_eq!(
+        db.get_at_sync(&snapshot, b"a")
+            .expect("checkpoint snapshot reads old value"),
+        Some(b"v1".to_vec())
+    );
+    drop(snapshot);
+
+    let duplicate = db
+        .create_checkpoint_sync("before-update")
+        .expect_err("duplicate checkpoint is rejected");
+    assert!(matches!(duplicate, Error::CheckpointAlreadyExists { .. }));
+
+    db.delete_checkpoint_sync("before-update")
+        .expect("checkpoint deletes");
+    let missing = db
+        .checkpoint_read_version_sync("before-update")
+        .expect_err("deleted checkpoint is missing");
+    assert!(matches!(missing, Error::CheckpointNotFound { .. }));
+    assert_eq!(db.oldest_retained_read_version(), db.latest_read_version());
 }
 
 #[test]

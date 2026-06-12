@@ -1,5 +1,78 @@
 use std::ops::Bound;
 
+/// Stable numeric cursor for a committed database state.
+///
+/// `ReadVersion` is the public identifier callers use when they want to open a
+/// [`Snapshot`](crate::Snapshot) at a specific historical state. Values are
+/// database-scoped: a read version is meaningful only for the database lineage
+/// that produced it, even if another database happens to contain the same
+/// numeric value.
+///
+/// Use [`Db::latest_read_version`](crate::Db::latest_read_version) to capture
+/// the newest visible state, and [`Db::snapshot_at`](crate::Db::snapshot_at) to
+/// validate and pin a version before reading. Versions older than
+/// [`Db::oldest_retained_read_version`](crate::Db::oldest_retained_read_version)
+/// are expired and must not be read by falling back to latest.
+///
+/// # Examples
+///
+/// ```rust
+/// use trine_kv::{Db, DbOptions, ReadVersion};
+///
+/// # fn main() -> trine_kv::Result<()> {
+/// let db = Db::open_sync(DbOptions::memory())?;
+/// assert_eq!(db.latest_read_version(), ReadVersion::ZERO);
+///
+/// db.put_sync(b"k", b"v1")?;
+/// let version = db.latest_read_version();
+/// let keep_version = db.snapshot_at(version)?;
+///
+/// db.put_sync(b"k", b"v2")?;
+/// let snapshot = db.snapshot_at(version)?;
+/// assert_eq!(db.get_at_sync(&snapshot, b"k")?, Some(b"v1".to_vec()));
+/// drop(keep_version);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReadVersion(u64);
+
+impl ReadVersion {
+    /// Read version for the empty database state before the first successful
+    /// state-changing write.
+    pub const ZERO: Self = Self(0);
+
+    /// Creates a read version from its stable numeric cursor value.
+    ///
+    /// The value is suitable for application-owned cursors that were
+    /// previously obtained from this same database lineage. Creating a
+    /// `ReadVersion` from a number does not prove the version is still
+    /// retained; call [`Db::snapshot_at`](crate::Db::snapshot_at) to validate
+    /// it before reading.
+    #[must_use]
+    pub const fn from_u64(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the stable numeric cursor value.
+    ///
+    /// Applications may persist this value and later rebuild it with
+    /// [`ReadVersion::from_u64`]. The number is a public cursor, not a promise
+    /// about Trine's internal commit allocation machinery.
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    pub(crate) const fn from_sequence(sequence: Sequence) -> Self {
+        Self(sequence.get())
+    }
+
+    pub(crate) const fn to_sequence(self) -> Sequence {
+        Sequence::new(self.0)
+    }
+}
+
 /// Monotonic commit sequence used for MVCC visibility.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Sequence(u64);
@@ -105,5 +178,20 @@ impl CommitInfo {
     #[must_use]
     pub const fn sequence(self) -> Sequence {
         self.sequence
+    }
+
+    /// Returns the read version made visible by this write.
+    ///
+    /// For a state-changing atomic write, every operation in the write becomes
+    /// visible at this read version. An accepted empty write batch does not
+    /// create a new database state and returns the latest read version that was
+    /// already visible.
+    ///
+    /// [`CommitInfo::sequence`] remains available for lower-level callers that
+    /// already depend on engine sequence terminology. New user-facing code
+    /// should prefer `read_version`.
+    #[must_use]
+    pub const fn read_version(self) -> ReadVersion {
+        ReadVersion::from_sequence(self.sequence)
     }
 }

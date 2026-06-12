@@ -252,6 +252,9 @@ pub struct DbOptions {
     pub runtime: RuntimeOptions,
     /// Startup policy for safe temporary files left by interrupted writes.
     pub fail_on_corruption: FailOnCorruptionPolicy,
+    /// Number of most recent read versions retained even when no snapshot or
+    /// checkpoint pins them.
+    pub keep_last_read_versions: u64,
     /// Enable garbage collection of obsolete blob bytes.
     pub blob_gc_enabled: bool,
     /// Minimum discardable-byte ratio required before a blob file is collected.
@@ -269,6 +272,8 @@ impl DbOptions {
     pub const DEFAULT_BLOCK_CACHE_BYTES: usize = 256 * 1024 * 1024;
     /// Default minimum blob file size for garbage collection.
     pub const DEFAULT_BLOB_GC_MIN_FILE_BYTES: u64 = 64 * 1024 * 1024;
+    /// Default number of recent read versions retained without explicit pins.
+    pub const DEFAULT_KEEP_LAST_READ_VERSIONS: u64 = 1;
 
     /// Creates persistent database options for `path`.
     ///
@@ -399,6 +404,27 @@ impl DbOptions {
         self.create_if_missing = false;
         self
     }
+
+    /// Sets how many recent read versions remain available without an active
+    /// [`crate::Snapshot`] or named checkpoint pin.
+    ///
+    /// A value of `1` retains only the latest read version by configuration.
+    /// Higher values allow applications to use recently returned
+    /// [`crate::ReadVersion`] cursors with [`crate::Db::snapshot_at`] even after
+    /// newer writes commit, as long as the requested version is still within
+    /// the window. Active snapshots and checkpoints can retain older versions
+    /// independently of this setting. `0` is invalid and rejected when the
+    /// database opens.
+    ///
+    /// # Parameters
+    ///
+    /// - `count`: number of recent read versions to retain. The unit is read
+    ///   versions, not bytes or time.
+    #[must_use]
+    pub const fn with_keep_last_read_versions(mut self, count: u64) -> Self {
+        self.keep_last_read_versions = count;
+        self
+    }
 }
 
 impl Default for DbOptions {
@@ -418,6 +444,7 @@ impl Default for DbOptions {
             background_worker_count: 1,
             runtime: RuntimeOptions::default(),
             fail_on_corruption: FailOnCorruptionPolicy::FailClosed,
+            keep_last_read_versions: Self::DEFAULT_KEEP_LAST_READ_VERSIONS,
             blob_gc_enabled: true,
             blob_gc_discardable_ratio: BlobGcRatio::HALF,
             blob_gc_min_file_bytes: Self::DEFAULT_BLOB_GC_MIN_FILE_BYTES,

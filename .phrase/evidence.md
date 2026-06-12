@@ -26,6 +26,98 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-06-12: ReadVersion Public API Design Started
+
+### Observation
+
+- User accepted `ReadVersion` as the public term for historical reads and
+  emphasized long-term design.
+- Current design phase now records `ReadVersion` as the public historical-read
+  boundary in `.phrase/protocol/read-version-public-api.md`.
+- The design keeps `Snapshot` as the primary read boundary and treats
+  retention as part of the public contract.
+- Review follow-up resolved four design risks: numeric cursor wording,
+  database-lineage scope, empty write batch semantics, and async-first
+  checkpoint APIs.
+
+### Interpretation
+
+- The public API should describe user-visible historical database states rather
+  than internal commit numbering.
+- Version-specific convenience reads are secondary to `snapshot_at(version)`,
+  because snapshots centralize validation, pinning, and cross-bucket
+  consistency.
+- The first implementation slice must not expose arbitrary historical reads
+  until the retained read-version floor can be checked.
+- Checkpoints update durable metadata in persistent storage modes, so their
+  primary API must be async-first with explicit sync adapters.
+
+### Verification
+
+- Design review against current V1 MVCC snapshot and write-batch contracts.
+- `git diff --check` passed for the design changes.
+- Forbidden-term scan over touched phrase files found no matches.
+
+### Remaining Blockers
+
+- Need to choose whether compatibility keeps existing public sequence methods
+  as lower-level aliases or starts migrating user-facing docs to read-version
+  names.
+
+### Recommended Next Action
+
+- Start a focused implementation phase for public `ReadVersion`, `snapshot_at`,
+  and retained-floor checks. Leave checkpoints for a later slice.
+
+## 2026-06-12: First ReadVersion API Slice
+
+### Observation
+
+- Added public `ReadVersion` with stable numeric cursor helpers.
+- Added `Db::latest_read_version`, `Db::oldest_retained_read_version`,
+  `Db::snapshot_at`, `Snapshot::read_version`, and
+  `CommitInfo::read_version`.
+- Added typed `ReadVersionTooNew` and `ReadVersionExpired` errors.
+- `snapshot_at` validates too-new and retained-floor bounds while pinning under
+  the snapshot tracker lock.
+- Existing `Sequence` access remains available for compatibility.
+
+### Interpretation
+
+- The first public historical-read slice is usable through snapshots without
+  exposing internal commit-number mechanics as the user model.
+- Historical reads below the retained floor are rejected even if old bytes still
+  happen to exist.
+- Checkpoints and configurable retention still need a separate durable metadata
+  phase.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q read_versions --test in_memory_mvcc`
+- `cargo test -q snapshot_at --test in_memory_mvcc`
+- `cargo test -q --test in_memory_mvcc`
+- `cargo check --all-targets --all-features`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test --doc --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test -q --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan over source, tests, and touched phrase files found no
+  matches.
+
+### Remaining Blockers
+
+- Checkpoint APIs are design-only.
+- Configurable recent-history retention is not implemented.
+- Existing public `Sequence` APIs need a pre-`1.0` documentation/migration
+  decision.
+
+### Recommended Next Action
+
+- Design the durable checkpoint metadata boundary before adding checkpoint
+  APIs.
+
 ## 2026-06-03: Performance Research Design Captured
 
 ### Observation
@@ -10121,3 +10213,50 @@ Record only evidence that can change planning or durable decisions.
 - Commit the internal batching change with its benchmark document.
 - If continuing point-read work, benchmark cache-warm locality and table-open
   locality before changing more read-path code.
+
+## 2026-06-12: ReadVersion Checkpoints And Retention
+
+### Observation
+
+- `DbOptions::with_keep_last_read_versions(count)` now controls a configured
+  recent read-version window; `0` is rejected at open.
+- `Db::{create,delete,checkpoint_read_version}` and `*_sync` variants now expose
+  named checkpoint pins with typed duplicate/missing errors.
+- Persistent and object-store databases store checkpoint pins in manifest
+  metadata; in-memory databases keep equivalent process-local metadata.
+- Manifest encoding advanced to v9 for checkpoints; v8 payloads decode with an
+  empty checkpoint map.
+- Compaction now uses the effective retained floor from active snapshots,
+  checkpoints, and configured recent retention.
+
+### Interpretation
+
+- Historical-read availability is no longer only an incidental active-snapshot
+  property. Applications can choose short recent retention or durable named pins
+  without learning internal commit-number mechanics.
+- The durable metadata boundary remains Trine's manifest, not a backend-specific
+  feature.
+
+### Verification
+
+- `cargo fmt`
+- `cargo test -q read_version --test in_memory_mvcc`
+- `cargo test -q manifest_checkpoint --lib`
+- `cargo test -q manifest_decode_v8 --lib`
+- `cargo check --all-targets --all-features`
+- `cargo fmt --check`
+- `git diff --check`
+- forbidden-term scan over `src`, `tests`, and `.phrase`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test --doc --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test -q --all-targets --all-features`
+
+### Remaining Blockers
+
+- No blocker for this phase.
+
+### Recommended Next Action
+
+- Close phase 146. Defer checkpoint replacement, time-based retention, and
+  lineage mapping until there is user evidence for them.

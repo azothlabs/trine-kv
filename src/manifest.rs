@@ -29,7 +29,7 @@ use crate::storage::BrowserStorageBackend;
 
 pub const MANIFEST_FILE_NAME: &str = "MANIFEST";
 const MANIFEST_MAGIC: u32 = 0x5452_4d46;
-const MANIFEST_VERSION: u16 = 8;
+const MANIFEST_VERSION: u16 = 9;
 const MIN_SUPPORTED_MANIFEST_VERSION: u16 = 8;
 const HEADER_LEN: usize = 14;
 // The lower bound for one table entry: fixed fields plus two empty byte fields.
@@ -42,6 +42,7 @@ pub struct ManifestState {
     buckets: BTreeMap<String, BucketOptions>,
     tables: BTreeMap<String, Vec<TableProperties>>,
     pending_blob_deletions: BTreeMap<u64, Sequence>,
+    checkpoints: BTreeMap<String, Sequence>,
 }
 
 impl ManifestState {
@@ -52,6 +53,7 @@ impl ManifestState {
             buckets: BTreeMap::new(),
             tables: BTreeMap::new(),
             pending_blob_deletions: BTreeMap::new(),
+            checkpoints: BTreeMap::new(),
         }
     }
 
@@ -73,6 +75,11 @@ impl ManifestState {
     #[must_use]
     pub fn pending_blob_deletions(&self) -> &BTreeMap<u64, Sequence> {
         &self.pending_blob_deletions
+    }
+
+    #[must_use]
+    pub fn checkpoints(&self) -> &BTreeMap<String, Sequence> {
+        &self.checkpoints
     }
 
     pub fn next_table_id(&self) -> Result<TableId> {
@@ -294,6 +301,38 @@ impl<C: ObjectClient> ObjectManifestStore<C> {
             let mut next_state = state.clone();
             next_state.buckets.insert(name.clone(), options.clone());
             next_state.tables.entry(name.clone()).or_default();
+            Ok(Some(next_state))
+        })
+        .await
+    }
+
+    /// Create a named checkpoint pin, CAS-published with rebase-retry.
+    pub(crate) async fn create_checkpoint(
+        &mut self,
+        name: String,
+        sequence: Sequence,
+    ) -> Result<()> {
+        self.commit_edit(|state| {
+            let mut next_state = state.clone();
+            if next_state
+                .checkpoints
+                .insert(name.clone(), sequence)
+                .is_some()
+            {
+                return Err(Error::CheckpointAlreadyExists { name: name.clone() });
+            }
+            Ok(Some(next_state))
+        })
+        .await
+    }
+
+    /// Delete a named checkpoint pin, CAS-published with rebase-retry.
+    pub(crate) async fn delete_checkpoint(&mut self, name: String) -> Result<()> {
+        self.commit_edit(|state| {
+            let mut next_state = state.clone();
+            if next_state.checkpoints.remove(&name).is_none() {
+                return Err(Error::CheckpointNotFound { name: name.clone() });
+            }
             Ok(Some(next_state))
         })
         .await
@@ -584,6 +623,62 @@ impl ManifestStore {
         .await
     }
 
+    pub(crate) fn create_checkpoint(&mut self, name: String, sequence: Sequence) -> Result<()> {
+        let mut next_state = self.state.clone();
+        if next_state
+            .checkpoints
+            .insert(name.clone(), sequence)
+            .is_some()
+        {
+            return Err(Error::CheckpointAlreadyExists { name });
+        }
+        self.publish_next_state(next_state)?.published_or_err()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn create_checkpoint_async(
+        &mut self,
+        name: String,
+        sequence: Sequence,
+    ) -> Result<()> {
+        self.commit_edit_async(|state| {
+            let mut next_state = state.clone();
+            if next_state
+                .checkpoints
+                .insert(name.clone(), sequence)
+                .is_some()
+            {
+                return Err(Error::CheckpointAlreadyExists { name: name.clone() });
+            }
+            Ok(Some(next_state))
+        })
+        .await
+    }
+
+    pub(crate) fn delete_checkpoint(&mut self, name: String) -> Result<()> {
+        let mut next_state = self.state.clone();
+        if next_state.checkpoints.remove(&name).is_none() {
+            return Err(Error::CheckpointNotFound { name });
+        }
+        self.publish_next_state(next_state)?.published_or_err()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn delete_checkpoint_async(&mut self, name: String) -> Result<()> {
+        self.commit_edit_async(|state| {
+            let mut next_state = state.clone();
+            if next_state.checkpoints.remove(&name).is_none() {
+                return Err(Error::CheckpointNotFound { name: name.clone() });
+            }
+            Ok(Some(next_state))
+        })
+        .await
+    }
+
+    pub(crate) fn checkpoint_sequence(&self, name: &str) -> Option<Sequence> {
+        self.state.checkpoints.get(name).copied()
+    }
+
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     pub(crate) fn prepare_create_bucket_publish(
         &self,
@@ -608,6 +703,45 @@ impl ManifestStore {
             base_state: self.state.clone(),
             next_state,
         }))
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    pub(crate) fn prepare_create_checkpoint_publish(
+        &self,
+        name: String,
+        sequence: Sequence,
+    ) -> Result<PreparedManifestPublish> {
+        let mut next_state = self.state.clone();
+        if next_state
+            .checkpoints
+            .insert(name.clone(), sequence)
+            .is_some()
+        {
+            return Err(Error::CheckpointAlreadyExists { name });
+        }
+        Ok(PreparedManifestPublish {
+            path: self.path.clone(),
+            storage: self.storage.clone(),
+            base_state: self.state.clone(),
+            next_state,
+        })
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    pub(crate) fn prepare_delete_checkpoint_publish(
+        &self,
+        name: String,
+    ) -> Result<PreparedManifestPublish> {
+        let mut next_state = self.state.clone();
+        if next_state.checkpoints.remove(&name).is_none() {
+            return Err(Error::CheckpointNotFound { name });
+        }
+        Ok(PreparedManifestPublish {
+            path: self.path.clone(),
+            storage: self.storage.clone(),
+            base_state: self.state.clone(),
+            next_state,
+        })
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -1130,6 +1264,7 @@ fn encode_state(state: &ManifestState) -> Result<Vec<u8>> {
     }
     put_tables(&mut bytes, &state.tables)?;
     put_pending_blob_deletions(&mut bytes, &state.pending_blob_deletions)?;
+    put_checkpoints(&mut bytes, &state.checkpoints)?;
 
     Ok(bytes)
 }
@@ -1189,6 +1324,11 @@ fn decode_state(payload: &[u8], version: u16) -> Result<ManifestState> {
     } else {
         BTreeMap::new()
     };
+    let checkpoints = if version >= 9 {
+        cursor.read_checkpoints()?
+    } else {
+        BTreeMap::new()
+    };
 
     if !cursor.is_finished() {
         return Err(invalid_manifest("trailing payload bytes"));
@@ -1199,6 +1339,7 @@ fn decode_state(payload: &[u8], version: u16) -> Result<ManifestState> {
         buckets,
         tables,
         pending_blob_deletions,
+        checkpoints,
     })
 }
 
@@ -1317,6 +1458,17 @@ fn put_pending_blob_deletions(
     put_u32(bytes, count);
     for (file_id, sequence) in pending_blob_deletions {
         put_u64(bytes, *file_id);
+        put_u64(bytes, sequence.get());
+    }
+    Ok(())
+}
+
+fn put_checkpoints(bytes: &mut Vec<u8>, checkpoints: &BTreeMap<String, Sequence>) -> Result<()> {
+    let count = u32::try_from(checkpoints.len())
+        .map_err(|_| Error::invalid_options("too many checkpoints for manifest"))?;
+    put_u32(bytes, count);
+    for (name, sequence) in checkpoints {
+        put_bytes(bytes, name.as_bytes())?;
         put_u64(bytes, sequence.get());
     }
     Ok(())
@@ -1559,6 +1711,33 @@ impl<'payload> Cursor<'payload> {
             previous = Some(file_id);
         }
         Ok(pending)
+    }
+
+    fn read_checkpoints(&mut self) -> Result<BTreeMap<String, Sequence>> {
+        let checkpoint_count = self.read_u32()? as usize;
+        if checkpoint_count > self.remaining_len() / 12 {
+            return Err(invalid_manifest("checkpoint count exceeds payload bytes"));
+        }
+
+        let mut checkpoints = BTreeMap::new();
+        let mut previous = None::<String>;
+        for _ in 0..checkpoint_count {
+            let name = String::from_utf8(self.read_bytes()?.to_vec()).map_err(|_| {
+                Error::InvalidFormat {
+                    message: "manifest checkpoint name is not valid UTF-8".to_owned(),
+                }
+            })?;
+            if name.is_empty() {
+                return Err(invalid_manifest("checkpoint name is empty"));
+            }
+            if previous.as_ref().is_some_and(|previous| previous >= &name) {
+                return Err(invalid_manifest("checkpoints are not sorted"));
+            }
+            let sequence = Sequence::new(self.read_u64()?);
+            checkpoints.insert(name.clone(), sequence);
+            previous = Some(name);
+        }
+        Ok(checkpoints)
     }
 
     fn read_table_properties(&mut self) -> Result<TableProperties> {
@@ -1871,6 +2050,18 @@ mod tests {
     }
 
     #[test]
+    fn manifest_decode_v8_defaults_empty_checkpoints() {
+        let mut payload = Vec::new();
+        super::put_u64(&mut payload, 0);
+        super::put_u32(&mut payload, 0);
+        super::put_u32(&mut payload, 0);
+        super::put_u32(&mut payload, 0);
+
+        let state = decode_state(&payload, 8).expect("v8 manifest decodes");
+        assert!(state.checkpoints().is_empty());
+    }
+
+    #[test]
     fn manifest_state_stays_put_when_publish_fails() {
         let dir = temp_manifest_dir("publish-fails");
         fs::create_dir_all(&dir).expect("create manifest test dir");
@@ -1914,6 +2105,32 @@ mod tests {
         .expect("manifest reopens through async helper");
         assert!(reopened.state().buckets().contains_key("users"));
         assert!(reopened.state().tables().contains_key("users"));
+    }
+
+    #[test]
+    fn manifest_checkpoint_publish_round_trip() {
+        let dir = temp_manifest_dir("checkpoint-round-trip");
+        fs::create_dir_all(&dir).expect("create manifest test dir");
+        let path = manifest_path(&dir);
+        let mut store = ManifestStore::open_or_create(path.clone(), true).expect("manifest opens");
+
+        store
+            .create_checkpoint("cp".to_owned(), crate::types::Sequence::new(7))
+            .expect("checkpoint publishes");
+        assert_eq!(
+            store.checkpoint_sequence("cp"),
+            Some(crate::types::Sequence::new(7))
+        );
+
+        let reopened = ManifestStore::open_or_create(path, false).expect("manifest reopens");
+        assert_eq!(
+            reopened.checkpoint_sequence("cp"),
+            Some(crate::types::Sequence::new(7))
+        );
+        assert_eq!(
+            reopened.state().checkpoints().get("cp"),
+            Some(&crate::types::Sequence::new(7))
+        );
     }
 
     #[test]
