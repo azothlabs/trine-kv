@@ -6,53 +6,49 @@ Complete
 
 ## Goal
 
-Make `ReadVersion` the documented user-facing historical-read boundary while
-keeping existing `Sequence` APIs as lower-level compatibility hooks.
+Prepare release metadata for the read-version and manifest v9 work.
 
 ## Scope
 
-- Public Rustdoc and examples that currently steer users toward `Sequence`.
-- Transaction read-boundary helper parity with `Snapshot` and `CommitInfo`.
-- Protocol wording for the `ReadVersion` / `Sequence` boundary.
+- Cargo crate version and lockfile package version.
+- `CHANGELOG.md` entry for the new release target.
+- Release checklist wording for the current minor target.
+- Evidence and roadmap state for the metadata phase.
 
 ## Out Of Scope
 
-- Removing `Sequence` from the public API.
-- Storage format, manifest format, WAL, MVCC, compaction, or transaction
-  conflict behavior changes.
-- Branch, merge, rebase, retention, or checkpoint semantics.
+- Further Rust engine behavior changes.
+- Publishing to crates.io.
+- Tagging, pushing, or opening a PR.
 
 ## Acceptance Gate
 
-- New user-facing examples prefer `ReadVersion` for historical-read cursors.
-- Existing `Sequence` APIs are documented as lower-level / diagnostics-oriented
-  rather than the primary application cursor.
-- No breaking API removal.
-- Rustdoc, doctests, focused checks, clippy, diff checks, and scans pass.
+- Version metadata agrees on the release target.
+- Changelog records public API additions and the manifest v9 storage-contract
+  change.
+- Release docs name the current crate minor target.
+- Formatting, package metadata checks, diff checks, and scans pass.
 
 ## Active Task Slice
 
 ```text
-task625 [x] goal:document Sequence boundary | scope:types db transaction docs | verify:rustdoc
-task626 [x] goal:add transaction read_version helper | scope:Transaction | verify:doctest/focused test
-task627 [x] goal:update protocol/evidence | scope:.phrase/protocol current evidence roadmap | verify:doc review
-task628 [x] goal:verify and commit | scope:docs tests clippy scans | verify:all pass
+task629 [x] goal:bump crate metadata | scope:Cargo.toml Cargo.lock docs/release.md | verify:cargo metadata/check
+task630 [x] goal:record changelog | scope:CHANGELOG.md | verify:doc review
+task631 [x] goal:verify and commit | scope:package/diff/scans | verify:all pass
 ```
 
 ## Evidence
 
-- Phase 146 completed `ReadVersion`, checkpoints, and configurable retention.
-- Audit found user-facing docs and examples still using `CommitInfo::sequence`
-  and `Transaction::read_sequence` as primary-looking entry points.
-- The long-term design says callers should not need internal commit-number
-  mechanics for historical reads.
+- Phase 146 advanced the manifest payload to v9 for durable checkpoint pins.
+- Project release rules say pre-`1.0` storage-contract changes should increment
+  the minor version.
+- Phase 147 completed the non-breaking public boundary cleanup.
 
 ## Known Residuals
 
-- Public `Sequence` remains exported for compatibility and lower-level
-  diagnostics in this phase.
+- Publishing workflow remains manual and out of scope for this phase.
 
 ## Next Recommendation
 
-- With the public sequence boundary cleaned up, keep larger historical-read
-  extensions deferred until there is explicit evidence for them.
+- Metadata is ready for review. Publishing, tagging, and pushing remain manual
+  follow-up work.

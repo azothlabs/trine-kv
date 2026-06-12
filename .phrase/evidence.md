@@ -10302,3 +10302,43 @@ Record only evidence that can change planning or durable decisions.
 
 - Close phase 147. Keep larger historical-read extensions deferred until there
   is explicit evidence for them.
+
+## 2026-06-12: 0.3.0 Release Metadata
+
+### Observation
+
+- `Cargo.toml` and the root `Cargo.lock` package entry now identify
+  `trine-kv` as `0.3.0`.
+- `CHANGELOG.md` records the read-version API additions, named checkpoint APIs,
+  configurable recent retention, typed errors, manifest v9 storage-contract
+  change, and public documentation boundary cleanup.
+- `docs/release.md` now names `0.3.0` as the current minor release target.
+- `cargo metadata --no-deps --format-version 1` reports package version
+  `0.3.0`.
+- `cargo package --list --allow-dirty --locked` succeeds.
+
+### Interpretation
+
+- The manifest v9 storage-contract change is now reflected as a pre-`1.0`
+  minor release target instead of staying under the `0.2.x` patch line.
+- This is release metadata only; publishing, tagging, and pushing remain manual
+  follow-up work.
+
+### Verification
+
+- `cargo metadata --no-deps --format-version 1`
+- `cargo package --list --allow-dirty --locked`
+- `cargo fmt --check`
+- version-target scan over `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, and
+  `docs/release.md`
+- `git diff --check`
+- forbidden-term scan over release metadata and phase docs
+
+### Remaining Blockers
+
+- No blocker for release metadata.
+
+### Recommended Next Action
+
+- Commit the metadata update. Run the full release checklist only when preparing
+  to tag or publish.

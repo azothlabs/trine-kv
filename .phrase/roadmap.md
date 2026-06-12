@@ -3618,3 +3618,26 @@ left public `Sequence` boundary cleanup as the known residual.
 - Removing `Sequence`, storage format changes, MVCC behavior changes,
   checkpoint replacement, time-based retention, writable branches, merge,
   rebase, replication, or lineage mapping.
+
+### Phase 148: 0.3.0 Release Metadata
+
+**Status**: Complete
+
+**Goal**: Align crate release metadata with the read-version API additions and
+manifest v9 storage-contract change.
+
+**Entry Condition**: Phase 146 introduced manifest v9 and Phase 147 completed
+the public API boundary cleanup.
+
+**Acceptance Gate**:
+
+- `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, and `docs/release.md` agree on
+  the release target.
+- Changelog records public API additions and the manifest v9 storage-contract
+  change.
+- Package metadata/list checks, formatting, diff checks, and scans pass.
+
+**Major Out Of Scope**:
+
+- Publishing, tagging, pushing, PR creation, or further engine behavior
+  changes.

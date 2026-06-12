@@ -2,6 +2,46 @@
 
 All public crate releases use Semantic Versioning.
 
+## 0.3.0 - 2026-06-12
+
+Read-version and checkpoint release. This release adds public historical-read
+cursor APIs and advances the manifest payload to v9 for durable checkpoint
+metadata. Existing v8 manifests remain readable, but manifest v9 is a
+storage-contract change, so this is a pre-`1.0` minor release.
+
+### Added
+
+- Public `ReadVersion` cursor type for committed database states, with
+  `ReadVersion::ZERO`, `ReadVersion::from_u64`, and `ReadVersion::as_u64`.
+- Historical read APIs:
+  - `Db::latest_read_version`;
+  - `Db::oldest_retained_read_version`;
+  - `Db::snapshot_at`;
+  - `Snapshot::read_version`;
+  - `CommitInfo::read_version`;
+  - `Transaction::read_version`.
+- Named checkpoint APIs with async-first and sync forms:
+  - `Db::create_checkpoint` and `Db::create_checkpoint_sync`;
+  - `Db::delete_checkpoint` and `Db::delete_checkpoint_sync`;
+  - `Db::checkpoint_read_version` and
+    `Db::checkpoint_read_version_sync`.
+- `DbOptions::with_keep_last_read_versions` for configured recent
+  read-version retention.
+- Typed errors for historical-read and checkpoint boundaries:
+  - `Error::ReadVersionTooNew`;
+  - `Error::ReadVersionExpired`;
+  - `Error::CheckpointAlreadyExists`;
+  - `Error::CheckpointNotFound`.
+
+### Changed
+
+- Manifest payload version advanced to v9 to store named checkpoint pins.
+- Compaction cleanup now protects the effective retained floor from active
+  snapshots, named checkpoints, and configured recent retention.
+- Public documentation now presents `ReadVersion` as the application-facing
+  historical-read cursor while keeping `Sequence` as a lower-level
+  compatibility and diagnostics type.
+
 ## 0.2.2 - 2026-06-10
 
 Adds an object-storage backend: run a Trine database on S3 / S3-compatible
