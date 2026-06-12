@@ -188,6 +188,7 @@ WriteBatch::delete_range_bucket(bucket, range) -> Result<()>
 Db::write(batch, write_options).await -> Result<CommitInfo>
 CommitInfo::read_version() -> ReadVersion
 Snapshot::read_version() -> ReadVersion
+Transaction::read_version() -> ReadVersion
 
 Transaction::get(key).await -> Result<Option<Value>>
 Transaction::put(key, value) -> Result<()>
@@ -311,6 +312,8 @@ Snapshot lifetime:
 Public read-version rules:
 
 - `ReadVersion` is the user-facing historical-read cursor for a database state;
+- `Sequence` remains a lower-level engine commit-ordering type for diagnostics
+  and compatibility, not the primary application cursor;
 - `latest_read_version` returns the newest state visible to readers;
 - `oldest_retained_read_version` returns the oldest state Trine promises to
   answer;

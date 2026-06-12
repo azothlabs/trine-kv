@@ -73,7 +73,13 @@ impl ReadVersion {
     }
 }
 
-/// Monotonic commit sequence used for MVCC visibility.
+/// Lower-level monotonic commit sequence used for MVCC visibility.
+///
+/// `Sequence` reflects Trine's engine-level commit ordering and remains public
+/// for diagnostics and existing callers that inspect storage-engine behavior.
+/// Application code that needs a stable historical-read cursor should prefer
+/// [`ReadVersion`], [`CommitInfo::read_version`], and
+/// [`crate::Db::snapshot_at`] instead of depending on sequence terminology.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Sequence(u64);
 
@@ -82,6 +88,11 @@ impl Sequence {
     pub const ZERO: Self = Self(0);
 
     /// Creates a sequence from its raw numeric value.
+    ///
+    /// This is a lower-level constructor for engine diagnostics and tests. It
+    /// does not prove that a database can read at the resulting boundary. Use
+    /// [`ReadVersion::from_u64`] with [`crate::Db::snapshot_at`] for
+    /// application-owned historical-read cursors.
     #[must_use]
     pub const fn new(value: u64) -> Self {
         Self(value)
@@ -174,7 +185,12 @@ impl CommitInfo {
         Self { sequence }
     }
 
-    /// Returns the commit sequence assigned to the write.
+    /// Returns the lower-level commit sequence assigned to the write.
+    ///
+    /// New user-facing code that wants a historical-read cursor should prefer
+    /// [`CommitInfo::read_version`]. The sequence accessor remains available
+    /// for diagnostics and compatibility with callers that reason about
+    /// engine-level commit ordering.
     #[must_use]
     pub const fn sequence(self) -> Sequence {
         self.sequence

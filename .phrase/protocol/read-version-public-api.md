@@ -92,6 +92,10 @@ impl Snapshot {
 impl CommitInfo {
     pub fn read_version(self) -> ReadVersion;
 }
+
+impl Transaction {
+    pub fn read_version(&self) -> ReadVersion;
+}
 ```
 
 `Db::snapshot()` remains the convenient way to create a snapshot at the latest
@@ -109,6 +113,22 @@ Version-specific convenience methods such as `get_at_version` or
 `range_at_version` should be added only if user evidence shows they reduce real
 friction. They duplicate snapshot validation and pinning semantics, so they are
 not the core design.
+
+## Sequence Boundary
+
+`Sequence` remains public for compatibility and for lower-level diagnostics
+that inspect Trine's engine-level commit ordering. It is not the primary
+application cursor for historical reads.
+
+User-facing APIs and examples should prefer `ReadVersion`:
+
+- `CommitInfo::read_version` instead of `CommitInfo::sequence`;
+- `Snapshot::read_version` instead of `Snapshot::read_sequence`;
+- `Transaction::read_version` instead of `Transaction::read_sequence`;
+- `Db::latest_read_version` instead of `Db::last_committed_sequence`.
+
+Removing `Sequence` from the public API would be a breaking API change and
+requires a separate pre-`1.0` decision.
 
 ## Error Semantics
 

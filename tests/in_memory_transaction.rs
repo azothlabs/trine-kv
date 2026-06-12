@@ -17,6 +17,15 @@ fn transaction_commits_staged_writes_without_reads() {
 }
 
 #[test]
+fn transaction_exposes_read_version_boundary() {
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
+    db.put_sync(b"a", b"v1").expect("seed value");
+
+    let txn = db.transaction(TransactionOptions::default());
+    assert_eq!(txn.read_version(), db.latest_read_version());
+}
+
+#[test]
 fn named_transaction_methods_reject_reserved_default_bucket_name() {
     let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     let mut txn = db.transaction(TransactionOptions::default());

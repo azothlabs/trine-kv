@@ -3592,3 +3592,29 @@ checkpoint APIs plus configurable retention as the next accepted boundary.
 
 - Writable branches, merge, rebase, time-based retention, checkpoint
   replacement, replication, or lineage mapping.
+
+### Phase 147: Public Sequence Boundary Cleanup
+
+**Status**: Complete
+
+**Goal**: Make `ReadVersion` the documented application-facing historical-read
+cursor while keeping `Sequence` as a lower-level compatibility and diagnostics
+type.
+
+**Entry Condition**: Phase 146 completed the read-version retention surface and
+left public `Sequence` boundary cleanup as the known residual.
+
+**Acceptance Gate**:
+
+- Public docs and protocol describe `Sequence` as lower-level engine commit
+  ordering.
+- Transaction exposes `read_version` to match `CommitInfo` and `Snapshot`.
+- User-facing examples prefer `ReadVersion`.
+- No public API removal.
+- Rustdoc, doctests, focused tests, clippy, diff checks, and scans pass.
+
+**Major Out Of Scope**:
+
+- Removing `Sequence`, storage format changes, MVCC behavior changes,
+  checkpoint replacement, time-based retention, writable branches, merge,
+  rebase, replication, or lineage mapping.

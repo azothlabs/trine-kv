@@ -2012,15 +2012,16 @@ impl Db {
         self.default_bucket_sync()?.get_many_sync(keys)
     }
 
-    /// Reads `key` from the default bucket at the sequence pinned by `snapshot`.
+    /// Reads `key` from the default bucket at the read version pinned by
+    /// `snapshot`.
     ///
     /// This is the repeatable-read form of [`Db::get_sync`]. Later commits do
-    /// not affect the result because visibility is capped at
-    /// `snapshot.read_sequence()`.
+    /// not affect the result because visibility is capped at the snapshot's
+    /// read boundary.
     ///
     /// # Parameters
     ///
-    /// - `snapshot`: snapshot whose sequence defines read visibility.
+    /// - `snapshot`: snapshot whose read version defines read visibility.
     /// - `key`: user key bytes in the built-in default bucket.
     pub fn get_at_sync(&self, snapshot: &Snapshot, key: &[u8]) -> Result<Option<Value>> {
         self.get_at_with_pin_state(
@@ -3646,7 +3647,12 @@ impl Db {
         &self.inner.options
     }
 
-    /// Returns the newest commit sequence visible to readers.
+    /// Returns the newest lower-level commit sequence visible to readers.
+    ///
+    /// New user-facing code that needs a historical-read cursor should prefer
+    /// [`Db::latest_read_version`]. The sequence accessor remains available for
+    /// diagnostics and compatibility with callers that inspect engine-level
+    /// commit ordering.
     #[must_use]
     pub fn last_committed_sequence(&self) -> Sequence {
         self.inner.commit_tracker.visible_sequence()
@@ -3667,9 +3673,9 @@ impl Db {
     ///
     /// A read version below this floor is expired and
     /// [`Db::snapshot_at`] returns [`Error::ReadVersionExpired`] instead of
-    /// reading whatever old bytes may still happen to exist. Active snapshots
-    /// can move this floor backward while they are alive; without older active
-    /// pins, the first implementation retains only the latest visible state.
+    /// reading whatever old bytes may still happen to exist. Active snapshots,
+    /// checkpoints, and configured recent-history retention can move this floor
+    /// backward.
     #[must_use]
     pub fn oldest_retained_read_version(&self) -> ReadVersion {
         ReadVersion::from_sequence(self.oldest_retained_sequence())

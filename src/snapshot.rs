@@ -110,7 +110,7 @@ struct SnapshotPin {
     tracker: Arc<SnapshotTracker>,
 }
 
-/// Repeatable-read handle pinned to a committed sequence.
+/// Repeatable-read handle pinned to a committed read version.
 #[derive(Debug)]
 pub struct Snapshot {
     read_sequence: Sequence,
@@ -118,7 +118,13 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Creates an untracked snapshot at `read_sequence`.
+    /// Creates an untracked snapshot at a lower-level read sequence.
+    ///
+    /// This constructor is primarily for internal callers and tests that
+    /// already reason about engine-level commit ordering. Application code
+    /// should normally use [`crate::Db::snapshot`] for the latest state or
+    /// [`crate::Db::snapshot_at`] with a [`ReadVersion`] for a historical
+    /// state.
     #[must_use]
     pub const fn new(read_sequence: Sequence) -> Self {
         Self {
@@ -127,7 +133,10 @@ impl Snapshot {
         }
     }
 
-    /// Returns the sequence visible through this snapshot.
+    /// Returns the lower-level sequence visible through this snapshot.
+    ///
+    /// New user-facing code should prefer [`Snapshot::read_version`]. The
+    /// sequence accessor remains available for compatibility and diagnostics.
     #[must_use]
     pub const fn read_sequence(&self) -> Sequence {
         self.read_sequence

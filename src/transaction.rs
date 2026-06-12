@@ -4,7 +4,7 @@ use crate::{
     error::Result,
     iterator::Iter,
     options::WriteOptions,
-    types::{CommitInfo, KeyRange, Sequence, Value},
+    types::{CommitInfo, KeyRange, ReadVersion, Sequence, Value},
     write_batch::WriteBatch,
 };
 
@@ -45,7 +45,7 @@ pub struct TransactionOptions {
 ///
 /// tx.put(b"counter", b"1");
 /// let commit = tx.commit_sync()?;
-/// assert!(commit.sequence().get() > 0);
+/// assert!(commit.read_version().as_u64() > 0);
 /// # Ok(())
 /// # }
 /// ```
@@ -90,10 +90,22 @@ impl Transaction {
         }
     }
 
-    /// Returns the sequence used by this transaction's read snapshot.
+    /// Returns the public read version used by this transaction's read
+    /// snapshot.
     ///
-    /// All transaction reads use this sequence, even if newer writes commit
-    /// before the transaction commits.
+    /// All transaction reads use this read boundary, even if newer writes
+    /// commit before the transaction commits.
+    #[must_use]
+    pub const fn read_version(&self) -> ReadVersion {
+        ReadVersion::from_sequence(self.read_sequence)
+    }
+
+    /// Returns the lower-level sequence used by this transaction's read
+    /// snapshot.
+    ///
+    /// New user-facing code should prefer [`Transaction::read_version`].
+    /// `read_sequence` remains available for callers that already inspect
+    /// Trine's engine-level commit ordering or diagnostics.
     #[must_use]
     pub const fn read_sequence(&self) -> Sequence {
         self.read_sequence

@@ -10260,3 +10260,45 @@ Record only evidence that can change planning or durable decisions.
 
 - Close phase 146. Defer checkpoint replacement, time-based retention, and
   lineage mapping until there is user evidence for them.
+
+## 2026-06-12: Public Sequence Boundary Cleanup
+
+### Observation
+
+- `CommitInfo`, `Snapshot`, and `Db` now document `ReadVersion` as the
+  user-facing historical-read cursor and describe `Sequence` as lower-level
+  engine commit ordering for compatibility and diagnostics.
+- `Transaction::read_version` was added so transaction read boundaries have the
+  same public vocabulary as `Snapshot` and committed writes.
+- User-facing doctest examples now prefer `commit.read_version()` over
+  `commit.sequence()`.
+- Protocol docs now explicitly record the `ReadVersion` / `Sequence` boundary.
+
+### Interpretation
+
+- The public API no longer steers new application code toward internal
+  sequence terminology while preserving compatibility for existing callers.
+- Removing `Sequence` from exports remains a separate breaking decision and was
+  intentionally not done in this phase.
+
+### Verification
+
+- `cargo fmt`
+- `cargo test -q transaction_exposes_read_version_boundary --test in_memory_transaction`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test --doc --all-features`
+- `cargo check --all-targets --all-features`
+- `cargo fmt --check`
+- `git diff --check`
+- forbidden-term scan over `src`, `tests`, and `.phrase`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test -q --all-targets --all-features`
+
+### Remaining Blockers
+
+- No blocker for this phase.
+
+### Recommended Next Action
+
+- Close phase 147. Keep larger historical-read extensions deferred until there
+  is explicit evidence for them.

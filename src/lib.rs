@@ -32,8 +32,9 @@
 //!   memtables, tables, filters, and compaction state.
 //! - [`WriteBatch`] groups puts, point deletes, and range deletes into one
 //!   atomic commit.
-//! - [`Snapshot`] pins a [`ReadVersion`] so repeated reads see a stable view
-//!   while newer writes continue.
+//! - [`ReadVersion`] is the application-facing cursor for a committed database
+//!   state. [`Snapshot`] pins one so repeated reads see a stable view while
+//!   newer writes continue.
 //! - [`Transaction`] records reads and stages writes, then rejects commit if a
 //!   later committed write conflicts with the read set.
 //!
@@ -103,7 +104,7 @@ mod substrate;
 mod table;
 /// Optimistic transaction API.
 pub mod transaction;
-/// Core key, value, range, sequence, and commit types.
+/// Core key, value, range, read-version, sequence, and commit types.
 pub mod types;
 mod version;
 mod wal;

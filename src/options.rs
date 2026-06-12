@@ -600,7 +600,7 @@ impl Default for BucketOptions {
 /// # fn main() -> trine_kv::Result<()> {
 /// let db = Db::open_sync(trine_kv::DbOptions::memory())?;
 /// let commit = db.put_with_options_sync(b"k", b"v", WriteOptions::sync_all())?;
-/// assert!(commit.sequence().get() > 0);
+/// assert!(commit.read_version().as_u64() > 0);
 /// # Ok(())
 /// # }
 /// ```
