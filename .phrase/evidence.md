@@ -26,6 +26,55 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-06-12: 0.3.0 Release Gate Prepared
+
+### Observation
+
+- `Cargo.toml` and `Cargo.lock` identify `trine-kv` as version `0.3.0`.
+- The release package includes 92 files and excludes internal repo workflow
+  directories such as `.github/`, `.phrase/`, `.rust-skills/`, and `.claude/`.
+- Wasm clippy exposed two release-gate lint blockers in `src/db.rs`; both were
+  fixed without changing runtime behavior and committed as `0f0e6c2`.
+- `cargo publish --dry-run --locked` reached the upload step and aborted because
+  it was a dry run.
+
+### Interpretation
+
+- The crate is ready for the explicit release action path: tag/push/publish.
+- The remaining work is operational release execution, not code readiness.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test -q --all-targets --all-features`
+- `cargo check --target wasm32-unknown-unknown --lib`
+- `cargo check --target wasm32-wasip1 --lib`
+- `cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings`
+- `cargo run --example quickstart`
+- `cargo run --example sync_quickstart`
+- `cargo run --example user_store`
+- `cargo run --example event_index`
+- `cargo package --list --locked`
+- `cargo package --locked`
+- `cargo publish --dry-run --locked`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test --doc --all-features`
+- `git diff --check`
+- Forbidden-term scan over source, tests, docs, `.phrase`, changelog, and
+  README found no matches.
+
+### Remaining Blockers
+
+- None for code/package readiness.
+- Actual `cargo publish`, git tag creation, push, and release publication were
+  intentionally not performed.
+
+### Recommended Next Action
+
+- When explicitly approved, create the release tag, push it, and run the real
+  publish command.
+
 ## 2026-06-12: ReadVersion Public API Design Started
 
 ### Observation
