@@ -257,7 +257,7 @@ not require UTF-8.
 
 ## Write A Batch
 
-Use `WriteBatch` when several changes must commit at the same sequence:
+Use `WriteBatch` when several changes must commit at the same read version:
 
 ```rust
 use trine_kv::{WriteBatch, WriteOptions};
@@ -273,7 +273,7 @@ let commit = db.write_sync(
     WriteOptions::default(),
 )?;
 
-println!("committed sequence {}", commit.sequence().get());
+println!("committed read version {}", commit.read_version().as_u64());
 ```
 
 Batch writes can span buckets. Named-bucket staging methods return `Result`
@@ -365,7 +365,7 @@ shape as the regular sync get API.
 
 ## Optimistic Transactions
 
-Transactions read at a fixed sequence and validate their read set at commit:
+Transactions read at a fixed read version and validate their read set at commit:
 
 ```rust
 use trine_kv::{Error, TransactionOptions};
@@ -378,7 +378,7 @@ let previous_user = txn.get_bucket_sync("users", b"user:001")?;
 txn.put_bucket("users", b"user:005", b"Margaret")?;
 
 match txn.commit_sync() {
-    Ok(info) => println!("committed sequence {}", info.sequence().get()),
+    Ok(info) => println!("committed read version {}", info.read_version().as_u64()),
     Err(Error::Conflict { message }) => println!("retry transaction: {message}"),
     Err(error) => return Err(error),
 }

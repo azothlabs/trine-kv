@@ -39,7 +39,7 @@ impl InternalKey {
     }
 
     #[must_use]
-    pub const fn sequence(&self) -> Sequence {
+    pub(crate) const fn sequence(&self) -> Sequence {
         self.sequence
     }
 

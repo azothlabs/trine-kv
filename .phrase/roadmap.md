@@ -3641,3 +3641,28 @@ the public API boundary cleanup.
 
 - Publishing, tagging, pushing, PR creation, or further engine behavior
   changes.
+
+### Phase 149: Remove Public Sequence Surface
+
+**Status**: Complete
+
+**Goal**: Remove internal commit sequence terminology from the public API before
+the `0.3.0` release.
+
+**Entry Condition**: User confirmed there is no real old-caller burden and the
+long-term API should expose `ReadVersion`, not internal commit-number
+mechanics.
+
+**Acceptance Gate**:
+
+- `Sequence` and `SnapshotSequence` are not public exports.
+- Public methods no longer expose sequence constructors or accessors.
+- Public examples and tests use `ReadVersion`.
+- Internal engine code keeps typed sequence invariants.
+- Rustdoc, doctests, clippy, full tests, diff checks, and scans pass.
+
+**Major Out Of Scope**:
+
+- Storage behavior changes, publishing, tagging, pushing, PR creation,
+  branches, merge, rebase, time-based retention, checkpoint replacement,
+  replication, or lineage mapping.

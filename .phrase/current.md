@@ -6,49 +6,53 @@ Complete
 
 ## Goal
 
-Prepare release metadata for the read-version and manifest v9 work.
+Remove `Sequence` from the public API before the `0.3.0` release.
 
 ## Scope
 
-- Cargo crate version and lockfile package version.
-- `CHANGELOG.md` entry for the new release target.
-- Release checklist wording for the current minor target.
-- Evidence and roadmap state for the metadata phase.
+- Stop exporting `Sequence` and `SnapshotSequence`.
+- Make sequence accessors and constructors crate-internal where they only serve
+  engine code.
+- Update public tests, docs, protocol, changelog, and release evidence to use
+  `ReadVersion`.
 
 ## Out Of Scope
 
-- Further Rust engine behavior changes.
-- Publishing to crates.io.
-- Tagging, pushing, or opening a PR.
+- Changing internal commit ordering, WAL, manifest, MVCC, compaction, or
+  transaction behavior.
+- Publishing, tagging, pushing, or opening a PR.
+- Branch, merge, rebase, time-based retention, checkpoint replacement, or
+  lineage mapping.
 
 ## Acceptance Gate
 
-- Version metadata agrees on the release target.
-- Changelog records public API additions and the manifest v9 storage-contract
-  change.
-- Release docs name the current crate minor target.
-- Formatting, package metadata checks, diff checks, and scans pass.
+- Public exports no longer include `Sequence` or `SnapshotSequence`.
+- External tests and docs use `ReadVersion` for historical-read boundaries.
+- Internal engine code keeps typed sequence semantics.
+- Rustdoc, doctests, focused tests, clippy, full tests, diff checks, and scans
+  pass.
 
 ## Active Task Slice
 
 ```text
-task629 [x] goal:bump crate metadata | scope:Cargo.toml Cargo.lock docs/release.md | verify:cargo metadata/check
-task630 [x] goal:record changelog | scope:CHANGELOG.md | verify:doc review
-task631 [x] goal:verify and commit | scope:package/diff/scans | verify:all pass
+task632 [x] goal:remove public Sequence surface | scope:lib types db snapshot transaction | verify:rg public surface
+task633 [x] goal:update public tests/docs | scope:tests docs protocol changelog | verify:focused tests/doctests
+task634 [x] goal:run full gate and commit | scope:rustdoc clippy tests scans | verify:all pass
 ```
 
 ## Evidence
 
-- Phase 146 advanced the manifest payload to v9 for durable checkpoint pins.
-- Project release rules say pre-`1.0` storage-contract changes should increment
-  the minor version.
-- Phase 147 completed the non-breaking public boundary cleanup.
+- User clarified there is no real old-caller burden to preserve.
+- `0.3.0` has not been released, so this breaking cleanup can be included in
+  the same pre-`1.0` minor release.
+- The long-term API direction is that callers should use `ReadVersion`, not
+  internal commit-number terminology.
 
 ## Known Residuals
 
-- Publishing workflow remains manual and out of scope for this phase.
+- None for this phase.
 
 ## Next Recommendation
 
-- Metadata is ready for review. Publishing, tagging, and pushing remain manual
-  follow-up work.
+- Public cleanup is complete. Keep further historical-read extensions deferred
+  until there is explicit evidence for them.

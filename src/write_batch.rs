@@ -73,7 +73,7 @@ impl BatchOperation {
 /// batch.put_bucket(users.name().as_str(), b"1", b"Ada")?;
 ///
 /// let commit = db.write_sync(batch, WriteOptions::sync_all())?;
-/// assert!(commit.sequence().get() > 0);
+/// assert!(commit.read_version().as_u64() > 0);
 /// # Ok(())
 /// # }
 /// ```

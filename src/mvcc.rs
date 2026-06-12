@@ -1,26 +1,23 @@
 use crate::types::Sequence;
 
-/// Sequence number pinned by a snapshot.
-pub type SnapshotSequence = Sequence;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Visibility {
-    read_sequence: SnapshotSequence,
+pub(crate) struct Visibility {
+    read_sequence: Sequence,
 }
 
 impl Visibility {
     #[must_use]
-    pub const fn new(read_sequence: SnapshotSequence) -> Self {
+    pub(crate) const fn new(read_sequence: Sequence) -> Self {
         Self { read_sequence }
     }
 
     #[must_use]
-    pub const fn read_sequence(self) -> SnapshotSequence {
+    pub(crate) const fn read_sequence(self) -> Sequence {
         self.read_sequence
     }
 
     #[must_use]
-    pub const fn can_see(self, sequence: Sequence) -> bool {
+    pub(crate) const fn can_see(self, sequence: Sequence) -> bool {
         sequence.get() <= self.read_sequence.get()
     }
 }

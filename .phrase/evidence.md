@@ -10342,3 +10342,49 @@ Record only evidence that can change planning or durable decisions.
 
 - Commit the metadata update. Run the full release checklist only when preparing
   to tag or publish.
+
+## 2026-06-12: Remove Public Sequence Surface
+
+### Observation
+
+- `Sequence` and `SnapshotSequence` are no longer re-exported from `lib.rs`.
+- `Sequence` is now crate-internal; `Db::last_committed_sequence`,
+  `Snapshot::{new,read_sequence}`, and `Transaction::read_sequence` are no
+  longer public API.
+- `CommitInfo::sequence` is available only for crate tests that verify internal
+  commit ordering; public callers use `CommitInfo::read_version`.
+- Public tests, usage docs, protocol docs, and changelog now use
+  `ReadVersion` for application-facing historical-read boundaries.
+
+### Interpretation
+
+- The `0.3.0` API shape now matches the long-term design: callers do not need
+  to understand internal commit-number terminology.
+- Internal storage-engine code still keeps typed sequence values for WAL, MVCC,
+  manifest, compaction, and recovery invariants.
+
+### Verification
+
+- `cargo fmt`
+- `cargo check --all-targets --all-features`
+- public-surface scan over source, docs, tests, protocol, and changelog
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test --doc --all-features`
+- `cargo test -q --test scaffold`
+- `cargo test -q --test async_api`
+- `cargo test -q transaction_exposes_read_version_boundary --test in_memory_transaction`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo package --list --allow-dirty --locked`
+- `cargo test -q --all-targets --all-features`
+- `git diff --check`
+- forbidden-term scan over `src`, `tests`, `docs`, `.phrase`,
+  `CHANGELOG.md`, and `README.md`
+
+### Remaining Blockers
+
+- No blocker for this phase.
+
+### Recommended Next Action
+
+- Commit the breaking API cleanup into the `0.3.0` release line.

@@ -100,17 +100,6 @@ impl Transaction {
         ReadVersion::from_sequence(self.read_sequence)
     }
 
-    /// Returns the lower-level sequence used by this transaction's read
-    /// snapshot.
-    ///
-    /// New user-facing code should prefer [`Transaction::read_version`].
-    /// `read_sequence` remains available for callers that already inspect
-    /// Trine's engine-level commit ordering or diagnostics.
-    #[must_use]
-    pub const fn read_sequence(&self) -> Sequence {
-        self.read_sequence
-    }
-
     /// Returns this transaction's options.
     #[must_use]
     pub const fn options(&self) -> TransactionOptions {

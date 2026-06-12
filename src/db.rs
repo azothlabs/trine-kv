@@ -1945,8 +1945,8 @@ impl Db {
     /// The `key` parameter is compared as raw bytes. The returned value is an
     /// owned `Vec<u8>` so callers can keep it after the database handle or
     /// iterator state changes. `Ok(None)` means no visible value exists at the
-    /// newest committed sequence, either because the key was never written or
-    /// because the newest visible record is a delete.
+    /// latest read version, either because the key was never written or because
+    /// the newest visible record is a delete.
     ///
     /// This method searches the active memtable, immutable memtables, and table
     /// files in newest-to-oldest MVCC order. Large values stored in blob files
@@ -3286,12 +3286,12 @@ impl Db {
         Ok(outcome)
     }
 
-    /// Creates a snapshot at the newest visible committed sequence.
+    /// Creates a snapshot at the latest visible read version.
     ///
     /// Reads through the returned [`Snapshot`] see the database as of the
-    /// sequence captured here, even if later writes commit before those reads
-    /// run. The snapshot keeps old versions needed by its reads alive until all
-    /// clones are dropped.
+    /// read version captured here, even if later writes commit before those
+    /// reads run. The snapshot keeps old versions needed by its reads alive
+    /// until all clones are dropped.
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
         self.inner
@@ -3647,14 +3647,8 @@ impl Db {
         &self.inner.options
     }
 
-    /// Returns the newest lower-level commit sequence visible to readers.
-    ///
-    /// New user-facing code that needs a historical-read cursor should prefer
-    /// [`Db::latest_read_version`]. The sequence accessor remains available for
-    /// diagnostics and compatibility with callers that inspect engine-level
-    /// commit ordering.
     #[must_use]
-    pub fn last_committed_sequence(&self) -> Sequence {
+    pub(crate) fn last_committed_sequence(&self) -> Sequence {
         self.inner.commit_tracker.visible_sequence()
     }
 
@@ -6712,7 +6706,7 @@ impl Db {
     /// Reads the newest committed value for `key` from the default bucket.
     ///
     /// This is the async form of [`Db::get_sync`]. It returns owned value bytes,
-    /// or `Ok(None)` when no value is visible at the newest committed sequence.
+    /// or `Ok(None)` when no value is visible at the latest read version.
     ///
     /// # Parameters
     ///
@@ -6834,8 +6828,7 @@ impl Db {
     /// Returns a forward iterator over default-bucket rows in `range`.
     ///
     /// This is the async form of [`Db::range_sync`]. The returned iterator is
-    /// positioned over the newest committed sequence captured when this method
-    /// runs.
+    /// positioned over the latest read version captured when this method runs.
     ///
     /// # Parameters
     ///

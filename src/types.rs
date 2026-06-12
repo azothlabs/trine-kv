@@ -73,40 +73,25 @@ impl ReadVersion {
     }
 }
 
-/// Lower-level monotonic commit sequence used for MVCC visibility.
-///
-/// `Sequence` reflects Trine's engine-level commit ordering and remains public
-/// for diagnostics and existing callers that inspect storage-engine behavior.
-/// Application code that needs a stable historical-read cursor should prefer
-/// [`ReadVersion`], [`CommitInfo::read_version`], and
-/// [`crate::Db::snapshot_at`] instead of depending on sequence terminology.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Sequence(u64);
+pub(crate) struct Sequence(u64);
 
 impl Sequence {
-    /// Sequence value used before the first committed write.
-    pub const ZERO: Self = Self(0);
+    pub(crate) const ZERO: Self = Self(0);
 
-    /// Creates a sequence from its raw numeric value.
-    ///
-    /// This is a lower-level constructor for engine diagnostics and tests. It
-    /// does not prove that a database can read at the resulting boundary. Use
-    /// [`ReadVersion::from_u64`] with [`crate::Db::snapshot_at`] for
-    /// application-owned historical-read cursors.
     #[must_use]
-    pub const fn new(value: u64) -> Self {
+    pub(crate) const fn new(value: u64) -> Self {
         Self(value)
     }
 
-    /// Returns the raw numeric sequence value.
     #[must_use]
-    pub const fn get(self) -> u64 {
+    pub(crate) const fn get(self) -> u64 {
         self.0
     }
 
-    /// Returns the next sequence, or `None` if the value would overflow.
     #[must_use]
-    pub const fn next(self) -> Option<Self> {
+    #[cfg(test)]
+    pub(crate) const fn next(self) -> Option<Self> {
         match self.0.checked_add(1) {
             Some(value) => Some(Self(value)),
             None => None,
@@ -179,20 +164,14 @@ pub struct CommitInfo {
 }
 
 impl CommitInfo {
-    /// Creates commit information for `sequence`.
     #[must_use]
-    pub const fn new(sequence: Sequence) -> Self {
+    pub(crate) const fn new(sequence: Sequence) -> Self {
         Self { sequence }
     }
 
-    /// Returns the lower-level commit sequence assigned to the write.
-    ///
-    /// New user-facing code that wants a historical-read cursor should prefer
-    /// [`CommitInfo::read_version`]. The sequence accessor remains available
-    /// for diagnostics and compatibility with callers that reason about
-    /// engine-level commit ordering.
     #[must_use]
-    pub const fn sequence(self) -> Sequence {
+    #[cfg(test)]
+    pub(crate) const fn sequence(self) -> Sequence {
         self.sequence
     }
 
@@ -202,10 +181,6 @@ impl CommitInfo {
     /// visible at this read version. An accepted empty write batch does not
     /// create a new database state and returns the latest read version that was
     /// already visible.
-    ///
-    /// [`CommitInfo::sequence`] remains available for lower-level callers that
-    /// already depend on engine sequence terminology. New user-facing code
-    /// should prefer `read_version`.
     #[must_use]
     pub const fn read_version(self) -> ReadVersion {
         ReadVersion::from_sequence(self.sequence)

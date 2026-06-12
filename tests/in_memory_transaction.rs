@@ -1,4 +1,6 @@
-use trine_kv::{Db, DbOptions, Error, KeyRange, TransactionOptions, WriteBatch, WriteOptions};
+use trine_kv::{
+    Db, DbOptions, Error, KeyRange, ReadVersion, TransactionOptions, WriteBatch, WriteOptions,
+};
 
 #[test]
 fn transaction_commits_staged_writes_without_reads() {
@@ -9,7 +11,7 @@ fn transaction_commits_staged_writes_without_reads() {
     txn.put(b"a", b"txn");
     let info = txn.commit_sync().expect("transaction commits");
 
-    assert_eq!(info.sequence().get(), 1);
+    assert_eq!(info.read_version(), ReadVersion::from_u64(1));
     assert_eq!(
         bucket.get_sync(b"a").expect("committed value"),
         Some(b"txn".to_vec())

@@ -10,10 +10,12 @@ use std::{
 use trine_kv::{
     BlobGcRatio, BlobLevelMergePolicy, BucketOptions, CompressionProfile, Db, DbOptions,
     DurabilityMode, Error, FailOnCorruptionPolicy, FilterPolicy, IndexSearchPolicy, KeyRange,
-    MaintenanceBudget, PrefixExtractor, PrefixFilterPolicy, Sequence, TransactionOptions,
-    WriteBatch, WriteOptions, blob, codec::CodecId, manifest, recovery, table, wal,
+    MaintenanceBudget, PrefixExtractor, PrefixFilterPolicy, TransactionOptions, WriteBatch,
+    WriteOptions, blob, codec::CodecId, manifest, recovery, table, wal,
     write_batch::BatchOperation,
 };
+
+use crate::types::Sequence;
 
 fn temp_db_path(name: &str) -> PathBuf {
     let nonce = SystemTime::now()

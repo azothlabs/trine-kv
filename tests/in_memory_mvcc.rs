@@ -52,7 +52,7 @@ fn point_writes_deletes_and_snapshot_reads_are_mvcc_visible() {
 }
 
 #[test]
-fn snapshots_pin_and_release_read_sequences() {
+fn snapshots_pin_and_release_read_versions() {
     let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     assert_eq!(db.stats().active_snapshots, 0);
 
@@ -70,7 +70,7 @@ fn snapshots_pin_and_release_read_sequences() {
 }
 
 #[test]
-fn write_batch_commits_multiple_buckets_at_one_sequence() {
+fn write_batch_commits_multiple_buckets_at_one_read_version() {
     let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     let users = db.bucket_sync("users").expect("users bucket opens");
     let posts = db.bucket_sync("posts").expect("posts bucket opens");
@@ -86,7 +86,7 @@ fn write_batch_commits_multiple_buckets_at_one_sequence() {
     let info = db
         .write_sync(batch, WriteOptions::default())
         .expect("batch commits");
-    assert_eq!(info.sequence().get(), 1);
+    assert_eq!(info.read_version(), ReadVersion::from_u64(1));
     assert_eq!(
         users.get_sync(b"1").expect("users read"),
         Some(b"ada".to_vec())
@@ -112,7 +112,7 @@ fn read_versions_track_latest_and_empty_batches_do_not_advance() {
     let first = db
         .put_with_options_sync(b"a", b"v1", WriteOptions::default())
         .expect("write commits");
-    assert_eq!(first.sequence().get(), 1);
+    assert_eq!(first.read_version(), ReadVersion::from_u64(1));
     assert_eq!(first.read_version(), ReadVersion::from_u64(1));
     assert_eq!(db.latest_read_version(), first.read_version());
     assert_eq!(db.oldest_retained_read_version(), first.read_version());

@@ -10,7 +10,7 @@ use std::{
 
 use trine_kv::{
     BucketOptions, Db, DbOptions, DurabilityMode, Error, Iter, KeyRange, KeyValue, LazyIter,
-    RuntimeOptions, Sequence, TransactionOptions, WriteBatch, WriteOptions,
+    ReadVersion, RuntimeOptions, TransactionOptions, WriteBatch, WriteOptions,
 };
 
 struct ThreadWake {
@@ -114,7 +114,7 @@ fn memory_compatibility_surface_smoke() {
     let mut batch = WriteBatch::new();
     batch.put(b"b".to_vec(), b"two".to_vec());
     let commit = block_on(db.write(batch, WriteOptions::default())).expect("batch writes");
-    assert_eq!(commit.sequence(), db.last_committed_sequence());
+    assert_eq!(commit.read_version(), db.latest_read_version());
 
     let default_rows = collect_async(block_on(db.prefix(b"b".to_vec())).expect("prefix opens"));
     assert_eq!(default_rows, vec![(b"b".to_vec(), b"two".to_vec())]);
@@ -155,7 +155,7 @@ fn memory_compatibility_surface_smoke() {
     block_on(txn.read_range(KeyRange::all())).expect("transaction async range read");
     txn.put(b"c".to_vec(), b"three".to_vec());
     let txn_commit = block_on(txn.commit()).expect("transaction async commit");
-    assert_eq!(txn_commit.sequence(), db.last_committed_sequence());
+    assert_eq!(txn_commit.read_version(), db.latest_read_version());
     assert_eq!(
         block_on(db.get(b"c")).expect("transaction write reads"),
         Some(b"three".to_vec())
@@ -428,7 +428,7 @@ fn dropping_unpolled_async_write_future_has_no_side_effect() {
             .expect("read after dropped future"),
         None
     );
-    assert_eq!(db.last_committed_sequence(), Sequence::ZERO);
+    assert_eq!(db.latest_read_version(), ReadVersion::ZERO);
 }
 
 #[test]
@@ -450,7 +450,7 @@ fn dropping_unpolled_persistent_async_write_future_has_no_wal_side_effect() {
             .expect("read after dropped future"),
         None
     );
-    assert_eq!(db.last_committed_sequence(), Sequence::ZERO);
+    assert_eq!(db.latest_read_version(), ReadVersion::ZERO);
     drop(db);
 
     let reopened = Db::open_sync(options).expect("persistent db reopens");
@@ -471,7 +471,7 @@ fn polled_async_write_future_reaches_visible_terminal_commit() {
 
     let commit = block_on(db.write(batch, WriteOptions::default())).expect("async write commits");
 
-    assert_eq!(commit.sequence(), db.last_committed_sequence());
+    assert_eq!(commit.read_version(), db.latest_read_version());
     assert_eq!(
         db.get_sync(b"accepted")
             .expect("read after accepted future"),
@@ -504,7 +504,7 @@ fn dropping_polled_async_write_future_does_not_cancel_accepted_native_write() {
             .expect("read accepted key after dropped future"),
         Some(b"value".to_vec())
     );
-    assert_eq!(db.last_committed_sequence(), Sequence::new(1));
+    assert_eq!(db.latest_read_version(), ReadVersion::from_u64(1));
 }
 
 #[test]
@@ -530,7 +530,7 @@ fn dropping_polled_persistent_async_write_future_survives_reopen() {
             .expect("read after accepted future drop")
             .is_some()
     });
-    assert_eq!(db.last_committed_sequence(), Sequence::new(1));
+    assert_eq!(db.latest_read_version(), ReadVersion::from_u64(1));
     drop(db);
 
     let reopened = Db::open_sync(options).expect("persistent db reopens");
@@ -540,7 +540,7 @@ fn dropping_polled_persistent_async_write_future_survives_reopen() {
             .expect("replay after accepted future drop"),
         Some(b"value".to_vec())
     );
-    assert_eq!(reopened.last_committed_sequence(), Sequence::new(1));
+    assert_eq!(reopened.latest_read_version(), ReadVersion::from_u64(1));
     cleanup_dir(&path);
 }
 
@@ -555,7 +555,7 @@ fn inline_runtime_async_write_completes_without_background_threads() {
     let commit = block_on(db.write(batch, WriteOptions::default()))
         .expect("inline runtime async write commits");
 
-    assert_eq!(commit.sequence(), Sequence::new(1));
+    assert_eq!(commit.read_version(), ReadVersion::from_u64(1));
     assert_eq!(
         db.get_sync(b"inline").expect("read inline runtime write"),
         Some(b"value".to_vec())

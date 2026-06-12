@@ -61,7 +61,7 @@ Rules:
 
 - **User key**: byte key supplied by the caller.
 - **Internal key**: encoded key used inside memtables and SSTables.
-- **Sequence**: monotonic commit number assigned by Trine.
+- **Sequence**: internal monotonic commit number assigned by Trine.
 - **Snapshot sequence**: read boundary for repeatable reads.
 - **ReadVersion**: public stable numeric cursor for a committed database state.
   It is database-scoped and does not require callers to understand internal
@@ -312,8 +312,8 @@ Snapshot lifetime:
 Public read-version rules:
 
 - `ReadVersion` is the user-facing historical-read cursor for a database state;
-- `Sequence` remains a lower-level engine commit-ordering type for diagnostics
-  and compatibility, not the primary application cursor;
+- internal `Sequence` remains the engine commit-ordering type, but public APIs
+  expose `ReadVersion` as the application cursor;
 - `latest_read_version` returns the newest state visible to readers;
 - `oldest_retained_read_version` returns the oldest state Trine promises to
   answer;

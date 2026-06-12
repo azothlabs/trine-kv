@@ -1,6 +1,6 @@
 use trine_kv::{
     BucketOptions, CompressionProfile, Db, DbOptions, Direction, DurabilityMode, KeyRange,
-    PrefixExtractor, Sequence, StorageMode, WriteBatch,
+    PrefixExtractor, ReadVersion, StorageMode, WriteBatch,
 };
 
 #[test]
@@ -14,7 +14,7 @@ fn scaffold_exposes_v1_public_boundaries() {
             .expect("default bucket get works"),
         Some(b"default-value".to_vec())
     );
-    assert_eq!(db.snapshot().read_sequence(), Sequence::new(1));
+    assert_eq!(db.snapshot().read_version(), ReadVersion::from_u64(1));
     assert_eq!(db.stats().live_buckets, 1);
     assert_eq!(CompressionProfile::default(), CompressionProfile::Fast);
 

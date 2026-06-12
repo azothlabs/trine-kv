@@ -118,27 +118,16 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Creates an untracked snapshot at a lower-level read sequence.
-    ///
-    /// This constructor is primarily for internal callers and tests that
-    /// already reason about engine-level commit ordering. Application code
-    /// should normally use [`crate::Db::snapshot`] for the latest state or
-    /// [`crate::Db::snapshot_at`] with a [`ReadVersion`] for a historical
-    /// state.
     #[must_use]
-    pub const fn new(read_sequence: Sequence) -> Self {
+    pub(crate) const fn new(read_sequence: Sequence) -> Self {
         Self {
             read_sequence,
             pin: None,
         }
     }
 
-    /// Returns the lower-level sequence visible through this snapshot.
-    ///
-    /// New user-facing code should prefer [`Snapshot::read_version`]. The
-    /// sequence accessor remains available for compatibility and diagnostics.
     #[must_use]
-    pub const fn read_sequence(&self) -> Sequence {
+    pub(crate) const fn read_sequence(&self) -> Sequence {
         self.read_sequence
     }
 

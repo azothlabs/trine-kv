@@ -104,7 +104,7 @@ mod substrate;
 mod table;
 /// Optimistic transaction API.
 pub mod transaction;
-/// Core key, value, range, read-version, sequence, and commit types.
+/// Core key, value, range, read-version, and commit types.
 pub mod types;
 mod version;
 mod wal;
@@ -115,7 +115,6 @@ pub use bucket::{Bucket, BucketName, BucketReader};
 pub use db::{Db, IntoOpenOptions, MaintenanceBudget, MaintenanceOutcome};
 pub use error::{Error, Result};
 pub use iterator::{Direction, Iter, LazyIter, LazyKeyValue, LazyValue};
-pub use mvcc::SnapshotSequence;
 pub use object_store::{
     ETag, InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta, Precondition, PutIf,
 };
@@ -131,7 +130,7 @@ pub use runtime::{CancellationToken, RuntimeCapabilities, RuntimeMode, RuntimeOp
 pub use snapshot::Snapshot;
 pub use stats::DbStats;
 pub use transaction::{Transaction, TransactionOptions};
-pub use types::{CommitInfo, KeyRange, KeyValue, ReadVersion, Sequence, Value};
+pub use types::{CommitInfo, KeyRange, KeyValue, ReadVersion, Value};
 pub use write_batch::WriteBatch;
 
 #[cfg(test)]

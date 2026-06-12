@@ -39,8 +39,15 @@ storage-contract change, so this is a pre-`1.0` minor release.
 - Compaction cleanup now protects the effective retained floor from active
   snapshots, named checkpoints, and configured recent retention.
 - Public documentation now presents `ReadVersion` as the application-facing
-  historical-read cursor while keeping `Sequence` as a lower-level
-  compatibility and diagnostics type.
+  historical-read cursor.
+
+### Removed
+
+- Removed the public `Sequence` / `SnapshotSequence` surface before the `0.3.0`
+  release. Engine commit ordering remains an internal implementation detail;
+  applications should use `ReadVersion`, `CommitInfo::read_version`,
+  `Snapshot::read_version`, `Transaction::read_version`, and
+  `Db::latest_read_version`.
 
 ## 0.2.2 - 2026-06-10
 

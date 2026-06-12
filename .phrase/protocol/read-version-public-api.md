@@ -116,19 +116,16 @@ not the core design.
 
 ## Sequence Boundary
 
-`Sequence` remains public for compatibility and for lower-level diagnostics
-that inspect Trine's engine-level commit ordering. It is not the primary
-application cursor for historical reads.
+`Sequence` is an internal engine commit-ordering type. It is not exported from
+the crate and should not appear in public API signatures, public examples, or
+application-facing documentation.
 
-User-facing APIs and examples should prefer `ReadVersion`:
+User-facing APIs and examples use `ReadVersion`:
 
-- `CommitInfo::read_version` instead of `CommitInfo::sequence`;
-- `Snapshot::read_version` instead of `Snapshot::read_sequence`;
-- `Transaction::read_version` instead of `Transaction::read_sequence`;
-- `Db::latest_read_version` instead of `Db::last_committed_sequence`.
-
-Removing `Sequence` from the public API would be a breaking API change and
-requires a separate pre-`1.0` decision.
+- `CommitInfo::read_version`;
+- `Snapshot::read_version`;
+- `Transaction::read_version`;
+- `Db::latest_read_version`.
 
 ## Error Semantics
 
