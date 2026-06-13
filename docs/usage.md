@@ -48,12 +48,23 @@ trine-kv = { path = "../trine-kv" }
 If you consume the crate through git, replace the path dependency with your
 repository URL.
 
-Enable native platform I/O explicitly when you want Trine's feature-gated
-cross-platform native file driver:
+Enable platform I/O explicitly when you want native-file storage operations to
+complete through Trine's async platform boundary. The baseline feature uses a
+bounded Trine-owned thread pool and does not pull the native async dependency
+stack:
 
 ```toml
 [dependencies]
 trine-kv = { version = "0.3", features = ["platform-io"] }
+```
+
+Enable native platform I/O when you want Trine to prefer audited native async
+backends and use the same thread-pool backend for operation rows that do not
+yet have native support:
+
+```toml
+[dependencies]
+trine-kv = { version = "0.3", features = ["platform-io-native"] }
 ```
 
 ## Open A Database
@@ -82,10 +93,12 @@ database-style durability for confirmed writes.
 On native targets, async persistent open, point reads, scans, lazy value reads,
 WAL-backed writes, and public flush enter Trine's storage boundary through async
 helpers. `platform-io` is the cross-platform async I/O abstraction below that
-boundary: Linux, Windows, macOS, BSD/other Unix, and fallback targets handle
-their own mechanics inside the platform driver, while the KV engine awaits
-Trine storage operations. Native async writes and public flush use awaitable
-storage completions on targets whose native-file backend advertises
+boundary: the baseline feature runs blocking native-file work on Trine's
+bounded platform thread pool, while `platform-io-native` lets Linux, Windows,
+macOS, BSD/other Unix, and future targets use their own native async mechanics
+where complete Trine operations have support. The KV engine awaits Trine
+storage operations in both modes. Native async writes and public flush use
+awaitable storage completions on targets whose native-file backend advertises
 `PlatformAsyncIo`; operations that are not true platform async remain counted as
 partial native, thread-pool managed async, blocking fallback, or unsupported
 work. Compaction and cooperative
@@ -115,8 +128,8 @@ let db = Db::open(
 .await?;
 ```
 
-With the `platform-io` feature enabled, select the platform I/O runtime when
-you want native-file data reads/writes, WAL append-object
+With either `platform-io` or `platform-io-native` enabled, select the platform
+I/O runtime when you want native-file data reads/writes, WAL append-object
 opening/append/persist/rewrite, manifest publish/read, object delete, directory
 create/sync/listing, and writer lease acquisition to go through Trine's
 platform driver:
@@ -187,10 +200,11 @@ if random_reads.uses_non_true_platform_async() {
 }
 ```
 
-On native targets where every current Trine storage operation is completed by
-platform-io's managed thread-pool path, `RuntimeOptions::platform_io()` still
-uses the platform driver and can advertise `PlatformAsyncIo` because the caller
-runtime receives asynchronous completions. The exact operation counters remain
+On native-thread targets using the baseline `platform-io` feature, every current
+native-file operation completes through `ThreadPoolManagedAsync`. With
+`platform-io-native`, operation rows that have native support use
+`TruePlatformAsync` or `PlatformNativeAsyncButPartial`; rows without native
+support use the same thread-pool backend. The exact operation counters remain
 the source of truth for whether work was true native async, partial native
 async, thread-pool managed async, blocking fallback, or unsupported. Targets
 without native threads must use an explicit host backend instead of silently

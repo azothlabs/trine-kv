@@ -1778,6 +1778,7 @@ dependencies = [
  "compio-driver",
  "compio-fs",
  "compio-runtime",
+ "crossbeam-channel",
  "dispatch2",
  "futures",
  "js-sys",

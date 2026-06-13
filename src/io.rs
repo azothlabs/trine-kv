@@ -6,8 +6,14 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
+#[cfg(all(
+    feature = "platform-io",
+    feature = "platform-io-native",
+    any(unix, windows)
+))]
+use std::sync::mpsc;
 #[cfg(feature = "platform-io")]
-use std::{path::PathBuf, sync::mpsc, thread};
+use std::{path::PathBuf, thread};
 
 use crate::{
     error::{Error, Result},
@@ -16,8 +22,14 @@ use crate::{
     storage::StorageReadBuffer,
 };
 
-#[cfg(feature = "platform-io")]
+#[cfg(all(
+    feature = "platform-io",
+    feature = "platform-io-native",
+    any(unix, windows)
+))]
 mod platform_backend;
+#[cfg(feature = "platform-io")]
+mod platform_threadpool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IoDriverKind {
@@ -37,6 +49,7 @@ impl IoDriverKind {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlatformIoBackendKind {
+    ThreadPoolManaged,
     LinuxNative,
     WindowsNative,
     MacOsNative,
@@ -394,8 +407,15 @@ impl IoDriver for BlockingAdapterIoDriver {
 #[cfg(feature = "platform-io")]
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PlatformIoDriver {
-    sender: Arc<Mutex<Option<mpsc::Sender<PlatformIoTask>>>>,
+    thread_pool_sender: Arc<Mutex<Option<crossbeam_channel::Sender<PlatformIoTask>>>>,
+    #[cfg(all(feature = "platform-io-native", any(unix, windows)))]
+    native_sender: Arc<Mutex<Option<mpsc::Sender<PlatformIoTask>>>>,
 }
+
+#[cfg(feature = "platform-io")]
+const PLATFORM_IO_THREAD_POOL_WORKERS: usize = 4;
+#[cfg(feature = "platform-io")]
+const PLATFORM_IO_THREAD_POOL_QUEUE_DEPTH: usize = 1024;
 
 #[cfg(feature = "platform-io")]
 enum PlatformIoTask {
@@ -471,7 +491,14 @@ impl PlatformIoDriver {
     }
 
     pub(crate) fn backend_matrix() -> PlatformIoBackendMatrix {
-        platform_backend::matrix()
+        #[cfg(all(feature = "platform-io-native", any(unix, windows)))]
+        {
+            platform_backend::matrix()
+        }
+        #[cfg(not(all(feature = "platform-io-native", any(unix, windows))))]
+        {
+            platform_threadpool::matrix()
+        }
     }
 
     pub(crate) fn task_class(operation: PlatformIoOperation) -> PlatformIoTaskClass {
@@ -621,22 +648,78 @@ impl PlatformIoDriver {
     }
 
     fn submit_task(&self, task: PlatformIoTask) -> Result<()> {
-        let sender = self.sender()?;
+        let operation = task.operation();
+        match Self::task_class(operation) {
+            PlatformIoTaskClass::TruePlatformAsync
+            | PlatformIoTaskClass::PlatformNativeAsyncButPartial => self.submit_native_task(task),
+            PlatformIoTaskClass::ThreadPoolManagedAsync | PlatformIoTaskClass::BlockingFallback => {
+                self.submit_thread_pool_task(task)
+            }
+            PlatformIoTaskClass::Unsupported => {
+                task.complete_start_error("platform I/O operation is unsupported on this target");
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(all(feature = "platform-io-native", any(unix, windows)))]
+    fn submit_native_task(&self, task: PlatformIoTask) -> Result<()> {
+        let sender = self.native_sender()?;
         sender.send(task).map_err(|_| Error::Closed)
     }
 
-    fn sender(&self) -> Result<mpsc::Sender<PlatformIoTask>> {
+    #[cfg(not(all(feature = "platform-io-native", any(unix, windows))))]
+    fn submit_native_task(&self, task: PlatformIoTask) -> Result<()> {
+        task.complete_start_error("native platform I/O feature is not enabled");
+        Ok(())
+    }
+
+    fn submit_thread_pool_task(&self, task: PlatformIoTask) -> Result<()> {
+        let sender = self.thread_pool_sender()?;
+        sender.try_send(task).map_err(|error| {
+            if error.is_full() {
+                Error::runtime_busy("platform I/O thread-pool queue is full")
+            } else {
+                Error::Closed
+            }
+        })
+    }
+
+    fn thread_pool_sender(&self) -> Result<crossbeam_channel::Sender<PlatformIoTask>> {
         let mut sender = self
-            .sender
+            .thread_pool_sender
             .lock()
-            .map_err(|_| Error::runtime_busy("platform I/O driver state is poisoned"))?;
+            .map_err(|_| Error::runtime_busy("platform I/O thread-pool state is poisoned"))?;
+        if let Some(sender) = sender.as_ref() {
+            return Ok(sender.clone());
+        }
+
+        let (next_sender, receiver) =
+            crossbeam_channel::bounded(PLATFORM_IO_THREAD_POOL_QUEUE_DEPTH);
+        for worker_index in 0..PLATFORM_IO_THREAD_POOL_WORKERS {
+            let receiver = receiver.clone();
+            thread::Builder::new()
+                .name(format!("trine-kv-platform-io-threadpool-{worker_index}"))
+                .spawn(move || platform_threadpool::run_worker(receiver))
+                .map_err(Error::Io)?;
+        }
+        *sender = Some(next_sender.clone());
+        Ok(next_sender)
+    }
+
+    #[cfg(all(feature = "platform-io-native", any(unix, windows)))]
+    fn native_sender(&self) -> Result<mpsc::Sender<PlatformIoTask>> {
+        let mut sender = self
+            .native_sender
+            .lock()
+            .map_err(|_| Error::runtime_busy("native platform I/O state is poisoned"))?;
         if let Some(sender) = sender.as_ref() {
             return Ok(sender.clone());
         }
 
         let (next_sender, receiver) = mpsc::channel();
         thread::Builder::new()
-            .name("trine-kv-platform-io".to_owned())
+            .name("trine-kv-platform-io-native".to_owned())
             .spawn(move || platform_backend::run_worker(receiver))
             .map_err(Error::Io)?;
         *sender = Some(next_sender.clone());
@@ -646,6 +729,113 @@ impl PlatformIoDriver {
 
 #[cfg(feature = "platform-io")]
 impl PlatformIoTask {
+    const fn operation(&self) -> PlatformIoOperation {
+        match self {
+            Self::Len { .. } => PlatformIoOperation::LengthLookup,
+            Self::ReadExactAtOwned { .. } => PlatformIoOperation::OwnedRandomRead,
+            Self::ReadOptional { .. } => PlatformIoOperation::OptionalWholeObjectRead,
+            Self::WriteTempRename { .. } => PlatformIoOperation::TempWriteRenamePublish,
+            Self::Append { .. } => PlatformIoOperation::Append,
+            Self::OpenAppend { .. } => PlatformIoOperation::AppendObjectOpen,
+            Self::Persist { .. } => PlatformIoOperation::Persist,
+            Self::Delete { .. } => PlatformIoOperation::ObjectDelete,
+            Self::CreateDirAll { .. } => PlatformIoOperation::DirectoryCreate,
+            Self::SyncDir { .. } => PlatformIoOperation::DirectorySync,
+            Self::ListFilePaths { .. } => PlatformIoOperation::DirectoryListing,
+            Self::AcquireWriterLease { .. } => PlatformIoOperation::WriterLeaseAcquire,
+        }
+    }
+
+    fn run_thread_pool(self) {
+        match self {
+            Self::Len { path, completion } => {
+                complete_platform_io(&completion, platform_threadpool::len(path));
+            }
+            Self::ReadExactAtOwned {
+                path,
+                offset,
+                len,
+                completion,
+            } => {
+                complete_platform_io(
+                    &completion,
+                    platform_threadpool::read_exact_at_owned(path, offset, len),
+                );
+            }
+            Self::ReadOptional { path, completion } => {
+                complete_platform_io(&completion, platform_threadpool::read_optional(path));
+            }
+            Self::WriteTempRename {
+                path,
+                tmp_path,
+                bytes,
+                durability,
+                create_parent,
+                sync_parent_on_sync_all,
+                completion,
+            } => {
+                complete_platform_io(
+                    &completion,
+                    platform_threadpool::write_temp_rename(
+                        &path,
+                        &tmp_path,
+                        &bytes,
+                        durability,
+                        create_parent,
+                        sync_parent_on_sync_all,
+                    ),
+                );
+            }
+            Self::Append {
+                path,
+                bytes,
+                durability,
+                completion,
+            } => {
+                complete_platform_io(
+                    &completion,
+                    platform_threadpool::append(path, &bytes, durability),
+                );
+            }
+            Self::OpenAppend { path, completion } => {
+                complete_platform_io(&completion, platform_threadpool::open_append(path));
+            }
+            Self::Persist {
+                path,
+                durability,
+                completion,
+            } => {
+                complete_platform_io(
+                    &completion,
+                    platform_threadpool::persist_path(path, durability),
+                );
+            }
+            Self::Delete { path, completion } => {
+                complete_platform_io(&completion, platform_threadpool::delete_path(path));
+            }
+            Self::CreateDirAll { path, completion } => {
+                complete_platform_io(&completion, platform_threadpool::create_dir_all(path));
+            }
+            Self::SyncDir { path, completion } => {
+                complete_platform_io(&completion, platform_threadpool::sync_directory(path));
+            }
+            Self::ListFilePaths { path, completion } => {
+                complete_platform_io(&completion, platform_threadpool::list_file_paths(path));
+            }
+            Self::AcquireWriterLease {
+                path,
+                owner,
+                completion,
+            } => {
+                complete_platform_io(
+                    &completion,
+                    platform_threadpool::acquire_writer_lease(&path, &owner),
+                );
+            }
+        }
+    }
+
+    #[cfg(all(feature = "platform-io-native", any(unix, windows)))]
     async fn run(self) {
         match self {
             Self::Len { path, completion } => {
@@ -861,308 +1051,372 @@ mod tests {
     fn platform_backend_matrix_matches_target_family() {
         let matrix = PlatformIoDriver::backend_matrix();
 
-        #[cfg(target_os = "linux")]
+        #[cfg(not(feature = "platform-io-native"))]
         {
-            assert_eq!(matrix.kind, PlatformIoBackendKind::LinuxNative);
-            assert_eq!(
-                matrix.owned_random_read,
-                PlatformIoTaskClass::TruePlatformAsync
-            );
-            assert_eq!(
-                matrix.temp_write_rename_publish,
-                PlatformIoTaskClass::TruePlatformAsync
-            );
-            assert_eq!(
-                matrix.directory_listing,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(matrix.wal_rewrite, PlatformIoTaskClass::TruePlatformAsync);
+            #[cfg(any(unix, windows))]
+            {
+                assert_eq!(matrix.kind, PlatformIoBackendKind::ThreadPoolManaged);
+                assert_eq!(
+                    matrix.length_lookup,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.owned_random_read,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.optional_whole_object_read,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.temp_write_rename_publish,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.append_object_open,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(matrix.append, PlatformIoTaskClass::ThreadPoolManagedAsync);
+                assert_eq!(matrix.persist, PlatformIoTaskClass::ThreadPoolManagedAsync);
+                assert_eq!(
+                    matrix.wal_rewrite,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.object_delete,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.directory_create,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.directory_sync,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.directory_listing,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.writer_lease_acquire,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+            }
+
+            #[cfg(not(any(unix, windows)))]
+            {
+                assert_eq!(matrix.kind, PlatformIoBackendKind::UnsupportedFallback);
+                assert_eq!(matrix.owned_random_read, PlatformIoTaskClass::Unsupported);
+                assert_eq!(matrix.directory_listing, PlatformIoTaskClass::Unsupported);
+            }
         }
-        #[cfg(windows)]
+
+        #[cfg(feature = "platform-io-native")]
         {
-            assert_eq!(matrix.kind, PlatformIoBackendKind::WindowsNative);
-            assert_eq!(
-                matrix.length_lookup,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.owned_random_read,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.optional_whole_object_read,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.temp_write_rename_publish,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.append_object_open,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.append,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(matrix.persist, PlatformIoTaskClass::ThreadPoolManagedAsync);
-            assert_eq!(
-                matrix.wal_rewrite,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.object_delete,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.directory_create,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.directory_sync,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.directory_listing,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.writer_lease_acquire,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-        }
-        #[cfg(target_os = "macos")]
-        {
-            assert_eq!(matrix.kind, PlatformIoBackendKind::MacOsNative);
-            assert_eq!(
-                matrix.length_lookup,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.owned_random_read,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.optional_whole_object_read,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.temp_write_rename_publish,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.append_object_open,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.append,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.persist,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.wal_rewrite,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.object_delete,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.directory_create,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.directory_sync,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.directory_listing,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.writer_lease_acquire,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-        }
-        #[cfg(target_os = "freebsd")]
-        {
-            assert_eq!(matrix.kind, PlatformIoBackendKind::FreeBsdNative);
-            assert_eq!(
-                matrix.length_lookup,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.owned_random_read,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.optional_whole_object_read,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.temp_write_rename_publish,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.append_object_open,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.append,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.persist,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.wal_rewrite,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.object_delete,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.directory_create,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.directory_sync,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.directory_listing,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.writer_lease_acquire,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-        }
-        #[cfg(any(target_os = "illumos", target_os = "solaris"))]
-        {
-            assert_eq!(matrix.kind, PlatformIoBackendKind::SolarishNative);
-            assert_eq!(
-                matrix.length_lookup,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.owned_random_read,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.optional_whole_object_read,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.temp_write_rename_publish,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.append_object_open,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.append,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.persist,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.wal_rewrite,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.object_delete,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.directory_create,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.directory_sync,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.directory_listing,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.writer_lease_acquire,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-        }
-        #[cfg(all(
-            unix,
-            not(any(
-                target_os = "linux",
-                target_os = "macos",
-                target_os = "freebsd",
-                target_os = "illumos",
-                target_os = "solaris"
-            ))
-        ))]
-        {
-            assert_eq!(matrix.kind, PlatformIoBackendKind::UnixFallback);
-            assert_eq!(
-                matrix.length_lookup,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.owned_random_read,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.optional_whole_object_read,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.temp_write_rename_publish,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.append_object_open,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(matrix.append, PlatformIoTaskClass::ThreadPoolManagedAsync);
-            assert_eq!(matrix.persist, PlatformIoTaskClass::ThreadPoolManagedAsync);
-            assert_eq!(
-                matrix.wal_rewrite,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.object_delete,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.directory_create,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.directory_sync,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.directory_listing,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-            assert_eq!(
-                matrix.writer_lease_acquire,
-                PlatformIoTaskClass::ThreadPoolManagedAsync
-            );
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            assert_eq!(matrix.kind, PlatformIoBackendKind::UnsupportedFallback);
-            assert_eq!(matrix.owned_random_read, PlatformIoTaskClass::Unsupported);
-            assert_eq!(matrix.directory_listing, PlatformIoTaskClass::Unsupported);
+            #[cfg(target_os = "linux")]
+            {
+                assert_eq!(matrix.kind, PlatformIoBackendKind::LinuxNative);
+                assert_eq!(
+                    matrix.owned_random_read,
+                    PlatformIoTaskClass::TruePlatformAsync
+                );
+                assert_eq!(
+                    matrix.temp_write_rename_publish,
+                    PlatformIoTaskClass::TruePlatformAsync
+                );
+                assert_eq!(
+                    matrix.directory_listing,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(matrix.wal_rewrite, PlatformIoTaskClass::TruePlatformAsync);
+            }
+            #[cfg(windows)]
+            {
+                assert_eq!(matrix.kind, PlatformIoBackendKind::WindowsNative);
+                assert_eq!(
+                    matrix.length_lookup,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.owned_random_read,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.optional_whole_object_read,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.temp_write_rename_publish,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.append_object_open,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.append,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(matrix.persist, PlatformIoTaskClass::ThreadPoolManagedAsync);
+                assert_eq!(
+                    matrix.wal_rewrite,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.object_delete,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.directory_create,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.directory_sync,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.directory_listing,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.writer_lease_acquire,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+            }
+            #[cfg(target_os = "macos")]
+            {
+                assert_eq!(matrix.kind, PlatformIoBackendKind::MacOsNative);
+                assert_eq!(
+                    matrix.length_lookup,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.owned_random_read,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.optional_whole_object_read,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.temp_write_rename_publish,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.append_object_open,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.append,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.persist,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.wal_rewrite,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.object_delete,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.directory_create,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.directory_sync,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.directory_listing,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.writer_lease_acquire,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+            }
+            #[cfg(target_os = "freebsd")]
+            {
+                assert_eq!(matrix.kind, PlatformIoBackendKind::FreeBsdNative);
+                assert_eq!(
+                    matrix.length_lookup,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.owned_random_read,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.optional_whole_object_read,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.temp_write_rename_publish,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.append_object_open,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.append,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.persist,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.wal_rewrite,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.object_delete,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.directory_create,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.directory_sync,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.directory_listing,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.writer_lease_acquire,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+            }
+            #[cfg(any(target_os = "illumos", target_os = "solaris"))]
+            {
+                assert_eq!(matrix.kind, PlatformIoBackendKind::SolarishNative);
+                assert_eq!(
+                    matrix.length_lookup,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.owned_random_read,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.optional_whole_object_read,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.temp_write_rename_publish,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.append_object_open,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.append,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.persist,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.wal_rewrite,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.object_delete,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.directory_create,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.directory_sync,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+                assert_eq!(
+                    matrix.directory_listing,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.writer_lease_acquire,
+                    PlatformIoTaskClass::PlatformNativeAsyncButPartial
+                );
+            }
+            #[cfg(all(
+                unix,
+                not(any(
+                    target_os = "linux",
+                    target_os = "macos",
+                    target_os = "freebsd",
+                    target_os = "illumos",
+                    target_os = "solaris"
+                ))
+            ))]
+            {
+                assert_eq!(matrix.kind, PlatformIoBackendKind::UnixFallback);
+                assert_eq!(
+                    matrix.length_lookup,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.owned_random_read,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.optional_whole_object_read,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.temp_write_rename_publish,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.append_object_open,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(matrix.append, PlatformIoTaskClass::ThreadPoolManagedAsync);
+                assert_eq!(matrix.persist, PlatformIoTaskClass::ThreadPoolManagedAsync);
+                assert_eq!(
+                    matrix.wal_rewrite,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.object_delete,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.directory_create,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.directory_sync,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.directory_listing,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+                assert_eq!(
+                    matrix.writer_lease_acquire,
+                    PlatformIoTaskClass::ThreadPoolManagedAsync
+                );
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                assert_eq!(matrix.kind, PlatformIoBackendKind::UnsupportedFallback);
+                assert_eq!(matrix.owned_random_read, PlatformIoTaskClass::Unsupported);
+                assert_eq!(matrix.directory_listing, PlatformIoTaskClass::Unsupported);
+            }
         }
     }
 

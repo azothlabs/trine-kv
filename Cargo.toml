@@ -29,10 +29,7 @@ name = "trine_kv"
 path = "src/lib.rs"
 
 [dependencies]
-compio = { version = "0.14.0", default-features = false, features = ["runtime"], optional = true }
-compio-driver = { version = "0.7.1", default-features = false, features = ["io-uring"], optional = true }
-compio-fs = { version = "0.7.0", default-features = false, features = ["io-uring"], optional = true }
-compio-runtime = { version = "0.7.0", default-features = false, features = ["io-uring"], optional = true }
+crossbeam-channel = { version = "0.5.15", optional = true }
 # Async primitives (e.g. `futures::lock::Mutex` for serializing object-store
 # manifest publishes Send-safely). Available on every target.
 futures = "0.3.32"
@@ -59,7 +56,18 @@ all = "warn"
 pedantic = "warn"
 
 [features]
-platform-io = ["dep:compio", "dep:compio-driver", "dep:compio-fs", "dep:compio-runtime"]
+platform-io = ["dep:crossbeam-channel"]
+platform-io-threadpool = ["platform-io"]
+platform-io-native = [
+    "platform-io",
+    "dep:compio",
+    "dep:compio-driver",
+    "dep:compio-fs",
+    "dep:compio-runtime",
+    "dep:block2",
+    "dep:dispatch2",
+    "dep:libc",
+]
 # Real object-storage `ObjectClient` (S3 and compatible) via the `object_store` crate.
 s3 = ["dep:object_store"]
 
@@ -69,7 +77,13 @@ opfs = "0.2.0"
 wasm-bindgen = "0.2.122"
 wasm-bindgen-futures = "0.4.72"
 
+[target.'cfg(any(unix, windows))'.dependencies]
+compio = { version = "0.14.0", default-features = false, features = ["runtime"], optional = true }
+compio-driver = { version = "0.7.1", default-features = false, features = ["io-uring"], optional = true }
+compio-fs = { version = "0.7.0", default-features = false, features = ["io-uring"], optional = true }
+compio-runtime = { version = "0.7.0", default-features = false, features = ["io-uring"], optional = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
-block2 = "0.6.2"
-dispatch2 = "0.3.1"
-libc = "0.2.186"
+block2 = { version = "0.6.2", optional = true }
+dispatch2 = { version = "0.3.1", optional = true }
+libc = { version = "0.2.186", optional = true }

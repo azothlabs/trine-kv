@@ -4709,7 +4709,11 @@ mod tests {
         std::fs::remove_dir_all(root).expect("test dir removes");
     }
 
-    #[cfg(all(feature = "platform-io", target_os = "linux"))]
+    #[cfg(all(
+        feature = "platform-io",
+        feature = "platform-io-native",
+        target_os = "linux"
+    ))]
     #[test]
     fn platform_io_native_file_read_and_append_use_platform_driver() {
         let root = temp_storage_root("trine-kv-platform-io-storage");
@@ -4789,7 +4793,11 @@ mod tests {
         std::fs::remove_dir_all(root).expect("test dir removes");
     }
 
-    #[cfg(all(feature = "platform-io", target_os = "linux"))]
+    #[cfg(all(
+        feature = "platform-io",
+        feature = "platform-io-native",
+        target_os = "linux"
+    ))]
     fn assert_platform_io_listing_managed_async(
         backend: &NativeFileBackend,
         directory: StorageDirectoryId,
@@ -4824,7 +4832,11 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "platform-io", target_os = "linux"))]
+    #[cfg(all(
+        feature = "platform-io",
+        feature = "platform-io-native",
+        target_os = "linux"
+    ))]
     fn assert_platform_task_accounting(
         stats: &NativeFileStorageStats,
         min_driver_tasks: u64,
@@ -4854,7 +4866,11 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "platform-io", target_os = "linux"))]
+    #[cfg(all(
+        feature = "platform-io",
+        feature = "platform-io-native",
+        target_os = "linux"
+    ))]
     #[test]
     fn platform_io_native_file_management_ops_use_platform_driver() {
         let root = temp_storage_root("trine-kv-platform-io-management");
@@ -5007,6 +5023,7 @@ mod tests {
 
     #[cfg(all(
         feature = "platform-io",
+        feature = "platform-io-native",
         any(
             windows,
             target_os = "macos",
@@ -5074,18 +5091,12 @@ mod tests {
 
     #[cfg(all(
         feature = "platform-io",
-        unix,
-        not(any(
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "freebsd",
-            target_os = "illumos",
-            target_os = "solaris"
-        ))
+        not(feature = "platform-io-native"),
+        any(unix, windows)
     ))]
     #[test]
-    fn platform_io_without_native_async_storage_ops_uses_platform_driver_fallback() {
-        let root = temp_storage_root("trine-kv-platform-io-fallback-storage");
+    fn platform_io_threadpool_storage_ops_use_platform_driver() {
+        let root = temp_storage_root("trine-kv-platform-io-threadpool-storage");
         std::fs::create_dir_all(&root).expect("test dir creates");
         let table =
             StorageObjectId::native_file(StorageObjectKind::Table, root.join("table.trinet"));
@@ -5122,7 +5133,7 @@ mod tests {
                 .random_read
                 .thread_pool_managed_async
                 > 0,
-            "Unix fallback platform random read should report thread-pool managed async"
+            "platform random read should report thread-pool managed async"
         );
         let platform_total = stats.platform_io_operations.total();
         assert!(

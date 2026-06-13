@@ -255,7 +255,7 @@ impl RuntimeCapabilities {
 }
 
 const fn platform_io_driver_flag() -> u8 {
-    if cfg!(feature = "platform-io") {
+    if cfg!(all(feature = "platform-io", any(unix, windows))) {
         PLATFORM_IO_DRIVER
     } else {
         0
@@ -639,7 +639,10 @@ mod tests {
         assert!(platform.cancellation_tokens());
         assert!(platform.task_join());
         assert!(platform.blocking_adapter());
-        assert_eq!(platform.platform_io_driver(), cfg!(feature = "platform-io"));
+        assert_eq!(
+            platform.platform_io_driver(),
+            cfg!(all(feature = "platform-io", any(unix, windows)))
+        );
         assert_eq!(
             platform.platform_async_io(),
             cfg!(all(feature = "platform-io", any(unix, windows)))

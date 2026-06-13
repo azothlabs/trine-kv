@@ -72,6 +72,12 @@ Evidence notes should separate:
   counters remain the source of truth for whether the operation used native OS
   completion or platform-managed thread-pool completion. Targets without native
   threads, such as browser WASM, must not advertise thread-pool managed async.
+- `platform-io` is the Cargo baseline for platform async I/O and uses Trine's
+  bounded thread-pool backend on native-thread targets. `platform-io-native`
+  enables native backend dependencies and falls back to the same thread-pool
+  backend for operation rows without native support. Targets without native
+  threads may compile the feature shape, but must not advertise
+  `PlatformAsyncIo`.
 - Platform-io completion must be judged before engine revalidation. The
   platform-io responsibility is to be Trine's cross-platform async file I/O
   abstraction; engine phases must not treat a half-complete backend matrix as

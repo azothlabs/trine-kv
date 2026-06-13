@@ -404,6 +404,12 @@ Rules:
 - must keep Linux, Windows, macOS, BSD/other Unix, and fallback mechanics behind
   the platform-io driver contract so the KV engine awaits Trine operations
   rather than OS APIs;
+- `platform-io` is the baseline Cargo feature and uses Trine's own bounded
+  thread-pool backend on native-thread targets;
+- `platform-io-threadpool` is an explicit alias for the baseline;
+- `platform-io-native` adds native async backend crates, prefers native async
+  for rows with evidence, and routes rows without native support to the
+  baseline thread-pool backend;
 - may submit directory and object listing through the platform driver as
   `ThreadPoolManagedAsync` when no real async directory enumeration operation
   exists but a native thread pool is available;
@@ -438,12 +444,15 @@ Rules:
 
 #### Native Platform Backend Matrix
 
-Current platform backend classifications are operation-level. Linux has current
-true async evidence for many operations. Windows, macOS, and BSD/Solaris-family
-targets have native async evidence for selected lower-level file data paths but
-still report partial rows when a complete Trine operation includes non-native
-steps. Generic Unix targets use thread-pool managed async until a stronger
-target-specific backend is proven behind the same platform-io contract.
+Current platform backend classifications are operation-level. With
+`platform-io`, native-thread targets use the baseline thread-pool matrix: every
+supported native-file operation row reports `ThreadPoolManagedAsync`. With
+`platform-io-native`, Linux has current true async evidence for many
+operations. Windows, macOS, and BSD/Solaris-family targets have native async
+evidence for selected lower-level file data paths but still report partial rows
+when a complete Trine operation includes non-native steps. Generic Unix targets
+use thread-pool managed async until a stronger target-specific backend is
+proven behind the same platform-io contract.
 
 ```text
 Operation                     Linux            Windows          macOS            BSD/Solaris      Generic fallback
@@ -466,13 +475,13 @@ Legend: `Partial` means `PlatformNativeAsyncButPartial`, and
 `ThreadPool` means `ThreadPoolManagedAsync`.
 
 With the current backend matrix, `RuntimeOptions::platform_io()` advertises
-`PlatformAsyncIo` when the `platform-io` Cargo feature is enabled on native Unix
-or Windows targets. This coarse capability means platform-io can return async
-completion through true native, partial native, or managed thread-pool
-execution; the per-operation matrix remains the source of truth for complete
-operation class. Linux directory listing is `ThreadPoolManagedAsync` because the
-selected Linux async stack exposes no directory enumeration operation for a
-complete Trine listing request.
+`PlatformAsyncIo` when `platform-io` or `platform-io-native` is enabled on
+native Unix or Windows targets. This coarse capability means platform-io can
+return async completion through true native, partial native, or managed
+thread-pool execution; the per-operation matrix remains the source of truth for
+complete operation class. Linux directory listing is `ThreadPoolManagedAsync`
+because the selected Linux async stack exposes no directory enumeration
+operation for a complete Trine listing request.
 On Windows, the selected backend opens files with overlapped support and submits
 positioned `ReadFile` / `WriteFile` operations through IOCP, but file open,
 metadata, sync, rename, delete, directory creation/listing, and related publish

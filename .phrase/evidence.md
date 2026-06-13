@@ -11343,3 +11343,70 @@ Negative check:
 - Return to engine revalidation using the completed platform-io abstraction
   matrix, while keeping native dependency gating for browser-WASM as a separate
   follow-up.
+
+## 2026-06-13: Platform-I/O Feature Split And Thread-Pool Baseline Complete
+
+### Observation
+
+- `platform-io` is now the baseline platform async I/O feature. It enables
+  `crossbeam-channel` and Trine's own bounded platform thread-pool backend, but
+  does not pull compio or other native async backend crates.
+- `platform-io-threadpool` is an explicit alias for the same baseline.
+- `platform-io-native` includes the baseline feature plus native backend crates.
+  Operation rows classified as `TruePlatformAsync` or
+  `PlatformNativeAsyncButPartial` route to the native worker; rows classified as
+  `ThreadPoolManagedAsync` route to the baseline thread-pool backend.
+- The platform thread-pool backend implements the complete current Trine native
+  file operation set: length lookup, random read, whole-object read, temporary
+  write plus rename publish, append open, append, persist, WAL rewrite, delete,
+  directory create, directory sync, directory/object listing, and writer lease.
+- `platform-io` and `platform-io-native` both compile on
+  `wasm32-unknown-unknown` without pulling the previous native-only dependency
+  path that failed in `socket2`. Runtime capability still does not advertise
+  `PlatformAsyncIo` or the platform driver on no-native-thread targets.
+
+### Interpretation
+
+- Platform-io now has the intended feature shape: thread-pool async is the
+  portability floor, and native async is an optimization path chosen per Trine
+  operation.
+- Compio remains useful under `platform-io-native`, but it is no longer required
+  for the baseline platform-io abstraction.
+- Browser-WASM/no-native-thread targets no longer fail merely because the
+  feature is enabled, and they still do not pretend to support thread-pool
+  async file I/O.
+
+### Verification
+
+- `cargo fmt`
+- `cargo test -q platform_backend_matrix_matches_target_family --features platform-io`
+- `cargo test -q platform_io_threadpool_storage_ops_use_platform_driver --features platform-io`
+- `cargo test -q runtime_capabilities_follow_selected_mode --features platform-io`
+- `cargo test -q platform_backend_matrix_matches_target_family --features platform-io-native`
+- `cargo test -q platform_io_partial_native_storage_ops_use_platform_driver --features platform-io-native`
+- `cargo test -q platform_io --features platform-io-native`
+- `cargo check -q --target x86_64-pc-windows-gnu --features platform-io-native --tests`
+- `cargo check -q --target wasm32-unknown-unknown --no-default-features --features platform-io`
+- `cargo check -q --target wasm32-unknown-unknown --no-default-features --features platform-io-native`
+- `cargo test -q --features platform-io`
+- `cargo test -q --features platform-io-native`
+- `cargo clippy -q --all-features`
+- `cargo check -q --features platform-io-threadpool`
+- `cargo check -q --target x86_64-pc-windows-gnu --features platform-io --tests`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test --doc -q --all-features`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo tree -q --no-default-features --features platform-io --edges normal`
+
+### Remaining Blockers
+
+- Native backends still have partial rows where complete Trine operations need
+  future native work.
+- Real Windows, FreeBSD, illumos, Solaris, and browser runtime diagnostics were
+  not run from this macOS workspace.
+
+### Recommended Next Action
+
+- Return to Phase 165 engine revalidation with the platform-io feature boundary
+  stabilized.

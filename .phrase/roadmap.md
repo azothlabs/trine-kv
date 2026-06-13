@@ -4042,15 +4042,39 @@ operation-level evidence.
 - Engine path rewrites, storage format changes, publishing, tagging, pushing,
   or PR creation.
 
-### Phase 164: Engine Revalidation After Platform-I/O Completion
+### Phase 164: Platform-I/O Feature Split And Thread-Pool Baseline
+
+**Status**: Complete
+
+**Goal**: Make `platform-io` a thread-pool baseline feature and
+`platform-io-native` a native-priority feature that falls back to the same
+thread-pool backend for rows without native support.
+
+**Entry Condition**: Phase 163 closes the operation-level platform-io matrix.
+
+**Acceptance Gate**:
+
+- `platform-io` no longer pulls native async backend dependencies.
+- `platform-io-native` preserves native/partial rows and routes unsupported
+  native rows through `ThreadPoolManagedAsync`.
+- `platform-io` and `platform-io-native` compile on browser-WASM without
+  native-only dependency failures.
+- Public docs and protocol explain the feature split.
+
+**Major Out Of Scope**:
+
+- New OS backend discovery, storage format changes, publishing, tagging,
+  pushing, or PR creation.
+
+### Phase 165: Engine Revalidation After Platform-I/O Completion
 
 **Status**: Planned
 
 **Goal**: Revisit write, flush, compaction, maintenance, cleanup, and close only
 after platform-io backends have completed their cross-platform abstraction
-responsibility.
+responsibility and feature split.
 
-**Entry Condition**: Phase 163 closes the operation-level platform-io matrix.
+**Entry Condition**: Phase 164 closes the platform-io feature boundary.
 
 **Acceptance Gate**:
 

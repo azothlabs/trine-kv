@@ -17,6 +17,18 @@ The engine should not know whether a platform backend uses io_uring, IOCP,
 Apple-specific APIs, BSD-specific APIs, polling, or an explicit fallback. The
 engine asks for a Trine storage operation and awaits the completion.
 
+Cargo features must preserve that boundary:
+
+- `platform-io` is the baseline feature. It uses Trine's own bounded
+  thread-pool backend on native-thread targets and does not pull native async
+  backend dependencies.
+- `platform-io-threadpool` is an explicit alias for the baseline.
+- `platform-io-native` enables native backend dependencies and prefers native
+  async operation rows where evidence exists. Rows without native support route
+  to the baseline thread-pool backend instead of blocking the caller runtime.
+- Targets without native threads may compile the feature shape, but they must
+  not advertise `PlatformAsyncIo` or report `ThreadPoolManagedAsync`.
+
 The current implementation evidence is strongest on Linux, but Linux is not
 the architecture boundary. Platform support is not uniform:
 
@@ -69,9 +81,9 @@ Trine records native platform I/O by operation capability class:
 - platform-driver blocking fallback task count;
 - Trine bounded blocking-adapter task count.
 
-`PlatformAsyncIo` capability is advertised when the selected native platform
-driver can return asynchronous completions to the caller runtime through true
-platform async, partial native async, or platform-io's managed thread-pool path.
+`PlatformAsyncIo` capability is advertised when the selected platform driver can
+return asynchronous completions to the caller runtime through true platform
+async, partial native async, or platform-io's managed thread-pool path.
 Per-operation counters remain the authority for whether a completion was
 `TruePlatformAsync`, `PlatformNativeAsyncButPartial`,
 `ThreadPoolManagedAsync`, `BlockingFallback`, or `Unsupported`. Browser WASM and
@@ -81,8 +93,10 @@ instead of reporting thread-pool managed async.
 ### Operation Matrix
 
 The table records current implementation class first, then the target direction
-for future backend phases. A later phase may strengthen a cell only with
-platform-specific implementation evidence.
+for future backend phases. Under baseline `platform-io`, native-thread targets
+use `ThreadPoolManagedAsync` for every supported row. Under
+`platform-io-native`, the following matrix applies. A later phase may strengthen
+a cell only with platform-specific implementation evidence.
 
 | Trine operation | Linux current / target | Windows current / target | macOS current / target | BSD/other Unix current / target | Generic fallback current / target |
 | --- | --- | --- | --- | --- | --- |
