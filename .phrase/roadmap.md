@@ -3751,3 +3751,186 @@ flush as the smallest remaining native async storage path before compaction.
 - Compaction, background maintenance, cleanup, close, cooperative maintenance,
   storage format changes, publishing, tagging, pushing, PR creation, or claiming
   new true async support on fallback targets.
+
+### Phase 153: Platform-I/O Contract Reset
+
+**Status**: Complete
+
+**Goal**: Restore platform-io as Trine's cross-platform async I/O abstraction,
+with operation-level capability reporting instead of a Linux-centered plan.
+
+**Entry Condition**: Phase 152 completed Linux native async flush and the user
+corrected the plan drift: Windows, macOS, and other platforms can have their
+own async mechanisms, so fallback counters describe current implementation
+state, not the intended platform-io boundary.
+
+**Acceptance Gate**:
+
+- ADR/protocol/current docs define platform-io as a cross-platform async I/O
+  abstraction.
+- Operation-level capability classes are defined, at minimum:
+  `TruePlatformAsync`, `PlatformNativeAsyncButPartial`,
+  `PlatformManagedFallback`, `BlockingFallback`, and `Unsupported`.
+- The operation table covers length lookup, random read, whole-object read,
+  temporary write plus rename publish, append open, append, persist/fsync, WAL
+  rewrite, delete, directory create, directory sync, directory listing, and
+  writer lease.
+- Linux, Windows, macOS, BSD/other Unix, and generic fallback targets have
+  explicit current-state classifications and target-state notes.
+- Docs no longer frame non-Linux behavior as a permanent fallback outcome.
+- Formatting and diff checks pass.
+
+**Major Out Of Scope**:
+
+- Implementing new Windows, macOS, or BSD backends.
+- Rewriting compaction, maintenance, cleanup, or close.
+- Storage format changes, publishing, tagging, pushing, PR creation, or public
+  API breaks.
+
+### Phase 154: Platform-I/O Driver Trait Cleanup
+
+**Status**: Complete
+
+**Goal**: Reshape the internal platform driver boundary so each platform backend
+owns operation submission and reports the capability class for each operation.
+
+**Entry Condition**: Phase 153 defines the cross-platform platform-io contract
+and operation table.
+
+**Acceptance Gate**:
+
+- `RuntimeOptions::platform_io()` enters the platform driver path on all
+  configured targets where the driver can be constructed.
+- Linux-specific, generic fallback, and shared driver logic are separated.
+- The backend boundary submits read, write, sync, rename-publish, delete,
+  directory sync, and writer-lease operations through platform-specific code
+  where available.
+- Backend stats report per-operation capability classes instead of one global
+  true-async flag.
+- Existing Linux write and flush behavior remains verified.
+
+**Major Out Of Scope**:
+
+- Full Windows, macOS, or BSD backend implementation beyond the trait shape and
+  scaffolding needed by this phase.
+- Engine compaction, maintenance, cleanup, close, or storage format changes.
+
+### Phase 155: Windows Platform Backend
+
+**Status**: Planned
+
+**Goal**: Implement the Windows platform-io backend using Windows-native async
+file operations where valid, with explicit fallback classification for the rest.
+
+**Entry Condition**: Phase 154 leaves a backend boundary that can express
+operation-level platform capability.
+
+**Acceptance Gate**:
+
+- Windows read/write/WAL append paths use an audited Windows-native async
+  mechanism where valid.
+- Flush, rename publish, delete, directory operations, and writer lease have
+  explicit capability classes and tests.
+- WAL offset and append serialization remain correct.
+- Windows tests and diagnostics prove which operations are true platform async,
+  platform-managed fallback, blocking fallback, or unsupported.
+
+**Major Out Of Scope**:
+
+- macOS/BSD backend work, Linux behavior changes, storage format changes,
+  publishing, tagging, pushing, or PR creation.
+
+### Phase 156: macOS Platform Backend
+
+**Status**: Planned
+
+**Goal**: Implement or explicitly classify the macOS platform-io backend using
+Apple-supported async file mechanisms where valid.
+
+**Entry Condition**: Phase 154 leaves a backend boundary that can express
+operation-level platform capability.
+
+**Acceptance Gate**:
+
+- macOS file operations are audited against available system APIs before claims
+  are made.
+- Valid async read/write operations are implemented or clearly classified.
+- Flush, rename publish, directory sync, delete, listing, and writer lease
+  behavior are classified and tested.
+- macOS diagnostics prove the selected class for each operation.
+
+**Major Out Of Scope**:
+
+- Windows/BSD backend work, Linux behavior changes, storage format changes,
+  publishing, tagging, pushing, or PR creation.
+
+### Phase 157: BSD And Other Unix Platform Backends
+
+**Status**: Planned
+
+**Goal**: Give BSD and other Unix targets explicit platform-io capability
+classification, implementing platform-specific async operations where the OS
+support is real enough for Trine's storage semantics.
+
+**Entry Condition**: Phase 154 leaves a backend boundary that can express
+operation-level platform capability.
+
+**Acceptance Gate**:
+
+- Supported Unix variants are audited instead of inheriting vague generic
+  fallback language.
+- Any implemented async operations have targeted tests.
+- Unsupported or blocking operations are explicitly classified and visible in
+  diagnostics.
+
+**Major Out Of Scope**:
+
+- Windows/macOS backend work, Linux behavior changes, storage format changes,
+  publishing, tagging, pushing, or PR creation.
+
+### Phase 158: Public Platform-I/O Diagnostics
+
+**Status**: Planned
+
+**Goal**: Make platform-io behavior visible enough that users and tests can see
+which operations are true platform async, platform-managed fallback, blocking
+fallback, or unsupported.
+
+**Entry Condition**: At least one non-Linux backend phase has proven the
+operation-level classification model.
+
+**Acceptance Gate**:
+
+- `DbStats` or adjacent diagnostics expose per-operation platform-io classes.
+- Public docs explain how to interpret true async, platform-managed fallback,
+  blocking fallback, and unsupported operations.
+- Tests assert diagnostics for Linux and at least one non-Linux target.
+
+**Major Out Of Scope**:
+
+- New storage behavior, storage format changes, publishing, tagging, pushing,
+  or PR creation.
+
+### Phase 159: Engine Path Revalidation On Cross-Platform Platform-I/O
+
+**Status**: Planned
+
+**Goal**: Re-evaluate write, flush, compaction, maintenance, cleanup, and close
+against the corrected cross-platform platform-io contract.
+
+**Entry Condition**: Platform-io has operation-level diagnostics and at least
+one non-Linux backend path has been implemented or explicitly classified.
+
+**Acceptance Gate**:
+
+- Existing native async write and flush paths are validated against the
+  operation table across available platforms.
+- The next engine async phase is chosen from evidence, not from the old
+  Linux-only residual list.
+- Any compaction or maintenance work records which platform-io operations it
+  depends on and what fallback class remains.
+
+**Major Out Of Scope**:
+
+- Adding new OS backends beyond those already selected by evidence.
+- Storage format changes, publishing, tagging, pushing, or PR creation.

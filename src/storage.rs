@@ -24,11 +24,13 @@ use crate::{
     object_store::{ObjectStoreBackend, ObjectStoreReadObject},
     options::DurabilityMode,
     runtime::Runtime,
-    stats::{StorageOperationMetric, StorageOperationStats},
+    stats::{PlatformIoOperationStats, StorageOperationMetric, StorageOperationStats},
 };
 
 #[cfg(feature = "platform-io")]
 use crate::io::{PlatformIoDriver, PlatformIoOperation, PlatformIoTaskClass};
+#[cfg(feature = "platform-io")]
+use crate::stats::PlatformIoClassCounters;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum StorageObjectKind {
@@ -869,6 +871,7 @@ impl NativeFileBackend {
             platform_blocking_fallback_tasks: self.metrics.platform_blocking_fallback_tasks(),
             inline_tasks: self.metrics.inline_tasks(),
             operations: self.metrics.operation_stats(),
+            platform_io_operations: self.metrics.platform_io_operation_stats(),
         }
     }
 
@@ -950,6 +953,8 @@ struct NativeFileStorageMetrics {
     platform_blocking_fallback: AtomicU64,
     inline: AtomicU64,
     operations: NativeFileStorageOperationMetrics,
+    #[cfg(feature = "platform-io")]
+    platform_io_operations: NativeFilePlatformIoOperationMetrics,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1010,10 +1015,12 @@ impl NativeFileStorageMetrics {
     #[cfg(feature = "platform-io")]
     fn record_platform_io_task(&self, class: PlatformIoTaskClass) {
         match class {
-            PlatformIoTaskClass::TrueAsync => {
+            PlatformIoTaskClass::TruePlatformAsync => {
                 self.platform_async_io.fetch_add(1, Ordering::Relaxed);
             }
-            PlatformIoTaskClass::BackendFallback => {
+            PlatformIoTaskClass::PlatformNativeAsyncButPartial
+            | PlatformIoTaskClass::PlatformManagedFallback
+            | PlatformIoTaskClass::Unsupported => {
                 self.platform_backend_fallback
                     .fetch_add(1, Ordering::Relaxed);
             }
@@ -1024,6 +1031,18 @@ impl NativeFileStorageMetrics {
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    #[cfg(feature = "platform-io")]
+    fn record_platform_io_operation(
+        &self,
+        operation: PlatformIoOperation,
+        class: PlatformIoTaskClass,
+    ) {
+        self.record_platform_io_task(class);
+        self.platform_io_operations
+            .metric(operation)
+            .record_class(class);
     }
 
     fn record_inline_task(&self) {
@@ -1058,6 +1077,121 @@ impl NativeFileStorageMetrics {
 
     fn operation_stats(&self) -> StorageOperationStats {
         self.operations.snapshot()
+    }
+
+    fn platform_io_operation_stats(&self) -> PlatformIoOperationStats {
+        #[cfg(feature = "platform-io")]
+        {
+            self.platform_io_operations.snapshot()
+        }
+        #[cfg(not(feature = "platform-io"))]
+        {
+            PlatformIoOperationStats::default()
+        }
+    }
+}
+
+#[cfg(feature = "platform-io")]
+#[derive(Debug, Default)]
+struct NativeFilePlatformIoOperationMetrics {
+    length_lookup: NativeFilePlatformIoClassMetrics,
+    random_read: NativeFilePlatformIoClassMetrics,
+    whole_object_read: NativeFilePlatformIoClassMetrics,
+    temp_write_rename_publish: NativeFilePlatformIoClassMetrics,
+    append_open: NativeFilePlatformIoClassMetrics,
+    append: NativeFilePlatformIoClassMetrics,
+    persist: NativeFilePlatformIoClassMetrics,
+    wal_rewrite: NativeFilePlatformIoClassMetrics,
+    delete: NativeFilePlatformIoClassMetrics,
+    directory_create: NativeFilePlatformIoClassMetrics,
+    directory_sync: NativeFilePlatformIoClassMetrics,
+    directory_listing: NativeFilePlatformIoClassMetrics,
+    writer_lease: NativeFilePlatformIoClassMetrics,
+}
+
+#[cfg(feature = "platform-io")]
+#[derive(Debug, Default)]
+struct NativeFilePlatformIoClassMetrics {
+    true_platform_async: AtomicU64,
+    platform_native_async_but_partial: AtomicU64,
+    platform_managed_fallback: AtomicU64,
+    blocking_fallback: AtomicU64,
+    unsupported: AtomicU64,
+}
+
+#[cfg(feature = "platform-io")]
+impl NativeFilePlatformIoOperationMetrics {
+    fn metric(&self, operation: PlatformIoOperation) -> &NativeFilePlatformIoClassMetrics {
+        match operation {
+            PlatformIoOperation::LengthLookup => &self.length_lookup,
+            PlatformIoOperation::OwnedRandomRead => &self.random_read,
+            PlatformIoOperation::OptionalWholeObjectRead => &self.whole_object_read,
+            PlatformIoOperation::TempWriteRenamePublish => &self.temp_write_rename_publish,
+            PlatformIoOperation::AppendObjectOpen => &self.append_open,
+            PlatformIoOperation::Append => &self.append,
+            PlatformIoOperation::Persist => &self.persist,
+            PlatformIoOperation::WalRewrite => &self.wal_rewrite,
+            PlatformIoOperation::ObjectDelete => &self.delete,
+            PlatformIoOperation::DirectoryCreate => &self.directory_create,
+            PlatformIoOperation::DirectorySync => &self.directory_sync,
+            PlatformIoOperation::DirectoryListing => &self.directory_listing,
+            PlatformIoOperation::WriterLeaseAcquire => &self.writer_lease,
+        }
+    }
+
+    fn snapshot(&self) -> PlatformIoOperationStats {
+        PlatformIoOperationStats {
+            length_lookup: self.length_lookup.snapshot(),
+            random_read: self.random_read.snapshot(),
+            whole_object_read: self.whole_object_read.snapshot(),
+            temp_write_rename_publish: self.temp_write_rename_publish.snapshot(),
+            append_open: self.append_open.snapshot(),
+            append: self.append.snapshot(),
+            persist: self.persist.snapshot(),
+            wal_rewrite: self.wal_rewrite.snapshot(),
+            delete: self.delete.snapshot(),
+            directory_create: self.directory_create.snapshot(),
+            directory_sync: self.directory_sync.snapshot(),
+            directory_listing: self.directory_listing.snapshot(),
+            writer_lease: self.writer_lease.snapshot(),
+        }
+    }
+}
+
+#[cfg(feature = "platform-io")]
+impl NativeFilePlatformIoClassMetrics {
+    fn record_class(&self, class: PlatformIoTaskClass) {
+        match class {
+            PlatformIoTaskClass::TruePlatformAsync => {
+                self.true_platform_async.fetch_add(1, Ordering::Relaxed);
+            }
+            PlatformIoTaskClass::PlatformNativeAsyncButPartial => {
+                self.platform_native_async_but_partial
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            PlatformIoTaskClass::PlatformManagedFallback => {
+                self.platform_managed_fallback
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            PlatformIoTaskClass::BlockingFallback => {
+                self.blocking_fallback.fetch_add(1, Ordering::Relaxed);
+            }
+            PlatformIoTaskClass::Unsupported => {
+                self.unsupported.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> PlatformIoClassCounters {
+        PlatformIoClassCounters {
+            true_platform_async: self.true_platform_async.load(Ordering::Acquire),
+            platform_native_async_but_partial: self
+                .platform_native_async_but_partial
+                .load(Ordering::Acquire),
+            platform_managed_fallback: self.platform_managed_fallback.load(Ordering::Acquire),
+            blocking_fallback: self.blocking_fallback.load(Ordering::Acquire),
+            unsupported: self.unsupported.load(Ordering::Acquire),
+        }
     }
 }
 
@@ -1130,7 +1264,7 @@ fn record_platform_io_task(
     _driver: &PlatformIoDriver,
     operation: PlatformIoOperation,
 ) {
-    metrics.record_platform_io_task(PlatformIoDriver::task_class(operation));
+    metrics.record_platform_io_operation(operation, PlatformIoDriver::task_class(operation));
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1150,6 +1284,7 @@ pub(crate) struct NativeFileStorageStats {
     pub(crate) platform_blocking_fallback_tasks: u64,
     pub(crate) inline_tasks: u64,
     pub(crate) operations: StorageOperationStats,
+    pub(crate) platform_io_operations: PlatformIoOperationStats,
 }
 
 fn record_timed_storage_result<T>(
@@ -1368,7 +1503,7 @@ impl StorageWalRewriteBackend for NativeFileBackend {
                     record_platform_io_task(
                         task_metrics.as_ref(),
                         &driver,
-                        PlatformIoOperation::TempWriteRenamePublish,
+                        PlatformIoOperation::WalRewrite,
                     );
                     completion.await
                 }),
@@ -4616,6 +4751,22 @@ mod tests {
 
         let stats = backend.stats();
         assert_platform_task_accounting(&stats, 4, 0);
+        assert!(
+            stats.platform_io_operations.random_read.true_platform_async > 0,
+            "Linux platform random reads should report true platform async"
+        );
+        assert!(
+            stats.platform_io_operations.append_open.true_platform_async > 0,
+            "Linux platform append open should report true platform async"
+        );
+        assert!(
+            stats.platform_io_operations.append.true_platform_async > 0,
+            "Linux platform append should report true platform async"
+        );
+        assert!(
+            stats.platform_io_operations.persist.true_platform_async > 0,
+            "Linux platform persist should report true platform async"
+        );
 
         std::fs::remove_dir_all(root).expect("test dir removes");
     }
@@ -4769,6 +4920,34 @@ mod tests {
 
         let stats = backend.stats();
         assert_platform_task_accounting(&stats, 11, 4);
+        assert!(
+            stats
+                .platform_io_operations
+                .temp_write_rename_publish
+                .true_platform_async
+                > 0,
+            "Linux platform publish writes should report true platform async"
+        );
+        assert!(
+            stats.platform_io_operations.wal_rewrite.true_platform_async > 0,
+            "Linux platform WAL rewrite should report true platform async"
+        );
+        assert!(
+            stats
+                .platform_io_operations
+                .directory_listing
+                .blocking_fallback
+                > 0,
+            "directory listing should report platform blocking fallback"
+        );
+        assert!(
+            stats
+                .platform_io_operations
+                .directory_sync
+                .true_platform_async
+                > 0,
+            "Linux platform directory sync should report true platform async"
+        );
 
         std::fs::remove_dir_all(root).expect("test dir removes");
     }
@@ -4807,6 +4986,24 @@ mod tests {
         );
         assert_eq!(stats.platform_blocking_fallback_tasks, 0);
         assert_eq!(stats.blocking_adapter_tasks, 0);
+        #[cfg(windows)]
+        assert!(
+            stats
+                .platform_io_operations
+                .random_read
+                .platform_native_async_but_partial
+                > 0,
+            "Windows platform random read should report partial native async"
+        );
+        #[cfg(all(unix, not(target_os = "linux")))]
+        assert!(
+            stats
+                .platform_io_operations
+                .random_read
+                .platform_managed_fallback
+                > 0,
+            "Unix fallback platform random read should report managed fallback"
+        );
 
         std::fs::remove_dir_all(root).expect("test dir removes");
     }

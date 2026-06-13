@@ -1,21 +1,22 @@
 use crate::io::{PlatformIoBackendKind, PlatformIoBackendMatrix, PlatformIoTaskClass};
 
 pub(super) const fn matrix() -> PlatformIoBackendMatrix {
-    use PlatformIoTaskClass::{BlockingFallback, TrueAsync};
+    use PlatformIoTaskClass::{BlockingFallback, TruePlatformAsync};
 
     PlatformIoBackendMatrix {
         kind: PlatformIoBackendKind::LinuxNative,
-        length_lookup: TrueAsync,
-        owned_random_read: TrueAsync,
-        optional_whole_object_read: TrueAsync,
-        temp_write_rename_publish: TrueAsync,
-        append_object_open: TrueAsync,
-        append: TrueAsync,
-        persist: TrueAsync,
-        object_delete: TrueAsync,
-        directory_create: TrueAsync,
-        directory_sync: TrueAsync,
+        length_lookup: TruePlatformAsync,
+        owned_random_read: TruePlatformAsync,
+        optional_whole_object_read: TruePlatformAsync,
+        temp_write_rename_publish: TruePlatformAsync,
+        append_object_open: TruePlatformAsync,
+        append: TruePlatformAsync,
+        persist: TruePlatformAsync,
+        wal_rewrite: TruePlatformAsync,
+        object_delete: TruePlatformAsync,
+        directory_create: TruePlatformAsync,
+        directory_sync: TruePlatformAsync,
         directory_listing: BlockingFallback,
-        writer_lease_acquire: TrueAsync,
+        writer_lease_acquire: TruePlatformAsync,
     }
 }

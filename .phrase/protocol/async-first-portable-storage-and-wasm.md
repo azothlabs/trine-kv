@@ -119,6 +119,34 @@ CooperativeTasks
 
 Capability names may evolve, but the distinction must remain explicit.
 
+Platform I/O capability is operation-level. `PlatformAsyncIo` is a coarse
+backend capability used for compatibility and diagnostics; it must not be the
+only design language for platform-io work.
+
+Required platform I/O operation classes:
+
+```text
+TruePlatformAsync
+PlatformNativeAsyncButPartial
+PlatformManagedFallback
+BlockingFallback
+Unsupported
+```
+
+Class meanings:
+
+- `TruePlatformAsync`: the complete Trine operation is submitted through a real
+  platform async completion mechanism for the selected target backend.
+- `PlatformNativeAsyncButPartial`: one or more lower-level steps can use a
+  native async primitive, but the complete Trine operation still includes
+  fallback-classified work.
+- `PlatformManagedFallback`: the platform driver owns the operation and hides
+  target mechanics from the KV engine, but completion is managed by a fallback
+  path inside the platform layer.
+- `BlockingFallback`: the platform driver uses an explicit blocking fallback
+  for an operation that has no real async platform operation yet.
+- `Unsupported`: the target cannot provide the operation through platform-io.
+
 ### 4.4 Runtime Independence
 
 The engine may depend on a small runtime boundary, but must not hard-code one
@@ -366,14 +394,17 @@ Rules:
 - must provide atomic manifest publish for persistent writable mode;
 - may implement async operations with a bounded blocking pool when the host file
   API is blocking;
-- may use the opt-in `platform-io` runtime mode for native-file length, owned
-  random reads, whole-object reads, temp-write publish operations, WAL
-  append-object opening/append/persist/rewrite, object delete, directory
-  create/sync, and writer lease acquisition when the build enables the matching
-  platform I/O feature;
-- may submit directory and object listing through the platform driver only as a
-  separately reported platform blocking fallback until that driver exposes a
-  real directory enumeration operation;
+- may use the opt-in `platform-io` runtime mode as the cross-platform async I/O
+  abstraction for native-file length, owned random reads, whole-object reads,
+  temp-write publish operations, WAL append-object opening/append/persist/rewrite,
+  object delete, directory create/sync/listing, and writer lease acquisition
+  when the build enables the matching platform I/O feature;
+- must keep Linux, Windows, macOS, BSD/other Unix, and fallback mechanics behind
+  the platform-io driver contract so the KV engine awaits Trine operations
+  rather than OS APIs;
+- may submit directory and object listing through the platform driver as a
+  separately reported `BlockingFallback` until that driver exposes a real async
+  directory enumeration operation;
 - may add stronger platform-specific implementations behind the same contract.
 - must report `BlockingAdapter` separately from `PlatformAsyncIo`; using a
   bounded blocking pool must not be described as true platform async I/O.
@@ -384,7 +415,7 @@ Rules:
   Trine's bounded blocking adapter and true platform async I/O tasks.
 - must advertise `PlatformAsyncIo` only when the current target has at least
   one true Trine-level platform async storage operation. A target whose current
-  Trine composite operations are all fallback-classified may still route work
+  operations are all fallback-classified may still route work
   through the platform driver when the user selects `RuntimeOptions::platform_io`,
   but it must report fallback task counters and must not advertise
   `PlatformAsyncIo`.
@@ -405,28 +436,38 @@ Rules:
 
 #### Native Platform Backend Matrix
 
-Current platform backend classifications:
+Current platform backend classifications are operation-level. Linux has current
+true async evidence for many operations. Windows, macOS, BSD/other Unix, and
+generic fallback targets are not final fallback destinations; they need audited
+backend implementations behind the same platform-io contract.
 
 ```text
-Linux: file read/write/sync/open/rename/delete/create/stat/lease are true
-       platform async when the native async backend feature is enabled;
-       directory listing is platform-driver blocking fallback.
-Windows: lower-level file read/write primitives can use IOCP, but current
-         Trine composite storage operations include fallback-classified open,
-         metadata, sync, rename, directory, or listing steps and are counted as
-         backend fallback unless replaced by a stronger implementation.
-macOS/BSD/other Unix: ordinary file work is backend fallback in this phase;
-                      do not claim kqueue/polling as true async regular-file
-                      I/O without a stronger backend.
-Other targets: unsupported fallback; persistent platform I/O must be rejected
-               or explicitly counted as fallback.
+Operation                     Linux            Windows          macOS            BSD/other Unix   Generic fallback
+length lookup                 TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback
+random read                   TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback
+whole-object read             TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback
+temp write + rename publish   TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback
+append open                   TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback
+append                        TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback
+persist/fsync                 TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback
+WAL rewrite                   TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback
+delete                        TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback
+directory create              TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback
+directory sync                TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback
+directory listing             BlockingFallback  BlockingFallback BlockingFallback BlockingFallback BlockingFallback
+writer lease                  TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback/Unsupported
 ```
+
+Legend: `Partial` means `PlatformNativeAsyncButPartial`, and
+`ManagedFallback` means `PlatformManagedFallback`.
 
 With the current backend matrix, `RuntimeOptions::platform_io()` advertises
 `PlatformAsyncIo` only on Linux when the `platform-io` Cargo feature is enabled.
 On non-Linux targets it can still route native storage through the platform
-driver, but current operations remain fallback-classified until a stronger
-target backend exists.
+driver, but current operations remain partial or fallback-classified until
+stronger target backends exist. That current-state classification is not the
+platform-io goal; the goal is that each platform backend handles its own async
+or fallback mechanics while preserving one Trine operation boundary for KV code.
 
 ### 9.3 WASI Backend
 

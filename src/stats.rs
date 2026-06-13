@@ -104,6 +104,14 @@ pub struct DbStats {
     pub storage_platform_backend_fallback_tasks: u64,
     /// Storage tasks that used a synchronous fallback path.
     pub storage_platform_sync_fallback_tasks: u64,
+    /// Per-operation platform I/O capability-class counters.
+    ///
+    /// These counters are filled only when native storage work is routed
+    /// through the `platform-io` driver. They explain how each Trine storage
+    /// operation completed at the platform boundary. For example, a target can
+    /// report true platform async reads while directory listing still reports a
+    /// blocking fallback.
+    pub storage_platform_io_operations: PlatformIoOperationStats,
     /// Storage tasks completed inline.
     pub storage_inline_tasks: u64,
     /// Per-operation storage request counters and latency totals.
@@ -170,6 +178,61 @@ pub struct StorageOperationStats {
     pub delete_object: StorageOperationMetric,
     /// Object list requests.
     pub list_objects: StorageOperationMetric,
+}
+
+/// Platform I/O capability-class counters for one Trine storage operation.
+///
+/// Each field is a task count. A single operation request increments exactly
+/// one field when it goes through the `platform-io` driver. Operations that use
+/// the normal bounded sync adapter or inline native file path do not increment
+/// this structure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlatformIoClassCounters {
+    /// Completed through a real platform async completion mechanism.
+    pub true_platform_async: u64,
+    /// Used at least one native async primitive but still needed fallback work.
+    pub platform_native_async_but_partial: u64,
+    /// Completed through a fallback managed inside the platform driver.
+    pub platform_managed_fallback: u64,
+    /// Completed through an explicit platform-driver blocking fallback.
+    pub blocking_fallback: u64,
+    /// Reached a platform I/O operation that the target cannot support.
+    pub unsupported: u64,
+}
+
+/// Per-operation platform I/O capability-class counters.
+///
+/// This table uses Trine operation names instead of OS API names. It lets tests
+/// and diagnostics distinguish, for example, random reads from directory
+/// listing even when both are routed through the same selected platform driver.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlatformIoOperationStats {
+    /// Length lookups for readable native-file objects.
+    pub length_lookup: PlatformIoClassCounters,
+    /// Owned-buffer positioned reads.
+    pub random_read: PlatformIoClassCounters,
+    /// Whole-object reads, including optional reads for manifests and tables.
+    pub whole_object_read: PlatformIoClassCounters,
+    /// Temporary-file writes followed by rename publish.
+    pub temp_write_rename_publish: PlatformIoClassCounters,
+    /// Opens of appendable WAL objects.
+    pub append_open: PlatformIoClassCounters,
+    /// Appends to WAL or appendable storage objects.
+    pub append: PlatformIoClassCounters,
+    /// Persistence requests such as flush, data sync, or full sync.
+    pub persist: PlatformIoClassCounters,
+    /// WAL rewrite operations that publish a replacement WAL file.
+    pub wal_rewrite: PlatformIoClassCounters,
+    /// Object delete requests.
+    pub delete: PlatformIoClassCounters,
+    /// Directory creation requests.
+    pub directory_create: PlatformIoClassCounters,
+    /// Directory sync requests after rename publication.
+    pub directory_sync: PlatformIoClassCounters,
+    /// Directory or object listing requests.
+    pub directory_listing: PlatformIoClassCounters,
+    /// Writer-lease acquisition requests.
+    pub writer_lease: PlatformIoClassCounters,
 }
 
 #[derive(Debug, Default)]

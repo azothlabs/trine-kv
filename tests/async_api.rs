@@ -332,6 +332,17 @@ fn platform_io_async_write_awaits_wal_without_whole_commit_adapter() {
         "platform async write should await platform storage completion"
     );
     assert!(
+        after
+            .storage_platform_io_operations
+            .append
+            .true_platform_async
+            > before
+                .storage_platform_io_operations
+                .append
+                .true_platform_async,
+        "platform async write should report append as true platform async"
+    );
+    assert!(
         after.storage_operations.append.requests > before.storage_operations.append.requests,
         "platform async write should still append a WAL record"
     );
@@ -525,6 +536,17 @@ fn platform_io_async_flush_awaits_storage_without_whole_flush_adapter() {
         "platform async flush should await platform storage completions"
     );
     assert!(
+        after
+            .storage_platform_io_operations
+            .temp_write_rename_publish
+            .true_platform_async
+            > before
+                .storage_platform_io_operations
+                .temp_write_rename_publish
+                .true_platform_async,
+        "platform async flush should publish table or manifest bytes as true platform async"
+    );
+    assert!(
         after.storage_operations.write_object.requests
             > before.storage_operations.write_object.requests,
         "platform async flush should write table objects through storage"
@@ -549,6 +571,17 @@ fn platform_io_async_flush_awaits_storage_without_whole_flush_adapter() {
         after.storage_operations.rewrite_wal.requests
             > before.storage_operations.rewrite_wal.requests,
         "platform async flush should rewrite WAL replay floor through storage"
+    );
+    assert!(
+        after
+            .storage_platform_io_operations
+            .wal_rewrite
+            .true_platform_async
+            > before
+                .storage_platform_io_operations
+                .wal_rewrite
+                .true_platform_async,
+        "platform async flush should report WAL rewrite as true platform async"
     );
     drop(db);
 

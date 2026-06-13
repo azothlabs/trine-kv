@@ -49,7 +49,7 @@ If you consume the crate through git, replace the path dependency with your
 repository URL.
 
 Enable native platform I/O explicitly when you want Trine's feature-gated
-native file driver:
+cross-platform native file driver:
 
 ```toml
 [dependencies]
@@ -81,9 +81,13 @@ database-style durability for confirmed writes.
 
 On native targets, async persistent open, point reads, scans, lazy value reads,
 WAL-backed writes, and public flush enter Trine's storage boundary through async
-helpers. Native async writes and public flush use awaitable storage completions
-on targets whose native-file backend advertises `PlatformAsyncIo`; fallback
-targets keep the bounded sync adapter boundary. Compaction and cooperative
+helpers. `platform-io` is the cross-platform async I/O abstraction below that
+boundary: Linux, Windows, macOS, BSD/other Unix, and fallback targets handle
+their own mechanics inside the platform driver, while the KV engine awaits
+Trine storage operations. Native async writes and public flush use awaitable
+storage completions on targets whose native-file backend advertises
+`PlatformAsyncIo`; operations that are not true platform async remain counted as
+platform-managed or blocking fallback work. Compaction and cooperative
 maintenance still use runtime task boundaries where the current engine internals
 are synchronous. Run `cargo run --example quickstart` for a complete checked
 path.
@@ -110,11 +114,11 @@ let db = Db::open(
 .await?;
 ```
 
-With the `platform-io` feature enabled on a target that has true Trine-level
-platform async storage operations, select the platform I/O runtime for
-native-file data reads/writes, WAL append-object opening/append/persist/rewrite,
-manifest publish/read, object delete, directory create/sync, and writer lease
-acquisition:
+With the `platform-io` feature enabled, select the platform I/O runtime when
+you want native-file data reads/writes, WAL append-object
+opening/append/persist/rewrite, manifest publish/read, object delete, directory
+create/sync/listing, and writer lease acquisition to go through Trine's
+platform driver:
 
 ```rust
 use trine_kv::{Db, DbOptions, RuntimeOptions};
@@ -124,20 +128,25 @@ options.runtime = RuntimeOptions::platform_io();
 let db = Db::open(options).await?;
 ```
 
-Directory and object listing are also submitted through the platform driver.
-The selected platform backend does not expose a directory enumeration primitive,
-so those listing calls are reported as
-`storage_platform_sync_fallback_tasks`. `DbStats` reports whether native
-storage work is routed through the platform driver
-(`storage_uses_platform_io_driver`) and separates true platform async file work
-(`storage_platform_async_io_tasks`) from platform backend fallback work
-(`storage_platform_backend_fallback_tasks`) and from Trine's bounded sync
-adapter task count. It also reports sync-adapter queue capacity,
-queued/submitted/completed/rejected task counts, total adapter runtime, and
-per-storage-operation request/latency counters. On targets where every current
-Trine storage operation is fallback-classified, `RuntimeOptions::platform_io()`
-can still use the platform driver, but it does not advertise
-`PlatformAsyncIo`.
+`DbStats` reports whether native storage work is routed through the platform
+driver (`storage_uses_platform_io_driver`) and separates true platform async
+file work (`storage_platform_async_io_tasks`) from platform backend fallback
+work (`storage_platform_backend_fallback_tasks`), platform-driver blocking
+fallback work (`storage_platform_sync_fallback_tasks`), and Trine's bounded
+sync-adapter task count. Directory and object listing are currently submitted
+through the platform driver as blocking fallback work because the selected
+backend does not expose a real async enumeration operation.
+
+`storage_platform_io_operations` breaks the same information down by Trine
+operation, such as random reads, WAL rewrite, directory sync, and writer lease.
+Each operation records whether it completed as true platform async, partial
+native async, platform-managed fallback, blocking fallback, or unsupported.
+
+On targets where every current Trine storage operation is fallback-classified,
+`RuntimeOptions::platform_io()` can still use the platform driver, but it does
+not advertise `PlatformAsyncIo`. That means the KV engine still uses the same
+platform-io boundary, while the selected platform backend reports honestly how
+each operation completed.
 
 WASI and browser persistence have explicit option constructors so callers can
 select those host boundaries without accidentally falling back to native files.

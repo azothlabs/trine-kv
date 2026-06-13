@@ -1,21 +1,22 @@
 use crate::io::{PlatformIoBackendKind, PlatformIoBackendMatrix, PlatformIoTaskClass};
 
 pub(super) const fn matrix() -> PlatformIoBackendMatrix {
-    use PlatformIoTaskClass::{BackendFallback, BlockingFallback};
+    use PlatformIoTaskClass::{BlockingFallback, PlatformManagedFallback};
 
     PlatformIoBackendMatrix {
         kind: PlatformIoBackendKind::UnsupportedFallback,
-        length_lookup: BackendFallback,
-        owned_random_read: BackendFallback,
-        optional_whole_object_read: BackendFallback,
-        temp_write_rename_publish: BackendFallback,
-        append_object_open: BackendFallback,
-        append: BackendFallback,
-        persist: BackendFallback,
-        object_delete: BackendFallback,
-        directory_create: BackendFallback,
-        directory_sync: BackendFallback,
+        length_lookup: PlatformManagedFallback,
+        owned_random_read: PlatformManagedFallback,
+        optional_whole_object_read: PlatformManagedFallback,
+        temp_write_rename_publish: PlatformManagedFallback,
+        append_object_open: PlatformManagedFallback,
+        append: PlatformManagedFallback,
+        persist: PlatformManagedFallback,
+        wal_rewrite: PlatformManagedFallback,
+        object_delete: PlatformManagedFallback,
+        directory_create: PlatformManagedFallback,
+        directory_sync: PlatformManagedFallback,
         directory_listing: BlockingFallback,
-        writer_lease_acquire: BackendFallback,
+        writer_lease_acquire: PlatformManagedFallback,
     }
 }

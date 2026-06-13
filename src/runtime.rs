@@ -228,6 +228,11 @@ impl RuntimeCapabilities {
     }
 
     /// Returns whether at least one Trine storage operation uses platform async I/O.
+    ///
+    /// This is a coarse runtime capability. Use [`crate::DbStats`] platform I/O
+    /// operation counters to see which storage operations completed through
+    /// true platform async, partial native async, platform-managed fallback,
+    /// blocking fallback, or unsupported classes.
     #[must_use]
     pub const fn platform_async_io(self) -> bool {
         self.has(PLATFORM_ASYNC_IO)

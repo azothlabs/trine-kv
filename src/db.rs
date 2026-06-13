@@ -3697,6 +3697,7 @@ impl Db {
         stats.storage_platform_backend_fallback_tasks =
             storage_stats.platform_backend_fallback_tasks;
         stats.storage_platform_sync_fallback_tasks = storage_stats.platform_blocking_fallback_tasks;
+        stats.storage_platform_io_operations = storage_stats.platform_io_operations;
         stats.storage_inline_tasks = storage_stats.inline_tasks;
         stats.storage_operations = storage_stats.operations;
     }

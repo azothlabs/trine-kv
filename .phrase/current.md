@@ -6,104 +6,109 @@ Complete
 
 ## Goal
 
-Complete the native async flush path so Linux `platform-io` public `flush()`
-awaits Trine storage completions instead of running the whole flush through the
-bounded sync adapter.
+Reshape the internal platform I/O driver boundary so each platform backend owns
+operation submission and reports the capability class for each Trine storage
+operation. KV engine code should use Trine operations and diagnostics, not
+Linux, Windows, macOS, BSD/other Unix, or fallback mechanics directly.
 
 ## Scope
 
-- Keep `flush_sync` and native fallback async flush behavior unchanged.
-- Route public native async `flush()` through an async flush path only when the
-  native storage backend advertises `PlatformAsyncIo`.
-- Write flushed table files through Trine async storage traits.
-- Publish manifest updates through prepared manifest publish without holding a
-  std mutex or publish barrier across await.
-- Sync the database directory and rewrite WAL through async storage/durability
-  operations where the selected backend supports them.
-- Verify Linux `platform-io` counters in Docker/Orbstack.
+- Keep existing Linux platform-io write and flush behavior intact.
+- Expand platform I/O task classes to match Phase 153:
+  `TruePlatformAsync`, `PlatformNativeAsyncButPartial`,
+  `PlatformManagedFallback`, `BlockingFallback`, and `Unsupported`.
+- Add operation-level class reporting for length lookup, random read,
+  whole-object read, temporary write plus rename publish, append open, append,
+  persist/fsync, WAL rewrite, delete, directory create, directory sync,
+  directory listing, and writer lease.
+- Preserve existing aggregate `DbStats` fields for compatibility while adding
+  the per-operation platform I/O table.
+- Keep Windows, macOS, and BSD backend implementation for later phases; this
+  phase only creates the trait/statistics shape and honest current
+  classifications.
 
 ## Backend Boundary Receipt
 
-- Trine operation names: public async flush, freeze public flush target, flush
-  table write, manifest publish, directory sync after rename, WAL replay-floor
-  rewrite, table install, flush stats.
-- Owned interface: `Db::flush`, `ManifestStore` prepared publish,
-  `DurabilitySubstrate`, `WalFrontDoor`, `NativeFileBackend`,
-  `StorageCapability::PlatformAsyncIo`, and `DbStats` storage task counters.
-- Chosen backend: existing Trine `PlatformIoDriver` for table object writes,
-  native manifest publish, directory sync, and WAL rewrite when the backend
-  advertises `PlatformAsyncIo`.
-- Known backend limits: native fallback targets keep the bounded adapter;
-  `run_maintenance_with_budget`, compaction, cleanup, and background
-  maintenance remain later phases unless directly needed for public `flush()`.
-- Leak-check scope: the public flush future must not hold std locks or the
-  publish barrier across await; native manifest publish uses a small runtime
-  blocking task to share the existing manifest/publish locks with sync
-  mutators while waiting for platform storage completion. Manifest state
-  advances only after durable publish succeeds; table files written before a
-  failed publish are cleaned up.
-- Verification gate: focused async flush tests with and without `platform-io`,
-  Linux Docker platform test, formatting, clippy, rustdoc, full tests, and diff
-  checks.
+- Trine operation names: length lookup, owned random read, whole-object read,
+  temporary write plus rename publish, append open, append, persist/fsync, WAL
+  rewrite, delete, directory create, directory sync, directory listing, and
+  writer lease.
+- Owned interface: `PlatformIoBackendMatrix`, `PlatformIoOperation`,
+  `PlatformIoTaskClass`, `PlatformIoDriver`, `NativeFileStorageStats`,
+  `DbStats`, and native storage metrics.
+- Chosen backend: existing platform-specific platform-io matrix modules.
+  Linux remains true platform async where current evidence supports it.
+  Windows reports partial native async until complete Trine operations are
+  implemented. macOS/BSD/other Unix and generic fallback report managed fallback
+  unless an operation has explicit blocking fallback or unsupported status.
+- Known backend limits: no new Windows/macOS/BSD async backend is implemented
+  in this phase. `PlatformAsyncIo` remains a coarse compatibility capability;
+  operation-level stats are the new implementation boundary for planning.
+- Leak-check scope: metrics must be recorded outside backend internals without
+  adding OS-specific branches to KV engine code, and no std lock may be held
+  across await as part of the new accounting.
+- Verification gate: formatting, default and `platform-io` checks, focused
+  platform matrix/storage tests, clippy, rustdoc, full tests if feasible, and
+  diff checks.
 
 ## Out Of Scope
 
-- Rewriting compaction or background maintenance.
-- Reworking manifest format, WAL format, SSTable format, MVCC visibility, or
-  transaction conflict rules.
-- Claiming new true async support on fallback targets.
+- Implementing Windows, macOS, or BSD true async file backends.
+- Rewriting compaction, maintenance, cleanup, close, or cooperative
+  maintenance.
+- Changing manifest, WAL, SSTable, MVCC, transaction, or recovery formats.
+- Making platform I/O the default runtime.
 - Publishing, tagging, pushing, or creating a GitHub release.
 
 ## Acceptance Gate
 
-- Public native async `flush()` uses the async flush path only when
-  `NativeFileBackend` supports `PlatformAsyncIo`.
-- Linux `platform-io` public `flush()` does not spawn the whole flush through
-  the bounded sync adapter.
-- WAL replay remains correct after async flush.
-- Native fallback async flush retains existing bounded-adapter behavior.
-- `cargo fmt --check`, focused tests with and without `platform-io`, Linux
-  Docker platform test, `cargo clippy -q --all-features`,
-  `cargo rustdoc --all-features -- -D warnings`, `cargo test -q`, and
-  `git diff --check` pass.
+- `RuntimeOptions::platform_io()` still enters the platform driver path on
+  targets where the driver can be constructed.
+- Platform class names in code match the Phase 153 contract.
+- Linux-specific, Windows partial, Unix managed fallback, and unsupported
+  fallback classifications are explicit in backend matrix modules.
+- Backend stats report operation-level class counters while preserving existing
+  aggregate counters.
+- Existing Linux platform write and flush behavior remains verified.
+- Documentation explains the new per-operation diagnostics.
 
 ## Active Task Slice
 
 ```text
-task670 [x] goal:select flush as next async-storage phase | scope:evidence roadmap current | verify:phase brief
-task671 [x] goal:prepare manifest publish for native async flush | scope:src/manifest.rs src/db.rs | verify:focused flush tests
-task672 [x] goal:route platform async public flush through async storage | scope:src/db.rs src/substrate.rs src/wal.rs | verify:Linux platform counters
-task673 [x] goal:verify and record native async flush evidence | scope:tests docs phrase | verify:full gate
+task679 [x] goal:start Phase 154 brief | scope:current roadmap | verify:phase brief
+task680 [x] goal:align platform task classes with Phase 153 | scope:src/io.rs src/io/platform_backend | verify:platform matrix test
+task681 [x] goal:add operation-level platform I/O stats | scope:src/stats.rs src/storage.rs src/db.rs | verify:focused storage stats tests
+task682 [x] goal:verify Linux write/flush behavior remains intact | scope:tests/async_api.rs storage tests | verify:focused platform-io tests
+task683 [x] goal:record Phase 154 evidence and next backend phase | scope:evidence roadmap current | verify:docs and diff checks
 ```
 
 ## Evidence
 
-- Phase 151 completed native async writes and left flush, compaction, manifest
-  publish, and directory work as residual async-storage phases.
-- Existing native public `flush()` calls `run_native_blocking_task(|db|
-  db.flush_sync())` for every persistent native backend.
-- Browser flush already uses a prepared manifest publish shape that avoids
-  holding std locks across await.
-- `ManifestStore` prepared publish is now available to native async flush, so
-  manifest bytes can be published through the async storage backend before the
-  prepared state is installed.
-- Linux Docker/Orbstack with `--security-opt seccomp=unconfined` passed
-  `platform_io_async_flush_awaits_storage_without_whole_flush_adapter`.
-- The Linux platform flush test allows one sync-adapter submitted-task delta
-  because observing `DbStats` can perform a native table-size lookup; the flush
-  storage write, manifest publish, directory sync, and WAL rewrite counters all
-  advance through storage operation counters.
-- `cargo test -q`, `cargo test -q --features platform-io`,
-  `cargo clippy -q --all-features`,
-  `cargo rustdoc --all-features -- -D warnings`, `cargo fmt --check`, and
-  focused async flush/WAL tests passed.
+- Phase 153 completed the cross-platform platform-io contract and operation
+  table.
+- The code already had `PlatformIoBackendMatrix`, so Phase 154 can be completed
+  as a focused driver/statistics cleanup rather than an engine rewrite.
+- Current changes add the five documented class names, add `WalRewrite` as its
+  own platform operation, and expose per-operation class counters through
+  `DbStats`.
+- `cargo check -q`, `cargo check -q --features platform-io`,
+  `cargo test -q platform_backend_matrix_matches_target_family --features
+  platform-io`, `cargo test -q
+  platform_io_native_file_management_ops_use_platform_driver --features
+  platform-io`, focused async write/flush tests, `cargo clippy -q
+  --all-features`, `cargo rustdoc --all-features -- -D warnings`,
+  `cargo test -q`, `cargo test -q --features platform-io`, and Linux Docker
+  `cargo test -q --features platform-io --test async_api` passed.
 
 ## Known Residuals
 
-- Compaction, background maintenance, cleanup, close, and native cooperative
-  maintenance still use existing fallback paths after this phase.
+- Full Windows backend implementation remains Phase 155.
+- macOS backend implementation or audit remains Phase 156.
+- BSD/other Unix backend implementation or audit remains Phase 157.
+- Engine compaction, maintenance, cleanup, close, and cooperative maintenance
+  still need revalidation after platform-io backend work progresses.
 
 ## Next Recommendation
 
-- After public native async flush passes, use fresh counters to choose between
-  async compaction and async maintenance/cleanup.
+- Start Phase 155: Windows Platform Backend, using the operation-level class
+  table as the implementation contract.

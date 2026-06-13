@@ -10647,3 +10647,158 @@ Record only evidence that can change planning or durable decisions.
 
 - Use fresh counters to choose the next phase: async compaction or async
   maintenance/cleanup.
+
+## 2026-06-13: Platform-I/O Goal Recalibration
+
+### Observation
+
+- The original user question was whether Trine is now truly async.
+- The user also stated that platform-io should work across platforms because
+  platform-io exists to hide different platform async mechanisms behind one
+  application-facing abstraction.
+- Phases 150 through 152 improved Linux platform-io routing, native async
+  writes, and native async flush, but the follow-up plan drifted toward treating
+  non-Linux fallback behavior as if it were the long-term destination.
+
+### Interpretation
+
+- Linux true async progress is useful evidence, but it is not the full
+  platform-io goal.
+- Windows, macOS, BSD, and other targets need platform-specific audits and
+  backend work instead of being permanently grouped under generic fallback.
+- Future platform-io evidence must be operation-level: one platform may support
+  true async reads and writes while another operation still needs a managed or
+  blocking fallback.
+
+### Remaining Blockers
+
+- No implementation blocker is known yet.
+- The next blocker to classify is evidence quality: each platform needs an
+  audited operation table before backend code can honestly claim true async or
+  fallback behavior.
+
+### Recommended Next Action
+
+- Start Phase 153: Platform-I/O Contract Reset before async compaction or
+  maintenance/cleanup.
+- Then run Phase 154: Platform-I/O Driver Trait Cleanup so Windows, macOS, BSD,
+  and fallback targets can plug into the same operation-level abstraction.
+
+## 2026-06-13: Phase 153 Started
+
+### Observation
+
+- The user clarified the design intent before implementation: platform-io
+  exists so each platform can handle async I/O in its own way while the KV
+  engine uses one unified Trine boundary.
+- The user confirmed this is the direction before implementation starts.
+
+### Interpretation
+
+- Phase 153 should be a contract and planning phase, not an engine rewrite.
+- The key design test is whether KV code can stop knowing how Linux, Windows,
+  macOS, BSD/other Unix, or fallback targets perform async I/O.
+
+### Recommended Next Action
+
+- Inventory current platform-io wording and update the ADR/protocol/current
+  contract before changing Rust driver code.
+
+## 2026-06-13: Platform-I/O Contract Reset Complete
+
+### Observation
+
+- ADR 0002 now defines platform-io as Trine's cross-platform async I/O
+  contract, not a Linux feature.
+- ADR 0002 and the async storage protocol define operation capability classes:
+  `TruePlatformAsync`, `PlatformNativeAsyncButPartial`,
+  `PlatformManagedFallback`, `BlockingFallback`, and `Unsupported`.
+- ADR 0002 and the protocol now include an operation table for length lookup,
+  random read, whole-object read, temporary write plus rename publish, append
+  open, append, persist/fsync, WAL rewrite, delete, directory create, directory
+  sync, directory listing, and writer lease.
+- Usage docs now explain that KV code uses the same platform-io boundary while
+  each platform backend reports how operations actually completed.
+
+### Interpretation
+
+- Phase 153 restored the intended architecture direction: platform-io is the
+  abstraction that owns platform async differences.
+- The current Linux true async path remains valid evidence, but Windows,
+  macOS, BSD/other Unix, and fallback targets are now first-class entries in
+  the platform-io plan.
+- `PlatformAsyncIo` remains too coarse as an implementation capability for the
+  next phase; Phase 154 should add operation-level backend reporting and keep
+  OS mechanics hidden from KV code.
+
+### Verification
+
+- `git diff --check`
+- `cargo fmt --check`
+
+### Remaining Blockers
+
+- No blocker for Phase 153 docs.
+- Phase 154 must turn the documented operation classes into driver trait and
+  diagnostics shape.
+
+### Recommended Next Action
+
+- Start Phase 154: Platform-I/O Driver Trait Cleanup.
+
+## 2026-06-13: Platform-I/O Driver Trait Cleanup Complete
+
+### Observation
+
+- `PlatformIoTaskClass` now uses the Phase 153 class names:
+  `TruePlatformAsync`, `PlatformNativeAsyncButPartial`,
+  `PlatformManagedFallback`, `BlockingFallback`, and `Unsupported`.
+- `PlatformIoOperation` now includes `WalRewrite` as a separate Trine
+  operation instead of counting WAL rewrite through generic temporary
+  write-plus-rename publish.
+- Target matrix modules now report Linux as true platform async, Windows as
+  partial native async, non-Linux Unix as platform-managed fallback, and
+  directory listing as blocking fallback.
+- `DbStats` now exposes `storage_platform_io_operations`, a per-operation table
+  of platform I/O class counters, while preserving the existing aggregate
+  platform async/backend fallback/blocking fallback counters.
+- Usage docs and runtime docs now tell callers to use per-operation counters
+  for precise platform I/O diagnostics.
+
+### Interpretation
+
+- Phase 154 turned the Phase 153 contract into a code boundary without changing
+  storage format or rewriting engine paths.
+- `PlatformAsyncIo` remains a useful coarse capability, but it is no longer the
+  only implementation signal for platform-io planning.
+- Windows/macOS/BSD work can now target one operation at a time and prove its
+  class through stats.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo check -q`
+- `cargo check -q --features platform-io`
+- `cargo test -q platform_backend_matrix_matches_target_family --features platform-io`
+- `cargo test -q platform_io_without_true_async_storage_ops_uses_platform_driver_fallback --features platform-io`
+- `cargo test -q platform_io_native_file_read_and_append_use_platform_driver --features platform-io`
+- `cargo test -q platform_io_native_file_management_ops_use_platform_driver --features platform-io`
+- `cargo test -q --features platform-io --test async_api persistent_async_write_uses_storage_backend_wal_append`
+- `cargo test -q --features platform-io --test async_api platform_io_async_flush_awaits_storage_without_whole_flush_adapter`
+- `cargo clippy -q --all-features`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test -q`
+- `cargo test -q --features platform-io`
+- Linux Docker/Orbstack:
+  `cargo test -q --features platform-io --test async_api`
+
+### Remaining Blockers
+
+- No blocker for Phase 154.
+- Windows backend implementation remains Phase 155.
+- macOS backend implementation or audit remains Phase 156.
+- BSD/other Unix backend implementation or audit remains Phase 157.
+
+### Recommended Next Action
+
+- Start Phase 155: Windows Platform Backend.
