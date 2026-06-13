@@ -26,6 +26,54 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-06-13: Localized Batched Point Read Follow-Up
+
+### Observation
+
+- The earlier `0.4.0` release benchmark check showed
+  `localized batched point read persistent` slower than the pre-platform
+  snapshot while localized sequential reads improved.
+- Dedicated diagnostics showed that batch size 16 still shares SSTable block
+  work: sequential localized reads performed 2048 point block metadata probes
+  and 2048 point data block reads, while batch size 16 performed 134 of each.
+- After changing `PointReadBatch` to borrow key byte slices instead of storing
+  owned key copies, the local release-profile run recorded
+  `localized sequential point batch persistent` at 1529 us and
+  `localized batched point read persistent` at 1399 us.
+- The same run recorded diagnostic wall times of 1352 us for sequential,
+  1588 us for batch 4, 1453 us for batch 8, 1392 us for batch 16, and 1427 us
+  for batch 32.
+
+### Interpretation
+
+- The batched path is doing the intended block-sharing work; the weak
+  benchmark row came from small hot-cache fixed costs competing with a small
+  I/O saving, not from a failure to group table reads.
+- Borrowing keys removes avoidable hot-path copies without changing public API
+  behavior, storage format, or MVCC visibility.
+- Batch size 4 is not a good localized benchmark target because it repeatedly
+  falls back to single-key lookup while still paying repeated `get_many` call
+  overhead.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q get_many --lib`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo bench --bench v1_bench`
+- `cargo test -q --all-targets --all-features`
+- `git diff --check`
+- Forbidden-term scan over the workspace found only the rule text in
+  `AGENTS.md`.
+
+### Remaining Blockers
+
+- None for this localized point-read slice.
+
+### Recommended Next Action
+
+- Continue performance work from fresh benchmark evidence.
+
 ## 2026-06-13: Read-Version Documentation And Example Slice
 
 ### Observation

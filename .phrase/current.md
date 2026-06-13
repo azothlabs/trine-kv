@@ -2,66 +2,63 @@
 
 ## Status
 
-In Progress
+Complete
 
 ## Goal
 
-Investigate and fix the current `WAL replay` benchmark slowdown without
-changing storage formats or weakening the single-writer guarantee.
+Investigate the `localized batched point read persistent` benchmark follow-up
+and keep only changes supported by local benchmark evidence.
 
 ## Scope
 
-- `benches/v1_bench.rs` WAL replay diagnostics.
-- Native-file writer lease acquisition on the default backend.
-- Platform-io thread-pool writer lease acquisition.
-- Native platform-io writer lease acquisition.
-- Benchmark evidence for before/after behavior.
+- `get_many` batch organization on the LSM point-read path.
+- `LsmVersion` table selection for borrowed key views.
+- Localized point-read benchmark diagnostics for batch sizes 4, 8, 16, and 32.
+- Benchmark evidence for the current localized sequential and batched rows.
 
 ## Out Of Scope
 
 - Storage format changes.
-- WAL frame format changes.
-- Manifest semantics.
-- Broad point-read or batch-read tuning.
+- WAL, manifest, compaction, or MVCC behavior changes.
+- Broad point-read tuning outside the localized `get_many` path.
 - Publishing, tagging, pushing, or release workflow changes.
 
 ## Acceptance Gate
 
-- `WAL replay` is decomposed into writable and read-only reopen diagnostics.
-- The dominant current cost is classified before optimizing.
-- Writer lease changes keep existing fail-closed tests passing.
-- Platform-io feature variants keep writer lease tests passing.
+- Diagnostics show whether localized batching still shares SSTable block work.
+- The chosen code change removes measured fixed cost without changing public
+  API behavior.
+- Existing `get_many` tests pass.
 - Strict clippy passes.
-- Release-profile benchmark evidence shows whether the selected change improved
-  the measured slowdown.
+- Release-profile benchmark evidence records the current sequential and batched
+  localized rows.
 
 ## Active Task Slice
 
 ```text
-task774 [x] goal:add WAL replay reopen diagnostics | scope:benches/v1_bench.rs | verify:cargo bench --bench v1_bench
-task775 [x] goal:remove unnecessary writer-lease owner sync | scope:src/storage.rs src/io/platform_threadpool.rs src/io/platform_backend.rs | verify:writer_lease tests
-task776 [x] goal:record benchmark evidence | scope:docs/benchmarks .phrase/evidence.md | verify:git diff review
+task777 [x] goal:add localized point-read diagnostics | scope:benches/v1_bench.rs | verify:cargo bench --bench v1_bench
+task778 [x] goal:avoid owned key copies in point-read batch state | scope:src/lsm/read.rs src/lsm/version.rs | verify:cargo test -q get_many --lib
+task779 [x] goal:record localized point-read evidence | scope:docs/benchmarks .phrase/evidence.md | verify:git diff review
 ```
 
 ## Evidence
 
-- Writable WAL replay reopen was dominated by writer-lease acquisition, not WAL
-  read/decode/replay.
-- Before the change, 32 writable reopen diagnostics spent 88076 us in writer
-  lease acquisition and 106515 us wall-clock total.
-- After the change, 32 writable reopen diagnostics spent 1888 us in writer
-  lease acquisition and 18706 us wall-clock total.
-- The `WAL replay` row moved from 35430 us to 31693 us in the local
-  release-profile run.
+- Localized batch size 16 still shares table block work: diagnostic metadata
+  probes and data block reads dropped from 2048 sequential operations to 134
+  batched operations.
+- After borrowing keys in `PointReadBatch`, the local release-profile run
+  recorded `localized sequential point batch persistent` at 1529 us and
+  `localized batched point read persistent` at 1399 us.
+- Batch size 4 remains slower because it repeatedly enters the small-batch
+  single-key path and still pays repeated batch-call overhead.
 
 ## Known Residuals
 
-- `localized batched point read persistent` remains a separate observation from
-  the `0.4.0` release benchmark check.
-- A full multi-run median after this change would reduce benchmark noise before
-  making a broader performance claim.
+- Local run-to-run noise is still visible at this microsecond scale, so the
+  correct claim is that the severe localized batch regression is not reproduced
+  after the key-copy fix, not that every run will beat sequential reads.
 
 ## Next Recommendation
 
-- Run one more release-profile benchmark if we want a three-run median for the
-  final write-up, then commit the writer-lease performance fix.
+- Continue performance work from fresh benchmark evidence rather than assuming
+  localized batching is the next bottleneck.

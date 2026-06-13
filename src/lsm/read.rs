@@ -383,7 +383,7 @@ impl LsmTree {
             |table, key_indices| {
                 let table_keys = key_indices
                     .iter()
-                    .map(|key_index| batch.unique_keys[*key_index].as_slice())
+                    .map(|key_index| batch.unique_keys[*key_index])
                     .collect::<Vec<_>>();
                 let records = table.newest_visible_point_value_records_for_keys_with_cache(
                     &table_keys,
@@ -417,7 +417,7 @@ impl LsmTree {
             unique_values.push(resolve_point_candidate(
                 snapshot,
                 &memtable_range_tombstones,
-                &batch.unique_keys[key_index],
+                batch.unique_keys[key_index],
                 candidate,
                 read_sequence,
                 db_path,
@@ -593,7 +593,7 @@ impl LsmTree {
         for (table, key_indices) in table_groups {
             let table_keys = key_indices
                 .iter()
-                .map(|key_index| batch.unique_keys[*key_index].as_slice())
+                .map(|key_index| batch.unique_keys[*key_index])
                 .collect::<Vec<_>>();
             let records = table
                 .newest_visible_point_value_records_for_keys_with_cache_async(
@@ -629,7 +629,7 @@ impl LsmTree {
                     &io,
                     snapshot,
                     &memtable_range_tombstones,
-                    &batch.unique_keys[key_index],
+                    batch.unique_keys[key_index],
                     candidate,
                     read_sequence,
                 )
@@ -725,8 +725,8 @@ impl LsmTree {
 }
 
 #[derive(Debug)]
-struct PointReadBatch {
-    unique_keys: Vec<Vec<u8>>,
+struct PointReadBatch<'key> {
+    unique_keys: Vec<&'key [u8]>,
     positions: Vec<Vec<usize>>,
     input_len: usize,
 }
@@ -734,8 +734,8 @@ struct PointReadBatch {
 const POINT_READ_BATCH_GROUPING_MIN_KEYS: usize = 8;
 const POINT_READ_BATCH_LINEAR_DEDUP_MAX_KEYS: usize = 32;
 
-impl PointReadBatch {
-    fn from_keys<K>(keys: &[K]) -> Self
+impl<'key> PointReadBatch<'key> {
+    fn from_keys<K>(keys: &'key [K]) -> Self
     where
         K: AsRef<[u8]>,
     {
@@ -756,7 +756,7 @@ impl PointReadBatch {
 
             let index = unique_keys.len();
             unique_indices.insert(key.to_vec(), index);
-            unique_keys.push(key.to_vec());
+            unique_keys.push(key);
             positions.push(vec![position]);
         }
 
@@ -767,24 +767,21 @@ impl PointReadBatch {
         }
     }
 
-    fn from_keys_linear<K>(keys: &[K]) -> Self
+    fn from_keys_linear<K>(keys: &'key [K]) -> Self
     where
         K: AsRef<[u8]>,
     {
-        let mut unique_keys: Vec<Vec<u8>> = Vec::new();
+        let mut unique_keys: Vec<&[u8]> = Vec::new();
         let mut positions: Vec<Vec<usize>> = Vec::new();
 
         for (position, key) in keys.iter().enumerate() {
             let key = key.as_ref();
-            if let Some(index) = unique_keys
-                .iter()
-                .position(|unique_key| unique_key.as_slice() == key)
-            {
+            if let Some(index) = unique_keys.iter().position(|unique_key| *unique_key == key) {
                 positions[index].push(position);
                 continue;
             }
 
-            unique_keys.push(key.to_vec());
+            unique_keys.push(key);
             positions.push(vec![position]);
         }
 

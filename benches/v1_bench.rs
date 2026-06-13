@@ -45,6 +45,7 @@ fn main() {
         bench_prefix_scan(),
     ];
     results.extend(bench_prefix_partition_scans());
+    extend_localized_point_batch_diagnostics(&mut results);
     results.push(bench_snapshot_read_under_writes());
     results.push(bench_transaction_commit());
     results.push(bench_transaction_conflict());
@@ -240,6 +241,52 @@ fn bench_persistent_localized_batched_point_read() -> BenchResult {
     drop(db);
     cleanup_dir(&dir);
     result
+}
+
+fn extend_localized_point_batch_diagnostics(results: &mut Vec<BenchResult>) {
+    let keys = localized_point_read_keys(ROWS, OPS);
+    push_localized_point_read_diagnostics(
+        results,
+        "localized point diagnostic sequential",
+        &keys,
+        sequential_point_batch_checksum,
+    );
+    for (batch_size, label) in [
+        (4, "localized point diagnostic batch 4"),
+        (8, "localized point diagnostic batch 8"),
+        (16, "localized point diagnostic batch 16"),
+        (32, "localized point diagnostic batch 32"),
+    ] {
+        push_localized_point_read_diagnostics(results, label, &keys, |bucket, keys| {
+            batched_point_read_checksum(bucket, keys, batch_size)
+        });
+    }
+}
+
+fn push_localized_point_read_diagnostics(
+    results: &mut Vec<BenchResult>,
+    label: &'static str,
+    keys: &[Vec<u8>],
+    read: impl FnOnce(&trine_kv::Bucket, &[Vec<u8>]) -> u64,
+) {
+    let (dir, db, bucket) = flushed_persistent_db(label, ROWS, BucketOptions::default());
+    let before = db.stats();
+    let start = Instant::now();
+    let checksum = read(&bucket, keys);
+    assert!(checksum > 0, "localized point diagnostic must read values");
+    let elapsed_micros = duration_micros(start.elapsed());
+    let after = db.stats();
+
+    let mut diagnostics = ColdReadDiagnostics::default();
+    diagnostics.record_delta(&before, &after);
+    results.push(BenchResult::diagnostic(
+        labelled(label, "wall micros"),
+        elapsed_micros,
+    ));
+    diagnostics.push_results_with_label(results, label);
+
+    drop(db);
+    cleanup_dir(&dir);
 }
 
 fn bench_active_memtable_random_get() -> BenchResult {

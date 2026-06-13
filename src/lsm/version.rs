@@ -104,17 +104,21 @@ impl LsmVersion {
         Ok(())
     }
 
-    pub(crate) fn for_each_point_lookup_table_for_keys(
+    pub(crate) fn for_each_point_lookup_table_for_keys<K>(
         &self,
-        keys: &[Vec<u8>],
+        keys: &[K],
         mut should_probe: impl FnMut(&Table, usize) -> bool,
         mut visit: impl FnMut(&Arc<Table>, &[usize]) -> Result<()>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+    {
         for level in &self.levels {
             if level.level == TableLevel::ZERO {
                 for table in &level.tables {
                     let mut key_indices = Vec::new();
                     for (key_index, key) in keys.iter().enumerate() {
+                        let key = key.as_ref();
                         if !should_probe(table, key_index) {
                             continue;
                         }
@@ -133,6 +137,7 @@ impl LsmVersion {
             let mut current_table: Option<Arc<Table>> = None;
             let mut key_indices = Vec::new();
             for (key_index, key) in keys.iter().enumerate() {
+                let key = key.as_ref();
                 let Some(table) = level.table_for_key(key) else {
                     continue;
                 };

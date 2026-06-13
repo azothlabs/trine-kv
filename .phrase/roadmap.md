@@ -4240,7 +4240,7 @@ release, then create the local Git tag used by GitHub release automation.
 
 ### Phase 172: WAL Replay Writer-Lease Performance
 
-**Status**: In Progress
+**Status**: Complete
 
 **Goal**: Diagnose the current `WAL replay` benchmark slowdown and fix the
 dominant cost without changing WAL, manifest, or storage formats.
@@ -4262,3 +4262,28 @@ as the main follow-up row after release.
 
 - Storage format changes, WAL frame changes, manifest semantics, broad
   point-read tuning, publishing, tagging, pushing, or release workflow changes.
+
+### Phase 173: Localized Batched Point Read Performance
+
+**Status**: Complete
+
+**Goal**: Diagnose the localized batched point-read follow-up row and keep only
+evidence-backed `get_many` hot-path changes.
+
+**Entry Condition**: Phase 172 is committed and the `0.4.0` benchmark check
+still identifies localized batched point reads as a remaining follow-up row.
+
+**Acceptance Gate**:
+
+- Localized point-read diagnostics compare sequential reads against batch sizes
+  4, 8, 16, and 32.
+- Diagnostics prove whether the batched path shares SSTable block work.
+- Any retained code change reduces fixed batch cost without changing public API
+  behavior or storage formats.
+- Focused `get_many` tests, formatting, strict clippy, benchmark evidence, and
+  diff checks pass.
+
+**Major Out Of Scope**:
+
+- Storage format changes, WAL/manifest behavior, broad read-path redesign,
+  publishing, tagging, pushing, or release workflow changes.
