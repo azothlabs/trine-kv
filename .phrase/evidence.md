@@ -11485,3 +11485,67 @@ Negative check:
 ### Recommended Next Action
 
 - Commit the completed Phase 165 engine revalidation.
+
+## 2026-06-13: Platform-I/O User Documentation And Verification Complete
+
+### Observation
+
+- README now explains the no-feature default, `platform-io` thread-pool
+  baseline, `platform-io-native` native-first feature, and the required
+  `RuntimeOptions::platform_io()` runtime selection step.
+- Added `docs/platform-io.md` as the focused user guide for feature choice,
+  operation classes, current backend matrix, stats inspection, and target
+  boundaries.
+- Updated `docs/usage.md`, `docs/durability.md`, and crate-level Rustdoc so
+  async storage wording matches the completed platform-io and engine
+  revalidation phases.
+- Added `examples/platform_io.rs`, which writes, reads, and flushes a
+  persistent database. With a platform-io feature enabled, it selects
+  `RuntimeOptions::platform_io()` and asserts platform operation counters when
+  the target supports the driver.
+- Local macOS `platform-io-native` example verification initially failed. The
+  failure exposed that DispatchIO can report success or lose a descriptor in
+  cases where Trine still needs a reliable complete file operation. The macOS
+  backend now retries create/write and descriptor-unavailable sync cases
+  through safe blocking file operations inside the same platform-io operation,
+  and temp-rename failures now carry both paths in their error message.
+
+### Interpretation
+
+- Platform-io is now documented as a user-facing feature/runtime choice, not
+  just an internal backend.
+- The feature docs match the architecture: the KV engine awaits Trine storage
+  operations; platform-io chooses true native, partial native, or managed
+  thread-pool completion below that boundary.
+- macOS remains correctly classified as partial native for the affected rows:
+  DispatchIO is still the native-first path, while the complete Trine operation
+  has safe managed steps where Apple-side behavior is not sufficient by itself.
+
+### Verification
+
+- `cargo fmt`
+- `cargo run -q --example platform_io`
+- `cargo run -q --example platform_io --features platform-io`
+- `cargo run -q --example platform_io --features platform-io-native`
+- `cargo test -q --features platform-io`
+- `cargo test -q --features platform-io-native`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test --doc -q --all-features`
+- `cargo clippy -q --all-features`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check -q --target wasm32-unknown-unknown --no-default-features --features platform-io`
+- `cargo check -q --target wasm32-unknown-unknown --no-default-features --features platform-io-native`
+- `cargo check -q --target x86_64-pc-windows-gnu --features platform-io-native --tests`
+
+### Remaining Blockers
+
+- Real Windows, Linux, BSD/Solaris, and browser runtime diagnostics remain
+  outside this macOS workspace unless run through target checks or Docker.
+- Native backend rows that are not true native async remain intentionally
+  classified as partial or thread-pool managed in the public matrix.
+
+### Recommended Next Action
+
+- Commit the documentation, example, verification evidence, and macOS
+  native-first reliability fix.

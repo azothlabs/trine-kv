@@ -67,6 +67,11 @@ yet have native support:
 trine-kv = { version = "0.3", features = ["platform-io-native"] }
 ```
 
+The feature makes the platform driver available. A database uses it only after
+selecting `RuntimeOptions::platform_io()`; see
+[Platform I/O and feature selection](platform-io.md) for the matrix, stats, and
+verification commands.
+
 ## Open A Database
 
 The primary database API is async-first. Passing a path opens a persistent
@@ -91,20 +96,17 @@ database is not opened read-only. On native targets, this default prioritizes
 database-style durability for confirmed writes.
 
 On native targets, async persistent open, point reads, scans, lazy value reads,
-WAL-backed writes, and public flush enter Trine's storage boundary through async
-helpers. `platform-io` is the cross-platform async I/O abstraction below that
-boundary: the baseline feature runs blocking native-file work on Trine's
-bounded platform thread pool, while `platform-io-native` lets Linux, Windows,
-macOS, BSD/other Unix, and future targets use their own native async mechanics
-where complete Trine operations have support. The KV engine awaits Trine
-storage operations in both modes. Native async writes and public flush use
-awaitable storage completions on targets whose native-file backend advertises
-`PlatformAsyncIo`; operations that are not true platform async remain counted as
-partial native, thread-pool managed async, blocking fallback, or unsupported
-work. Compaction and cooperative
-maintenance still use runtime task boundaries where the current engine internals
-are synchronous. Run `cargo run --example quickstart` for a complete checked
-path.
+WAL-backed writes, WAL persistence, public flush, compaction, cooperative
+maintenance, obsolete-file cleanup, and async close enter Trine's storage or
+durability boundary through awaitable operation-level helpers. `platform-io` is
+the cross-platform async I/O abstraction below that boundary: the baseline
+feature runs native-file work on Trine's bounded platform thread pool, while
+`platform-io-native` lets Linux, Windows, macOS, BSD/other Unix, and future
+targets use their own native async mechanics where complete Trine operations
+have support. The KV engine awaits Trine storage operations in both modes; the
+feature choice affects the lower driver class, not whether the engine falls
+back to whole synchronous wrappers. Run `cargo run --example quickstart` for a
+complete checked path.
 
 Synchronous callers can use explicit `*_sync` adapters:
 
@@ -209,6 +211,13 @@ the source of truth for whether work was true native async, partial native
 async, thread-pool managed async, blocking fallback, or unsupported. Targets
 without native threads must use an explicit host backend instead of silently
 pretending to have thread-pool managed async file I/O.
+
+For a checked platform-io path:
+
+```text
+cargo run --example platform_io --features platform-io
+cargo run --example platform_io --features platform-io-native
+```
 
 WASI and browser persistence have explicit option constructors so callers can
 select those host boundaries without accidentally falling back to native files.
@@ -766,6 +775,7 @@ Use these commands before trusting a change to documentation or examples:
 ```text
 cargo run --example quickstart
 cargo run --example sync_quickstart
+cargo run --example platform_io --features platform-io
 cargo run --example read_versions
 cargo run --example user_store
 cargo run --example event_index

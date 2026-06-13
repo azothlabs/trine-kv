@@ -44,6 +44,35 @@
 //! writes. Lower durability modes such as [`DurabilityMode::Buffered`] are
 //! available through [`WriteOptions`] for data that can tolerate losing recent
 //! confirmed writes after a crash.
+//!
+//! # Platform I/O features
+//!
+//! The async API works without feature flags. Enable `platform-io` when
+//! native-file storage should complete through Trine's portable platform I/O
+//! boundary, backed by a bounded Trine-owned thread pool. Enable
+//! `platform-io-native` when Trine should prefer audited native async backends
+//! and use the same thread-pool backend for unsupported operation rows.
+//!
+//! After enabling either feature, select the platform I/O runtime for a
+//! database:
+//!
+//! ```rust
+//! use trine_kv::{Db, DbOptions, RuntimeOptions};
+//!
+//! # async fn example() -> trine_kv::Result<()> {
+//! let mut options = DbOptions::new("target/doc-example-platform-io");
+//! options.runtime = RuntimeOptions::platform_io();
+//!
+//! let db = Db::open(options).await?;
+//! db.put(b"k", b"v").await?;
+//! db.flush().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Use [`DbStats::storage_platform_io_operations`] to inspect whether each
+//! Trine operation completed as true native async, partial native async,
+//! thread-pool managed async, fallback, or unsupported work.
 
 #![warn(missing_docs)]
 #![allow(clippy::missing_errors_doc, clippy::module_name_repetitions)]

@@ -1,0 +1,104 @@
+use std::{
+    future::Future,
+    path::{Path, PathBuf},
+    sync::Arc,
+    task::{Context, Poll, Wake, Waker},
+    thread,
+    time::Duration,
+};
+
+use trine_kv::{Db, DbOptions, Result, RuntimeOptions};
+
+fn main() -> Result<()> {
+    let path = temp_path("trine-kv-platform-io");
+    reset_dir(&path)?;
+    block_on(run(&path))?;
+    reset_dir(&path)?;
+    Ok(())
+}
+
+async fn run(path: &Path) -> Result<()> {
+    let mut options = DbOptions::new(path);
+    if cfg!(feature = "platform-io") {
+        options.runtime = RuntimeOptions::platform_io();
+    }
+    options.background_worker_count = 0;
+
+    let db = Db::open(options).await?;
+    db.put(b"platform-io:key", b"value").await?;
+    assert_eq!(db.get(b"platform-io:key").await?, Some(b"value".to_vec()));
+    db.flush().await?;
+
+    let stats = db.stats();
+    let platform = stats.storage_platform_io_operations.total();
+
+    if cfg!(all(feature = "platform-io", any(unix, windows))) {
+        assert!(
+            stats.storage_uses_platform_io_driver,
+            "platform-io runtime should select the platform driver",
+        );
+        assert!(
+            stats.storage_uses_platform_async_io,
+            "platform-io should return async storage completions",
+        );
+        assert!(
+            platform.total() > 0,
+            "platform-io should record operation-level completions",
+        );
+        assert!(
+            platform.true_platform_async
+                + platform.platform_native_async_but_partial
+                + platform.thread_pool_managed_async
+                > 0,
+            "platform-io should classify each completed operation",
+        );
+    } else {
+        assert!(
+            !stats.storage_uses_platform_io_driver,
+            "platform driver is feature and target gated",
+        );
+    }
+
+    db.close().await
+}
+
+fn block_on<T>(future: impl Future<Output = T>) -> T {
+    let waker = Waker::from(Arc::new(ThreadWake {
+        thread: thread::current(),
+    }));
+    let mut context = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match Future::poll(future.as_mut(), &mut context) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => thread::park_timeout(Duration::from_millis(10)),
+        }
+    }
+}
+
+struct ThreadWake {
+    thread: thread::Thread,
+}
+
+impl Wake for ThreadWake {
+    fn wake(self: Arc<Self>) {
+        self.thread.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.thread.unpark();
+    }
+}
+
+fn temp_path(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("{name}-{}", std::process::id()))
+}
+
+fn reset_dir(path: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(trine_kv::Error::Io(error)),
+    }
+    Ok(())
+}

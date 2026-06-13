@@ -1,4 +1,5 @@
 use std::{
+    io,
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
 };
@@ -162,7 +163,7 @@ pub(super) async fn write_temp_rename(
         apple_dispatch::write_truncate(&tmp_path, &bytes, durability)?;
         compio::fs::rename(&tmp_path, &path)
             .await
-            .map_err(Error::Io)?;
+            .map_err(|error| rename_error(&tmp_path, &path, &error))?;
         if sync_parent_on_sync_all && durability == DurabilityMode::SyncAll {
             sync_parent_directory(&path).await?;
         }
@@ -190,7 +191,7 @@ pub(super) async fn write_temp_rename(
         file.close().await.map_err(Error::Io)?;
         compio::fs::rename(&tmp_path, &path)
             .await
-            .map_err(Error::Io)?;
+            .map_err(|error| rename_error(&tmp_path, &path, &error))?;
         if sync_parent_on_sync_all && durability == DurabilityMode::SyncAll {
             sync_parent_directory(&path).await?;
         }
@@ -396,6 +397,17 @@ async fn sync_parent_directory(path: &Path) -> Result<()> {
     };
 
     sync_directory(parent.to_path_buf()).await
+}
+
+fn rename_error(from: &Path, to: &Path, error: &io::Error) -> Error {
+    Error::Io(io::Error::new(
+        error.kind(),
+        format!(
+            "platform I/O temp rename {} -> {} failed: {error}",
+            from.display(),
+            to.display()
+        ),
+    ))
 }
 
 #[cfg(target_os = "macos")]

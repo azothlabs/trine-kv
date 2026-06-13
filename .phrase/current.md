@@ -6,104 +6,68 @@ Complete
 
 ## Goal
 
-Revalidate the KV engine after platform-io became the full platform async
-abstraction: async engine APIs should call Trine operation-level storage and
-durability async boundaries, while platform-io decides whether each target uses
-native async, partial native async, or thread-pool managed async below that
-boundary.
+Make platform-io's completed async abstraction understandable and verifiable
+from user-facing docs, crate docs, and a runnable example.
 
 ## Scope
 
-- Native persistent engine APIs:
-  - write / transaction commit
-  - WAL persist
-  - public flush
-  - compact range and budgeted compaction
-  - cooperative maintenance
-  - obsolete table/blob cleanup
-  - close coordination
-- Existing browser and object-store async paths remain separate accepted async
-  backends.
-- Keep OS-specific async mechanics inside platform-io/storage/substrate, not
-  inside engine API decisions.
-
-## Backend Boundary Receipt
-
-- Engine code now selects async storage by Trine operation and storage mode,
-  not by OS async primitive or `PlatformAsyncIo` capability.
-- `platform-io` default/threadpool feature provides the async completion floor;
-  `platform-io-native` only changes the lower driver choice.
-- Engine async dependencies are:
-  - WAL append / persist / rewrite through `DurabilitySubstrate`;
-  - table/blob object writes through `StorageObjectWriteBackend`;
-  - manifest publish through async prepared manifest publish;
-  - directory sync through `StorageDirectorySyncBackend`;
-  - object delete through `StorageObjectDeleteBackend`;
-  - blob reads during GC through `StorageReadBackend`.
-- Writer lease release during close remains a synchronous drop/lock release,
-  not a storage operation. Close now performs pending cleanup through async
-  storage before releasing the lease.
+- README feature selection and verification path.
+- Usage guide platform-io section.
+- Dedicated `docs/platform-io.md` feature/runtime/matrix guide.
+- Crate-level Rustdoc for platform I/O features.
+- Runnable `platform_io` example that checks driver and operation counters.
+- Local macOS native-first verification for `platform-io-native`.
 
 ## Out Of Scope
 
-- New OS backend discovery or making every native backend row
-  `TruePlatformAsync`.
-- Storage format changes.
+- New storage format changes.
+- New OS backend architecture.
 - Publishing, tagging, pushing, or PR creation.
 
 ## Acceptance Gate
 
-- Public native async write no longer uses the old whole-write runtime blocking
-  adapter wrapper.
-- Public native async persist no longer wraps `persist_sync`; it awaits WAL lane
-  persistence.
-- Public native async flush, compaction, maintenance, cleanup, and close no
-  longer use `run_native_blocking_task`.
-- Native compaction and blob GC write/read/delete/publish through async storage
-  operations.
-- Default `platform-io` and `platform-io-native` both compile and test through
-  the same engine async path.
-- Evidence records operation dependencies and verification.
+- README explains the difference between no feature, `platform-io`, and
+  `platform-io-native`.
+- Docs state that enabling a feature only makes the driver available; callers
+  still select it with `RuntimeOptions::platform_io()`.
+- Docs explain operation-level classes:
+  `TruePlatformAsync`, `PlatformNativeAsyncButPartial`,
+  `ThreadPoolManagedAsync`, `BlockingFallback`, and `Unsupported`.
+- A checked example validates both `platform-io` and `platform-io-native`.
+- Public Rustdoc passes with warnings denied and doctests pass.
+- Cross-target feature checks keep browser-style WASM and Windows feature
+  shapes honest.
 
 ## Active Task Slice
 
 ```text
-task745 [x] goal:remove whole-write blocking wrapper | scope:src/db/commit.rs src/substrate.rs src/wal.rs | verify:cargo check/test
-task746 [x] goal:route WAL persist/rewrite through async substrate | scope:src/db.rs src/substrate.rs src/wal.rs | verify:platform-io tests
-task747 [x] goal:route native flush/compaction/maintenance through async storage | scope:src/db.rs | verify:async API tests
-task748 [x] goal:route cleanup/blob-GC/close through async storage where storage work exists | scope:src/db.rs | verify:cleanup tests/full gate
-task749 [x] goal:update evidence and roadmap | scope:.phrase | verify:rg stale wrappers
+task750 [x] goal:add platform-io runnable example | scope:examples/platform_io.rs | verify:cargo run example with both features
+task751 [x] goal:document feature/runtime selection | scope:README.md docs/usage.md docs/platform-io.md src/lib.rs | verify:rustdoc/doctest
+task752 [x] goal:fix local macOS native-first verification gap | scope:src/io/platform_backend/apple_dispatch.rs src/io/platform_backend.rs | verify:platform-io-native example/tests
+task753 [x] goal:record evidence and roadmap | scope:.phrase | verify:diff review
 ```
 
 ## Evidence
 
-- `Db::write` / async transaction commit now starts a background native write
-  future that runs `commit_write_request_async`. Poll-then-drop writes still
-  complete, but the background task no longer calls the old whole-write
-  synchronous wrapper.
-- `Db::persist` now calls `persist_native_async`, which awaits
-  `DurabilitySubstrate::persist_wal_async` and `WalFrontDoor::persist_async`.
-- `Db::flush`, `Db::compact_range`, `Db::compact_range_with_budget`, and
-  `Db::run_maintenance_with_budget` now use native async flush/compaction
-  helpers for persistent native storage regardless of whether the lower driver
-  is native or threadpool.
-- Native compaction, blob GC, obsolete-table cleanup, and obsolete-blob cleanup
-  now use async storage writes, reads, directory sync, deletes, and manifest
-  publish.
-- `run_native_blocking_task` and the engine-level
-  `uses_native_platform_async_storage_path` selector were removed.
+- `platform_io` example writes, reads, and flushes a persistent database. It
+  also selects `RuntimeOptions::platform_io()` and asserts platform operation
+  counters when the feature/target supports the driver.
+- README, usage docs, dedicated platform-io docs, and crate Rustdoc now explain
+  both the Cargo feature choice and the runtime selection step.
+- Local macOS `platform-io-native` verification exposed a DispatchIO descriptor
+  and file-creation reliability gap. The native backend now keeps DispatchIO as
+  the preferred path, but retries create/write and descriptor-unavailable sync
+  cases through safe blocking file operations inside the same platform-io
+  operation.
 
 ## Known Residuals
 
-- Synchronous APIs intentionally remain synchronous.
-- Background worker maintenance still uses the synchronous maintenance path; it
-  already runs on owned background workers and is not part of public async API
-  executor blocking.
-- `DbInner::drop` keeps best-effort synchronous cleanup because Rust destructors
-  cannot await.
+- Real Windows, Linux, BSD/Solaris, and browser runtime diagnostics remain
+  outside this macOS workspace unless run through target checks or Docker.
+- Native backend rows that are not true native async remain intentionally
+  classified as partial or thread-pool managed in the public matrix.
 
 ## Next Recommendation
 
-- With platform-io and engine revalidation complete, the next phase should be a
-  full validation/packaging pass or any user-selected release/push workflow,
-  rather than more async abstraction work.
+- Commit the verification, documentation, example, and macOS native-first
+  reliability fix.

@@ -1,9 +1,9 @@
 # Trine KV
 
 Trine KV is an embedded Rust key-value database for applications that need
-ordered local storage without running a separate server. It gives simple code a
-default bucket, and lets larger applications add named buckets with their own
-prefix, filter, compression, and large-value settings.
+ordered local storage without running a separate server. It gives small
+programs a default bucket, and lets larger applications add named buckets with
+their own prefix, filter, compression, and large-value settings.
 
 The crate is implemented and verified by the repository test suite, benchmark
 harness, and durability notes. To see the main path work end to end:
@@ -13,8 +13,10 @@ cargo run --example quickstart
 ```
 
 Then read [docs/usage.md](docs/usage.md) for the API path and
-[docs/durability.md](docs/durability.md) for persistence guarantees and limits.
-Release packaging notes live in [docs/release.md](docs/release.md).
+[docs/platform-io.md](docs/platform-io.md) when you need the feature/runtime
+choice for async native-file I/O. [docs/durability.md](docs/durability.md)
+explains persistence guarantees and limits. Release packaging notes live in
+[docs/release.md](docs/release.md).
 
 ## Common Capabilities
 
@@ -43,10 +45,10 @@ Release packaging notes live in [docs/release.md](docs/release.md).
   compaction, and read-only open.
 - Explicit in-memory mode for tests, examples, and short-lived data that should
   disappear when the `Db` is dropped.
-- Async open/read/write/scan/transaction/maintenance entry points for hosts
-  that need to drive storage cooperatively. Native async persistent APIs enter
-  storage waits through Trine's storage boundary and use runtime task
-  boundaries for synchronous maintenance/WAL internals.
+- Async open/read/write/scan/transaction/maintenance entry points. Native
+  persistent async APIs enter operation-level storage waits through Trine's
+  storage boundary; platform-io chooses native, partial native, or managed
+  thread-pool completion below that boundary.
 - Block-based SSTables with partitioned index/filter blocks, data-block hash
   lookup for point reads, high-priority metadata caching, compression, and
   linear/binary/auto index seek policies.
@@ -80,6 +82,53 @@ For local development, depend on a path:
 [dependencies]
 trine-kv = { path = "../trine-kv" }
 ```
+
+## Feature Flags
+
+Most applications can start with no feature flags:
+
+```toml
+[dependencies]
+trine-kv = "0.3"
+```
+
+Enable `platform-io` when native-file storage should complete through Trine's
+portable async platform boundary. This baseline uses a bounded Trine-owned
+thread pool and avoids native async backend dependencies:
+
+```toml
+[dependencies]
+trine-kv = { version = "0.3", features = ["platform-io"] }
+```
+
+Enable `platform-io-native` when you want native async where Trine has audited
+operation support, with the same thread-pool backend for the remaining rows:
+
+```toml
+[dependencies]
+trine-kv = { version = "0.3", features = ["platform-io-native"] }
+```
+
+After enabling either feature, select the runtime for a database:
+
+```rust
+use trine_kv::{Db, DbOptions, RuntimeOptions};
+
+let mut options = DbOptions::new("./trine-data");
+options.runtime = RuntimeOptions::platform_io();
+
+let db = Db::open(options).await?;
+```
+
+Verify the path with:
+
+```text
+cargo run --example platform_io --features platform-io
+cargo run --example platform_io --features platform-io-native
+```
+
+See [docs/platform-io.md](docs/platform-io.md) for the operation matrix and
+stats fields.
 
 ## Common API Example
 
@@ -158,6 +207,7 @@ cargo clippy
 cargo test
 cargo run --example quickstart
 cargo run --example sync_quickstart
+cargo run --example platform_io --features platform-io
 cargo run --example read_versions
 cargo run --example user_store
 cargo run --example event_index
@@ -170,6 +220,8 @@ cargo bench --bench v1_bench
   transaction commit, maintenance, read-only reopen, and storage runtime stats.
 - `sync_quickstart`: first pass through the explicit sync adapters, including
   persistent open, buckets, scans, transactions, flush, reopen, and stats.
+- `platform_io`: runs a small write/read/flush path and, when a platform-io
+  feature is enabled, checks `RuntimeOptions::platform_io()` operation counters.
 - `read_versions`: captures public read-version cursors, creates a named
   checkpoint, reopens from the checkpoint, and shows expiration after deletion.
 - `user_store`: wraps Trine KV behind a small repository-style API.
@@ -179,6 +231,7 @@ cargo bench --bench v1_bench
 ## Documentation
 
 - [Usage guide](docs/usage.md)
+- [Platform I/O and feature selection](docs/platform-io.md)
 - [Durability notes](docs/durability.md)
 - [Release packaging](docs/release.md)
 - [0.1 benchmark baseline](docs/benchmarks/0.1-baseline.md)

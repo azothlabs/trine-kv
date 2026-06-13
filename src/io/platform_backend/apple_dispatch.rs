@@ -2,7 +2,8 @@
 
 use std::{
     ffi::CString,
-    io,
+    fs::{File, OpenOptions},
+    io::{self, Seek, SeekFrom, Write},
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     ptr::NonNull,
@@ -101,12 +102,15 @@ pub(super) fn sync_path(path: &Path, durability: DurabilityMode) -> Result<()> {
 
     let queue = new_queue();
     let cleanup = RcBlock::new(|_error: libc::c_int| {});
-    let path = dispatch_path(path)?;
-    let path_ptr = NonNull::new(path.as_ptr().cast_mut())
+    let dispatch_path = dispatch_path(path)?;
+    let path_ptr = NonNull::new(dispatch_path.as_ptr().cast_mut())
         .ok_or_else(|| Error::invalid_options("macOS DispatchIO path is empty"))?;
     let channel = unsafe_channel_with_path(path_ptr, libc::O_RDONLY, 0, &queue, &cleanup);
-    barrier_sync(&channel, durability)?;
+    let synced = barrier_sync(&channel, durability)?;
     channel.close(DispatchIOCloseFlags(0));
+    if !synced {
+        sync_path_blocking(path, durability)?;
+    }
     Ok(())
 }
 
@@ -173,8 +177,8 @@ fn write_dispatch(
 ) -> Result<()> {
     let queue = new_queue();
     let cleanup = RcBlock::new(|_error: libc::c_int| {});
-    let path = dispatch_path(path)?;
-    let path_ptr = NonNull::new(path.as_ptr().cast_mut())
+    let dispatch_path = dispatch_path(path)?;
+    let path_ptr = NonNull::new(dispatch_path.as_ptr().cast_mut())
         .ok_or_else(|| Error::invalid_options("macOS DispatchIO path is empty"))?;
     let channel = unsafe_channel_with_path(path_ptr, flags, 0o666, &queue, &cleanup);
     channel.set_high_water(bytes.len().clamp(1, 1024 * 1024));
@@ -215,6 +219,9 @@ fn write_dispatch(
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             channel.close(DispatchIOCloseFlags::DISPATCH_IO_STOP);
+            if should_retry_with_blocking_write(&error, flags) {
+                return write_path_blocking(path, bytes, offset, flags, durability);
+            }
             return Err(Error::Io(error));
         }
         Err(_) => {
@@ -223,21 +230,25 @@ fn write_dispatch(
         }
     }
 
-    barrier_sync(&channel, durability)?;
+    let synced = barrier_sync(&channel, durability)?;
     channel.close(DispatchIOCloseFlags(0));
+    if flags & libc::O_CREAT != 0 && !path.exists() {
+        return write_path_blocking(path, bytes, offset, flags, durability);
+    }
+    if !synced {
+        sync_path_blocking(path, durability)?;
+    }
     Ok(())
 }
 
-fn barrier_sync(channel: &DispatchIO, durability: DurabilityMode) -> Result<()> {
+fn barrier_sync(channel: &DispatchIO, durability: DurabilityMode) -> Result<bool> {
     if !requires_sync(durability) {
-        return Ok(());
+        return Ok(true);
     }
 
     let fd = channel.descriptor();
     if fd < 0 {
-        return Err(Error::Io(io::Error::other(
-            "macOS DispatchIO descriptor is unavailable",
-        )));
+        return Ok(false);
     }
 
     let (tx, rx) = mpsc::channel();
@@ -256,12 +267,89 @@ fn barrier_sync(channel: &DispatchIO, durability: DurabilityMode) -> Result<()> 
     }
 
     match rx.recv() {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(())) => Ok(true),
         Ok(Err(error)) => Err(Error::Io(error)),
         Err(_) => Err(Error::runtime_busy(
             "macOS DispatchIO barrier channel closed",
         )),
     }
+}
+
+fn sync_path_blocking(path: &Path, durability: DurabilityMode) -> Result<()> {
+    if !requires_sync(durability) {
+        return Ok(());
+    }
+
+    let file = File::open(path).map_err(|error| {
+        Error::Io(io::Error::new(
+            error.kind(),
+            format!(
+                "macOS DispatchIO sync fallback failed to open {}: {error}",
+                path.display()
+            ),
+        ))
+    })?;
+    match durability {
+        DurabilityMode::SyncData => file.sync_data().map_err(Error::Io),
+        DurabilityMode::SyncAll => file.sync_all().map_err(Error::Io),
+        DurabilityMode::Buffered | DurabilityMode::Flush => Ok(()),
+    }
+}
+
+fn write_path_blocking(
+    path: &Path,
+    bytes: &[u8],
+    offset: libc::off_t,
+    flags: libc::c_int,
+    durability: DurabilityMode,
+) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    if flags & libc::O_EXCL != 0 {
+        options.create_new(true);
+    } else if flags & libc::O_CREAT != 0 {
+        options.create(true);
+    }
+    if flags & libc::O_TRUNC != 0 {
+        options.truncate(true);
+    }
+
+    let mut file = options.open(path).map_err(|error| {
+        Error::Io(io::Error::new(
+            error.kind(),
+            format!(
+                "macOS DispatchIO write fallback failed to open {}: {error}",
+                path.display()
+            ),
+        ))
+    })?;
+    if offset > 0 {
+        file.seek(SeekFrom::Start(u64::try_from(offset).map_err(|_| {
+            Error::invalid_options("macOS DispatchIO write fallback offset overflow")
+        })?))?;
+    }
+    file.write_all(bytes).map_err(|error| {
+        Error::Io(io::Error::new(
+            error.kind(),
+            format!(
+                "macOS DispatchIO write fallback failed to write {}: {error}",
+                path.display()
+            ),
+        ))
+    })?;
+    persist_file_blocking(&file, durability)
+}
+
+fn persist_file_blocking(file: &File, durability: DurabilityMode) -> Result<()> {
+    match durability {
+        DurabilityMode::SyncData => file.sync_data().map_err(Error::Io),
+        DurabilityMode::SyncAll => file.sync_all().map_err(Error::Io),
+        DurabilityMode::Buffered | DurabilityMode::Flush => Ok(()),
+    }
+}
+
+fn should_retry_with_blocking_write(error: &io::Error, flags: libc::c_int) -> bool {
+    flags & libc::O_CREAT != 0 && error.kind() != io::ErrorKind::AlreadyExists
 }
 
 fn unsafe_channel_with_path(

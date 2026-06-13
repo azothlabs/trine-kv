@@ -4091,3 +4091,27 @@ responsibility and feature split.
 
 - New OS backend discovery, storage format changes, publishing, tagging,
   pushing, or PR creation.
+
+### Phase 166: Platform-I/O User Documentation And Verification
+
+**Status**: Complete
+
+**Goal**: Make the completed platform-io feature shape understandable and
+verifiable from the README, usage guide, crate docs, and runnable examples.
+
+**Entry Condition**: Phase 165 completed the engine async revalidation.
+
+**Acceptance Gate**:
+
+- README explains the feature split and the required
+  `RuntimeOptions::platform_io()` runtime selection.
+- Usage and platform I/O docs explain operation classes, current backend
+  matrix, stats fields, and target boundaries.
+- A checked example proves both `platform-io` and `platform-io-native` feature
+  paths on the local native target.
+- Rustdoc, doctests, feature tests, and cross-target checks pass.
+
+**Major Out Of Scope**:
+
+- New backend architecture, storage format changes, publishing, tagging,
+  pushing, or PR creation.

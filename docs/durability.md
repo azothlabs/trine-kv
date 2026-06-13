@@ -187,10 +187,14 @@ Persistent writable databases start one background maintenance worker by
 default. `DbOptions::background_worker_count = 0` keeps maintenance fully
 manual, and read-only or in-memory opens do not start workers.
 
-Native async maintenance methods run the current synchronous maintenance engine
-behind Trine's runtime task boundary. This keeps async callers from doing that
-work inline on their own thread while preserving the existing flush,
-compaction, and WAL semantics.
+Native async maintenance methods use the same durability rules through
+operation-level async storage boundaries. Flush, compaction, blob GC,
+obsolete-file cleanup, manifest publish, directory sync, WAL rewrite, and WAL
+persistence are awaited through Trine storage or durability substrate helpers.
+With `platform-io`, those helpers complete through Trine's managed platform
+thread pool; with `platform-io-native`, each operation uses native async where
+the selected target has audited support and the managed thread pool for the
+remaining rows.
 
 WASI and browser persistent options default to inline runtime execution with no
 background worker threads. Browser persistent maintenance is exposed through
