@@ -463,6 +463,10 @@ Legend: `Partial` means `PlatformNativeAsyncButPartial`, and
 
 With the current backend matrix, `RuntimeOptions::platform_io()` advertises
 `PlatformAsyncIo` only on Linux when the `platform-io` Cargo feature is enabled.
+The Linux directory listing row remains `BlockingFallback` because the selected
+Linux async stack exposes no directory enumeration operation for a complete
+Trine listing request; Trine therefore treats listing as an explicit platform
+driver fallback instead of an unexamined gap.
 On Windows, the selected backend opens files with overlapped support and submits
 positioned `ReadFile` / `WriteFile` operations through IOCP, but file open,
 metadata, sync, rename, delete, directory creation/listing, and related publish

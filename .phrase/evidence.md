@@ -11090,3 +11090,54 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Start Phase 160 by auditing and resolving Linux directory listing.
+
+## 2026-06-13: Linux Platform-I/O Completion Complete
+
+### Observation
+
+- Linux platform backend rows are now asserted at the complete Trine operation
+  boundary for length lookup, random read, whole-object read, temp write plus
+  rename publish, append open, append, persist, WAL rewrite, delete, directory
+  create, directory sync, directory listing, and writer lease.
+- The selected Linux async file stack exposes async file open, read, write,
+  metadata, rename, remove, mkdir, sync, and lease-marker creation paths through
+  platform-io, but does not expose a directory enumeration operation for a
+  complete Trine listing request.
+- `compio-fs 0.7.0` has no async directory read API in the selected dependency
+  stack, and the selected `io-uring 0.7.12` crate/UAPI surface has no
+  getdents/readdir operation.
+- Linux directory listing therefore remains `BlockingFallback`, but it is now
+  an explicit platform-driver fallback with a test assertion rather than an
+  unexamined residual.
+- KV engine code did not gain Linux-specific branching.
+
+### Interpretation
+
+- Linux platform-io is complete for this phase: every Trine operation row has
+  a tested class, and the remaining fallback row has source-backed evidence.
+- The next backend completion work should move to Windows partial operations,
+  especially complete open, metadata, sync, rename, delete, directory, and lease
+  paths.
+- Engine revalidation should remain paused until Windows, macOS, and the
+  cross-platform acceptance matrix are current.
+
+### Verification
+
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo test -q platform_backend_matrix_matches_target_family --features platform-io`
+- `docker run --rm --security-opt seccomp=unconfined -v /Users/poria/Developer/Work/Azoth/trine-kv:/workspace -w /workspace -e CARGO_TARGET_DIR=/tmp/trine-kv-target rust:1.85-bookworm cargo test -q --features platform-io platform_io`
+- `cargo test -q`
+- `cargo test -q --features platform-io`
+- `cargo clippy -q --all-features`
+
+### Remaining Blockers
+
+- Linux directory listing stays `BlockingFallback` until the selected
+  backend/kernel contract exposes real async directory enumeration.
+- Windows complete-operation implementation remains open.
+- macOS backend selection remains open.
+
+### Recommended Next Action
+
+- Start Phase 161: Windows Platform-I/O Operation Completion.

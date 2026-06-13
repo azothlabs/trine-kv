@@ -3937,7 +3937,7 @@ one non-Linux backend path has been implemented or explicitly classified.
 
 ### Phase 160: Linux Platform-I/O Completion
 
-**Status**: Planned
+**Status**: Completed
 
 **Goal**: Finish Linux platform-io as a complete Trine-operation backend by
 removing remaining fallback rows, especially directory listing, or recording a

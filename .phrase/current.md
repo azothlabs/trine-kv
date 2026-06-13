@@ -2,7 +2,7 @@
 
 ## Status
 
-Active
+Complete
 
 ## Goal
 
@@ -59,10 +59,10 @@ to engine revalidation.
 
 ```text
 task710 [x] goal:correct roadmap back to platform-io backend completion | scope:decision roadmap current | verify:docs diff
-task711 [ ] goal:audit Linux directory listing backend support | scope:kernel/backend/source | verify:source evidence
-task712 [ ] goal:update Linux backend implementation or classification | scope:src/io src/io/platform_backend | verify:Docker Linux platform-io tests
-task713 [ ] goal:assert every Linux operation row | scope:tests stats | verify:Docker Linux matrix tests
-task714 [ ] goal:record and commit Phase 160 | scope:evidence roadmap git | verify:commit
+task711 [x] goal:audit Linux directory listing backend support | scope:kernel/backend/source | verify:source evidence
+task712 [x] goal:update Linux backend implementation or classification | scope:src/io src/io/platform_backend | verify:Docker Linux platform-io tests
+task713 [x] goal:assert every Linux operation row | scope:tests stats | verify:Docker Linux matrix tests
+task714 [x] goal:record and commit Phase 160 | scope:evidence roadmap git | verify:commit
 ```
 
 ## Evidence
@@ -73,6 +73,11 @@ task714 [ ] goal:record and commit Phase 160 | scope:evidence roadmap git | veri
 - Phase 159 is retained as a diagnostic checkpoint, but its recommended next
   action is superseded by the platform-io backend completion sequence.
 - Linux directory listing is the known remaining Linux fallback row.
+- Source audit found no async directory enumeration primitive in the selected
+  Linux stack, so the row is now an explicit hard fallback rather than an
+  unexamined gap.
+- Docker Linux `platform_io` tests assert every Linux operation row at the
+  Trine operation boundary.
 
 ## Known Residuals
 
@@ -81,9 +86,9 @@ task714 [ ] goal:record and commit Phase 160 | scope:evidence roadmap git | veri
 - macOS needs a newly selected or implemented Apple-side async file path before
   it can move beyond managed fallback.
 - Other Unix remains fallback unless later evidence proves more.
+- Linux directory listing remains `BlockingFallback` until the selected Linux
+  backend/kernel contract exposes a real async directory enumeration path.
 
 ## Next Recommendation
 
-- Audit Linux directory listing support in the selected backend/kernel path,
-  then either implement true async listing or record a hard backend limit with
-  tests.
+- Start Phase 161: Windows Platform-I/O Operation Completion.

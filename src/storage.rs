@@ -4725,6 +4725,8 @@ mod tests {
         let object = backend
             .open_read_blocking(table)
             .expect("platform I/O read object opens");
+        let object_len = block_on_test_future(object.len()).expect("platform I/O len completes");
+        assert_eq!(object_len, 6);
         let buffer = block_on_test_future(object.read_exact_at_owned(2, 3))
             .expect("platform I/O read completes");
         assert_eq!(buffer.offset(), 2);
@@ -4750,7 +4752,15 @@ mod tests {
         );
 
         let stats = backend.stats();
-        assert_platform_task_accounting(&stats, 4, 0);
+        assert_platform_task_accounting(&stats, 5, 0);
+        assert!(
+            stats
+                .platform_io_operations
+                .length_lookup
+                .true_platform_async
+                > 0,
+            "Linux platform length lookup should report true platform async"
+        );
         assert!(
             stats.platform_io_operations.random_read.true_platform_async > 0,
             "Linux platform random reads should report true platform async"
@@ -4938,6 +4948,34 @@ mod tests {
         assert!(
             stats.platform_io_operations.wal_rewrite.true_platform_async > 0,
             "Linux platform WAL rewrite should report true platform async"
+        );
+        assert!(
+            stats
+                .platform_io_operations
+                .whole_object_read
+                .true_platform_async
+                > 0,
+            "Linux platform whole-object reads should report true platform async"
+        );
+        assert!(
+            stats.platform_io_operations.delete.true_platform_async > 0,
+            "Linux platform deletes should report true platform async"
+        );
+        assert!(
+            stats
+                .platform_io_operations
+                .directory_create
+                .true_platform_async
+                > 0,
+            "Linux platform directory create should report true platform async"
+        );
+        assert!(
+            stats
+                .platform_io_operations
+                .writer_lease
+                .true_platform_async
+                > 0,
+            "Linux platform writer lease should report true platform async"
         );
         assert!(
             stats
