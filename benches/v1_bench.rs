@@ -1,5 +1,6 @@
 use std::{
-    fs,
+    collections::BTreeMap,
+    env, fs,
     hint::black_box,
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -19,12 +20,22 @@ const LARGE_ROWS: usize = 128;
 const LARGE_OPS: usize = 256;
 const LARGE_VALUE_BYTES: usize = 16 * 1024;
 const WAL_REPLAY_DIAGNOSTIC_RUNS: usize = 32;
+const BENCH_RUNS_ENV: &str = "TRINE_BENCH_RUNS";
 
 fn main() {
+    let runs = benchmark_runs();
     println!("trine-kv v1 benchmark");
     println!("rows={ROWS} ops={OPS}");
-    println!("name,iterations,elapsed_us,units_per_sec,checksum");
 
+    if runs == 1 {
+        print_single_run(run_benchmarks());
+        return;
+    }
+
+    print_multi_run_summary(runs);
+}
+
+fn run_benchmarks() -> Vec<BenchResult> {
     let mut results = vec![
         bench_single_key_put(),
         bench_batch_write(),
@@ -70,6 +81,19 @@ fn main() {
     results.push(bench_long_shared_prefix_get());
     results.extend(bench_iterator_advance_to());
     results.extend(bench_codec_comparison());
+    results
+}
+
+fn benchmark_runs() -> usize {
+    env::var(BENCH_RUNS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|runs| *runs > 0)
+        .unwrap_or(1)
+}
+
+fn print_single_run(results: Vec<BenchResult>) {
+    println!("name,iterations,elapsed_us,units_per_sec,checksum");
 
     for result in results {
         println!(
@@ -79,6 +103,47 @@ fn main() {
             result.elapsed.as_micros(),
             result.units_per_second(),
             result.checksum
+        );
+    }
+}
+
+fn print_multi_run_summary(runs: usize) {
+    let mut summaries = BTreeMap::<(&'static str, &'static str), BenchSummary>::new();
+    for run_index in 0..runs {
+        eprintln!("benchmark run {}/{}", run_index + 1, runs);
+        for result in run_benchmarks() {
+            let group = benchmark_group(result.name);
+            summaries
+                .entry((group, result.name))
+                .or_insert_with(|| BenchSummary::new(group, result.name, result.iterations))
+                .record(&result);
+        }
+    }
+
+    println!(
+        "{}",
+        concat!(
+            "group,name,runs,iterations,elapsed_us_min,elapsed_us_median,",
+            "elapsed_us_max,units_per_sec_median,value_min,value_median,value_max"
+        )
+    );
+    for summary in summaries.values() {
+        let (elapsed_min, elapsed_median, elapsed_max) = summary.elapsed_stats();
+        let units_median = summary.units_per_second_median();
+        let (checksum_min, checksum_median, checksum_max) = summary.checksum_stats();
+        println!(
+            "{},{},{},{},{},{},{},{},{},{},{}",
+            summary.group,
+            summary.name,
+            summary.runs(),
+            summary.iterations,
+            elapsed_min,
+            elapsed_median,
+            elapsed_max,
+            units_median,
+            checksum_min,
+            checksum_median,
+            checksum_max
         );
     }
 }
@@ -107,6 +172,110 @@ impl BenchResult {
         }
         let units = (self.iterations as u128).saturating_mul(1_000_000_000);
         u64::try_from(units / nanos).unwrap_or(u64::MAX)
+    }
+}
+
+struct BenchSummary {
+    group: &'static str,
+    name: &'static str,
+    iterations: usize,
+    elapsed_micros: Vec<u64>,
+    units_per_second: Vec<u64>,
+    checksums: Vec<u64>,
+}
+
+impl BenchSummary {
+    fn new(group: &'static str, name: &'static str, iterations: usize) -> Self {
+        Self {
+            group,
+            name,
+            iterations,
+            elapsed_micros: Vec::new(),
+            units_per_second: Vec::new(),
+            checksums: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, result: &BenchResult) {
+        assert_eq!(
+            self.iterations, result.iterations,
+            "benchmark iterations changed across runs for {}",
+            self.name
+        );
+        self.elapsed_micros.push(duration_micros(result.elapsed));
+        self.units_per_second.push(result.units_per_second());
+        self.checksums.push(result.checksum);
+    }
+
+    fn runs(&self) -> usize {
+        self.elapsed_micros.len()
+    }
+
+    fn elapsed_stats(&self) -> (u64, u64, u64) {
+        value_stats(&self.elapsed_micros)
+    }
+
+    fn units_per_second_median(&self) -> u64 {
+        value_median(&self.units_per_second)
+    }
+
+    fn checksum_stats(&self) -> (u64, u64, u64) {
+        value_stats(&self.checksums)
+    }
+}
+
+fn value_stats(values: &[u64]) -> (u64, u64, u64) {
+    assert!(
+        !values.is_empty(),
+        "benchmark summary needs at least one run"
+    );
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    (
+        sorted[0],
+        sorted[sorted.len() / 2],
+        sorted[sorted.len() - 1],
+    )
+}
+
+fn value_median(values: &[u64]) -> u64 {
+    value_stats(values).1
+}
+
+fn benchmark_group(name: &str) -> &'static str {
+    if name.contains("diagnostic")
+        || name.starts_with("read pruning")
+        || name.starts_with("WAL replay writable open")
+        || name.starts_with("WAL replay read-only open")
+    {
+        "diagnostics"
+    } else if name.contains("WAL replay") || name.contains("cold table") {
+        "startup-recovery"
+    } else if name.contains("blob")
+        || name.contains("large inline")
+        || name.contains("separated blob")
+    {
+        "blob-large-values"
+    } else if name.contains("compaction") {
+        "compaction"
+    } else if name.contains("put") || name == "batch write" || name.contains("flush throughput") {
+        "writes-flush"
+    } else if name.contains("range scan") || name.contains("prefix scan") {
+        "scans"
+    } else if name.contains("transaction") || name.contains("snapshot") {
+        "mvcc-transactions"
+    } else if name.contains("cache") || name.contains("block decode") {
+        "cache-decode"
+    } else if name.contains("index seek") || name.contains("shared-prefix") {
+        "search-policy"
+    } else if name.contains("iterator") {
+        "iterator"
+    } else if name.contains("codec") {
+        "codec"
+    } else if name.contains("get") || name.contains("point") || name.contains("missing") {
+        "point-reads"
+    } else {
+        "misc"
     }
 }
 

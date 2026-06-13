@@ -26,6 +26,52 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-06-13: Benchmark Baseline Refresh And Target Selection
+
+### Observation
+
+- The benchmark harness now keeps its existing single-run CSV by default.
+- Setting `TRINE_BENCH_RUNS=N` runs the full benchmark suite N times and emits
+  grouped min, median, and max summaries.
+- The first local grouped baseline used
+  `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench`.
+- The largest selected median rows were `compaction throughput` at 178000 us,
+  `blob level merge` at 170524 us, `blob GC rewrite` at 169310 us,
+  `separated blob values` at 109257 us, `cold table read` at 83592 us,
+  `cold table read-only` at 71677 us, and `flush throughput` at 65977 us.
+- Point-read medians were much smaller in this run: `random get` at 1059 us,
+  `localized batched point read persistent` at 1131 us, and
+  `batched point read persistent` at 1459 us.
+
+### Interpretation
+
+- The next performance target should not be point reads.
+- Compaction and blob maintenance are the largest grouped costs in the
+  refreshed baseline, with cold startup/recovery and flush throughput behind
+  them.
+- The next real optimization phase should decompose compaction/blob write
+  amplification before changing storage behavior.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo clippy --bench v1_bench -- -D warnings`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo bench --bench v1_bench`
+- `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench`
+- `git diff --check`
+- Forbidden-term scan over the workspace found only the rule text in
+  `AGENTS.md`.
+
+### Remaining Blockers
+
+- None for the benchmark baseline refresh slice.
+
+### Recommended Next Action
+
+- Start a compaction/blob maintenance breakdown phase, then continue the
+  remaining KV optimization queue from grouped benchmark evidence.
+
 ## 2026-06-13: Localized Batched Point Read Follow-Up
 
 ### Observation

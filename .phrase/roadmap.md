@@ -4287,3 +4287,162 @@ still identifies localized batched point reads as a remaining follow-up row.
 
 - Storage format changes, WAL/manifest behavior, broad read-path redesign,
   publishing, tagging, pushing, or release workflow changes.
+
+### Phase 174: Benchmark Baseline Refresh And Target Selection
+
+**Status**: Complete
+
+**Goal**: Make performance decisions use grouped, multi-run benchmark evidence
+before starting the next KV optimization phase.
+
+**Entry Condition**: Phase 173 is complete and the user wants to continue with
+the broader KV optimization queue.
+
+**Acceptance Gate**:
+
+- The benchmark harness supports a multi-run summary mode with min, median, and
+  max timings.
+- Existing single-run output remains compatible for simple local checks.
+- Benchmark rows are grouped by workload area so startup/recovery, writes,
+  scans, blob, cache, codec, and diagnostics can be compared without manual
+  sorting.
+- A new local grouped baseline is recorded and recommends the next concrete
+  optimization phase.
+
+**Major Out Of Scope**:
+
+- Storage format changes, engine behavior changes, platform-io behavior
+  changes, publishing, tagging, pushing, or release workflow changes.
+
+### Phase 175: Compaction And Blob Maintenance Breakdown
+
+**Status**: Planned
+
+**Goal**: Decompose the largest refreshed benchmark rows before changing
+compaction or blob-maintenance behavior.
+
+**Entry Condition**: Phase 174 grouped baseline identifies compaction and blob
+maintenance as the largest selected median rows.
+
+**Acceptance Gate**:
+
+- Diagnostics separate compaction table output, blob output, manifest publish,
+  directory sync, obsolete cleanup, blob GC candidate selection, and blob
+  level-merge rewrite costs.
+- The selected optimization target is chosen from those diagnostics.
+- No storage format or public API behavior changes occur before the dominant
+  cost is classified.
+
+**Major Out Of Scope**:
+
+- Startup/recovery, write group commit, range/prefix scan, cache/decode,
+  concurrency, platform-io, publishing, tagging, or pushing changes.
+
+### Phase 176: Startup And Recovery Path Optimization
+
+**Status**: Planned
+
+**Goal**: Reduce persistent open, cold table read, read-only open, and WAL
+replay costs using grouped startup/recovery diagnostics.
+
+**Entry Condition**: A grouped baseline or Phase 175 evidence identifies
+startup/recovery as the next largest user-visible cost.
+
+**Acceptance Gate**:
+
+- Persistent open diagnostics separate directory listing, manifest load, WAL
+  replay, table metadata open, blob validation, and first-read costs.
+- Any retained fix keeps recovery fail-closed behavior and storage formats
+  unchanged.
+
+**Major Out Of Scope**:
+
+- Compaction policy, write group commit, scan, cache/decode, blob maintenance,
+  publishing, tagging, or pushing changes.
+
+### Phase 177: Write Fsync And Group Commit Optimization
+
+**Status**: Planned
+
+**Goal**: Measure and reduce confirmed-write latency and throughput costs
+without weakening durability defaults.
+
+**Entry Condition**: Grouped evidence identifies single-key put, batch write,
+flush, WAL append, or sync boundaries as the next largest risk.
+
+**Acceptance Gate**:
+
+- Diagnostics separate WAL append, WAL persist, commit publication, manifest
+  publish, directory sync, and flush-triggered work.
+- Any retained optimization preserves the documented durability semantics.
+
+**Major Out Of Scope**:
+
+- Storage format changes, compaction/blob maintenance, startup/recovery,
+  scan/cache redesign, publishing, tagging, or pushing changes.
+
+### Phase 178: Range And Prefix Scan Read-Amplification
+
+**Status**: Planned
+
+**Goal**: Reduce range and prefix scan table/block work when grouped evidence
+shows scan workloads are the next target.
+
+**Entry Condition**: Grouped benchmark evidence identifies range/prefix scan
+costs or diagnostics as the next selected bottleneck.
+
+**Acceptance Gate**:
+
+- Diagnostics separate table candidate selection, prefix filters, block
+  metadata probes, data block reads, range tombstone checks, and iterator
+  advancement costs.
+- Existing MVCC visibility and range-delete behavior remain unchanged.
+
+**Major Out Of Scope**:
+
+- Compaction/blob, startup/recovery, write durability, cache policy, platform
+  I/O, publishing, tagging, or pushing changes.
+
+### Phase 179: Block Cache And Decode Path Optimization
+
+**Status**: Planned
+
+**Goal**: Improve hot-read cache/decode behavior after grouped evidence points
+to cache misses, block decode, or compression cost.
+
+**Entry Condition**: Grouped benchmark evidence identifies block-cache,
+table-block decode, or codec rows as the next selected target.
+
+**Acceptance Gate**:
+
+- Diagnostics separate cache hits/misses, metadata/data block decode, codec
+  time, and allocation-sensitive paths.
+- Any cache policy change preserves correctness for table, blob, snapshot, and
+  range-delete reads.
+
+**Major Out Of Scope**:
+
+- Compaction/blob, startup/recovery, write durability, scan algorithm,
+  publishing, tagging, or pushing changes.
+
+### Phase 180: Concurrent Read/Write And Background Maintenance
+
+**Status**: Planned
+
+**Goal**: Measure foreground latency under concurrent reads, writes, flush,
+compaction, and maintenance.
+
+**Entry Condition**: Grouped benchmark evidence or user workload evidence shows
+foreground latency under background work is the next risk.
+
+**Acceptance Gate**:
+
+- Benchmarks report read/write latency while background flush, compaction, and
+  cleanup run.
+- Diagnostics identify lock contention, worker scheduling, storage queueing,
+  and maintenance budget effects before behavior changes.
+
+**Major Out Of Scope**:
+
+- Storage format changes, platform-io backend changes, publishing, tagging, or
+  pushing changes.

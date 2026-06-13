@@ -6,59 +6,63 @@ Complete
 
 ## Goal
 
-Investigate the `localized batched point read persistent` benchmark follow-up
-and keep only changes supported by local benchmark evidence.
+Refresh the benchmark baseline machinery so later KV optimization phases choose
+targets from grouped, multi-run evidence instead of single-run noise.
 
 ## Scope
 
-- `get_many` batch organization on the LSM point-read path.
-- `LsmVersion` table selection for borrowed key views.
-- Localized point-read benchmark diagnostics for batch sizes 4, 8, 16, and 32.
-- Benchmark evidence for the current localized sequential and batched rows.
+- `benches/v1_bench.rs` output mode for multi-run summaries.
+- Workload grouping for existing benchmark rows.
+- First grouped baseline evidence for the next optimization phase.
+- Documentation that explains how to run the refreshed benchmark check.
 
 ## Out Of Scope
 
 - Storage format changes.
-- WAL, manifest, compaction, or MVCC behavior changes.
-- Broad point-read tuning outside the localized `get_many` path.
+- WAL, manifest, compaction, MVCC, table, blob, cache, or platform-io behavior
+  changes.
+- Optimizing startup/recovery, writes, compaction, scans, cache, blob, or
+  concurrency in this phase.
 - Publishing, tagging, pushing, or release workflow changes.
 
 ## Acceptance Gate
 
-- Diagnostics show whether localized batching still shares SSTable block work.
-- The chosen code change removes measured fixed cost without changing public
-  API behavior.
-- Existing `get_many` tests pass.
-- Strict clippy passes.
-- Release-profile benchmark evidence records the current sequential and batched
-  localized rows.
+- Default benchmark output remains compatible with the existing single-run CSV.
+- `TRINE_BENCH_RUNS=N` runs the full benchmark suite multiple times and reports
+  grouped min/median/max summaries.
+- Workload groups cover point reads, scans, transactions, recovery, writes,
+  blob, cache, cold open/read, search policy, iterator, codec, and diagnostics.
+- A local multi-run benchmark result is recorded and used to recommend the next
+  optimization phase.
+- Formatting, strict clippy, benchmark execution, and diff checks pass.
 
 ## Active Task Slice
 
 ```text
-task777 [x] goal:add localized point-read diagnostics | scope:benches/v1_bench.rs | verify:cargo bench --bench v1_bench
-task778 [x] goal:avoid owned key copies in point-read batch state | scope:src/lsm/read.rs src/lsm/version.rs | verify:cargo test -q get_many --lib
-task779 [x] goal:record localized point-read evidence | scope:docs/benchmarks .phrase/evidence.md | verify:git diff review
+task780 [x] goal:add multi-run grouped benchmark output | scope:benches/v1_bench.rs | verify:cargo bench --bench v1_bench
+task781 [x] goal:record grouped baseline and next target | scope:docs/benchmarks .phrase/evidence.md | verify:git diff review
+task782 [x] goal:update roadmap for follow-up KV optimization queue | scope:.phrase/roadmap.md | verify:git diff review
 ```
 
 ## Evidence
 
-- Localized batch size 16 still shares table block work: diagnostic metadata
-  probes and data block reads dropped from 2048 sequential operations to 134
-  batched operations.
-- After borrowing keys in `PointReadBatch`, the local release-profile run
-  recorded `localized sequential point batch persistent` at 1529 us and
-  `localized batched point read persistent` at 1399 us.
-- Batch size 4 remains slower because it repeatedly enters the small-batch
-  single-key path and still pays repeated batch-call overhead.
+- Default single-run output remains compatible with the existing CSV shape.
+- `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench` now emits grouped min,
+  median, and max summaries.
+- The first grouped baseline recorded median rows of 178000 us for compaction,
+  170524 us for blob level merge, 169310 us for blob GC rewrite, 109257 us for
+  separated blob values, 83592 us for cold table read, and 65977 us for flush
+  throughput.
+- Future optimization areas include startup/recovery, write fsync/group commit,
+  flush/compaction/blob maintenance, range/prefix scans, block cache/decode,
+  large-value paths, and concurrent read/write behavior.
 
 ## Known Residuals
 
-- Local run-to-run noise is still visible at this microsecond scale, so the
-  correct claim is that the severe localized batch regression is not reproduced
-  after the key-copy fix, not that every run will beat sequential reads.
+- The new baseline machinery is not a performance fix; it is the evidence gate
+  for choosing the next real optimization target.
 
 ## Next Recommendation
 
-- Continue performance work from fresh benchmark evidence rather than assuming
-  localized batching is the next bottleneck.
+- Start the next optimization phase by decomposing compaction and blob
+  maintenance write amplification before changing behavior.
