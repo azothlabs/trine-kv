@@ -1173,9 +1173,15 @@ mod tests {
         use PlatformIoOperation as Op;
         use PlatformIoTaskClass::{ThreadPoolManagedAsync, TruePlatformAsync};
 
-        assert_all_platform_rows(matrix, TruePlatformAsync);
         assert_eq!(matrix.kind, PlatformIoBackendKind::LinuxNative);
-        assert_platform_rows(matrix, &[(Op::DirectoryListing, ThreadPoolManagedAsync)]);
+        for operation in ALL_PLATFORM_OPERATIONS {
+            let expected = if operation == Op::DirectoryListing {
+                ThreadPoolManagedAsync
+            } else {
+                TruePlatformAsync
+            };
+            assert_eq!(matrix.class_for(operation), expected, "{operation:?}");
+        }
     }
 
     #[cfg(feature = "platform-io")]

@@ -11651,3 +11651,56 @@ Negative check:
 ### Recommended Next Action
 
 - Commit this CI regression fix and rerun the Windows platform-io job.
+
+## 2026-06-13: Platform-I/O CI Regression Fix Follow-Up
+
+### Observation
+
+- CI then reported two Linux lib-test failures:
+  - `io::tests::platform_backend_matrix_matches_target_family` expected
+    `DirectoryListing` to be `TruePlatformAsync` on Linux native, but the
+    backend matrix correctly reports directory listing as
+    `ThreadPoolManagedAsync`.
+  - `storage::tests::runtime_enabled_native_file_object_read_uses_blocking_adapter`
+    saw `blocking_adapter_submitted_tasks == 1` where the local all-features
+    run saw `2`.
+- Windows `platform_io` example still failed with bare `Access is denied`,
+  which can still occur before final cleanup if a stale temp directory from a
+  previous run is reused.
+
+### Interpretation
+
+- The Linux matrix helper was wrong because it asserted every row as true
+  native before overriding directory listing. Directory listing has remained
+  the known thread-pool-managed Linux row.
+- The storage read test should prove the backend read uses the blocking adapter;
+  exact inclusion of the helper worker in submitted/completed task stats is not
+  the behavior boundary.
+- Windows example runs need a per-run unique path so denied cleanup from a
+  previous process cannot poison the next process.
+
+### Verification
+
+- `cargo test -q --lib --all-features io::tests::platform_backend_matrix_matches_target_family`
+- `cargo test -q --lib --all-features storage::tests::runtime_enabled_native_file_object_read_uses_blocking_adapter`
+- Linux Docker:
+  - `cargo test -q --lib --features platform-io-native io::tests::platform_backend_matrix_matches_target_family`
+  - `cargo test -q --lib --features platform-io-native storage::tests::runtime_enabled_native_file_object_read_uses_blocking_adapter`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo check -q --target x86_64-pc-windows-gnu --features platform-io --tests`
+- `cargo check -q --target x86_64-pc-windows-gnu --features platform-io-native --tests`
+- `cargo test -q --features platform-io platform_io`
+- `cargo test -q --features platform-io-native platform_io`
+- `cargo run -q --example platform_io --features platform-io`
+- `cargo run -q --example platform_io --features platform-io-native`
+- `cargo fmt --check`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Windows runtime behavior still needs the GitHub Actions rerun to confirm the
+  per-run temp path fixes the runner-side example failure.
+
+### Recommended Next Action
+
+- Commit this follow-up and rerun CI.

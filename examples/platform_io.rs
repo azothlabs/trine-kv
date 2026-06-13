@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
     task::{Context, Poll, Wake, Waker},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use trine_kv::{Db, DbOptions, Result, RuntimeOptions};
@@ -91,7 +91,10 @@ impl Wake for ThreadWake {
 }
 
 fn temp_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("{name}-{}", std::process::id()))
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    std::env::temp_dir().join(format!("{name}-{}-{nonce}", std::process::id()))
 }
 
 fn reset_dir(path: &Path) -> Result<()> {

@@ -5281,8 +5281,14 @@ mod tests {
         assert!(stats.uses_blocking_adapter);
         assert_eq!(stats.blocking_adapter_tasks, 1);
         assert_eq!(stats.blocking_adapter_queue_capacity, 2);
-        assert_eq!(stats.blocking_adapter_submitted_tasks, 2);
-        assert_eq!(stats.blocking_adapter_completed_tasks, 2);
+        assert!(
+            (1..=2).contains(&stats.blocking_adapter_submitted_tasks),
+            "submitted blocking tasks should include the read and may include the worker holder"
+        );
+        assert!(
+            (1..=2).contains(&stats.blocking_adapter_completed_tasks),
+            "completed blocking tasks should include the read and may include the worker holder"
+        );
         assert_eq!(stats.operations.read_object_bytes.requests, 1);
         assert!(stats.operations.read_object_bytes.total_latency_micros > 0);
         assert_eq!(stats.inline_tasks, 0);

@@ -6,14 +6,16 @@ Complete
 
 ## Goal
 
-Fix the CI regressions exposed after the cross-platform platform-io gate landed.
+Fix the remaining CI regressions exposed after the first platform-io CI
+regression patch.
 
 ## Scope
 
-- `cargo clippy --all-targets --all-features -- -D warnings` failures from
-  long platform-io test functions.
-- Windows `platform_io` example failure caused by cleanup returning
-  `PermissionDenied` after the checked database path had already completed.
+- Linux native backend matrix assertion that accidentally expected directory
+  listing to be true platform async.
+- Runtime-enabled native-file read test that depended on exact helper-worker
+  task accounting across feature/target combinations.
+- Windows `platform_io` example path reuse after a denied cleanup.
 - Verification for the same commands used by CI where they can run locally.
 
 ## Out Of Scope
@@ -24,29 +26,35 @@ Fix the CI regressions exposed after the cross-platform platform-io gate landed.
 
 ## Acceptance Gate
 
-- No `too_many_lines` failures under strict all-target clippy.
-- `platform_io` example cleanup is best-effort after the database path has
-  completed, so Windows file-handle release timing does not fail the example.
-- Local Windows target checks still pass.
-- Platform-io examples and focused tests still pass.
+- Linux native matrix expects `ThreadPoolManagedAsync` for directory listing
+  and true platform async for the remaining Linux native rows.
+- Runtime-enabled native-file read test proves the backend read task completed
+  through the blocking adapter without depending on whether the worker holder
+  is counted.
+- `platform_io` example uses a per-run unique temp directory so stale Windows
+  directories from previous runs do not affect the next run.
+- Local Windows target checks, Linux Docker focused tests, strict clippy,
+  examples, formatting, and diff checks pass.
 
 ## Active Task Slice
 
 ```text
-task758 [x] goal:fix all-target clippy too_many_lines | scope:src/io.rs src/storage.rs tests/async_api.rs | verify:cargo clippy --all-targets --all-features -- -D warnings
-task759 [x] goal:make example cleanup tolerate Windows handle timing | scope:examples/platform_io.rs | verify:platform_io examples
-task760 [x] goal:record CI regression evidence | scope:.phrase | verify:diff review
+task761 [x] goal:fix Linux native matrix directory listing class | scope:src/io.rs | verify:docker lib test
+task762 [x] goal:relax blocking-adapter stats test to behavior boundary | scope:src/storage.rs | verify:local/docker lib tests
+task763 [x] goal:avoid Windows example stale temp path reuse | scope:examples/platform_io.rs | verify:examples/windows target checks
+task764 [x] goal:record second CI regression evidence | scope:.phrase | verify:diff review
 ```
 
 ## Evidence
 
-- The large platform backend matrix test is now operation-row driven through
-  helper assertions instead of one monolithic per-platform function.
-- The Linux platform-io flush test and native-file management test now keep
-  operation flow and counter-class assertions in separate helpers.
-- `examples/platform_io.rs` still resets any old directory before opening, but
-  the final cleanup is best-effort because Windows can temporarily deny
-  directory removal after file-heavy examples.
+- Linux `platform-io-native` matrix now checks directory listing as
+  `ThreadPoolManagedAsync` and the rest of the audited Linux native rows as
+  `TruePlatformAsync`.
+- The runtime-enabled native-file read test still asserts one backend
+  blocking-adapter read task, while allowing submitted/completed runtime task
+  counters to include or exclude the helper worker depending on stats baseline.
+- `examples/platform_io.rs` now includes a timestamp nonce in its temp
+  directory name.
 
 ## Known Residuals
 

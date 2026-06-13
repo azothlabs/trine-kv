@@ -4165,3 +4165,28 @@ reported strict clippy failures and Windows example cleanup failure.
 
 - New backend architecture, storage format changes, publishing, tagging,
   pushing, or PR creation.
+
+### Phase 169: Platform-I/O CI Regression Fix Follow-Up
+
+**Status**: Complete
+
+**Goal**: Fix the Linux lib-test and Windows example failures exposed by the
+CI rerun after Phase 168.
+
+**Entry Condition**: CI rerun reports Linux matrix/stats test failures and
+Windows `platform_io` example `Access is denied`.
+
+**Acceptance Gate**:
+
+- Linux native platform matrix keeps directory listing classified as
+  thread-pool managed.
+- Runtime-enabled native-file object read test no longer depends on exact
+  helper-worker task accounting.
+- `platform_io` example uses a per-run unique temp directory.
+- Local macOS checks, Linux Docker focused tests, and Windows target checks
+  pass.
+
+**Major Out Of Scope**:
+
+- New backend architecture, storage format changes, publishing, tagging,
+  pushing, or PR creation.
