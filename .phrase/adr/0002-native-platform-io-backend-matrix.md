@@ -27,8 +27,12 @@ the architecture boundary. Platform support is not uniform:
   include blocking or helper-managed open, metadata, sync, rename, delete,
   directory, listing, or lease steps before they can be counted as complete true
   platform async operations.
-- macOS, BSD, and other Unix targets need platform-specific audits before Trine
-  can claim true platform async regular-file operations.
+- macOS has an explicit backend row. With the selected backend, macOS
+  regular-file operations use the Unix polling path and remain
+  platform-managed fallback until Apple-specific async file support is audited
+  and implemented.
+- BSD and other Unix targets need platform-specific audits before Trine can
+  claim true platform async regular-file operations.
 - Directory enumeration has no native async primitive in the selected backend.
 
 ## Decision
@@ -107,9 +111,11 @@ Driver cleanup may start only after this contract is in place. It must:
   A Trine operation is not counted as true platform async until every required
   step has a correct platform completion path or a Trine-owned async strategy
   that keeps the operation true at the storage boundary.
-- macOS/BSD must not be described as true native async for regular files until
-  a stronger backend is implemented and verified, but they remain first-class
-  platform-io targets.
+- macOS must not be described as true native async for regular files with the
+  selected backend, but it is now a first-class platform-io target with an
+  explicit matrix row.
+- BSD must not be described as true native async for regular files until a
+  stronger backend is implemented and verified.
 - Directory enumeration remains a separately counted blocker until a backend
   exposes a real async directory enumeration operation.
 - With the current backend matrix, non-Linux targets can use the platform I/O

@@ -6,24 +6,19 @@ Complete
 
 ## Goal
 
-Advance the Windows platform-io backend from a vague partial bucket to an
-audited Windows-native async backend plan and implementation slice. Windows
-must use native overlapped/IOCP file primitives where a complete Trine
-operation can honestly support them, while mixed operations stay classified as
-partial until every required step is covered.
+Give macOS its own platform-io backend classification instead of inheriting the
+generic non-Linux Unix fallback label. The macOS backend should remain honest:
+ordinary file work is platform-managed fallback until a platform-supported
+async regular-file path is audited and implemented.
 
 ## Scope
 
-- Audit the currently selected `compio` Windows backend behavior used by
-  Trine's platform-io layer.
-- Keep KV engine code on Trine operations; Windows details stay below
-  `platform-io`.
-- Split Windows classifications by actual evidence:
-  overlapped/IOCP read/write steps versus blocking open, metadata, sync,
-  rename, delete, create-directory, and listing steps.
-- Add Windows-target compile and matrix tests that lock the current Windows
-  backend classification.
-- Update ADR/protocol/evidence if the audit changes any Phase 153 assumptions.
+- Audit the selected `compio` macOS regular-file path.
+- Add a distinct macOS platform backend kind and matrix module.
+- Keep macOS operation classes fallback-classified where the selected backend
+  uses blocking decisions or direct syscalls.
+- Verify macOS diagnostics on the local host.
+- Update ADR/protocol/evidence so macOS is first-class but not overstated.
 
 ## Backend Boundary Receipt
 
@@ -31,78 +26,76 @@ partial until every required step is covered.
   temporary write plus rename publish, append open, append, persist/fsync, WAL
   rewrite, delete, directory create, directory sync, directory listing, and
   writer lease.
-- Owned interface: `src/io/platform_backend/windows_backend.rs`,
-  `PlatformIoBackendMatrix`, `PlatformIoTaskClass`, `PlatformIoOperation`,
-  `PlatformIoDriver`, and platform I/O stats.
-- Chosen backend: existing `compio` Windows path using `FILE_FLAG_OVERLAPPED`
-  file handles and IOCP-backed `ReadFile` / `WriteFile` for positioned
-  read/write primitives.
-- Known backend limits: `compio-fs 0.7.0` opens files with
-  `FILE_FLAG_OVERLAPPED`, but file open, metadata, rename, delete,
-  create-directory, and some sync operations still use blocking or helper
-  paths. A Trine operation that includes those steps remains partial.
-- Leak-check scope: no Windows-specific branching in KV engine code; no std
-  lock is introduced across await; stats must keep reporting operation class
-  honestly.
-- Verification gate: Windows target `cargo check`, platform matrix tests,
-  formatting, clippy/rustdoc where relevant, and diff checks. Real Windows
-  runtime tests are recorded as required evidence before claiming stronger
-  true async coverage beyond compile/audit.
+- Owned interface: `PlatformIoBackendKind::MacOsNative`,
+  `src/io/platform_backend/macos_backend.rs`, platform operation stats, ADR
+  0002, and async storage protocol.
+- Chosen backend: selected `compio` Unix polling path on macOS.
+- Known backend limits: `compio-driver 0.7.1` enables AIO only for FreeBSD and
+  Solaris-family targets. On macOS, regular-file open/stat/read/write/sync and
+  rename/delete/create-directory operations are blocking decisions or direct
+  syscalls in the selected path.
+- Leak-check scope: no macOS-specific branching in KV engine code; only the
+  platform backend matrix and diagnostics distinguish macOS.
+- Verification gate: macOS host platform matrix/storage tests, formatting,
+  clippy/rustdoc if public docs are touched, full local tests if feasible, and
+  diff checks.
 
 ## Out Of Scope
 
-- Implementing macOS or BSD backends.
+- Implementing new Apple-specific async file primitives.
+- Implementing Windows or BSD backend upgrades.
 - Rewriting compaction, maintenance, cleanup, close, or cooperative
   maintenance.
 - Changing manifest, WAL, SSTable, MVCC, transaction, or recovery formats.
-- Claiming a complete Windows Trine operation is true platform async while any
-  required step remains blocking or fallback-classified.
 - Publishing, tagging, pushing, or creating a GitHub release.
 
 ## Acceptance Gate
 
-- Windows backend classification is backed by source audit and target compile.
-- Windows read/write primitives are tied to overlapped/IOCP evidence.
-- Mixed Windows Trine operations remain `PlatformNativeAsyncButPartial` unless
-  every required step is proven true platform async.
-- Directory listing remains `BlockingFallback`.
-- Evidence records what still requires a real Windows runtime test.
+- macOS has an explicit backend kind and matrix module.
+- macOS ordinary file operations report `PlatformManagedFallback`.
+- macOS directory listing reports `BlockingFallback`.
+- Local macOS platform-io tests prove diagnostics use platform-driver fallback
+  counters and operation-level fallback counters.
+- Evidence records that true macOS async regular-file support remains a future
+  implementation/audit.
 - Phase completion is committed before starting the next phase.
 
 ## Active Task Slice
 
 ```text
-task684 [x] goal:start Windows backend phase | scope:current roadmap | verify:phase brief
-task685 [x] goal:audit selected compio Windows file path | scope:cargo registry source evidence | verify:audit notes
-task686 [x] goal:lock Windows backend classifications | scope:src/io/platform_backend/windows_backend.rs src/io.rs | verify:windows target check
-task687 [x] goal:update docs/evidence for Windows backend limits | scope:ADR protocol evidence | verify:docs diff
-task688 [x] goal:verify and commit Phase 155 | scope:tests docs git | verify:target check plus local gate
+task689 [x] goal:start macOS backend phase | scope:current roadmap | verify:phase brief
+task690 [x] goal:audit selected macOS compio path | scope:cargo registry source | verify:audit notes
+task691 [x] goal:add explicit macOS backend matrix | scope:src/io src/io/platform_backend | verify:platform matrix test
+task692 [x] goal:update docs/evidence for macOS backend limits | scope:ADR protocol evidence | verify:docs diff
+task693 [x] goal:verify and commit Phase 156 | scope:tests docs git | verify:local macOS gate
 ```
 
 ## Evidence
 
-- Phase 154 added operation-level platform I/O stats and made Windows current
-  classifications visible as `PlatformNativeAsyncButPartial`.
-- Local audit found `compio-fs 0.7.0` Windows `OpenOptions::open` sets
-  `FILE_FLAG_OVERLAPPED` before opening the file, then wraps it for compio.
-- Local audit found `compio-driver 0.7.1` Windows `ReadAt` and `WriteAt` call
-  `ReadFile` / `WriteFile` with `OVERLAPPED`, and IOCP completion ports are
-  used by the driver.
-- Local audit also found Windows metadata, open, rename, remove, and
-  create-directory helpers use blocking/helper paths in the selected backend.
-- `cargo check -q --target x86_64-pc-windows-gnu --features platform-io` and
-  `cargo check -q --target x86_64-pc-windows-gnu --features platform-io
-  --tests` passed.
+- Local audit found `compio-driver 0.7.1` sets `aio` only for FreeBSD and
+  Solaris-family targets in `build.rs`.
+- Local audit found macOS regular-file `ReadAt`, `WriteAt`, and `Sync` on the
+  selected polling path use `Decision::Blocking` before direct `pread`,
+  `pwrite`, or `fsync` syscalls.
+- Local audit found open/stat/rename/delete/create-directory operations are
+  also blocking decisions or direct syscalls in the selected path.
+- `src/io/platform_backend/macos_backend.rs` now gives macOS an explicit
+  `MacOsNative` backend kind while keeping operation classes honest.
+- `cargo fmt --check`, `cargo check -q`, `cargo check -q --features
+  platform-io`, focused macOS platform tests, `cargo clippy -q
+  --all-features`, `cargo rustdoc --all-features -- -D warnings`,
+  `cargo test -q`, `cargo test -q --features platform-io`, and
+  `git diff --check` passed.
 
 ## Known Residuals
 
-- Real Windows runtime tests have not run in this environment yet.
-- A complete Windows Trine operation cannot be upgraded from partial to true
-  platform async until every required step is audited and implemented.
-- macOS and BSD/other Unix remain later phases.
+- No Apple-specific true async regular-file implementation exists in this
+  phase.
+- BSD/other Unix still need their own phase.
+- Engine compaction, maintenance, cleanup, close, and cooperative maintenance
+  still need later revalidation.
 
 ## Next Recommendation
 
-- Commit Phase 155, then start Phase 156: macOS Platform Backend, unless the
-  user chooses to keep iterating on Windows blocking open/metadata/sync steps
-  first.
+- Commit Phase 156, then start Phase 157: BSD/other Unix backend
+  classification.

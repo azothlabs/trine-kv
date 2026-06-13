@@ -10844,3 +10844,50 @@ Record only evidence that can change planning or durable decisions.
 
 - Start Phase 156: macOS Platform Backend, unless the next decision is to keep
   drilling into Windows complete-operation true async coverage first.
+
+## 2026-06-13: macOS Platform Backend Classification Complete
+
+### Observation
+
+- macOS now has an explicit `PlatformIoBackendKind::MacOsNative` and
+  `src/io/platform_backend/macos_backend.rs`.
+- The selected `compio-driver 0.7.1` build enables `aio` only for FreeBSD and
+  Solaris-family targets, not macOS.
+- On the selected macOS polling path, regular-file read/write/sync operations
+  use blocking decisions before direct `pread`, `pwrite`, or `fsync` syscalls.
+- Open, stat, rename, delete, and create-directory operations are also blocking
+  decisions or direct syscalls in the selected path.
+- macOS ordinary file operations remain `PlatformManagedFallback`; directory
+  listing remains `BlockingFallback`.
+
+### Interpretation
+
+- macOS is now first-class in platform-io diagnostics, but current regular-file
+  operations are not true platform async.
+- This corrects the previous generic Unix bucket without overstating Apple
+  async support.
+- A future macOS implementation phase must choose and prove Apple-supported
+  async file primitives before any operation is upgraded.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo check -q`
+- `cargo check -q --features platform-io`
+- `cargo test -q platform_backend_matrix_matches_target_family --features platform-io`
+- `cargo test -q platform_io_without_true_async_storage_ops_uses_platform_driver_fallback --features platform-io`
+- `cargo clippy -q --all-features`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test -q`
+- `cargo test -q --features platform-io`
+- `git diff --check`
+
+### Remaining Blockers
+
+- No blocker for macOS classification.
+- True macOS platform async regular-file support remains future work.
+- BSD/other Unix classification remains Phase 157.
+
+### Recommended Next Action
+
+- Start Phase 157: BSD and other Unix platform backend classification.

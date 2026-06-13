@@ -469,6 +469,12 @@ metadata, sync, rename, delete, directory creation/listing, and related publish
 steps still include blocking or helper-managed work. Therefore Windows rows
 remain partial until a complete Trine operation can be proven end to end.
 
+On macOS, the selected backend uses the Unix polling path for regular files.
+With `compio-driver 0.7.1`, AIO is enabled only for FreeBSD and Solaris-family
+targets, so macOS regular-file read, write, sync, open, stat, rename, delete,
+and directory operations remain platform-managed fallback or blocking fallback
+until an Apple-specific backend is implemented.
+
 On non-Linux targets it can still route native storage through the platform
 driver, but current operations remain partial or fallback-classified until
 stronger target backends exist. That current-state classification is not the

@@ -3842,7 +3842,7 @@ operation-level platform capability.
 
 ### Phase 156: macOS Platform Backend
 
-**Status**: Planned
+**Status**: Complete
 
 **Goal**: Implement or explicitly classify the macOS platform-io backend using
 Apple-supported async file mechanisms where valid.

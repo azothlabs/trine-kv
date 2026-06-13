@@ -13,7 +13,9 @@ use super::{PlatformIoBackendMatrix, PlatformIoTask};
 
 #[cfg(target_os = "linux")]
 mod linux_backend;
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+mod macos_backend;
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 mod unix_backend;
 #[cfg(not(any(target_os = "linux", windows, unix)))]
 mod unsupported_backend;
@@ -29,7 +31,11 @@ pub(super) fn matrix() -> PlatformIoBackendMatrix {
     {
         windows_backend::matrix()
     }
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    {
+        macos_backend::matrix()
+    }
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     {
         unix_backend::matrix()
     }
