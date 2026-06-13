@@ -4767,6 +4767,13 @@ mod tests {
             stats.platform_io_operations.persist.true_platform_async > 0,
             "Linux platform persist should report true platform async"
         );
+        assert!(
+            stats
+                .platform_io_operations
+                .total()
+                .uses_true_platform_async(),
+            "Linux platform diagnostics should aggregate true platform async work"
+        );
 
         std::fs::remove_dir_all(root).expect("test dir removes");
     }
@@ -4935,6 +4942,13 @@ mod tests {
         assert!(
             stats
                 .platform_io_operations
+                .total()
+                .uses_true_platform_async(),
+            "Linux platform management diagnostics should aggregate true platform async work"
+        );
+        assert!(
+            stats
+                .platform_io_operations
                 .directory_listing
                 .blocking_fallback
                 > 0,
@@ -5003,6 +5017,15 @@ mod tests {
                 .platform_managed_fallback
                 > 0,
             "Unix fallback platform random read should report managed fallback"
+        );
+        let platform_total = stats.platform_io_operations.total();
+        assert!(
+            platform_total.uses_fallback(),
+            "non-Linux platform diagnostics should aggregate fallback work"
+        );
+        assert!(
+            !platform_total.uses_true_platform_async(),
+            "non-Linux fallback diagnostics should not report true platform async work"
         );
 
         std::fs::remove_dir_all(root).expect("test dir removes");

@@ -488,6 +488,14 @@ stronger target backends exist. That current-state classification is not the
 platform-io goal; the goal is that each platform backend handles its own async
 or fallback mechanics while preserving one Trine operation boundary for KV code.
 
+Public diagnostics expose that boundary through
+`DbStats::storage_platform_io_operations`. Each operation has class counters for
+true platform async, partial native async, platform-managed fallback, blocking
+fallback, and unsupported completions. `PlatformIoOperationStats::total()` sums
+all operation rows into one class counter set for dashboards and health checks;
+individual rows remain the source of truth when a caller needs to know whether,
+for example, random reads differ from directory listing on the selected target.
+
 ### 9.3 WASI Backend
 
 The WASI backend is persistent only when the host grants suitable storage

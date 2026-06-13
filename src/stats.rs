@@ -182,29 +182,174 @@ pub struct StorageOperationStats {
 
 /// Platform I/O capability-class counters for one Trine storage operation.
 ///
-/// Each field is a task count. A single operation request increments exactly
-/// one field when it goes through the `platform-io` driver. Operations that use
-/// the normal bounded sync adapter or inline native file path do not increment
-/// this structure.
+/// Each field is a task count. A single operation request increments exactly one
+/// field when it goes through the `platform-io` driver. Operations that use the
+/// normal bounded sync adapter or inline native file path do not increment this
+/// structure. A zero value usually means the operation has not run through the
+/// platform driver during the stats interval, not that the target lacks support.
+///
+/// Use [`Self::total`] to count all platform-driver completions for the
+/// operation, and [`Self::fallback_total`] to count completions that were not
+/// end-to-end true platform async.
+///
+/// # Examples
+///
+/// ```
+/// use trine_kv::PlatformIoClassCounters;
+///
+/// let counters = PlatformIoClassCounters {
+///     true_platform_async: 2,
+///     platform_managed_fallback: 1,
+///     ..PlatformIoClassCounters::default()
+/// };
+///
+/// assert_eq!(counters.total(), 3);
+/// assert_eq!(counters.fallback_total(), 1);
+/// assert!(counters.uses_true_platform_async());
+/// assert!(counters.uses_fallback());
+/// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PlatformIoClassCounters {
-    /// Completed through a real platform async completion mechanism.
+    /// Completions that used a real platform async completion mechanism.
+    ///
+    /// These are operation requests whose selected backend class is true
+    /// platform async for the whole Trine storage operation. On the current
+    /// backend matrix this is expected on Linux for the operations audited as
+    /// true async.
     pub true_platform_async: u64,
-    /// Used at least one native async primitive but still needed fallback work.
+    /// Completions that used native async primitives but still needed fallback
+    /// work.
+    ///
+    /// This class means the platform has audited native async evidence for part
+    /// of the operation, but at least one user-visible step such as open,
+    /// metadata, sync, rename, delete, directory work, or lease handling is not
+    /// yet true platform async.
     pub platform_native_async_but_partial: u64,
-    /// Completed through a fallback managed inside the platform driver.
+    /// Completions handled by a fallback managed inside the platform driver.
+    ///
+    /// The operation still crossed the platform-io boundary, but the selected
+    /// backend did not provide true async behavior for this Trine operation.
     pub platform_managed_fallback: u64,
-    /// Completed through an explicit platform-driver blocking fallback.
+    /// Completions handled by an explicit platform-driver blocking fallback.
+    ///
+    /// This is used for operations such as directory listing when the selected
+    /// backend has no real async enumeration path.
     pub blocking_fallback: u64,
-    /// Reached a platform I/O operation that the target cannot support.
+    /// Completions rejected because the target cannot support the operation.
     pub unsupported: u64,
+}
+
+impl PlatformIoClassCounters {
+    /// Returns the total number of platform-driver completions in these class
+    /// counters.
+    ///
+    /// The result is a task count. It is the saturating sum of all class fields,
+    /// so it stays at `u64::MAX` instead of wrapping if counters are combined
+    /// after a very long process lifetime.
+    #[must_use]
+    pub fn total(self) -> u64 {
+        self.true_platform_async
+            .saturating_add(self.platform_native_async_but_partial)
+            .saturating_add(self.platform_managed_fallback)
+            .saturating_add(self.blocking_fallback)
+            .saturating_add(self.unsupported)
+    }
+
+    /// Returns whether no platform-driver completion has been recorded.
+    ///
+    /// A zero result means this counter set is empty for the observed stats
+    /// snapshot. It does not by itself prove that the operation is unsupported;
+    /// use [`Self::has_unsupported`] after the operation has been attempted to
+    /// check unsupported completions.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.total() == 0
+    }
+
+    /// Returns the number of platform-driver completions that were not true
+    /// platform async for the whole Trine operation.
+    ///
+    /// This includes partial native async, platform-managed fallback, blocking
+    /// fallback, and unsupported completions. It excludes
+    /// [`Self::true_platform_async`].
+    #[must_use]
+    pub fn fallback_total(self) -> u64 {
+        self.platform_native_async_but_partial
+            .saturating_add(self.platform_managed_fallback)
+            .saturating_add(self.blocking_fallback)
+            .saturating_add(self.unsupported)
+    }
+
+    /// Returns whether at least one completion was true platform async for the
+    /// whole Trine operation.
+    #[must_use]
+    pub fn uses_true_platform_async(self) -> bool {
+        self.true_platform_async > 0
+    }
+
+    /// Returns whether at least one completion used a partial, managed,
+    /// blocking, or unsupported fallback class.
+    #[must_use]
+    pub fn uses_fallback(self) -> bool {
+        self.fallback_total() > 0
+    }
+
+    /// Returns whether at least one completion reached an unsupported platform
+    /// operation.
+    #[must_use]
+    pub fn has_unsupported(self) -> bool {
+        self.unsupported > 0
+    }
+
+    fn saturating_add_assign(&mut self, other: Self) {
+        self.true_platform_async = self
+            .true_platform_async
+            .saturating_add(other.true_platform_async);
+        self.platform_native_async_but_partial = self
+            .platform_native_async_but_partial
+            .saturating_add(other.platform_native_async_but_partial);
+        self.platform_managed_fallback = self
+            .platform_managed_fallback
+            .saturating_add(other.platform_managed_fallback);
+        self.blocking_fallback = self
+            .blocking_fallback
+            .saturating_add(other.blocking_fallback);
+        self.unsupported = self.unsupported.saturating_add(other.unsupported);
+    }
 }
 
 /// Per-operation platform I/O capability-class counters.
 ///
-/// This table uses Trine operation names instead of OS API names. It lets tests
-/// and diagnostics distinguish, for example, random reads from directory
-/// listing even when both are routed through the same selected platform driver.
+/// This table uses Trine operation names instead of OS API names. It lets
+/// diagnostics distinguish, for example, random reads from directory listing
+/// even when both are routed through the same selected platform driver.
+///
+/// Use [`Self::total`] to summarize all operations into one class counter set
+/// for dashboards, health checks, or tests that only need to know whether any
+/// platform I/O work used true async, fallback, or unsupported classes.
+///
+/// # Examples
+///
+/// ```
+/// use trine_kv::{PlatformIoClassCounters, PlatformIoOperationStats};
+///
+/// let stats = PlatformIoOperationStats {
+///     random_read: PlatformIoClassCounters {
+///         true_platform_async: 4,
+///         ..PlatformIoClassCounters::default()
+///     },
+///     directory_listing: PlatformIoClassCounters {
+///         blocking_fallback: 1,
+///         ..PlatformIoClassCounters::default()
+///     },
+///     ..PlatformIoOperationStats::default()
+/// };
+///
+/// let total = stats.total();
+/// assert_eq!(total.total(), 5);
+/// assert!(total.uses_true_platform_async());
+/// assert!(total.uses_fallback());
+/// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PlatformIoOperationStats {
     /// Length lookups for readable native-file objects.
@@ -233,6 +378,32 @@ pub struct PlatformIoOperationStats {
     pub directory_listing: PlatformIoClassCounters,
     /// Writer-lease acquisition requests.
     pub writer_lease: PlatformIoClassCounters,
+}
+
+impl PlatformIoOperationStats {
+    /// Returns class counters summed across every Trine platform I/O operation.
+    ///
+    /// Each field in the returned value is a task count. The sums saturate at
+    /// `u64::MAX`, matching [`PlatformIoClassCounters::total`], so callers can
+    /// safely aggregate snapshots from long-lived processes without wrapping.
+    #[must_use]
+    pub fn total(self) -> PlatformIoClassCounters {
+        let mut total = PlatformIoClassCounters::default();
+        total.saturating_add_assign(self.length_lookup);
+        total.saturating_add_assign(self.random_read);
+        total.saturating_add_assign(self.whole_object_read);
+        total.saturating_add_assign(self.temp_write_rename_publish);
+        total.saturating_add_assign(self.append_open);
+        total.saturating_add_assign(self.append);
+        total.saturating_add_assign(self.persist);
+        total.saturating_add_assign(self.wal_rewrite);
+        total.saturating_add_assign(self.delete);
+        total.saturating_add_assign(self.directory_create);
+        total.saturating_add_assign(self.directory_sync);
+        total.saturating_add_assign(self.directory_listing);
+        total.saturating_add_assign(self.writer_lease);
+        total
+    }
 }
 
 #[derive(Debug, Default)]
@@ -384,5 +555,59 @@ impl FilterStats {
         self.block_prefix_false_positives = self
             .block_prefix_false_positives
             .saturating_add(other.block_prefix_false_positives);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PlatformIoClassCounters, PlatformIoOperationStats};
+
+    #[test]
+    fn platform_io_class_counter_helpers_summarize_classes() {
+        let counters = PlatformIoClassCounters {
+            true_platform_async: 2,
+            platform_native_async_but_partial: 3,
+            platform_managed_fallback: 5,
+            blocking_fallback: 7,
+            unsupported: 11,
+        };
+
+        assert_eq!(counters.total(), 28);
+        assert_eq!(counters.fallback_total(), 26);
+        assert!(!counters.is_empty());
+        assert!(counters.uses_true_platform_async());
+        assert!(counters.uses_fallback());
+        assert!(counters.has_unsupported());
+        assert!(PlatformIoClassCounters::default().is_empty());
+    }
+
+    #[test]
+    fn platform_io_operation_stats_total_saturates_by_class() {
+        let stats = PlatformIoOperationStats {
+            length_lookup: PlatformIoClassCounters {
+                true_platform_async: u64::MAX,
+                platform_managed_fallback: 1,
+                ..PlatformIoClassCounters::default()
+            },
+            random_read: PlatformIoClassCounters {
+                true_platform_async: 1,
+                platform_native_async_but_partial: 2,
+                blocking_fallback: 3,
+                unsupported: 4,
+                ..PlatformIoClassCounters::default()
+            },
+            directory_listing: PlatformIoClassCounters {
+                blocking_fallback: 5,
+                ..PlatformIoClassCounters::default()
+            },
+            ..PlatformIoOperationStats::default()
+        };
+
+        let total = stats.total();
+        assert_eq!(total.true_platform_async, u64::MAX);
+        assert_eq!(total.platform_native_async_but_partial, 2);
+        assert_eq!(total.platform_managed_fallback, 1);
+        assert_eq!(total.blocking_fallback, 8);
+        assert_eq!(total.unsupported, 4);
     }
 }

@@ -10939,3 +10939,55 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Start Phase 158: Public Platform-I/O Diagnostics.
+
+## 2026-06-13: Public Platform-I/O Diagnostics Complete
+
+### Observation
+
+- `PlatformIoClassCounters` and `PlatformIoOperationStats` are now re-exported
+  from the crate root alongside `DbStats`.
+- `PlatformIoClassCounters` exposes public helpers for total completions,
+  fallback completions, empty checks, true-async checks, fallback checks, and
+  unsupported checks.
+- `PlatformIoOperationStats::total()` sums all Trine operation rows into one
+  class counter set using saturating arithmetic.
+- Public usage docs explain how to interpret true platform async, partial native
+  async, platform-managed fallback, blocking fallback, and unsupported
+  counters.
+- Existing Linux and non-Linux platform-io tests now also assert aggregate
+  diagnostics.
+
+### Interpretation
+
+- Users no longer need to hand-sum every operation row to answer whether the
+  selected platform driver actually produced true async completions or fallback
+  completions.
+- The public diagnostics remain aligned with the Trine storage operation
+  boundary instead of leaking OS API details into KV-facing code.
+- Phase 159 can revalidate engine paths against a stable, public diagnostics
+  surface.
+
+### Verification
+
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo test -q platform_io_class_counter_helpers_summarize_classes`
+- `cargo test -q platform_io_operation_stats_total_saturates_by_class`
+- `cargo test -q platform_io_without_true_async_storage_ops_uses_platform_driver_fallback --features platform-io`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test -q --doc --all-features`
+- `cargo clippy -q --all-features`
+- `cargo test -q`
+- `cargo test -q --features platform-io`
+- `docker run --rm --security-opt seccomp=unconfined -v /Users/poria/Developer/Work/Azoth/trine-kv:/workspace -w /workspace -e CARGO_TARGET_DIR=/tmp/trine-kv-target rust:1.85-bookworm cargo test -q --features platform-io platform_io`
+
+### Remaining Blockers
+
+- Real Windows, FreeBSD, and illumos runtime diagnostics were not run in this
+  environment.
+- Complete-operation true async upgrades still need implementation for
+  non-Linux targets where current operations are partial or fallback-classified.
+
+### Recommended Next Action
+
+- Start Phase 159: Engine Path Revalidation On Cross-Platform Platform-I/O.

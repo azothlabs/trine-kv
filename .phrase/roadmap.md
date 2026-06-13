@@ -3890,7 +3890,7 @@ operation-level platform capability.
 
 ### Phase 158: Public Platform-I/O Diagnostics
 
-**Status**: Planned
+**Status**: Complete
 
 **Goal**: Make platform-io behavior visible enough that users and tests can see
 which operations are true platform async, platform-managed fallback, blocking

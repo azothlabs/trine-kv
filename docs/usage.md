@@ -133,14 +133,47 @@ driver (`storage_uses_platform_io_driver`) and separates true platform async
 file work (`storage_platform_async_io_tasks`) from platform backend fallback
 work (`storage_platform_backend_fallback_tasks`), platform-driver blocking
 fallback work (`storage_platform_sync_fallback_tasks`), and Trine's bounded
-sync-adapter task count. Directory and object listing are currently submitted
-through the platform driver as blocking fallback work because the selected
-backend does not expose a real async enumeration operation.
+sync-adapter task count. `storage_uses_platform_async_io` is true only when at
+least one current Trine storage operation is classified as true platform async
+on the selected target.
 
 `storage_platform_io_operations` breaks the same information down by Trine
 operation, such as random reads, WAL rewrite, directory sync, and writer lease.
 Each operation records whether it completed as true platform async, partial
 native async, platform-managed fallback, blocking fallback, or unsupported.
+The operation table uses Trine storage operation names rather than OS API names
+so the KV engine and callers can share one portable diagnostic vocabulary.
+Directory and object listing are currently submitted through the platform
+driver as blocking fallback work because the selected backend does not expose a
+real async enumeration operation.
+
+```rust
+let stats = db.stats();
+let platform_total = stats.storage_platform_io_operations.total();
+
+if stats.storage_uses_platform_io_driver {
+    println!("platform driver completions: {}", platform_total.total());
+    println!(
+        "true async completions: {}",
+        platform_total.true_platform_async,
+    );
+    println!("fallback completions: {}", platform_total.fallback_total());
+}
+```
+
+For a specific operation, inspect that operation's class counters:
+
+```rust
+let random_reads = db.stats().storage_platform_io_operations.random_read;
+
+if random_reads.uses_true_platform_async() {
+    println!("some random reads completed as true platform async");
+}
+
+if random_reads.uses_fallback() {
+    println!("some random reads used partial, managed, blocking, or unsupported fallback");
+}
+```
 
 On targets where every current Trine storage operation is fallback-classified,
 `RuntimeOptions::platform_io()` can still use the platform driver, but it does
