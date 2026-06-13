@@ -11046,3 +11046,47 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Start Phase 160: Native Async Compaction Output And Cleanup.
+
+## 2026-06-13: Platform-I/O Backend Completion Supersedes Engine Revalidation
+
+### Observation
+
+- User corrected the phase order: platform-io must first complete its role as
+  Trine's cross-platform async file I/O abstraction.
+- Linux still has at least one known fallback row: directory listing.
+- Windows remains partial at the complete Trine operation level because open,
+  metadata, sync, rename, delete, directory, and lease steps are not fully
+  completed.
+- macOS remains managed fallback until an Apple-supported async file path is
+  selected or implemented.
+- Other Unix should remain fallback for now.
+- Every platform must be accepted by complete Trine operation rows, not by the
+  existence of a lower-level OS async primitive.
+
+### Interpretation
+
+- Phase 159 remains useful as a diagnostic checkpoint, but its recommended
+  engine implementation phase was premature.
+- The immediate sequence must return to platform-io backend completion:
+  Linux first, then Windows, then macOS, then a cross-platform acceptance
+  matrix.
+- Engine revalidation should resume only after platform-io backend capability
+  is no longer a half-finished premise.
+
+### Verification
+
+- `.phrase/decision.md` now records platform-io completion before engine
+  revalidation as a durable boundary.
+- `.phrase/roadmap.md` now moves engine revalidation after Linux, Windows,
+  macOS, and cross-platform platform-io acceptance phases.
+- `.phrase/current.md` now starts Phase 160 as Linux Platform-I/O Completion.
+
+### Remaining Blockers
+
+- Linux directory listing backend support needs source/kernel audit.
+- Windows complete-operation implementation remains open.
+- macOS backend selection remains open.
+
+### Recommended Next Action
+
+- Start Phase 160 by auditing and resolving Linux directory listing.

@@ -2,102 +2,88 @@
 
 ## Status
 
-Complete
+Active
 
 ## Goal
 
-Revalidate engine write, flush, compaction, maintenance, cleanup, and close
-paths against the corrected cross-platform platform-io contract, then choose
-the next async phase from evidence.
+Finish Linux platform-io as a complete Trine-operation backend before returning
+to engine revalidation.
 
 ## Scope
 
-- Use public platform-io diagnostics and storage operation counters to validate
-  the current async write and public flush paths.
-- Audit compaction, maintenance, cleanup, and close paths for the storage
-  operations they depend on and whether those operations are currently awaited
-  through platform-io or still run behind runtime/task boundaries.
-- Record the next phase from fresh evidence instead of carrying forward an old
-  Linux-only residual list.
-- Keep this phase diagnostic and decision-focused unless a small missing test or
-  doc update is required to prove the classification.
+- Audit Linux operation rows at the Trine operation boundary:
+  random read, whole-object read, temporary write plus rename publish, append
+  open, append, persist, WAL rewrite, delete, directory create, directory sync,
+  directory listing, and writer lease.
+- Remove remaining Linux fallback rows where the selected backend/kernel
+  contract can support a complete true async operation.
+- Treat directory listing as the first known Linux gap.
+- Keep other platforms out of this phase except for ensuring the shared
+  operation table and diagnostics remain portable.
 
 ## Backend Boundary Receipt
 
-- Owned public surface: `DbStats` storage operation counters and platform-io
-  operation counters.
-- Owned internal paths: write/WAL append, public flush, compaction table write
-  and cleanup, cooperative maintenance, blob cleanup, and database close.
-- Operation names remain: length lookup, owned random read, whole-object read,
-  temporary write plus rename publish, append open, append, persist/fsync, WAL
-  rewrite, delete, directory create, directory sync, directory listing, and
-  writer lease.
-- Current platform-io class meanings remain unchanged.
-- Leak-check scope: KV engine code should depend on Trine storage operations
-  and runtime capabilities, not OS-specific async mechanisms.
-- Verification gate: targeted tests for write/flush diagnostics, audit evidence
-  for compaction/maintenance/cleanup/close, and full local gates if code or docs
-  change.
+- Trine operation names are the acceptance rows, not OS syscall names.
+- Owned internal surface: Linux platform backend matrix, platform task
+  submission for directory/listing operations, and platform-io diagnostics.
+- Chosen backend: selected Linux platform-io backend behind Trine's
+  `PlatformIoDriver`.
+- Known backend limit entering the phase: directory listing is currently
+  `BlockingFallback`; other Linux rows are currently reported as true platform
+  async by existing tests but must be rechecked as complete Trine operations.
+- Leak-check scope: no Linux-specific branching in KV engine code.
+- Verification gate: Docker Linux platform-io tests asserting every Linux
+  operation row and local cross-platform checks for unaffected fallback targets.
 
 ## Out Of Scope
 
-- Implementing new OS-specific platform backends.
-- Changing storage formats, WAL/manifest/table semantics, MVCC, transaction
-  semantics, or durability semantics.
-- Rewriting compaction or maintenance in this phase unless evidence shows a
-  small local correction is required for diagnostics.
-- Publishing, tagging, pushing, or creating a GitHub release.
+- Windows partial-operation completion.
+- macOS backend selection or Apple-specific implementation.
+- Other Unix upgrades beyond preserving fallback classification.
+- Engine compaction, maintenance, cleanup, close, or broader engine
+  revalidation.
+- Storage format changes, publishing, tagging, pushing, or PR creation.
 
 ## Acceptance Gate
 
-- Existing native async write and flush paths are validated against the
-  operation table across available platforms.
-- Compaction, maintenance, cleanup, and close have recorded storage-operation
-  dependencies and current async/fallback class limits.
-- The next engine async phase is chosen from evidence.
-- Phase completion is recorded in evidence and committed before starting the
-  next phase.
+- Linux operation rows are all asserted by tests at the complete Trine operation
+  boundary.
+- Directory listing is no longer an unexamined blocking fallback; it is either
+  true platform async or explicitly proven unavailable for the selected
+  backend/kernel contract.
+- Public protocol/evidence records any hard Linux backend limit.
+- Phase completion is recorded in evidence and committed before starting
+  Windows.
 
 ## Active Task Slice
 
 ```text
-task704 [x] goal:start engine path revalidation phase | scope:current roadmap | verify:phase brief
-task705 [x] goal:audit write and flush diagnostics | scope:src/db.rs tests/async_api.rs | verify:targeted tests
-task706 [x] goal:audit compaction and maintenance storage dependencies | scope:src/db.rs src/storage.rs | verify:evidence table
-task707 [x] goal:audit cleanup and close storage dependencies | scope:src/db.rs src/storage.rs | verify:evidence table
-task708 [x] goal:choose next async phase from evidence | scope:evidence roadmap current | verify:updated docs
-task709 [x] goal:verify and commit Phase 159 | scope:tests docs git | verify:commit
+task710 [x] goal:correct roadmap back to platform-io backend completion | scope:decision roadmap current | verify:docs diff
+task711 [ ] goal:audit Linux directory listing backend support | scope:kernel/backend/source | verify:source evidence
+task712 [ ] goal:update Linux backend implementation or classification | scope:src/io src/io/platform_backend | verify:Docker Linux platform-io tests
+task713 [ ] goal:assert every Linux operation row | scope:tests stats | verify:Docker Linux matrix tests
+task714 [ ] goal:record and commit Phase 160 | scope:evidence roadmap git | verify:commit
 ```
 
 ## Evidence
 
-- Phase 158 made operation-level platform-io totals public and tested on Linux
-  and local non-Linux fallback paths.
-- Existing async write and flush tests assert Linux platform-io operation
-  counters for append, temporary write plus rename publish, and WAL rewrite.
-- `flush_native_async()` awaits async table writes, directory sync, manifest
-  publish, and WAL rewrite through storage operations, but cleanup still uses
-  synchronous delete helpers.
-- Native `compact_range`, budgeted compaction, and native maintenance still wrap
-  sync implementations in `run_native_blocking_task`.
-- Native compaction output table/blob writes use synchronous table/blob writers.
-- Native close still wraps `close_sync()` in `run_native_blocking_task` and
-  performs shutdown, publish-barrier waiting, cleanup, and writer lease release
-  as one lifecycle boundary.
-- Docker Linux platform-io diagnostics prove compaction writes storage output
-  tables without increasing the true-platform-async temporary write/rename
-  counter.
+- User correction on 2026-06-13: platform-io must first complete its role as
+  the cross-platform async abstraction before engine revalidation resumes.
+- Phase 158 made per-operation diagnostics available.
+- Phase 159 is retained as a diagnostic checkpoint, but its recommended next
+  action is superseded by the platform-io backend completion sequence.
+- Linux directory listing is the known remaining Linux fallback row.
 
 ## Known Residuals
 
-- Real Windows, FreeBSD, and illumos runtime diagnostics remain external to this
-  local host.
-- Real Windows, FreeBSD, and illumos runtime diagnostics remain external to this
-  local host.
-- Close remains a lifecycle boundary for a later phase because it couples worker
-  shutdown, publish-barrier waiting, cleanup, and writer lease release.
+- Windows remains partial for complete operations that still include open,
+  metadata, sync, rename, delete, directory, or lease fallback steps.
+- macOS needs a newly selected or implemented Apple-side async file path before
+  it can move beyond managed fallback.
+- Other Unix remains fallback unless later evidence proves more.
 
 ## Next Recommendation
 
-- Commit Phase 159, then start Phase 160: native async compaction output and
-  cleanup.
+- Audit Linux directory listing support in the selected backend/kernel path,
+  then either implement true async listing or record a hard backend limit with
+  tests.

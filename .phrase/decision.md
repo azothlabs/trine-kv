@@ -70,6 +70,16 @@ Evidence notes should separate:
   only provides polling, thread-pool fallback, or lower-level primitives that
   are not enough for a complete Trine operation must not advertise that
   capability.
+- Platform-io completion must be judged before engine revalidation. The
+  platform-io responsibility is to be Trine's cross-platform async file I/O
+  abstraction; engine phases must not treat a half-complete backend matrix as
+  the final async boundary.
+- Platform-io backend acceptance is per complete Trine operation, not per OS
+  primitive. The required operation rows are random read, whole-object read,
+  temporary write plus rename publish, append open, append, persist, WAL
+  rewrite, delete, directory create, directory sync, directory listing, and
+  writer lease. Each row must report whether the complete operation is true
+  platform async, partial, fallback, or unsupported on the selected platform.
 - Persistent storage behavior is governed by backend capabilities, including
   writer lease, manifest publish, durability strength, and background-work
   support.

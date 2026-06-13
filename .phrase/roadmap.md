@@ -3935,29 +3935,127 @@ one non-Linux backend path has been implemented or explicitly classified.
 - Adding new OS backends beyond those already selected by evidence.
 - Storage format changes, publishing, tagging, pushing, or PR creation.
 
-### Phase 160: Native Async Compaction Output And Cleanup
+### Phase 160: Linux Platform-I/O Completion
 
 **Status**: Planned
 
-**Goal**: Move native compaction output writes, compaction directory sync, and
-cleanup deletes onto awaitable storage operations where platform-io can report
-their operation classes.
+**Goal**: Finish Linux platform-io as a complete Trine-operation backend by
+removing remaining fallback rows, especially directory listing, or recording a
+hard kernel/backend impossibility with tests that keep the row honest.
 
-**Entry Condition**: Phase 159 proves that write/flush are already represented
-in platform-io diagnostics while compaction and cleanup remain on synchronous
-native helpers.
+**Entry Condition**: Phase 158 exposes per-operation diagnostics and Phase 159
+shows engine revalidation is premature until platform-io backends are complete.
 
 **Acceptance Gate**:
 
-- Native compaction output table/blob writes use async storage helpers where
-  the selected backend supports them.
-- Compaction and flush cleanup deletes can be awaited through the storage
-  boundary instead of calling synchronous delete helpers on the async path.
-- Platform-io diagnostics prove the changed operations on Linux and do not
-  overstate non-Linux fallback behavior.
-- Storage format and compaction semantics remain unchanged.
+- Linux operation rows are validated as complete Trine operations:
+  random read, whole-object read, temp write plus rename publish, append open,
+  append, persist, WAL rewrite, delete, directory create, directory sync,
+  directory listing, and writer lease.
+- Directory listing no longer remains an unexamined blocking fallback. It is
+  either true platform async or explicitly proven unavailable for the selected
+  Linux backend/kernel contract.
+- Docker Linux platform-io tests assert the final Linux class for every
+  operation row.
+- KV engine code does not gain Linux-specific branching.
 
 **Major Out Of Scope**:
 
-- Reworking close, worker shutdown, manifest semantics, or new OS backends.
-- Storage format changes, publishing, tagging, pushing, or PR creation.
+- Windows/macOS backend upgrades, engine revalidation, storage format changes,
+  publishing, tagging, pushing, or PR creation.
+
+### Phase 161: Windows Platform-I/O Operation Completion
+
+**Status**: Planned
+
+**Goal**: Turn Windows from partial-operation diagnostics into complete
+Trine-operation implementations where Windows has a provable native async path.
+
+**Entry Condition**: Linux backend completion gives the operation-level
+acceptance harness a stable shape.
+
+**Acceptance Gate**:
+
+- Windows open, metadata, sync, rename, delete, directory create/sync/listing,
+  and writer lease steps are implemented or classified at the complete
+  operation boundary.
+- Partial rows are split so each full Trine operation reports true async,
+  partial, fallback, or unsupported from evidence, not from lower-level
+  primitive availability alone.
+- Windows target checks and available runtime tests prove the matrix.
+
+**Major Out Of Scope**:
+
+- macOS backend selection, other Unix upgrades, engine revalidation, storage
+  format changes, publishing, tagging, pushing, or PR creation.
+
+### Phase 162: macOS Platform-I/O Backend Selection
+
+**Status**: Planned
+
+**Goal**: Re-select or implement the Apple-side native file I/O path so macOS
+does not remain a generic managed fallback without proof.
+
+**Entry Condition**: Windows/Linux operation-level harnesses make backend
+claims measurable at the Trine operation boundary.
+
+**Acceptance Gate**:
+
+- Apple-supported async file mechanisms are audited before implementation
+  claims are made.
+- macOS operation rows are implemented or honestly classified as true async,
+  partial, fallback, or unsupported per complete Trine operation.
+- macOS tests prove the selected matrix and avoid claiming true async from
+  polling or helper-managed fallback alone.
+
+**Major Out Of Scope**:
+
+- Other Unix upgrades beyond fallback classification, engine revalidation,
+  storage format changes, publishing, tagging, pushing, or PR creation.
+
+### Phase 163: Platform-I/O Cross-Platform Acceptance Matrix
+
+**Status**: Planned
+
+**Goal**: Close platform-io as Trine's cross-platform async abstraction by
+checking Linux, Windows, macOS, and other Unix against one operation-level
+acceptance matrix.
+
+**Entry Condition**: Linux, Windows, and macOS backend phases have current
+operation-level evidence.
+
+**Acceptance Gate**:
+
+- Every listed Trine operation has an asserted class on Linux, Windows, macOS,
+  and other Unix.
+- Other Unix remains fallback unless a target-specific audit proves more.
+- Public docs explain the completed backend matrix without implying that an OS
+  primitive alone completes a Trine operation.
+- Engine revalidation is explicitly unblocked only after this matrix passes.
+
+**Major Out Of Scope**:
+
+- Engine path rewrites, storage format changes, publishing, tagging, pushing,
+  or PR creation.
+
+### Phase 164: Engine Revalidation After Platform-I/O Completion
+
+**Status**: Planned
+
+**Goal**: Revisit write, flush, compaction, maintenance, cleanup, and close only
+after platform-io backends have completed their cross-platform abstraction
+responsibility.
+
+**Entry Condition**: Phase 163 closes the operation-level platform-io matrix.
+
+**Acceptance Gate**:
+
+- Engine path decisions use the completed platform-io matrix, not temporary
+  backend gaps.
+- Any engine async work records which completed platform-io operations it
+  depends on.
+
+**Major Out Of Scope**:
+
+- New OS backend discovery, storage format changes, publishing, tagging,
+  pushing, or PR creation.
