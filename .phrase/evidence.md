@@ -10891,3 +10891,51 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Start Phase 157: BSD and other Unix platform backend classification.
+
+## 2026-06-13: BSD And Other Unix Backend Classification Complete
+
+### Observation
+
+- `PlatformIoBackendKind` now distinguishes `FreeBsdNative`,
+  `SolarishNative`, and generic `UnixFallback`.
+- FreeBSD and Solaris-family backend matrices classify operations with selected
+  backend AIO read/write/sync primitive coverage as
+  `PlatformNativeAsyncButPartial`.
+- FreeBSD and Solaris-family operations that do not include audited AIO
+  primitive coverage remain `PlatformManagedFallback`; directory listing
+  remains `BlockingFallback`.
+- Generic other Unix targets remain `PlatformManagedFallback` except directory
+  listing, which remains `BlockingFallback`.
+- `x86_64-unknown-freebsd` and `x86_64-unknown-illumos` targets were installed
+  for compile verification.
+
+### Interpretation
+
+- BSD/other Unix diagnostics are no longer a single vague fallback bucket.
+- FreeBSD and Solaris-family targets can now show partial native async coverage
+  without claiming complete true platform async Trine operations.
+- Real host runtime validation is still required before stronger claims.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo check -q --features platform-io`
+- `cargo test -q platform_backend_matrix_matches_target_family --features platform-io`
+- `cargo check -q --target x86_64-unknown-freebsd --features platform-io`
+- `cargo check -q --target x86_64-unknown-freebsd --features platform-io --tests`
+- `cargo check -q --target x86_64-unknown-illumos --features platform-io`
+- `cargo check -q --target x86_64-unknown-illumos --features platform-io --tests`
+- `cargo clippy -q --all-features`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test -q`
+- `cargo test -q --features platform-io`
+
+### Remaining Blockers
+
+- Real FreeBSD/illumos runtime tests were not run in this environment.
+- Complete-operation true async upgrades still need implementation for remaining
+  blocking/direct syscall steps.
+
+### Recommended Next Action
+
+- Start Phase 158: Public Platform-I/O Diagnostics.

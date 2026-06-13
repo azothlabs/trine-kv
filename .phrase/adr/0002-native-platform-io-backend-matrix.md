@@ -31,8 +31,12 @@ the architecture boundary. Platform support is not uniform:
   regular-file operations use the Unix polling path and remain
   platform-managed fallback until Apple-specific async file support is audited
   and implemented.
-- BSD and other Unix targets need platform-specific audits before Trine can
-  claim true platform async regular-file operations.
+- FreeBSD and Solaris-family targets have AIO primitive evidence in the
+  selected backend for read/write/sync steps, but complete Trine operations
+  remain partial while open, metadata, rename, delete, directory, listing, or
+  lease steps are still blocking or helper-managed.
+- Other Unix targets remain platform-managed fallback until platform-specific
+  audits prove stronger behavior.
 - Directory enumeration has no native async primitive in the selected backend.
 
 ## Decision
@@ -77,17 +81,17 @@ platform-specific implementation evidence.
 
 | Trine operation | Linux current / target | Windows current / target | macOS current / target | BSD/other Unix current / target | Generic fallback current / target |
 | --- | --- | --- | --- | --- | --- |
-| Length lookup | `TruePlatformAsync` / keep true async where supported | `PlatformNativeAsyncButPartial` / audit metadata path and make complete operation true async if possible | `PlatformManagedFallback` / audit Apple metadata APIs | `PlatformManagedFallback` / audit target APIs | `PlatformManagedFallback` / stay fallback unless target grows support |
-| Random read | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / complete overlapped read path | `PlatformManagedFallback` / audit native async read options | `PlatformManagedFallback` / audit target async read options | `PlatformManagedFallback` |
-| Whole-object read | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / complete open plus read path | `PlatformManagedFallback` / audit complete operation | `PlatformManagedFallback` / audit complete operation | `PlatformManagedFallback` |
-| Temporary write plus rename publish | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / audit write, sync, rename, and directory steps | `PlatformManagedFallback` / audit full publish path | `PlatformManagedFallback` / audit full publish path | `PlatformManagedFallback` |
-| Append open | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / audit append handle semantics | `PlatformManagedFallback` / audit append open | `PlatformManagedFallback` / audit append open | `PlatformManagedFallback` |
-| Append | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / complete serialized overlapped append or explicit lane strategy | `PlatformManagedFallback` / audit async append feasibility | `PlatformManagedFallback` / audit async append feasibility | `PlatformManagedFallback` |
-| Persist/fsync | `TruePlatformAsync` / keep true async when backend completion is real | `PlatformNativeAsyncButPartial` / audit flush completion semantics | `PlatformManagedFallback` / audit fsync/fcntl completion semantics | `PlatformManagedFallback` / audit fsync completion semantics | `PlatformManagedFallback` |
-| WAL rewrite | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / audit complete rewrite and publish steps | `PlatformManagedFallback` / audit rewrite path | `PlatformManagedFallback` / audit rewrite path | `PlatformManagedFallback` |
-| Delete | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / audit delete semantics | `PlatformManagedFallback` / audit delete semantics | `PlatformManagedFallback` / audit delete semantics | `PlatformManagedFallback` |
-| Directory create | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / audit create-directory completion | `PlatformManagedFallback` / audit create-directory completion | `PlatformManagedFallback` / audit create-directory completion | `PlatformManagedFallback` |
-| Directory sync | `TruePlatformAsync` / keep true async where supported | `PlatformNativeAsyncButPartial` / audit directory handle sync | `PlatformManagedFallback` / audit directory sync support | `PlatformManagedFallback` / audit directory sync support | `PlatformManagedFallback` |
+| Length lookup | `TruePlatformAsync` / keep true async where supported | `PlatformNativeAsyncButPartial` / audit metadata path and make complete operation true async if possible | `PlatformManagedFallback` / audit Apple metadata APIs | `PlatformManagedFallback` on other Unix; FreeBSD/Solaris-family managed for metadata | `PlatformManagedFallback` / stay fallback unless target grows support |
+| Random read | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / complete overlapped read path | `PlatformManagedFallback` / audit native async read options | FreeBSD/Solaris-family `PlatformNativeAsyncButPartial`; other Unix `PlatformManagedFallback` | `PlatformManagedFallback` |
+| Whole-object read | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / complete open plus read path | `PlatformManagedFallback` / audit complete operation | FreeBSD/Solaris-family `PlatformNativeAsyncButPartial`; other Unix `PlatformManagedFallback` | `PlatformManagedFallback` |
+| Temporary write plus rename publish | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / audit write, sync, rename, and directory steps | `PlatformManagedFallback` / audit full publish path | FreeBSD/Solaris-family `PlatformNativeAsyncButPartial`; other Unix `PlatformManagedFallback` | `PlatformManagedFallback` |
+| Append open | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / audit append handle semantics | `PlatformManagedFallback` / audit append open | `PlatformManagedFallback` | `PlatformManagedFallback` |
+| Append | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / complete serialized overlapped append or explicit lane strategy | `PlatformManagedFallback` / audit async append feasibility | FreeBSD/Solaris-family `PlatformNativeAsyncButPartial`; other Unix `PlatformManagedFallback` | `PlatformManagedFallback` |
+| Persist/fsync | `TruePlatformAsync` / keep true async when backend completion is real | `PlatformNativeAsyncButPartial` / audit flush completion semantics | `PlatformManagedFallback` / audit fsync/fcntl completion semantics | FreeBSD/Solaris-family `PlatformNativeAsyncButPartial`; other Unix `PlatformManagedFallback` | `PlatformManagedFallback` |
+| WAL rewrite | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / audit complete rewrite and publish steps | `PlatformManagedFallback` / audit rewrite path | FreeBSD/Solaris-family `PlatformNativeAsyncButPartial`; other Unix `PlatformManagedFallback` | `PlatformManagedFallback` |
+| Delete | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / audit delete semantics | `PlatformManagedFallback` / audit delete semantics | `PlatformManagedFallback` | `PlatformManagedFallback` |
+| Directory create | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / audit create-directory completion | `PlatformManagedFallback` / audit create-directory completion | `PlatformManagedFallback` | `PlatformManagedFallback` |
+| Directory sync | `TruePlatformAsync` / keep true async where supported | `PlatformNativeAsyncButPartial` / audit directory handle sync | `PlatformManagedFallback` / audit directory sync support | FreeBSD/Solaris-family `PlatformNativeAsyncButPartial`; other Unix `PlatformManagedFallback` | `PlatformManagedFallback` |
 | Directory listing | `BlockingFallback` / replace only if a real async enumeration operation exists | `BlockingFallback` / replace only with audited async enumeration | `BlockingFallback` / replace only with audited async enumeration | `BlockingFallback` / replace only with audited async enumeration | `BlockingFallback` |
 | Writer lease | `TruePlatformAsync` / keep true async where current backend supports it | `PlatformNativeAsyncButPartial` / audit lock/open semantics | `PlatformManagedFallback` / audit lock semantics | `PlatformManagedFallback` / audit lock semantics | `PlatformManagedFallback` or `Unsupported` by target |
 
@@ -114,8 +118,12 @@ Driver cleanup may start only after this contract is in place. It must:
 - macOS must not be described as true native async for regular files with the
   selected backend, but it is now a first-class platform-io target with an
   explicit matrix row.
-- BSD must not be described as true native async for regular files until a
-  stronger backend is implemented and verified.
+- FreeBSD and Solaris-family targets may be classified as partial for operations
+  that include selected-backend AIO read/write/sync primitives, but they must
+  not be described as complete true platform async until remaining blocking
+  steps are replaced and verified.
+- Other BSD/Unix targets must not be described as true native async for regular
+  files until a stronger backend is implemented and verified.
 - Directory enumeration remains a separately counted blocker until a backend
   exposes a real async directory enumeration operation.
 - With the current backend matrix, non-Linux targets can use the platform I/O

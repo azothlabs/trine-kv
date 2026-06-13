@@ -3866,7 +3866,7 @@ operation-level platform capability.
 
 ### Phase 157: BSD And Other Unix Platform Backends
 
-**Status**: Planned
+**Status**: Complete
 
 **Goal**: Give BSD and other Unix targets explicit platform-io capability
 classification, implementing platform-specific async operations where the OS

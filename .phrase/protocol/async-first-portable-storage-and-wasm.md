@@ -475,6 +475,13 @@ targets, so macOS regular-file read, write, sync, open, stat, rename, delete,
 and directory operations remain platform-managed fallback or blocking fallback
 until an Apple-specific backend is implemented.
 
+On FreeBSD and Solaris-family targets, the selected backend exposes libc AIO for
+some regular-file read, write, and sync primitives. Complete Trine operations
+that include those primitives are `PlatformNativeAsyncButPartial` while open,
+stat, rename, delete, directory, listing, or lease steps remain blocking or
+helper-managed. Other Unix targets remain `PlatformManagedFallback` unless a
+target-specific audit proves stronger behavior.
+
 On non-Linux targets it can still route native storage through the platform
 driver, but current operations remain partial or fallback-classified until
 stronger target backends exist. That current-state classification is not the

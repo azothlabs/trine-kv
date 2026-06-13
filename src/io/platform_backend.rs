@@ -11,11 +11,24 @@ use crate::{
 
 use super::{PlatformIoBackendMatrix, PlatformIoTask};
 
+#[cfg(target_os = "freebsd")]
+mod freebsd_backend;
 #[cfg(target_os = "linux")]
 mod linux_backend;
 #[cfg(target_os = "macos")]
 mod macos_backend;
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+#[cfg(any(target_os = "illumos", target_os = "solaris"))]
+mod solarish_backend;
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "illumos",
+        target_os = "solaris"
+    ))
+))]
 mod unix_backend;
 #[cfg(not(any(target_os = "linux", windows, unix)))]
 mod unsupported_backend;
@@ -35,7 +48,24 @@ pub(super) fn matrix() -> PlatformIoBackendMatrix {
     {
         macos_backend::matrix()
     }
-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    #[cfg(target_os = "freebsd")]
+    {
+        freebsd_backend::matrix()
+    }
+    #[cfg(any(target_os = "illumos", target_os = "solaris"))]
+    {
+        solarish_backend::matrix()
+    }
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "illumos",
+            target_os = "solaris"
+        ))
+    ))]
     {
         unix_backend::matrix()
     }

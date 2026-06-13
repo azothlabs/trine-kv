@@ -6,19 +6,21 @@ Complete
 
 ## Goal
 
-Give macOS its own platform-io backend classification instead of inheriting the
-generic non-Linux Unix fallback label. The macOS backend should remain honest:
-ordinary file work is platform-managed fallback until a platform-supported
-async regular-file path is audited and implemented.
+Give BSD and other Unix targets explicit platform-io classification instead of
+leaving every non-Linux/non-macOS Unix target in one vague fallback bucket.
+Where the selected backend exposes AIO primitives, classify complete Trine
+operations as partial until their remaining blocking steps are replaced.
 
 ## Scope
 
-- Audit the selected `compio` macOS regular-file path.
-- Add a distinct macOS platform backend kind and matrix module.
-- Keep macOS operation classes fallback-classified where the selected backend
-  uses blocking decisions or direct syscalls.
-- Verify macOS diagnostics on the local host.
-- Update ADR/protocol/evidence so macOS is first-class but not overstated.
+- Audit the selected `compio-driver 0.7.1` Unix backend for FreeBSD,
+  Solaris-family targets, and other Unix targets.
+- Split backend classifications where the selected backend has materially
+  different async support.
+- Keep complete Trine operation classes honest: AIO read/write/sync primitives
+  do not make operations true platform async if open, rename, delete, directory,
+  or lease steps remain blocking.
+- Record validation limits for targets not installed in this environment.
 
 ## Backend Boundary Receipt
 
@@ -26,24 +28,26 @@ async regular-file path is audited and implemented.
   temporary write plus rename publish, append open, append, persist/fsync, WAL
   rewrite, delete, directory create, directory sync, directory listing, and
   writer lease.
-- Owned interface: `PlatformIoBackendKind::MacOsNative`,
-  `src/io/platform_backend/macos_backend.rs`, platform operation stats, ADR
-  0002, and async storage protocol.
-- Chosen backend: selected `compio` Unix polling path on macOS.
-- Known backend limits: `compio-driver 0.7.1` enables AIO only for FreeBSD and
-  Solaris-family targets. On macOS, regular-file open/stat/read/write/sync and
-  rename/delete/create-directory operations are blocking decisions or direct
-  syscalls in the selected path.
-- Leak-check scope: no macOS-specific branching in KV engine code; only the
-  platform backend matrix and diagnostics distinguish macOS.
-- Verification gate: macOS host platform matrix/storage tests, formatting,
-  clippy/rustdoc if public docs are touched, full local tests if feasible, and
-  diff checks.
+- Owned interface: `PlatformIoBackendKind`, backend matrix modules,
+  `PlatformIoTaskClass`, platform I/O stats, ADR 0002, and async storage
+  protocol.
+- Chosen backend: selected `compio` Unix polling/AIO path. FreeBSD and
+  Solaris-family targets have AIO hooks for some regular-file read/write/sync
+  primitives; other Unix targets remain platform-managed fallback.
+- Known backend limits: FreeBSD/Solaris-family complete Trine operations are
+  partial, not true platform async, because open, stat, rename, delete,
+  directory, listing, and lease steps still include blocking/direct syscall
+  work.
+- Leak-check scope: no BSD/Unix-specific branching in KV engine code; only
+  platform backend matrices and diagnostics differ by target.
+- Verification gate: local compile/tests for unaffected targets, source audit,
+  target checks where installed, and explicit evidence for any unavailable
+  target runtime.
 
 ## Out Of Scope
 
-- Implementing new Apple-specific async file primitives.
-- Implementing Windows or BSD backend upgrades.
+- Implementing new BSD, Solaris, or Unix-specific async file primitives.
+- Implementing macOS or Windows upgrades.
 - Rewriting compaction, maintenance, cleanup, close, or cooperative
   maintenance.
 - Changing manifest, WAL, SSTable, MVCC, transaction, or recovery formats.
@@ -51,51 +55,42 @@ async regular-file path is audited and implemented.
 
 ## Acceptance Gate
 
-- macOS has an explicit backend kind and matrix module.
-- macOS ordinary file operations report `PlatformManagedFallback`.
-- macOS directory listing reports `BlockingFallback`.
-- Local macOS platform-io tests prove diagnostics use platform-driver fallback
-  counters and operation-level fallback counters.
-- Evidence records that true macOS async regular-file support remains a future
-  implementation/audit.
+- FreeBSD/Solaris-family async primitive evidence is recorded separately from
+  other Unix fallback evidence.
+- Backend matrix code exposes the distinction without changing KV engine code.
+- Other Unix targets remain `PlatformManagedFallback` unless audited otherwise.
+- Directory listing remains `BlockingFallback`.
+- Verification limits are recorded for targets unavailable in this environment.
 - Phase completion is committed before starting the next phase.
 
 ## Active Task Slice
 
 ```text
-task689 [x] goal:start macOS backend phase | scope:current roadmap | verify:phase brief
-task690 [x] goal:audit selected macOS compio path | scope:cargo registry source | verify:audit notes
-task691 [x] goal:add explicit macOS backend matrix | scope:src/io src/io/platform_backend | verify:platform matrix test
-task692 [x] goal:update docs/evidence for macOS backend limits | scope:ADR protocol evidence | verify:docs diff
-task693 [x] goal:verify and commit Phase 156 | scope:tests docs git | verify:local macOS gate
+task694 [x] goal:start BSD/other Unix phase | scope:current roadmap | verify:phase brief
+task695 [x] goal:audit selected Unix AIO/fallback paths | scope:cargo registry source | verify:audit notes
+task696 [x] goal:split BSD/Solaris-family backend classification | scope:src/io src/io/platform_backend | verify:local compile plus cfg review
+task697 [x] goal:update docs/evidence for BSD/other Unix limits | scope:ADR protocol evidence | verify:docs diff
+task698 [x] goal:verify and commit Phase 157 | scope:tests docs git | verify:available target checks
 ```
 
 ## Evidence
 
-- Local audit found `compio-driver 0.7.1` sets `aio` only for FreeBSD and
-  Solaris-family targets in `build.rs`.
-- Local audit found macOS regular-file `ReadAt`, `WriteAt`, and `Sync` on the
-  selected polling path use `Decision::Blocking` before direct `pread`,
-  `pwrite`, or `fsync` syscalls.
-- Local audit found open/stat/rename/delete/create-directory operations are
-  also blocking decisions or direct syscalls in the selected path.
-- `src/io/platform_backend/macos_backend.rs` now gives macOS an explicit
-  `MacOsNative` backend kind while keeping operation classes honest.
-- `cargo fmt --check`, `cargo check -q`, `cargo check -q --features
-  platform-io`, focused macOS platform tests, `cargo clippy -q
-  --all-features`, `cargo rustdoc --all-features -- -D warnings`,
-  `cargo test -q`, `cargo test -q --features platform-io`, and
-  `git diff --check` passed.
+- `compio-driver 0.7.1` build aliases set `aio` for FreeBSD and
+  Solaris-family targets only.
+- On non-AIO Unix targets, regular-file read/write/sync operations use blocking
+  decisions before direct syscalls.
+- FreeBSD/Solaris-family AIO primitive evidence still needs to be mapped to
+  complete Trine operation classes.
+- `FreeBsdNative` and `SolarishNative` backend kinds now distinguish selected
+  backend AIO primitive targets from other Unix fallback targets.
+- FreeBSD and illumos target checks passed with `platform-io`, including test
+  compilation.
 
 ## Known Residuals
 
-- No Apple-specific true async regular-file implementation exists in this
-  phase.
-- BSD/other Unix still need their own phase.
-- Engine compaction, maintenance, cleanup, close, and cooperative maintenance
-  still need later revalidation.
+- Real runtime validation on BSD/Solaris-family hosts remains external to this
+  local host; this phase verified target compilation only.
 
 ## Next Recommendation
 
-- Commit Phase 156, then start Phase 157: BSD/other Unix backend
-  classification.
+- Commit Phase 157, then start Phase 158: Public Platform-I/O Diagnostics.
