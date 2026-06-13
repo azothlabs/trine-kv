@@ -16,7 +16,7 @@ Before `1.0.0`, the crate still uses SemVer-formatted versions. Breaking public
 API or storage-contract changes should increment the minor version, and patch
 releases should stay compatible with the same minor line.
 
-The current crate minor release target is `0.3.0`. The v1 engine protocol
+The current crate minor release target is `0.4.0`. The v1 engine protocol
 remains documented separately in `.phrase/protocol/trine-kv-v1-spec.md`.
 
 ## Package Contents

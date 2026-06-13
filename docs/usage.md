@@ -31,11 +31,11 @@ index in sync.
 
 ## Add The Crate
 
-Published releases use Semantic Versioning. For the `0.3` release line:
+Published releases use Semantic Versioning. For the `0.4` release line:
 
 ```toml
 [dependencies]
-trine-kv = "0.3"
+trine-kv = "0.4"
 ```
 
 For local development from this repository:
@@ -55,7 +55,7 @@ stack:
 
 ```toml
 [dependencies]
-trine-kv = { version = "0.3", features = ["platform-io"] }
+trine-kv = { version = "0.4", features = ["platform-io"] }
 ```
 
 Enable native platform I/O when you want Trine to prefer audited native async
@@ -64,7 +64,7 @@ yet have native support:
 
 ```toml
 [dependencies]
-trine-kv = { version = "0.3", features = ["platform-io-native"] }
+trine-kv = { version = "0.4", features = ["platform-io-native"] }
 ```
 
 The feature makes the platform driver available. A database uses it only after

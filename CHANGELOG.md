@@ -2,6 +2,42 @@
 
 All public crate releases use Semantic Versioning.
 
+## 0.4.0 - 2026-06-13
+
+Platform I/O release. This release makes `platform-io` the portable async
+native-file storage boundary and adds `platform-io-native` for native-first
+operation support with thread-pool managed async fallback for remaining rows.
+The public storage format is unchanged from `0.3.0`, but the feature surface and
+runtime behavior are meaningful enough for a pre-`1.0` minor release.
+
+### Added
+
+- `platform-io` feature for Trine-owned bounded thread-pool async completion on
+  native-thread targets.
+- `platform-io-threadpool` feature alias for callers that want to name the
+  thread-pool baseline explicitly.
+- `platform-io-native` feature for native-first platform I/O on Linux, Windows,
+  macOS, and other Unix targets, with operation-level fallback to the same
+  managed thread pool where native support is partial.
+- Platform I/O operation stats and backend matrix reporting for random reads,
+  whole-object reads, temp-write plus rename publish, WAL append/persist,
+  rewrite, delete, directory operations, and writer leases.
+- `examples/platform_io.rs` as a checked feature-selection smoke path.
+- `docs/platform-io.md` with feature guidance, operation classes, and
+  verification commands.
+
+### Changed
+
+- Native-file async read, write, flush, compaction, cleanup, directory, and
+  lease paths can now enter Trine's operation-level platform I/O driver when
+  `RuntimeOptions::platform_io()` is selected.
+- Windows directory sync now treats directory-handle `PermissionDenied` as a
+  best-effort directory-sync boundary after file sync and rename have completed,
+  matching the strongest behavior available on common Windows filesystems and CI
+  runners.
+- README, usage docs, durability docs, release docs, and CI now describe and
+  verify the platform I/O feature matrix.
+
 ## 0.3.0 - 2026-06-12
 
 Read-version and checkpoint release. This release adds public historical-read

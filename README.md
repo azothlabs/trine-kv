@@ -89,7 +89,7 @@ Most applications can start with no feature flags:
 
 ```toml
 [dependencies]
-trine-kv = "0.3"
+trine-kv = "0.4"
 ```
 
 Enable `platform-io` when native-file storage should complete through Trine's
@@ -98,7 +98,7 @@ thread pool and avoids native async backend dependencies:
 
 ```toml
 [dependencies]
-trine-kv = { version = "0.3", features = ["platform-io"] }
+trine-kv = { version = "0.4", features = ["platform-io"] }
 ```
 
 Enable `platform-io-native` when you want native async where Trine has audited
@@ -106,7 +106,7 @@ operation support, with the same thread-pool backend for the remaining rows:
 
 ```toml
 [dependencies]
-trine-kv = { version = "0.3", features = ["platform-io-native"] }
+trine-kv = { version = "0.4", features = ["platform-io-native"] }
 ```
 
 After enabling either feature, select the runtime for a database:

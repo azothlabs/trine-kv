@@ -4215,3 +4215,25 @@ boundary across native durability and platform-io paths.
 
 - New backend architecture, storage format changes, publishing, tagging,
   pushing, or PR creation.
+
+### Phase 171: 0.4.0 Release Metadata And Tag
+
+**Status**: In Progress
+
+**Goal**: Align crate metadata and user-facing docs for the platform I/O
+release, then create the local Git tag used by GitHub release automation.
+
+**Entry Condition**: Platform I/O cross-platform CI has passed.
+
+**Acceptance Gate**:
+
+- `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, and `docs/release.md` agree on
+  `0.4.0`.
+- README, usage docs, and platform I/O docs use the `0.4` dependency line.
+- Package verification and dry-run publish pass.
+- A local `v0.4.0` tag points at the release metadata commit.
+
+**Major Out Of Scope**:
+
+- New platform I/O behavior, storage format changes, actual crates.io publish,
+  pushing, PR creation, or GitHub release page editing.

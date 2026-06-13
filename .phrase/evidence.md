@@ -11789,3 +11789,24 @@ Negative check:
 ### Recommended Next Action
 
 - Commit the Windows directory-sync permission fix and rerun CI.
+
+## 2026-06-13: 0.4.0 Release Metadata Start
+
+### Observation
+
+- GitHub Actions has passed after the Windows directory-sync permission fix,
+  according to the user.
+- `Cargo.toml`, `Cargo.lock`, README, usage docs, platform I/O docs, release
+  docs, and changelog still referenced the `0.3` release line.
+
+### Interpretation
+
+- The platform I/O work is a meaningful pre-`1.0` feature release and should
+  use `0.4.0` under the SemVer rule in `.phrase/decision.md`.
+- GitHub release creation can be driven by a `v0.4.0` tag after the release
+  metadata commit.
+
+### Recommended Next Action
+
+- Align release metadata to `0.4.0`, run package and dry-run publish checks,
+  commit the release metadata, and create the local `v0.4.0` tag.
