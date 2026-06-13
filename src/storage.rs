@@ -490,6 +490,7 @@ pub(crate) trait StorageAppendObject: StorageThreadBound {
     fn persist(&mut self, durability: DurabilityMode) -> StorageFuture<'_, ()>;
 }
 
+#[allow(dead_code)]
 pub(crate) trait BlockingStorageAppendObject: StorageAppendObject {
     fn append_blocking(&mut self, bytes: &[u8], durability: DurabilityMode) -> Result<()> {
         poll_ready_storage_future(StorageAppendObject::append(self, bytes, durability))
@@ -2794,11 +2795,13 @@ impl NativeFileAppendObject {
         }
     }
 
+    #[allow(dead_code)]
     fn append_to_file(&mut self, bytes: &[u8], durability: DurabilityMode) -> Result<()> {
         let mut file = self.lock_or_open_file()?;
         append_native_file_object(&mut file, bytes, durability)
     }
 
+    #[allow(dead_code)]
     fn persist_file(&mut self, durability: DurabilityMode) -> Result<()> {
         let mut file = self.lock_or_open_file()?;
         persist_native_append_file(&mut file, durability)
@@ -2811,6 +2814,7 @@ impl NativeFileAppendObject {
             .ok_or_else(|| Error::runtime_busy("platform append object has no local file handle"))
     }
 
+    #[allow(dead_code)]
     fn lock_or_open_file(&mut self) -> Result<MutexGuard<'_, File>> {
         if self.file.is_none() {
             self.file = Some(Arc::new(Mutex::new(open_native_append_file(&self.object)?)));

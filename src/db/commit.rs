@@ -13,6 +13,7 @@ use crate::{
     error::{Error, Result},
     lsm::LsmTree,
     options::{DurabilityMode, StorageMode, WriteOptions},
+    storage::{StorageCapability, StorageReadBackend},
     transaction::TransactionReadSet,
     types::{CommitInfo, Sequence},
     wal::WalBatch,
@@ -608,14 +609,42 @@ impl Db {
         waiter.wait()
     }
 
-    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
-    fn run_accepted_write_async(&self, request: WriteRequest) -> WriteFuture {
-        WriteFuture::new(self.clone(), request)
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn run_accepted_write_async(
+        &self,
+        request: WriteRequest,
+    ) -> impl Future<Output = Result<CommitInfo>> + Send + 'static {
+        let db = self.clone();
+        async move {
+            if db.uses_native_platform_async_write_path() {
+                db.commit_write_request_async(request).await
+            } else {
+                WriteFuture::new(db, request).await
+            }
+        }
     }
 
     fn commit_write_request(&self, request: WriteRequest) -> Result<CommitInfo> {
         let accepted_state = self.accept_write_request(request)?;
         self.publish_accepted_write_state(accepted_state)
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn commit_write_request_async(&self, request: WriteRequest) -> Result<CommitInfo> {
+        let accepted_state = self.accept_write_request_with_wal_preaccept(request, false)?;
+        self.publish_accepted_write_state_async(accepted_state)
+            .await
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn uses_native_platform_async_write_path(&self) -> bool {
+        self.inner.options.storage_mode.persistent_path().is_some()
+            && self.inner.substrate.wal_is_present()
+            && self
+                .inner
+                .native_storage
+                .capabilities()
+                .supports(StorageCapability::PlatformAsyncIo)
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -648,6 +677,14 @@ impl Db {
     }
 
     fn accept_write_request(&self, request: WriteRequest) -> Result<AcceptedWriteState> {
+        self.accept_write_request_with_wal_preaccept(request, true)
+    }
+
+    fn accept_write_request_with_wal_preaccept(
+        &self,
+        request: WriteRequest,
+        preaccept_wal: bool,
+    ) -> Result<AcceptedWriteState> {
         let WriteRequest {
             operations,
             write_options,
@@ -676,7 +713,11 @@ impl Db {
 
         let prepared =
             self.prepare_writer_local_commit(operations, write_options, transaction_reads)?;
-        let wal_accept = self.preaccept_wal_front_door_if_ready(&prepared)?;
+        let wal_accept = if preaccept_wal {
+            self.preaccept_wal_front_door_if_ready(&prepared)?
+        } else {
+            WalAcceptState::Deferred
+        };
         Ok(AcceptedWriteState::Pending(WriterLocalWriteState::new(
             prepared, wal_accept,
         )))
@@ -791,7 +832,6 @@ impl Db {
         Ok(DurableSequencedWrite::new(prepared, slot))
     }
 
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     async fn publish_accepted_write_state_async(
         &self,
         accepted_state: AcceptedWriteState,
@@ -831,7 +871,6 @@ impl Db {
         }
     }
 
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     async fn accept_deferred_wal_for_sequenced_write_async(
         &self,
         sequenced: SequencedWrite,
@@ -1099,6 +1138,19 @@ impl Db {
         }
 
         self.accept_wal_front_door(sequence, operations, durability)
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn accept_wal_front_door_async(
+        &self,
+        sequence: Sequence,
+        operations: &[BatchOperation],
+        durability: DurabilityMode,
+    ) -> Result<()> {
+        self.inner
+            .substrate
+            .accept_commit_async(sequence, operations, durability)
+            .await
     }
 
     pub(super) fn replay_wal_batches(

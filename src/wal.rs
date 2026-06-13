@@ -1,12 +1,15 @@
 use std::{
     collections::BTreeMap,
+    future::Future,
     ops::Bound,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, SyncSender},
     },
+    task::{Context, Poll, Wake, Waker},
     thread::{self, JoinHandle},
 };
 
@@ -14,13 +17,12 @@ use crate::{
     error::{Error, Result},
     options::DurabilityMode,
     storage::{
-        BlockingStorageAppendBackend, BlockingStorageAppendObject,
-        BlockingStorageDirectoryListBackend, BlockingStorageObjectReadBackend,
-        BlockingStorageReadBackend, BlockingStorageReadObject, BlockingStorageWalRewriteBackend,
-        NativeFileAppendObject, NativeFileBackend, StorageAppendBackend, StorageAppendObject,
-        StorageCapability, StorageDirectoryFile, StorageDirectoryId, StorageDirectoryListBackend,
-        StorageObjectId, StorageObjectKind, StorageObjectReadBackend, StorageReadBackend,
-        StorageReadObject, StorageWalRewriteBackend,
+        BlockingStorageAppendBackend, BlockingStorageDirectoryListBackend,
+        BlockingStorageObjectReadBackend, BlockingStorageReadBackend, BlockingStorageReadObject,
+        BlockingStorageWalRewriteBackend, NativeFileAppendObject, NativeFileBackend,
+        StorageAppendBackend, StorageAppendObject, StorageCapability, StorageDirectoryFile,
+        StorageDirectoryId, StorageDirectoryListBackend, StorageObjectId, StorageObjectKind,
+        StorageObjectReadBackend, StorageReadBackend, StorageReadObject, StorageWalRewriteBackend,
     },
     types::{KeyRange, Sequence},
     write_batch::BatchOperation,
@@ -109,16 +111,158 @@ enum WalLaneCommand {
     Append {
         frame: Vec<u8>,
         durability: DurabilityMode,
-        reply: SyncSender<Result<()>>,
+        reply: WalLaneReply,
     },
     Persist {
         durability: DurabilityMode,
-        reply: SyncSender<Result<()>>,
+        reply: WalLaneReply,
     },
     Rewrite {
         replay_floor: Sequence,
-        reply: SyncSender<Result<()>>,
+        reply: WalLaneReply,
     },
+}
+
+#[derive(Debug)]
+struct WalLaneReply {
+    completion: Arc<WalLaneCompletion>,
+}
+
+#[derive(Debug)]
+struct WalLaneWaiter {
+    completion: Arc<WalLaneCompletion>,
+}
+
+#[derive(Debug)]
+struct WalLaneCompletion {
+    result: Mutex<Option<Result<()>>>,
+    ready: Condvar,
+    waker: Mutex<Option<Waker>>,
+}
+
+struct WalStorageThreadWake {
+    thread: thread::Thread,
+}
+
+impl WalLaneCompletion {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            result: Mutex::new(None),
+            ready: Condvar::new(),
+            waker: Mutex::new(None),
+        })
+    }
+
+    fn pair() -> (WalLaneReply, WalLaneWaiter) {
+        let completion = Self::new();
+        (
+            WalLaneReply {
+                completion: Arc::clone(&completion),
+            },
+            WalLaneWaiter { completion },
+        )
+    }
+
+    fn complete(&self, result: Result<()>) {
+        {
+            let mut slot = match self.result.lock() {
+                Ok(slot) => slot,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *slot = Some(result);
+        }
+        self.ready.notify_all();
+
+        let waker = match self.waker.lock() {
+            Ok(mut waker) => waker.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+impl WalLaneReply {
+    fn complete(self, result: Result<()>) {
+        self.completion.complete(result);
+    }
+}
+
+impl WalLaneWaiter {
+    fn wait(self) -> Result<()> {
+        let mut result = self
+            .completion
+            .result
+            .lock()
+            .map_err(|_| wal_front_door_completion_poisoned())?;
+        loop {
+            if let Some(result) = result.take() {
+                return result;
+            }
+            result = self
+                .completion
+                .ready
+                .wait(result)
+                .map_err(|_| wal_front_door_completion_poisoned())?;
+        }
+    }
+
+    fn register_waker(&self, context: &Context<'_>) -> Result<()> {
+        let mut waker = self
+            .completion
+            .waker
+            .lock()
+            .map_err(|_| wal_front_door_completion_poisoned())?;
+        let replace = match waker.as_ref() {
+            Some(registered) => !registered.will_wake(context.waker()),
+            None => true,
+        };
+        if replace {
+            *waker = Some(context.waker().clone());
+        }
+        Ok(())
+    }
+
+    fn take_result(&self) -> Result<Option<Result<()>>> {
+        self.completion
+            .result
+            .lock()
+            .map(|mut result| result.take())
+            .map_err(|_| wal_front_door_completion_poisoned())
+    }
+}
+
+impl Future for WalLaneWaiter {
+    type Output = Result<()>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.take_result() {
+            Ok(Some(result)) => return Poll::Ready(result),
+            Ok(None) => {}
+            Err(error) => return Poll::Ready(Err(error)),
+        }
+
+        if let Err(error) = self.register_waker(context) {
+            return Poll::Ready(Err(error));
+        }
+
+        match self.take_result() {
+            Ok(Some(result)) => Poll::Ready(result),
+            Ok(None) => Poll::Pending,
+            Err(error) => Poll::Ready(Err(error)),
+        }
+    }
+}
+
+impl Wake for WalStorageThreadWake {
+    fn wake(self: Arc<Self>) {
+        self.thread.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.thread.unpark();
+    }
 }
 
 impl WalWriter {
@@ -149,11 +293,11 @@ impl WalWriter {
     }
 
     fn append_frame(&mut self, frame: &[u8], durability: DurabilityMode) -> Result<()> {
-        self.append.append_blocking(frame, durability)
+        wait_for_wal_storage_future(self.append.append(frame, durability))
     }
 
     fn persist(&mut self, durability: DurabilityMode) -> Result<()> {
-        self.append.persist_blocking(durability)
+        wait_for_wal_storage_future(self.append.persist(durability))
     }
 
     pub(crate) fn reopen_append_with_backend(
@@ -163,6 +307,20 @@ impl WalWriter {
     ) -> Result<()> {
         self.append = open_wal_append_object_with_backend(backend, path)?;
         Ok(())
+    }
+}
+
+fn wait_for_wal_storage_future<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
+    let waker = Waker::from(Arc::new(WalStorageThreadWake {
+        thread: thread::current(),
+    }));
+    let mut context = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(result) => return result,
+            Poll::Pending => thread::park(),
+        }
     }
 }
 
@@ -259,6 +417,30 @@ impl WalFrontDoor {
             durability,
             reply,
         })?;
+        self.records_accepted.fetch_add(1, Ordering::Relaxed);
+        self.bytes_accepted.fetch_add(frame_len, Ordering::Relaxed);
+        Ok(WalFrontDoorAccept {
+            sequence,
+            shard_index,
+        })
+    }
+
+    pub(crate) async fn accept_commit_async(
+        &self,
+        sequence: Sequence,
+        operations: &[BatchOperation],
+        durability: DurabilityMode,
+    ) -> Result<WalFrontDoorAccept> {
+        let shard_index = self.shard_index_for_sequence(sequence);
+        let lane = self.lane(shard_index)?;
+        let frame = encode_batch_frame(sequence, operations)?;
+        let frame_len = usize_to_u64_saturating(frame.len());
+        let waiter = enqueue_wal_lane_command(lane, |reply| WalLaneCommand::Append {
+            frame,
+            durability,
+            reply,
+        })?;
+        waiter.await?;
         self.records_accepted.fetch_add(1, Ordering::Relaxed);
         self.bytes_accepted.fetch_add(frame_len, Ordering::Relaxed);
         Ok(WalFrontDoorAccept {
@@ -848,19 +1030,24 @@ fn wal_storage_object(path: &Path) -> StorageObjectId {
 
 fn send_wal_lane_command(
     lane: &WalFrontDoorLane,
-    command: impl FnOnce(SyncSender<Result<()>>) -> WalLaneCommand,
+    command: impl FnOnce(WalLaneReply) -> WalLaneCommand,
 ) -> Result<()> {
+    enqueue_wal_lane_command(lane, command)?.wait()
+}
+
+fn enqueue_wal_lane_command(
+    lane: &WalFrontDoorLane,
+    command: impl FnOnce(WalLaneReply) -> WalLaneCommand,
+) -> Result<WalLaneWaiter> {
     let sender = lane
         .sender
         .as_ref()
         .ok_or_else(wal_front_door_worker_stopped)?;
-    let (reply_sender, reply_receiver) = mpsc::sync_channel(1);
+    let (reply, waiter) = WalLaneCompletion::pair();
     sender
-        .send(command(reply_sender))
+        .send(command(reply))
         .map_err(|_| wal_front_door_worker_stopped())?;
-    reply_receiver
-        .recv()
-        .map_err(|_| wal_front_door_worker_stopped())?
+    Ok(waiter)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -886,11 +1073,11 @@ fn run_wal_lane_worker(
                     &frame,
                     durability,
                 );
-                let _ = reply.send(result);
+                reply.complete(result);
             }
             WalLaneCommand::Persist { durability, reply } => {
                 let result = persist_wal_lane(&mut writer, durability);
-                let _ = reply.send(result);
+                reply.complete(result);
             }
             WalLaneCommand::Rewrite {
                 replay_floor,
@@ -898,7 +1085,7 @@ fn run_wal_lane_worker(
             } => {
                 let result =
                     rewrite_wal_lane_after_replay_floor(&backend, &path, &mut writer, replay_floor);
-                let _ = reply.send(result);
+                reply.complete(result);
             }
         }
     }
@@ -951,6 +1138,10 @@ fn wal_front_door_worker_stopped() -> Error {
     Error::Corruption {
         message: "WAL front door worker stopped".to_owned(),
     }
+}
+
+fn wal_front_door_completion_poisoned() -> Error {
+    Error::runtime_busy("WAL front door completion state is poisoned")
 }
 
 fn validate_wal_stream_order(batches: &[WalBatch]) -> Result<()> {

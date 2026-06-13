@@ -271,6 +271,81 @@ fn persistent_open_replays_wal() {
 }
 
 #[test]
+fn persistent_async_write_uses_storage_backend_wal_append() {
+    let path = temp_db_path("persistent-async-write-wal-storage");
+    let mut options = DbOptions::persistent(&path).with_durability(DurabilityMode::Flush);
+    options.background_worker_count = 0;
+
+    let db = block_on(Db::open(options.clone())).expect("persistent async open");
+    let before = db.stats();
+    block_on(db.put_with_options(
+        b"wal-storage-key".to_vec(),
+        b"wal-storage-value".to_vec(),
+        WriteOptions::flush(),
+    ))
+    .expect("async write appends through storage backend");
+    let after = db.stats();
+
+    assert!(
+        after.storage_operations.append.requests > before.storage_operations.append.requests,
+        "async write should append WAL through the storage backend"
+    );
+    assert!(
+        after.storage_sync_adapter_tasks > before.storage_sync_adapter_tasks,
+        "native fallback async write should still use the bounded storage adapter"
+    );
+    drop(db);
+
+    let reopened = block_on(Db::open(options)).expect("persistent async reopen replays WAL");
+    assert_eq!(
+        block_on(reopened.get(b"wal-storage-key")).expect("async get after replay"),
+        Some(b"wal-storage-value".to_vec())
+    );
+    cleanup_dir(&path);
+}
+
+#[cfg(all(feature = "platform-io", target_os = "linux"))]
+#[test]
+fn platform_io_async_write_awaits_wal_without_whole_commit_adapter() {
+    let path = temp_db_path("platform-io-async-write");
+    let mut options = DbOptions::persistent(&path).with_durability(DurabilityMode::Flush);
+    options.runtime = RuntimeOptions::platform_io();
+    options.background_worker_count = 0;
+
+    let db = block_on(Db::open(options.clone())).expect("platform I/O persistent open");
+    assert!(db.stats().storage_uses_platform_async_io);
+    let before = db.stats();
+    block_on(db.put_with_options(
+        b"platform-key".to_vec(),
+        b"platform-value".to_vec(),
+        WriteOptions::flush(),
+    ))
+    .expect("platform async write commits");
+    let after = db.stats();
+
+    assert_eq!(
+        after.storage_sync_adapter_submitted_tasks, before.storage_sync_adapter_submitted_tasks,
+        "platform async write should not spawn the whole commit through the sync adapter"
+    );
+    assert!(
+        after.storage_platform_async_io_tasks > before.storage_platform_async_io_tasks,
+        "platform async write should await platform storage completion"
+    );
+    assert!(
+        after.storage_operations.append.requests > before.storage_operations.append.requests,
+        "platform async write should still append a WAL record"
+    );
+    drop(db);
+
+    let reopened = block_on(Db::open(options)).expect("platform I/O reopen replays WAL");
+    assert_eq!(
+        block_on(reopened.get(b"platform-key")).expect("platform replay read"),
+        Some(b"platform-value".to_vec())
+    );
+    cleanup_dir(&path);
+}
+
+#[test]
 fn persistent_read_only_open_async_skips_clean_wal_reads() {
     let path = temp_db_path("persistent-read-only-async-clean-wal");
     let mut options = DbOptions::persistent(&path);

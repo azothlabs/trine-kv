@@ -388,6 +388,11 @@ Rules:
   through the platform driver when the user selects `RuntimeOptions::platform_io`,
   but it must report fallback task counters and must not advertise
   `PlatformAsyncIo`.
+- native persistent async writes may use the async WAL lane completion only when
+  the native-file backend advertises `PlatformAsyncIo`; fallback targets must
+  keep the bounded sync-adapter write boundary.
+- native async writes must not append directly to WAL files outside
+  `WalFrontDoor`; sync and async writers share that lane boundary.
 
 #### Native Platform Backend Matrix
 

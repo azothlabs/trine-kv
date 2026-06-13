@@ -76,6 +76,24 @@ impl DurabilitySubstrate {
         }
     }
 
+    /// Append a commit's operations to the WAL and await the WAL lane
+    /// completion when the substrate has one.
+    pub(crate) async fn accept_commit_async(
+        &self,
+        sequence: Sequence,
+        operations: &[BatchOperation],
+        durability: DurabilityMode,
+    ) -> Result<()> {
+        match self {
+            Self::Filesystem(substrate) => {
+                substrate
+                    .accept_commit_async(sequence, operations, durability)
+                    .await
+            }
+            Self::ObjectStore(_) => Ok(()),
+        }
+    }
+
     /// Flush WAL durability to the requested level (no-op when there is no WAL;
     /// no-op for the WAL-less object store).
     pub(crate) fn persist_wal(&self, durability: DurabilityMode) -> Result<()> {
@@ -148,6 +166,21 @@ impl FilesystemSubstrate {
     ) -> Result<()> {
         if let Some(wal) = &self.wal {
             let accepted = wal.accept_commit(sequence, operations, durability)?;
+            debug_assert_eq!(accepted.sequence(), sequence);
+        }
+        Ok(())
+    }
+
+    async fn accept_commit_async(
+        &self,
+        sequence: Sequence,
+        operations: &[BatchOperation],
+        durability: DurabilityMode,
+    ) -> Result<()> {
+        if let Some(wal) = &self.wal {
+            let accepted = wal
+                .accept_commit_async(sequence, operations, durability)
+                .await?;
             debug_assert_eq!(accepted.sequence(), sequence);
         }
         Ok(())

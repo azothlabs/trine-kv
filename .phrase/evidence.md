@@ -10534,3 +10534,58 @@ Record only evidence that can change planning or durable decisions.
 - Start a native async write-path phase so Linux `platform-io` writes await
   storage completions instead of running the whole commit through the bounded
   sync adapter.
+
+## 2026-06-13: Native Async Write Path
+
+### Observation
+
+- Phase 150 was committed as `fcd5cc3`.
+- `WalFrontDoor` now exposes an awaitable lane completion for commit appends.
+  Sync callers wait on the same completion; async callers await it.
+- `DurabilitySubstrate` exposes async WAL accept for filesystem WALs while
+  keeping object-store durability WAL-less.
+- Native persistent async writes now choose the async publish path only when
+  `NativeFileBackend` advertises `PlatformAsyncIo`.
+- Native fallback targets keep the existing `WriteFuture` path that runs the
+  accepted commit through the bounded adapter.
+- Usage docs and the async storage protocol now state that native async writes
+  may use the async WAL lane only on true platform async targets.
+
+### Interpretation
+
+- Linux `platform-io` writes can now await WAL storage completions without
+  spawning the entire commit through Trine's bounded sync adapter.
+- Keeping `WalFrontDoor` as the append boundary avoids file-offset races between
+  sync writes and async writes.
+- Flush, compaction, manifest publish, and directory work remain separate
+  async-storage phases.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q --test async_api persistent_async_write_uses_storage_backend_wal_append`
+- `cargo test -q --lib wal::tests`
+- `cargo test -q --features platform-io --test async_api persistent_async_write_uses_storage_backend_wal_append`
+- `cargo test -q --features platform-io --test async_api platform_io_async_write_awaits_wal_without_whole_commit_adapter`
+- `cargo test -q --features platform-io --lib wal::tests`
+- `cargo test -q --test async_api`
+- `cargo test -q --features platform-io --test async_api`
+- `cargo test -q`
+- `cargo clippy -q --all-features`
+- `cargo rustdoc --all-features -- -D warnings`
+- `git diff --check`
+- `docker run --rm --security-opt seccomp=unconfined ... rust:1.85-bookworm
+  cargo test -q --features platform-io --test async_api
+  platform_io_async_write_awaits_wal_without_whole_commit_adapter`
+
+### Remaining Blockers
+
+- No blocker for native async writes.
+- The Linux-only platform async write stats assertion passed in a Linux Docker
+  container on Orbstack after allowing `io_uring` through Docker seccomp.
+- Flush and compaction still use their current native fallback paths.
+
+### Recommended Next Action
+
+- Choose the next async-storage phase from fresh evidence: flush, compaction,
+  or manifest/directory publish.

@@ -3695,3 +3695,30 @@ to take effect on Linux because `PlatformIoDriver` creation is gated by
 - Native async commit/flush/compaction rewrites, storage format changes,
   publishing, tagging, pushing, PR creation, or claiming new true async support
   on non-Linux targets.
+
+### Phase 151: Native Async Write Path
+
+**Status**: Complete
+
+**Goal**: Let native persistent async writes await Trine storage completions on
+true platform async targets instead of running the whole commit through the
+bounded sync adapter.
+
+**Entry Condition**: Phase 150 completed platform-driver routing and left native
+async writes as the next storage-path residual.
+
+**Acceptance Gate**:
+
+- WAL lane ownership remains the filesystem append serialization boundary.
+- Native persistent async writes choose the async publish path only when
+  `NativeFileBackend` advertises `PlatformAsyncIo`.
+- Fallback targets retain the bounded sync-adapter write path.
+- WAL records remain replayable after async writes and async transactions.
+- Focused async/WAL tests with and without `platform-io`, formatting, clippy,
+  rustdoc, full tests, and diff checks pass.
+
+**Major Out Of Scope**:
+
+- Flush, compaction, manifest publish, directory work, storage format changes,
+  publishing, tagging, pushing, PR creation, or claiming new true async support
+  on fallback targets.
