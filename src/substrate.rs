@@ -78,6 +78,7 @@ impl DurabilitySubstrate {
 
     /// Append a commit's operations to the WAL and await the WAL lane
     /// completion when the substrate has one.
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
     pub(crate) async fn accept_commit_async(
         &self,
         sequence: Sequence,
@@ -103,6 +104,16 @@ impl DurabilitySubstrate {
         }
     }
 
+    /// Flush WAL durability to the requested level and await the WAL lane
+    /// completion when the substrate has one.
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
+    pub(crate) async fn persist_wal_async(&self, durability: DurabilityMode) -> Result<()> {
+        match self {
+            Self::Filesystem(substrate) => substrate.persist_wal_async(durability).await,
+            Self::ObjectStore(_) => Ok(()),
+        }
+    }
+
     /// WAL statistics, or `None` when there is no WAL (always `None` for the
     /// object store).
     pub(crate) fn wal_stats(&self) -> Option<WalFrontDoorStats> {
@@ -123,6 +134,7 @@ impl DurabilitySubstrate {
 
     /// Truncate WAL data below a checkpoint and await the WAL lane completion
     /// when the substrate has one.
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
     pub(crate) async fn rewrite_wal_after_replay_floor_async(
         &self,
         replay_floor: Sequence,
@@ -187,6 +199,7 @@ impl FilesystemSubstrate {
         Ok(())
     }
 
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
     async fn accept_commit_async(
         &self,
         sequence: Sequence,
@@ -210,6 +223,15 @@ impl FilesystemSubstrate {
         }
     }
 
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
+    async fn persist_wal_async(&self, durability: DurabilityMode) -> Result<()> {
+        if let Some(wal) = &self.wal {
+            wal.persist_async(durability).await
+        } else {
+            Ok(())
+        }
+    }
+
     fn wal_stats(&self) -> Option<WalFrontDoorStats> {
         self.wal.as_ref().map(WalFrontDoor::stats)
     }
@@ -222,6 +244,7 @@ impl FilesystemSubstrate {
         }
     }
 
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
     async fn rewrite_wal_after_replay_floor_async(&self, replay_floor: Sequence) -> Result<()> {
         if let Some(wal) = &self.wal {
             wal.rewrite_after_replay_floor_async(replay_floor).await

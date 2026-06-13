@@ -2882,21 +2882,6 @@ impl Db {
         receiver.await.map_err(|_| Error::runtime_busy(label))?
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    async fn run_native_blocking_task<T>(
-        &self,
-        task: impl FnOnce(Db) -> Result<T> + Send + 'static,
-    ) -> Result<T>
-    where
-        T: Send + 'static,
-    {
-        let db = self.clone();
-        self.inner
-            .runtime
-            .spawn_blocking_result(move || task(db))?
-            .await
-    }
-
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     async fn persist_browser_async(&self, mode: DurabilityMode) -> Result<()> {
         self.ensure_open()?;
@@ -2908,6 +2893,31 @@ impl Db {
         };
         let storage = self.browser_storage()?;
         wal.persist(&storage, Path::new(""), mode).await
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn persist_native_async(&self, mode: DurabilityMode) -> Result<()> {
+        self.ensure_open()?;
+
+        if self.inner.options.storage_mode.is_wasi_persistent()
+            && matches!(mode, DurabilityMode::SyncData | DurabilityMode::SyncAll)
+        {
+            return Err(Error::unsupported_durability(mode));
+        }
+
+        match &self.inner.options.storage_mode {
+            StorageMode::InMemory
+            | StorageMode::HostPersistent {
+                backend: HostStorageBackend::ObjectStore,
+            } => Ok(()),
+            StorageMode::Persistent { .. }
+            | StorageMode::HostPersistent {
+                backend: HostStorageBackend::Wasi { .. },
+            } => self.inner.substrate.persist_wal_async(mode).await,
+            StorageMode::HostPersistent { backend } => {
+                Err(Error::unsupported_backend(backend.as_str()))
+            }
+        }
     }
 
     /// Flushes committed memtable data to persistent table files.
@@ -3019,16 +3029,34 @@ impl Db {
             || self.l0_pressure_exceeded()?
             || self.foreground_l0_overlap_pressure_exceeded()?
         {
-            let compaction_path = db_path.clone();
-            self.run_native_blocking_task(move |db| {
-                db.run_compaction_barrier(&compaction_path, &KeyRange::all(), true)
-            })
-            .await?;
+            self.run_compaction_barrier_native_async(&db_path, &KeyRange::all(), true)
+                .await?;
         }
-        self.cleanup_pending_obsolete_table_files(&db_path)?;
-        self.cleanup_pending_obsolete_blob_files(&db_path)?;
+        self.cleanup_pending_obsolete_table_files_native_async(&db_path)
+            .await?;
+        self.cleanup_pending_obsolete_blob_files_native_async(&db_path)
+            .await?;
         self.take_background_maintenance_error()?;
 
+        Ok(())
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn close_native_async(&self) -> Result<()> {
+        self.inner.closed.store(true, Ordering::Release);
+        shutdown_background_workers(
+            &self.inner.maintenance,
+            &self.inner.runtime_shutdown,
+            &self.inner.background_workers,
+        );
+        if let Some(db_path) = self.persistent_path().map(Path::to_path_buf) {
+            self.cleanup_pending_obsolete_table_files_native_async(&db_path)
+                .await?;
+            self.cleanup_pending_obsolete_blob_files_native_async(&db_path)
+                .await?;
+        }
+        let _publish = self.inner.publish_barrier.enter()?;
+        self.inner.substrate.release_writer_lease();
         Ok(())
     }
 
@@ -4499,16 +4527,6 @@ impl Db {
         self.inner.options.storage_mode.persistent_path()
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    fn uses_native_platform_async_storage_path(&self) -> bool {
-        self.persistent_path().is_some()
-            && self
-                .inner
-                .native_storage
-                .capabilities()
-                .supports(StorageCapability::PlatformAsyncIo)
-    }
-
     fn persist_bucket_creation(&self, name: &str, options: &BucketOptions) -> Result<()> {
         if let Some(manifest) = &self.inner.manifest {
             // Manifest I/O happens outside the bucket registry lock. Two
@@ -4947,23 +4965,69 @@ impl Db {
             .iter()
             .map(|(bucket, table)| (bucket.clone(), table.properties().clone()))
             .collect::<Vec<_>>();
-        self.run_native_blocking_task(move |db| {
-            let _publish = db.inner.publish_barrier.enter()?;
-            let manifest = db
-                .inner
-                .manifest
-                .as_ref()
-                .ok_or_else(|| Error::Corruption {
-                    message: "persistent database is missing manifest store".to_owned(),
-                })?;
-            let mut manifest = manifest
+        let manifest = self
+            .inner
+            .manifest
+            .as_ref()
+            .ok_or_else(|| Error::Corruption {
+                message: "persistent database is missing manifest store".to_owned(),
+            })?;
+        let prepared = {
+            let manifest = manifest
                 .lock()
                 .map_err(|_| lock_poisoned("manifest store"))?;
-            let prepared = manifest.prepare_add_tables_publish(edits, flush_sequence)?;
-            futures::executor::block_on(prepared.publish_async())?;
-            manifest.install_prepared_publish(prepared)
-        })
-        .await
+            manifest.prepare_add_tables_publish(edits, flush_sequence)?
+        };
+        prepared.publish_async().await?;
+        manifest
+            .lock()
+            .map_err(|_| lock_poisoned("manifest store"))?
+            .install_prepared_publish(prepared)
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn publish_compacted_tables_native_async(
+        &self,
+        outputs: &[NamedCompactionOutput],
+        obsolete_blob_ids: &[u64],
+    ) -> Result<()> {
+        let edits = outputs
+            .iter()
+            .map(|output| {
+                (
+                    output.bucket.clone(),
+                    output.output.input_table_ids.clone(),
+                    output
+                        .output
+                        .tables
+                        .iter()
+                        .map(|table| table.properties().clone())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let manifest = self
+            .inner
+            .manifest
+            .as_ref()
+            .ok_or_else(|| Error::Corruption {
+                message: "persistent database is missing manifest store".to_owned(),
+            })?;
+        let prepared = {
+            let manifest = manifest
+                .lock()
+                .map_err(|_| lock_poisoned("manifest store"))?;
+            manifest.prepare_replace_tables_batch_publish(
+                edits,
+                obsolete_blob_ids.to_vec(),
+                self.last_committed_sequence(),
+            )?
+        };
+        prepared.publish_async().await?;
+        manifest
+            .lock()
+            .map_err(|_| lock_poisoned("manifest store"))?
+            .install_prepared_publish(prepared)
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -5353,6 +5417,158 @@ impl Db {
         Ok(outcome)
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[allow(clippy::too_many_lines)]
+    async fn run_compaction_barrier_native_async(
+        &self,
+        db_path: &Path,
+        range: &KeyRange,
+        local_l0_compaction: bool,
+    ) -> Result<()> {
+        loop {
+            self.take_background_maintenance_error()?;
+            let outcome = self
+                .run_compaction_once_with_budget_native_async(
+                    db_path,
+                    range,
+                    local_l0_compaction,
+                    MaintenanceBudget::unbounded(),
+                )
+                .await?;
+            if outcome.compactions != 0 || !outcome.busy {
+                return Ok(());
+            }
+            if !self.inner.maintenance.has_pending_compaction() {
+                return Ok(());
+            }
+            self.request_background_compaction();
+            self.record_cooperative_maintenance_yield();
+            self.inner.maintenance.wait_until_compaction_idle();
+            self.take_background_maintenance_error()?;
+        }
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[allow(clippy::too_many_lines)]
+    async fn run_compaction_once_with_budget_native_async(
+        &self,
+        db_path: &Path,
+        range: &KeyRange,
+        local_l0_compaction: bool,
+        budget: MaintenanceBudget,
+    ) -> Result<MaintenanceOutcome> {
+        let oldest_active_snapshot = self.oldest_retained_sequence();
+        let compaction_inputs =
+            self.collect_compaction_inputs(range, oldest_active_snapshot, local_l0_compaction)?;
+        if compaction_inputs.is_empty() {
+            return Ok(MaintenanceOutcome::default());
+        }
+
+        let reservations = compaction_inputs
+            .iter()
+            .map(|input| CompactionReservation {
+                bucket: input.bucket.clone(),
+                range: input.input.compaction_range.clone(),
+            })
+            .collect::<Vec<_>>();
+        let Some(compaction_guard) = self.inner.maintenance.reserve_compactions(reservations)
+        else {
+            return Ok(MaintenanceOutcome::busy_outcome());
+        };
+        let mut compaction_inputs = compaction_inputs
+            .into_iter()
+            .filter(|input| compaction_guard.contains(&input.bucket, &input.input.compaction_range))
+            .collect::<Vec<_>>();
+        if compaction_inputs.is_empty() {
+            return Ok(MaintenanceOutcome::busy_outcome());
+        }
+        let limit = budget.compaction_input_limit();
+        let budget_exhausted = compaction_inputs.len() > limit;
+        compaction_inputs.truncate(limit);
+        if compaction_inputs.is_empty() {
+            return Ok(MaintenanceOutcome::default());
+        }
+
+        let PendingCompactionOutputs {
+            outputs: written_tables,
+            written_table_ids,
+        } = self
+            .build_compaction_outputs_native_async(
+                db_path,
+                oldest_active_snapshot,
+                &compaction_inputs,
+            )
+            .await?;
+
+        let output_tables = written_tables
+            .iter()
+            .flat_map(|output| output.output.tables.iter().cloned())
+            .collect::<Vec<_>>();
+        let input_tables = compaction_inputs
+            .iter()
+            .flat_map(|input| input.input.input_tables.iter().cloned())
+            .collect::<Vec<_>>();
+        let output_table_ids = output_tables
+            .iter()
+            .map(|table| table.properties().id)
+            .collect::<BTreeSet<_>>();
+        let obsolete_table_ids = compaction_inputs
+            .iter()
+            .flat_map(|input| input.input.input_table_ids.iter().copied())
+            .filter(|table_id| !output_table_ids.contains(table_id))
+            .collect::<Vec<_>>();
+        let obsolete_blob_ids =
+            self.obsolete_blob_ids_for_compaction(&compaction_inputs, &written_tables)?;
+
+        let storage = self.inner.native_storage.clone();
+        if !written_table_ids.is_empty() {
+            if let Err(error) = sync_storage_directory_after_renames_async(&storage, db_path).await
+            {
+                let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+                return Err(error);
+            }
+        }
+
+        if let Err(error) = self.validate_compacted_tables(&written_tables) {
+            let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+            if is_level_layout_compaction_error(&error) {
+                return Ok(MaintenanceOutcome::default());
+            }
+            return Err(error);
+        }
+        if let Err(error) = self
+            .publish_compacted_tables_native_async(&written_tables, &obsolete_blob_ids)
+            .await
+        {
+            let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+            return Err(error);
+        }
+
+        self.install_compacted_tables(written_tables)?;
+        self.record_compaction_stats_from_tables(
+            compaction_inputs.len(),
+            &input_tables,
+            &output_tables,
+        );
+        self.retire_obsolete_table_files_native_async(db_path, &obsolete_table_ids)
+            .await?;
+        self.cleanup_pending_obsolete_blob_files_native_async(db_path)
+            .await?;
+        if self.inner.options.blob_gc_enabled {
+            self.run_blob_gc_once_native_async(db_path).await?;
+        }
+
+        let outcome = MaintenanceOutcome {
+            compactions: compaction_inputs.len(),
+            budget_exhausted,
+            ..MaintenanceOutcome::default()
+        };
+        if outcome.budget_exhausted {
+            self.record_maintenance_budget_exhaustion();
+        }
+        Ok(outcome)
+    }
+
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     #[allow(clippy::too_many_lines)]
     async fn run_compaction_once_with_budget_browser_async(
@@ -5549,6 +5765,100 @@ impl Db {
                             db_path,
                             &written_table_ids,
                         );
+                        return Err(error);
+                    }
+                };
+                output_tables.push(Arc::new(table));
+            }
+            outputs.push(NamedCompactionOutput {
+                bucket: input.bucket.clone(),
+                output: LsmCompactionOutput {
+                    input_table_ids: input.input.input_table_ids.clone(),
+                    tables: output_tables,
+                },
+            });
+        }
+
+        Ok(PendingCompactionOutputs {
+            outputs,
+            written_table_ids,
+        })
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn build_compaction_outputs_native_async(
+        &self,
+        db_path: &Path,
+        oldest_active_snapshot: Sequence,
+        compaction_inputs: &[NamedCompactionInput],
+    ) -> Result<PendingCompactionOutputs> {
+        let storage = self.inner.native_storage.clone();
+        let mut outputs = Vec::with_capacity(compaction_inputs.len());
+        let mut written_table_ids = Vec::new();
+        let mut next_table_id = self.next_table_id()?;
+
+        for input in compaction_inputs {
+            let force_rewrite_trivial =
+                input.tree.options.blob_level_merge_policy == BlobLevelMergePolicy::Always;
+            if input.input.trivial_move && !force_rewrite_trivial {
+                outputs.push(NamedCompactionOutput {
+                    bucket: input.bucket.clone(),
+                    output: LsmCompactionOutput {
+                        input_table_ids: input.input.input_table_ids.clone(),
+                        tables: vec![input.input.moved_table()?],
+                    },
+                });
+                continue;
+            }
+
+            let payloads = match input.tree.build_compaction_table_payloads(
+                &input.input,
+                &input.input.compaction_range,
+                oldest_active_snapshot,
+                self.inner.options.target_table_bytes,
+            ) {
+                Ok(payloads) => payloads,
+                Err(error) => {
+                    let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+                    return Err(error);
+                }
+            };
+            let mut table_options = input.input.table_options.clone();
+            table_options.rewrite_blob_indexes = should_rewrite_blob_indexes_for_compaction(
+                &input.input,
+                &payloads,
+                input.tree.options.blob_level_merge_policy,
+            );
+            let mut output_tables = Vec::with_capacity(payloads.len());
+            for payload in payloads {
+                let table_id = next_table_id;
+                next_table_id = if let Some(table_id) = next_table_id.next() {
+                    table_id
+                } else {
+                    let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+                    return Err(Error::Corruption {
+                        message: "table id counter overflow".to_owned(),
+                    });
+                };
+
+                let table_path = table::table_path(db_path, table_id);
+                written_table_ids.push(table_id);
+                let table = match table::write_table_with_backend_async(
+                    &storage,
+                    &table_path,
+                    table_id,
+                    input.input.table_level,
+                    &table_options,
+                    &payload.point_records,
+                    &payload.range_tombstones,
+                    DurabilityMode::SyncAll,
+                )
+                .await
+                {
+                    Ok(table) => table,
+                    Err(error) => {
+                        let _ =
+                            remove_storage_files_async(&storage, db_path, &written_table_ids).await;
                         return Err(error);
                     }
                 };
@@ -5767,6 +6077,112 @@ impl Db {
         self.cleanup_pending_obsolete_blob_files(db_path)
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[allow(clippy::too_many_lines)]
+    async fn run_blob_gc_once_native_async(&self, db_path: &Path) -> Result<()> {
+        let Some(plan) = self
+            .build_blob_gc_rewrite_plan_native_async(db_path)
+            .await?
+        else {
+            return Ok(());
+        };
+
+        let input_bytes = plan.candidates.iter().fold(0_u64, |bytes, candidate| {
+            bytes.saturating_add(candidate.total_bytes)
+        });
+        let discarded_bytes = plan.candidates.iter().fold(0_u64, |bytes, candidate| {
+            bytes.saturating_add(candidate.total_bytes.saturating_sub(candidate.live_bytes))
+        });
+        let obsolete_blob_ids = plan
+            .candidates
+            .iter()
+            .map(|candidate| candidate.file_id)
+            .collect::<Vec<_>>();
+
+        let header = blob::BlobFileHeader::new(
+            plan.new_blob_file_id,
+            self.last_committed_sequence(),
+            1,
+            crate::codec::CodecId::None,
+        );
+        let blob_records = blob_gc_blob_records(&plan.records);
+        let written_table_ids = plan
+            .tables
+            .iter()
+            .map(|table| table.output_table_id)
+            .collect::<Vec<_>>();
+        let obsolete_table_ids = plan
+            .tables
+            .iter()
+            .map(|table| table.input_table_id)
+            .collect::<Vec<_>>();
+        let storage = self.inner.native_storage.clone();
+        let indexes = match blob::write_blob_file_with_backend_async(
+            &storage,
+            db_path,
+            plan.new_blob_file_id,
+            header,
+            &blob_records,
+            DurabilityMode::SyncAll,
+        )
+        .await
+        {
+            Ok(indexes) => indexes,
+            Err(error) => {
+                let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+                return Err(error);
+            }
+        };
+
+        let mut tables = plan.tables;
+        let output_bytes = match apply_blob_gc_indexes(&mut tables, plan.records, indexes) {
+            Ok(output_bytes) => output_bytes,
+            Err(error) => {
+                let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+                return Err(error);
+            }
+        };
+        let outputs = match self
+            .write_blob_gc_replacement_tables_native_async(db_path, tables)
+            .await
+        {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = sync_storage_directory_after_renames_async(&storage, db_path).await {
+            let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+            return Err(error);
+        }
+
+        if let Err(error) = self
+            .publish_compacted_tables_native_async(&outputs, &obsolete_blob_ids)
+            .await
+        {
+            let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+            return Err(error);
+        }
+
+        self.install_compacted_tables(outputs)?;
+        self.retire_obsolete_table_files_native_async(db_path, &obsolete_table_ids)
+            .await?;
+        self.inner.blob_gc_runs.fetch_add(1, Ordering::AcqRel);
+        self.inner
+            .blob_gc_input_bytes
+            .fetch_add(input_bytes, Ordering::AcqRel);
+        self.inner
+            .blob_gc_output_bytes
+            .fetch_add(output_bytes, Ordering::AcqRel);
+        self.inner
+            .blob_gc_discarded_bytes
+            .fetch_add(discarded_bytes, Ordering::AcqRel);
+        self.cleanup_pending_obsolete_blob_files_native_async(db_path)
+            .await
+    }
+
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     #[allow(clippy::too_many_lines)]
     async fn run_blob_gc_once_browser_async(&self, db_path: &Path) -> Result<()> {
@@ -5960,6 +6376,107 @@ impl Db {
         }))
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn build_blob_gc_rewrite_plan_native_async(
+        &self,
+        db_path: &Path,
+    ) -> Result<Option<BlobGcRewritePlan>> {
+        let candidates = self.choose_blob_gc_candidates_native_async(db_path).await?;
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let candidate_file_ids = candidates
+            .iter()
+            .map(|candidate| candidate.file_id)
+            .collect::<BTreeSet<_>>();
+
+        let storage = self.inner.native_storage.clone();
+        let mut next_table_id = self.next_table_id()?;
+        let new_blob_file_id = next_table_id.get();
+        let mut tables = Vec::new();
+        let mut rewrite_sources = Vec::new();
+        {
+            let buckets = self
+                .inner
+                .buckets
+                .read()
+                .map_err(|_| lock_poisoned("bucket registry"))?;
+
+            for (bucket, tree) in buckets.iter() {
+                for table in tree.tables_snapshot()? {
+                    if !table
+                        .blob_file_ids()
+                        .iter()
+                        .any(|file_id| candidate_file_ids.contains(file_id))
+                    {
+                        continue;
+                    }
+                    let output_table_id = next_table_id;
+                    next_table_id = next_table_id.next().ok_or_else(|| Error::Corruption {
+                        message: "table id counter overflow".to_owned(),
+                    })?;
+
+                    let table_index = tables.len();
+                    let point_records = table.point_records()?;
+                    for (record_index, point_record) in point_records.iter().enumerate() {
+                        let Some(ValueRef::BlobIndex(index)) = point_record.value.as_ref() else {
+                            continue;
+                        };
+                        if !candidate_file_ids.contains(&index.file_id) {
+                            continue;
+                        }
+                        rewrite_sources.push((
+                            point_record.internal_key.clone(),
+                            *index,
+                            table_index,
+                            record_index,
+                        ));
+                    }
+
+                    tables.push(BlobGcRewriteTable {
+                        bucket: bucket.clone(),
+                        input_table_id: table.properties().id,
+                        output_table_id,
+                        level: table.properties().level,
+                        options: blob_gc_table_write_options(&tree.options),
+                        point_records,
+                        range_tombstones: table.range_tombstones()?.all().to_vec(),
+                    });
+                }
+            }
+        }
+
+        if rewrite_sources.is_empty() {
+            return Ok(None);
+        }
+
+        let mut rewrite_records = Vec::with_capacity(rewrite_sources.len());
+        for (internal_key, index, table_index, record_index) in rewrite_sources {
+            let blob_record = blob::read_record_for_index_with_backend_async(
+                &storage,
+                db_path,
+                &index,
+                Some(&internal_key),
+            )
+            .await?;
+            rewrite_records.push(BlobGcRewriteRecord {
+                internal_key,
+                value: blob_record.record.value.clone(),
+                compression: blob_record.record.compression,
+                table_index,
+                record_index,
+            });
+        }
+        rewrite_records.sort_by(|left, right| left.internal_key.cmp(&right.internal_key));
+
+        Ok(Some(BlobGcRewritePlan {
+            candidates,
+            new_blob_file_id,
+            tables,
+            records: rewrite_records,
+        }))
+    }
+
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     async fn build_blob_gc_rewrite_plan_browser_async(
         &self,
@@ -6103,6 +6620,49 @@ impl Db {
         Ok(candidates)
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn choose_blob_gc_candidates_native_async(
+        &self,
+        db_path: &Path,
+    ) -> Result<Vec<BlobGcCandidate>> {
+        let live_bytes_by_file = self.live_blob_bytes_by_file()?;
+        let storage = self.inner.native_storage.clone();
+        let mut candidates = Vec::new();
+
+        for (file_id, live_bytes) in live_bytes_by_file {
+            let properties =
+                blob::read_blob_file_properties_with_backend_async(&storage, db_path, file_id)
+                    .await?;
+            let total_bytes = properties.encoded_bytes;
+            if total_bytes < self.inner.options.blob_gc_min_file_bytes {
+                continue;
+            }
+            let discardable_bytes = total_bytes.saturating_sub(live_bytes);
+            if discardable_bytes == 0
+                || !self
+                    .inner
+                    .options
+                    .blob_gc_discardable_ratio
+                    .should_collect(discardable_bytes, total_bytes)
+            {
+                continue;
+            }
+
+            candidates.push(BlobGcCandidate {
+                file_id,
+                total_bytes,
+                live_bytes,
+            });
+        }
+        candidates.sort_by(|left, right| {
+            let left_discardable = left.total_bytes.saturating_sub(left.live_bytes);
+            let right_discardable = right.total_bytes.saturating_sub(right.live_bytes);
+            right_discardable.cmp(&left_discardable)
+        });
+
+        Ok(candidates)
+    }
+
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     async fn choose_blob_gc_candidates_browser_async(
         &self,
@@ -6144,6 +6704,47 @@ impl Db {
         });
 
         Ok(candidates)
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn write_blob_gc_replacement_tables_native_async(
+        &self,
+        db_path: &Path,
+        tables: Vec<BlobGcRewriteTable>,
+    ) -> Result<Vec<NamedCompactionOutput>> {
+        let storage = self.inner.native_storage.clone();
+        let mut outputs = Vec::with_capacity(tables.len());
+        for rewrite_table in tables {
+            let table_path = table::table_path(db_path, rewrite_table.output_table_id);
+            let point_records = rewrite_table
+                .point_records
+                .iter()
+                .map(|record| (record.internal_key.clone(), record.value.clone()))
+                .collect::<Vec<_>>();
+            let table = Arc::new(
+                table::write_table_with_backend_async(
+                    &storage,
+                    &table_path,
+                    rewrite_table.output_table_id,
+                    rewrite_table.level,
+                    &rewrite_table.options,
+                    &point_records,
+                    &rewrite_table.range_tombstones,
+                    DurabilityMode::SyncAll,
+                )
+                .await?,
+            );
+
+            outputs.push(NamedCompactionOutput {
+                bucket: rewrite_table.bucket,
+                output: LsmCompactionOutput {
+                    input_table_ids: vec![rewrite_table.input_table_id],
+                    tables: vec![table],
+                },
+            });
+        }
+
+        Ok(outputs)
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -6306,6 +6907,7 @@ impl Db {
             .rewrite_wal_after_replay_floor(replay_floor)
     }
 
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
     async fn rewrite_wal_after_replay_floor_async(&self, replay_floor: Sequence) -> Result<()> {
         self.inner
             .substrate
@@ -6374,6 +6976,62 @@ impl Db {
             &self.inner.snapshots,
             self.inner.manifest.as_ref(),
         )
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn cleanup_pending_obsolete_blob_files_native_async(&self, db_path: &Path) -> Result<()> {
+        if self.inner.snapshots.active_count() != 0 {
+            return Ok(());
+        }
+        let manifest = self
+            .inner
+            .manifest
+            .as_ref()
+            .ok_or_else(|| Error::Corruption {
+                message: "persistent database is missing manifest store".to_owned(),
+            })?;
+
+        let pending_file_ids = {
+            let manifest = manifest
+                .lock()
+                .map_err(|_| lock_poisoned("manifest store"))?;
+            let referenced_blob_ids = referenced_blob_file_ids_from_manifest(manifest.state());
+            manifest
+                .state()
+                .pending_blob_deletions()
+                .keys()
+                .copied()
+                .filter(|file_id| !referenced_blob_ids.contains(file_id))
+                .collect::<Vec<_>>()
+        };
+        if pending_file_ids.is_empty() {
+            return Ok(());
+        }
+
+        let storage = self.inner.native_storage.clone();
+        for file_id in &pending_file_ids {
+            delete_storage_object_async(
+                &storage,
+                StorageObjectKind::Blob,
+                &blob::blob_path(db_path, *file_id),
+            )
+            .await?;
+        }
+
+        let prepared = {
+            let manifest = manifest
+                .lock()
+                .map_err(|_| lock_poisoned("manifest store"))?;
+            manifest.prepare_clear_pending_blob_deletions_publish(&pending_file_ids)
+        };
+        let Some(prepared) = prepared else {
+            return Ok(());
+        };
+        prepared.publish_async().await?;
+        manifest
+            .lock()
+            .map_err(|_| lock_poisoned("manifest store"))?
+            .install_prepared_publish(prepared)
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -6505,6 +7163,25 @@ impl Db {
         self.cleanup_pending_obsolete_table_files(db_path)
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn retire_obsolete_table_files_native_async(
+        &self,
+        db_path: &Path,
+        table_ids: &[table::TableId],
+    ) -> Result<()> {
+        {
+            let mut pending = self
+                .inner
+                .pending_obsolete_table_ids
+                .lock()
+                .map_err(|_| lock_poisoned("obsolete table cleanup queue"))?;
+            pending.extend(table_ids.iter().copied());
+        }
+
+        self.cleanup_pending_obsolete_table_files_native_async(db_path)
+            .await
+    }
+
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     async fn retire_obsolete_table_files_browser_async(
         &self,
@@ -6531,6 +7208,49 @@ impl Db {
             &self.inner.snapshots,
             &self.inner.pending_obsolete_table_ids,
         )
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn cleanup_pending_obsolete_table_files_native_async(
+        &self,
+        db_path: &Path,
+    ) -> Result<()> {
+        if self.inner.snapshots.active_count() != 0 {
+            return Ok(());
+        }
+
+        let table_ids = {
+            let pending = self
+                .inner
+                .pending_obsolete_table_ids
+                .lock()
+                .map_err(|_| lock_poisoned("obsolete table cleanup queue"))?;
+            if pending.is_empty() {
+                return Ok(());
+            }
+            pending.iter().copied().collect::<Vec<_>>()
+        };
+
+        let storage = self.inner.native_storage.clone();
+        for table_id in &table_ids {
+            delete_storage_object_async(
+                &storage,
+                StorageObjectKind::Table,
+                &table::table_path(db_path, *table_id),
+            )
+            .await?;
+        }
+
+        let mut pending = self
+            .inner
+            .pending_obsolete_table_ids
+            .lock()
+            .map_err(|_| lock_poisoned("obsolete table cleanup queue"))?;
+        for table_id in table_ids {
+            pending.remove(&table_id);
+        }
+
+        Ok(())
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -7261,9 +7981,7 @@ impl Db {
 
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         if self.persistent_path().is_some() {
-            return self
-                .run_native_blocking_task(move |db| db.persist_sync(mode))
-                .await;
+            return self.persist_native_async(mode).await;
         }
 
         self.persist_sync(mode)
@@ -7291,10 +8009,7 @@ impl Db {
 
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         if self.persistent_path().is_some() {
-            if self.uses_native_platform_async_storage_path() {
-                return self.flush_native_async().await;
-            }
-            return self.run_native_blocking_task(|db| db.flush_sync()).await;
+            return self.flush_native_async().await;
         }
 
         self.flush_sync()
@@ -7329,9 +8044,18 @@ impl Db {
 
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         if self.persistent_path().is_some() {
-            return self
-                .run_native_blocking_task(move |db| db.compact_range_sync(range))
-                .await;
+            self.take_background_maintenance_error()?;
+            self.ensure_open()?;
+            if self.inner.options.read_only {
+                return Err(Error::ReadOnly);
+            }
+            let Some(path) = self.persistent_path() else {
+                return Ok(());
+            };
+            let db_path = path.to_path_buf();
+            self.run_compaction_barrier_native_async(&db_path, &range, false)
+                .await?;
+            return Ok(());
         }
 
         self.compact_range_sync(range)
@@ -7373,10 +8097,17 @@ impl Db {
 
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         if self.persistent_path().is_some() {
+            self.take_background_maintenance_error()?;
+            self.ensure_open()?;
+            if self.inner.options.read_only {
+                return Err(Error::ReadOnly);
+            }
+            let Some(path) = self.persistent_path() else {
+                return Ok(MaintenanceOutcome::default());
+            };
+            let db_path = path.to_path_buf();
             return self
-                .run_native_blocking_task(move |db| {
-                    db.compact_range_with_budget_sync(range, budget)
-                })
+                .run_compaction_once_with_budget_native_async(&db_path, &range, false, budget)
                 .await;
         }
 
@@ -7424,9 +8155,46 @@ impl Db {
 
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         if self.persistent_path().is_some() {
-            return self
-                .run_native_blocking_task(move |db| db.run_maintenance_with_budget_sync(budget))
-                .await;
+            self.take_background_maintenance_error()?;
+            self.ensure_open()?;
+            if self.inner.options.read_only {
+                return Err(Error::ReadOnly);
+            }
+            let Some(path) = self.persistent_path() else {
+                return Ok(MaintenanceOutcome::default());
+            };
+            let db_path = path.to_path_buf();
+            let mut outcome = MaintenanceOutcome::default();
+            let mut should_compact = self.l0_pressure_exceeded()?;
+
+            if self.has_immutable_memtables()? {
+                let (flush_should_compact, flush_outcome) = self
+                    .run_flush_once_with_budget_native_async(&db_path, false, budget)
+                    .await?;
+                should_compact |= flush_should_compact;
+                outcome.add_assign(flush_outcome);
+            }
+
+            if should_compact {
+                let compaction_outcome = self
+                    .run_compaction_once_with_budget_native_async(
+                        &db_path,
+                        &KeyRange::all(),
+                        true,
+                        budget,
+                    )
+                    .await?;
+                outcome.add_assign(compaction_outcome);
+            }
+
+            if outcome.made_progress() {
+                self.cleanup_pending_obsolete_table_files_native_async(&db_path)
+                    .await?;
+                self.cleanup_pending_obsolete_blob_files_native_async(&db_path)
+                    .await?;
+            }
+            self.take_background_maintenance_error()?;
+            return Ok(outcome);
         }
 
         self.run_maintenance_with_budget_sync(budget)
@@ -7436,12 +8204,7 @@ impl Db {
     pub async fn close(&self) -> Result<()> {
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         if self.persistent_path().is_some() {
-            return self
-                .run_native_blocking_task(|db| {
-                    db.close_sync();
-                    Ok(())
-                })
-                .await;
+            return self.close_native_async().await;
         }
 
         self.close_sync();
@@ -8306,6 +9069,7 @@ fn delete_storage_object(
     backend.delete_object_blocking(StorageObjectId::native_file(kind, path))
 }
 
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
 async fn delete_storage_object_async(
     backend: &NativeFileBackend,
     kind: StorageObjectKind,
@@ -8326,6 +9090,7 @@ fn sync_storage_directory_after_renames(backend: &NativeFileBackend, path: &Path
     backend.sync_directory_after_renames_blocking(StorageDirectoryId::native_file(path))
 }
 
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
 async fn sync_storage_directory_after_renames_async(
     backend: &NativeFileBackend,
     path: &Path,
@@ -8369,6 +9134,7 @@ fn remove_storage_files(
     remove_blob_files(backend, db_path, table_ids)
 }
 
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
 async fn remove_storage_files_async(
     backend: &NativeFileBackend,
     db_path: &Path,

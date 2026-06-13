@@ -10994,6 +10994,9 @@ Record only evidence that can change planning or durable decisions.
 
 ## 2026-06-13: Engine Path Revalidation Complete
 
+Superseded by `2026-06-13: Engine Revalidation After Platform-I/O Completion
+Complete` below. The blockers in this section record the pre-Phase-165 state.
+
 ### Observation
 
 - Native platform-io async write tests prove WAL append/persist operations are
@@ -11410,3 +11413,75 @@ Negative check:
 
 - Return to Phase 165 engine revalidation with the platform-io feature boundary
   stabilized.
+
+## 2026-06-13: Engine Revalidation After Platform-I/O Completion Complete
+
+### Observation
+
+- Native async write no longer uses the old whole-write path that spawned
+  accepted writes onto a runtime blocking adapter and then ran synchronous
+  commit logic. `Db::write` and async transaction commit now start a background
+  write future that preserves poll-then-drop completion while running
+  `commit_write_request_async` inside the task.
+- WAL durability now has an async path all the way through:
+  `Db::persist` -> `DurabilitySubstrate::persist_wal_async` ->
+  `WalFrontDoor::persist_async` -> awaited WAL lane completion.
+- Native public `flush`, `compact_range`, `compact_range_with_budget`, and
+  `run_maintenance_with_budget` now use operation-level async helpers instead
+  of wrapping `flush_sync`, `compact_range_sync`, or
+  `run_maintenance_with_budget_sync`.
+- Native compaction and blob GC now write table/blob objects, publish manifests,
+  sync directories, read blob records, and delete obsolete files through async
+  storage backend operations.
+- Native pending obsolete table/blob cleanup now has async storage delete and
+  async manifest publish paths. `Db::close` uses those async cleanup paths before
+  releasing the writer lease.
+- Removed `run_native_blocking_task` and the engine-level
+  `uses_native_platform_async_storage_path` selector. Engine async decisions now
+  depend on storage mode and Trine operation boundaries, while platform-io
+  chooses native, partial native, or thread-pool managed async below storage.
+
+### Interpretation
+
+- The original design direction is restored: platform-io is the cross-platform
+  async abstraction, and the KV engine waits on storage/substrate async
+  operations rather than detecting platform async details.
+- Default `platform-io` and `platform-io-native` now share the same engine async
+  path. The feature choice affects the lower driver class, not whether the
+  engine falls back to whole synchronous wrappers.
+- Synchronous APIs, background worker maintenance, and destructor cleanup remain
+  intentionally synchronous boundaries. They are not public async executor
+  paths; `DbInner::drop` cannot await by language design.
+
+### Verification
+
+- `cargo check -q`
+- `cargo check -q --features platform-io`
+- `cargo check -q --features platform-io-native`
+- `cargo check -q --target wasm32-unknown-unknown --features platform-io-native`
+- `cargo test -q --test async_api async --features platform-io`
+- `cargo test -q --test async_api persistent_open_replays_wal`
+- `cargo test -q platform_io --features platform-io`
+- `cargo test -q platform_io --features platform-io-native`
+- `cargo test -q maintenance --features platform-io-native`
+- `cargo test -q`
+- `cargo test -q --features platform-io`
+- `cargo test -q --features platform-io-native`
+- `cargo check -q --target wasm32-unknown-unknown --no-default-features --features platform-io`
+- `cargo check -q --target wasm32-unknown-unknown --no-default-features --features platform-io-native`
+- `cargo check -q --target x86_64-pc-windows-gnu --features platform-io-native --tests`
+- `cargo check -q --features platform-io-threadpool`
+- `cargo clippy -q --all-features`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test --doc -q --all-features`
+- `cargo fmt --check`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Real Windows, Linux, BSD/Solaris, and browser runtime diagnostics remain
+  outside this macOS workspace unless run through target checks or Docker.
+
+### Recommended Next Action
+
+- Commit the completed Phase 165 engine revalidation.

@@ -1,13 +1,14 @@
 use std::{
     future::Future,
     ops::Bound,
-    pin::Pin,
     sync::{Arc, Condvar, Mutex, atomic::Ordering},
     task::{Context, Poll, Waker},
 };
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use std::path::Path;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use std::{pin::Pin, thread};
 
 use crate::{
     error::{Error, Result},
@@ -130,29 +131,36 @@ struct WriteWaiter {
 }
 
 #[derive(Debug)]
-struct WriteCompletion {
-    result: Mutex<Option<Result<CommitInfo>>>,
-    ready: Condvar,
-    waker: Mutex<Option<Waker>>,
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+struct BackgroundWriteFuture {
+    state: BackgroundWriteFutureState,
 }
 
 #[derive(Debug)]
-struct WriteFuture {
-    state: WriteFutureState,
-}
-
-#[derive(Debug)]
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
-enum WriteFutureState {
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+enum BackgroundWriteFutureState {
     Start { db: Db, request: WriteRequest },
     Waiting { waiter: WriteWaiter },
     Done,
 }
 
 #[derive(Debug)]
-enum WriteStart {
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+enum BackgroundWriteStart {
     Ready(Result<CommitInfo>),
     Pending(WriteWaiter),
+}
+
+#[derive(Debug)]
+struct WriteCompletion {
+    result: Mutex<Option<Result<CommitInfo>>>,
+    ready: Condvar,
+    waker: Mutex<Option<Waker>>,
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+struct WriteThreadWake {
+    thread: thread::Thread,
 }
 
 impl WriteRequest {
@@ -450,62 +458,101 @@ impl WriteWaiter {
     }
 }
 
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
-impl WriteFuture {
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl BackgroundWriteFuture {
     fn new(db: Db, request: WriteRequest) -> Self {
         Self {
-            state: WriteFutureState::Start { db, request },
+            state: BackgroundWriteFutureState::Start { db, request },
         }
     }
 
-    fn start(db: &Db, request: WriteRequest, context: &mut Context<'_>) -> WriteStart {
-        let (accepted_write, waiter) = AcceptedWrite::accept(request);
-        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        if db.inner.runtime.capabilities().blocking_adapter() {
-            if let Err(error) = waiter.register_waker(context) {
-                return WriteStart::Ready(Err(error));
-            }
-            let task_db = db.clone();
-            let spawn_result = db.inner.runtime.spawn_blocking(move || {
-                accepted_write.execute(&task_db);
-            });
-            return match spawn_result {
-                Ok(()) => WriteStart::Pending(waiter),
-                Err(error) => WriteStart::Ready(Err(error)),
+    fn start(db: &Db, request: WriteRequest, context: &mut Context<'_>) -> BackgroundWriteStart {
+        let completion = Arc::new(WriteCompletion::new());
+        let waiter = WriteWaiter {
+            completion: Arc::clone(&completion),
+        };
+        if let Err(error) = waiter.register_waker(context) {
+            return BackgroundWriteStart::Ready(Err(error));
+        }
+
+        let task_db = db.clone();
+        let task = move || {
+            let result = wait_for_engine_write_future(task_db.commit_write_request_async(request));
+            drop(task_db);
+            completion.complete(result);
+        };
+
+        if db.inner.runtime.capabilities().background_threads() {
+            let spawn = db
+                .inner
+                .runtime
+                .spawn_background("trine-async-write".to_owned(), task);
+            return match spawn {
+                Ok(_task) => BackgroundWriteStart::Pending(waiter),
+                Err(error) => BackgroundWriteStart::Ready(Err(error)),
             };
         }
 
-        accepted_write.execute(db);
+        task();
         match waiter.poll_result(context) {
-            Poll::Ready(result) => WriteStart::Ready(result),
-            Poll::Pending => WriteStart::Pending(waiter),
+            Poll::Ready(result) => BackgroundWriteStart::Ready(result),
+            Poll::Pending => BackgroundWriteStart::Pending(waiter),
         }
     }
 }
 
-impl Future for WriteFuture {
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl Future for BackgroundWriteFuture {
     type Output = Result<CommitInfo>;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        let state = std::mem::replace(&mut self.state, WriteFutureState::Done);
+        let state = std::mem::replace(&mut self.state, BackgroundWriteFutureState::Done);
         match state {
-            WriteFutureState::Start { db, request } => match Self::start(&db, request, context) {
-                WriteStart::Ready(result) => Poll::Ready(result),
-                WriteStart::Pending(waiter) => {
-                    self.state = WriteFutureState::Waiting { waiter };
-                    Poll::Pending
+            BackgroundWriteFutureState::Start { db, request } => {
+                match Self::start(&db, request, context) {
+                    BackgroundWriteStart::Ready(result) => Poll::Ready(result),
+                    BackgroundWriteStart::Pending(waiter) => {
+                        self.state = BackgroundWriteFutureState::Waiting { waiter };
+                        Poll::Pending
+                    }
                 }
-            },
-            WriteFutureState::Waiting { waiter } => match waiter.poll_result(context) {
+            }
+            BackgroundWriteFutureState::Waiting { waiter } => match waiter.poll_result(context) {
                 Poll::Ready(result) => Poll::Ready(result),
                 Poll::Pending => {
-                    self.state = WriteFutureState::Waiting { waiter };
+                    self.state = BackgroundWriteFutureState::Waiting { waiter };
                     Poll::Pending
                 }
             },
-            WriteFutureState::Done => {
+            BackgroundWriteFutureState::Done => {
                 panic!("write future polled after completion");
             }
+        }
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl std::task::Wake for WriteThreadWake {
+    fn wake(self: Arc<Self>) {
+        self.thread.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.thread.unpark();
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn wait_for_engine_write_future<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
+    let waker = Waker::from(Arc::new(WriteThreadWake {
+        thread: thread::current(),
+    }));
+    let mut context = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(result) => return result,
+            Poll::Pending => thread::park(),
         }
     }
 }
@@ -614,13 +661,7 @@ impl Db {
         request: WriteRequest,
     ) -> impl Future<Output = Result<CommitInfo>> + Send + 'static {
         let db = self.clone();
-        async move {
-            if db.uses_native_platform_async_storage_path() {
-                db.commit_write_request_async(request).await
-            } else {
-                WriteFuture::new(db, request).await
-            }
-        }
+        BackgroundWriteFuture::new(db, request)
     }
 
     fn commit_write_request(&self, request: WriteRequest) -> Result<CommitInfo> {

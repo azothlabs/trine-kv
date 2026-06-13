@@ -4068,7 +4068,7 @@ thread-pool backend for rows without native support.
 
 ### Phase 165: Engine Revalidation After Platform-I/O Completion
 
-**Status**: Planned
+**Status**: Complete
 
 **Goal**: Revisit write, flush, compaction, maintenance, cleanup, and close only
 after platform-io backends have completed their cross-platform abstraction
@@ -4082,6 +4082,10 @@ responsibility and feature split.
   backend gaps.
 - Any engine async work records which completed platform-io operations it
   depends on.
+- Public native async write, persist, flush, compaction, maintenance, cleanup,
+  and close no longer use whole synchronous wrappers for storage work.
+- Default `platform-io` and `platform-io-native` share the same engine async
+  path; feature choice only changes the lower platform-io driver class.
 
 **Major Out Of Scope**:
 

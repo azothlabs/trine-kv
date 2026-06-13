@@ -425,6 +425,7 @@ impl WalFrontDoor {
         })
     }
 
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
     pub(crate) async fn accept_commit_async(
         &self,
         sequence: Sequence,
@@ -456,6 +457,15 @@ impl WalFrontDoor {
         Ok(())
     }
 
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
+    pub(crate) async fn persist_async(&self, durability: DurabilityMode) -> Result<()> {
+        for lane in &self.lanes {
+            enqueue_wal_lane_command(lane, |reply| WalLaneCommand::Persist { durability, reply })?
+                .await?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn stats(&self) -> WalFrontDoorStats {
         WalFrontDoorStats {
             shards: self.active_shard_count,
@@ -476,6 +486,7 @@ impl WalFrontDoor {
         Ok(())
     }
 
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
     pub(crate) async fn rewrite_after_replay_floor_async(
         &self,
         replay_floor: Sequence,
