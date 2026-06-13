@@ -11549,3 +11549,60 @@ Negative check:
 
 - Commit the documentation, example, verification evidence, and macOS
   native-first reliability fix.
+
+## 2026-06-13: Platform-I/O Cross-Platform CI Runtime Gate Complete
+
+### Observation
+
+- Added a Windows GitHub Actions job that runs:
+  - `cargo check --features platform-io --tests`
+  - `cargo check --features platform-io-native --tests`
+  - `cargo test --features platform-io platform_io`
+  - `cargo test --features platform-io-native platform_io`
+  - `cargo run --example platform_io --features platform-io`
+  - `cargo run --example platform_io --features platform-io-native`
+- Ubuntu CI example coverage now also runs `platform_io` without features,
+  with `platform-io`, and with `platform-io-native`.
+- Linux Docker runtime validation initially failed two Linux-only
+  `platform_io` tests. The tests still expected the baseline `platform-io`
+  feature to increment true-native counters, but Phase 164 changed
+  `platform-io` into the thread-pool baseline.
+- Updated the Linux-only async write, flush, and compaction tests to assert
+  `ThreadPoolManagedAsync` counters under `platform-io` and
+  `TruePlatformAsync` counters under `platform-io-native`.
+
+### Interpretation
+
+- The failure was test drift, not a Linux runtime backend failure: the runnable
+  Linux examples passed, and the corrected tests passed for both feature modes.
+- CI now protects the Windows platform-io feature path instead of relying only
+  on local target checks.
+- Linux runtime validation now checks the feature split exactly where the
+  backend differs: baseline thread-pool managed completion versus native-first
+  true async completion.
+
+### Verification
+
+- Linux Docker:
+  - `cargo run -q --example platform_io --features platform-io`
+  - `cargo run -q --example platform_io --features platform-io-native`
+  - `cargo test -q --features platform-io platform_io`
+  - `cargo test -q --features platform-io-native platform_io`
+- Local:
+  - `cargo test -q --features platform-io platform_io`
+  - `cargo test -q --features platform-io-native platform_io`
+  - `cargo check -q --target x86_64-pc-windows-gnu --features platform-io --tests`
+  - `cargo check -q --target x86_64-pc-windows-gnu --features platform-io-native --tests`
+  - `cargo clippy -q --all-features`
+  - `cargo fmt --check`
+  - `git diff --check`
+
+### Remaining Blockers
+
+- Windows runtime execution will happen in GitHub Actions after this commit;
+  local validation from macOS is limited to Windows target checks.
+- BSD/Solaris and browser runtime diagnostics remain outside this workspace.
+
+### Recommended Next Action
+
+- Commit the CI/runtime verification update.

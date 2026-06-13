@@ -327,21 +327,40 @@ fn platform_io_async_write_awaits_wal_without_whole_commit_adapter() {
         after.storage_sync_adapter_submitted_tasks, before.storage_sync_adapter_submitted_tasks,
         "platform async write should not spawn the whole commit through the sync adapter"
     );
-    assert!(
-        after.storage_platform_async_io_tasks > before.storage_platform_async_io_tasks,
-        "platform async write should await platform storage completion"
-    );
-    assert!(
-        after
-            .storage_platform_io_operations
-            .append
-            .true_platform_async
-            > before
+    if cfg!(feature = "platform-io-native") {
+        assert!(
+            after.storage_platform_async_io_tasks > before.storage_platform_async_io_tasks,
+            "native platform async write should await native platform storage completion"
+        );
+        assert!(
+            after
                 .storage_platform_io_operations
                 .append
-                .true_platform_async,
-        "platform async write should report append as true platform async"
-    );
+                .true_platform_async
+                > before
+                    .storage_platform_io_operations
+                    .append
+                    .true_platform_async,
+            "native platform async write should report append as true platform async"
+        );
+    } else {
+        assert!(
+            after.storage_platform_thread_pool_managed_async_tasks
+                > before.storage_platform_thread_pool_managed_async_tasks,
+            "baseline platform async write should await managed thread-pool storage completion"
+        );
+        assert!(
+            after
+                .storage_platform_io_operations
+                .append
+                .thread_pool_managed_async
+                > before
+                    .storage_platform_io_operations
+                    .append
+                    .thread_pool_managed_async,
+            "baseline platform async write should report append as thread-pool managed async"
+        );
+    }
     assert!(
         after.storage_operations.append.requests > before.storage_operations.append.requests,
         "platform async write should still append a WAL record"
@@ -531,21 +550,40 @@ fn platform_io_async_flush_awaits_storage_without_whole_flush_adapter() {
         "platform async flush should not spawn the whole flush through the sync adapter; \
          DbStats may perform one native table-size lookup while observing the result"
     );
-    assert!(
-        after.storage_platform_async_io_tasks > before.storage_platform_async_io_tasks,
-        "platform async flush should await platform storage completions"
-    );
-    assert!(
-        after
-            .storage_platform_io_operations
-            .temp_write_rename_publish
-            .true_platform_async
-            > before
+    if cfg!(feature = "platform-io-native") {
+        assert!(
+            after.storage_platform_async_io_tasks > before.storage_platform_async_io_tasks,
+            "native platform async flush should await native platform storage completions"
+        );
+        assert!(
+            after
                 .storage_platform_io_operations
                 .temp_write_rename_publish
-                .true_platform_async,
-        "platform async flush should publish table or manifest bytes as true platform async"
-    );
+                .true_platform_async
+                > before
+                    .storage_platform_io_operations
+                    .temp_write_rename_publish
+                    .true_platform_async,
+            "native platform async flush should publish table or manifest bytes as true platform async"
+        );
+    } else {
+        assert!(
+            after.storage_platform_thread_pool_managed_async_tasks
+                > before.storage_platform_thread_pool_managed_async_tasks,
+            "baseline platform async flush should await managed thread-pool storage completions"
+        );
+        assert!(
+            after
+                .storage_platform_io_operations
+                .temp_write_rename_publish
+                .thread_pool_managed_async
+                > before
+                    .storage_platform_io_operations
+                    .temp_write_rename_publish
+                    .thread_pool_managed_async,
+            "baseline platform async flush should publish table or manifest bytes as thread-pool managed async"
+        );
+    }
     assert!(
         after.storage_operations.write_object.requests
             > before.storage_operations.write_object.requests,
@@ -572,17 +610,31 @@ fn platform_io_async_flush_awaits_storage_without_whole_flush_adapter() {
             > before.storage_operations.rewrite_wal.requests,
         "platform async flush should rewrite WAL replay floor through storage"
     );
-    assert!(
-        after
-            .storage_platform_io_operations
-            .wal_rewrite
-            .true_platform_async
-            > before
+    if cfg!(feature = "platform-io-native") {
+        assert!(
+            after
                 .storage_platform_io_operations
                 .wal_rewrite
-                .true_platform_async,
-        "platform async flush should report WAL rewrite as true platform async"
-    );
+                .true_platform_async
+                > before
+                    .storage_platform_io_operations
+                    .wal_rewrite
+                    .true_platform_async,
+            "native platform async flush should report WAL rewrite as true platform async"
+        );
+    } else {
+        assert!(
+            after
+                .storage_platform_io_operations
+                .wal_rewrite
+                .thread_pool_managed_async
+                > before
+                    .storage_platform_io_operations
+                    .wal_rewrite
+                    .thread_pool_managed_async,
+            "baseline platform async flush should report WAL rewrite as thread-pool managed async"
+        );
+    }
     drop(db);
 
     let reopened = block_on(Db::open(options)).expect("platform I/O reopen after flush");
@@ -595,7 +647,7 @@ fn platform_io_async_flush_awaits_storage_without_whole_flush_adapter() {
 
 #[cfg(all(feature = "platform-io", target_os = "linux"))]
 #[test]
-fn platform_io_async_compaction_output_writes_are_not_yet_platform_io() {
+fn platform_io_async_compaction_output_writes_use_platform_driver() {
     let path = temp_db_path("platform-io-async-compaction");
     let mut options = DbOptions::persistent(&path).with_durability(DurabilityMode::Flush);
     options.runtime = RuntimeOptions::platform_io();
@@ -624,17 +676,31 @@ fn platform_io_async_compaction_output_writes_are_not_yet_platform_io() {
             > before.storage_operations.write_object.requests,
         "compaction should write output tables through the storage write operation"
     );
-    assert_eq!(
-        after
-            .storage_platform_io_operations
-            .temp_write_rename_publish
-            .true_platform_async,
-        before
-            .storage_platform_io_operations
-            .temp_write_rename_publish
-            .true_platform_async,
-        "native compaction output writes still use the synchronous table writer"
-    );
+    if cfg!(feature = "platform-io-native") {
+        assert!(
+            after
+                .storage_platform_io_operations
+                .temp_write_rename_publish
+                .true_platform_async
+                > before
+                    .storage_platform_io_operations
+                    .temp_write_rename_publish
+                    .true_platform_async,
+            "native platform async compaction should publish output bytes as true platform async"
+        );
+    } else {
+        assert!(
+            after
+                .storage_platform_io_operations
+                .temp_write_rename_publish
+                .thread_pool_managed_async
+                > before
+                    .storage_platform_io_operations
+                    .temp_write_rename_publish
+                    .thread_pool_managed_async,
+            "baseline platform async compaction should publish output bytes as thread-pool managed async"
+        );
+    }
     assert_eq!(
         block_on(db.get(b"compact-key")).expect("read after compaction"),
         Some(b"v2".to_vec())

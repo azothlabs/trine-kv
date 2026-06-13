@@ -6,68 +6,59 @@ Complete
 
 ## Goal
 
-Make platform-io's completed async abstraction understandable and verifiable
-from user-facing docs, crate docs, and a runnable example.
+Close the remaining cross-platform verification gap for platform-io by adding
+Windows CI coverage and running Linux runtime validation in Docker.
 
 ## Scope
 
-- README feature selection and verification path.
-- Usage guide platform-io section.
-- Dedicated `docs/platform-io.md` feature/runtime/matrix guide.
-- Crate-level Rustdoc for platform I/O features.
-- Runnable `platform_io` example that checks driver and operation counters.
-- Local macOS native-first verification for `platform-io-native`.
+- GitHub Actions CI for Windows platform-io feature modes.
+- Ubuntu CI example coverage for `platform_io`.
+- Linux Docker runtime validation for `platform-io` and
+  `platform-io-native`.
+- Linux-only platform_io test assertions after the feature split.
 
 ## Out Of Scope
 
-- New storage format changes.
-- New OS backend architecture.
+- New backend architecture.
+- Storage format changes.
 - Publishing, tagging, pushing, or PR creation.
 
 ## Acceptance Gate
 
-- README explains the difference between no feature, `platform-io`, and
-  `platform-io-native`.
-- Docs state that enabling a feature only makes the driver available; callers
-  still select it with `RuntimeOptions::platform_io()`.
-- Docs explain operation-level classes:
-  `TruePlatformAsync`, `PlatformNativeAsyncButPartial`,
-  `ThreadPoolManagedAsync`, `BlockingFallback`, and `Unsupported`.
-- A checked example validates both `platform-io` and `platform-io-native`.
-- Public Rustdoc passes with warnings denied and doctests pass.
-- Cross-target feature checks keep browser-style WASM and Windows feature
-  shapes honest.
+- Windows CI checks `platform-io` and `platform-io-native` tests.
+- Windows CI runs `examples/platform_io.rs` with both feature modes.
+- Linux Docker runs `platform_io` examples and tests with both feature modes.
+- Linux tests distinguish `ThreadPoolManagedAsync` under `platform-io` from
+  `TruePlatformAsync` under `platform-io-native`.
+- Local cross-target Windows checks, formatting, clippy, and diff checks pass.
 
 ## Active Task Slice
 
 ```text
-task750 [x] goal:add platform-io runnable example | scope:examples/platform_io.rs | verify:cargo run example with both features
-task751 [x] goal:document feature/runtime selection | scope:README.md docs/usage.md docs/platform-io.md src/lib.rs | verify:rustdoc/doctest
-task752 [x] goal:fix local macOS native-first verification gap | scope:src/io/platform_backend/apple_dispatch.rs src/io/platform_backend.rs | verify:platform-io-native example/tests
-task753 [x] goal:record evidence and roadmap | scope:.phrase | verify:diff review
+task754 [x] goal:add Windows platform-io CI gate | scope:.github/workflows/ci.yml | verify:windows target checks
+task755 [x] goal:run Linux platform-io runtime gate | scope:docker rust:1.85-bookworm | verify:examples/tests with both features
+task756 [x] goal:update stale Linux-only platform_io assertions | scope:tests/async_api.rs | verify:docker gate
+task757 [x] goal:record evidence | scope:.phrase | verify:diff review
 ```
 
 ## Evidence
 
-- `platform_io` example writes, reads, and flushes a persistent database. It
-  also selects `RuntimeOptions::platform_io()` and asserts platform operation
-  counters when the feature/target supports the driver.
-- README, usage docs, dedicated platform-io docs, and crate Rustdoc now explain
-  both the Cargo feature choice and the runtime selection step.
-- Local macOS `platform-io-native` verification exposed a DispatchIO descriptor
-  and file-creation reliability gap. The native backend now keeps DispatchIO as
-  the preferred path, but retries create/write and descriptor-unavailable sync
-  cases through safe blocking file operations inside the same platform-io
-  operation.
+- CI now has a `windows-platform-io` job that checks, tests, and runs the
+  `platform_io` example with both `platform-io` and `platform-io-native`.
+- Ubuntu CI example coverage now includes `platform_io` without features,
+  with `platform-io`, and with `platform-io-native`.
+- Linux Docker initially exposed stale Linux-only tests that expected
+  `platform-io` to increment true-native counters. After the feature split,
+  baseline `platform-io` should increment thread-pool managed counters, while
+  `platform-io-native` should increment true native counters on Linux.
+- Linux Docker runtime gate passed after updating those assertions.
 
 ## Known Residuals
 
-- Real Windows, Linux, BSD/Solaris, and browser runtime diagnostics remain
-  outside this macOS workspace unless run through target checks or Docker.
-- Native backend rows that are not true native async remain intentionally
-  classified as partial or thread-pool managed in the public matrix.
+- Windows runtime execution will happen in GitHub Actions after this commit;
+  local validation from macOS is limited to Windows target checks.
+- BSD/Solaris and browser runtime diagnostics remain outside this workspace.
 
 ## Next Recommendation
 
-- Commit the verification, documentation, example, and macOS native-first
-  reliability fix.
+- Commit the CI/runtime verification update.

@@ -49,6 +49,9 @@ jobs:
         run: |
           cargo run --example quickstart
           cargo run --example sync_quickstart
+          cargo run --example platform_io
+          cargo run --example platform_io --features platform-io
+          cargo run --example platform_io --features platform-io-native
           cargo run --example user_store
           cargo run --example event_index
 
@@ -63,3 +66,29 @@ jobs:
 
       - name: Verify package
         run: cargo package --locked
+
+  windows-platform-io:
+    name: Windows Platform I/O
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Check platform I/O features
+        run: |
+          cargo check --features platform-io --tests
+          cargo check --features platform-io-native --tests
+
+      - name: Test platform I/O features
+        run: |
+          cargo test --features platform-io platform_io
+          cargo test --features platform-io-native platform_io
+
+      - name: Run platform I/O example
+        run: |
+          cargo run --example platform_io --features platform-io
+          cargo run --example platform_io --features platform-io-native

@@ -4115,3 +4115,29 @@ verifiable from the README, usage guide, crate docs, and runnable examples.
 
 - New backend architecture, storage format changes, publishing, tagging,
   pushing, or PR creation.
+
+### Phase 167: Platform-I/O Cross-Platform CI Runtime Gate
+
+**Status**: Complete
+
+**Goal**: Move platform-io verification beyond local macOS by adding Windows CI
+coverage and running Linux runtime validation in Docker.
+
+**Entry Condition**: Phase 166 documented feature/runtime usage and identified
+real Windows/Linux runtime diagnostics as the remaining verification gap.
+
+**Acceptance Gate**:
+
+- CI includes a Windows platform-io job that checks, tests, and runs the
+  `platform_io` example for `platform-io` and `platform-io-native`.
+- Linux Docker runtime gate runs the `platform_io` example and platform_io
+  tests for both feature modes.
+- Linux-only tests assert the correct operation class for the selected feature:
+  thread-pool managed for `platform-io`, true native async for
+  `platform-io-native`.
+- Local cross-target Windows checks, formatting, clippy, and diff checks pass.
+
+**Major Out Of Scope**:
+
+- New backend architecture, storage format changes, publishing, tagging,
+  pushing, or PR creation.
