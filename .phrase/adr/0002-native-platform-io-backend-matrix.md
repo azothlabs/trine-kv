@@ -22,9 +22,11 @@ the architecture boundary. Platform support is not uniform:
 
 - Linux can use native async file operations when the backend feature enables
   the Linux native async path.
-- Windows can use native overlapped/IOCP file primitives, but current Trine
-  operations still need target-specific audit and implementation before they
-  can be counted as true platform async completions.
+- Windows can use native overlapped/IOCP file primitives for positioned reads
+  and writes with the selected backend, but current Trine operations still
+  include blocking or helper-managed open, metadata, sync, rename, delete,
+  directory, listing, or lease steps before they can be counted as complete true
+  platform async operations.
 - macOS, BSD, and other Unix targets need platform-specific audits before Trine
   can claim true platform async regular-file operations.
 - Directory enumeration has no native async primitive in the selected backend.
@@ -100,10 +102,11 @@ Driver cleanup may start only after this contract is in place. It must:
 
 - Linux true async remains current evidence, not the definition of
   `platform-io`.
-- Windows IOCP or overlapped I/O coverage must remain per-operation. A Trine
-  operation is not counted as true platform async until every required step has
-  a correct platform completion path or a Trine-owned async strategy that keeps
-  the operation true at the storage boundary.
+- Windows IOCP or overlapped I/O coverage must remain per-operation. Current
+  evidence proves positioned read/write primitives, not whole Trine operations.
+  A Trine operation is not counted as true platform async until every required
+  step has a correct platform completion path or a Trine-owned async strategy
+  that keeps the operation true at the storage boundary.
 - macOS/BSD must not be described as true native async for regular files until
   a stronger backend is implemented and verified, but they remain first-class
   platform-io targets.

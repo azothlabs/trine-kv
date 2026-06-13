@@ -10802,3 +10802,45 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Start Phase 155: Windows Platform Backend.
+
+## 2026-06-13: Windows Platform Backend Audit Complete
+
+### Observation
+
+- The selected `compio-fs 0.7.0` Windows `OpenOptions::open` sets
+  `FILE_FLAG_OVERLAPPED` before opening files.
+- The selected `compio-driver 0.7.1` Windows `ReadAt` and `WriteAt`
+  implementations call `ReadFile` / `WriteFile` with an `OVERLAPPED` pointer.
+- The selected `compio-driver 0.7.1` Windows driver creates IOCP completion
+  ports and attaches handles through `CreateIoCompletionPort`.
+- The selected Windows metadata, open, rename, remove, and create-directory
+  helpers still use blocking/helper-managed paths.
+- `src/io/platform_backend/windows_backend.rs` now records why Windows remains
+  `PlatformNativeAsyncButPartial` for complete Trine operations even though
+  positioned read/write primitives have native async evidence.
+
+### Interpretation
+
+- Windows platform-io is not "unable to async"; it has audited native async
+  primitives for positioned read/write.
+- Current complete Trine operations remain partial because their open,
+  metadata, sync, rename, delete, directory, listing, and lease steps are not
+  all true platform async yet.
+- The next Windows implementation slice should replace one blocking/helper
+  step at a time and then upgrade only the affected Trine operations.
+
+### Verification
+
+- `cargo check -q --target x86_64-pc-windows-gnu --features platform-io`
+- `cargo check -q --target x86_64-pc-windows-gnu --features platform-io --tests`
+
+### Remaining Blockers
+
+- Real Windows runtime tests have not run in this environment.
+- Windows complete-operation upgrades still need implementation for open,
+  metadata, sync, rename, delete, directory, and lease steps.
+
+### Recommended Next Action
+
+- Start Phase 156: macOS Platform Backend, unless the next decision is to keep
+  drilling into Windows complete-operation true async coverage first.

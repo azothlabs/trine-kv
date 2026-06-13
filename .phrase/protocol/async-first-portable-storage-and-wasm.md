@@ -463,6 +463,12 @@ Legend: `Partial` means `PlatformNativeAsyncButPartial`, and
 
 With the current backend matrix, `RuntimeOptions::platform_io()` advertises
 `PlatformAsyncIo` only on Linux when the `platform-io` Cargo feature is enabled.
+On Windows, the selected backend opens files with overlapped support and submits
+positioned `ReadFile` / `WriteFile` operations through IOCP, but file open,
+metadata, sync, rename, delete, directory creation/listing, and related publish
+steps still include blocking or helper-managed work. Therefore Windows rows
+remain partial until a complete Trine operation can be proven end to end.
+
 On non-Linux targets it can still route native storage through the platform
 driver, but current operations remain partial or fallback-classified until
 stronger target backends exist. That current-state classification is not the
