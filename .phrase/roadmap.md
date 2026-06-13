@@ -3966,7 +3966,7 @@ shows engine revalidation is premature until platform-io backends are complete.
 
 ### Phase 161: Windows Platform-I/O Operation Completion
 
-**Status**: Planned
+**Status**: Completed
 
 **Goal**: Turn Windows from partial-operation diagnostics into complete
 Trine-operation implementations where Windows has a provable native async path.
@@ -3991,7 +3991,7 @@ acceptance harness a stable shape.
 
 ### Phase 162: macOS Platform-I/O Backend Selection
 
-**Status**: Planned
+**Status**: Complete
 
 **Goal**: Re-select or implement the Apple-side native file I/O path so macOS
 does not remain a generic managed fallback without proof.
@@ -4007,6 +4007,8 @@ claims measurable at the Trine operation boundary.
   partial, fallback, or unsupported per complete Trine operation.
 - macOS tests prove the selected matrix and avoid claiming true async from
   polling or helper-managed fallback alone.
+- `RuntimeOptions::platform_io()` reports platform async capability for macOS
+  because selected operations now use native partial async data paths.
 
 **Major Out Of Scope**:
 

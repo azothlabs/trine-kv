@@ -6,89 +6,100 @@ Complete
 
 ## Goal
 
-Finish Linux platform-io as a complete Trine-operation backend before returning
-to engine revalidation.
+Finish platform-io as a cross-platform async abstraction for the current backend
+slice: Windows rows are operation-level instead of broad partial claims, and
+macOS uses an Apple-side async file data path instead of generic managed
+fallback for read/write work.
 
 ## Scope
 
-- Audit Linux operation rows at the Trine operation boundary:
-  random read, whole-object read, temporary write plus rename publish, append
-  open, append, persist, WAL rewrite, delete, directory create, directory sync,
-  directory listing, and writer lease.
-- Remove remaining Linux fallback rows where the selected backend/kernel
-  contract can support a complete true async operation.
-- Treat directory listing as the first known Linux gap.
-- Keep other platforms out of this phase except for ensuring the shared
-  operation table and diagnostics remain portable.
+- Windows:
+  - keep IOCP-backed read/write operations as partial when the complete Trine
+    operation also includes open, metadata, sync, rename, delete, directory, or
+    lease setup work;
+  - classify operations without a Windows async substep as managed or blocking
+    fallback.
+- macOS:
+  - use Apple `DispatchIO` through `dispatch2` inside platform-io for file
+    open/read/write data paths;
+  - keep metadata, rename, delete, directory creation/listing, and remaining
+    durability gaps visible as partial or fallback at the Trine operation row.
+- Runtime/statistics:
+  - treat true and partial native async rows as platform async capability;
+  - keep per-operation class counters as the detailed truth.
+- Keep KV engine code unaware of Windows or macOS mechanics.
 
 ## Backend Boundary Receipt
 
-- Trine operation names are the acceptance rows, not OS syscall names.
-- Owned internal surface: Linux platform backend matrix, platform task
-  submission for directory/listing operations, and platform-io diagnostics.
-- Chosen backend: selected Linux platform-io backend behind Trine's
-  `PlatformIoDriver`.
-- Known backend limit entering the phase: directory listing is currently
-  `BlockingFallback`; other Linux rows are currently reported as true platform
-  async by existing tests but must be rechecked as complete Trine operations.
-- Leak-check scope: no Linux-specific branching in KV engine code.
-- Verification gate: Docker Linux platform-io tests asserting every Linux
-  operation row and local cross-platform checks for unaffected fallback targets.
+- Trine operation names are the acceptance rows, not OS function names.
+- Owned internal surface: platform backend matrix modules, macOS DispatchIO
+  backend module, shared platform task submission, runtime capability flag,
+  per-operation diagnostics, and target-family tests.
+- Chosen macOS backend: Apple `DispatchIO` via `dispatch2`, with unsafe calls
+  contained in the macOS platform backend module.
+- Known backend limits after this phase: Windows and macOS still have partial
+  rows where complete operations include non-native steps; directory listing
+  remains blocking fallback; generic other Unix remains managed fallback.
+- Leak-check scope: no Windows-specific or macOS-specific branching in KV
+  engine code.
+- Verification gate: target-family matrix tests, platform-io storage tests,
+  Windows target compile checks, and local full gates.
 
 ## Out Of Scope
 
-- Windows partial-operation completion.
-- macOS backend selection or Apple-specific implementation.
-- Other Unix upgrades beyond preserving fallback classification.
-- Engine compaction, maintenance, cleanup, close, or broader engine
-  revalidation.
-- Storage format changes, publishing, tagging, pushing, or PR creation.
+- Making every Windows/macOS complete operation `TruePlatformAsync`.
+- Other Unix upgrades beyond preserving current BSD/Solaris and generic fallback
+  classification.
+- Engine revalidation, storage format changes, publishing, tagging, pushing, or
+  PR creation.
 
 ## Acceptance Gate
 
-- Linux operation rows are all asserted by tests at the complete Trine operation
-  boundary.
-- Directory listing is no longer an unexamined blocking fallback; it is either
-  true platform async or explicitly proven unavailable for the selected
-  backend/kernel contract.
-- Public protocol/evidence records any hard Linux backend limit.
-- Phase completion is recorded in evidence and committed before starting
-  Windows.
+- Windows rows distinguish partial IOCP-backed operations from managed or
+  blocking fallback rows.
+- macOS read/write data-path rows use an Apple native async backend and are
+  classified at the complete Trine operation boundary.
+- Runtime capabilities and stats no longer claim macOS/Windows have no platform
+  async when native partial async rows exist.
+- Protocol/evidence records remaining limits per complete Trine operation.
+- Phase completion is recorded and committed.
 
 ## Active Task Slice
 
 ```text
-task710 [x] goal:correct roadmap back to platform-io backend completion | scope:decision roadmap current | verify:docs diff
-task711 [x] goal:audit Linux directory listing backend support | scope:kernel/backend/source | verify:source evidence
-task712 [x] goal:update Linux backend implementation or classification | scope:src/io src/io/platform_backend | verify:Docker Linux platform-io tests
-task713 [x] goal:assert every Linux operation row | scope:tests stats | verify:Docker Linux matrix tests
-task714 [x] goal:record and commit Phase 160 | scope:evidence roadmap git | verify:commit
+task720 [x] goal:audit Windows backend substeps | scope:compio windows driver storage path | verify:source evidence
+task721 [x] goal:update Windows operation matrix | scope:src/io/platform_backend/windows_backend.rs src/io.rs | verify:matrix test
+task722 [x] goal:implement macOS Apple data path | scope:Cargo.toml src/io/platform_backend/apple_dispatch.rs src/io/platform_backend.rs | verify:platform-io storage tests
+task723 [x] goal:update runtime/stat diagnostics | scope:src/runtime.rs src/storage.rs src/stats.rs | verify:runtime capability and platform_io tests
+task724 [x] goal:record evidence and commit | scope:current evidence protocol roadmap git | verify:full gate plus commit
 ```
 
 ## Evidence
 
-- User correction on 2026-06-13: platform-io must first complete its role as
-  the cross-platform async abstraction before engine revalidation resumes.
-- Phase 158 made per-operation diagnostics available.
-- Phase 159 is retained as a diagnostic checkpoint, but its recommended next
-  action is superseded by the platform-io backend completion sequence.
-- Linux directory listing is the known remaining Linux fallback row.
-- Source audit found no async directory enumeration primitive in the selected
-  Linux stack, so the row is now an explicit hard fallback rather than an
-  unexamined gap.
-- Docker Linux `platform_io` tests assert every Linux operation row at the
-  Trine operation boundary.
+- Windows positioned file read/write use IOCP, while open, metadata, sync,
+  rename, delete, directory creation/listing, and related lease steps remain
+  synchronous or helper-managed in the selected backend.
+- macOS `mio-aio` is not usable for this target because it does not support
+  macOS; selected `compio` also leaves macOS regular files on the polling
+  fallback path.
+- macOS `dispatch2` exposes Apple `DispatchIO`; the new backend uses it for
+  open/read/write data paths and keeps the unsafe boundary inside platform-io.
+- Platform-io capability is now true on targets with true or partial native
+  async rows, while operation counters still show true/partial/fallback
+  separately.
 
 ## Known Residuals
 
-- Windows remains partial for complete operations that still include open,
-  metadata, sync, rename, delete, directory, or lease fallback steps.
-- macOS needs a newly selected or implemented Apple-side async file path before
-  it can move beyond managed fallback.
-- Other Unix remains fallback unless later evidence proves more.
-- Linux directory listing remains `BlockingFallback` until the selected Linux
-  backend/kernel contract exposes a real async directory enumeration path.
+- Windows rows that include IOCP read/write plus synchronous setup remain
+  partial until non-async substeps are removed or split into separate accepted
+  operations.
+- macOS metadata, rename, delete, directory create/listing, and parts of
+  durability remain partial or fallback.
+- Directory listing remains explicit blocking fallback on all current native
+  backends.
 
 ## Next Recommendation
 
-- Start Phase 161: Windows Platform-I/O Operation Completion.
+- Run the cross-platform operation acceptance phase to verify Linux, Windows,
+  macOS, BSD/Solaris, and generic fallback rows against the same Trine operation
+  harness before returning to engine revalidation.

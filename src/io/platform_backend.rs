@@ -11,6 +11,8 @@ use crate::{
 
 use super::{PlatformIoBackendMatrix, PlatformIoTask};
 
+#[cfg(target_os = "macos")]
+mod apple_dispatch;
 #[cfg(target_os = "freebsd")]
 mod freebsd_backend;
 #[cfg(target_os = "linux")]
@@ -98,26 +100,44 @@ pub(super) async fn len(path: PathBuf) -> Result<u64> {
     Ok(metadata.len())
 }
 
+#[allow(clippy::unused_async)]
 pub(super) async fn read_exact_at_owned(
     path: PathBuf,
     offset: usize,
     len: usize,
 ) -> Result<StorageReadBuffer> {
-    use compio::io::AsyncReadAtExt;
+    #[cfg(target_os = "macos")]
+    {
+        apple_dispatch::read_exact_at_owned(&path, offset, len)
+    }
 
-    let file = compio::fs::File::open(path).await.map_err(Error::Io)?;
-    let buffer = vec![0; len];
-    let compio::buf::BufResult(result, buffer) =
-        file.read_exact_at(buffer, platform_offset(offset)?).await;
-    result.map_err(Error::Io)?;
-    Ok(StorageReadBuffer::from_vec(offset, buffer))
+    #[cfg(not(target_os = "macos"))]
+    {
+        use compio::io::AsyncReadAtExt;
+
+        let file = compio::fs::File::open(path).await.map_err(Error::Io)?;
+        let buffer = vec![0; len];
+        let compio::buf::BufResult(result, buffer) =
+            file.read_exact_at(buffer, platform_offset(offset)?).await;
+        result.map_err(Error::Io)?;
+        Ok(StorageReadBuffer::from_vec(offset, buffer))
+    }
 }
 
+#[allow(clippy::unused_async)]
 pub(super) async fn read_optional(path: PathBuf) -> Result<Option<Arc<[u8]>>> {
-    match compio::fs::read(path).await {
-        Ok(bytes) => Ok(Some(Arc::from(bytes))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(Error::Io(error)),
+    #[cfg(target_os = "macos")]
+    {
+        apple_dispatch::read_optional(&path)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        match compio::fs::read(path).await {
+            Ok(bytes) => Ok(Some(Arc::from(bytes))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(Error::Io(error)),
+        }
     }
 }
 
@@ -129,30 +149,53 @@ pub(super) async fn write_temp_rename(
     create_parent: bool,
     sync_parent_on_sync_all: bool,
 ) -> Result<()> {
-    use compio::io::AsyncWriteAtExt;
-
-    if create_parent {
-        if let Some(parent) = tmp_path.parent() {
-            compio::fs::create_dir_all(parent)
-                .await
-                .map_err(Error::Io)?;
+    #[cfg(target_os = "macos")]
+    {
+        if create_parent {
+            if let Some(parent) = tmp_path.parent() {
+                compio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(Error::Io)?;
+            }
         }
+
+        apple_dispatch::write_truncate(&tmp_path, &bytes, durability)?;
+        compio::fs::rename(&tmp_path, &path)
+            .await
+            .map_err(Error::Io)?;
+        if sync_parent_on_sync_all && durability == DurabilityMode::SyncAll {
+            sync_parent_directory(&path).await?;
+        }
+        Ok(())
     }
 
-    let mut file = compio::fs::File::create(&tmp_path)
-        .await
-        .map_err(Error::Io)?;
-    let compio::buf::BufResult(result, _buffer) = file.write_all_at(bytes.to_vec(), 0).await;
-    result.map_err(Error::Io)?;
-    persist_published_file(&file, durability).await?;
-    file.close().await.map_err(Error::Io)?;
-    compio::fs::rename(&tmp_path, &path)
-        .await
-        .map_err(Error::Io)?;
-    if sync_parent_on_sync_all && durability == DurabilityMode::SyncAll {
-        sync_parent_directory(&path).await?;
+    #[cfg(not(target_os = "macos"))]
+    {
+        use compio::io::AsyncWriteAtExt;
+
+        if create_parent {
+            if let Some(parent) = tmp_path.parent() {
+                compio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(Error::Io)?;
+            }
+        }
+
+        let mut file = compio::fs::File::create(&tmp_path)
+            .await
+            .map_err(Error::Io)?;
+        let compio::buf::BufResult(result, _buffer) = file.write_all_at(bytes.to_vec(), 0).await;
+        result.map_err(Error::Io)?;
+        persist_published_file(&file, durability).await?;
+        file.close().await.map_err(Error::Io)?;
+        compio::fs::rename(&tmp_path, &path)
+            .await
+            .map_err(Error::Io)?;
+        if sync_parent_on_sync_all && durability == DurabilityMode::SyncAll {
+            sync_parent_directory(&path).await?;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 pub(super) async fn open_append(path: PathBuf) -> Result<()> {
@@ -162,10 +205,18 @@ pub(super) async fn open_append(path: PathBuf) -> Result<()> {
             .map_err(Error::Io)?;
     }
 
-    let mut options = compio::fs::OpenOptions::new();
-    options.write(true).create(true);
-    let file = options.open(path).await.map_err(Error::Io)?;
-    file.close().await.map_err(Error::Io)
+    #[cfg(target_os = "macos")]
+    {
+        apple_dispatch::write_existing_or_create(&path, &[], 0, DurabilityMode::Buffered)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut options = compio::fs::OpenOptions::new();
+        options.write(true).create(true);
+        let file = options.open(path).await.map_err(Error::Io)?;
+        file.close().await.map_err(Error::Io)
+    }
 }
 
 pub(super) async fn append(
@@ -173,28 +224,51 @@ pub(super) async fn append(
     bytes: Arc<[u8]>,
     durability: DurabilityMode,
 ) -> Result<()> {
-    use compio::io::AsyncWriteAtExt;
+    #[cfg(target_os = "macos")]
+    {
+        let offset = match compio::fs::metadata(&path).await {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(Error::Io(error)),
+        };
+        apple_dispatch::write_existing_or_create(&path, &bytes, offset, durability)
+    }
 
-    let mut options = compio::fs::OpenOptions::new();
-    options.write(true).create(true);
-    let mut file = options.open(&path).await.map_err(Error::Io)?;
-    let offset = match compio::fs::metadata(&path).await {
-        Ok(metadata) => metadata.len(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(error) => return Err(Error::Io(error)),
-    };
-    let compio::buf::BufResult(result, _buffer) = file.write_all_at(bytes.to_vec(), offset).await;
-    result.map_err(Error::Io)?;
-    persist_wal_file(&file, durability).await?;
-    file.close().await.map_err(Error::Io)
+    #[cfg(not(target_os = "macos"))]
+    {
+        use compio::io::AsyncWriteAtExt;
+
+        let mut options = compio::fs::OpenOptions::new();
+        options.write(true).create(true);
+        let mut file = options.open(&path).await.map_err(Error::Io)?;
+        let offset = match compio::fs::metadata(&path).await {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(Error::Io(error)),
+        };
+        let compio::buf::BufResult(result, _buffer) =
+            file.write_all_at(bytes.to_vec(), offset).await;
+        result.map_err(Error::Io)?;
+        persist_wal_file(&file, durability).await?;
+        file.close().await.map_err(Error::Io)
+    }
 }
 
+#[allow(clippy::unused_async)]
 pub(super) async fn persist_path(path: PathBuf, durability: DurabilityMode) -> Result<()> {
-    let mut options = compio::fs::OpenOptions::new();
-    options.write(true);
-    let file = options.open(path).await.map_err(Error::Io)?;
-    persist_wal_file(&file, durability).await?;
-    file.close().await.map_err(Error::Io)
+    #[cfg(target_os = "macos")]
+    {
+        apple_dispatch::sync_path(&path, durability)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut options = compio::fs::OpenOptions::new();
+        options.write(true);
+        let file = options.open(path).await.map_err(Error::Io)?;
+        persist_wal_file(&file, durability).await?;
+        file.close().await.map_err(Error::Io)
+    }
 }
 
 pub(super) async fn delete_path(path: PathBuf) -> Result<()> {
@@ -232,42 +306,68 @@ fn list_file_paths_blocking(path: &Path) -> Result<Vec<PathBuf>> {
 }
 
 pub(super) async fn acquire_writer_lease(path: PathBuf, owner: Arc<[u8]>) -> Result<()> {
-    use compio::io::AsyncWriteAtExt;
-
-    if let Some(parent) = path.parent() {
-        compio::fs::create_dir_all(parent)
-            .await
-            .map_err(Error::Io)?;
-    }
-
-    let mut options = compio::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    let mut file = match options.open(&path).await {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(Error::Corruption {
-                message: format!("database lock is already held: {}", path.display()),
-            });
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(parent) = path.parent() {
+            compio::fs::create_dir_all(parent)
+                .await
+                .map_err(Error::Io)?;
         }
-        Err(error) => return Err(Error::Io(error)),
-    };
 
-    let compio::buf::BufResult(result, _buffer) = file.write_all_at(owner.to_vec(), 0).await;
-    if let Err(error) = result {
-        let _ = compio::fs::remove_file(&path).await;
-        return Err(Error::Io(error));
+        match apple_dispatch::write_create_new(&path, &owner, DurabilityMode::SyncAll) {
+            Ok(()) => Ok(()),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(Error::Corruption {
+                    message: format!("database lock is already held: {}", path.display()),
+                })
+            }
+            Err(error) => {
+                let _ = compio::fs::remove_file(&path).await;
+                Err(error)
+            }
+        }
     }
-    if let Err(error) = file.sync_all().await {
-        let _ = compio::fs::remove_file(&path).await;
-        return Err(Error::Io(error));
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        use compio::io::AsyncWriteAtExt;
+
+        if let Some(parent) = path.parent() {
+            compio::fs::create_dir_all(parent)
+                .await
+                .map_err(Error::Io)?;
+        }
+
+        let mut options = compio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = match options.open(&path).await {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(Error::Corruption {
+                    message: format!("database lock is already held: {}", path.display()),
+                });
+            }
+            Err(error) => return Err(Error::Io(error)),
+        };
+
+        let compio::buf::BufResult(result, _buffer) = file.write_all_at(owner.to_vec(), 0).await;
+        if let Err(error) = result {
+            let _ = compio::fs::remove_file(&path).await;
+            return Err(Error::Io(error));
+        }
+        if let Err(error) = file.sync_all().await {
+            let _ = compio::fs::remove_file(&path).await;
+            return Err(Error::Io(error));
+        }
+        if let Err(error) = file.close().await {
+            let _ = compio::fs::remove_file(&path).await;
+            return Err(Error::Io(error));
+        }
+        Ok(())
     }
-    if let Err(error) = file.close().await {
-        let _ = compio::fs::remove_file(&path).await;
-        return Err(Error::Io(error));
-    }
-    Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 async fn persist_wal_file(file: &compio::fs::File, durability: DurabilityMode) -> Result<()> {
     match durability {
         DurabilityMode::Buffered | DurabilityMode::Flush => Ok(()),
@@ -276,6 +376,7 @@ async fn persist_wal_file(file: &compio::fs::File, durability: DurabilityMode) -
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 async fn persist_published_file(file: &compio::fs::File, durability: DurabilityMode) -> Result<()> {
     match durability {
         DurabilityMode::Buffered => Ok(()),
@@ -297,7 +398,13 @@ async fn sync_parent_directory(path: &Path) -> Result<()> {
     sync_directory(parent.to_path_buf()).await
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
+#[allow(clippy::unused_async)]
+pub(super) async fn sync_directory(path: PathBuf) -> Result<()> {
+    apple_dispatch::sync_path(&path, DurabilityMode::SyncAll)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 pub(super) async fn sync_directory(path: PathBuf) -> Result<()> {
     let file = compio::fs::File::open(path).await.map_err(Error::Io)?;
     file.sync_all().await.map_err(Error::Io)?;
@@ -326,6 +433,7 @@ pub(super) async fn sync_directory(_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn platform_offset(offset: usize) -> Result<u64> {
     u64::try_from(offset).map_err(|_| Error::invalid_options("platform I/O offset overflow"))
 }

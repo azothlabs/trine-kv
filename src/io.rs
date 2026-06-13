@@ -883,7 +883,56 @@ mod tests {
             assert_eq!(matrix.kind, PlatformIoBackendKind::WindowsNative);
             assert_eq!(
                 matrix.length_lookup,
+                PlatformIoTaskClass::PlatformManagedFallback
+            );
+            assert_eq!(
+                matrix.owned_random_read,
                 PlatformIoTaskClass::PlatformNativeAsyncButPartial
+            );
+            assert_eq!(
+                matrix.optional_whole_object_read,
+                PlatformIoTaskClass::PlatformNativeAsyncButPartial
+            );
+            assert_eq!(
+                matrix.temp_write_rename_publish,
+                PlatformIoTaskClass::PlatformNativeAsyncButPartial
+            );
+            assert_eq!(
+                matrix.append_object_open,
+                PlatformIoTaskClass::PlatformManagedFallback
+            );
+            assert_eq!(
+                matrix.append,
+                PlatformIoTaskClass::PlatformNativeAsyncButPartial
+            );
+            assert_eq!(matrix.persist, PlatformIoTaskClass::PlatformManagedFallback);
+            assert_eq!(
+                matrix.wal_rewrite,
+                PlatformIoTaskClass::PlatformNativeAsyncButPartial
+            );
+            assert_eq!(
+                matrix.object_delete,
+                PlatformIoTaskClass::PlatformManagedFallback
+            );
+            assert_eq!(
+                matrix.directory_create,
+                PlatformIoTaskClass::PlatformManagedFallback
+            );
+            assert_eq!(
+                matrix.directory_sync,
+                PlatformIoTaskClass::PlatformManagedFallback
+            );
+            assert_eq!(
+                matrix.writer_lease_acquire,
+                PlatformIoTaskClass::PlatformNativeAsyncButPartial
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(matrix.kind, PlatformIoBackendKind::MacOsNative);
+            assert_eq!(
+                matrix.length_lookup,
+                PlatformIoTaskClass::PlatformManagedFallback
             );
             assert_eq!(
                 matrix.owned_random_read,
@@ -915,52 +964,6 @@ mod tests {
             );
             assert_eq!(
                 matrix.object_delete,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.directory_create,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.directory_sync,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-            assert_eq!(
-                matrix.writer_lease_acquire,
-                PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            );
-        }
-        #[cfg(target_os = "macos")]
-        {
-            assert_eq!(matrix.kind, PlatformIoBackendKind::MacOsNative);
-            assert_eq!(
-                matrix.length_lookup,
-                PlatformIoTaskClass::PlatformManagedFallback
-            );
-            assert_eq!(
-                matrix.owned_random_read,
-                PlatformIoTaskClass::PlatformManagedFallback
-            );
-            assert_eq!(
-                matrix.optional_whole_object_read,
-                PlatformIoTaskClass::PlatformManagedFallback
-            );
-            assert_eq!(
-                matrix.temp_write_rename_publish,
-                PlatformIoTaskClass::PlatformManagedFallback
-            );
-            assert_eq!(
-                matrix.append_object_open,
-                PlatformIoTaskClass::PlatformManagedFallback
-            );
-            assert_eq!(matrix.append, PlatformIoTaskClass::PlatformManagedFallback);
-            assert_eq!(matrix.persist, PlatformIoTaskClass::PlatformManagedFallback);
-            assert_eq!(
-                matrix.wal_rewrite,
-                PlatformIoTaskClass::PlatformManagedFallback
-            );
-            assert_eq!(
-                matrix.object_delete,
                 PlatformIoTaskClass::PlatformManagedFallback
             );
             assert_eq!(
@@ -969,11 +972,11 @@ mod tests {
             );
             assert_eq!(
                 matrix.directory_sync,
-                PlatformIoTaskClass::PlatformManagedFallback
+                PlatformIoTaskClass::PlatformNativeAsyncButPartial
             );
             assert_eq!(
                 matrix.writer_lease_acquire,
-                PlatformIoTaskClass::PlatformManagedFallback
+                PlatformIoTaskClass::PlatformNativeAsyncButPartial
             );
         }
         #[cfg(target_os = "freebsd")]

@@ -11141,3 +11141,120 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Start Phase 161: Windows Platform-I/O Operation Completion.
+
+## 2026-06-13: Windows Platform-I/O Operation Completion Complete
+
+### Observation
+
+- Windows source audit shows the selected backend opens files with
+  `FILE_FLAG_OVERLAPPED` and submits positioned `ReadFile` / `WriteFile`
+  operations through IOCP.
+- The same backend still performs file open, metadata, sync, rename, delete,
+  directory creation/listing, and related lease setup through synchronous or
+  helper-managed paths.
+- The Windows operation matrix now separates:
+  - `PlatformNativeAsyncButPartial` rows for Trine operations that include an
+    IOCP read/write substep plus non-async setup or publish work;
+  - `PlatformManagedFallback` rows for length lookup, append open, persist,
+    delete, directory create, and directory sync;
+  - `BlockingFallback` for directory listing.
+- KV engine code did not gain Windows-specific branching.
+
+### Interpretation
+
+- Windows platform-io is no longer an undifferentiated partial backend. Its
+  current row classes now state which complete Trine operations have IOCP-backed
+  substeps and which are platform-managed fallback.
+- Windows still is not globally true async. Fully true complete operations would
+  require changing or separating open, metadata, sync, rename, delete,
+  directory, and lease setup boundaries.
+- macOS remains the next missing backend because it still needs an Apple-side
+  async file path instead of generic managed fallback.
+
+### Verification
+
+- `cargo fmt`
+- `cargo test -q platform_backend_matrix_matches_target_family --features platform-io`
+- `cargo check -q --target x86_64-pc-windows-gnu --features platform-io`
+- `cargo check -q --target x86_64-pc-windows-gnu --features platform-io --tests`
+
+### Remaining Blockers
+
+- Windows directory listing remains `BlockingFallback`.
+- Windows complete operations that include synchronous open, metadata, sync,
+  rename, delete, directory, or lease setup remain partial or managed fallback.
+- macOS backend selection/implementation remains open.
+
+### Recommended Next Action
+
+- Start Phase 162: macOS Platform-I/O Backend Selection.
+
+## 2026-06-13: macOS DispatchIO Platform Backend Complete
+
+### Observation
+
+- `mio-aio 2.0.0` is not a macOS solution: its README says it does not work on
+  macOS because macOS AIO lacks the kqueue notification path it relies on.
+- The selected `compio` stack still leaves macOS regular-file work on the Unix
+  polling/blocking path, so reusing it would keep macOS as managed fallback.
+- `dispatch2 0.3.1` exposes Apple `DispatchIO`. The macOS backend now uses it
+  inside platform-io for:
+  - path-backed open/create via `dispatch_io_create_with_path`;
+  - random and whole-object reads via `dispatch_io_read`;
+  - temporary writes, append writes, WAL rewrite data writes, and lease owner
+    writes via `dispatch_io_write`;
+  - fsync-style durability through a `DispatchIO` barrier where the operation
+    still has non-native completion limits.
+- macOS operation rows now report `PlatformNativeAsyncButPartial` for read/write
+  data-path operations and remain managed or blocking fallback for metadata,
+  delete, directory creation/listing, and other unsupported complete-operation
+  steps.
+- `RuntimeOptions::platform_io()` now advertises `PlatformAsyncIo` on targets
+  with true or partial native async rows: Linux, Windows, macOS, FreeBSD,
+  illumos, and Solaris-family targets.
+- KV engine code did not gain Windows-specific or macOS-specific branching.
+
+### Interpretation
+
+- macOS is no longer a generic managed fallback for file data I/O. The Apple
+  async mechanism is behind the platform-io abstraction, so KV code remains
+  platform-agnostic.
+- macOS is still not globally true async at the complete Trine operation level.
+  The correct class for most current macOS operations is partial because
+  metadata, rename, delete, directory, and some durability boundaries still lack
+  a complete Apple async file-operation proof.
+- Platform async capability now means "has true or partial native async
+  operation rows"; exact operation health must continue to use
+  `DbStats::storage_platform_io_operations`.
+
+### Verification
+
+- `cargo fmt`
+- `cargo check -q --features platform-io`
+- `cargo test -q platform_backend_matrix_matches_target_family --features platform-io`
+- `cargo test -q platform_io --features platform-io`
+- `cargo test -q runtime_capabilities_follow_selected_mode --features platform-io`
+- `cargo test -q`
+- `cargo test -q --features platform-io`
+- `cargo clippy -q --all-features`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test --doc -q --all-features`
+- `cargo fmt --check`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Windows complete operations that include synchronous open, metadata, sync,
+  rename, delete, directory, or lease setup remain partial or managed fallback.
+- macOS directory listing remains `BlockingFallback`.
+- macOS metadata, rename, delete, directory create/listing, and remaining
+  durability edges are not complete true async operations.
+- Real Windows, FreeBSD, illumos, and Solaris runtime diagnostics were not run
+  in this macOS environment.
+
+### Recommended Next Action
+
+- Run the cross-platform operation acceptance phase before engine revalidation:
+  prove each Trine operation row on Linux, Windows, macOS, BSD/Solaris, and
+  generic fallback as true async, partial, managed fallback, blocking fallback,
+  or unsupported.

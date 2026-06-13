@@ -68,3 +68,8 @@ js-sys = "0.3.99"
 opfs = "0.2.0"
 wasm-bindgen = "0.2.122"
 wasm-bindgen-futures = "0.4.72"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+libc = "0.2.186"

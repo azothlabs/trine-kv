@@ -263,7 +263,17 @@ const fn platform_io_driver_flag() -> u8 {
 }
 
 const fn platform_async_io_flag() -> u8 {
-    if cfg!(all(feature = "platform-io", target_os = "linux")) {
+    if cfg!(all(
+        feature = "platform-io",
+        any(
+            target_os = "linux",
+            windows,
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "illumos",
+            target_os = "solaris"
+        )
+    )) {
         PLATFORM_ASYNC_IO
     } else {
         0
@@ -642,7 +652,17 @@ mod tests {
         assert_eq!(platform.platform_io_driver(), cfg!(feature = "platform-io"));
         assert_eq!(
             platform.platform_async_io(),
-            cfg!(all(feature = "platform-io", target_os = "linux"))
+            cfg!(all(
+                feature = "platform-io",
+                any(
+                    target_os = "linux",
+                    windows,
+                    target_os = "macos",
+                    target_os = "freebsd",
+                    target_os = "illumos",
+                    target_os = "solaris"
+                )
+            ))
         );
 
         let inline = RuntimeOptions::inline().capabilities();

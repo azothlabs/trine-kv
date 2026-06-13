@@ -1015,12 +1015,11 @@ impl NativeFileStorageMetrics {
     #[cfg(feature = "platform-io")]
     fn record_platform_io_task(&self, class: PlatformIoTaskClass) {
         match class {
-            PlatformIoTaskClass::TruePlatformAsync => {
+            PlatformIoTaskClass::TruePlatformAsync
+            | PlatformIoTaskClass::PlatformNativeAsyncButPartial => {
                 self.platform_async_io.fetch_add(1, Ordering::Relaxed);
             }
-            PlatformIoTaskClass::PlatformNativeAsyncButPartial
-            | PlatformIoTaskClass::PlatformManagedFallback
-            | PlatformIoTaskClass::Unsupported => {
+            PlatformIoTaskClass::PlatformManagedFallback | PlatformIoTaskClass::Unsupported => {
                 self.platform_backend_fallback
                     .fetch_add(1, Ordering::Relaxed);
             }
@@ -5004,9 +5003,86 @@ mod tests {
         std::fs::remove_dir_all(root).expect("test dir removes");
     }
 
-    #[cfg(all(feature = "platform-io", not(target_os = "linux")))]
+    #[cfg(all(
+        feature = "platform-io",
+        any(
+            windows,
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "illumos",
+            target_os = "solaris"
+        )
+    ))]
     #[test]
-    fn platform_io_without_true_async_storage_ops_uses_platform_driver_fallback() {
+    fn platform_io_partial_native_storage_ops_use_platform_driver() {
+        let root = temp_storage_root("trine-kv-platform-io-partial-native-storage");
+        std::fs::create_dir_all(&root).expect("test dir creates");
+        let table =
+            StorageObjectId::native_file(StorageObjectKind::Table, root.join("table.trinet"));
+        std::fs::write(table.path(), b"abcdef").expect("table file writes");
+
+        let runtime = Runtime::new(RuntimeOptions::platform_io());
+        let backend = NativeFileBackend::with_runtime(runtime);
+        let capabilities = backend.capabilities();
+        assert!(capabilities.supports(StorageCapability::PlatformAsyncIo));
+        assert!(capabilities.supports(StorageCapability::BlockingAdapter));
+
+        let object = backend
+            .open_read_blocking(table)
+            .expect("read object opens with platform driver fallback");
+        let buffer = block_on_test_future(object.read_exact_at_owned(2, 3))
+            .expect("read completes through platform driver fallback");
+        assert_eq!(buffer.offset(), 2);
+        assert_eq!(&*buffer.into_bytes(), b"cde");
+
+        let stats = backend.stats();
+        assert!(!stats.uses_blocking_adapter);
+        assert!(stats.uses_platform_io_driver);
+        assert!(stats.uses_platform_async_io);
+        assert!(
+            stats.platform_async_io_tasks > 0,
+            "partial native platform work should count as platform async I/O"
+        );
+        assert_eq!(
+            stats.platform_backend_fallback_tasks, 0,
+            "single random read should not be counted as managed backend fallback"
+        );
+        assert_eq!(stats.platform_blocking_fallback_tasks, 0);
+        assert_eq!(stats.blocking_adapter_tasks, 0);
+        assert!(
+            stats
+                .platform_io_operations
+                .random_read
+                .platform_native_async_but_partial
+                > 0,
+            "platform random read should report partial native async"
+        );
+        let platform_total = stats.platform_io_operations.total();
+        assert!(
+            platform_total.uses_fallback(),
+            "non-Linux platform diagnostics should aggregate fallback work"
+        );
+        assert!(
+            !platform_total.uses_true_platform_async(),
+            "partial native diagnostics should not report whole-operation true async work"
+        );
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[cfg(all(
+        feature = "platform-io",
+        unix,
+        not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "illumos",
+            target_os = "solaris"
+        ))
+    ))]
+    #[test]
+    fn platform_io_without_native_async_storage_ops_uses_platform_driver_fallback() {
         let root = temp_storage_root("trine-kv-platform-io-fallback-storage");
         std::fs::create_dir_all(&root).expect("test dir creates");
         let table =
@@ -5038,16 +5114,6 @@ mod tests {
         );
         assert_eq!(stats.platform_blocking_fallback_tasks, 0);
         assert_eq!(stats.blocking_adapter_tasks, 0);
-        #[cfg(windows)]
-        assert!(
-            stats
-                .platform_io_operations
-                .random_read
-                .platform_native_async_but_partial
-                > 0,
-            "Windows platform random read should report partial native async"
-        );
-        #[cfg(all(unix, not(target_os = "linux")))]
         assert!(
             stats
                 .platform_io_operations
@@ -5059,11 +5125,11 @@ mod tests {
         let platform_total = stats.platform_io_operations.total();
         assert!(
             platform_total.uses_fallback(),
-            "non-Linux platform diagnostics should aggregate fallback work"
+            "fallback diagnostics should aggregate fallback work"
         );
         assert!(
             !platform_total.uses_true_platform_async(),
-            "non-Linux fallback diagnostics should not report true platform async work"
+            "fallback diagnostics should not report true platform async work"
         );
 
         std::fs::remove_dir_all(root).expect("test dir removes");

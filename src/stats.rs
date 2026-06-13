@@ -98,7 +98,7 @@ pub struct DbStats {
     pub storage_sync_adapter_rejected_tasks: u64,
     /// Total runtime spent by sync-adapter tasks.
     pub storage_sync_adapter_total_runtime_micros: u64,
-    /// Storage tasks completed through platform async I/O.
+    /// Storage tasks completed through true or partial native platform async I/O.
     pub storage_platform_async_io_tasks: u64,
     /// Storage tasks that used a backend fallback path.
     pub storage_platform_backend_fallback_tasks: u64,

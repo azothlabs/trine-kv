@@ -1,27 +1,28 @@
 use crate::io::{PlatformIoBackendKind, PlatformIoBackendMatrix, PlatformIoTaskClass};
 
 pub(super) const fn matrix() -> PlatformIoBackendMatrix {
-    use PlatformIoTaskClass::{BlockingFallback, PlatformManagedFallback};
+    use PlatformIoTaskClass::{
+        BlockingFallback, PlatformManagedFallback, PlatformNativeAsyncButPartial,
+    };
 
-    // The selected compio macOS path uses the Unix polling driver for regular
-    // files. In compio-driver 0.7.1, macOS regular-file open/stat/read/write,
-    // sync, rename, delete, and directory operations are submitted as blocking
-    // decisions or direct syscalls rather than audited platform async file
-    // completions. Keep macOS explicit while preserving honest fallback classes.
+    // macOS data-path reads and writes use DispatchIO through the Apple
+    // platform module. Complete Trine operations stay partial when they also
+    // include metadata, rename, delete, directory, or durability steps without
+    // an Apple file-completion primitive.
     PlatformIoBackendMatrix {
         kind: PlatformIoBackendKind::MacOsNative,
         length_lookup: PlatformManagedFallback,
-        owned_random_read: PlatformManagedFallback,
-        optional_whole_object_read: PlatformManagedFallback,
-        temp_write_rename_publish: PlatformManagedFallback,
-        append_object_open: PlatformManagedFallback,
-        append: PlatformManagedFallback,
-        persist: PlatformManagedFallback,
-        wal_rewrite: PlatformManagedFallback,
+        owned_random_read: PlatformNativeAsyncButPartial,
+        optional_whole_object_read: PlatformNativeAsyncButPartial,
+        temp_write_rename_publish: PlatformNativeAsyncButPartial,
+        append_object_open: PlatformNativeAsyncButPartial,
+        append: PlatformNativeAsyncButPartial,
+        persist: PlatformNativeAsyncButPartial,
+        wal_rewrite: PlatformNativeAsyncButPartial,
         object_delete: PlatformManagedFallback,
         directory_create: PlatformManagedFallback,
-        directory_sync: PlatformManagedFallback,
+        directory_sync: PlatformNativeAsyncButPartial,
         directory_listing: BlockingFallback,
-        writer_lease_acquire: PlatformManagedFallback,
+        writer_lease_acquire: PlatformNativeAsyncButPartial,
     }
 }

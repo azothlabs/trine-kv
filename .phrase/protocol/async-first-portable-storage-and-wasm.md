@@ -437,47 +437,55 @@ Rules:
 #### Native Platform Backend Matrix
 
 Current platform backend classifications are operation-level. Linux has current
-true async evidence for many operations. Windows, macOS, BSD/other Unix, and
-generic fallback targets are not final fallback destinations; they need audited
-backend implementations behind the same platform-io contract.
+true async evidence for many operations. Windows, macOS, and BSD/Solaris-family
+targets have native async evidence for selected lower-level file data paths but
+still report partial rows when a complete Trine operation includes non-native
+steps. Generic fallback targets remain managed or blocking fallback until a
+target-specific backend is proven behind the same platform-io contract.
 
 ```text
-Operation                     Linux            Windows          macOS            BSD/other Unix   Generic fallback
-length lookup                 TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback
-random read                   TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback
-whole-object read             TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback
-temp write + rename publish   TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback
-append open                   TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback
-append                        TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback
-persist/fsync                 TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback
-WAL rewrite                   TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback
-delete                        TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback
-directory create              TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback
-directory sync                TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback
+Operation                     Linux            Windows          macOS            BSD/Solaris      Generic fallback
+length lookup                 TruePlatformAsync ManagedFallback  ManagedFallback  ManagedFallback  ManagedFallback
+random read                   TruePlatformAsync Partial          Partial          Partial          ManagedFallback
+whole-object read             TruePlatformAsync Partial          Partial          Partial          ManagedFallback
+temp write + rename publish   TruePlatformAsync Partial          Partial          Partial          ManagedFallback
+append open                   TruePlatformAsync ManagedFallback  Partial          ManagedFallback  ManagedFallback
+append                        TruePlatformAsync Partial          Partial          Partial          ManagedFallback
+persist/fsync                 TruePlatformAsync ManagedFallback  Partial          Partial          ManagedFallback
+WAL rewrite                   TruePlatformAsync Partial          Partial          Partial          ManagedFallback
+delete                        TruePlatformAsync ManagedFallback  ManagedFallback  ManagedFallback  ManagedFallback
+directory create              TruePlatformAsync ManagedFallback  ManagedFallback  ManagedFallback  ManagedFallback
+directory sync                TruePlatformAsync ManagedFallback  Partial          Partial          ManagedFallback
 directory listing             BlockingFallback  BlockingFallback BlockingFallback BlockingFallback BlockingFallback
-writer lease                  TruePlatformAsync Partial          ManagedFallback  ManagedFallback  ManagedFallback/Unsupported
+writer lease                  TruePlatformAsync Partial          Partial          Partial          ManagedFallback/Unsupported
 ```
 
 Legend: `Partial` means `PlatformNativeAsyncButPartial`, and
 `ManagedFallback` means `PlatformManagedFallback`.
 
 With the current backend matrix, `RuntimeOptions::platform_io()` advertises
-`PlatformAsyncIo` only on Linux when the `platform-io` Cargo feature is enabled.
-The Linux directory listing row remains `BlockingFallback` because the selected
-Linux async stack exposes no directory enumeration operation for a complete
-Trine listing request; Trine therefore treats listing as an explicit platform
-driver fallback instead of an unexamined gap.
+`PlatformAsyncIo` when the `platform-io` Cargo feature is enabled on Linux,
+Windows, macOS, FreeBSD, illumos, and Solaris-family targets. This coarse
+capability means at least one operation has true or partial native async
+coverage; the per-operation matrix remains the source of truth for complete
+operation class. The Linux directory listing row remains `BlockingFallback`
+because the selected Linux async stack exposes no directory enumeration
+operation for a complete Trine listing request; Trine therefore treats listing
+as an explicit platform driver fallback instead of an unexamined gap.
 On Windows, the selected backend opens files with overlapped support and submits
 positioned `ReadFile` / `WriteFile` operations through IOCP, but file open,
 metadata, sync, rename, delete, directory creation/listing, and related publish
 steps still include blocking or helper-managed work. Therefore Windows rows
-remain partial until a complete Trine operation can be proven end to end.
+with IOCP read/write substeps are `Partial`, rows without such a substep are
+`ManagedFallback`, and directory listing remains `BlockingFallback` until a
+complete Trine operation can be proven end to end.
 
-On macOS, the selected backend uses the Unix polling path for regular files.
-With `compio-driver 0.7.1`, AIO is enabled only for FreeBSD and Solaris-family
-targets, so macOS regular-file read, write, sync, open, stat, rename, delete,
-and directory operations remain platform-managed fallback or blocking fallback
-until an Apple-specific backend is implemented.
+On macOS, platform-io uses Apple `DispatchIO` through the `dispatch2` crate for
+the file data path: open/create through `dispatch_io_create_with_path`, random
+and whole-object read through `dispatch_io_read`, and write-like paths through
+`dispatch_io_write`. Operations remain `Partial` when they also need metadata,
+rename, delete, directory creation/listing, or durability work without an Apple
+file-completion primitive. Directory listing remains `BlockingFallback`.
 
 On FreeBSD and Solaris-family targets, the selected backend exposes libc AIO for
 some regular-file read, write, and sync primitives. Complete Trine operations
