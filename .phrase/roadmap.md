@@ -4190,3 +4190,28 @@ Windows `platform_io` example `Access is denied`.
 
 - New backend architecture, storage format changes, publishing, tagging,
   pushing, or PR creation.
+
+### Phase 170: Windows Directory Sync Permission Handling
+
+**Status**: Complete
+
+**Goal**: Treat Windows directory-sync access denial as a general platform
+boundary across native durability and platform-io paths.
+
+**Entry Condition**: Windows CI keeps failing `platform_io` examples with
+`Access is denied` after temp-path cleanup was made best-effort and unique.
+
+**Acceptance Gate**:
+
+- Native durability, `platform-io`, and `platform-io-native` Windows directory
+  sync paths all accept directory open/flush `PermissionDenied` as best-effort.
+- File sync and rename still run before the Windows best-effort directory
+  flush.
+- `platform_io` example reports operation context for future Windows errors.
+- Durability docs state the Windows directory-sync limitation.
+- Local macOS checks, Linux Docker smoke, and Windows target checks pass.
+
+**Major Out Of Scope**:
+
+- New backend architecture, storage format changes, publishing, tagging,
+  pushing, or PR creation.

@@ -6,16 +6,16 @@ Complete
 
 ## Goal
 
-Fix the clippy feature-cfg regression exposed after the platform-io CI follow-up
-patch.
+Fix the Windows platform-io permission failure as a general directory-sync
+semantics issue, not as an example-only workaround.
 
 ## Scope
 
-- `NativeFileBackend::uses_platform_io_driver`.
-- `NativeFileStorageMetrics::platform_io_operation_stats`.
-- No-feature branches that return fixed values while keeping call sites
-  instance-method based.
-- Verification for the same commands used by CI where they can run locally.
+- Windows directory sync through native durability helpers.
+- Windows directory sync through `platform-io` thread-pool backend.
+- Windows directory sync through `platform-io-native` backend.
+- `examples/platform_io.rs` error context for future Windows failures.
+- Durability docs for Windows directory-sync limits.
 
 ## Out Of Scope
 
@@ -25,22 +25,31 @@ patch.
 
 ## Acceptance Gate
 
-- Strict clippy passes with all features.
-- Strict clippy passes without platform-io features.
-- Platform-io examples and Windows target checks still pass.
+- Windows directory-open or directory-flush `PermissionDenied` is treated as a
+  best-effort directory-sync boundary, while file sync and rename still run.
+- Platform-io baseline and native Windows backends use the same helper.
+- The example reports which operation failed if another Windows permission
+  issue appears.
+- Local Windows target checks, strict clippy, examples, focused tests, and
+  Linux Docker smoke pass.
 
 ## Active Task Slice
 
 ```text
-task765 [x] goal:fix unused_self in no-feature storage branches | scope:src/storage.rs | verify:strict clippy with and without all-features
-task766 [x] goal:record clippy feature-cfg evidence | scope:.phrase | verify:diff review
+task767 [x] goal:make Windows directory sync PermissionDenied best-effort | scope:src/durability.rs src/io/platform_threadpool.rs src/io/platform_backend.rs | verify:windows target checks
+task768 [x] goal:add platform_io operation context | scope:examples/platform_io.rs | verify:examples
+task769 [x] goal:update durability docs and evidence | scope:docs/durability.md .phrase | verify:diff review
 ```
 
 ## Evidence
 
-- No-feature storage branches now visibly read existing receiver state before
-  returning fixed no-platform-io values, keeping call sites simple while
-  satisfying strict clippy.
+- Windows directory sync now attempts backup-semantics directory handles, but
+  accepts `PermissionDenied` from directory open/flush as the strongest
+  available best-effort directory sync on that platform.
+- The same Windows directory-sync helper is used by native durability,
+  platform-io thread-pool, and platform-io-native code paths.
+- `platform_io` now wraps open/write/read/flush/close errors with operation
+  context.
 
 ## Known Residuals
 
@@ -50,4 +59,4 @@ task766 [x] goal:record clippy feature-cfg evidence | scope:.phrase | verify:dif
 
 ## Next Recommendation
 
-- Commit the CI regression fix and rerun CI.
+- Commit the Windows directory-sync permission fix and rerun CI.

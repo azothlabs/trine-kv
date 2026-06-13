@@ -244,12 +244,19 @@ pub(super) fn sync_directory(path: PathBuf) -> Result<()> {
     const FILE_SHARE_WRITE: u32 = 0x0000_0002;
     const FILE_SHARE_DELETE: u32 = 0x0000_0004;
 
-    let file = OpenOptions::new()
+    let file = match OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)?;
-    file.sync_all().map_err(Error::Io)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if crate::durability::is_windows_directory_sync_permission_denied(&error) => {
+            return Ok(());
+        }
+        Err(error) => return Err(Error::Io(error)),
+    };
+    crate::durability::finish_windows_directory_sync(file.sync_all())
 }
 
 #[cfg(not(any(unix, windows)))]

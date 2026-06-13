@@ -11739,3 +11739,53 @@ Negative check:
 ### Recommended Next Action
 
 - Commit the clippy feature-cfg fix and rerun CI.
+
+## 2026-06-13: Windows Directory Sync Permission Handling
+
+### Observation
+
+- Windows CI continued to fail `examples/platform_io.rs` with bare
+  `Access is denied` for both `platform-io` and `platform-io-native`.
+- The platform-io write/flush path calls directory sync after rename publish.
+  On Windows this opens a directory handle with backup semantics and calls
+  `sync_all`, which can return `ERROR_ACCESS_DENIED` on CI runners or
+  filesystems even when file sync and rename succeeded.
+- The same directory-sync pattern existed in native durability helpers,
+  platform-io thread-pool backend, and platform-io-native backend.
+
+### Interpretation
+
+- This is a general Windows permission/lifecycle boundary, not an example
+  cleanup problem. Directory flush cannot be treated as equally reliable across
+  Windows filesystems and runners.
+- Trine should still sync file contents and metadata before rename, attempt the
+  directory sync, and then treat Windows directory `PermissionDenied` as
+  best-effort instead of failing normal write/flush paths.
+- Future Windows failures need operation context, so the example should report
+  whether failure happened during open, write, read, flush, or close.
+
+### Verification
+
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo check -q --target x86_64-pc-windows-gnu --features platform-io --tests`
+- `cargo check -q --target x86_64-pc-windows-gnu --features platform-io-native --tests`
+- `cargo run -q --example platform_io`
+- `cargo run -q --example platform_io --features platform-io`
+- `cargo run -q --example platform_io --features platform-io-native`
+- `cargo test -q --features platform-io platform_io`
+- `cargo test -q --features platform-io-native platform_io`
+- Linux Docker:
+  - `cargo run -q --example platform_io --features platform-io`
+  - `cargo run -q --example platform_io --features platform-io-native`
+  - `cargo test -q --features platform-io platform_io`
+  - `cargo test -q --features platform-io-native platform_io`
+
+### Remaining Blockers
+
+- Windows runtime behavior still needs the GitHub Actions rerun because this
+  workspace is macOS.
+
+### Recommended Next Action
+
+- Commit the Windows directory-sync permission fix and rerun CI.

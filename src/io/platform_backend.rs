@@ -435,9 +435,15 @@ pub(super) async fn sync_directory(path: PathBuf) -> Result<()> {
         .read(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
-    let file = options.open(path).await.map_err(Error::Io)?;
-    file.sync_all().await.map_err(Error::Io)?;
-    file.close().await.map_err(Error::Io)
+    let file = match options.open(path).await {
+        Ok(file) => file,
+        Err(error) if crate::durability::is_windows_directory_sync_permission_denied(&error) => {
+            return Ok(());
+        }
+        Err(error) => return Err(Error::Io(error)),
+    };
+    let sync_result = crate::durability::finish_windows_directory_sync(file.sync_all().await);
+    file.close().await.map_err(Error::Io).and(sync_result)
 }
 
 #[cfg(not(any(unix, windows)))]

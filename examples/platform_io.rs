@@ -7,7 +7,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use trine_kv::{Db, DbOptions, Result, RuntimeOptions};
+use trine_kv::{Db, DbOptions, Error, Result, RuntimeOptions};
 
 fn main() -> Result<()> {
     let path = temp_path("trine-kv-platform-io");
@@ -24,10 +24,14 @@ async fn run(path: &Path) -> Result<()> {
     }
     options.background_worker_count = 0;
 
-    let db = Db::open(options).await?;
-    db.put(b"platform-io:key", b"value").await?;
-    assert_eq!(db.get(b"platform-io:key").await?, Some(b"value".to_vec()));
-    db.flush().await?;
+    let db = with_context(Db::open(options).await, "open platform_io database")?;
+    with_context(
+        db.put(b"platform-io:key", b"value").await,
+        "write platform_io key",
+    )?;
+    let value = with_context(db.get(b"platform-io:key").await, "read platform_io key")?;
+    assert_eq!(value, Some(b"value".to_vec()));
+    with_context(db.flush().await, "flush platform_io database")?;
 
     let stats = db.stats();
     let platform = stats.storage_platform_io_operations.total();
@@ -59,7 +63,17 @@ async fn run(path: &Path) -> Result<()> {
         );
     }
 
-    db.close().await
+    with_context(db.close().await, "close platform_io database")
+}
+
+fn with_context<T>(result: Result<T>, operation: &'static str) -> Result<T> {
+    result.map_err(|error| match error {
+        Error::Io(error) => Error::Io(std::io::Error::new(
+            error.kind(),
+            format!("{operation} failed: {error}"),
+        )),
+        error => error,
+    })
 }
 
 fn block_on<T>(future: impl Future<Output = T>) -> T {

@@ -1,5 +1,10 @@
 use std::path::Path;
 
+#[cfg(windows)]
+use std::io;
+
+#[cfg(windows)]
+use crate::error::Error;
 use crate::error::Result;
 
 pub(crate) fn sync_parent_dir_after_rename(path: &Path) -> Result<()> {
@@ -37,16 +42,35 @@ fn sync_directory(path: &Path) -> Result<()> {
     const FILE_SHARE_WRITE: u32 = 0x0000_0002;
     const FILE_SHARE_DELETE: u32 = 0x0000_0004;
 
-    // Windows requires backup semantics to open a directory handle. Once the
-    // handle is open, `sync_all` asks the platform to flush that directory
-    // metadata, which is the directory-entry half of atomic file publish.
-    OpenOptions::new()
+    // Windows requires backup semantics to open a directory handle. Some
+    // filesystems and runners reject directory flush with ERROR_ACCESS_DENIED;
+    // Trine still syncs the file itself and treats this directory step as the
+    // strongest available best effort on Windows.
+    let file = match OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)?
-        .sync_all()?;
-    Ok(())
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if is_windows_directory_sync_permission_denied(&error) => return Ok(()),
+        Err(error) => return Err(Error::Io(error)),
+    };
+    finish_windows_directory_sync(file.sync_all())
+}
+
+#[cfg(windows)]
+pub(crate) fn finish_windows_directory_sync(result: io::Result<()>) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if is_windows_directory_sync_permission_denied(&error) => Ok(()),
+        Err(error) => Err(Error::Io(error)),
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn is_windows_directory_sync_permission_denied(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(5)
 }
 
 #[cfg(not(any(unix, windows)))]
