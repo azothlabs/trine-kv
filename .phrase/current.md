@@ -6,16 +6,15 @@ Complete
 
 ## Goal
 
-Close the remaining cross-platform verification gap for platform-io by adding
-Windows CI coverage and running Linux runtime validation in Docker.
+Fix the CI regressions exposed after the cross-platform platform-io gate landed.
 
 ## Scope
 
-- GitHub Actions CI for Windows platform-io feature modes.
-- Ubuntu CI example coverage for `platform_io`.
-- Linux Docker runtime validation for `platform-io` and
-  `platform-io-native`.
-- Linux-only platform_io test assertions after the feature split.
+- `cargo clippy --all-targets --all-features -- -D warnings` failures from
+  long platform-io test functions.
+- Windows `platform_io` example failure caused by cleanup returning
+  `PermissionDenied` after the checked database path had already completed.
+- Verification for the same commands used by CI where they can run locally.
 
 ## Out Of Scope
 
@@ -25,40 +24,36 @@ Windows CI coverage and running Linux runtime validation in Docker.
 
 ## Acceptance Gate
 
-- Windows CI checks `platform-io` and `platform-io-native` tests.
-- Windows CI runs `examples/platform_io.rs` with both feature modes.
-- Linux Docker runs `platform_io` examples and tests with both feature modes.
-- Linux tests distinguish `ThreadPoolManagedAsync` under `platform-io` from
-  `TruePlatformAsync` under `platform-io-native`.
-- Local cross-target Windows checks, formatting, clippy, and diff checks pass.
+- No `too_many_lines` failures under strict all-target clippy.
+- `platform_io` example cleanup is best-effort after the database path has
+  completed, so Windows file-handle release timing does not fail the example.
+- Local Windows target checks still pass.
+- Platform-io examples and focused tests still pass.
 
 ## Active Task Slice
 
 ```text
-task754 [x] goal:add Windows platform-io CI gate | scope:.github/workflows/ci.yml | verify:windows target checks
-task755 [x] goal:run Linux platform-io runtime gate | scope:docker rust:1.85-bookworm | verify:examples/tests with both features
-task756 [x] goal:update stale Linux-only platform_io assertions | scope:tests/async_api.rs | verify:docker gate
-task757 [x] goal:record evidence | scope:.phrase | verify:diff review
+task758 [x] goal:fix all-target clippy too_many_lines | scope:src/io.rs src/storage.rs tests/async_api.rs | verify:cargo clippy --all-targets --all-features -- -D warnings
+task759 [x] goal:make example cleanup tolerate Windows handle timing | scope:examples/platform_io.rs | verify:platform_io examples
+task760 [x] goal:record CI regression evidence | scope:.phrase | verify:diff review
 ```
 
 ## Evidence
 
-- CI now has a `windows-platform-io` job that checks, tests, and runs the
-  `platform_io` example with both `platform-io` and `platform-io-native`.
-- Ubuntu CI example coverage now includes `platform_io` without features,
-  with `platform-io`, and with `platform-io-native`.
-- Linux Docker initially exposed stale Linux-only tests that expected
-  `platform-io` to increment true-native counters. After the feature split,
-  baseline `platform-io` should increment thread-pool managed counters, while
-  `platform-io-native` should increment true native counters on Linux.
-- Linux Docker runtime gate passed after updating those assertions.
+- The large platform backend matrix test is now operation-row driven through
+  helper assertions instead of one monolithic per-platform function.
+- The Linux platform-io flush test and native-file management test now keep
+  operation flow and counter-class assertions in separate helpers.
+- `examples/platform_io.rs` still resets any old directory before opening, but
+  the final cleanup is best-effort because Windows can temporarily deny
+  directory removal after file-heavy examples.
 
 ## Known Residuals
 
-- Windows runtime execution will happen in GitHub Actions after this commit;
-  local validation from macOS is limited to Windows target checks.
+- Windows runtime execution must be confirmed by GitHub Actions because this
+  workspace is macOS.
 - BSD/Solaris and browser runtime diagnostics remain outside this workspace.
 
 ## Next Recommendation
 
-- Commit the CI/runtime verification update.
+- Commit the CI regression fix and rerun CI.

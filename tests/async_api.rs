@@ -550,40 +550,7 @@ fn platform_io_async_flush_awaits_storage_without_whole_flush_adapter() {
         "platform async flush should not spawn the whole flush through the sync adapter; \
          DbStats may perform one native table-size lookup while observing the result"
     );
-    if cfg!(feature = "platform-io-native") {
-        assert!(
-            after.storage_platform_async_io_tasks > before.storage_platform_async_io_tasks,
-            "native platform async flush should await native platform storage completions"
-        );
-        assert!(
-            after
-                .storage_platform_io_operations
-                .temp_write_rename_publish
-                .true_platform_async
-                > before
-                    .storage_platform_io_operations
-                    .temp_write_rename_publish
-                    .true_platform_async,
-            "native platform async flush should publish table or manifest bytes as true platform async"
-        );
-    } else {
-        assert!(
-            after.storage_platform_thread_pool_managed_async_tasks
-                > before.storage_platform_thread_pool_managed_async_tasks,
-            "baseline platform async flush should await managed thread-pool storage completions"
-        );
-        assert!(
-            after
-                .storage_platform_io_operations
-                .temp_write_rename_publish
-                .thread_pool_managed_async
-                > before
-                    .storage_platform_io_operations
-                    .temp_write_rename_publish
-                    .thread_pool_managed_async,
-            "baseline platform async flush should publish table or manifest bytes as thread-pool managed async"
-        );
-    }
+    assert_platform_io_flush_publish_class(&before, &after);
     assert!(
         after.storage_operations.write_object.requests
             > before.storage_operations.write_object.requests,
@@ -610,6 +577,60 @@ fn platform_io_async_flush_awaits_storage_without_whole_flush_adapter() {
             > before.storage_operations.rewrite_wal.requests,
         "platform async flush should rewrite WAL replay floor through storage"
     );
+    assert_platform_io_flush_wal_rewrite_class(&before, &after);
+    drop(db);
+
+    let reopened = block_on(Db::open(options)).expect("platform I/O reopen after flush");
+    assert_eq!(
+        block_on(reopened.get(b"flush-key")).expect("platform replay read"),
+        Some(b"flush-value".to_vec())
+    );
+    cleanup_dir(&path);
+}
+
+#[cfg(all(feature = "platform-io", target_os = "linux"))]
+fn assert_platform_io_flush_publish_class(before: &trine_kv::DbStats, after: &trine_kv::DbStats) {
+    if cfg!(feature = "platform-io-native") {
+        assert!(
+            after.storage_platform_async_io_tasks > before.storage_platform_async_io_tasks,
+            "native platform async flush should await native platform storage completions"
+        );
+        assert!(
+            after
+                .storage_platform_io_operations
+                .temp_write_rename_publish
+                .true_platform_async
+                > before
+                    .storage_platform_io_operations
+                    .temp_write_rename_publish
+                    .true_platform_async,
+            "native platform async flush should publish bytes as true platform async"
+        );
+    } else {
+        assert!(
+            after.storage_platform_thread_pool_managed_async_tasks
+                > before.storage_platform_thread_pool_managed_async_tasks,
+            "baseline platform async flush should await managed thread-pool completions"
+        );
+        assert!(
+            after
+                .storage_platform_io_operations
+                .temp_write_rename_publish
+                .thread_pool_managed_async
+                > before
+                    .storage_platform_io_operations
+                    .temp_write_rename_publish
+                    .thread_pool_managed_async,
+            "baseline platform async flush should publish bytes as managed async"
+        );
+    }
+}
+
+#[cfg(all(feature = "platform-io", target_os = "linux"))]
+fn assert_platform_io_flush_wal_rewrite_class(
+    before: &trine_kv::DbStats,
+    after: &trine_kv::DbStats,
+) {
     if cfg!(feature = "platform-io-native") {
         assert!(
             after
@@ -620,7 +641,7 @@ fn platform_io_async_flush_awaits_storage_without_whole_flush_adapter() {
                     .storage_platform_io_operations
                     .wal_rewrite
                     .true_platform_async,
-            "native platform async flush should report WAL rewrite as true platform async"
+            "native platform async flush should report WAL rewrite as true async"
         );
     } else {
         assert!(
@@ -632,17 +653,9 @@ fn platform_io_async_flush_awaits_storage_without_whole_flush_adapter() {
                     .storage_platform_io_operations
                     .wal_rewrite
                     .thread_pool_managed_async,
-            "baseline platform async flush should report WAL rewrite as thread-pool managed async"
+            "baseline platform async flush should report WAL rewrite as managed async"
         );
     }
-    drop(db);
-
-    let reopened = block_on(Db::open(options)).expect("platform I/O reopen after flush");
-    assert_eq!(
-        block_on(reopened.get(b"flush-key")).expect("platform replay read"),
-        Some(b"flush-value".to_vec())
-    );
-    cleanup_dir(&path);
 }
 
 #[cfg(all(feature = "platform-io", target_os = "linux"))]

@@ -4954,6 +4954,17 @@ mod tests {
 
         let stats = backend.stats();
         assert_platform_task_accounting(&stats, 11, 0);
+        assert_linux_platform_management_counters(&stats);
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[cfg(all(
+        feature = "platform-io",
+        feature = "platform-io-native",
+        target_os = "linux"
+    ))]
+    fn assert_linux_platform_management_counters(stats: &NativeFileStorageStats) {
         assert!(
             stats
                 .platform_io_operations
@@ -5017,8 +5028,6 @@ mod tests {
                 > 0,
             "Linux platform directory sync should report true platform async"
         );
-
-        std::fs::remove_dir_all(root).expect("test dir removes");
     }
 
     #[cfg(all(

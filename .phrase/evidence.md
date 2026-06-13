@@ -11606,3 +11606,48 @@ Negative check:
 ### Recommended Next Action
 
 - Commit the CI/runtime verification update.
+
+## 2026-06-13: Platform-I/O CI Regression Fix
+
+### Observation
+
+- CI ran `cargo clippy --all-targets --all-features -- -D warnings`, which is
+  stricter than the earlier local `cargo clippy -q --all-features` check. It
+  reported `too_many_lines` in:
+  - `src/io.rs::platform_backend_matrix_matches_target_family`
+  - `tests/async_api.rs::platform_io_async_flush_awaits_storage_without_whole_flush_adapter`
+  - `src/storage.rs::platform_io_native_file_management_ops_use_platform_driver`
+- Windows CI ran `cargo run --example platform_io --features platform-io` and
+  `cargo run --example platform_io --features platform-io-native`; both reached
+  an `Access is denied` error from example directory cleanup.
+
+### Interpretation
+
+- The clippy failures were test-structure drift, not backend behavior. The
+  matrix and counter checks are still the same checks, but now live behind
+  small operation-row helpers.
+- The Windows example failure was cleanup lifecycle sensitivity. The example
+  should fail if the database operation fails, but it should not fail because
+  Windows has not released a file handle by the time final temp-directory
+  cleanup runs.
+
+### Verification
+
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo check -q --target x86_64-pc-windows-gnu --features platform-io --tests`
+- `cargo check -q --target x86_64-pc-windows-gnu --features platform-io-native --tests`
+- `cargo test -q --features platform-io platform_io`
+- `cargo run -q --example platform_io`
+- `cargo run -q --example platform_io --features platform-io`
+- `cargo run -q --example platform_io --features platform-io-native`
+- `cargo fmt --check`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Windows runtime behavior still needs the GitHub Actions rerun to confirm the
+  cleanup fix on the actual runner.
+
+### Recommended Next Action
+
+- Commit this CI regression fix and rerun the Windows platform-io job.

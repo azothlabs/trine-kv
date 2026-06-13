@@ -4141,3 +4141,27 @@ real Windows/Linux runtime diagnostics as the remaining verification gap.
 
 - New backend architecture, storage format changes, publishing, tagging,
   pushing, or PR creation.
+
+### Phase 168: Platform-I/O CI Regression Fix
+
+**Status**: Complete
+
+**Goal**: Fix the CI failures exposed by the new cross-platform platform-io
+gate.
+
+**Entry Condition**: Phase 167 added Windows CI and Linux runtime checks; CI
+reported strict clippy failures and Windows example cleanup failure.
+
+**Acceptance Gate**:
+
+- Strict all-target clippy passes without `too_many_lines` failures.
+- Platform-io tests keep operation-level assertions after helper extraction.
+- The `platform_io` example does not fail solely because final temp-directory
+  cleanup is denied on Windows.
+- Local examples, focused tests, Windows target checks, formatting, and diff
+  checks pass.
+
+**Major Out Of Scope**:
+
+- New backend architecture, storage format changes, publishing, tagging,
+  pushing, or PR creation.

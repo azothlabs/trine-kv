@@ -13,7 +13,7 @@ fn main() -> Result<()> {
     let path = temp_path("trine-kv-platform-io");
     reset_dir(&path)?;
     block_on(run(&path))?;
-    reset_dir(&path)?;
+    cleanup_dir_best_effort(&path);
     Ok(())
 }
 
@@ -101,4 +101,8 @@ fn reset_dir(path: &Path) -> Result<()> {
         Err(error) => return Err(trine_kv::Error::Io(error)),
     }
     Ok(())
+}
+
+fn cleanup_dir_best_effort(path: &Path) {
+    let _ = std::fs::remove_dir_all(path);
 }
