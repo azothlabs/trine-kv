@@ -901,6 +901,7 @@ impl NativeFileBackend {
         }
         #[cfg(not(feature = "platform-io"))]
         {
+            let _ = self.runtime.is_some();
             false
         }
     }
@@ -1087,6 +1088,7 @@ impl NativeFileStorageMetrics {
         }
         #[cfg(not(feature = "platform-io"))]
         {
+            let _ = self.inline_tasks();
             PlatformIoOperationStats::default()
         }
     }

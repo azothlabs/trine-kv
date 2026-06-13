@@ -11704,3 +11704,38 @@ Negative check:
 ### Recommended Next Action
 
 - Commit this follow-up and rerun CI.
+
+## 2026-06-13: Platform-I/O Clippy Feature-Cfg Fix
+
+### Observation
+
+- CI reported `clippy::unused_self` for:
+  - `NativeFileBackend::uses_platform_io_driver`
+  - `NativeFileStorageMetrics::platform_io_operation_stats`
+- The warnings appear in feature combinations where `platform-io` code is cfg'd
+  out, leaving methods whose no-feature branches return fixed values.
+
+### Interpretation
+
+- The behavior was correct, but the no-feature branches did not visibly read
+  `self`, so strict clippy treated the receiver as unnecessary.
+- Keeping the methods as instance methods avoids scattering cfg-specific call
+  sites through storage stats and capability code.
+
+### Verification
+
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo run -q --example platform_io`
+- `cargo run -q --example platform_io --features platform-io`
+- `cargo check -q --target x86_64-pc-windows-gnu --features platform-io --tests`
+- `cargo fmt --check`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Windows runtime behavior still needs the GitHub Actions rerun.
+
+### Recommended Next Action
+
+- Commit the clippy feature-cfg fix and rerun CI.
