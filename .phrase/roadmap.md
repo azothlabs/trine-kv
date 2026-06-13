@@ -4237,3 +4237,28 @@ release, then create the local Git tag used by GitHub release automation.
 
 - New platform I/O behavior, storage format changes, actual crates.io publish,
   pushing, PR creation, or GitHub release page editing.
+
+### Phase 172: WAL Replay Writer-Lease Performance
+
+**Status**: In Progress
+
+**Goal**: Diagnose the current `WAL replay` benchmark slowdown and fix the
+dominant cost without changing WAL, manifest, or storage formats.
+
+**Entry Condition**: The `0.4.0` release benchmark check identifies `WAL replay`
+as the main follow-up row after release.
+
+**Acceptance Gate**:
+
+- `WAL replay` diagnostics separate writable reopen, read-only reopen, storage
+  requests, and writer-lease latency.
+- The dominant slowdown is classified from current evidence before changing
+  code.
+- The selected fix keeps writer lease fail-closed tests passing across default,
+  `platform-io`, and `platform-io-native` feature variants.
+- Release-profile benchmark evidence records before/after behavior.
+
+**Major Out Of Scope**:
+
+- Storage format changes, WAL frame changes, manifest semantics, broad
+  point-read tuning, publishing, tagging, pushing, or release workflow changes.

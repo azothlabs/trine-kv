@@ -11810,3 +11810,82 @@ Negative check:
 
 - Align release metadata to `0.4.0`, run package and dry-run publish checks,
   commit the release metadata, and create the local `v0.4.0` tag.
+
+## 2026-06-13: 0.4 Release Benchmark Check
+
+### Observation
+
+- Ran `cargo bench --bench v1_bench` three times on the current `0.4.0`
+  release candidate.
+- Exported `166c2a3`, the pre-platform-io snapshot after `0.3.0` release docs,
+  and ran the same benchmark three times.
+- Current medians compared with the pre-platform snapshot:
+  - `flush throughput`: 66507 us -> 67610 us (+1.7%).
+  - `compaction throughput`: 232869 us -> 183985 us (-21.0%).
+  - `separated blob values`: 128401 us -> 125066 us (-2.6%).
+  - `random get`: 1059 us -> 972 us (-8.2%).
+  - `prefix scan`: 7176 us -> 6832 us (-4.8%).
+  - `WAL replay`: 28694 us -> 35413 us (+23.4%).
+
+### Interpretation
+
+- The platform I/O work does not show a broad default-path benchmark regression.
+- Older focused write-path numbers from `v1-prepublish-tuning.md` are not a
+  direct release gate because they predate later WAL replay-floor rewrite and
+  storage-backend routing work.
+- `WAL replay` is the main follow-up row. It is not obviously tied to platform
+  I/O feature selection, but the delta is large enough to revisit in a
+  WAL-focused performance phase.
+
+### Recommended Next Action
+
+- Do not block the `0.4.0` platform I/O release on the benchmark result.
+- After release, consider a focused WAL replay and localized batched point-read
+  benchmark phase if those workloads matter for the next minor release.
+
+## 2026-06-13: WAL Replay Slowdown Was Writer-Lease Sync
+
+### Observation
+
+- Added `WAL replay` diagnostics that split writable reopen, read-only reopen,
+  storage requests, first-read deltas, and writer-lease latency.
+- Before the writer-lease change:
+  - `WAL replay`: 35430 us.
+  - `WAL replay read-only`: 29501 us.
+  - 32 writable reopen diagnostics: 106515 us wall-clock.
+  - 32 writable writer-lease acquisitions: 88076 us.
+  - 32 writable WAL object reads: 1664 us.
+- After changing writer-lease owner persistence from `sync_all` to ordinary
+  write/flush:
+  - `WAL replay`: 31693 us.
+  - `WAL replay read-only`: 31706 us.
+  - 32 writable reopen diagnostics: 18706 us wall-clock.
+  - 32 writable writer-lease acquisitions: 1888 us.
+  - 32 writable WAL object reads: 1520 us.
+
+### Interpretation
+
+- The measured slowdown was not WAL read/decode/replay. Writable reopen was
+  dominated by syncing the human-readable writer-lease owner text.
+- The single-writer guarantee comes from exclusive `create_new` creation of the
+  `LOCK` file and fail-closed behavior when the file exists.
+- Owner text is used by drop-time cleanup and diagnostics; syncing that text to
+  storage was expensive and did not by itself provide parent-directory durable
+  lease semantics.
+- The fix should apply consistently to the default native path, platform-io
+  thread-pool path, and native platform I/O path.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q writer_lease`
+- `cargo test -q --features platform-io writer_lease`
+- `cargo test -q --features platform-io-native writer_lease`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo bench --bench v1_bench`
+
+### Recommended Next Action
+
+- Commit the writer-lease performance fix after a final diff review.
+- Treat localized batched point-read behavior as a separate future performance
+  slice, not part of this WAL replay fix.

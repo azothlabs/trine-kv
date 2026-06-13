@@ -3614,8 +3614,10 @@ fn writer_lease_owner_text() -> String {
 }
 
 fn write_native_file_writer_lease_owner(file: &mut File, owner: &str) -> Result<()> {
+    // The exclusive lease is the create-new LOCK file. The owner text is only a
+    // drop-time guard and diagnostic aid, so it does not need a storage sync.
     file.write_all(owner.as_bytes())?;
-    file.sync_all()?;
+    file.flush()?;
     Ok(())
 }
 

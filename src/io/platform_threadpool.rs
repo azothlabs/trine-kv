@@ -190,7 +190,7 @@ pub(super) fn acquire_writer_lease(path: &Path, owner: &[u8]) -> Result<()> {
         let _ = fs::remove_file(path);
         return Err(Error::Io(error));
     }
-    if let Err(error) = file.sync_all() {
+    if let Err(error) = file.flush() {
         let _ = fs::remove_file(path);
         return Err(Error::Io(error));
     }

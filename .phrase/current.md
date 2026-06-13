@@ -6,58 +6,62 @@ In Progress
 
 ## Goal
 
-Prepare the `0.4.0` release metadata for the completed platform I/O work and
-create the Git tag used by the GitHub release flow.
+Investigate and fix the current `WAL replay` benchmark slowdown without
+changing storage formats or weakening the single-writer guarantee.
 
 ## Scope
 
-- Cargo crate version and lockfile version.
-- User-facing version references in README and docs.
-- Changelog entry for `0.4.0`.
-- Release checklist target version.
-- Local packaging and dry-run publishing verification.
-- Local `v0.4.0` tag after the release commit.
+- `benches/v1_bench.rs` WAL replay diagnostics.
+- Native-file writer lease acquisition on the default backend.
+- Platform-io thread-pool writer lease acquisition.
+- Native platform-io writer lease acquisition.
+- Benchmark evidence for before/after behavior.
 
 ## Out Of Scope
 
-- New platform I/O behavior.
 - Storage format changes.
-- Actual crates.io publish from this local workspace.
-- Pushing commits or tags unless explicitly requested.
-- Creating a GitHub release page beyond the tag.
+- WAL frame format changes.
+- Manifest semantics.
+- Broad point-read or batch-read tuning.
+- Publishing, tagging, pushing, or release workflow changes.
 
 ## Acceptance Gate
 
-- `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, and release docs agree on
-  `0.4.0`.
-- README, usage docs, and platform I/O docs use the `0.4` dependency line.
-- Cargo package contents exclude repository-only workflow files.
-- `cargo publish --dry-run --locked` passes.
-- `git diff --check` and formatting checks pass.
-- A local `v0.4.0` tag points at the release metadata commit.
+- `WAL replay` is decomposed into writable and read-only reopen diagnostics.
+- The dominant current cost is classified before optimizing.
+- Writer lease changes keep existing fail-closed tests passing.
+- Platform-io feature variants keep writer lease tests passing.
+- Strict clippy passes.
+- Release-profile benchmark evidence shows whether the selected change improved
+  the measured slowdown.
 
 ## Active Task Slice
 
 ```text
-task770 [ ] goal:align release metadata to 0.4.0 | scope:Cargo.toml Cargo.lock CHANGELOG.md README.md docs | verify:rg version audit
-task771 [ ] goal:verify package and dry-run publish | scope:cargo package/publish | verify:cargo package --locked && cargo publish --dry-run --locked
-task772 [ ] goal:create release commit and v0.4.0 tag | scope:git metadata | verify:git status && git show v0.4.0
+task774 [x] goal:add WAL replay reopen diagnostics | scope:benches/v1_bench.rs | verify:cargo bench --bench v1_bench
+task775 [x] goal:remove unnecessary writer-lease owner sync | scope:src/storage.rs src/io/platform_threadpool.rs src/io/platform_backend.rs | verify:writer_lease tests
+task776 [x] goal:record benchmark evidence | scope:docs/benchmarks .phrase/evidence.md | verify:git diff review
 ```
 
 ## Evidence
 
-- GitHub Actions has passed after the Windows directory-sync permission fix,
-  according to the user.
-- The release is a pre-`1.0` minor bump because platform I/O adds a meaningful
-  feature surface and cross-platform async behavior.
+- Writable WAL replay reopen was dominated by writer-lease acquisition, not WAL
+  read/decode/replay.
+- Before the change, 32 writable reopen diagnostics spent 88076 us in writer
+  lease acquisition and 106515 us wall-clock total.
+- After the change, 32 writable reopen diagnostics spent 1888 us in writer
+  lease acquisition and 18706 us wall-clock total.
+- The `WAL replay` row moved from 35430 us to 31693 us in the local
+  release-profile run.
 
 ## Known Residuals
 
-- Actual crates.io publish should happen through the guarded manual workflow or
-  with an available local registry token.
-- Push remains pending until the user asks for it.
+- `localized batched point read persistent` remains a separate observation from
+  the `0.4.0` release benchmark check.
+- A full multi-run median after this change would reduce benchmark noise before
+  making a broader performance claim.
 
 ## Next Recommendation
 
-- Finish local release verification, commit the metadata, and create the local
-  `v0.4.0` tag.
+- Run one more release-profile benchmark if we want a three-run median for the
+  final write-up, then commit the writer-lease performance fix.

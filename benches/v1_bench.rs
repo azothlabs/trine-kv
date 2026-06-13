@@ -18,6 +18,7 @@ const LOCALIZED_POINT_READ_BATCH: usize = 16;
 const LARGE_ROWS: usize = 128;
 const LARGE_OPS: usize = 256;
 const LARGE_VALUE_BYTES: usize = 16 * 1024;
+const WAL_REPLAY_DIAGNOSTIC_RUNS: usize = 32;
 
 fn main() {
     println!("trine-kv v1 benchmark");
@@ -48,6 +49,8 @@ fn main() {
     results.push(bench_transaction_commit());
     results.push(bench_transaction_conflict());
     results.push(bench_wal_replay());
+    results.push(bench_wal_replay_read_only());
+    extend_wal_replay_diagnostics(&mut results);
     results.push(bench_flush_throughput());
     results.push(bench_compaction_throughput());
     results.push(bench_large_inline_values());
@@ -115,6 +118,10 @@ fn measure(name: &'static str, iterations: usize, mut run: impl FnMut() -> u64) 
         elapsed: start.elapsed(),
         checksum,
     }
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 fn benchmark_persistent_options(path: impl Into<PathBuf>) -> DbOptions {
@@ -407,15 +414,7 @@ fn bench_wal_replay() -> BenchResult {
     measure("WAL replay", ROWS, || {
         let dir = temp_dir("wal-replay");
         let options = benchmark_persistent_options(&dir);
-        {
-            let db = Db::open_sync(options.clone()).expect("persistent db opens");
-            let bucket = db.default_bucket_sync().expect("bucket opens");
-            for index in 0..ROWS {
-                bucket
-                    .put_sync(key(index), value(index))
-                    .expect("put succeeds");
-            }
-        }
+        populate_wal_replay_dir(options.clone());
         let db = Db::open_sync(options).expect("persistent db reopens");
         let bucket = db.default_bucket_sync().expect("bucket reopens");
         let checksum = bucket
@@ -426,6 +425,111 @@ fn bench_wal_replay() -> BenchResult {
         cleanup_dir(&dir);
         checksum
     })
+}
+
+fn bench_wal_replay_read_only() -> BenchResult {
+    measure("WAL replay read-only", ROWS, || {
+        let dir = temp_dir("wal-replay-read-only");
+        let options = benchmark_persistent_options(&dir);
+        populate_wal_replay_dir(options.clone());
+        let db = Db::open_sync(options.read_only()).expect("read-only persistent db reopens");
+        let bucket = db.default_bucket_sync().expect("bucket reopens");
+        let checksum = bucket
+            .get_sync(&key(ROWS / 2))
+            .expect("get succeeds")
+            .map_or(0, |value| value.len() as u64);
+        drop(db);
+        cleanup_dir(&dir);
+        checksum
+    })
+}
+
+fn extend_wal_replay_diagnostics(results: &mut Vec<BenchResult>) {
+    extend_wal_replay_open_diagnostics(results, "WAL replay writable open", false);
+    extend_wal_replay_open_diagnostics(results, "WAL replay read-only open", true);
+}
+
+fn extend_wal_replay_open_diagnostics(
+    results: &mut Vec<BenchResult>,
+    label: &'static str,
+    read_only: bool,
+) {
+    let mut open_diagnostics = ColdReadDiagnostics::default();
+    let mut first_read_diagnostics = ColdReadDiagnostics::default();
+    let mut open_wall_micros = 0_u64;
+    let mut open_memtable_bytes = 0_u64;
+    let mut open_visible_sequence = 0_u64;
+    let mut open_wal_shards = 0_u64;
+    let mut open_wal_open_shards = 0_u64;
+
+    for _ in 0..WAL_REPLAY_DIAGNOSTIC_RUNS {
+        let dir = temp_dir("wal-replay-diagnostics");
+        let options = benchmark_persistent_options(&dir);
+        populate_wal_replay_dir(options.clone());
+        let open_options = if read_only {
+            options.read_only()
+        } else {
+            options
+        };
+
+        let start = Instant::now();
+        let db = Db::open_sync(open_options).expect("persistent db reopens");
+        open_wall_micros = open_wall_micros.saturating_add(duration_micros(start.elapsed()));
+
+        let open_stats = db.stats();
+        open_diagnostics.record(&open_stats);
+        open_memtable_bytes = open_memtable_bytes.saturating_add(open_stats.memtable_bytes);
+        open_visible_sequence =
+            open_visible_sequence.saturating_add(open_stats.commit_visible_sequence);
+        open_wal_shards = open_wal_shards.saturating_add(open_stats.wal_shards as u64);
+        open_wal_open_shards =
+            open_wal_open_shards.saturating_add(open_stats.wal_open_shards as u64);
+
+        let bucket = db.default_bucket_sync().expect("bucket reopens");
+        let value_len = bucket
+            .get_sync(&key(ROWS / 2))
+            .expect("get succeeds")
+            .map_or(0, |value| value.len());
+        assert!(value_len > 0, "WAL replay diagnostic must read a value");
+
+        let after_first_read = db.stats();
+        first_read_diagnostics.record_delta(&open_stats, &after_first_read);
+        drop(db);
+        cleanup_dir(&dir);
+    }
+
+    results.push(BenchResult::diagnostic(
+        labelled(label, "wall micros"),
+        open_wall_micros,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "memtable bytes"),
+        open_memtable_bytes,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "visible sequence"),
+        open_visible_sequence,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "configured shards"),
+        open_wal_shards,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "active shards"),
+        open_wal_open_shards,
+    ));
+    open_diagnostics.push_results_with_label(results, label);
+    first_read_diagnostics.push_results_with_label(results, labelled(label, "first read"));
+}
+
+fn populate_wal_replay_dir(options: DbOptions) {
+    let db = Db::open_sync(options).expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+    for index in 0..ROWS {
+        bucket
+            .put_sync(key(index), value(index))
+            .expect("put succeeds");
+    }
 }
 
 fn bench_flush_throughput() -> BenchResult {
@@ -802,6 +906,7 @@ struct ColdReadDiagnostics {
     read_exact_at_owned_micros: u64,
     read_object_bytes_micros: u64,
     read_current_manifest_micros: u64,
+    open_append_micros: u64,
     acquire_writer_lease_micros: u64,
     list_directory_files_micros: u64,
     list_objects_micros: u64,
@@ -873,6 +978,9 @@ impl ColdReadDiagnostics {
                 .read_current_manifest
                 .total_latency_micros,
         );
+        self.open_append_micros = self
+            .open_append_micros
+            .saturating_add(stats.storage_operations.open_append.total_latency_micros);
         self.acquire_writer_lease_micros = self.acquire_writer_lease_micros.saturating_add(
             stats
                 .storage_operations
@@ -1053,6 +1161,13 @@ impl ColdReadDiagnostics {
                         .total_latency_micros,
                 ),
         );
+        self.open_append_micros = self.open_append_micros.saturating_add(
+            after
+                .storage_operations
+                .open_append
+                .total_latency_micros
+                .saturating_sub(before.storage_operations.open_append.total_latency_micros),
+        );
         self.acquire_writer_lease_micros = self.acquire_writer_lease_micros.saturating_add(
             after
                 .storage_operations
@@ -1185,6 +1300,10 @@ impl ColdReadDiagnostics {
         results.push(BenchResult::diagnostic(
             labelled(label, "storage current manifest micros"),
             self.read_current_manifest_micros,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled(label, "storage open append micros"),
+            self.open_append_micros,
         ));
         results.push(BenchResult::diagnostic(
             labelled(label, "storage acquire writer lease micros"),

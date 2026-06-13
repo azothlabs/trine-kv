@@ -315,7 +315,7 @@ pub(super) async fn acquire_writer_lease(path: PathBuf, owner: Arc<[u8]>) -> Res
                 .map_err(Error::Io)?;
         }
 
-        match apple_dispatch::write_create_new(&path, &owner, DurabilityMode::SyncAll) {
+        match apple_dispatch::write_create_new(&path, &owner, DurabilityMode::Buffered) {
             Ok(()) => Ok(()),
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 Err(Error::Corruption {
@@ -353,10 +353,6 @@ pub(super) async fn acquire_writer_lease(path: PathBuf, owner: Arc<[u8]>) -> Res
 
         let compio::buf::BufResult(result, _buffer) = file.write_all_at(owner.to_vec(), 0).await;
         if let Err(error) = result {
-            let _ = compio::fs::remove_file(&path).await;
-            return Err(Error::Io(error));
-        }
-        if let Err(error) = file.sync_all().await {
             let _ = compio::fs::remove_file(&path).await;
             return Err(Error::Io(error));
         }
