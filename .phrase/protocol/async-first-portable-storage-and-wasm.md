@@ -496,6 +496,32 @@ all operation rows into one class counter set for dashboards and health checks;
 individual rows remain the source of truth when a caller needs to know whether,
 for example, random reads differ from directory listing on the selected target.
 
+### 9.2.1 Native Engine Path Revalidation
+
+The native engine must be judged at the storage operation boundary, not by the
+name of the public async method. Current evidence:
+
+```text
+Path                         Current native platform-io status
+write / WAL append           awaits append and persist storage completions
+public flush table writes     awaits temp write plus rename publish
+public flush directory sync   awaits directory sync
+public flush WAL rewrite      awaits WAL rewrite
+public flush cleanup          still uses synchronous delete helpers
+compaction output writes      still use synchronous table/blob writers
+compaction directory sync     still uses synchronous directory sync
+compaction cleanup            still uses synchronous delete helpers
+native maintenance            still wraps sync maintenance in a blocking task
+native close                  still wraps sync close in a blocking task
+```
+
+This means platform-io is correctly wired for the existing write and flush
+storage completions, but the next engine async work should target native
+compaction output writes and cleanup deletes before claiming broader engine
+async coverage. Close remains a separate lifecycle boundary because it also
+coordinates worker shutdown, the publish barrier, writer lease release, and
+best-effort cleanup.
+
 ### 9.3 WASI Backend
 
 The WASI backend is persistent only when the host grants suitable storage

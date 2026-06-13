@@ -593,6 +593,55 @@ fn platform_io_async_flush_awaits_storage_without_whole_flush_adapter() {
     cleanup_dir(&path);
 }
 
+#[cfg(all(feature = "platform-io", target_os = "linux"))]
+#[test]
+fn platform_io_async_compaction_output_writes_are_not_yet_platform_io() {
+    let path = temp_db_path("platform-io-async-compaction");
+    let mut options = DbOptions::persistent(&path).with_durability(DurabilityMode::Flush);
+    options.runtime = RuntimeOptions::platform_io();
+    options.background_worker_count = 1;
+    options.max_l0_files = 64;
+
+    let db = block_on(Db::open(options)).expect("platform I/O persistent open");
+    block_on(db.put(b"compact-key".to_vec(), b"v1".to_vec())).expect("first write commits");
+    block_on(db.flush()).expect("first flush writes an L0 table");
+    block_on(db.put(b"compact-key".to_vec(), b"v2".to_vec())).expect("second write commits");
+    block_on(db.flush()).expect("second flush writes an overlapping L0 table");
+
+    let before = db.stats();
+    let outcome = block_on(
+        db.compact_range_with_budget(KeyRange::all(), trine_kv::MaintenanceBudget::unbounded()),
+    )
+    .expect("platform I/O compaction succeeds");
+    let after = db.stats();
+
+    assert!(
+        outcome.compactions > 0 || after.compaction_runs > before.compaction_runs,
+        "compaction should rewrite overlapping L0 tables"
+    );
+    assert!(
+        after.storage_operations.write_object.requests
+            > before.storage_operations.write_object.requests,
+        "compaction should write output tables through the storage write operation"
+    );
+    assert_eq!(
+        after
+            .storage_platform_io_operations
+            .temp_write_rename_publish
+            .true_platform_async,
+        before
+            .storage_platform_io_operations
+            .temp_write_rename_publish
+            .true_platform_async,
+        "native compaction output writes still use the synchronous table writer"
+    );
+    assert_eq!(
+        block_on(db.get(b"compact-key")).expect("read after compaction"),
+        Some(b"v2".to_vec())
+    );
+    cleanup_dir(&path);
+}
+
 #[test]
 fn dropping_unpolled_async_write_future_has_no_side_effect() {
     let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");

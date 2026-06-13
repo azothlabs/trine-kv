@@ -10991,3 +10991,58 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Start Phase 159: Engine Path Revalidation On Cross-Platform Platform-I/O.
+
+## 2026-06-13: Engine Path Revalidation Complete
+
+### Observation
+
+- Native platform-io async write tests prove WAL append/persist operations are
+  awaited through storage completions without spawning the whole commit through
+  the sync adapter.
+- Native platform-io public flush tests prove table/manifest publish,
+  directory sync, and WAL rewrite operations are awaited through storage
+  completions.
+- `flush_native_async()` still calls synchronous cleanup helpers after the async
+  flush storage operations complete.
+- Native `compact_range`, budgeted compaction, and native maintenance still
+  wrap their synchronous implementations in `run_native_blocking_task`.
+- Native compaction output table/blob writes still call synchronous table/blob
+  writers, which use `write_object_blocking`.
+- Native close still wraps `close_sync()` in `run_native_blocking_task`; the
+  sync close path couples worker shutdown, publish-barrier waiting, cleanup,
+  and writer lease release.
+- A new Linux platform-io test proves compaction writes output tables through
+  the storage write counter while the true-platform-async temp write/rename
+  counter does not increase during compaction.
+
+### Interpretation
+
+- Write and public flush are the currently proven native async storage paths.
+- The next engine async phase should not revisit OS backends first; it should
+  move native compaction output writes and cleanup deletes onto awaitable
+  storage operations.
+- Close should remain a later lifecycle phase because it contains more than file
+  I/O.
+
+### Verification
+
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo test -q persistent_async_maintenance_runs_on_runtime_blocking_task`
+- `cargo test -q --features platform-io platform_io_without_true_async_storage_ops_uses_platform_driver_fallback`
+- `docker run --rm --security-opt seccomp=unconfined -v /Users/poria/Developer/Work/Azoth/trine-kv:/workspace -w /workspace -e CARGO_TARGET_DIR=/tmp/trine-kv-target rust:1.85-bookworm cargo test -q --features platform-io platform_io`
+- `cargo test -q`
+- `cargo test -q --features platform-io`
+- `cargo clippy -q --all-features`
+
+### Remaining Blockers
+
+- Real Windows, FreeBSD, and illumos runtime diagnostics were not run in this
+  environment.
+- Native compaction and cleanup still need async storage implementations.
+- Native close still needs a separate lifecycle design before it should be
+  split.
+
+### Recommended Next Action
+
+- Start Phase 160: Native Async Compaction Output And Cleanup.

@@ -3913,7 +3913,7 @@ operation-level classification model.
 
 ### Phase 159: Engine Path Revalidation On Cross-Platform Platform-I/O
 
-**Status**: Planned
+**Status**: Complete
 
 **Goal**: Re-evaluate write, flush, compaction, maintenance, cleanup, and close
 against the corrected cross-platform platform-io contract.
@@ -3933,4 +3933,31 @@ one non-Linux backend path has been implemented or explicitly classified.
 **Major Out Of Scope**:
 
 - Adding new OS backends beyond those already selected by evidence.
+- Storage format changes, publishing, tagging, pushing, or PR creation.
+
+### Phase 160: Native Async Compaction Output And Cleanup
+
+**Status**: Planned
+
+**Goal**: Move native compaction output writes, compaction directory sync, and
+cleanup deletes onto awaitable storage operations where platform-io can report
+their operation classes.
+
+**Entry Condition**: Phase 159 proves that write/flush are already represented
+in platform-io diagnostics while compaction and cleanup remain on synchronous
+native helpers.
+
+**Acceptance Gate**:
+
+- Native compaction output table/blob writes use async storage helpers where
+  the selected backend supports them.
+- Compaction and flush cleanup deletes can be awaited through the storage
+  boundary instead of calling synchronous delete helpers on the async path.
+- Platform-io diagnostics prove the changed operations on Linux and do not
+  overstate non-Linux fallback behavior.
+- Storage format and compaction semantics remain unchanged.
+
+**Major Out Of Scope**:
+
+- Reworking close, worker shutdown, manifest semantics, or new OS backends.
 - Storage format changes, publishing, tagging, pushing, or PR creation.
