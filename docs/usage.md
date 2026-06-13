@@ -19,21 +19,23 @@ Then look at the integration examples when you want to embed the database
 behind an application boundary:
 
 ```text
+cargo run --example read_versions
 cargo run --example user_store
 cargo run --example event_index
 ```
 
+`read_versions` shows public historical-read cursors and named checkpoints.
 `user_store` wraps Trine KV behind a small repository-style API. `event_index`
 uses two buckets and one write batch to keep event payloads and an account
 index in sync.
 
 ## Add The Crate
 
-Published releases use Semantic Versioning. For the `0.1` release line:
+Published releases use Semantic Versioning. For the `0.3` release line:
 
 ```toml
 [dependencies]
-trine-kv = "0.1"
+trine-kv = "0.3"
 ```
 
 For local development from this repository:
@@ -51,7 +53,7 @@ native file driver:
 
 ```toml
 [dependencies]
-trine-kv = { version = "0.1", features = ["platform-io"] }
+trine-kv = { version = "0.3", features = ["platform-io"] }
 ```
 
 ## Open A Database
@@ -318,8 +320,8 @@ MVCC or range-delete checks.
 
 ## Snapshots
 
-A snapshot keeps reads pinned to the database sequence that was current when
-the snapshot was created:
+A snapshot keeps reads pinned to the database read version that was current
+when the snapshot was created:
 
 ```rust
 let snapshot = db.snapshot();
@@ -341,6 +343,85 @@ for item in snapshot.prefix_sync(&users, b"user:")? {
 
 Keep snapshots short-lived when possible. Long-lived snapshots can delay
 cleanup of old versions and blob files.
+
+## Read Versions And Checkpoints
+
+`ReadVersion` is the public cursor for a committed database state. Write APIs
+return it through `CommitInfo::read_version`, snapshots expose it with
+`Snapshot::read_version`, and `Db::latest_read_version` returns the newest
+visible committed state:
+
+```rust
+use trine_kv::{WriteBatch, WriteOptions};
+
+let mut batch = WriteBatch::new();
+batch.put_bucket("users", b"user:001", b"Ada")?;
+let first = db.write_sync(batch, WriteOptions::default())?.read_version();
+assert_eq!(db.latest_read_version(), first);
+```
+
+Use `Db::snapshot_at` when an application stores a read version and later needs
+to reopen that same state:
+
+```rust
+let version = db.latest_read_version();
+let snapshot = db.snapshot_at(version)?;
+
+users.put_sync(b"user:001", b"Ada Lovelace")?;
+
+assert_eq!(snapshot.get_sync(&users, b"user:001")?, Some(b"Ada".to_vec()));
+assert_eq!(users.get_sync(b"user:001")?, Some(b"Ada Lovelace".to_vec()));
+```
+
+`snapshot_at` validates the cursor against this database and the oldest
+retained read version. If the requested version is newer than the database has
+seen, it returns `Error::ReadVersionTooNew`. If the version is older than Trine
+still retains, it returns `Error::ReadVersionExpired`.
+
+By default, Trine retains only the newest committed state unless an active
+snapshot or checkpoint pins an older state. Use
+`DbOptions::with_keep_last_read_versions` when the application wants a small
+recent-history window:
+
+```rust
+use trine_kv::{Db, DbOptions};
+
+let db = Db::open_sync(DbOptions::new("./trine-data").with_keep_last_read_versions(8))?;
+```
+
+Named checkpoints pin important read versions until deletion. They are durable
+metadata for persistent databases, so a checkpoint created before closing can
+be looked up after reopening:
+
+```rust
+let checkpoint = db.create_checkpoint_sync("before-import")?;
+db.flush_sync()?;
+drop(db);
+
+let db = Db::open_sync("./trine-data")?;
+let retained = db.checkpoint_read_version_sync("before-import")?;
+assert_eq!(retained, checkpoint);
+
+let snapshot = db.snapshot_at(retained)?;
+```
+
+Delete checkpoints when the application no longer needs that historical state:
+
+```rust
+db.delete_checkpoint_sync("before-import")?;
+```
+
+Deleting a checkpoint only removes its retained-version pin. Snapshots already
+opened from that checkpoint continue to read their pinned state until dropped.
+After the checkpoint and any old snapshots are gone, future writes and cleanup
+may advance `Db::oldest_retained_read_version`; a later `snapshot_at` for the
+deleted checkpoint's version can then return `Error::ReadVersionExpired`.
+
+Run the checked example for the full path:
+
+```text
+cargo run --example read_versions
+```
 
 ## Repeated Point Reads
 
@@ -609,6 +690,7 @@ Use these commands before trusting a change to documentation or examples:
 ```text
 cargo run --example quickstart
 cargo run --example sync_quickstart
+cargo run --example read_versions
 cargo run --example user_store
 cargo run --example event_index
 cargo fmt --check

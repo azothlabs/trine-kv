@@ -26,6 +26,12 @@ Release packaging notes live in [docs/release.md](docs/release.md).
   logical separation or independent tuning.
 - Atomic write batches across the default bucket and named buckets.
 - MVCC snapshots that keep old reads stable while newer writes commit.
+- Public `ReadVersion` cursors for reopening a retained committed state with
+  `Db::snapshot_at`.
+- Named checkpoints that pin important read versions until the application
+  deletes them.
+- Configurable recent read-version retention with
+  `DbOptions::with_keep_last_read_versions`.
 - Snapshot-bound point readers that can avoid copying inline table values when
   callers can work with borrowed bytes.
 - Optimistic transactions with point and range conflict checks.
@@ -91,7 +97,7 @@ async fn run() -> trine_kv::Result<()> {
     let users = db.bucket("users").await?;
     users.put(b"user:001", b"Ada").await?;
 
-    // Snapshots keep a stable read sequence while newer writes continue.
+    // Snapshots keep a stable read version while newer writes continue.
     let snapshot = db.snapshot();
     users.put(b"user:002", b"Lin").await?;
     assert_eq!(snapshot.get(&users, b"user:002").await?, None);
@@ -152,6 +158,7 @@ cargo clippy
 cargo test
 cargo run --example quickstart
 cargo run --example sync_quickstart
+cargo run --example read_versions
 cargo run --example user_store
 cargo run --example event_index
 cargo bench --bench v1_bench
@@ -163,6 +170,8 @@ cargo bench --bench v1_bench
   transaction commit, maintenance, read-only reopen, and storage runtime stats.
 - `sync_quickstart`: first pass through the explicit sync adapters, including
   persistent open, buckets, scans, transactions, flush, reopen, and stats.
+- `read_versions`: captures public read-version cursors, creates a named
+  checkpoint, reopens from the checkpoint, and shows expiration after deletion.
 - `user_store`: wraps Trine KV behind a small repository-style API.
 - `event_index`: stores event payloads and a secondary account index with one
   atomic write batch.
@@ -196,7 +205,8 @@ cargo bench --bench v1_bench
 - Browser persistence is async-only: use `Db::open` plus async mutation
   and maintenance methods. Synchronous browser persistent open, mutation, and
   maintenance `*_sync` APIs return typed unsupported errors.
-- Read-only open is for inspecting a stable directory state; the `0.1` line
-  does not define live multi-process reads against an active writer.
+- Read-only open is for inspecting a stable directory state; the current
+  pre-`1.0` line does not define live multi-process reads against an active
+  writer.
 - Repair is intentionally narrow and only removes known safe temporary files
   when explicitly requested.

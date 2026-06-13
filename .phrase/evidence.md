@@ -26,6 +26,53 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-06-13: Read-Version Documentation And Example Slice
+
+### Observation
+
+- README mentioned `ReadVersion` only as a capability and did not list a
+  dedicated runnable example.
+- `docs/usage.md` still used `0.1` dependency examples and did not explain the
+  `0.3.0` historical-read/checkpoint workflow.
+- Added `examples/read_versions.rs`, which creates a checkpoint, flushes,
+  reopens the database, reads the retained version, deletes the checkpoint, and
+  observes expiration after the old read version is no longer pinned.
+- README, usage guide, release checklist, and changelog now mention the
+  `read_versions` example.
+
+### Interpretation
+
+- The `0.3.0` release now has a user-facing path for the new read-version and
+  checkpoint APIs instead of only API-level Rustdoc and tests.
+- The release checklist should keep running `read_versions` with the other
+  examples.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo run --example read_versions`
+- `cargo clippy --example read_versions -- -D warnings`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --doc --all-features`
+- `cargo test -q --all-targets --all-features`
+- `cargo run --example quickstart`
+- `cargo run --example sync_quickstart`
+- `cargo run --example user_store`
+- `cargo run --example event_index`
+- `git diff --check`
+- Forbidden-term scan over source, tests, docs, `.phrase`, changelog, README,
+  and examples found no matches.
+- Old `0.1` dependency and old read-boundary wording scan over README, usage,
+  release docs, and examples found no matches.
+
+### Remaining Blockers
+
+- None for this documentation slice.
+
+### Recommended Next Action
+
+- Continue release operations only after an explicit tag/publish request.
+
 ## 2026-06-12: 0.3.0 Release Gate Prepared
 
 ### Observation

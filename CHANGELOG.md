@@ -40,6 +40,8 @@ storage-contract change, so this is a pre-`1.0` minor release.
   snapshots, named checkpoints, and configured recent retention.
 - Public documentation now presents `ReadVersion` as the application-facing
   historical-read cursor.
+- Added the `read_versions` example covering retained read versions,
+  checkpoint lookup after reopen, and expiration after checkpoint deletion.
 
 ### Removed
 

@@ -6,53 +6,54 @@ Complete
 
 ## Goal
 
-Remove `Sequence` from the public API before the `0.3.0` release.
+Document the `0.3.0` read-version and checkpoint feature set before release.
 
 ## Scope
 
-- Stop exporting `Sequence` and `SnapshotSequence`.
-- Make sequence accessors and constructors crate-internal where they only serve
-  engine code.
-- Update public tests, docs, protocol, changelog, and release evidence to use
-  `ReadVersion`.
+- Add a runnable example for `ReadVersion`, `snapshot_at`, named checkpoints,
+  checkpoint lookup after reopen, and expiration after deletion.
+- Update README feature summaries, command lists, and example index.
+- Update the usage guide dependency version, historical-read section, and
+  verification path.
+- Update release checklist and changelog so the new example is part of the
+  release story.
 
 ## Out Of Scope
 
-- Changing internal commit ordering, WAL, manifest, MVCC, compaction, or
-  transaction behavior.
-- Publishing, tagging, pushing, or opening a PR.
-- Branch, merge, rebase, time-based retention, checkpoint replacement, or
-  lineage mapping.
+- Changing storage behavior, retention semantics, manifest format, or public
+  API names.
+- Publishing, tagging, pushing, or creating a GitHub release.
+- Adding more checkpoint lifecycle features beyond the existing public API.
 
 ## Acceptance Gate
 
-- Public exports no longer include `Sequence` or `SnapshotSequence`.
-- External tests and docs use `ReadVersion` for historical-read boundaries.
-- Internal engine code keeps typed sequence semantics.
-- Rustdoc, doctests, focused tests, clippy, full tests, diff checks, and scans
+- `cargo run --example read_versions` passes.
+- All README/usage/release command lists mention the new example.
+- Usage docs explain `ReadVersion`, `snapshot_at`,
+  `DbOptions::with_keep_last_read_versions`, and checkpoint deletion.
+- Focused clippy, doctests, full tests, all examples, diff checks, and scans
   pass.
 
 ## Active Task Slice
 
 ```text
-task632 [x] goal:remove public Sequence surface | scope:lib types db snapshot transaction | verify:rg public surface
-task633 [x] goal:update public tests/docs | scope:tests docs protocol changelog | verify:focused tests/doctests
-task634 [x] goal:run full gate and commit | scope:rustdoc clippy tests scans | verify:all pass
+task641 [x] goal:add checked read-version example | scope:examples/read_versions.rs | verify:cargo run --example read_versions
+task642 [x] goal:update user docs | scope:README docs/usage docs/release CHANGELOG | verify:rg/read_versions + docs scan
+task643 [x] goal:verify and commit docs slice | scope:examples docs phrase | verify:clippy/doctest/full tests/examples/scans
 ```
 
 ## Evidence
 
-- User clarified there is no real old-caller burden to preserve.
-- `0.3.0` has not been released, so this breaking cleanup can be included in
-  the same pre-`1.0` minor release.
-- The long-term API direction is that callers should use `ReadVersion`, not
-  internal commit-number terminology.
+- Existing docs mentioned `ReadVersion` only lightly and `docs/usage.md` still
+  showed `0.1` dependency examples.
+- No runnable example covered checkpoint reopen and expiration behavior.
+- The new `read_versions` example passes and demonstrates durable checkpoint
+  lookup after reopen plus expiration after checkpoint deletion.
 
 ## Known Residuals
 
-- None for this phase.
+- None for this documentation slice.
 
 ## Next Recommendation
 
-- Public cleanup is complete. Keep further historical-read extensions deferred
-  until there is explicit evidence for them.
+- Continue release operations only after an explicit tag/publish request.
