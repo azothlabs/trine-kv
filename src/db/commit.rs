@@ -13,7 +13,6 @@ use crate::{
     error::{Error, Result},
     lsm::LsmTree,
     options::{DurabilityMode, StorageMode, WriteOptions},
-    storage::{StorageCapability, StorageReadBackend},
     transaction::TransactionReadSet,
     types::{CommitInfo, Sequence},
     wal::WalBatch,
@@ -616,7 +615,7 @@ impl Db {
     ) -> impl Future<Output = Result<CommitInfo>> + Send + 'static {
         let db = self.clone();
         async move {
-            if db.uses_native_platform_async_write_path() {
+            if db.uses_native_platform_async_storage_path() {
                 db.commit_write_request_async(request).await
             } else {
                 WriteFuture::new(db, request).await
@@ -634,17 +633,6 @@ impl Db {
         let accepted_state = self.accept_write_request_with_wal_preaccept(request, false)?;
         self.publish_accepted_write_state_async(accepted_state)
             .await
-    }
-
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    fn uses_native_platform_async_write_path(&self) -> bool {
-        self.inner.options.storage_mode.persistent_path().is_some()
-            && self.inner.substrate.wal_is_present()
-            && self
-                .inner
-                .native_storage
-                .capabilities()
-                .supports(StorageCapability::PlatformAsyncIo)
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]

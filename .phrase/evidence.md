@@ -10589,3 +10589,61 @@ Record only evidence that can change planning or durable decisions.
 
 - Choose the next async-storage phase from fresh evidence: flush, compaction,
   or manifest/directory publish.
+
+## 2026-06-13: Native Async Flush Path
+
+### Observation
+
+- Public native async `flush()` now uses a native async flush path when
+  `NativeFileBackend` advertises `PlatformAsyncIo`; fallback targets keep the
+  existing bounded sync-adapter path.
+- Native async flush writes table files with `write_table_with_backend_async`,
+  syncs the database directory through async storage, publishes manifest bytes
+  through prepared manifest publish inside a small native blocking task that
+  shares sync manifest serialization, installs flushed tables after durable
+  publish, and rewrites WAL replay floor through an awaitable WAL lane command.
+- `ManifestStore` prepared publish is now a shared internal tool for browser
+  and native async publish paths.
+- Usage docs and the async storage protocol now describe public native async
+  flush as platform-async-capable while keeping compaction and maintenance as
+  later phases.
+
+### Interpretation
+
+- Linux `platform-io` public `flush()` no longer needs to run the entire flush
+  through Trine's bounded sync adapter.
+- Keeping manifest publish split into prepare / publish / install lets native
+  async flush use platform storage completion while preserving existing sync
+  manifest serialization. The public flush future does not itself hold std
+  locks across await.
+- `DbStats` observation can add one native table-size lookup to the submitted
+  sync-adapter counter; the Linux flush test accounts for this and verifies the
+  table write, manifest publish, directory sync, and WAL rewrite operation
+  counters.
+- Compaction, background maintenance, cleanup, close, and native cooperative
+  maintenance still need separate async-storage work.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q --test async_api persistent_async_maintenance_runs_on_runtime_blocking_task`
+- `cargo test -q --features platform-io --test async_api`
+- `cargo test -q --features platform-io --lib wal::tests`
+- `docker run --rm --security-opt seccomp=unconfined ... rust:1.85-bookworm
+  cargo test -q --features platform-io --test async_api
+  platform_io_async_flush_awaits_storage_without_whole_flush_adapter`
+- `cargo test -q`
+- `cargo test -q --features platform-io`
+- `cargo clippy -q --all-features`
+- `cargo rustdoc --all-features -- -D warnings`
+
+### Remaining Blockers
+
+- No blocker for public native async flush.
+- Compaction, background maintenance, cleanup, close, and native cooperative
+  maintenance still use existing fallback paths.
+
+### Recommended Next Action
+
+- Use fresh counters to choose the next phase: async compaction or async
+  maintenance/cleanup.

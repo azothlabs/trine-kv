@@ -526,6 +526,7 @@ pub(crate) trait StorageWalRewriteBackend: StorageReadBackend {
     ) -> StorageFuture<'_, ()>;
 }
 
+#[allow(dead_code)]
 pub(crate) trait BlockingStorageWalRewriteBackend: StorageWalRewriteBackend {
     fn rewrite_wal_blocking(
         &self,

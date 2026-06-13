@@ -80,12 +80,13 @@ database is not opened read-only. On native targets, this default prioritizes
 database-style durability for confirmed writes.
 
 On native targets, async persistent open, point reads, scans, lazy value reads,
-and WAL-backed writes enter Trine's storage boundary through async helpers.
-Native async writes use an awaitable WAL lane on targets whose native-file
-backend advertises `PlatformAsyncIo`; fallback targets keep the bounded sync
-adapter boundary. Maintenance still uses runtime task boundaries where the
-current engine internals are synchronous. Run `cargo run --example quickstart`
-for a complete checked path.
+WAL-backed writes, and public flush enter Trine's storage boundary through async
+helpers. Native async writes and public flush use awaitable storage completions
+on targets whose native-file backend advertises `PlatformAsyncIo`; fallback
+targets keep the bounded sync adapter boundary. Compaction and cooperative
+maintenance still use runtime task boundaries where the current engine internals
+are synchronous. Run `cargo run --example quickstart` for a complete checked
+path.
 
 Synchronous callers can use explicit `*_sync` adapters:
 

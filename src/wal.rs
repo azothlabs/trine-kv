@@ -476,6 +476,20 @@ impl WalFrontDoor {
         Ok(())
     }
 
+    pub(crate) async fn rewrite_after_replay_floor_async(
+        &self,
+        replay_floor: Sequence,
+    ) -> Result<()> {
+        for lane in &self.lanes {
+            enqueue_wal_lane_command(lane, |reply| WalLaneCommand::Rewrite {
+                replay_floor,
+                reply,
+            })?
+            .await?;
+        }
+        Ok(())
+    }
+
     fn count_open_lanes(&self) -> usize {
         self.lanes
             .iter()
@@ -879,6 +893,7 @@ where
     Ok(merged)
 }
 
+#[allow(dead_code)]
 pub(crate) fn rewrite_batches_after_with_backend(
     backend: &NativeFileBackend,
     path: &Path,
@@ -987,6 +1002,7 @@ where
     backend.read_object_bytes(wal_storage_object(path)).await
 }
 
+#[allow(dead_code)]
 fn rewrite_wal_object_with_backend(
     backend: &NativeFileBackend,
     path: &Path,
@@ -1124,10 +1140,16 @@ fn rewrite_wal_lane_after_replay_floor(
 ) -> Result<()> {
     if let Some(writer) = writer.as_mut() {
         writer.persist(DurabilityMode::SyncAll)?;
-    } else if read_wal_object_with_backend(backend, path)?.is_none() {
+    } else if wait_for_wal_storage_future(read_wal_object_with_backend_async(backend, path))?
+        .is_none()
+    {
         return Ok(());
     }
-    rewrite_batches_after_with_backend(backend, path, replay_floor)?;
+    wait_for_wal_storage_future(rewrite_batches_after_with_backend_async(
+        backend,
+        path,
+        replay_floor,
+    ))?;
     if let Some(writer) = writer.as_mut() {
         writer.reopen_append_with_backend(backend, path)?;
     }

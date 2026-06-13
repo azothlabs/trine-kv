@@ -417,7 +417,6 @@ impl<C: ObjectClient> ObjectManifestStore<C> {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedManifestPublish {
     path: PathBuf,
@@ -744,7 +743,6 @@ impl ManifestStore {
         })
     }
 
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     pub(crate) fn install_prepared_publish(
         &mut self,
         prepared: PreparedManifestPublish,
@@ -815,7 +813,6 @@ impl ManifestStore {
         .await
     }
 
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     #[allow(dead_code)]
     pub(crate) fn prepare_add_tables_publish(
         &self,
@@ -923,7 +920,7 @@ impl ManifestStore {
         self.publish_next_state(next_state)?.published_or_err()
     }
 
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    #[allow(dead_code)]
     pub(crate) fn prepare_replace_tables_batch_publish(
         &self,
         replacements: Vec<(String, Vec<TableId>, Vec<TableProperties>)>,
@@ -993,7 +990,7 @@ impl ManifestStore {
         self.publish_next_state(next_state)?.published_or_err()
     }
 
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    #[allow(dead_code)]
     pub(crate) fn prepare_clear_pending_blob_deletions_publish(
         &self,
         file_ids: &[u64],
@@ -1111,7 +1108,6 @@ impl ManifestStore {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 impl PreparedManifestPublish {
     pub(crate) async fn publish_async(&self) -> Result<()> {
         let outcome = match &self.storage {
@@ -1124,6 +1120,7 @@ impl PreparedManifestPublish {
                 )
                 .await?
             }
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
             ManifestStoreBackend::Browser(storage) => {
                 publish_manifest_with_backend_async(
                     storage,

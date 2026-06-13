@@ -38,9 +38,9 @@ use crate::{
         BlockingStorageDirectorySyncBackend, BlockingStorageObjectDeleteBackend,
         BlockingStorageReadBackend, BlockingStorageReadObject, NativeFileBackend,
         StorageCapability, StorageDirectoryCreateBackend, StorageDirectoryFile, StorageDirectoryId,
-        StorageDirectoryListBackend, StorageManifestReadBackend, StorageObjectDeleteBackend,
-        StorageObjectId, StorageObjectKind, StorageObjectListBackend, StorageObjectReadBackend,
-        StorageReadBackend,
+        StorageDirectoryListBackend, StorageDirectorySyncBackend, StorageManifestReadBackend,
+        StorageObjectDeleteBackend, StorageObjectId, StorageObjectKind, StorageObjectListBackend,
+        StorageObjectReadBackend, StorageReadBackend,
     },
     substrate::{
         DurabilitySubstrate, FilesystemSubstrate, ObjectStoreSubstrate, ObjectWriterLease,
@@ -2977,6 +2977,61 @@ impl Db {
         Ok(())
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn flush_native_async(&self) -> Result<()> {
+        self.ensure_open()?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+        self.take_background_maintenance_error()?;
+        if self.inner.options.storage_mode.is_object_store_persistent() {
+            return Err(Error::unsupported_backend(
+                "object-store flush requires the async API",
+            ));
+        }
+
+        let Some(path) = self.persistent_path() else {
+            return Ok(());
+        };
+        let db_path = path.to_path_buf();
+        let target_sequence = self.freeze_public_flush_target()?;
+        let mut should_compact = false;
+
+        while self.has_immutable_memtables_at_or_below(target_sequence)? {
+            self.take_background_maintenance_error()?;
+            let (flush_should_compact, outcome) = self
+                .run_flush_once_with_budget_native_async(
+                    &db_path,
+                    false,
+                    MaintenanceBudget::unbounded(),
+                )
+                .await?;
+            if outcome.busy {
+                self.request_background_flush();
+                self.record_cooperative_maintenance_yield();
+                self.inner.maintenance.wait_until_flush_idle();
+                continue;
+            }
+            should_compact |= flush_should_compact;
+        }
+
+        if should_compact
+            || self.l0_pressure_exceeded()?
+            || self.foreground_l0_overlap_pressure_exceeded()?
+        {
+            let compaction_path = db_path.clone();
+            self.run_native_blocking_task(move |db| {
+                db.run_compaction_barrier(&compaction_path, &KeyRange::all(), true)
+            })
+            .await?;
+        }
+        self.cleanup_pending_obsolete_table_files(&db_path)?;
+        self.cleanup_pending_obsolete_blob_files(&db_path)?;
+        self.take_background_maintenance_error()?;
+
+        Ok(())
+    }
+
     // Keep the public shape aligned with the accepted v1 protocol:
     // `Db::compact_range_sync(range) -> Result<()>`.
     /// Compacts table files that overlap `range`.
@@ -4443,6 +4498,16 @@ impl Db {
         self.inner.options.storage_mode.persistent_path()
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn uses_native_platform_async_storage_path(&self) -> bool {
+        self.persistent_path().is_some()
+            && self
+                .inner
+                .native_storage
+                .capabilities()
+                .supports(StorageCapability::PlatformAsyncIo)
+    }
+
     fn persist_bucket_creation(&self, name: &str, options: &BucketOptions) -> Result<()> {
         if let Some(manifest) = &self.inner.manifest {
             // Manifest I/O happens outside the bucket registry lock. Two
@@ -4770,6 +4835,134 @@ impl Db {
             self.rewrite_wal_after_replay_floor(flush_sequence)?;
         }
         self.l0_pressure_exceeded()
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn run_flush_once_with_budget_native_async(
+        &self,
+        db_path: &Path,
+        freeze_active: bool,
+        budget: MaintenanceBudget,
+    ) -> Result<(bool, MaintenanceOutcome)> {
+        let Some(_flush_guard) = self.inner.maintenance.try_start_flush() else {
+            return Ok((false, MaintenanceOutcome::busy_outcome()));
+        };
+
+        if freeze_active {
+            let _memtable_publish = self
+                .inner
+                .memtable_publish_lock
+                .lock()
+                .map_err(|_| lock_poisoned("memtable publish lock"))?;
+            let _publish = self.inner.publish_barrier.enter()?;
+            self.freeze_all_active_memtables(self.last_committed_sequence())?;
+        }
+
+        let (flush_inputs, budget_exhausted) = self.collect_flush_inputs_with_budget(budget)?;
+        let flush_count = flush_inputs.len();
+        let should_compact = self
+            .write_flush_inputs_native_async(db_path, &flush_inputs)
+            .await?;
+        let outcome = MaintenanceOutcome {
+            flushes: flush_count,
+            budget_exhausted: budget_exhausted && flush_count != 0,
+            ..MaintenanceOutcome::default()
+        };
+        if outcome.budget_exhausted {
+            self.record_maintenance_budget_exhaustion();
+        }
+        Ok((should_compact, outcome))
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn write_flush_inputs_native_async(
+        &self,
+        db_path: &Path,
+        flush_inputs: &[NamedFlushInput],
+    ) -> Result<bool> {
+        if flush_inputs.is_empty() {
+            return Ok(false);
+        }
+
+        let flush_sequence = flush_inputs
+            .iter()
+            .map(|input| input.input.freeze_sequence)
+            .max()
+            .expect("non-empty flush input list has a max sequence");
+        let storage = self.inner.native_storage.clone();
+        let mut written_tables = Vec::with_capacity(flush_inputs.len());
+        let mut written_table_ids = Vec::with_capacity(flush_inputs.len());
+
+        for input in flush_inputs {
+            let table_path = table::table_path(db_path, input.input.table_id);
+            written_table_ids.push(input.input.table_id);
+            let table = match table::write_table_with_backend_async(
+                &storage,
+                &table_path,
+                input.input.table_id,
+                input.input.table_level,
+                &input.input.table_options,
+                &input.input.point_records,
+                &input.input.range_tombstones,
+                DurabilityMode::SyncAll,
+            )
+            .await
+            {
+                Ok(table) => table,
+                Err(error) => {
+                    let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+                    return Err(error);
+                }
+            };
+            written_tables.push((input.bucket.clone(), Arc::new(table)));
+        }
+
+        if let Err(error) = sync_storage_directory_after_renames_async(&storage, db_path).await {
+            let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+            return Err(error);
+        }
+
+        if let Err(error) = self
+            .publish_flushed_tables_native_async(&written_tables, flush_sequence)
+            .await
+        {
+            let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+            return Err(error);
+        }
+
+        Self::install_flushed_tables(flush_inputs, written_tables)?;
+        self.rewrite_wal_after_replay_floor_async(flush_sequence)
+            .await?;
+        self.l0_pressure_exceeded()
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn publish_flushed_tables_native_async(
+        &self,
+        tables: &[(String, Arc<Table>)],
+        flush_sequence: Sequence,
+    ) -> Result<()> {
+        let edits = tables
+            .iter()
+            .map(|(bucket, table)| (bucket.clone(), table.properties().clone()))
+            .collect::<Vec<_>>();
+        self.run_native_blocking_task(move |db| {
+            let _publish = db.inner.publish_barrier.enter()?;
+            let manifest = db
+                .inner
+                .manifest
+                .as_ref()
+                .ok_or_else(|| Error::Corruption {
+                    message: "persistent database is missing manifest store".to_owned(),
+                })?;
+            let mut manifest = manifest
+                .lock()
+                .map_err(|_| lock_poisoned("manifest store"))?;
+            let prepared = manifest.prepare_add_tables_publish(edits, flush_sequence)?;
+            futures::executor::block_on(prepared.publish_async())?;
+            manifest.install_prepared_publish(prepared)
+        })
+        .await
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -6112,6 +6305,13 @@ impl Db {
             .rewrite_wal_after_replay_floor(replay_floor)
     }
 
+    async fn rewrite_wal_after_replay_floor_async(&self, replay_floor: Sequence) -> Result<()> {
+        self.inner
+            .substrate
+            .rewrite_wal_after_replay_floor_async(replay_floor)
+            .await
+    }
+
     fn install_flushed_tables(
         inputs: &[NamedFlushInput],
         tables: Vec<(String, Arc<Table>)>,
@@ -7090,6 +7290,9 @@ impl Db {
 
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         if self.persistent_path().is_some() {
+            if self.uses_native_platform_async_storage_path() {
+                return self.flush_native_async().await;
+            }
             return self.run_native_blocking_task(|db| db.flush_sync()).await;
         }
 
@@ -8102,11 +8305,36 @@ fn delete_storage_object(
     backend.delete_object_blocking(StorageObjectId::native_file(kind, path))
 }
 
+async fn delete_storage_object_async(
+    backend: &NativeFileBackend,
+    kind: StorageObjectKind,
+    path: &Path,
+) -> Result<()> {
+    backend
+        .capabilities()
+        .require(StorageCapability::ObjectDelete)?;
+    backend
+        .delete_object(StorageObjectId::native_file(kind, path))
+        .await
+}
+
 fn sync_storage_directory_after_renames(backend: &NativeFileBackend, path: &Path) -> Result<()> {
     backend
         .capabilities()
         .require(StorageCapability::DirectorySync)?;
     backend.sync_directory_after_renames_blocking(StorageDirectoryId::native_file(path))
+}
+
+async fn sync_storage_directory_after_renames_async(
+    backend: &NativeFileBackend,
+    path: &Path,
+) -> Result<()> {
+    backend
+        .capabilities()
+        .require(StorageCapability::DirectorySync)?;
+    backend
+        .sync_directory_after_renames(StorageDirectoryId::native_file(path))
+        .await
 }
 
 fn create_storage_directory_all(backend: &NativeFileBackend, path: &Path) -> Result<()> {
@@ -8138,6 +8366,29 @@ fn remove_storage_files(
     // can be removed together after a failed flush or compaction attempt.
     remove_table_files(backend, db_path, table_ids)?;
     remove_blob_files(backend, db_path, table_ids)
+}
+
+async fn remove_storage_files_async(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+    table_ids: &[table::TableId],
+) -> Result<()> {
+    for table_id in table_ids {
+        delete_storage_object_async(
+            backend,
+            StorageObjectKind::Table,
+            &table::table_path(db_path, *table_id),
+        )
+        .await?;
+        delete_storage_object_async(
+            backend,
+            StorageObjectKind::Blob,
+            &blob::blob_path(db_path, table_id.get()),
+        )
+        .await?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

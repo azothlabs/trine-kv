@@ -3722,3 +3722,32 @@ async writes as the next storage-path residual.
 - Flush, compaction, manifest publish, directory work, storage format changes,
   publishing, tagging, pushing, PR creation, or claiming new true async support
   on fallback targets.
+
+### Phase 152: Native Async Flush Path
+
+**Status**: Complete
+
+**Goal**: Let native persistent public async `flush()` await Trine storage
+completions on true platform async targets instead of running the whole flush
+through the bounded sync adapter.
+
+**Entry Condition**: Phase 151 completed native async writes and left public
+flush as the smallest remaining native async storage path before compaction.
+
+**Acceptance Gate**:
+
+- Public native async `flush()` chooses the async flush path only when
+  `NativeFileBackend` advertises `PlatformAsyncIo`.
+- Table writes, manifest publish, directory sync, and WAL replay-floor rewrite
+  use async storage/durability completions on Linux `platform-io`.
+- The public flush future does not hold std locks or the publish barrier across
+  await; native manifest publish stays serialized with sync manifest mutators.
+- Native fallback async flush retains the bounded sync-adapter path.
+- Focused tests, Linux Docker platform test, formatting, clippy, rustdoc, full
+  tests, and diff checks pass.
+
+**Major Out Of Scope**:
+
+- Compaction, background maintenance, cleanup, close, cooperative maintenance,
+  storage format changes, publishing, tagging, pushing, PR creation, or claiming
+  new true async support on fallback targets.

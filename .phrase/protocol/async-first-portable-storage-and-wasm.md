@@ -393,6 +393,15 @@ Rules:
   keep the bounded sync-adapter write boundary.
 - native async writes must not append directly to WAL files outside
   `WalFrontDoor`; sync and async writers share that lane boundary.
+- public native async flush may use async storage completions for table writes,
+  manifest publish, directory sync, and WAL rewrite only when the native-file
+  backend advertises `PlatformAsyncIo`; fallback targets must keep the bounded
+  sync-adapter flush boundary.
+- native async flush must not hold std locks or the publish barrier in the
+  public caller future across await; native manifest publish may use a small
+  runtime blocking task that holds the existing manifest/publish locks while it
+  waits for platform storage completion, so sync and async manifest mutators
+  stay serialized.
 
 #### Native Platform Backend Matrix
 

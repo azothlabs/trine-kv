@@ -475,7 +475,7 @@ fn persistent_async_maintenance_runs_on_runtime_blocking_task() {
     assert_eq!(after_flush.immutable_memtables, 0);
     assert!(
         after_flush.storage_sync_adapter_submitted_tasks > before_flush,
-        "native async flush should run through the runtime blocking task boundary"
+        "native fallback async flush should run through the runtime blocking task boundary"
     );
 
     let before_compact = db.stats().storage_sync_adapter_submitted_tasks;
@@ -489,6 +489,74 @@ fn persistent_async_maintenance_runs_on_runtime_blocking_task() {
     );
 
     block_on(db.close()).expect("async close succeeds");
+    cleanup_dir(&path);
+}
+
+#[cfg(all(feature = "platform-io", target_os = "linux"))]
+#[test]
+fn platform_io_async_flush_awaits_storage_without_whole_flush_adapter() {
+    let path = temp_db_path("platform-io-async-flush");
+    let mut options = DbOptions::persistent(&path).with_durability(DurabilityMode::Flush);
+    options.runtime = RuntimeOptions::platform_io();
+    options.background_worker_count = 0;
+    options.max_l0_files = 64;
+
+    let db = block_on(Db::open(options.clone())).expect("platform I/O persistent open");
+    block_on(db.put_with_options(
+        b"flush-key".to_vec(),
+        b"flush-value".to_vec(),
+        WriteOptions::flush(),
+    ))
+    .expect("platform async write commits");
+
+    let before = db.stats();
+    block_on(db.flush()).expect("platform async flush succeeds");
+    let after = db.stats();
+
+    assert_eq!(after.immutable_memtables, 0);
+    assert!(
+        after.storage_sync_adapter_submitted_tasks
+            <= before.storage_sync_adapter_submitted_tasks + 1,
+        "platform async flush should not spawn the whole flush through the sync adapter; \
+         DbStats may perform one native table-size lookup while observing the result"
+    );
+    assert!(
+        after.storage_platform_async_io_tasks > before.storage_platform_async_io_tasks,
+        "platform async flush should await platform storage completions"
+    );
+    assert!(
+        after.storage_operations.write_object.requests
+            > before.storage_operations.write_object.requests,
+        "platform async flush should write table objects through storage"
+    );
+    assert!(
+        after.storage_operations.publish_manifest.requests
+            > before.storage_operations.publish_manifest.requests,
+        "platform async flush should publish the manifest through storage"
+    );
+    assert!(
+        after
+            .storage_operations
+            .sync_directory_after_renames
+            .requests
+            > before
+                .storage_operations
+                .sync_directory_after_renames
+                .requests,
+        "platform async flush should sync the database directory through storage"
+    );
+    assert!(
+        after.storage_operations.rewrite_wal.requests
+            > before.storage_operations.rewrite_wal.requests,
+        "platform async flush should rewrite WAL replay floor through storage"
+    );
+    drop(db);
+
+    let reopened = block_on(Db::open(options)).expect("platform I/O reopen after flush");
+    assert_eq!(
+        block_on(reopened.get(b"flush-key")).expect("platform replay read"),
+        Some(b"flush-value".to_vec())
+    );
     cleanup_dir(&path);
 }
 

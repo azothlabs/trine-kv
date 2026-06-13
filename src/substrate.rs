@@ -121,6 +121,22 @@ impl DurabilitySubstrate {
         }
     }
 
+    /// Truncate WAL data below a checkpoint and await the WAL lane completion
+    /// when the substrate has one.
+    pub(crate) async fn rewrite_wal_after_replay_floor_async(
+        &self,
+        replay_floor: Sequence,
+    ) -> Result<()> {
+        match self {
+            Self::Filesystem(substrate) => {
+                substrate
+                    .rewrite_wal_after_replay_floor_async(replay_floor)
+                    .await
+            }
+            Self::ObjectStore(_) => Ok(()),
+        }
+    }
+
     /// Release the single-writer lease (idempotent; called on close).
     ///
     /// The object-store lease is a fencing-epoch object reclaimed by the next
@@ -201,6 +217,14 @@ impl FilesystemSubstrate {
     fn rewrite_wal_after_replay_floor(&self, replay_floor: Sequence) -> Result<()> {
         if let Some(wal) = &self.wal {
             wal.rewrite_after_replay_floor(replay_floor)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn rewrite_wal_after_replay_floor_async(&self, replay_floor: Sequence) -> Result<()> {
+        if let Some(wal) = &self.wal {
+            wal.rewrite_after_replay_floor_async(replay_floor).await
         } else {
             Ok(())
         }
