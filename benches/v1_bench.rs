@@ -16,6 +16,7 @@ const ROWS: usize = 1_024;
 const OPS: usize = 2_048;
 const POINT_READ_BATCH: usize = 4;
 const LOCALIZED_POINT_READ_BATCH: usize = 16;
+const WRITE_DIAGNOSTIC_OPS: usize = 256;
 const LARGE_ROWS: usize = 128;
 const LARGE_OPS: usize = 256;
 const LARGE_VALUE_BYTES: usize = 16 * 1024;
@@ -63,6 +64,8 @@ fn run_benchmarks() -> Vec<BenchResult> {
     results.push(bench_wal_replay());
     results.push(bench_wal_replay_read_only());
     extend_wal_replay_diagnostics(&mut results);
+    results.extend(bench_persistent_write_path());
+    extend_persistent_write_path_diagnostics(&mut results);
     results.push(bench_flush_throughput());
     results.push(bench_compaction_throughput());
     results.push(bench_large_inline_values());
@@ -259,7 +262,12 @@ fn benchmark_group(name: &str) -> &'static str {
         "blob-large-values"
     } else if name.contains("compaction") {
         "compaction"
-    } else if name.contains("put") || name == "batch write" || name.contains("flush throughput") {
+    } else if name.contains("put")
+        || name == "batch write"
+        || name.starts_with("persistent batch write")
+        || name.starts_with("write path")
+        || name.contains("flush throughput")
+    {
         "writes-flush"
     } else if name.contains("range scan") || name.contains("prefix scan") {
         "scans"
@@ -324,6 +332,69 @@ fn bench_batch_write() -> BenchResult {
         db.write_sync(batch, WriteOptions::default())
             .expect("batch write succeeds");
         ROWS as u64
+    })
+}
+
+fn bench_persistent_write_path() -> Vec<BenchResult> {
+    vec![
+        bench_persistent_single_key_put(
+            DurabilityMode::Buffered,
+            "persistent single-key put buffered",
+        ),
+        bench_persistent_single_key_put(DurabilityMode::Flush, "persistent single-key put flush"),
+        bench_persistent_single_key_put(
+            DurabilityMode::SyncData,
+            "persistent single-key put sync-data",
+        ),
+        bench_persistent_single_key_put(
+            DurabilityMode::SyncAll,
+            "persistent single-key put sync-all",
+        ),
+        bench_persistent_batch_write(DurabilityMode::Buffered, "persistent batch write buffered"),
+        bench_persistent_batch_write(DurabilityMode::Flush, "persistent batch write flush"),
+        bench_persistent_batch_write(DurabilityMode::SyncData, "persistent batch write sync-data"),
+        bench_persistent_batch_write(DurabilityMode::SyncAll, "persistent batch write sync-all"),
+    ]
+}
+
+fn bench_persistent_single_key_put(durability: DurabilityMode, name: &'static str) -> BenchResult {
+    measure(name, WRITE_DIAGNOSTIC_OPS, || {
+        let dir = temp_dir(name);
+        let db = Db::open_sync(DbOptions::persistent(&dir).with_durability(durability))
+            .expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
+        for index in 0..WRITE_DIAGNOSTIC_OPS {
+            bucket
+                .put_sync(key(index), value(index))
+                .expect("put succeeds");
+        }
+        let stats = db.stats();
+        drop(db);
+        cleanup_dir(&dir);
+        stats
+            .wal_bytes_accepted
+            .saturating_add(stats.commit_visible_sequence)
+    })
+}
+
+fn bench_persistent_batch_write(durability: DurabilityMode, name: &'static str) -> BenchResult {
+    measure(name, ROWS, || {
+        let dir = temp_dir(name);
+        let db = Db::open_sync(DbOptions::persistent(&dir).with_durability(durability))
+            .expect("persistent db opens");
+        db.default_bucket_sync().expect("bucket opens");
+        let mut batch = WriteBatch::new();
+        for index in 0..ROWS {
+            batch.put(key(index), value(index));
+        }
+        db.write_sync(batch, WriteOptions::default())
+            .expect("batch write succeeds");
+        let stats = db.stats();
+        drop(db);
+        cleanup_dir(&dir);
+        stats
+            .wal_bytes_accepted
+            .saturating_add(stats.commit_visible_sequence)
     })
 }
 
@@ -663,6 +734,324 @@ fn bench_wal_replay_read_only() -> BenchResult {
 fn extend_wal_replay_diagnostics(results: &mut Vec<BenchResult>) {
     extend_wal_replay_open_diagnostics(results, "WAL replay writable open", false);
     extend_wal_replay_open_diagnostics(results, "WAL replay read-only open", true);
+}
+
+fn extend_persistent_write_path_diagnostics(results: &mut Vec<BenchResult>) {
+    extend_single_key_write_diagnostics(results, DurabilityMode::Buffered, "buffered");
+    extend_single_key_write_diagnostics(results, DurabilityMode::Flush, "flush");
+    extend_single_key_write_diagnostics(results, DurabilityMode::SyncData, "sync-data");
+    extend_single_key_write_diagnostics(results, DurabilityMode::SyncAll, "sync-all");
+    extend_explicit_persist_diagnostics(results);
+    extend_flush_wall_diagnostics(results);
+}
+
+fn extend_single_key_write_diagnostics(
+    results: &mut Vec<BenchResult>,
+    durability: DurabilityMode,
+    label: &'static str,
+) {
+    let mut diagnostics = WritePathDiagnostics::default();
+    let mut wall_micros = 0_u64;
+    let mut wal_records = 0_u64;
+    let mut wal_bytes = 0_u64;
+    for index in 0..32 {
+        let dir = temp_dir(labelled("write-path-diagnostic", label));
+        let db = Db::open_sync(DbOptions::persistent(&dir).with_durability(durability))
+            .expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
+        let before = db.stats();
+        let started = Instant::now();
+        bucket
+            .put_sync(key(index), value(index))
+            .expect("put succeeds");
+        wall_micros = wall_micros.saturating_add(duration_micros(started.elapsed()));
+        let after = db.stats();
+        diagnostics.record_delta(&before, &after);
+        wal_records = wal_records.saturating_add(
+            after
+                .wal_records_accepted
+                .saturating_sub(before.wal_records_accepted),
+        );
+        wal_bytes = wal_bytes.saturating_add(
+            after
+                .wal_bytes_accepted
+                .saturating_sub(before.wal_bytes_accepted),
+        );
+        drop(db);
+        cleanup_dir(&dir);
+    }
+
+    let base = labelled("write path single-key diagnostic", label);
+    results.push(BenchResult::diagnostic(
+        labelled(base, "wall micros"),
+        wall_micros,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(base, "wal records accepted"),
+        wal_records,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(base, "wal bytes accepted"),
+        wal_bytes,
+    ));
+    diagnostics.push_results(results, base);
+}
+
+fn extend_explicit_persist_diagnostics(results: &mut Vec<BenchResult>) {
+    let mut commit_diagnostics = WritePathDiagnostics::default();
+    let mut persist_diagnostics = WritePathDiagnostics::default();
+    let mut commit_wall_micros = 0_u64;
+    let mut persist_wall_micros = 0_u64;
+    let dir = temp_dir("write-path-explicit-persist-diagnostic");
+    let db = Db::open_sync(DbOptions::persistent(&dir).with_durability(DurabilityMode::Buffered))
+        .expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+
+    for index in 0..WRITE_DIAGNOSTIC_OPS {
+        let before = db.stats();
+        let started = Instant::now();
+        bucket
+            .put_sync(key(index), value(index))
+            .expect("put succeeds");
+        commit_wall_micros = commit_wall_micros.saturating_add(duration_micros(started.elapsed()));
+        let after_commit = db.stats();
+        commit_diagnostics.record_delta(&before, &after_commit);
+
+        let started = Instant::now();
+        db.persist_sync(DurabilityMode::SyncData)
+            .expect("persist succeeds");
+        persist_wall_micros =
+            persist_wall_micros.saturating_add(duration_micros(started.elapsed()));
+        let after_persist = db.stats();
+        persist_diagnostics.record_delta(&after_commit, &after_persist);
+    }
+    drop(db);
+    cleanup_dir(&dir);
+
+    let commit_label = "write path explicit persist diagnostic commit";
+    results.push(BenchResult::diagnostic(
+        labelled(commit_label, "wall micros"),
+        commit_wall_micros,
+    ));
+    commit_diagnostics.push_results(results, commit_label);
+
+    let persist_label = "write path explicit persist diagnostic persist";
+    results.push(BenchResult::diagnostic(
+        labelled(persist_label, "wall micros"),
+        persist_wall_micros,
+    ));
+    persist_diagnostics.push_results(results, persist_label);
+}
+
+fn extend_flush_wall_diagnostics(results: &mut Vec<BenchResult>) {
+    let dir = temp_dir("write-path-flush-diagnostic");
+    let db = Db::open_sync(benchmark_persistent_options(&dir)).expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+    for index in 0..ROWS {
+        bucket
+            .put_sync(key(index), value(index))
+            .expect("put succeeds");
+    }
+
+    let before = db.stats();
+    let started = Instant::now();
+    db.flush_sync().expect("flush succeeds");
+    let wall_micros = duration_micros(started.elapsed());
+    let after = db.stats();
+    let mut diagnostics = WritePathDiagnostics::default();
+    diagnostics.record_delta(&before, &after);
+    drop(db);
+    cleanup_dir(&dir);
+
+    let label = "write path flush diagnostic";
+    results.push(BenchResult::diagnostic(
+        labelled(label, "wall micros"),
+        wall_micros,
+    ));
+    diagnostics.push_results(results, label);
+}
+
+#[derive(Default)]
+struct WritePathDiagnostics {
+    open_append_requests: u64,
+    append_requests: u64,
+    persist_requests: u64,
+    write_object_requests: u64,
+    publish_manifest_requests: u64,
+    sync_directory_requests: u64,
+    open_append_micros: u64,
+    append_micros: u64,
+    persist_micros: u64,
+    write_object_micros: u64,
+    publish_manifest_micros: u64,
+    sync_directory_micros: u64,
+    pending_sync_bytes: u64,
+}
+
+impl WritePathDiagnostics {
+    fn record_delta(&mut self, before: &trine_kv::DbStats, after: &trine_kv::DbStats) {
+        self.open_append_requests = self.open_append_requests.saturating_add(
+            after
+                .storage_operations
+                .open_append
+                .requests
+                .saturating_sub(before.storage_operations.open_append.requests),
+        );
+        self.append_requests = self.append_requests.saturating_add(
+            after
+                .storage_operations
+                .append
+                .requests
+                .saturating_sub(before.storage_operations.append.requests),
+        );
+        self.persist_requests = self.persist_requests.saturating_add(
+            after
+                .storage_operations
+                .persist
+                .requests
+                .saturating_sub(before.storage_operations.persist.requests),
+        );
+        self.write_object_requests = self.write_object_requests.saturating_add(
+            after
+                .storage_operations
+                .write_object
+                .requests
+                .saturating_sub(before.storage_operations.write_object.requests),
+        );
+        self.publish_manifest_requests = self.publish_manifest_requests.saturating_add(
+            after
+                .storage_operations
+                .publish_manifest
+                .requests
+                .saturating_sub(before.storage_operations.publish_manifest.requests),
+        );
+        self.sync_directory_requests = self.sync_directory_requests.saturating_add(
+            after
+                .storage_operations
+                .sync_directory_after_renames
+                .requests
+                .saturating_sub(
+                    before
+                        .storage_operations
+                        .sync_directory_after_renames
+                        .requests,
+                ),
+        );
+        self.record_latency_delta(before, after);
+        self.pending_sync_bytes = self
+            .pending_sync_bytes
+            .saturating_add(after.wal_bytes_pending_sync);
+    }
+
+    fn record_latency_delta(&mut self, before: &trine_kv::DbStats, after: &trine_kv::DbStats) {
+        self.open_append_micros = self.open_append_micros.saturating_add(
+            after
+                .storage_operations
+                .open_append
+                .total_latency_micros
+                .saturating_sub(before.storage_operations.open_append.total_latency_micros),
+        );
+        self.append_micros = self.append_micros.saturating_add(
+            after
+                .storage_operations
+                .append
+                .total_latency_micros
+                .saturating_sub(before.storage_operations.append.total_latency_micros),
+        );
+        self.persist_micros = self.persist_micros.saturating_add(
+            after
+                .storage_operations
+                .persist
+                .total_latency_micros
+                .saturating_sub(before.storage_operations.persist.total_latency_micros),
+        );
+        self.write_object_micros = self.write_object_micros.saturating_add(
+            after
+                .storage_operations
+                .write_object
+                .total_latency_micros
+                .saturating_sub(before.storage_operations.write_object.total_latency_micros),
+        );
+        self.publish_manifest_micros = self.publish_manifest_micros.saturating_add(
+            after
+                .storage_operations
+                .publish_manifest
+                .total_latency_micros
+                .saturating_sub(
+                    before
+                        .storage_operations
+                        .publish_manifest
+                        .total_latency_micros,
+                ),
+        );
+        self.sync_directory_micros = self.sync_directory_micros.saturating_add(
+            after
+                .storage_operations
+                .sync_directory_after_renames
+                .total_latency_micros
+                .saturating_sub(
+                    before
+                        .storage_operations
+                        .sync_directory_after_renames
+                        .total_latency_micros,
+                ),
+        );
+    }
+
+    fn push_results(&self, results: &mut Vec<BenchResult>, label: &'static str) {
+        results.push(BenchResult::diagnostic(
+            labelled(label, "storage open append requests"),
+            self.open_append_requests,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled(label, "storage append requests"),
+            self.append_requests,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled(label, "storage persist requests"),
+            self.persist_requests,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled(label, "storage write object requests"),
+            self.write_object_requests,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled(label, "storage publish manifest requests"),
+            self.publish_manifest_requests,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled(label, "storage sync directory requests"),
+            self.sync_directory_requests,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled(label, "storage open append micros"),
+            self.open_append_micros,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled(label, "storage append micros"),
+            self.append_micros,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled(label, "storage persist micros"),
+            self.persist_micros,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled(label, "storage write object micros"),
+            self.write_object_micros,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled(label, "storage publish manifest micros"),
+            self.publish_manifest_micros,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled(label, "storage sync directory micros"),
+            self.sync_directory_micros,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled(label, "pending sync bytes"),
+            self.pending_sync_bytes,
+        ));
+    }
 }
 
 fn extend_wal_replay_open_diagnostics(

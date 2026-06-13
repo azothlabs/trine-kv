@@ -1085,6 +1085,7 @@ fn run_wal_lane_worker(
     receiver: mpsc::Receiver<WalLaneCommand>,
 ) {
     let mut writer = None::<WalWriter>;
+    let mut persisted_level = None::<DurabilityMode>;
     while let Ok(command) = receiver.recv() {
         match command {
             WalLaneCommand::Append {
@@ -1100,18 +1101,26 @@ fn run_wal_lane_worker(
                     &frame,
                     durability,
                 );
+                if result.is_ok() {
+                    record_wal_lane_append_durability(&mut persisted_level, durability);
+                }
                 reply.complete(result);
             }
             WalLaneCommand::Persist { durability, reply } => {
-                let result = persist_wal_lane(&mut writer, durability);
+                let result = persist_wal_lane(&mut writer, &mut persisted_level, durability);
                 reply.complete(result);
             }
             WalLaneCommand::Rewrite {
                 replay_floor,
                 reply,
             } => {
-                let result =
-                    rewrite_wal_lane_after_replay_floor(&backend, &path, &mut writer, replay_floor);
+                let result = rewrite_wal_lane_after_replay_floor(
+                    &backend,
+                    &path,
+                    &mut writer,
+                    &mut persisted_level,
+                    replay_floor,
+                );
                 reply.complete(result);
             }
         }
@@ -1136,21 +1145,57 @@ fn append_wal_lane_frame(
         .append_frame(frame, durability)
 }
 
-fn persist_wal_lane(writer: &mut Option<WalWriter>, durability: DurabilityMode) -> Result<()> {
+fn persist_wal_lane(
+    writer: &mut Option<WalWriter>,
+    persisted_level: &mut Option<DurabilityMode>,
+    durability: DurabilityMode,
+) -> Result<()> {
     if let Some(writer) = writer.as_mut() {
-        writer.persist(durability)?;
+        if wal_lane_needs_persist(*persisted_level, durability) {
+            writer.persist(durability)?;
+            *persisted_level = Some(durability);
+        }
     }
     Ok(())
+}
+
+fn record_wal_lane_append_durability(
+    persisted_level: &mut Option<DurabilityMode>,
+    durability: DurabilityMode,
+) {
+    *persisted_level = Some(match *persisted_level {
+        Some(existing) if wal_durability_rank(existing) <= wal_durability_rank(durability) => {
+            existing
+        }
+        Some(_) | None => durability,
+    });
+}
+
+fn wal_lane_needs_persist(
+    persisted_level: Option<DurabilityMode>,
+    durability: DurabilityMode,
+) -> bool {
+    persisted_level.is_none_or(|level| wal_durability_rank(level) < wal_durability_rank(durability))
+}
+
+const fn wal_durability_rank(mode: DurabilityMode) -> u8 {
+    match mode {
+        DurabilityMode::Buffered => 0,
+        DurabilityMode::Flush => 1,
+        DurabilityMode::SyncData => 2,
+        DurabilityMode::SyncAll => 3,
+    }
 }
 
 fn rewrite_wal_lane_after_replay_floor(
     backend: &NativeFileBackend,
     path: &Path,
     writer: &mut Option<WalWriter>,
+    persisted_level: &mut Option<DurabilityMode>,
     replay_floor: Sequence,
 ) -> Result<()> {
-    if let Some(writer) = writer.as_mut() {
-        writer.persist(DurabilityMode::SyncAll)?;
+    if writer.is_some() {
+        persist_wal_lane(writer, persisted_level, DurabilityMode::SyncAll)?;
     } else if wait_for_wal_storage_future(read_wal_object_with_backend_async(backend, path))?
         .is_none()
     {
@@ -1163,6 +1208,7 @@ fn rewrite_wal_lane_after_replay_floor(
     ))?;
     if let Some(writer) = writer.as_mut() {
         writer.reopen_append_with_backend(backend, path)?;
+        *persisted_level = Some(DurabilityMode::SyncAll);
     }
     Ok(())
 }
@@ -1679,6 +1725,58 @@ mod tests {
             (1..=DEFAULT_WAL_SHARD_COUNT)
                 .map(|sequence| Sequence::new(sequence as u64))
                 .collect::<Vec<_>>()
+        );
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn wal_front_door_persists_only_dirty_shards() {
+        let dir = temp_dir("front-door-dirty-shards");
+        fs::create_dir_all(&dir).expect("create WAL test dir");
+        let backend = NativeFileBackend::new();
+        let front_door =
+            WalFrontDoor::open_sharded_with_backend(&backend, &dir, DEFAULT_WAL_SHARD_COUNT)
+                .expect("front door opens");
+
+        for sequence in 1..=DEFAULT_WAL_SHARD_COUNT {
+            front_door
+                .accept_commit(
+                    Sequence::new(sequence as u64),
+                    &[put("k", "v")],
+                    DurabilityMode::Buffered,
+                )
+                .expect("commit accepts");
+            front_door
+                .persist(DurabilityMode::SyncData)
+                .expect("dirty lane persists");
+        }
+
+        let after_first_round = backend.stats().operations.persist.requests;
+        let expected_first_round =
+            u64::try_from(DEFAULT_WAL_SHARD_COUNT).expect("shard count fits u64");
+        assert_eq!(after_first_round, expected_first_round);
+
+        front_door
+            .persist(DurabilityMode::SyncData)
+            .expect("clean lanes skip redundant persist");
+        assert_eq!(
+            backend.stats().operations.persist.requests,
+            after_first_round
+        );
+
+        front_door
+            .accept_commit(
+                Sequence::new(expected_first_round + 1),
+                &[put("k", "v")],
+                DurabilityMode::Buffered,
+            )
+            .expect("next commit accepts");
+        front_door
+            .persist(DurabilityMode::SyncData)
+            .expect("newly dirty lane persists");
+        assert_eq!(
+            backend.stats().operations.persist.requests,
+            after_first_round + 1
         );
         cleanup_dir(&dir);
     }

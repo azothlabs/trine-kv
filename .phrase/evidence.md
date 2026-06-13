@@ -12034,3 +12034,45 @@ Negative check:
 - Commit the writer-lease performance fix after a final diff review.
 - Treat localized batched point-read behavior as a separate future performance
   slice, not part of this WAL replay fix.
+
+## 2026-06-13: WAL Persist Dirty-Lane Optimization
+
+### Observation
+
+- Added persistent write-path benchmark rows for single-key and batch writes
+  across `Buffered`, `Flush`, `SyncData`, and `SyncAll`.
+- Added diagnostics for WAL append, explicit `persist_sync`, and public flush.
+- Before the change, 256 buffered commits followed by
+  `persist_sync(DurabilityMode::SyncData)` produced 1018 WAL persist storage
+  requests and about 1.21s median persist wall time.
+- After tracking per-lane WAL durability, the same diagnostic produced 256 WAL
+  persist storage requests and about 0.49s median persist wall time.
+- The focused WAL test `wal_front_door_persists_only_dirty_shards` proves clean
+  WAL shards are skipped while a newly dirty shard is still persisted.
+
+### Interpretation
+
+- The avoidable write-path cost was not per-commit WAL append itself; it was
+  explicit persist repeatedly syncing WAL shards that had not changed since the
+  previous persist call.
+- Per-commit `SyncData` and `SyncAll` writes still pay the real storage sync on
+  the lane that accepted the commit. That cost should not be hidden by changing
+  durability defaults.
+- Public batching and explicit `persist_sync` remain the safe user-facing way
+  to amortize strict durability costs without changing visibility semantics.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q wal_front_door_persists_only_dirty_shards --lib`
+- `cargo test -q --lib`
+- `cargo clippy --bench v1_bench -- -D warnings`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench`
+- `git diff --check`
+
+### Recommended Next Action
+
+- Treat write-path dirty-lane persist as complete.
+- Choose the next measured optimization from remaining benchmark evidence,
+  likely scan/search-policy or block-cache/decode work.

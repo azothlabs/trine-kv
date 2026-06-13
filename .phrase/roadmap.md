@@ -4363,7 +4363,7 @@ startup/recovery as the next largest user-visible cost.
 
 ### Phase 177: Write Fsync And Group Commit Optimization
 
-**Status**: Planned
+**Status**: Complete
 
 **Goal**: Measure and reduce confirmed-write latency and throughput costs
 without weakening durability defaults.
