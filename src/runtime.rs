@@ -231,7 +231,7 @@ impl RuntimeCapabilities {
     ///
     /// This is a coarse runtime capability. Use [`crate::DbStats`] platform I/O
     /// operation counters to see which storage operations completed through
-    /// true platform async, partial native async, platform-managed fallback,
+    /// true platform async, partial native async, thread-pool managed async,
     /// blocking fallback, or unsupported classes.
     #[must_use]
     pub const fn platform_async_io(self) -> bool {
@@ -241,9 +241,9 @@ impl RuntimeCapabilities {
     /// Returns whether the platform I/O driver can be selected for storage work.
     ///
     /// This reports the routing layer, not true async file capability. A target
-    /// may support the platform driver while all current storage operations are
-    /// fallback-classified; use [`Self::platform_async_io`] to check whether at
-    /// least one operation is backed by a real platform async primitive.
+    /// may support the platform driver while operations are completed by a
+    /// managed thread-pool path; use [`Self::platform_async_io`] to check
+    /// whether storage work still completes asynchronously through platform-io.
     #[must_use]
     pub const fn platform_io_driver(self) -> bool {
         self.has(PLATFORM_IO_DRIVER)
@@ -263,17 +263,7 @@ const fn platform_io_driver_flag() -> u8 {
 }
 
 const fn platform_async_io_flag() -> u8 {
-    if cfg!(all(
-        feature = "platform-io",
-        any(
-            target_os = "linux",
-            windows,
-            target_os = "macos",
-            target_os = "freebsd",
-            target_os = "illumos",
-            target_os = "solaris"
-        )
-    )) {
+    if cfg!(all(feature = "platform-io", any(unix, windows))) {
         PLATFORM_ASYNC_IO
     } else {
         0
@@ -652,17 +642,7 @@ mod tests {
         assert_eq!(platform.platform_io_driver(), cfg!(feature = "platform-io"));
         assert_eq!(
             platform.platform_async_io(),
-            cfg!(all(
-                feature = "platform-io",
-                any(
-                    target_os = "linux",
-                    windows,
-                    target_os = "macos",
-                    target_os = "freebsd",
-                    target_os = "illumos",
-                    target_os = "solaris"
-                )
-            ))
+            cfg!(all(feature = "platform-io", any(unix, windows)))
         );
 
         let inline = RuntimeOptions::inline().capabilities();

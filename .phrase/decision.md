@@ -65,11 +65,13 @@ Evidence notes should separate:
 - Public database open is path-first and persistent by default:
   `Db::open(path)` and `Db::open_sync(path)` open a persistent database, while
   in-memory mode requires explicit `DbOptions::memory()`.
-- `PlatformAsyncIo` must mean at least one current Trine storage operation is
-  executed by a real OS async primitive for the selected target. A backend that
-  only provides polling, thread-pool fallback, or lower-level primitives that
-  are not enough for a complete Trine operation must not advertise that
-  capability.
+- `PlatformAsyncIo` means the selected platform-io backend can complete at
+  least one current Trine storage operation asynchronously without blocking the
+  caller runtime. The operation may be `TruePlatformAsync`,
+  `PlatformNativeAsyncButPartial`, or `ThreadPoolManagedAsync`; exact class
+  counters remain the source of truth for whether the operation used native OS
+  completion or platform-managed thread-pool completion. Targets without native
+  threads, such as browser WASM, must not advertise thread-pool managed async.
 - Platform-io completion must be judged before engine revalidation. The
   platform-io responsibility is to be Trine's cross-platform async file I/O
   abstraction; engine phases must not treat a half-complete backend matrix as
@@ -79,7 +81,8 @@ Evidence notes should separate:
   temporary write plus rename publish, append open, append, persist, WAL
   rewrite, delete, directory create, directory sync, directory listing, and
   writer lease. Each row must report whether the complete operation is true
-  platform async, partial, fallback, or unsupported on the selected platform.
+  platform async, partial native async, thread-pool managed async, blocking
+  fallback, or unsupported on the selected platform.
 - Persistent storage behavior is governed by backend capabilities, including
   writer lease, manifest publish, durability strength, and background-work
   support.

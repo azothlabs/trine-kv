@@ -128,7 +128,7 @@ Required platform I/O operation classes:
 ```text
 TruePlatformAsync
 PlatformNativeAsyncButPartial
-PlatformManagedFallback
+ThreadPoolManagedAsync
 BlockingFallback
 Unsupported
 ```
@@ -140,11 +140,13 @@ Class meanings:
 - `PlatformNativeAsyncButPartial`: one or more lower-level steps can use a
   native async primitive, but the complete Trine operation still includes
   fallback-classified work.
-- `PlatformManagedFallback`: the platform driver owns the operation and hides
-  target mechanics from the KV engine, but completion is managed by a fallback
-  path inside the platform layer.
+- `ThreadPoolManagedAsync`: the platform driver owns the operation and hides
+  target mechanics from the KV engine. Completion is asynchronous because the
+  operation runs on platform-io's managed blocking lane rather than the caller
+  runtime. Targets without native threads must not use this class.
 - `BlockingFallback`: the platform driver uses an explicit blocking fallback
-  for an operation that has no real async platform operation yet.
+  for an operation that cannot currently be moved to a native or thread-pool
+  managed completion path.
 - `Unsupported`: the target cannot provide the operation through platform-io.
 
 ### 4.4 Runtime Independence
@@ -402,23 +404,23 @@ Rules:
 - must keep Linux, Windows, macOS, BSD/other Unix, and fallback mechanics behind
   the platform-io driver contract so the KV engine awaits Trine operations
   rather than OS APIs;
-- may submit directory and object listing through the platform driver as a
-  separately reported `BlockingFallback` until that driver exposes a real async
-  directory enumeration operation;
+- may submit directory and object listing through the platform driver as
+  `ThreadPoolManagedAsync` when no real async directory enumeration operation
+  exists but a native thread pool is available;
 - may add stronger platform-specific implementations behind the same contract.
 - must report `BlockingAdapter` separately from `PlatformAsyncIo`; using a
-  bounded blocking pool must not be described as true platform async I/O.
-- must report platform backend fallback tasks separately from true platform
-  async I/O tasks when a platform driver is selected but a target or operation
-  cannot honestly use a native async file primitive.
-- must report platform-driver blocking fallback tasks separately from both
-  Trine's bounded blocking adapter and true platform async I/O tasks.
-- must advertise `PlatformAsyncIo` only when the current target has at least
-  one true Trine-level platform async storage operation. A target whose current
-  operations are all fallback-classified may still route work
-  through the platform driver when the user selects `RuntimeOptions::platform_io`,
-  but it must report fallback task counters and must not advertise
-  `PlatformAsyncIo`.
+  bounded blocking pool must not be described as true platform async I/O, but it
+  may be described as `ThreadPoolManagedAsync` when owned by platform-io.
+- must report platform thread-pool managed async tasks separately from true or
+  partial native async I/O tasks when a target or operation cannot honestly use
+  a native async file primitive.
+- must report platform-driver blocking fallback tasks separately from Trine's
+  bounded blocking adapter, native async I/O tasks, and thread-pool managed
+  async tasks.
+- must advertise `PlatformAsyncIo` when the current target has at least one
+  true, partial native, or thread-pool managed async storage operation through
+  platform-io. Browser WASM and other targets without native threads must not
+  get `PlatformAsyncIo` from the thread-pool managed class.
 - native persistent async writes may use the async WAL lane completion only when
   the native-file backend advertises `PlatformAsyncIo`; fallback targets must
   keep the bounded sync-adapter write boundary.
@@ -440,69 +442,69 @@ Current platform backend classifications are operation-level. Linux has current
 true async evidence for many operations. Windows, macOS, and BSD/Solaris-family
 targets have native async evidence for selected lower-level file data paths but
 still report partial rows when a complete Trine operation includes non-native
-steps. Generic fallback targets remain managed or blocking fallback until a
+steps. Generic Unix targets use thread-pool managed async until a stronger
 target-specific backend is proven behind the same platform-io contract.
 
 ```text
 Operation                     Linux            Windows          macOS            BSD/Solaris      Generic fallback
-length lookup                 TruePlatformAsync ManagedFallback  ManagedFallback  ManagedFallback  ManagedFallback
-random read                   TruePlatformAsync Partial          Partial          Partial          ManagedFallback
-whole-object read             TruePlatformAsync Partial          Partial          Partial          ManagedFallback
-temp write + rename publish   TruePlatformAsync Partial          Partial          Partial          ManagedFallback
-append open                   TruePlatformAsync ManagedFallback  Partial          ManagedFallback  ManagedFallback
-append                        TruePlatformAsync Partial          Partial          Partial          ManagedFallback
-persist/fsync                 TruePlatformAsync ManagedFallback  Partial          Partial          ManagedFallback
-WAL rewrite                   TruePlatformAsync Partial          Partial          Partial          ManagedFallback
-delete                        TruePlatformAsync ManagedFallback  ManagedFallback  ManagedFallback  ManagedFallback
-directory create              TruePlatformAsync ManagedFallback  ManagedFallback  ManagedFallback  ManagedFallback
-directory sync                TruePlatformAsync ManagedFallback  Partial          Partial          ManagedFallback
-directory listing             BlockingFallback  BlockingFallback BlockingFallback BlockingFallback BlockingFallback
-writer lease                  TruePlatformAsync Partial          Partial          Partial          ManagedFallback/Unsupported
+length lookup                 TruePlatformAsync ThreadPool       ThreadPool       ThreadPool       ThreadPool
+random read                   TruePlatformAsync Partial          Partial          Partial          ThreadPool
+whole-object read             TruePlatformAsync Partial          Partial          Partial          ThreadPool
+temp write + rename publish   TruePlatformAsync Partial          Partial          Partial          ThreadPool
+append open                   TruePlatformAsync ThreadPool       Partial          ThreadPool       ThreadPool
+append                        TruePlatformAsync Partial          Partial          Partial          ThreadPool
+persist/fsync                 TruePlatformAsync ThreadPool       Partial          Partial          ThreadPool
+WAL rewrite                   TruePlatformAsync Partial          Partial          Partial          ThreadPool
+delete                        TruePlatformAsync ThreadPool       ThreadPool       ThreadPool       ThreadPool
+directory create              TruePlatformAsync ThreadPool       ThreadPool       ThreadPool       ThreadPool
+directory sync                TruePlatformAsync ThreadPool       Partial          Partial          ThreadPool
+directory listing             ThreadPool        ThreadPool       ThreadPool       ThreadPool       ThreadPool
+writer lease                  TruePlatformAsync Partial          Partial          Partial          ThreadPool/Unsupported
 ```
 
 Legend: `Partial` means `PlatformNativeAsyncButPartial`, and
-`ManagedFallback` means `PlatformManagedFallback`.
+`ThreadPool` means `ThreadPoolManagedAsync`.
 
 With the current backend matrix, `RuntimeOptions::platform_io()` advertises
-`PlatformAsyncIo` when the `platform-io` Cargo feature is enabled on Linux,
-Windows, macOS, FreeBSD, illumos, and Solaris-family targets. This coarse
-capability means at least one operation has true or partial native async
-coverage; the per-operation matrix remains the source of truth for complete
-operation class. The Linux directory listing row remains `BlockingFallback`
-because the selected Linux async stack exposes no directory enumeration
-operation for a complete Trine listing request; Trine therefore treats listing
-as an explicit platform driver fallback instead of an unexamined gap.
+`PlatformAsyncIo` when the `platform-io` Cargo feature is enabled on native Unix
+or Windows targets. This coarse capability means platform-io can return async
+completion through true native, partial native, or managed thread-pool
+execution; the per-operation matrix remains the source of truth for complete
+operation class. Linux directory listing is `ThreadPoolManagedAsync` because the
+selected Linux async stack exposes no directory enumeration operation for a
+complete Trine listing request.
 On Windows, the selected backend opens files with overlapped support and submits
 positioned `ReadFile` / `WriteFile` operations through IOCP, but file open,
 metadata, sync, rename, delete, directory creation/listing, and related publish
 steps still include blocking or helper-managed work. Therefore Windows rows
 with IOCP read/write substeps are `Partial`, rows without such a substep are
-`ManagedFallback`, and directory listing remains `BlockingFallback` until a
-complete Trine operation can be proven end to end.
+`ThreadPoolManagedAsync` until a complete native operation can be proven end to
+end.
 
 On macOS, platform-io uses Apple `DispatchIO` through the `dispatch2` crate for
 the file data path: open/create through `dispatch_io_create_with_path`, random
 and whole-object read through `dispatch_io_read`, and write-like paths through
 `dispatch_io_write`. Operations remain `Partial` when they also need metadata,
 rename, delete, directory creation/listing, or durability work without an Apple
-file-completion primitive. Directory listing remains `BlockingFallback`.
+file-completion primitive. Operations without an Apple file-completion step are
+`ThreadPoolManagedAsync` on native macOS.
 
 On FreeBSD and Solaris-family targets, the selected backend exposes libc AIO for
 some regular-file read, write, and sync primitives. Complete Trine operations
 that include those primitives are `PlatformNativeAsyncButPartial` while open,
-stat, rename, delete, directory, listing, or lease steps remain blocking or
-helper-managed. Other Unix targets remain `PlatformManagedFallback` unless a
+stat, rename, delete, directory, listing, or lease steps remain thread-pool
+managed. Other Unix targets remain `ThreadPoolManagedAsync` unless a
 target-specific audit proves stronger behavior.
 
-On non-Linux targets it can still route native storage through the platform
-driver, but current operations remain partial or fallback-classified until
-stronger target backends exist. That current-state classification is not the
-platform-io goal; the goal is that each platform backend handles its own async
-or fallback mechanics while preserving one Trine operation boundary for KV code.
+On native targets without a stronger backend, platform-io still routes native
+storage through its managed thread pool. That is a valid async completion path,
+not an engine-level fallback. The goal remains that each platform backend
+handles its own async mechanics while preserving one Trine operation boundary
+for KV code.
 
 Public diagnostics expose that boundary through
 `DbStats::storage_platform_io_operations`. Each operation has class counters for
-true platform async, partial native async, platform-managed fallback, blocking
+true platform async, partial native async, thread-pool managed async, blocking
 fallback, and unsupported completions. `PlatformIoOperationStats::total()` sums
 all operation rows into one class counter set for dashboards and health checks;
 individual rows remain the source of truth when a caller needs to know whether,
@@ -639,9 +641,9 @@ Stats and diagnostics should expose:
 - blocking adapter call count when enabled;
 - whether the storage backend uses a blocking adapter or platform async I/O;
 - true platform async task count;
-- platform backend fallback count;
-- platform-driver blocking fallback count for operations without a real
-  platform primitive;
+- platform thread-pool managed async count;
+- platform-driver blocking fallback count for operations that cannot currently
+  be moved to native or thread-pool managed completion;
 - unsupported capability errors.
 
 ## 12. Required Tests

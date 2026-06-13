@@ -87,7 +87,8 @@ their own mechanics inside the platform driver, while the KV engine awaits
 Trine storage operations. Native async writes and public flush use awaitable
 storage completions on targets whose native-file backend advertises
 `PlatformAsyncIo`; operations that are not true platform async remain counted as
-platform-managed or blocking fallback work. Compaction and cooperative
+partial native, thread-pool managed async, blocking fallback, or unsupported
+work. Compaction and cooperative
 maintenance still use runtime task boundaries where the current engine internals
 are synchronous. Run `cargo run --example quickstart` for a complete checked
 path.
@@ -129,23 +130,27 @@ let db = Db::open(options).await?;
 ```
 
 `DbStats` reports whether native storage work is routed through the platform
-driver (`storage_uses_platform_io_driver`) and separates true platform async
-file work (`storage_platform_async_io_tasks`) from platform backend fallback
-work (`storage_platform_backend_fallback_tasks`), platform-driver blocking
-fallback work (`storage_platform_sync_fallback_tasks`), and Trine's bounded
-sync-adapter task count. `storage_uses_platform_async_io` is true only when at
-least one current Trine storage operation is classified as true platform async
-on the selected target.
+driver (`storage_uses_platform_io_driver`) and separates true or partial native
+platform async work (`storage_platform_async_io_tasks`) from platform-io managed
+thread-pool work (`storage_platform_thread_pool_managed_async_tasks`),
+platform-driver blocking fallback work (`storage_platform_sync_fallback_tasks`),
+and Trine's bounded sync-adapter task count. `storage_uses_platform_async_io` is
+true when the selected native platform driver can complete Trine operations
+asynchronously without blocking the caller runtime; use the per-operation class
+counters to see whether each operation was true native async, partial native
+async, thread-pool managed async, blocking fallback, or unsupported.
 
 `storage_platform_io_operations` breaks the same information down by Trine
 operation, such as random reads, WAL rewrite, directory sync, and writer lease.
 Each operation records whether it completed as true platform async, partial
-native async, platform-managed fallback, blocking fallback, or unsupported.
+native async, thread-pool managed async, blocking fallback, or unsupported.
 The operation table uses Trine storage operation names rather than OS API names
 so the KV engine and callers can share one portable diagnostic vocabulary.
-Directory and object listing are currently submitted through the platform
-driver as blocking fallback work because the selected backend does not expose a
-real async enumeration operation.
+On native targets, directory and object listing are submitted through
+platform-io's managed thread-pool path when the selected backend does not expose
+a real async enumeration operation. Targets without native threads, such as
+browser-style WASM environments, must not report managed thread-pool async for
+those operations.
 
 ```rust
 let stats = db.stats();
@@ -157,7 +162,14 @@ if stats.storage_uses_platform_io_driver {
         "true async completions: {}",
         platform_total.true_platform_async,
     );
-    println!("fallback completions: {}", platform_total.fallback_total());
+    println!(
+        "thread-pool completions: {}",
+        platform_total.thread_pool_managed_async,
+    );
+    println!(
+        "non-true async completions: {}",
+        platform_total.non_true_platform_async_total(),
+    );
 }
 ```
 
@@ -170,16 +182,19 @@ if random_reads.uses_true_platform_async() {
     println!("some random reads completed as true platform async");
 }
 
-if random_reads.uses_fallback() {
-    println!("some random reads used partial, managed, blocking, or unsupported fallback");
+if random_reads.uses_non_true_platform_async() {
+    println!("some random reads used partial, thread-pool, blocking, or unsupported work");
 }
 ```
 
-On targets where every current Trine storage operation is fallback-classified,
-`RuntimeOptions::platform_io()` can still use the platform driver, but it does
-not advertise `PlatformAsyncIo`. That means the KV engine still uses the same
-platform-io boundary, while the selected platform backend reports honestly how
-each operation completed.
+On native targets where every current Trine storage operation is completed by
+platform-io's managed thread-pool path, `RuntimeOptions::platform_io()` still
+uses the platform driver and can advertise `PlatformAsyncIo` because the caller
+runtime receives asynchronous completions. The exact operation counters remain
+the source of truth for whether work was true native async, partial native
+async, thread-pool managed async, blocking fallback, or unsupported. Targets
+without native threads must use an explicit host backend instead of silently
+pretending to have thread-pool managed async file I/O.
 
 WASI and browser persistence have explicit option constructors so callers can
 select those host boundaries without accidentally falling back to native files.

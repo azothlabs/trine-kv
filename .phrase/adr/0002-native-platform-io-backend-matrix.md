@@ -24,20 +24,22 @@ the architecture boundary. Platform support is not uniform:
   the Linux native async path.
 - Windows can use native overlapped/IOCP file primitives for positioned reads
   and writes with the selected backend, but current Trine operations still
-  include blocking or helper-managed open, metadata, sync, rename, delete,
-  directory, listing, or lease steps before they can be counted as complete true
-  platform async operations.
-- macOS has an explicit backend row. With the selected backend, macOS
-  regular-file operations use the Unix polling path and remain
-  platform-managed fallback until Apple-specific async file support is audited
-  and implemented.
+  include non-IOCP open, metadata, sync, rename, delete, directory, listing, or
+  lease steps before they can be counted as complete true platform async
+  operations.
+- macOS has an explicit backend row. With the selected backend, macOS file data
+  operations use Apple `DispatchIO` for read/write steps, while metadata,
+  rename, delete, directory, listing, and remaining durability steps are still
+  partial or thread-pool managed at the complete Trine operation boundary.
 - FreeBSD and Solaris-family targets have AIO primitive evidence in the
   selected backend for read/write/sync steps, but complete Trine operations
   remain partial while open, metadata, rename, delete, directory, listing, or
   lease steps are still blocking or helper-managed.
-- Other Unix targets remain platform-managed fallback until platform-specific
-  audits prove stronger behavior.
-- Directory enumeration has no native async primitive in the selected backend.
+- Other Unix targets use platform-io's managed thread-pool path until
+  platform-specific audits prove stronger behavior.
+- Directory enumeration has no native async primitive in the selected backend,
+  so native targets complete listing through platform-io's managed thread-pool
+  path. Targets without native threads must not use that class.
 
 ## Decision
 
@@ -47,31 +49,34 @@ Trine records native platform I/O by operation capability class:
   platform async completion mechanism for the selected target backend.
 - `PlatformNativeAsyncButPartial`: the backend has a real platform async
   primitive for one or more lower-level steps, but the complete Trine operation
-  still needs fallback-classified steps. This does not advertise
-  `PlatformAsyncIo` for that operation.
-- `PlatformManagedFallback`: work is owned by `PlatformIoDriver`, but the
-  selected backend completes it through polling, an internal helper, inline
-  completion, or another backend-managed fallback. The KV engine still sees the
-  same platform-io boundary.
+  still needs non-native-async steps.
+- `ThreadPoolManagedAsync`: work is owned by `PlatformIoDriver` and blocking
+  file work runs on platform-io's managed thread pool. The KV engine still sees
+  the same async platform-io boundary. Browser WASM and other targets without
+  native threads must not report this class.
 - `BlockingFallback`: work is explicitly run through a platform-driver
-  blocking fallback. It must be counted separately from Trine's bounded
-  blocking adapter.
+  blocking fallback because the platform driver cannot currently move it to
+  native async or its managed thread-pool path. It must be counted separately
+  from Trine's bounded blocking adapter.
 - `Unsupported`: the target cannot provide the operation through platform-io
   and must reject the mode or route through a different declared backend.
 
 `DbStats` must report:
 
 - whether native storage work is routed through `PlatformIoDriver`;
-- true platform async task count;
-- platform backend fallback task count;
+- true or partial native platform async task count;
+- platform-io managed thread-pool task count;
 - platform-driver blocking fallback task count;
 - Trine bounded blocking-adapter task count.
 
-`PlatformAsyncIo` capability is advertised only when the selected target has at
-least one true Trine-level platform async storage operation. A target whose
-current operations are all fallback-classified may still route work through
-`PlatformIoDriver` when the user selects `RuntimeMode::PlatformIo`, but it must
-report fallback task counts and must not advertise `PlatformAsyncIo`.
+`PlatformAsyncIo` capability is advertised when the selected native platform
+driver can return asynchronous completions to the caller runtime through true
+platform async, partial native async, or platform-io's managed thread-pool path.
+Per-operation counters remain the authority for whether a completion was
+`TruePlatformAsync`, `PlatformNativeAsyncButPartial`,
+`ThreadPoolManagedAsync`, `BlockingFallback`, or `Unsupported`. Browser WASM and
+other targets without native threads must reject or use an explicit host backend
+instead of reporting thread-pool managed async.
 
 ### Operation Matrix
 
@@ -81,19 +86,19 @@ platform-specific implementation evidence.
 
 | Trine operation | Linux current / target | Windows current / target | macOS current / target | BSD/other Unix current / target | Generic fallback current / target |
 | --- | --- | --- | --- | --- | --- |
-| Length lookup | `TruePlatformAsync` / keep true async where supported | `PlatformNativeAsyncButPartial` / audit metadata path and make complete operation true async if possible | `PlatformManagedFallback` / audit Apple metadata APIs | `PlatformManagedFallback` on other Unix; FreeBSD/Solaris-family managed for metadata | `PlatformManagedFallback` / stay fallback unless target grows support |
-| Random read | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / complete overlapped read path | `PlatformManagedFallback` / audit native async read options | FreeBSD/Solaris-family `PlatformNativeAsyncButPartial`; other Unix `PlatformManagedFallback` | `PlatformManagedFallback` |
-| Whole-object read | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / complete open plus read path | `PlatformManagedFallback` / audit complete operation | FreeBSD/Solaris-family `PlatformNativeAsyncButPartial`; other Unix `PlatformManagedFallback` | `PlatformManagedFallback` |
-| Temporary write plus rename publish | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / audit write, sync, rename, and directory steps | `PlatformManagedFallback` / audit full publish path | FreeBSD/Solaris-family `PlatformNativeAsyncButPartial`; other Unix `PlatformManagedFallback` | `PlatformManagedFallback` |
-| Append open | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / audit append handle semantics | `PlatformManagedFallback` / audit append open | `PlatformManagedFallback` | `PlatformManagedFallback` |
-| Append | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / complete serialized overlapped append or explicit lane strategy | `PlatformManagedFallback` / audit async append feasibility | FreeBSD/Solaris-family `PlatformNativeAsyncButPartial`; other Unix `PlatformManagedFallback` | `PlatformManagedFallback` |
-| Persist/fsync | `TruePlatformAsync` / keep true async when backend completion is real | `PlatformNativeAsyncButPartial` / audit flush completion semantics | `PlatformManagedFallback` / audit fsync/fcntl completion semantics | FreeBSD/Solaris-family `PlatformNativeAsyncButPartial`; other Unix `PlatformManagedFallback` | `PlatformManagedFallback` |
-| WAL rewrite | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / audit complete rewrite and publish steps | `PlatformManagedFallback` / audit rewrite path | FreeBSD/Solaris-family `PlatformNativeAsyncButPartial`; other Unix `PlatformManagedFallback` | `PlatformManagedFallback` |
-| Delete | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / audit delete semantics | `PlatformManagedFallback` / audit delete semantics | `PlatformManagedFallback` | `PlatformManagedFallback` |
-| Directory create | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / audit create-directory completion | `PlatformManagedFallback` / audit create-directory completion | `PlatformManagedFallback` | `PlatformManagedFallback` |
-| Directory sync | `TruePlatformAsync` / keep true async where supported | `PlatformNativeAsyncButPartial` / audit directory handle sync | `PlatformManagedFallback` / audit directory sync support | FreeBSD/Solaris-family `PlatformNativeAsyncButPartial`; other Unix `PlatformManagedFallback` | `PlatformManagedFallback` |
-| Directory listing | `BlockingFallback` / replace only if a real async enumeration operation exists | `BlockingFallback` / replace only with audited async enumeration | `BlockingFallback` / replace only with audited async enumeration | `BlockingFallback` / replace only with audited async enumeration | `BlockingFallback` |
-| Writer lease | `TruePlatformAsync` / keep true async where current backend supports it | `PlatformNativeAsyncButPartial` / audit lock/open semantics | `PlatformManagedFallback` / audit lock semantics | `PlatformManagedFallback` / audit lock semantics | `PlatformManagedFallback` or `Unsupported` by target |
+| Length lookup | `TruePlatformAsync` / keep true async where supported | `PlatformNativeAsyncButPartial` / audit metadata path and make complete operation true async if possible | `ThreadPoolManagedAsync` / audit Apple metadata APIs | `ThreadPoolManagedAsync` on other Unix; FreeBSD/Solaris-family managed for metadata | `ThreadPoolManagedAsync` / stay fallback unless target grows support |
+| Random read | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / complete overlapped read path | `ThreadPoolManagedAsync` / audit native async read options | FreeBSD/Solaris-family `PlatformNativeAsyncButPartial`; other Unix `ThreadPoolManagedAsync` | `ThreadPoolManagedAsync` |
+| Whole-object read | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / complete open plus read path | `ThreadPoolManagedAsync` / audit complete operation | FreeBSD/Solaris-family `PlatformNativeAsyncButPartial`; other Unix `ThreadPoolManagedAsync` | `ThreadPoolManagedAsync` |
+| Temporary write plus rename publish | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / audit write, sync, rename, and directory steps | `ThreadPoolManagedAsync` / audit full publish path | FreeBSD/Solaris-family `PlatformNativeAsyncButPartial`; other Unix `ThreadPoolManagedAsync` | `ThreadPoolManagedAsync` |
+| Append open | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / audit append handle semantics | `ThreadPoolManagedAsync` / audit append open | `ThreadPoolManagedAsync` | `ThreadPoolManagedAsync` |
+| Append | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / complete serialized overlapped append or explicit lane strategy | `ThreadPoolManagedAsync` / audit async append feasibility | FreeBSD/Solaris-family `PlatformNativeAsyncButPartial`; other Unix `ThreadPoolManagedAsync` | `ThreadPoolManagedAsync` |
+| Persist/fsync | `TruePlatformAsync` / keep true async when backend completion is real | `PlatformNativeAsyncButPartial` / audit flush completion semantics | `ThreadPoolManagedAsync` / audit fsync/fcntl completion semantics | FreeBSD/Solaris-family `PlatformNativeAsyncButPartial`; other Unix `ThreadPoolManagedAsync` | `ThreadPoolManagedAsync` |
+| WAL rewrite | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / audit complete rewrite and publish steps | `ThreadPoolManagedAsync` / audit rewrite path | FreeBSD/Solaris-family `PlatformNativeAsyncButPartial`; other Unix `ThreadPoolManagedAsync` | `ThreadPoolManagedAsync` |
+| Delete | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / audit delete semantics | `ThreadPoolManagedAsync` / audit delete semantics | `ThreadPoolManagedAsync` | `ThreadPoolManagedAsync` |
+| Directory create | `TruePlatformAsync` / keep true async | `PlatformNativeAsyncButPartial` / audit create-directory completion | `ThreadPoolManagedAsync` / audit create-directory completion | `ThreadPoolManagedAsync` | `ThreadPoolManagedAsync` |
+| Directory sync | `TruePlatformAsync` / keep true async where supported | `PlatformNativeAsyncButPartial` / audit directory handle sync | `ThreadPoolManagedAsync` / audit directory sync support | FreeBSD/Solaris-family `PlatformNativeAsyncButPartial`; other Unix `ThreadPoolManagedAsync` | `ThreadPoolManagedAsync` |
+| Directory listing | `ThreadPoolManagedAsync` / replace only if a real async enumeration operation exists | `ThreadPoolManagedAsync` / replace only with audited async enumeration | `ThreadPoolManagedAsync` / replace only with audited async enumeration | `ThreadPoolManagedAsync` / replace only with audited async enumeration | `ThreadPoolManagedAsync` on native-thread targets; `Unsupported` without native threads |
+| Writer lease | `TruePlatformAsync` / keep true async where current backend supports it | `PlatformNativeAsyncButPartial` / audit lock/open semantics | `ThreadPoolManagedAsync` / audit lock semantics | `ThreadPoolManagedAsync` / audit lock semantics | `ThreadPoolManagedAsync` or `Unsupported` by target |
 
 ### Phase 154 Entry Criteria
 
@@ -124,8 +129,10 @@ Driver cleanup may start only after this contract is in place. It must:
   steps are replaced and verified.
 - Other BSD/Unix targets must not be described as true native async for regular
   files until a stronger backend is implemented and verified.
-- Directory enumeration remains a separately counted blocker until a backend
-  exposes a real async directory enumeration operation.
+- Directory enumeration remains a separately counted native-async gap until a
+  backend exposes a real async directory enumeration operation; on native
+  targets it is currently completed by platform-io's managed thread-pool path.
 - With the current backend matrix, non-Linux targets can use the platform I/O
   driver when the `platform-io` Cargo feature is enabled, but their current
-  classes are fallback or partial until audited target implementations land.
+  classes are thread-pool managed or partial until audited target
+  implementations land.

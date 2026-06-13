@@ -867,7 +867,9 @@ impl NativeFileBackend {
             blocking_adapter_rejected_tasks: blocking_adapter_stats.rejected_tasks,
             blocking_adapter_total_runtime_micros: blocking_adapter_stats.total_runtime_micros,
             platform_async_io_tasks: self.metrics.platform_async_io_tasks(),
-            platform_backend_fallback_tasks: self.metrics.platform_backend_fallback_tasks(),
+            platform_thread_pool_managed_async_tasks: self
+                .metrics
+                .platform_thread_pool_managed_async_tasks(),
             platform_blocking_fallback_tasks: self.metrics.platform_blocking_fallback_tasks(),
             inline_tasks: self.metrics.inline_tasks(),
             operations: self.metrics.operation_stats(),
@@ -949,7 +951,7 @@ impl Default for NativeFileBackend {
 struct NativeFileStorageMetrics {
     blocking_adapter: AtomicU64,
     platform_async_io: AtomicU64,
-    platform_backend_fallback: AtomicU64,
+    platform_thread_pool_managed_async: AtomicU64,
     platform_blocking_fallback: AtomicU64,
     inline: AtomicU64,
     operations: NativeFileStorageOperationMetrics,
@@ -1019,16 +1021,15 @@ impl NativeFileStorageMetrics {
             | PlatformIoTaskClass::PlatformNativeAsyncButPartial => {
                 self.platform_async_io.fetch_add(1, Ordering::Relaxed);
             }
-            PlatformIoTaskClass::PlatformManagedFallback | PlatformIoTaskClass::Unsupported => {
-                self.platform_backend_fallback
+            PlatformIoTaskClass::ThreadPoolManagedAsync => {
+                self.platform_thread_pool_managed_async
                     .fetch_add(1, Ordering::Relaxed);
             }
             PlatformIoTaskClass::BlockingFallback => {
-                self.platform_backend_fallback
-                    .fetch_add(1, Ordering::Relaxed);
                 self.platform_blocking_fallback
                     .fetch_add(1, Ordering::Relaxed);
             }
+            PlatformIoTaskClass::Unsupported => {}
         }
     }
 
@@ -1062,8 +1063,9 @@ impl NativeFileStorageMetrics {
         self.platform_async_io.load(Ordering::Acquire)
     }
 
-    fn platform_backend_fallback_tasks(&self) -> u64 {
-        self.platform_backend_fallback.load(Ordering::Acquire)
+    fn platform_thread_pool_managed_async_tasks(&self) -> u64 {
+        self.platform_thread_pool_managed_async
+            .load(Ordering::Acquire)
     }
 
     fn platform_blocking_fallback_tasks(&self) -> u64 {
@@ -1113,7 +1115,7 @@ struct NativeFilePlatformIoOperationMetrics {
 struct NativeFilePlatformIoClassMetrics {
     true_platform_async: AtomicU64,
     platform_native_async_but_partial: AtomicU64,
-    platform_managed_fallback: AtomicU64,
+    thread_pool_managed_async: AtomicU64,
     blocking_fallback: AtomicU64,
     unsupported: AtomicU64,
 }
@@ -1168,8 +1170,8 @@ impl NativeFilePlatformIoClassMetrics {
                 self.platform_native_async_but_partial
                     .fetch_add(1, Ordering::Relaxed);
             }
-            PlatformIoTaskClass::PlatformManagedFallback => {
-                self.platform_managed_fallback
+            PlatformIoTaskClass::ThreadPoolManagedAsync => {
+                self.thread_pool_managed_async
                     .fetch_add(1, Ordering::Relaxed);
             }
             PlatformIoTaskClass::BlockingFallback => {
@@ -1187,7 +1189,7 @@ impl NativeFilePlatformIoClassMetrics {
             platform_native_async_but_partial: self
                 .platform_native_async_but_partial
                 .load(Ordering::Acquire),
-            platform_managed_fallback: self.platform_managed_fallback.load(Ordering::Acquire),
+            thread_pool_managed_async: self.thread_pool_managed_async.load(Ordering::Acquire),
             blocking_fallback: self.blocking_fallback.load(Ordering::Acquire),
             unsupported: self.unsupported.load(Ordering::Acquire),
         }
@@ -1279,7 +1281,7 @@ pub(crate) struct NativeFileStorageStats {
     pub(crate) blocking_adapter_rejected_tasks: u64,
     pub(crate) blocking_adapter_total_runtime_micros: u64,
     pub(crate) platform_async_io_tasks: u64,
-    pub(crate) platform_backend_fallback_tasks: u64,
+    pub(crate) platform_thread_pool_managed_async_tasks: u64,
     pub(crate) platform_blocking_fallback_tasks: u64,
     pub(crate) inline_tasks: u64,
     pub(crate) operations: StorageOperationStats,
@@ -4788,7 +4790,7 @@ mod tests {
     }
 
     #[cfg(all(feature = "platform-io", target_os = "linux"))]
-    fn assert_platform_io_listing_fallbacks(
+    fn assert_platform_io_listing_managed_async(
         backend: &NativeFileBackend,
         directory: StorageDirectoryId,
         table: &StorageObjectId,
@@ -4797,11 +4799,11 @@ mod tests {
             StorageObjectListRequest::native_file(StorageObjectKind::Table, directory.path())
                 .with_file_extension("trinet");
         let listed_objects = block_on_test_future(backend.list_objects(list_request.clone()))
-            .expect("platform I/O object listing fallback completes");
+            .expect("platform I/O object listing completes");
         assert_eq!(listed_objects, vec![table.clone()]);
 
         let listed_files = block_on_test_future(backend.list_directory_files(directory.clone()))
-            .expect("platform I/O directory listing fallback completes");
+            .expect("platform I/O directory listing completes");
         assert!(
             listed_files.iter().any(|file| file.path() == table.path()),
             "directory listing should include the table"
@@ -4834,7 +4836,7 @@ mod tests {
 
         let driver_tasks = stats
             .platform_async_io_tasks
-            .saturating_add(stats.platform_backend_fallback_tasks);
+            .saturating_add(stats.platform_thread_pool_managed_async_tasks);
         assert!(
             driver_tasks >= min_driver_tasks,
             "platform driver task count {driver_tasks} should be at least {min_driver_tasks}"
@@ -4926,7 +4928,7 @@ mod tests {
             "dropping writer lease should remove marker"
         );
 
-        assert_platform_io_listing_fallbacks(&backend, directory.clone(), &table);
+        assert_platform_io_listing_managed_async(&backend, directory.clone(), &table);
 
         block_on_test_future(backend.sync_directory_after_renames(directory))
             .expect("platform I/O directory sync completes");
@@ -4935,7 +4937,7 @@ mod tests {
         assert!(!table.path().exists(), "table object should be deleted");
 
         let stats = backend.stats();
-        assert_platform_task_accounting(&stats, 11, 4);
+        assert_platform_task_accounting(&stats, 11, 0);
         assert!(
             stats
                 .platform_io_operations
@@ -4987,9 +4989,9 @@ mod tests {
             stats
                 .platform_io_operations
                 .directory_listing
-                .blocking_fallback
+                .thread_pool_managed_async
                 > 0,
-            "directory listing should report platform blocking fallback"
+            "directory listing should report thread-pool managed async"
         );
         assert!(
             stats
@@ -5044,8 +5046,8 @@ mod tests {
             "partial native platform work should count as platform async I/O"
         );
         assert_eq!(
-            stats.platform_backend_fallback_tasks, 0,
-            "single random read should not be counted as managed backend fallback"
+            stats.platform_thread_pool_managed_async_tasks, 0,
+            "single random read should not be counted as thread-pool managed async"
         );
         assert_eq!(stats.platform_blocking_fallback_tasks, 0);
         assert_eq!(stats.blocking_adapter_tasks, 0);
@@ -5059,8 +5061,8 @@ mod tests {
         );
         let platform_total = stats.platform_io_operations.total();
         assert!(
-            platform_total.uses_fallback(),
-            "non-Linux platform diagnostics should aggregate fallback work"
+            platform_total.uses_non_true_platform_async(),
+            "non-Linux platform diagnostics should aggregate non-true-platform work"
         );
         assert!(
             !platform_total.uses_true_platform_async(),
@@ -5092,7 +5094,7 @@ mod tests {
         let runtime = Runtime::new(RuntimeOptions::platform_io());
         let backend = NativeFileBackend::with_runtime(runtime);
         let capabilities = backend.capabilities();
-        assert!(!capabilities.supports(StorageCapability::PlatformAsyncIo));
+        assert!(capabilities.supports(StorageCapability::PlatformAsyncIo));
         assert!(capabilities.supports(StorageCapability::BlockingAdapter));
 
         let object = backend
@@ -5106,11 +5108,11 @@ mod tests {
         let stats = backend.stats();
         assert!(!stats.uses_blocking_adapter);
         assert!(stats.uses_platform_io_driver);
-        assert!(!stats.uses_platform_async_io);
+        assert!(stats.uses_platform_async_io);
         assert_eq!(stats.platform_async_io_tasks, 0);
         assert!(
-            stats.platform_backend_fallback_tasks > 0,
-            "platform driver should account backend fallback tasks"
+            stats.platform_thread_pool_managed_async_tasks > 0,
+            "platform driver should account thread-pool managed async tasks"
         );
         assert_eq!(stats.platform_blocking_fallback_tasks, 0);
         assert_eq!(stats.blocking_adapter_tasks, 0);
@@ -5118,18 +5120,18 @@ mod tests {
             stats
                 .platform_io_operations
                 .random_read
-                .platform_managed_fallback
+                .thread_pool_managed_async
                 > 0,
-            "Unix fallback platform random read should report managed fallback"
+            "Unix fallback platform random read should report thread-pool managed async"
         );
         let platform_total = stats.platform_io_operations.total();
         assert!(
-            platform_total.uses_fallback(),
-            "fallback diagnostics should aggregate fallback work"
+            platform_total.uses_non_true_platform_async(),
+            "thread-pool diagnostics should aggregate non-true-platform work"
         );
         assert!(
             !platform_total.uses_true_platform_async(),
-            "fallback diagnostics should not report true platform async work"
+            "thread-pool diagnostics should not report true platform async work"
         );
 
         std::fs::remove_dir_all(root).expect("test dir removes");

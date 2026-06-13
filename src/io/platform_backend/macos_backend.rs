@@ -1,9 +1,7 @@
 use crate::io::{PlatformIoBackendKind, PlatformIoBackendMatrix, PlatformIoTaskClass};
 
 pub(super) const fn matrix() -> PlatformIoBackendMatrix {
-    use PlatformIoTaskClass::{
-        BlockingFallback, PlatformManagedFallback, PlatformNativeAsyncButPartial,
-    };
+    use PlatformIoTaskClass::{PlatformNativeAsyncButPartial, ThreadPoolManagedAsync};
 
     // macOS data-path reads and writes use DispatchIO through the Apple
     // platform module. Complete Trine operations stay partial when they also
@@ -11,7 +9,7 @@ pub(super) const fn matrix() -> PlatformIoBackendMatrix {
     // an Apple file-completion primitive.
     PlatformIoBackendMatrix {
         kind: PlatformIoBackendKind::MacOsNative,
-        length_lookup: PlatformManagedFallback,
+        length_lookup: ThreadPoolManagedAsync,
         owned_random_read: PlatformNativeAsyncButPartial,
         optional_whole_object_read: PlatformNativeAsyncButPartial,
         temp_write_rename_publish: PlatformNativeAsyncButPartial,
@@ -19,10 +17,10 @@ pub(super) const fn matrix() -> PlatformIoBackendMatrix {
         append: PlatformNativeAsyncButPartial,
         persist: PlatformNativeAsyncButPartial,
         wal_rewrite: PlatformNativeAsyncButPartial,
-        object_delete: PlatformManagedFallback,
-        directory_create: PlatformManagedFallback,
+        object_delete: ThreadPoolManagedAsync,
+        directory_create: ThreadPoolManagedAsync,
         directory_sync: PlatformNativeAsyncButPartial,
-        directory_listing: BlockingFallback,
+        directory_listing: ThreadPoolManagedAsync,
         writer_lease_acquire: PlatformNativeAsyncButPartial,
     }
 }

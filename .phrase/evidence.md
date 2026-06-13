@@ -10712,7 +10712,7 @@ Record only evidence that can change planning or durable decisions.
   contract, not a Linux feature.
 - ADR 0002 and the async storage protocol define operation capability classes:
   `TruePlatformAsync`, `PlatformNativeAsyncButPartial`,
-  `PlatformManagedFallback`, `BlockingFallback`, and `Unsupported`.
+  `ThreadPoolManagedAsync`, `BlockingFallback`, and `Unsupported`.
 - ADR 0002 and the protocol now include an operation table for length lookup,
   random read, whole-object read, temporary write plus rename publish, append
   open, append, persist/fsync, WAL rewrite, delete, directory create, directory
@@ -10752,7 +10752,7 @@ Record only evidence that can change planning or durable decisions.
 
 - `PlatformIoTaskClass` now uses the Phase 153 class names:
   `TruePlatformAsync`, `PlatformNativeAsyncButPartial`,
-  `PlatformManagedFallback`, `BlockingFallback`, and `Unsupported`.
+  `ThreadPoolManagedAsync`, `BlockingFallback`, and `Unsupported`.
 - `PlatformIoOperation` now includes `WalRewrite` as a separate Trine
   operation instead of counting WAL rewrite through generic temporary
   write-plus-rename publish.
@@ -10857,7 +10857,7 @@ Record only evidence that can change planning or durable decisions.
   use blocking decisions before direct `pread`, `pwrite`, or `fsync` syscalls.
 - Open, stat, rename, delete, and create-directory operations are also blocking
   decisions or direct syscalls in the selected path.
-- macOS ordinary file operations remain `PlatformManagedFallback`; directory
+- macOS ordinary file operations remain `ThreadPoolManagedAsync`; directory
   listing remains `BlockingFallback`.
 
 ### Interpretation
@@ -10902,9 +10902,9 @@ Record only evidence that can change planning or durable decisions.
   backend AIO read/write/sync primitive coverage as
   `PlatformNativeAsyncButPartial`.
 - FreeBSD and Solaris-family operations that do not include audited AIO
-  primitive coverage remain `PlatformManagedFallback`; directory listing
+  primitive coverage remain `ThreadPoolManagedAsync`; directory listing
   remains `BlockingFallback`.
-- Generic other Unix targets remain `PlatformManagedFallback` except directory
+- Generic other Unix targets remain `ThreadPoolManagedAsync` except directory
   listing, which remains `BlockingFallback`.
 - `x86_64-unknown-freebsd` and `x86_64-unknown-illumos` targets were installed
   for compile verification.
@@ -11155,7 +11155,7 @@ Record only evidence that can change planning or durable decisions.
 - The Windows operation matrix now separates:
   - `PlatformNativeAsyncButPartial` rows for Trine operations that include an
     IOCP read/write substep plus non-async setup or publish work;
-  - `PlatformManagedFallback` rows for length lookup, append open, persist,
+  - `ThreadPoolManagedAsync` rows for length lookup, append open, persist,
     delete, directory create, and directory sync;
   - `BlockingFallback` for directory listing.
 - KV engine code did not gain Windows-specific branching.
@@ -11258,3 +11258,88 @@ Record only evidence that can change planning or durable decisions.
   prove each Trine operation row on Linux, Windows, macOS, BSD/Solaris, and
   generic fallback as true async, partial, managed fallback, blocking fallback,
   or unsupported.
+
+## 2026-06-13: ThreadPoolManagedAsync Platform-I/O Class Complete
+
+### Observation
+
+- Replaced the old platform-managed fallback class name with
+  `ThreadPoolManagedAsync` in code, stats, protocol, ADR, roadmap/current docs,
+  and public usage guidance.
+- Platform-io now distinguishes:
+  - `TruePlatformAsync` for complete Trine operations backed by native async
+    completion;
+  - `PlatformNativeAsyncButPartial` for complete Trine operations that include
+    native async substeps plus remaining non-native steps;
+  - `ThreadPoolManagedAsync` for blocking file work owned by platform-io's
+    managed thread-pool path;
+  - `BlockingFallback` for work that cannot currently move to native async or
+    platform-io managed thread-pool completion;
+  - `Unsupported` for targets that cannot provide the operation.
+- Native directory listing rows now report `ThreadPoolManagedAsync` because the
+  selected backend does not expose native async enumeration, but platform-io
+  owns the blocking lane and returns an async completion to the caller.
+- Unsupported/no-native-thread platform rows now report `Unsupported` instead
+  of thread-pool managed async.
+- `PlatformAsyncIo` now means the selected native platform driver can return
+  async completions to the caller runtime through true native, partial native,
+  or platform-io managed thread-pool work. Per-operation counters remain the
+  source of truth for exact class.
+- Public stats now separate true-or-partial native async task counts from
+  `storage_platform_thread_pool_managed_async_tasks` and blocking fallback
+  counts. Existing `fallback_total` and `uses_fallback` helpers remain as
+  compatibility aliases, while new docs prefer non-true-platform naming.
+
+### Interpretation
+
+- Platform-io's role is now aligned with the original design: the KV engine
+  waits on one async storage boundary, while platform-io decides whether the
+  selected target uses native async, partial native async, or managed
+  thread-pool async below that boundary.
+- Linux remains the strongest backend for complete true async operations.
+  Windows and macOS have audited native async substeps, but complete operations
+  remain partial where non-native steps still exist.
+- Native Unix targets without stronger backend evidence still use platform-io
+  managed thread-pool async, which is an honest async completion path rather
+  than an engine-visible fallback.
+- Browser-WASM/no-native-thread targets are not falsely classified as
+  thread-pool managed async. `wasm32-unknown-unknown` without `platform-io`
+  still compiles, but `platform-io` with that target currently fails in the
+  native dependency stack (`socket2`), so a future feature-gating phase should
+  split native platform-io dependencies from browser host backends.
+
+### Verification
+
+- `cargo fmt`
+- `cargo test -q platform_backend_matrix_matches_target_family --features platform-io`
+- `cargo test -q platform_io --features platform-io`
+- `cargo test -q runtime_capabilities_follow_selected_mode --features platform-io`
+- `cargo check -q --target x86_64-pc-windows-gnu --features platform-io --tests`
+- `cargo check -q --target wasm32-unknown-unknown --no-default-features`
+- `cargo test -q`
+- `cargo test -q --features platform-io`
+- `cargo clippy -q --all-features`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test --doc -q --all-features`
+
+Negative check:
+
+- `cargo check -q --target wasm32-unknown-unknown --no-default-features --features platform-io`
+  still fails because the current native platform-io dependency stack pulls
+  `socket2`, which does not support that target.
+
+### Remaining Blockers
+
+- Windows/macOS/BSD/Solaris complete operations still need future work before
+  all rows can become `TruePlatformAsync`.
+- Real Windows, FreeBSD, illumos, Solaris, and browser-WASM runtime diagnostics
+  were not run in this macOS workspace.
+- A future WASM feature-gating pass should make `platform-io` either target-gated
+  or explicitly unavailable without pulling native-only dependencies on browser
+  targets.
+
+### Recommended Next Action
+
+- Return to engine revalidation using the completed platform-io abstraction
+  matrix, while keeping native dependency gating for browser-WASM as a separate
+  follow-up.

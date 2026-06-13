@@ -3770,7 +3770,7 @@ state, not the intended platform-io boundary.
   abstraction.
 - Operation-level capability classes are defined, at minimum:
   `TruePlatformAsync`, `PlatformNativeAsyncButPartial`,
-  `PlatformManagedFallback`, `BlockingFallback`, and `Unsupported`.
+  `ThreadPoolManagedAsync`, `BlockingFallback`, and `Unsupported`.
 - The operation table covers length lookup, random read, whole-object read,
   temporary write plus rename publish, append open, append, persist/fsync, WAL
   rewrite, delete, directory create, directory sync, directory listing, and
@@ -3893,8 +3893,8 @@ operation-level platform capability.
 **Status**: Complete
 
 **Goal**: Make platform-io behavior visible enough that users and tests can see
-which operations are true platform async, platform-managed fallback, blocking
-fallback, or unsupported.
+which operations are true platform async, partial native async, thread-pool
+managed async, blocking fallback, or unsupported.
 
 **Entry Condition**: At least one non-Linux backend phase has proven the
 operation-level classification model.
@@ -3902,8 +3902,8 @@ operation-level classification model.
 **Acceptance Gate**:
 
 - `DbStats` or adjacent diagnostics expose per-operation platform-io classes.
-- Public docs explain how to interpret true async, platform-managed fallback,
-  blocking fallback, and unsupported operations.
+- Public docs explain how to interpret true async, partial native async,
+  thread-pool managed async, blocking fallback, and unsupported operations.
 - Tests assert diagnostics for Linux and at least one non-Linux target.
 
 **Major Out Of Scope**:
@@ -3994,7 +3994,7 @@ acceptance harness a stable shape.
 **Status**: Complete
 
 **Goal**: Re-select or implement the Apple-side native file I/O path so macOS
-does not remain a generic managed fallback without proof.
+does not remain a generic thread-pool managed path without proof.
 
 **Entry Condition**: Windows/Linux operation-level harnesses make backend
 claims measurable at the Trine operation boundary.
@@ -4017,11 +4017,11 @@ claims measurable at the Trine operation boundary.
 
 ### Phase 163: Platform-I/O Cross-Platform Acceptance Matrix
 
-**Status**: Planned
+**Status**: Complete
 
 **Goal**: Close platform-io as Trine's cross-platform async abstraction by
-checking Linux, Windows, macOS, and other Unix against one operation-level
-acceptance matrix.
+checking Linux, Windows, macOS, other Unix, and no-native-thread targets against
+one operation-level acceptance matrix.
 
 **Entry Condition**: Linux, Windows, and macOS backend phases have current
 operation-level evidence.
@@ -4029,8 +4029,10 @@ operation-level evidence.
 **Acceptance Gate**:
 
 - Every listed Trine operation has an asserted class on Linux, Windows, macOS,
-  and other Unix.
-- Other Unix remains fallback unless a target-specific audit proves more.
+  other Unix, and unsupported/no-native-thread targets.
+- Native targets without stronger audited support use
+  `ThreadPoolManagedAsync`, while unsupported/no-native-thread targets remain
+  `Unsupported`.
 - Public docs explain the completed backend matrix without implying that an OS
   primitive alone completes a Trine operation.
 - Engine revalidation is explicitly unblocked only after this matrix passes.

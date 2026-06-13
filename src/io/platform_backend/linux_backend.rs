@@ -1,7 +1,7 @@
 use crate::io::{PlatformIoBackendKind, PlatformIoBackendMatrix, PlatformIoTaskClass};
 
 pub(super) const fn matrix() -> PlatformIoBackendMatrix {
-    use PlatformIoTaskClass::{BlockingFallback, TruePlatformAsync};
+    use PlatformIoTaskClass::{ThreadPoolManagedAsync, TruePlatformAsync};
 
     PlatformIoBackendMatrix {
         kind: PlatformIoBackendKind::LinuxNative,
@@ -17,9 +17,9 @@ pub(super) const fn matrix() -> PlatformIoBackendMatrix {
         directory_create: TruePlatformAsync,
         directory_sync: TruePlatformAsync,
         // Linux io_uring does not expose a directory enumeration opcode in the
-        // selected UAPI/crate stack, so the complete Trine listing operation
-        // remains an explicit blocking fallback.
-        directory_listing: BlockingFallback,
+        // selected UAPI/crate stack, so platform-io completes listing through
+        // its managed blocking lane rather than a native completion.
+        directory_listing: ThreadPoolManagedAsync,
         writer_lease_acquire: TruePlatformAsync,
     }
 }
