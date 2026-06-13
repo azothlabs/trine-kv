@@ -75,6 +75,7 @@ fn run_benchmarks() -> Vec<BenchResult> {
     results.push(bench_block_cache_warm_read());
     results.push(bench_cold_table_read());
     results.push(bench_cold_table_read_only());
+    results.extend(bench_cold_table_open_wall_diagnostics());
     results.extend(bench_read_pruning_diagnostics());
     results.extend(bench_runtime_block_decode_reads());
     results.extend(bench_index_seek_policies());
@@ -627,37 +628,36 @@ fn bench_transaction_conflict() -> BenchResult {
 }
 
 fn bench_wal_replay() -> BenchResult {
-    measure("WAL replay", ROWS, || {
-        let dir = temp_dir("wal-replay");
-        let options = benchmark_persistent_options(&dir);
-        populate_wal_replay_dir(options.clone());
-        let db = Db::open_sync(options).expect("persistent db reopens");
+    let dir = temp_dir("wal-replay");
+    let options = benchmark_persistent_options(&dir);
+    populate_wal_replay_dir(options.clone());
+    let result = measure("WAL replay", ROWS, || {
+        let db = Db::open_sync(options.clone()).expect("persistent db reopens");
         let bucket = db.default_bucket_sync().expect("bucket reopens");
-        let checksum = bucket
+        bucket
             .get_sync(&key(ROWS / 2))
             .expect("get succeeds")
-            .map_or(0, |value| value.len() as u64);
-        drop(db);
-        cleanup_dir(&dir);
-        checksum
-    })
+            .map_or(0, |value| value.len() as u64)
+    });
+    cleanup_dir(&dir);
+    result
 }
 
 fn bench_wal_replay_read_only() -> BenchResult {
-    measure("WAL replay read-only", ROWS, || {
-        let dir = temp_dir("wal-replay-read-only");
-        let options = benchmark_persistent_options(&dir);
-        populate_wal_replay_dir(options.clone());
-        let db = Db::open_sync(options.read_only()).expect("read-only persistent db reopens");
+    let dir = temp_dir("wal-replay-read-only");
+    let options = benchmark_persistent_options(&dir);
+    populate_wal_replay_dir(options.clone());
+    let result = measure("WAL replay read-only", ROWS, || {
+        let db =
+            Db::open_sync(options.clone().read_only()).expect("read-only persistent db reopens");
         let bucket = db.default_bucket_sync().expect("bucket reopens");
-        let checksum = bucket
+        bucket
             .get_sync(&key(ROWS / 2))
             .expect("get succeeds")
-            .map_or(0, |value| value.len() as u64);
-        drop(db);
-        cleanup_dir(&dir);
-        checksum
-    })
+            .map_or(0, |value| value.len() as u64)
+    });
+    cleanup_dir(&dir);
+    result
 }
 
 fn extend_wal_replay_diagnostics(results: &mut Vec<BenchResult>) {
@@ -986,20 +986,20 @@ fn bench_block_cache_warm_read() -> BenchResult {
 }
 
 fn bench_cold_table_read() -> BenchResult {
-    measure("cold table read", 32, || {
-        let dir = temp_dir("cold-read");
-        let options = benchmark_persistent_options(&dir);
-        {
-            let db = Db::open_sync(options.clone()).expect("persistent db opens");
-            let bucket = db.default_bucket_sync().expect("bucket opens");
-            for index in 0..ROWS {
-                bucket
-                    .put_sync(key(index), value(index))
-                    .expect("put succeeds");
-            }
-            db.flush_sync().expect("flush succeeds");
+    let dir = temp_dir("cold-read");
+    let options = benchmark_persistent_options(&dir);
+    {
+        let db = Db::open_sync(options.clone()).expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
+        for index in 0..ROWS {
+            bucket
+                .put_sync(key(index), value(index))
+                .expect("put succeeds");
         }
+        db.flush_sync().expect("flush succeeds");
+    }
 
+    let result = measure("cold table read", 32, || {
         let mut checksum = 0;
         for _ in 0..32 {
             let db = Db::open_sync(options.clone()).expect("persistent db reopens");
@@ -1009,27 +1009,28 @@ fn bench_cold_table_read() -> BenchResult {
                 .expect("get succeeds")
                 .map_or(0, |value| value.len() as u64);
         }
-        cleanup_dir(&dir);
         checksum
-    })
+    });
+    cleanup_dir(&dir);
+    result
 }
 
 fn bench_cold_table_read_only() -> BenchResult {
-    measure("cold table read-only", 32, || {
-        let dir = temp_dir("cold-read-only");
-        let options = benchmark_persistent_options(&dir);
-        {
-            let db = Db::open_sync(options.clone()).expect("persistent db opens");
-            let bucket = db.default_bucket_sync().expect("bucket opens");
-            for index in 0..ROWS {
-                bucket
-                    .put_sync(key(index), value(index))
-                    .expect("put succeeds");
-            }
-            db.flush_sync().expect("flush succeeds");
+    let dir = temp_dir("cold-read-only");
+    let options = benchmark_persistent_options(&dir);
+    {
+        let db = Db::open_sync(options.clone()).expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
+        for index in 0..ROWS {
+            bucket
+                .put_sync(key(index), value(index))
+                .expect("put succeeds");
         }
+        db.flush_sync().expect("flush succeeds");
+    }
 
-        let read_only_options = options.read_only();
+    let read_only_options = options.read_only();
+    let result = measure("cold table read-only", 32, || {
         let mut checksum = 0;
         for _ in 0..32 {
             let db =
@@ -1040,9 +1041,88 @@ fn bench_cold_table_read_only() -> BenchResult {
                 .expect("get succeeds")
                 .map_or(0, |value| value.len() as u64);
         }
-        cleanup_dir(&dir);
         checksum
-    })
+    });
+    cleanup_dir(&dir);
+    result
+}
+
+fn bench_cold_table_open_wall_diagnostics() -> Vec<BenchResult> {
+    let mut results = Vec::new();
+    extend_cold_table_open_wall_diagnostics(&mut results, false);
+    extend_cold_table_open_wall_diagnostics(&mut results, true);
+    results
+}
+
+fn extend_cold_table_open_wall_diagnostics(results: &mut Vec<BenchResult>, read_only: bool) {
+    let dir = if read_only {
+        temp_dir("cold-open-wall-read-only")
+    } else {
+        temp_dir("cold-open-wall")
+    };
+    let options = benchmark_persistent_options(&dir);
+    {
+        let db = Db::open_sync(options.clone()).expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
+        for index in 0..ROWS {
+            bucket
+                .put_sync(key(index), value(index))
+                .expect("put succeeds");
+        }
+        db.flush_sync().expect("flush succeeds");
+    }
+
+    let open_options = if read_only {
+        options.read_only()
+    } else {
+        options
+    };
+    let label = if read_only {
+        "cold table read-only"
+    } else {
+        "cold table"
+    };
+    let mut open_wall_micros = 0_u64;
+    let mut first_read_wall_micros = 0_u64;
+    let mut close_wall_micros = 0_u64;
+    let mut checksum = 0_u64;
+    for _ in 0..32 {
+        let open_start = Instant::now();
+        let db = Db::open_sync(open_options.clone()).expect("persistent db reopens");
+        open_wall_micros = open_wall_micros.saturating_add(duration_micros(open_start.elapsed()));
+
+        let bucket = db.default_bucket_sync().expect("bucket reopens");
+        let read_start = Instant::now();
+        checksum = checksum.saturating_add(
+            bucket
+                .get_sync(&key(ROWS / 2))
+                .expect("get succeeds")
+                .map_or(0, |value| value.len() as u64),
+        );
+        first_read_wall_micros =
+            first_read_wall_micros.saturating_add(duration_micros(read_start.elapsed()));
+        drop(bucket);
+
+        let close_start = Instant::now();
+        drop(db);
+        close_wall_micros =
+            close_wall_micros.saturating_add(duration_micros(close_start.elapsed()));
+    }
+    assert!(checksum > 0, "cold open wall diagnostic must read values");
+    cleanup_dir(&dir);
+
+    results.push(BenchResult::diagnostic(
+        labelled(label, "open wall micros"),
+        open_wall_micros,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "first read wall micros"),
+        first_read_wall_micros,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "close wall micros"),
+        close_wall_micros,
+    ));
 }
 
 fn bench_read_pruning_diagnostics() -> Vec<BenchResult> {

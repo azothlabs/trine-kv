@@ -4340,7 +4340,7 @@ maintenance as the largest selected median rows.
 
 ### Phase 176: Startup And Recovery Path Optimization
 
-**Status**: Planned
+**Status**: Complete
 
 **Goal**: Reduce persistent open, cold table read, read-only open, and WAL
 replay costs using grouped startup/recovery diagnostics.
@@ -4352,8 +4352,9 @@ startup/recovery as the next largest user-visible cost.
 
 - Persistent open diagnostics separate directory listing, manifest load, WAL
   replay, table metadata open, blob validation, and first-read costs.
-- Any retained fix keeps recovery fail-closed behavior and storage formats
-  unchanged.
+- The benchmark rows exclude setup work that is not part of startup/recovery.
+- Any retained engine fix keeps recovery fail-closed behavior and storage
+  formats unchanged.
 
 **Major Out Of Scope**:
 

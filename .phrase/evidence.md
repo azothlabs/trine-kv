@@ -26,6 +26,57 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-06-13: Startup And Recovery Benchmark Boundary
+
+### Observation
+
+- The startup/recovery rows previously measured setup work as part of elapsed
+  time. `cold table read` and `cold table read-only` created, populated, and
+  flushed a database inside the measured closure; `WAL replay` rows populated
+  the WAL replay directory inside the measured closure.
+- The benchmark now prepares those directories before `measure`, so the rows
+  measure reopen/replay/read work.
+- Added wall diagnostics for cold table open, first read, and close/drop.
+- The local 3-run summary after the measurement fix recorded `WAL replay` at
+  852 us, `WAL replay read-only` at 581 us, `cold table read` at 17668 us, and
+  `cold table read-only` at 3772 us.
+- Writable cold diagnostics recorded median wall values of 6996 us for open,
+  1489 us for first read, and 9918 us for close/drop across 32 iterations.
+- A Unix-only writer-lease drop shortcut was tested and rejected because
+  `native_file_writer_lease_does_not_remove_changed_marker` proved it would
+  remove a changed `LOCK` marker.
+
+### Interpretation
+
+- Startup/recovery was overstated by benchmark setup cost; it is not the next
+  largest optimization area after the corrected measurement.
+- Writable close/drop still has real cost, but the obvious shortcut would
+  weaken the tested writer-lease fail-closed contract.
+- No engine behavior change should be kept for this phase without a different
+  safety proof.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q writer_lease --lib`
+- `cargo test -q read_only --lib`
+- `cargo clippy --bench v1_bench -- -D warnings`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo bench --bench v1_bench`
+- `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench`
+- `git diff --check`
+- Forbidden-term scan over the workspace found only the rule text in
+  `AGENTS.md`.
+
+### Remaining Blockers
+
+- None for this startup/recovery benchmark-boundary slice.
+
+### Recommended Next Action
+
+- Return to the grouped baseline recommendation: decompose compaction and blob
+  maintenance write amplification next.
+
 ## 2026-06-13: Benchmark Baseline Refresh And Target Selection
 
 ### Observation

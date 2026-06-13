@@ -6,63 +6,61 @@ Complete
 
 ## Goal
 
-Refresh the benchmark baseline machinery so later KV optimization phases choose
-targets from grouped, multi-run evidence instead of single-run noise.
+Reduce startup, reopen, and recovery-path cost using measured diagnostics while
+preserving recovery safety and storage formats.
 
 ## Scope
 
-- `benches/v1_bench.rs` output mode for multi-run summaries.
-- Workload grouping for existing benchmark rows.
-- First grouped baseline evidence for the next optimization phase.
-- Documentation that explains how to run the refreshed benchmark check.
+- Persistent open and reopen diagnostics for writable and read-only modes.
+- Cold table read and WAL replay startup paths.
+- Directory listing, process lock, manifest read, recovery checks, WAL replay,
+  table metadata open, blob validation, and first-read costs.
+- One measured startup/recovery optimization if diagnostics expose a safe
+  dominant cost.
 
 ## Out Of Scope
 
 - Storage format changes.
-- WAL, manifest, compaction, MVCC, table, blob, cache, or platform-io behavior
-  changes.
-- Optimizing startup/recovery, writes, compaction, scans, cache, blob, or
-  concurrency in this phase.
-- Publishing, tagging, pushing, or release workflow changes.
+- Manifest, WAL, SSTable, blob, MVCC, transaction, or compaction semantics.
+- Write group commit, scan optimization, cache policy, platform-io backend
+  changes, publishing, tagging, pushing, or release workflow changes.
 
 ## Acceptance Gate
 
-- Default benchmark output remains compatible with the existing single-run CSV.
-- `TRINE_BENCH_RUNS=N` runs the full benchmark suite multiple times and reports
-  grouped min/median/max summaries.
-- Workload groups cover point reads, scans, transactions, recovery, writes,
-  blob, cache, cold open/read, search policy, iterator, codec, and diagnostics.
-- A local multi-run benchmark result is recorded and used to recommend the next
-  optimization phase.
-- Formatting, strict clippy, benchmark execution, and diff checks pass.
+- Startup/recovery diagnostics classify the dominant cost before optimization.
+- Any retained code change preserves recovery fail-closed behavior and storage
+  formats.
+- Focused recovery/open tests pass.
+- Strict clippy passes.
+- Single-run and grouped benchmark evidence records before/after behavior.
 
 ## Active Task Slice
 
 ```text
-task780 [x] goal:add multi-run grouped benchmark output | scope:benches/v1_bench.rs | verify:cargo bench --bench v1_bench
-task781 [x] goal:record grouped baseline and next target | scope:docs/benchmarks .phrase/evidence.md | verify:git diff review
-task782 [x] goal:update roadmap for follow-up KV optimization queue | scope:.phrase/roadmap.md | verify:git diff review
+task783 [x] goal:add startup/recovery phase diagnostics | scope:benches/v1_bench.rs | verify:cargo bench --bench v1_bench
+task784 [x] goal:fix measured startup/recovery benchmark boundary | scope:benches/v1_bench.rs | verify:TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench
+task785 [x] goal:record startup/recovery evidence | scope:docs/benchmarks .phrase/evidence.md | verify:git diff review
 ```
 
 ## Evidence
 
-- Default single-run output remains compatible with the existing CSV shape.
-- `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench` now emits grouped min,
-  median, and max summaries.
-- The first grouped baseline recorded median rows of 178000 us for compaction,
-  170524 us for blob level merge, 169310 us for blob GC rewrite, 109257 us for
-  separated blob values, 83592 us for cold table read, and 65977 us for flush
-  throughput.
-- Future optimization areas include startup/recovery, write fsync/group commit,
-  flush/compaction/blob maintenance, range/prefix scans, block cache/decode,
-  large-value paths, and concurrent read/write behavior.
+- Startup/recovery benchmark rows were measuring setup work. Cold table rows
+  included database population and flush; WAL replay rows included WAL test
+  directory creation.
+- After moving setup outside `measure`, the local 3-run summary recorded
+  `WAL replay` at 852 us, `WAL replay read-only` at 581 us, `cold table read`
+  at 17668 us, and `cold table read-only` at 3772 us.
+- Cold writable diagnostics recorded 6996 us open wall, 1489 us first-read
+  wall, and 9918 us close/drop wall across 32 iterations.
+- A Unix-only writer-lease drop shortcut was rejected by the existing changed
+  marker regression test and was not retained.
 
 ## Known Residuals
 
-- The new baseline machinery is not a performance fix; it is the evidence gate
-  for choosing the next real optimization target.
+- Writable close/drop remains visibly more expensive than read-only close/drop,
+  but the tested writer-lease owner guard is part of the fail-closed contract.
 
 ## Next Recommendation
 
-- Start the next optimization phase by decomposing compaction and blob
-  maintenance write amplification before changing behavior.
+- Return to the grouped baseline recommendation: decompose compaction and blob
+  maintenance write amplification next.
