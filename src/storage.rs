@@ -829,7 +829,7 @@ impl NativeFileBackend {
         #[cfg(feature = "platform-io")]
         let platform_io = runtime
             .capabilities()
-            .platform_async_io()
+            .platform_io_driver()
             .then(PlatformIoDriver::new);
         Self {
             runtime: Some(runtime),
@@ -840,18 +840,21 @@ impl NativeFileBackend {
     }
 
     pub(crate) fn stats(&self) -> NativeFileStorageStats {
-        let driver = self.io_driver_info();
+        let uses_platform_io_driver = self.uses_platform_io_driver();
+        let uses_platform_async_io = self.supports_platform_async_io();
         let blocking_adapter_stats = self
             .runtime
             .as_ref()
             .and_then(Runtime::blocking_adapter_stats)
             .unwrap_or_default();
         NativeFileStorageStats {
-            uses_blocking_adapter: self
-                .runtime
-                .as_ref()
-                .is_some_and(|runtime| runtime.capabilities().blocking_adapter()),
-            uses_platform_async_io: driver.kind().is_platform_async(),
+            uses_blocking_adapter: !uses_platform_io_driver
+                && self
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.capabilities().blocking_adapter()),
+            uses_platform_io_driver,
+            uses_platform_async_io,
             blocking_adapter_tasks: self.metrics.blocking_adapter_tasks(),
             blocking_adapter_queue_capacity: blocking_adapter_stats.queue_capacity,
             blocking_adapter_queued_tasks: blocking_adapter_stats.queued_tasks,
@@ -882,6 +885,25 @@ impl NativeFileBackend {
         } else {
             InlineIoDriver.info()
         }
+    }
+
+    fn uses_platform_io_driver(&self) -> bool {
+        #[cfg(feature = "platform-io")]
+        {
+            self.platform_io.is_some()
+        }
+        #[cfg(not(feature = "platform-io"))]
+        {
+            false
+        }
+    }
+
+    fn supports_platform_async_io(&self) -> bool {
+        self.uses_platform_io_driver()
+            && self
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.capabilities().platform_async_io())
     }
 
     fn run_owned_storage_task<T>(
@@ -1112,6 +1134,7 @@ fn record_platform_io_task(
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct NativeFileStorageStats {
     pub(crate) uses_blocking_adapter: bool,
+    pub(crate) uses_platform_io_driver: bool,
     pub(crate) uses_platform_async_io: bool,
     pub(crate) blocking_adapter_tasks: u64,
     pub(crate) blocking_adapter_queue_capacity: usize,
@@ -1163,12 +1186,16 @@ impl StorageReadBackend for NativeFileBackend {
 
     fn capabilities(&self) -> StorageCapabilities {
         let capabilities = StorageCapabilities::native_file();
-        if self.io_driver_info().kind().is_platform_async() {
-            capabilities
+        if self.uses_platform_io_driver() {
+            let capabilities = capabilities
                 .with(StorageCapability::AsyncTasks)
                 .with(StorageCapability::BlockingAdapter)
-                .with(StorageCapability::BackgroundThreads)
-                .with(StorageCapability::PlatformAsyncIo)
+                .with(StorageCapability::BackgroundThreads);
+            if self.supports_platform_async_io() {
+                capabilities.with(StorageCapability::PlatformAsyncIo)
+            } else {
+                capabilities
+            }
         } else if self.io_driver_info().kind().is_blocking_adapter() {
             capabilities
                 .with(StorageCapability::AsyncTasks)
@@ -4629,6 +4656,7 @@ mod tests {
         min_driver_tasks: u64,
         min_blocking_fallback_tasks: u64,
     ) {
+        assert!(stats.uses_platform_io_driver);
         assert!(stats.uses_platform_async_io);
         assert_eq!(stats.blocking_adapter_tasks, 0);
 
@@ -4646,15 +4674,9 @@ mod tests {
             min_blocking_fallback_tasks
         );
 
-        #[cfg(target_os = "linux")]
         assert!(
             stats.platform_async_io_tasks > 0,
             "Linux platform backend should account true async work"
-        );
-        #[cfg(all(unix, not(target_os = "linux")))]
-        assert_eq!(
-            stats.platform_async_io_tasks, 0,
-            "Unix polling backend must not claim true async file work"
         );
     }
 
@@ -4748,7 +4770,7 @@ mod tests {
 
     #[cfg(all(feature = "platform-io", not(target_os = "linux")))]
     #[test]
-    fn platform_io_without_true_async_storage_ops_uses_blocking_adapter() {
+    fn platform_io_without_true_async_storage_ops_uses_platform_driver_fallback() {
         let root = temp_storage_root("trine-kv-platform-io-fallback-storage");
         std::fs::create_dir_all(&root).expect("test dir creates");
         let table =
@@ -4763,19 +4785,23 @@ mod tests {
 
         let object = backend
             .open_read_blocking(table)
-            .expect("read object opens without platform driver");
+            .expect("read object opens with platform driver fallback");
         let buffer = block_on_test_future(object.read_exact_at_owned(2, 3))
-            .expect("read completes through sync adapter");
+            .expect("read completes through platform driver fallback");
         assert_eq!(buffer.offset(), 2);
         assert_eq!(&*buffer.into_bytes(), b"cde");
 
         let stats = backend.stats();
-        assert!(stats.uses_blocking_adapter);
+        assert!(!stats.uses_blocking_adapter);
+        assert!(stats.uses_platform_io_driver);
         assert!(!stats.uses_platform_async_io);
         assert_eq!(stats.platform_async_io_tasks, 0);
-        assert_eq!(stats.platform_backend_fallback_tasks, 0);
+        assert!(
+            stats.platform_backend_fallback_tasks > 0,
+            "platform driver should account backend fallback tasks"
+        );
         assert_eq!(stats.platform_blocking_fallback_tasks, 0);
-        assert_eq!(stats.blocking_adapter_tasks, 1);
+        assert_eq!(stats.blocking_adapter_tasks, 0);
 
         std::fs::remove_dir_all(root).expect("test dir removes");
     }

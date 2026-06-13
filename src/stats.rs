@@ -75,6 +75,13 @@ pub struct DbStats {
     pub wal_bytes_accepted: u64,
     /// Whether storage work is using the runtime's sync adapter.
     pub storage_uses_sync_adapter: bool,
+    /// Whether native storage work is routed through the platform I/O driver.
+    ///
+    /// This reports the selected storage driver. It can be `true` on targets
+    /// whose current operations are fallback-classified; use
+    /// [`Self::storage_uses_platform_async_io`] and the platform task counters
+    /// to distinguish true async work from fallback work.
+    pub storage_uses_platform_io_driver: bool,
     /// Whether storage work is using platform async I/O.
     pub storage_uses_platform_async_io: bool,
     /// Blocking storage tasks accepted by the sync adapter.

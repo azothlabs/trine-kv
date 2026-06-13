@@ -8807,9 +8807,10 @@ Record only evidence that can change planning or durable decisions.
 
 - Gated `RuntimeOptions::platform_io()` so `PlatformAsyncIo` is advertised only
   on Linux with the `platform-io` feature under the current backend matrix.
-- On non-Linux targets with `platform-io`, native-file storage now uses the
-  bounded blocking adapter instead of starting a platform driver that can only
-  report fallback work for current Trine operations.
+- On non-Linux targets with `platform-io`, native-file storage did not advertise
+  `PlatformAsyncIo` while current Trine operations were all fallback-classified.
+  Phase 150 later changed routing so those targets may start the platform
+  driver while still reporting fallback work honestly.
 - Expanded matrix tests so Windows and non-Linux Unix composite storage
   operations are pinned as fallback-classified.
 - Updated ADR 0002, the async storage protocol, usage docs, decision framework,
@@ -10484,3 +10485,52 @@ Record only evidence that can change planning or durable decisions.
 ### Recommended Next Action
 
 - Commit the breaking API cleanup into the `0.3.0` release line.
+
+## 2026-06-13: Cross-Platform Platform I/O Routing
+
+### Observation
+
+- `RuntimeCapabilities` now distinguishes platform-driver routing from true
+  platform async I/O.
+- `NativeFileBackend::with_runtime(RuntimeOptions::platform_io())` creates
+  `PlatformIoDriver` whenever the `platform-io` feature is enabled.
+- `DbStats` now exposes `storage_uses_platform_io_driver`.
+- Non-Linux `platform-io` storage tests now expect platform-driver backend
+  fallback counters and no `PlatformAsyncIo` capability.
+- ADR 0002, the async storage protocol, usage docs, roadmap, and current phase
+  brief now describe platform routing, fallback tasks, and `PlatformAsyncIo` as
+  separate facts.
+
+### Interpretation
+
+- `platform-io` is now a cross-platform Trine routing mode instead of a Linux-only
+  path hidden behind `PlatformAsyncIo`.
+- `PlatformAsyncIo` remains honest: fallback-classified targets can use the
+  platform driver but still do not claim true platform async storage work.
+- The native write, flush, and compaction paths still need separate work before
+  the database is full-chain async on Linux.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q runtime_capabilities_follow_selected_mode`
+- `cargo test -q persistent_open_attaches_runtime_enabled_native_storage_backend`
+- `cargo test -q --test async_api async_cursor_reads_flushed_tables`
+- `cargo test -q --features platform-io runtime_capabilities_follow_selected_mode`
+- `cargo test -q --features platform-io platform_io_without_true_async_storage_ops_uses_platform_driver_fallback`
+- `cargo test -q --features platform-io`
+- `cargo clippy -q --all-features`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test -q`
+- `git diff --check`
+
+### Remaining Blockers
+
+- No blocker for platform I/O routing.
+- Native async write, flush, and compaction remain future phases.
+
+### Recommended Next Action
+
+- Start a native async write-path phase so Linux `platform-io` writes await
+  storage completions instead of running the whole commit through the bounded
+  sync adapter.

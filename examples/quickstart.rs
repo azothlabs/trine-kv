@@ -78,6 +78,7 @@ async fn run(path: &Path) -> Result<()> {
     assert_eq!(stats.live_buckets, 2);
     assert!(stats.total_tables > 0);
     assert!(stats.storage_uses_sync_adapter);
+    assert!(!stats.storage_uses_platform_io_driver);
     assert!(!stats.storage_uses_platform_async_io);
 
     drop(users);

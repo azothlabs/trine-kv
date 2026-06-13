@@ -37,6 +37,7 @@ Trine records native platform I/O by operation class:
 
 `DbStats` must report:
 
+- whether native storage work is routed through `PlatformIoDriver`;
 - true platform async task count;
 - platform backend fallback task count;
 - platform-driver blocking fallback task count;
@@ -44,9 +45,10 @@ Trine records native platform I/O by operation class:
 
 `PlatformAsyncIo` capability is advertised only when the selected target has at
 least one true Trine-level platform async storage operation. A target whose
-current Trine composite operations are all fallback-classified must use the
-bounded blocking adapter instead of starting a platform driver only to count
-fallback work.
+current Trine composite operations are all fallback-classified may still route
+work through `PlatformIoDriver` when the user selects `RuntimeMode::PlatformIo`,
+but it must report fallback task counts and must not advertise
+`PlatformAsyncIo`.
 
 ## Consequences
 
@@ -58,5 +60,6 @@ fallback work.
   a stronger backend is implemented and verified.
 - Directory enumeration remains a separately counted blocker until a backend
   exposes a real async directory enumeration operation.
-- With the current backend matrix, non-Linux targets do not advertise
-  `PlatformAsyncIo` even when the `platform-io` Cargo feature is enabled.
+- With the current backend matrix, non-Linux targets can use the platform I/O
+  driver when the `platform-io` Cargo feature is enabled, but they do not
+  advertise `PlatformAsyncIo`.

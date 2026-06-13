@@ -31,10 +31,6 @@ impl IoDriverKind {
     pub(crate) const fn is_blocking_adapter(self) -> bool {
         matches!(self, Self::BlockingAdapter)
     }
-
-    pub(crate) const fn is_platform_async(self) -> bool {
-        matches!(self, Self::Platform)
-    }
 }
 
 #[cfg(feature = "platform-io")]

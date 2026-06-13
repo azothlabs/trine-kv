@@ -49,6 +49,7 @@ const BLOCKING_ADAPTER: u8 = 1 << 2;
 const CANCELLATION_TOKENS: u8 = 1 << 3;
 const TASK_JOIN: u8 = 1 << 4;
 const PLATFORM_ASYNC_IO: u8 = 1 << 5;
+const PLATFORM_IO_DRIVER: u8 = 1 << 6;
 
 const DEFAULT_BLOCKING_WORKERS: usize = 4;
 const DEFAULT_BLOCKING_QUEUE_DEPTH: usize = 1024;
@@ -156,9 +157,9 @@ impl RuntimeOptions {
             | TASK_JOIN;
         match self.mode {
             RuntimeMode::NativeThreads => RuntimeCapabilities::new(NATIVE_THREAD_FLAGS),
-            RuntimeMode::PlatformIo => {
-                RuntimeCapabilities::new(NATIVE_THREAD_FLAGS | platform_async_io_flag())
-            }
+            RuntimeMode::PlatformIo => RuntimeCapabilities::new(
+                NATIVE_THREAD_FLAGS | platform_io_driver_flag() | platform_async_io_flag(),
+            ),
             RuntimeMode::Inline => {
                 RuntimeCapabilities::new(COOPERATIVE_TASKS | CANCELLATION_TOKENS)
             }
@@ -232,8 +233,27 @@ impl RuntimeCapabilities {
         self.has(PLATFORM_ASYNC_IO)
     }
 
+    /// Returns whether the platform I/O driver can be selected for storage work.
+    ///
+    /// This reports the routing layer, not true async file capability. A target
+    /// may support the platform driver while all current storage operations are
+    /// fallback-classified; use [`Self::platform_async_io`] to check whether at
+    /// least one operation is backed by a real platform async primitive.
+    #[must_use]
+    pub const fn platform_io_driver(self) -> bool {
+        self.has(PLATFORM_IO_DRIVER)
+    }
+
     const fn has(self, flag: u8) -> bool {
         self.flags & flag != 0
+    }
+}
+
+const fn platform_io_driver_flag() -> u8 {
+    if cfg!(feature = "platform-io") {
+        PLATFORM_IO_DRIVER
+    } else {
+        0
     }
 }
 
@@ -606,6 +626,7 @@ mod tests {
         assert!(native.cancellation_tokens());
         assert!(native.task_join());
         assert!(native.blocking_adapter());
+        assert!(!native.platform_io_driver());
         assert!(!native.platform_async_io());
 
         let platform = RuntimeOptions::platform_io().capabilities();
@@ -613,6 +634,7 @@ mod tests {
         assert!(platform.cancellation_tokens());
         assert!(platform.task_join());
         assert!(platform.blocking_adapter());
+        assert_eq!(platform.platform_io_driver(), cfg!(feature = "platform-io"));
         assert_eq!(
             platform.platform_async_io(),
             cfg!(all(feature = "platform-io", target_os = "linux"))
@@ -623,6 +645,7 @@ mod tests {
         assert!(inline.cooperative_tasks());
         assert!(inline.cancellation_tokens());
         assert!(!inline.blocking_adapter());
+        assert!(!inline.platform_io_driver());
         assert!(!inline.platform_async_io());
         assert!(!inline.task_join());
     }

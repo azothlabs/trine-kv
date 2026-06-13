@@ -3628,6 +3628,7 @@ impl Db {
     fn add_storage_runtime_stats(&self, stats: &mut DbStats) {
         let storage_stats = self.inner.native_storage.stats();
         stats.storage_uses_sync_adapter = storage_stats.uses_blocking_adapter;
+        stats.storage_uses_platform_io_driver = storage_stats.uses_platform_io_driver;
         stats.storage_uses_platform_async_io = storage_stats.uses_platform_async_io;
         stats.storage_sync_adapter_tasks = storage_stats.blocking_adapter_tasks;
         stats.storage_sync_adapter_queue_capacity = storage_stats.blocking_adapter_queue_capacity;
@@ -8472,6 +8473,7 @@ mod tests {
         assert_eq!(stats.live_blob_files, 1);
         assert!(stats.live_blob_bytes >= value.len() as u64);
         assert!(stats.storage_uses_sync_adapter);
+        assert!(!stats.storage_uses_platform_io_driver);
         assert!(!stats.storage_uses_platform_async_io);
         assert_eq!(stats.storage_sync_adapter_queue_capacity, 1024);
         assert!(stats.storage_sync_adapter_submitted_tasks >= stats.storage_sync_adapter_tasks);

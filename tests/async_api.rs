@@ -236,6 +236,7 @@ fn persistent_async_range_and_prefix_advance_flushed_tables() {
         "async cursor coverage should advance over flushed table files"
     );
     assert!(stats.storage_uses_sync_adapter);
+    assert!(!stats.storage_uses_platform_io_driver);
     assert!(!stats.storage_uses_platform_async_io);
     assert!(
         stats.storage_sync_adapter_tasks > 0,

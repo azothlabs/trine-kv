@@ -124,15 +124,17 @@ let db = Db::open(options).await?;
 Directory and object listing are also submitted through the platform driver.
 The selected platform backend does not expose a directory enumeration primitive,
 so those listing calls are reported as
-`storage_platform_sync_fallback_tasks`. `DbStats` also separates true
-platform async file work (`storage_platform_async_io_tasks`) from platform
-backend fallback work (`storage_platform_backend_fallback_tasks`) and from
-Trine's bounded sync adapter task count. It also reports sync-adapter
-queue capacity, queued/submitted/completed/rejected task counts, total adapter
-runtime, and per-storage-operation request/latency counters. On targets where
-every current Trine storage operation is fallback-classified,
-`RuntimeOptions::platform_io()` uses the bounded sync adapter and does not
-advertise `PlatformAsyncIo`.
+`storage_platform_sync_fallback_tasks`. `DbStats` reports whether native
+storage work is routed through the platform driver
+(`storage_uses_platform_io_driver`) and separates true platform async file work
+(`storage_platform_async_io_tasks`) from platform backend fallback work
+(`storage_platform_backend_fallback_tasks`) and from Trine's bounded sync
+adapter task count. It also reports sync-adapter queue capacity,
+queued/submitted/completed/rejected task counts, total adapter runtime, and
+per-storage-operation request/latency counters. On targets where every current
+Trine storage operation is fallback-classified, `RuntimeOptions::platform_io()`
+can still use the platform driver, but it does not advertise
+`PlatformAsyncIo`.
 
 WASI and browser persistence have explicit option constructors so callers can
 select those host boundaries without accidentally falling back to native files.

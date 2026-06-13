@@ -2659,9 +2659,8 @@ preventing false `PlatformAsyncIo` capability reporting.
 
 - `PlatformAsyncIo` is advertised only when the current target has at least one
   true Trine-level platform async storage operation.
-- Non-Linux targets with the `platform-io` feature use the bounded blocking
-  adapter instead of starting a platform driver whose current Trine operations
-  are all fallback-classified.
+- Non-Linux targets with the `platform-io` feature do not advertise
+  `PlatformAsyncIo` while current Trine operations are all fallback-classified.
 - Directory enumeration remains explicit fallback and is not counted as true
   platform async work.
 - Windows and non-Linux Unix matrix tests assert fallback classification for
@@ -3666,3 +3665,33 @@ mechanics.
 - Storage behavior changes, publishing, tagging, pushing, PR creation,
   branches, merge, rebase, time-based retention, checkpoint replacement,
   replication, or lineage mapping.
+
+### Phase 150: Cross-Platform Platform I/O Routing
+
+**Status**: Complete
+
+**Goal**: Make `RuntimeMode::PlatformIo` consistently select Trine's platform
+I/O routing layer while keeping true platform async I/O capability reporting
+target-specific and honest.
+
+**Entry Condition**: User identified that `platform-io` currently only appears
+to take effect on Linux because `PlatformIoDriver` creation is gated by
+`PlatformAsyncIo`.
+
+**Acceptance Gate**:
+
+- Runtime capabilities distinguish platform driver routing from true platform
+  async I/O.
+- Native file storage starts the platform driver when `platform-io` is enabled
+  and `RuntimeMode::PlatformIo` is selected.
+- Non-Linux targets report fallback task counters instead of claiming
+  `PlatformAsyncIo`.
+- `DbStats` exposes whether platform driver routing is active.
+- ADR/docs/tests reflect the routing/fallback distinction.
+- Focused tests, formatting, and diff checks pass.
+
+**Major Out Of Scope**:
+
+- Native async commit/flush/compaction rewrites, storage format changes,
+  publishing, tagging, pushing, PR creation, or claiming new true async support
+  on non-Linux targets.

@@ -384,8 +384,10 @@ Rules:
   Trine's bounded blocking adapter and true platform async I/O tasks.
 - must advertise `PlatformAsyncIo` only when the current target has at least
   one true Trine-level platform async storage operation. A target whose current
-  Trine composite operations are all fallback-classified must use the bounded
-  blocking adapter instead of a platform driver that only counts fallback work.
+  Trine composite operations are all fallback-classified may still route work
+  through the platform driver when the user selects `RuntimeOptions::platform_io`,
+  but it must report fallback task counters and must not advertise
+  `PlatformAsyncIo`.
 
 #### Native Platform Backend Matrix
 
@@ -408,8 +410,9 @@ Other targets: unsupported fallback; persistent platform I/O must be rejected
 
 With the current backend matrix, `RuntimeOptions::platform_io()` advertises
 `PlatformAsyncIo` only on Linux when the `platform-io` Cargo feature is enabled.
-On non-Linux targets it remains a native runtime mode with blocking-adapter
-support until a stronger target backend exists.
+On non-Linux targets it can still route native storage through the platform
+driver, but current operations remain fallback-classified until a stronger
+target backend exists.
 
 ### 9.3 WASI Backend
 
