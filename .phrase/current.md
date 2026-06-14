@@ -6,77 +6,78 @@ Complete
 
 ## Goal
 
-Measure and reduce flush, compaction, and blob-GC write amplification while
-preserving MVCC visibility, manifest publish semantics, blob reference safety,
-durability, and storage formats.
+Measure and reduce hot-read block-cache and block-decode costs while preserving
+MVCC visibility, table/blob formats, prefix/range filters, compression
+contracts, and read-path correctness.
 
 ## Scope
 
-- Flush throughput, compaction throughput, blob-GC rewrite, and blob-level
-  merge benchmark rows.
-- Output table/blob write counts and bytes, manifest publish counts and
-  latency, directory sync counts and latency, obsolete cleanup timing, object
-  delete counts, and compaction selection behavior.
-- One or more measured write-amplification reductions if diagnostics expose a
-  safe dominant cost.
+- Block cache keys, admission, eviction, and hit promotion costs.
+- Metadata/data block cache separation and whether metadata survives data churn.
+- Repeated data-block decode paths when cache is disabled or undersized.
+- Compression-block decode costs and avoidable allocation in benchmark-visible
+  paths.
+- Benchmark diagnostics that distinguish cache hits, cache misses, table data
+  block reads, metadata probes, storage reads, and codec decode work.
 
 ## Out Of Scope
 
 - Storage format changes.
-- MVCC visibility, snapshot, range-delete, prefix-filter, table format,
-  manifest durable-cutover behavior, blob reference safety, platform-io,
-  publishing, tagging, pushing, or release workflow changes.
-- Read-path block-cache policy, compression codec changes, public durability
-  defaults, and startup/recovery optimization.
+- MVCC, snapshot, transaction, range-delete, prefix-filter, manifest, WAL,
+  compaction, blob-GC, platform-io, publishing, tagging, pushing, or release
+  workflow changes.
+- New compression formats beyond the V1 `none` and `fast-lz4-block` contract.
+- Broad cache replacement algorithm rewrites without benchmark evidence.
 
 ## Acceptance Gate
 
-- Diagnostics classify table/blob write requests, manifest publish requests,
-  directory sync requests, object delete requests, compaction table input and
-  output bytes, blob-GC input/output/discarded bytes, and cleanup publish
-  behavior before optimization.
-- Any retained code change preserves manifest publish semantics, blob file
-  reachability, snapshot-delayed cleanup, durability, and storage formats.
-- Focused flush/compaction/blob tests pass.
+- Diagnostics classify warm cache hit behavior, forced block decode reads,
+  metadata/data cache behavior, and codec decode behavior before optimization.
+- Any retained code change is justified by benchmark evidence and keeps table
+  reads, filters, cache key separation, and compression behavior unchanged.
+- Focused cache/table tests pass.
 - Strict clippy passes.
 - Single-run and grouped benchmark evidence records before/after behavior.
 
 ## Active Task Slice
 
 ```text
-task792 [x] goal:add write-amplification diagnostics | scope:benches/v1_bench.rs | verify:TRINE_BENCH_RUNS=1 cargo bench --bench v1_bench
-task793 [x] goal:optimize measured maintenance write-amplification cost | scope:src/db.rs benches/v1_bench.rs | verify:cargo test -q compaction --lib && cargo test -q blob --lib
-task794 [x] goal:record maintenance write-amplification evidence | scope:docs/benchmarks .phrase/evidence.md | verify:git diff review
+task795 [x] goal:add block-cache/decode diagnostics | scope:benches/v1_bench.rs | verify:TRINE_BENCH_RUNS=1 cargo bench --bench v1_bench
+task796 [x] goal:optimize measured cache/decode bottleneck | scope:src/cache.rs benches/v1_bench.rs | verify:cargo test -q cache --lib
+task797 [x] goal:record cache/decode evidence | scope:docs/benchmarks .phrase/evidence.md | verify:git diff review
 ```
 
 ## Evidence
 
-- Phase 178 completed prefix table cursor metadata reuse.
-- Benchmark baseline refresh previously identified compaction throughput,
-  blob-GC rewrite, and blob-level merge as the largest grouped write-side
-  costs.
-- Added write-amplification diagnostics for flush, compaction, blob-GC rewrite,
-  and blob-level merge. The diagnostics classify output writes, manifest
-  publishes, directory syncs, object deletes, compaction bytes, blob-GC bytes,
-  and wall time.
-- The measured foreground amplification was cleanup metadata publication after
-  blob maintenance. Blob-GC rewrite previously used three manifest publishes;
-  blob-level merge used two. Both still had to delete obsolete files
-  immediately.
-- The retained change keeps foreground blob-file deletion immediate but defers
-  clearing manifest pending-deletion metadata to later cleanup boundaries such
-  as flush, open, or close.
-- After the change, blob-GC rewrite uses two manifest publishes and blob-level
-  merge uses one, while write-object, directory-sync, and delete counts remain
-  unchanged.
+- Phase 179 completed maintenance write-amplification diagnostics and reduced
+  foreground manifest publishes for blob maintenance cleanup.
+- Grouped benchmark evidence currently points to cache/decode, point reads,
+  startup/recovery, search-policy, and concurrent maintenance as remaining
+  optimization candidates.
+- Initial audit found block cache keys already include kind/table/block and
+  metadata entries use higher eviction priority than data/blob entries.
+- Initial audit found cache hits clone the cached value and then attempt
+  best-effort recency promotion; promotion currently scans the priority queue
+  even when the hot key is already the newest entry.
+- Added benchmark rows and diagnostics for random hot block-cache reads, warm
+  cache-hit counters, random cache-hit counters, forced block decode counters,
+  and codec decode-only costs.
+- A/B `TRINE_BENCH_RUNS=5 cargo bench --bench v1_bench` kept the cache change:
+  random cached block read median improved from 1532 us to 1488 us, warm cached
+  read median improved from 1361 us to 1285 us, random hit diagnostic improved
+  from 1681 us to 1657 us, and warm hit diagnostic improved from 1421 us to
+  1316 us.
+- Cache-hit diagnostics still reported 2048 cache hits, zero misses, and zero
+  storage read-owned requests; forced decode diagnostics still reported zero
+  hits, 2048 misses, and 2049 storage read-owned requests.
 
 ## Known Residuals
 
-- The optimization intentionally reduces foreground manifest publishes, not
-  physical table/blob output count. Obsolete blob files are still deleted before
-  foreground compaction returns when no snapshot pin keeps them reachable.
+- LZ4 block decode remains much more expensive than `none` decode in the
+  decode-only rows. Reducing that further likely requires a separate table
+  block ownership or compression-boundary phase.
 
 ## Next Recommendation
 
-- Move next to block-cache/decode or search-policy work based on grouped
-  benchmark evidence.
+- Move next to concurrent read/write and background maintenance, unless the
+  user wants a dedicated LZ4 decode-allocation phase first.

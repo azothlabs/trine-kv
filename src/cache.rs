@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{HashMap, VecDeque},
     future::Future,
     sync::{
         Arc, RwLock,
@@ -371,7 +371,7 @@ fn usize_to_u64_saturating(value: usize) -> u64 {
 
 #[derive(Debug, Default)]
 struct BlockCacheState {
-    entries: BTreeMap<BlockCacheKey, BlockCacheEntry>,
+    entries: HashMap<BlockCacheKey, BlockCacheEntry>,
     high_order: VecDeque<BlockCacheKey>,
     low_order: VecDeque<BlockCacheKey>,
     high_bytes: u64,
@@ -470,6 +470,9 @@ impl BlockCacheState {
 }
 
 fn promote_order(order: &mut VecDeque<BlockCacheKey>, key: BlockCacheKey) {
+    if order.back().is_some_and(|candidate| *candidate == key) {
+        return;
+    }
     let Some(position) = order.iter().position(|candidate| *candidate == key) else {
         return;
     };
@@ -479,10 +482,14 @@ fn promote_order(order: &mut VecDeque<BlockCacheKey>, key: BlockCacheKey) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        collections::VecDeque,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use super::{
         BLOCK_CACHE_SHARD_COUNT, BlockCache, BlockCacheKey, CacheKind, block_cache_shard_index,
+        promote_order,
     };
     use crate::table::{DecodedDataBlock, TableId};
 
@@ -563,6 +570,16 @@ mod tests {
             .get_or_insert_data_block_with(low_a, || Ok(load_counted_block(&low_loads)))
             .expect("low-priority block reloads");
         assert_eq!(low_loads.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn promoting_newest_entry_keeps_recency_order() {
+        let keys = keys_in_same_shard(3);
+        let mut order = VecDeque::from([keys[0], keys[1], keys[2]]);
+
+        promote_order(&mut order, keys[2]);
+
+        assert_eq!(order, VecDeque::from([keys[0], keys[1], keys[2]]));
     }
 
     fn load_counted_block(loads: &AtomicUsize) -> DecodedDataBlock {

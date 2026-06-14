@@ -12185,3 +12185,64 @@ Negative check:
 - Treat maintenance write-amplification cleanup publish as complete.
 - Move next to block-cache/decode or search-policy work based on grouped
   benchmark evidence.
+
+## 2026-06-14: Block Cache And Decode Path
+
+### Observation
+
+- Added benchmark coverage for `block cache random block read`, warm cache-hit
+  diagnostics, random cache-hit diagnostics, forced block-decode diagnostics,
+  and codec decode-only rows.
+- Before the cache change, with the new diagnostics present,
+  `TRINE_BENCH_RUNS=5 cargo bench --bench v1_bench` reported these medians:
+  - `block cache random block read`: 1532 us.
+  - `block cache warm read`: 1361 us.
+  - `block cache random hit diagnostic wall micros`: 1681 us.
+  - `block cache warm hit diagnostic wall micros`: 1421 us.
+  - `native runtime block decode read`: 7511 us.
+  - `inline runtime block decode read`: 7983 us.
+- After changing block-cache shard entries from `BTreeMap` to `HashMap` and
+  skipping recency promotion when the key is already newest, the same command
+  reported these medians:
+  - `block cache random block read`: 1488 us.
+  - `block cache warm read`: 1285 us.
+  - `block cache random hit diagnostic wall micros`: 1657 us.
+  - `block cache warm hit diagnostic wall micros`: 1316 us.
+  - `native runtime block decode read`: 6555 us.
+  - `inline runtime block decode read`: 6843 us.
+- Cache-hit diagnostics reported 2048 cache hits, zero misses, and zero storage
+  read-owned requests before and after the change.
+- Forced decode diagnostics reported zero hits, 2048 misses, and 2049 storage
+  read-owned requests before and after the change.
+
+### Interpretation
+
+- The retained cache change reduces hot cache maintenance cost without changing
+  cache keys, cache admission, priority eviction, table format, compression
+  format, MVCC visibility, or read correctness.
+- The forced decode and codec decode-only rows show that LZ4 decode cost remains
+  visible, but reducing it safely likely needs a separate table block ownership
+  or compression-boundary phase.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q cache --lib`
+- `cargo test -q table --lib`
+- `cargo test -q --lib`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `TRINE_BENCH_RUNS=1 cargo bench --bench v1_bench`
+- `TRINE_BENCH_RUNS=5 cargo bench --bench v1_bench` before cache change
+- `TRINE_BENCH_RUNS=5 cargo bench --bench v1_bench` after cache change
+- `git diff --check`
+- Forbidden-term scan over the workspace found no matches.
+
+### Remaining Blockers
+
+- None for the retained block-cache maintenance change.
+- LZ4 decode allocation and decode cost remains a possible future target.
+
+### Recommended Next Action
+
+- Move next to concurrent read/write and background maintenance, unless a
+  dedicated LZ4 decode-allocation phase is selected first.

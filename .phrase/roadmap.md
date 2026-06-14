@@ -4429,7 +4429,7 @@ sync, or obsolete cleanup as the next selected bottleneck.
 
 ### Phase 180: Block Cache And Decode Path Optimization
 
-**Status**: Planned
+**Status**: Complete
 
 **Goal**: Improve hot-read cache/decode behavior after grouped evidence points
 to cache misses, block decode, or compression cost.
@@ -4443,6 +4443,8 @@ table-block decode, or codec rows as the next selected target.
   time, and allocation-sensitive paths.
 - Any cache policy change preserves correctness for table, blob, snapshot, and
   range-delete reads.
+- Phase 180 evidence is recorded in `docs/benchmarks/v1-block-cache-decode.md`
+  and `.phrase/evidence.md`.
 
 **Major Out Of Scope**:
 
