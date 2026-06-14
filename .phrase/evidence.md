@@ -26,6 +26,60 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-06-14: Point Batch And Negative Lookup Diagnostics
+
+### Observation
+
+- Existing `get_many` already grouped table reads by data block for localized
+  point hits, but missing-key persistent batch diagnostics did not distinguish
+  out-of-bounds keys from in-bounds filter misses.
+- Added persistent diagnostics for `missing-*` keys and bounded absent
+  `key-*`-range keys.
+- Out-of-bounds missing reads perform 2048 point table probes, 0 block metadata
+  probes, 0 data block reads, and 0 filter skips because table key bounds reject
+  them.
+- In-bounds bounded missing reads perform 2048 point table probes, 18 block
+  metadata probes, 2048 filter skips, 0 data block reads, and 0 read-owned
+  storage requests.
+- Small all-unique `get_many` slices previously built `PointReadBatch` state
+  before falling back to the single-key loop. The read path now checks this case
+  first; small duplicate batches still use the batch path.
+- After the optimization, the local 3-run summary recorded
+  `missing batched point read persistent` at 124 us median, down from 328 us
+  before, and `bounded missing batched point read persistent` at 224 us median,
+  down from 386 us before. `localized batched point read persistent` stayed
+  faster than localized sequential, 1125 us versus 1348 us median.
+
+### Interpretation
+
+- Negative lookup is already I/O efficient when Bloom filters apply; the
+  missing-read issue was small-batch overhead, not extra table block reads.
+- Bounded and out-of-bounds missing diagnostics must stay separate because they
+  exercise different pruning mechanisms.
+- The retained optimization improves small all-unique `get_many` calls without
+  weakening duplicate sharing, MVCC visibility, or table/block grouping for
+  larger batches.
+
+### Verification
+
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo test -q lsm::read::tests::`
+- `cargo test -q get_many_sync`
+- `cargo check -q --benches`
+- `cargo clippy -q --all-targets --all-features -- -D warnings`
+- `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench`
+
+### Remaining Blockers
+
+- None for this read-path slice.
+
+### Recommended Next Action
+
+- Continue the KV optimization queue from grouped benchmark evidence; keep
+  larger structural read optimizations, such as metadata cache policy and
+  compressed read bandwidth, behind fresh diagnostics.
+
 ## 2026-06-13: Startup And Recovery Benchmark Boundary
 
 ### Observation

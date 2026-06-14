@@ -52,6 +52,10 @@ fn run_benchmarks() -> Vec<BenchResult> {
         bench_persistent_batched_point_read(),
         bench_persistent_localized_sequential_point_batch(),
         bench_persistent_localized_batched_point_read(),
+        bench_persistent_missing_sequential_point_batch(),
+        bench_persistent_missing_batched_point_read(),
+        bench_persistent_bounded_missing_sequential_point_batch(),
+        bench_persistent_bounded_missing_batched_point_read(),
         bench_active_memtable_random_get(),
         bench_delta_backed_random_get(),
         bench_delta_backed_missing_get(),
@@ -62,6 +66,8 @@ fn run_benchmarks() -> Vec<BenchResult> {
     ];
     results.extend(bench_prefix_partition_scans());
     extend_localized_point_batch_diagnostics(&mut results);
+    extend_missing_point_batch_diagnostics(&mut results);
+    extend_bounded_missing_point_batch_diagnostics(&mut results);
     results.push(bench_snapshot_read_under_writes());
     results.push(bench_transaction_commit());
     results.push(bench_transaction_conflict());
@@ -492,6 +498,65 @@ fn bench_persistent_localized_batched_point_read() -> BenchResult {
     result
 }
 
+fn bench_persistent_missing_sequential_point_batch() -> BenchResult {
+    let (dir, db, bucket) = flushed_persistent_db(
+        "missing-sequential-point-batch",
+        ROWS,
+        BucketOptions::default(),
+    );
+    let keys = missing_point_read_keys(OPS);
+    let result = measure("missing sequential point batch persistent", OPS, || {
+        sequential_point_batch_checksum(&bucket, &keys)
+    });
+    drop(db);
+    cleanup_dir(&dir);
+    result
+}
+
+fn bench_persistent_missing_batched_point_read() -> BenchResult {
+    let (dir, db, bucket) =
+        flushed_persistent_db("missing-batched-point-read", ROWS, BucketOptions::default());
+    let keys = missing_point_read_keys(OPS);
+    let result = measure("missing batched point read persistent", OPS, || {
+        batched_point_read_checksum(&bucket, &keys, POINT_READ_BATCH)
+    });
+    drop(db);
+    cleanup_dir(&dir);
+    result
+}
+
+fn bench_persistent_bounded_missing_sequential_point_batch() -> BenchResult {
+    let (dir, db, bucket) = flushed_persistent_db(
+        "bounded-missing-sequential-point-batch",
+        ROWS,
+        BucketOptions::default(),
+    );
+    let keys = bounded_missing_point_read_keys(ROWS, OPS);
+    let result = measure(
+        "bounded missing sequential point batch persistent",
+        OPS,
+        || sequential_point_batch_checksum(&bucket, &keys),
+    );
+    drop(db);
+    cleanup_dir(&dir);
+    result
+}
+
+fn bench_persistent_bounded_missing_batched_point_read() -> BenchResult {
+    let (dir, db, bucket) = flushed_persistent_db(
+        "bounded-missing-batched-point-read",
+        ROWS,
+        BucketOptions::default(),
+    );
+    let keys = bounded_missing_point_read_keys(ROWS, OPS);
+    let result = measure("bounded missing batched point read persistent", OPS, || {
+        batched_point_read_checksum(&bucket, &keys, POINT_READ_BATCH)
+    });
+    drop(db);
+    cleanup_dir(&dir);
+    result
+}
+
 fn extend_localized_point_batch_diagnostics(results: &mut Vec<BenchResult>) {
     let keys = localized_point_read_keys(ROWS, OPS);
     push_localized_point_read_diagnostics(
@@ -512,6 +577,46 @@ fn extend_localized_point_batch_diagnostics(results: &mut Vec<BenchResult>) {
     }
 }
 
+fn extend_missing_point_batch_diagnostics(results: &mut Vec<BenchResult>) {
+    let keys = missing_point_read_keys(OPS);
+    push_missing_point_read_diagnostics(
+        results,
+        "missing point diagnostic sequential",
+        &keys,
+        sequential_point_batch_checksum,
+    );
+    for (batch_size, label) in [
+        (4, "missing point diagnostic batch 4"),
+        (8, "missing point diagnostic batch 8"),
+        (16, "missing point diagnostic batch 16"),
+        (32, "missing point diagnostic batch 32"),
+    ] {
+        push_missing_point_read_diagnostics(results, label, &keys, |bucket, keys| {
+            batched_point_read_checksum(bucket, keys, batch_size)
+        });
+    }
+}
+
+fn extend_bounded_missing_point_batch_diagnostics(results: &mut Vec<BenchResult>) {
+    let keys = bounded_missing_point_read_keys(ROWS, OPS);
+    push_missing_point_read_diagnostics(
+        results,
+        "bounded missing point diagnostic sequential",
+        &keys,
+        sequential_point_batch_checksum,
+    );
+    for (batch_size, label) in [
+        (4, "bounded missing point diagnostic batch 4"),
+        (8, "bounded missing point diagnostic batch 8"),
+        (16, "bounded missing point diagnostic batch 16"),
+        (32, "bounded missing point diagnostic batch 32"),
+    ] {
+        push_missing_point_read_diagnostics(results, label, &keys, |bucket, keys| {
+            batched_point_read_checksum(bucket, keys, batch_size)
+        });
+    }
+}
+
 fn push_localized_point_read_diagnostics(
     results: &mut Vec<BenchResult>,
     label: &'static str,
@@ -523,6 +628,32 @@ fn push_localized_point_read_diagnostics(
     let start = Instant::now();
     let checksum = read(&bucket, keys);
     assert!(checksum > 0, "localized point diagnostic must read values");
+    let elapsed_micros = duration_micros(start.elapsed());
+    let after = db.stats();
+
+    let mut diagnostics = ColdReadDiagnostics::default();
+    diagnostics.record_delta(&before, &after);
+    results.push(BenchResult::diagnostic(
+        labelled(label, "wall micros"),
+        elapsed_micros,
+    ));
+    diagnostics.push_results_with_label(results, label);
+
+    drop(db);
+    cleanup_dir(&dir);
+}
+
+fn push_missing_point_read_diagnostics(
+    results: &mut Vec<BenchResult>,
+    label: &'static str,
+    keys: &[Vec<u8>],
+    read: impl FnOnce(&trine_kv::Bucket, &[Vec<u8>]) -> u64,
+) {
+    let (dir, db, bucket) = flushed_persistent_db(label, ROWS, BucketOptions::default());
+    let before = db.stats();
+    let start = Instant::now();
+    let checksum = read(&bucket, keys);
+    assert_eq!(checksum, 0, "missing point diagnostic must miss every key");
     let elapsed_micros = duration_micros(start.elapsed());
     let after = db.stats();
 
@@ -3177,6 +3308,25 @@ fn point_read_keys(rows: usize, ops: usize, mut seed: u64) -> Vec<Vec<u8>> {
 
 fn localized_point_read_keys(rows: usize, ops: usize) -> Vec<Vec<u8>> {
     (0..ops).map(|index| key(index % rows)).collect()
+}
+
+fn missing_point_read_keys(ops: usize) -> Vec<Vec<u8>> {
+    (0..ops)
+        .map(|index| format!("missing-{index:04}").into_bytes())
+        .collect()
+}
+
+fn bounded_missing_point_read_keys(rows: usize, ops: usize) -> Vec<Vec<u8>> {
+    assert!(
+        rows > 1,
+        "bounded missing keys need at least two table keys"
+    );
+    (0..ops)
+        .map(|index| {
+            let key_index = index % (rows - 1);
+            format!("key-{key_index:08}!missing").into_bytes()
+        })
+        .collect()
 }
 
 fn range_scan_checksum(bucket: &trine_kv::Bucket, scans: usize) -> u64 {

@@ -6,78 +6,82 @@ Active
 
 ## Goal
 
-Reduce the current largest persistent-write and maintenance costs without
-weakening confirmed-write durability or changing V1 storage formats.
+Make Trine's LSM read-path advantages measurable and improve the first
+high-signal batch/negative lookup bottleneck.
 
 ## Scope
 
-- Classify `persistent single-key put sync-data/sync-all` against the durability
-  contract and existing batch write path.
-- Improve blob level merge and compaction throughput when a safe table/blob
-  rewrite optimization exists.
-- Native persistent local-file workloads first; object-store/browser behavior
-  stays on its existing durability path unless separately proven.
-- Evidence from `v1_bench` grouped rows and targeted diagnostics.
+- Persistent local-file point reads first.
+- `get_many` and localized point batches.
+- Negative lookup / missing point reads.
+- Metadata/data-block cache and filter counters that prove whether reads avoid
+  unnecessary table, index, and data-block work.
+- Compression read bandwidth is discovery-only until batch/missing evidence is
+  clear.
 
 ## Out Of Scope
 
-- Reducing `SyncData` or `SyncAll` semantics for confirmed single-key writes.
 - Storage format changes.
-- Public API changes unless evidence shows existing batch APIs cannot express
-  the safe path.
-- New compaction selection policy.
-- Platform-io backend changes.
+- Public API changes unless existing `get_many` cannot express the optimized
+  path.
+- Compaction throughput and blob GC write-side tuning.
+- Platform-io backend work.
 - Publishing, tagging, pushing, or release workflow changes.
 
 ## Acceptance Gate
 
-- The single-key sync write row is classified as inherent per-commit sync cost
-  unless a safe implementation change lowers it without changing durability.
-- A retained maintenance optimization improves or explains blob level merge and
-  compaction throughput with benchmark evidence.
-- Focused tests cover the behavior boundary.
+- Benchmark diagnostics distinguish sequential versus batched point reads for
+  localized hits and missing keys.
+- Evidence reports table probes, block metadata probes, data block reads,
+  filter skips, cache misses, and storage read requests.
+- A retained optimization improves at least one of: localized batch reads,
+  missing batch reads, or metadata/data-block reuse without weakening MVCC or
+  read visibility.
+- Focused tests cover the changed read-path behavior.
 - Formatting, strict clippy, relevant tests, and diff whitespace checks pass
-  before any commit.
+  before commit.
 
 ## Active Task Slice
 
 ```text
-task814 [x] goal:reject unsafe/unhelpful output-file durability change | scope:src/table.rs src/blob.rs src/db.rs | verify:targeted bench
-task815 [ ] goal:record sync-write classification and maintenance evidence | scope:docs/benchmarks .phrase/evidence.md | verify:evidence review
-task816 [x] goal:cache blob read objects during level-merge inline rewrite | scope:src/blob.rs | verify:blob tests + grouped bench
-task817 [ ] goal:profile and reduce ordinary compaction throughput cost | scope:src/table.rs src/lsm src/db.rs | verify:compaction diagnostics + grouped bench
+task818 [x] goal:add persistent missing batch benchmark diagnostics | scope:benches/v1_bench.rs | verify:cargo check -q --benches + targeted bench rows
+task819 [x] goal:separate out-of-bounds miss from in-bounds filter miss diagnostics | scope:benches/v1_bench.rs | verify:cargo check -q --benches + targeted bench rows
+task820 [x] goal:measure read-path diagnostics and choose first retained optimization | scope:src/lsm src/table.rs benches/v1_bench.rs | verify:TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench
 ```
 
 ## Evidence
 
-- Current grouped benchmark medians put `persistent single-key put sync-data`
-  around 523738 us and `sync-all` around 521558 us for 256 sequential writes.
-- `persistent batch write sync-data` is much lower, around 21938 us for 1024
-  writes, which shows the safe user-facing path for many confirmed writes is
-  batching.
-- WAL append lanes already keep the append writer open; sequential single-key
-  sync cost is dominated by one storage sync per confirmed commit.
-- WAL append lanes already keep the append writer open; changing output table
-  or blob file durability from `SyncAll` to `SyncData` did not improve grouped
-  maintenance rows and was rejected.
-- A retained table-writer cleanup skips redundant sorting for already-sorted
-  flush/compaction payloads and lets encoded table metadata be reused after
-  blocking writes instead of re-reading table metadata from disk.
-- Blob level merge no longer reopens and revalidates the same blob file for
-  every retained `BlobIndex` during sync inline rewrite; one rewrite pass caches
-  blob read objects by file id.
+- `get_many` already exists for `Db`, `Bucket`, and `BucketReader`.
+- Table point batch reads already group keys by data block and have a regression
+  test proving multiple keys in one persistent data block share one data-block
+  read.
+- Existing localized point diagnostics cover hit-heavy sequential versus batched
+  reads, but missing-key persistent batch diagnostics were not separated from
+  memory-only `missing get`.
+- The first persistent missing diagnostic used `missing-*` keys, which sort
+  outside the `key-*` table bounds and therefore measure key-bound rejection
+  rather than Bloom/filter negative lookup.
+- New bounded missing diagnostics use absent `key-*`-range keys. They report
+  2048 point filter skips, 18 block metadata probes, 0 data-block reads, and
+  0 storage read-owned requests, proving the in-bounds negative path is filter
+  gated.
+- Retained optimization: small all-unique `get_many` slices choose the single
+  key loop before allocating/deduplicating a `PointReadBatch`; small duplicate
+  slices still use the batch path for shared lookup.
+- Three-run V1 benchmark evidence after the optimization:
+  - `missing batched point read persistent` median 124 us versus 328 us before.
+  - `bounded missing batched point read persistent` median 224 us versus 386 us
+    before.
+  - `localized batched point read persistent` median 1125 us and remains faster
+    than localized sequential median 1348 us.
 
 ## Known Residuals
 
-- Sequential single-key `SyncData`/`SyncAll` cannot be made cheap without
-  relaxing the meaning of a confirmed write or adding a different explicit
-  group-commit API.
-- Ordinary compaction remains unresolved. Blob level merge improved in grouped
-  benchmark evidence, but compaction still needs profiling around payload
-  assembly, table encoding, validation, publish, and cleanup.
+- Missing-key advantage must be proven by low data-block reads and high filter
+  skips, not just wall-clock time.
+- Out-of-bounds missing keys should remain a separate diagnostic because they
+  exercise key-bound rejection rather than table filters.
 
 ## Next Recommendation
 
-- Commit the blob level merge cache slice, then continue with ordinary
-  compaction profiling. Do not revisit output-file `SyncData` without new
-  filesystem-specific evidence.
+- Run the strict local gate and commit this read-path slice.

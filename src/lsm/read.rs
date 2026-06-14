@@ -332,11 +332,10 @@ impl LsmTree {
     where
         K: AsRef<[u8]>,
     {
-        let batch = PointReadBatch::from_keys(keys);
-        if batch.unique_keys.is_empty() {
+        if keys.is_empty() {
             return Ok(Vec::new());
         }
-        if batch.prefers_single_key_path() {
+        if point_read_batch_prefers_single_key_path(keys) {
             let mut values = Vec::with_capacity(keys.len());
             for key in keys {
                 values.push(self.read_visible_point_value_in_snapshot(
@@ -351,6 +350,7 @@ impl LsmTree {
             return Ok(values);
         }
 
+        let batch = PointReadBatch::from_keys(keys);
         let mut candidates = Vec::with_capacity(batch.unique_keys.len());
         candidates.resize_with(batch.unique_keys.len(), || None);
         for (index, key) in batch.unique_keys.iter().enumerate() {
@@ -529,11 +529,10 @@ impl LsmTree {
         B: StorageReadBackend,
         K: AsRef<[u8]>,
     {
-        let batch = PointReadBatch::from_keys(keys);
-        if batch.unique_keys.is_empty() {
+        if keys.is_empty() {
             return Ok(Vec::new());
         }
-        if batch.prefers_single_key_path() {
+        if point_read_batch_prefers_single_key_path(keys) {
             let mut values = Vec::with_capacity(keys.len());
             for key in keys {
                 values.push(
@@ -554,6 +553,7 @@ impl LsmTree {
             return Ok(values);
         }
 
+        let batch = PointReadBatch::from_keys(keys);
         let mut candidates = Vec::with_capacity(batch.unique_keys.len());
         candidates.resize_with(batch.unique_keys.len(), || None);
         for (index, key) in batch.unique_keys.iter().enumerate() {
@@ -803,11 +803,29 @@ impl<'key> PointReadBatch<'key> {
         }
         values
     }
+}
 
-    fn prefers_single_key_path(&self) -> bool {
-        self.input_len < POINT_READ_BATCH_GROUPING_MIN_KEYS
-            && self.unique_keys.len() == self.input_len
+fn point_read_batch_prefers_single_key_path<K>(keys: &[K]) -> bool
+where
+    K: AsRef<[u8]>,
+{
+    keys.len() < POINT_READ_BATCH_GROUPING_MIN_KEYS && point_read_batch_keys_are_unique(keys)
+}
+
+fn point_read_batch_keys_are_unique<K>(keys: &[K]) -> bool
+where
+    K: AsRef<[u8]>,
+{
+    for (index, key) in keys.iter().enumerate() {
+        let key = key.as_ref();
+        if keys[..index]
+            .iter()
+            .any(|existing| existing.as_ref() == key)
+        {
+            return false;
+        }
     }
+    true
 }
 
 fn resolve_point_candidate(
@@ -1038,4 +1056,32 @@ where
     value
         .into_point_value_with_backend_async(backend, internal_key, db_path, blob_reads)
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{POINT_READ_BATCH_GROUPING_MIN_KEYS, point_read_batch_prefers_single_key_path};
+
+    #[test]
+    fn small_unique_point_batches_use_single_key_path() {
+        let keys = [b"a".as_slice(), b"b".as_slice(), b"c".as_slice()];
+
+        assert!(point_read_batch_prefers_single_key_path(&keys));
+    }
+
+    #[test]
+    fn small_duplicate_point_batches_keep_batch_path() {
+        let keys = [b"a".as_slice(), b"b".as_slice(), b"a".as_slice()];
+
+        assert!(!point_read_batch_prefers_single_key_path(&keys));
+    }
+
+    #[test]
+    fn grouping_threshold_uses_batch_path() {
+        let keys = (0..POINT_READ_BATCH_GROUPING_MIN_KEYS)
+            .map(|index| format!("key-{index:08}").into_bytes())
+            .collect::<Vec<_>>();
+
+        assert!(!point_read_batch_prefers_single_key_path(&keys));
+    }
 }
