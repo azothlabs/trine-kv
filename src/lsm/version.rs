@@ -141,6 +141,9 @@ impl LsmVersion {
                         .tables
                         .iter()
                         .filter(|table| {
+                            if !table.key_bounds_may_contain_key(key) {
+                                return false;
+                            }
                             table.record_point_table_probe();
                             l0_table_probes += 1;
                             table.may_contain_key(key)
@@ -169,6 +172,9 @@ impl LsmVersion {
             if level.level == TableLevel::ZERO {
                 let mut l0_table_probes = 0;
                 for table in &level.tables {
+                    if !table.key_bounds_may_contain_key(key) {
+                        continue;
+                    }
                     if !should_probe(table) {
                         continue;
                     }
@@ -209,6 +215,9 @@ impl LsmVersion {
                     let mut key_indices = Vec::new();
                     for (key_index, key) in keys.iter().enumerate() {
                         let key = key.as_ref();
+                        if !table.key_bounds_may_contain_key(key) {
+                            continue;
+                        }
                         if !should_probe(table, key_index) {
                             continue;
                         }

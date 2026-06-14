@@ -9994,7 +9994,7 @@ mod tests {
             .point_non_l0_table_probes
             .saturating_sub(before.read_path.point_non_l0_table_probes);
         assert_eq!(table_probes, l0_probes.saturating_add(non_l0_probes));
-        assert_eq!(l0_probes, 2);
+        assert_eq!(l0_probes, 1);
         assert_eq!(non_l0_probes, 0);
         assert_eq!(
             after
@@ -10008,7 +10008,7 @@ mod tests {
                 .read_path
                 .point_l0_overlap_extra_table_probes
                 .saturating_sub(before.read_path.point_l0_overlap_extra_table_probes),
-            1
+            0
         );
 
         let before = db.stats();
@@ -10049,7 +10049,7 @@ mod tests {
                 .read_path
                 .batch_point_l0_overlap_extra_table_probes
                 .saturating_sub(before.read_path.batch_point_l0_overlap_extra_table_probes),
-            1
+            0
         );
 
         drop(db);

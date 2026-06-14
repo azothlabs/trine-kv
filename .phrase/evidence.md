@@ -124,6 +124,58 @@ Record only evidence that can change planning or durable decisions.
 - Implement task825: derive an in-memory L0 guard index from table key bounds
   and use it to reduce point/missing/get_many L0 overlap probes.
 
+## 2026-06-14: First In-Memory L0 Guard Pruning
+
+### Observation
+
+- L0 point and grouped point-batch lookup now use existing table user-key bounds
+  before recording a point table probe or consulting Bloom filters.
+- The retained change does not alter table format, manifest state, WAL,
+  recovery, range tombstone selection, or non-L0 point lookup.
+- The local `cargo bench --bench v1_bench` run reduced
+  `read pruning L0 stack diagnostic sequential` from the prior 16384 L0 table
+  probes and 14336 extra L0 probes to 2048 L0 table probes and 0 extra L0
+  probes. Block metadata probes and data-block reads stayed at 2048.
+- The same run reduced `read pruning L0 stack diagnostic batch 4` from the
+  prior 4096 L0 table probes and 3584 extra batch L0 probes to 512 L0 table
+  probes and 0 extra batch L0 probes. Block metadata probes and data-block
+  reads stayed at 512.
+- Out-of-bounds persistent missing diagnostics now show 0 point table probes,
+  because the in-memory key-bounds guard rejects them before table probes.
+
+### Interpretation
+
+- Existing table bounds are sufficient for the first useful guard slice: they
+  remove unrelated L0 candidates before Bloom/filter or block work.
+- The first retained guard behavior improves point, missing, and grouped
+  point-batch candidate cost while preserving the observed block-access counts.
+- Further guard work should extend from point reads toward range/prefix safety
+  only with separate diagnostics.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q point_read_stats_split_l0_and_non_l0_probes`
+- `cargo clippy -q --all-targets --all-features -- -D warnings`
+- `cargo test -q get_many_sync`
+- `cargo test -q range_tombstone`
+- `cargo test -q range_delete`
+- `cargo test -q snapshot`
+- `cargo bench --bench v1_bench`
+- `cargo test -q`
+- `cargo rustdoc --all-features -- -D warnings`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Compaction rewrite-depth diagnostics are still missing; no guard-aware or
+  non-uniform compaction policy should be retained before task826 evidence.
+
+### Recommended Next Action
+
+- Implement task826: add compaction rewrite-depth diagnostics before changing
+  compaction policy.
+
 ## 2026-06-14: Point Batch And Negative Lookup Diagnostics
 
 ### Observation
