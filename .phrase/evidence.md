@@ -13313,3 +13313,69 @@ Negative check:
 
 - Commit this blob level merge slice, then continue with ordinary compaction
   profiling.
+
+## 2026-06-14: Phase E Non-Uniform Per-Level Compaction
+
+### Observation
+
+- The compaction picker's no-pressure `MultiTableLevel` fallback previously
+  fired uniformly on any non-level-0 level with at least two in-range tables.
+  Because L1+ levels are validated non-overlapping, two tables at a deep level
+  never cover the same user key, so that fallback added no point-read candidate
+  depth there; it was pure write amplification (rewriting a deep level only to
+  spawn an even deeper one).
+- Phase E replaces the hardcoded `>= 2` threshold with a depth-scaled per-level
+  budget `multi_table_fallback_threshold(level) = 1 + level` (L1 -> 2, L2 -> 3,
+  L3 -> 4, ...). Shallow levels stay tight; deeper levels stay lazy until a
+  trigger justifies the rewrite.
+- `L0Overlap` (upper overlap budget via `max_l0_files`) and `LevelSize` (space
+  amplification, justified at any depth) are unchanged, so deep levels still
+  compact under size pressure.
+- A new `CompactionSkip::LowerLevelLazy` policy stat records the "did not run"
+  side, surfaced through `DbStats::compaction_skips`, complementing the existing
+  `compaction_triggers` "did run" rows.
+
+### Interpretation
+
+- This is an in-memory policy derived from existing table bounds and config; no
+  manifest/WAL/SSTable/blob format change (persisted guard metadata remains the
+  Phase F decision).
+- The depth-scaled budget is the correct boundary: it preserves Phase D's
+  shallow L1->L2 guard-local spreading (`persistent_multi_table_compaction_moves
+  _one_guard_local_input` still moves one of three L1 tables to L2) while making
+  genuinely deep levels lazy. An earlier "suppress the deepest populated level"
+  idea was rejected because it would have broken that Phase D L1 behavior.
+- Read amplification does not regress: deep levels stay non-overlapping, so
+  point reads still probe at most one table per level.
+
+### Verification
+
+- `cargo build -q`
+- `cargo test -q compaction --lib` (40 tests; 4 new planner tests)
+- `cargo test -q --lib persistent_deep_level_stays_lazy_and_reports_skip`
+- `cargo test -q --lib persistent_multi_table_compaction_moves_one_guard_local_input`
+- `cargo test -q --lib` (347 tests)
+- `cargo test -q --all-features` (all green; one background-timing test,
+  `persistent_background_maintenance_error_surfaces_to_later_write`, is a
+  pre-existing sleep-based flake under heavy parallel load: passes in isolation
+  3/3 and is unrelated to the compaction picker)
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo check -q --benches` + `cargo clippy --bench v1_bench -- -D warnings`
+- `git diff --check`
+- `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench`: guard multi-table
+  compaction held at 1 input table / 9177 input bytes / 9177 output bytes with
+  point table probes flat at 2048; broad comparison and throughput rows
+  unchanged. Bench completed with no assert failures.
+
+### Remaining Blockers
+
+- None for Phase E. The depth-scaled budget `1 + level` is an in-memory
+  heuristic; further tuning would need dedicated deep-level benchmark evidence.
+- Deep-level space reclamation still relies on `LevelSize`; tombstone/blob/
+  overlap-explosion-specific deep triggers remain future work.
+
+### Recommended Next Action
+
+- Evaluate Phase F (persisted guard metadata) only if deriving guards from table
+  bounds at open/recovery becomes a measured cost.

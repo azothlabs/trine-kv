@@ -35,8 +35,8 @@ use crate::{
     runtime::{self, CancellationToken, Runtime, RuntimeTask},
     snapshot::{Snapshot, SnapshotTracker},
     stats::{
-        BlobReadMetrics, CompactionLevelStats, CompactionTrigger, CompactionTriggerStats, DbStats,
-        LevelStats,
+        BlobReadMetrics, CompactionLevelStats, CompactionSkip, CompactionSkipStats,
+        CompactionTrigger, CompactionTriggerStats, DbStats, LevelStats,
     },
     storage::{
         BlockingStorageDirectoryCreateBackend, BlockingStorageDirectoryListBackend,
@@ -240,6 +240,7 @@ pub(crate) struct DbInner {
     compaction_output_bytes: AtomicU64,
     compaction_level_stats: Mutex<BTreeMap<u32, CompactionLevelStats>>,
     compaction_trigger_stats: Mutex<BTreeMap<CompactionTrigger, CompactionTriggerStats>>,
+    compaction_skip_stats: Mutex<BTreeMap<CompactionSkip, CompactionSkipStats>>,
     blob_gc_runs: AtomicU64,
     blob_gc_input_bytes: AtomicU64,
     blob_gc_output_bytes: AtomicU64,
@@ -1156,6 +1157,7 @@ impl Db {
                 compaction_output_bytes: AtomicU64::new(0),
                 compaction_level_stats: Mutex::new(BTreeMap::new()),
                 compaction_trigger_stats: Mutex::new(BTreeMap::new()),
+                compaction_skip_stats: Mutex::new(BTreeMap::new()),
                 blob_gc_runs: AtomicU64::new(0),
                 blob_gc_input_bytes: AtomicU64::new(0),
                 blob_gc_output_bytes: AtomicU64::new(0),
@@ -1293,6 +1295,7 @@ impl Db {
                 compaction_output_bytes: AtomicU64::new(0),
                 compaction_level_stats: Mutex::new(BTreeMap::new()),
                 compaction_trigger_stats: Mutex::new(BTreeMap::new()),
+                compaction_skip_stats: Mutex::new(BTreeMap::new()),
                 blob_gc_runs: AtomicU64::new(0),
                 blob_gc_input_bytes: AtomicU64::new(0),
                 blob_gc_output_bytes: AtomicU64::new(0),
@@ -1399,6 +1402,7 @@ impl Db {
                 compaction_output_bytes: AtomicU64::new(0),
                 compaction_level_stats: Mutex::new(BTreeMap::new()),
                 compaction_trigger_stats: Mutex::new(BTreeMap::new()),
+                compaction_skip_stats: Mutex::new(BTreeMap::new()),
                 blob_gc_runs: AtomicU64::new(0),
                 blob_gc_input_bytes: AtomicU64::new(0),
                 blob_gc_output_bytes: AtomicU64::new(0),
@@ -1662,6 +1666,7 @@ impl Db {
                 compaction_output_bytes: AtomicU64::new(0),
                 compaction_level_stats: Mutex::new(BTreeMap::new()),
                 compaction_trigger_stats: Mutex::new(BTreeMap::new()),
+                compaction_skip_stats: Mutex::new(BTreeMap::new()),
                 blob_gc_runs: AtomicU64::new(0),
                 blob_gc_input_bytes: AtomicU64::new(0),
                 blob_gc_output_bytes: AtomicU64::new(0),
@@ -3612,6 +3617,7 @@ impl Db {
         stats.blob_read_bytes = blob_read_bytes;
         self.add_compaction_level_stats(&mut stats);
         self.add_compaction_trigger_stats(&mut stats);
+        self.add_compaction_skip_stats(&mut stats);
         let cache_stats = self.inner.block_cache.stats();
         stats.block_cache_hits = cache_stats.hits;
         stats.block_cache_misses = cache_stats.misses;
@@ -3727,6 +3733,12 @@ impl Db {
     fn add_compaction_trigger_stats(&self, stats: &mut DbStats) {
         if let Ok(compaction_triggers) = self.inner.compaction_trigger_stats.lock() {
             stats.compaction_triggers = compaction_triggers.values().cloned().collect();
+        }
+    }
+
+    fn add_compaction_skip_stats(&self, stats: &mut DbStats) {
+        if let Ok(compaction_skips) = self.inner.compaction_skip_stats.lock() {
+            stats.compaction_skips = compaction_skips.values().cloned().collect();
         }
     }
 
@@ -5328,9 +5340,12 @@ impl Db {
         let compaction_options = compaction_options(&self.inner.options, local_l0_compaction);
 
         for (name, state) in buckets.iter() {
-            let Some(input) =
-                state.plan_compaction(name, range, oldest_active_snapshot, compaction_options)?
-            else {
+            let result =
+                state.plan_compaction(name, range, oldest_active_snapshot, compaction_options)?;
+            if let Some(skip) = result.skip {
+                self.record_compaction_skip(skip);
+            }
+            let Some(input) = result.input else {
                 continue;
             };
             inputs.push(NamedCompactionInput {
@@ -7593,6 +7608,17 @@ impl Db {
             entry.input_bytes = entry.input_bytes.saturating_add(delta.input_bytes);
             entry.output_bytes = entry.output_bytes.saturating_add(delta.output_bytes);
         }
+    }
+
+    fn record_compaction_skip(&self, skip: CompactionSkip) {
+        let Ok(mut skips) = self.inner.compaction_skip_stats.lock() else {
+            return;
+        };
+        let entry = skips.entry(skip).or_insert(CompactionSkipStats {
+            skip,
+            occurrences: 0,
+        });
+        entry.occurrences = entry.occurrences.saturating_add(1);
     }
 }
 

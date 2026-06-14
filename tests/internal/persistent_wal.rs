@@ -8,7 +8,8 @@ use std::{
 };
 
 use trine_kv::{
-    BlobGcRatio, BlobLevelMergePolicy, BucketOptions, CompactionTrigger, CompressionProfile, Db,
+    BlobGcRatio, BlobLevelMergePolicy, BucketOptions, CompactionSkip, CompactionTrigger,
+    CompressionProfile, Db,
     DbOptions, DurabilityMode, Error, FailOnCorruptionPolicy, FilterPolicy, IndexSearchPolicy,
     KeyRange, MaintenanceBudget, PrefixExtractor, PrefixFilterPolicy, TransactionOptions,
     WriteBatch, WriteOptions, blob, codec::CodecId, manifest, recovery, table, wal,
@@ -2156,6 +2157,94 @@ fn persistent_multi_table_compaction_moves_one_guard_local_input() {
     }
 
     fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_deep_level_stays_lazy_and_reports_skip() {
+    let path = temp_db_path("deep-level-lazy");
+    let mut options = DbOptions::persistent(&path);
+    // A huge target keeps every level under its byte target so no LevelSize
+    // trigger fires and only the non-uniform no-pressure policy is exercised.
+    options.target_table_bytes = usize::MAX / 4;
+    options.max_l0_files = 64;
+
+    let db = Db::open_sync(options).expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+
+    // Build three disjoint single-key L1 tables, matching the guard-local setup.
+    for chunk in 0..3 {
+        let key = format!("key-{chunk:03}").into_bytes();
+        let value = format!("value-{chunk:03}").into_bytes();
+        bucket.put_sync(key, value).expect("write chunk key");
+        db.flush_sync().expect("flush L0 table");
+        db.compact_range_sync(KeyRange::all())
+            .expect("move flushed table to L1");
+    }
+    assert_eq!(default_table_levels(&path), vec![1, 1, 1]);
+
+    // Drive the picker until it stabilizes. Shallow L1 keeps merging one table
+    // down to L2 (tight budget of 2); once L1 is under budget and L2 holds two
+    // non-overlapping tables (deep budget of 3), the policy leaves L2 lazy and
+    // records the skip instead of spawning an L3.
+    let table_probes_before = point_read_table_probes(&db, &bucket);
+    let mut guard = 0;
+    loop {
+        let before = db.stats();
+        db.compact_range_sync(KeyRange::all())
+            .expect("compaction step succeeds");
+        let after = db.stats();
+        let made_progress = after.compaction_output_tables > before.compaction_output_tables;
+        guard += 1;
+        if !made_progress || guard > 16 {
+            break;
+        }
+    }
+
+    let stats = db.stats();
+    let lazy_skips = stats
+        .compaction_skips
+        .iter()
+        .find(|row| row.skip == CompactionSkip::LowerLevelLazy)
+        .map_or(0, |row| row.occurrences);
+    assert!(
+        lazy_skips >= 1,
+        "the deep level should be left lazy at least once: {:?}",
+        stats.compaction_skips
+    );
+
+    // Read amplification does not regress: the deep level stays non-overlapping,
+    // so point reads still probe at most one table per level.
+    let table_probes_after = point_read_table_probes(&db, &bucket);
+    assert!(
+        table_probes_after <= table_probes_before,
+        "lazy deep level must not increase point table probes ({table_probes_before} -> {table_probes_after})"
+    );
+
+    // Data is still correct after the lazy policy stabilizes.
+    for chunk in 0..3 {
+        let key = format!("key-{chunk:03}").into_bytes();
+        assert_eq!(
+            bucket.get_sync(&key).expect("deep-level read"),
+            Some(format!("value-{chunk:03}").into_bytes())
+        );
+    }
+
+    drop(bucket);
+    drop(db);
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+fn point_read_table_probes(db: &Db, bucket: &trine_kv::Bucket) -> u64 {
+    let before = db.stats();
+    for chunk in 0..3 {
+        let key = format!("key-{chunk:03}").into_bytes();
+        let _ = bucket.get_sync(&key).expect("probe read");
+    }
+    let after = db.stats();
+    after
+        .read_path
+        .point_table_probes
+        .saturating_sub(before.read_path.point_table_probes)
 }
 
 #[test]

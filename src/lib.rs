@@ -158,8 +158,8 @@ pub use recovery::RecoveryReport;
 pub use runtime::{CancellationToken, RuntimeCapabilities, RuntimeMode, RuntimeOptions};
 pub use snapshot::Snapshot;
 pub use stats::{
-    CompactionTrigger, CompactionTriggerStats, DbStats, PlatformIoClassCounters,
-    PlatformIoOperationStats,
+    CompactionSkip, CompactionSkipStats, CompactionTrigger, CompactionTriggerStats, DbStats,
+    PlatformIoClassCounters, PlatformIoOperationStats,
 };
 pub use transaction::{Transaction, TransactionOptions};
 pub use types::{CommitInfo, KeyRange, KeyValue, ReadVersion, Value};

@@ -59,6 +59,8 @@ pub struct DbStats {
     pub compaction_levels: Vec<CompactionLevelStats>,
     /// Per-trigger table and byte counts read and written by compaction.
     pub compaction_triggers: Vec<CompactionTriggerStats>,
+    /// Per-reason counts for compactions the picker deliberately did not run.
+    pub compaction_skips: Vec<CompactionSkipStats>,
     /// Commit sequences allocated by writers.
     pub commit_sequences_allocated: u64,
     /// Highest commit sequence visible to readers.
@@ -510,6 +512,31 @@ pub struct CompactionTriggerStats {
     pub input_bytes: u64,
     /// Output table bytes written for this reason.
     pub output_bytes: u64,
+}
+
+/// Reason the compaction picker deliberately left a level un-compacted.
+///
+/// This is the "did not run" complement to [`CompactionTrigger`]: it explains a
+/// non-uniform per-level policy decision rather than a compaction that happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CompactionSkip {
+    /// A deeper non-level-0 level had enough non-overlapping tables that a
+    /// uniform picker would merge one downward, but the non-uniform policy left
+    /// it lazy. The level was within its depth-scaled file budget and no size,
+    /// tombstone, or blob trigger justified rewriting it. Because non-level-0
+    /// levels are non-overlapping, the extra tables add no point-read candidate
+    /// depth, so leaving them avoids write amplification without regressing
+    /// reads.
+    LowerLevelLazy,
+}
+
+/// Per-reason counts for compactions the picker deliberately did not run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionSkipStats {
+    /// Policy reason shared by the skipped compaction decisions in this row.
+    pub skip: CompactionSkip,
+    /// Number of times the picker chose this lazy decision.
+    pub occurrences: u64,
 }
 
 /// Filter counters for table-level and block-level filters.

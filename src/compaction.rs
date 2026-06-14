@@ -2,7 +2,7 @@ use std::{cmp::Ordering, ops::Bound};
 
 use crate::{
     error::{Error, Result},
-    stats::CompactionTrigger,
+    stats::{CompactionSkip, CompactionTrigger},
     table::{TableId, TableLevel, TableProperties},
     types::{KeyRange, Sequence},
 };
@@ -15,6 +15,31 @@ pub struct CompactionPlan {
     pub oldest_active_snapshot: Sequence,
     pub key_range: KeyRange,
     pub trigger: CompactionTrigger,
+}
+
+/// Outcome of one picker evaluation.
+///
+/// `plan` carries the compaction to run, if any. `skip` records a deliberate
+/// non-uniform per-level policy decision (for example, leaving a deep level
+/// lazy) so the caller can surface it through stats even when no compaction
+/// runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompactionDecision {
+    pub(crate) plan: Option<CompactionPlan>,
+    pub(crate) skip: Option<CompactionSkip>,
+}
+
+impl CompactionDecision {
+    fn planned(plan: CompactionPlan) -> Self {
+        Self {
+            plan: Some(plan),
+            skip: None,
+        }
+    }
+
+    fn idle(skip: Option<CompactionSkip>) -> Self {
+        Self { plan: None, skip }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,10 +103,10 @@ pub(crate) fn plan_compaction(
     range: &KeyRange,
     oldest_active_snapshot: Sequence,
     options: CompactionOptions,
-) -> Result<Option<CompactionPlan>> {
+) -> Result<CompactionDecision> {
     if let Some(input_tables) = l0_compaction_inputs(tables, range, options) {
         let key_range = key_range_for_inputs(tables, &input_tables);
-        return Ok(Some(CompactionPlan {
+        return Ok(CompactionDecision::planned(CompactionPlan {
             bucket: bucket.to_owned(),
             input_tables,
             output_level: TableLevel(1),
@@ -96,7 +121,7 @@ pub(crate) fn plan_compaction(
         let input_tables = narrow_leveled_inputs(tables, range, level, output_level);
         if !input_tables.is_empty() {
             let key_range = key_range_for_inputs(tables, &input_tables);
-            return Ok(Some(CompactionPlan {
+            return Ok(CompactionDecision::planned(CompactionPlan {
                 bucket: bucket.to_owned(),
                 input_tables,
                 output_level,
@@ -107,16 +132,26 @@ pub(crate) fn plan_compaction(
         }
     }
 
+    // No-pressure fallback. The non-uniform per-level policy only merges a level
+    // downward when its in-range table count reaches the level's depth-scaled
+    // budget. Shallow levels stay tight so data keeps spreading toward larger
+    // levels; deep levels stay lazy because their extra non-overlapping tables
+    // add no point-read candidate depth and rewriting them only spawns an even
+    // deeper level. `LevelSize` above still compacts any over-target level.
     let Some(level) = shallowest_multi_table_level(tables, range) else {
-        return Ok(None);
+        return Ok(CompactionDecision::idle(lower_level_lazy_skip(
+            tables, range,
+        )));
     };
     let output_level = level.next().ok_or_else(level_overflow)?;
     let input_tables = narrow_leveled_inputs(tables, range, level, output_level);
     if input_tables.is_empty() {
-        return Ok(None);
+        return Ok(CompactionDecision::idle(lower_level_lazy_skip(
+            tables, range,
+        )));
     }
 
-    Ok(Some(CompactionPlan {
+    Ok(CompactionDecision::planned(CompactionPlan {
         bucket: bucket.to_owned(),
         key_range: key_range_for_inputs(tables, &input_tables),
         input_tables,
@@ -124,6 +159,49 @@ pub(crate) fn plan_compaction(
         oldest_active_snapshot,
         trigger: CompactionTrigger::MultiTableLevel,
     }))
+}
+
+/// Number of in-range tables a non-level-0 level must hold before the
+/// no-pressure fallback merges one of them downward.
+///
+/// The budget grows with depth (`1 + level`: L1 -> 2, L2 -> 3, L3 -> 4, ...) so
+/// shallow levels are compacted aggressively to keep read candidates low while
+/// deep levels are left lazy until size pressure justifies a rewrite.
+fn multi_table_fallback_threshold(level: TableLevel) -> usize {
+    1usize.saturating_add(level.get() as usize)
+}
+
+/// Report a `LowerLevelLazy` skip when at least one non-level-0 level holds two
+/// or more in-range tables (which the old uniform `>= 2` rule would have merged)
+/// but stays under its depth-scaled budget, so the picker leaves it lazy.
+fn lower_level_lazy_skip(tables: &[CompactionTable], range: &KeyRange) -> Option<CompactionSkip> {
+    let suppressed = level_set(tables, range).into_iter().any(|level| {
+        let count = overlapping_table_count(tables, range, level);
+        count >= 2 && count < multi_table_fallback_threshold(level)
+    });
+    suppressed.then_some(CompactionSkip::LowerLevelLazy)
+}
+
+fn level_set(
+    tables: &[CompactionTable],
+    range: &KeyRange,
+) -> std::collections::BTreeSet<TableLevel> {
+    tables
+        .iter()
+        .filter(|table| table.level != TableLevel::ZERO && table.overlaps_range(range))
+        .map(|table| table.level)
+        .collect()
+}
+
+fn overlapping_table_count(
+    tables: &[CompactionTable],
+    range: &KeyRange,
+    level: TableLevel,
+) -> usize {
+    tables
+        .iter()
+        .filter(|table| table.level == level && table.overlaps_range(range))
+        .count()
 }
 
 fn l0_compaction_inputs(
@@ -277,19 +355,9 @@ fn shallowest_multi_table_level(
     tables: &[CompactionTable],
     range: &KeyRange,
 ) -> Option<TableLevel> {
-    tables
-        .iter()
-        .filter(|table| table.level != TableLevel::ZERO && table.overlaps_range(range))
-        .map(|table| table.level)
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .find(|level| {
-            tables
-                .iter()
-                .filter(|table| table.level == *level && table.overlaps_range(range))
-                .count()
-                >= 2
-        })
+    level_set(tables, range).into_iter().find(|level| {
+        overlapping_table_count(tables, range, *level) >= multi_table_fallback_threshold(*level)
+    })
 }
 
 fn highest_scored_level(
@@ -489,6 +557,7 @@ mod tests {
             options(),
         )
         .expect("planning succeeds")
+        .plan
         .expect("plan exists");
 
         assert_eq!(plan.input_tables, vec![TableId(1), TableId(2), TableId(3)]);
@@ -509,6 +578,7 @@ mod tests {
             options(),
         )
         .expect("planning succeeds")
+        .plan
         .expect("plan exists");
 
         assert_eq!(plan.input_tables, vec![TableId(1), TableId(2)]);
@@ -527,6 +597,7 @@ mod tests {
             options(),
         )
         .expect("planning succeeds")
+        .plan
         .expect("plan exists");
 
         assert_eq!(plan.input_tables, vec![TableId(1)]);
@@ -549,6 +620,7 @@ mod tests {
             options(),
         )
         .expect("planning succeeds")
+        .plan
         .expect("plan exists");
 
         assert_eq!(plan.input_tables, vec![TableId(1), TableId(2)]);
@@ -574,6 +646,7 @@ mod tests {
             options(),
         )
         .expect("planning succeeds")
+        .plan
         .expect("plan exists");
 
         assert_eq!(plan.input_tables, vec![TableId(1)]);
@@ -598,6 +671,7 @@ mod tests {
             options(),
         )
         .expect("planning succeeds")
+        .plan
         .expect("plan exists");
 
         assert_eq!(plan.input_tables, vec![TableId(1), TableId(3)]);
@@ -622,6 +696,7 @@ mod tests {
             options(),
         )
         .expect("planning succeeds")
+        .plan
         .expect("plan exists");
 
         assert_eq!(plan.input_tables, vec![TableId(1), TableId(3), TableId(4)]);
@@ -647,6 +722,7 @@ mod tests {
             options(),
         )
         .expect("planning succeeds")
+        .plan
         .expect("plan exists");
 
         assert_eq!(plan.input_tables, vec![TableId(2), TableId(3)]);
@@ -671,6 +747,7 @@ mod tests {
             options(),
         )
         .expect("planning succeeds")
+        .plan
         .expect("plan exists");
 
         assert_eq!(plan.input_tables, vec![TableId(2), TableId(3)]);
@@ -693,10 +770,112 @@ mod tests {
             options(),
         )
         .expect("planning succeeds")
+        .plan
         .expect("plan exists");
 
         assert_eq!(plan.input_tables, vec![TableId(2)]);
         assert_eq!(plan.output_level, TableLevel(2));
+    }
+
+    #[test]
+    fn shallow_multi_table_level_still_merges_at_two_tables() {
+        // L1 stays tight: two non-overlapping tables and no L0 trigger one
+        // guard-local downward merge, preserving the upper/middle policy.
+        let tables = vec![
+            table(1, 1, b"a", b"b"),
+            table(2, 1, b"c", b"d"),
+            table(3, 2, b"a", b"d"),
+        ];
+
+        let decision = plan_compaction(
+            "default",
+            &tables,
+            &KeyRange::all(),
+            Sequence::ZERO,
+            options(),
+        )
+        .expect("planning succeeds");
+
+        let plan = decision.plan.expect("plan exists");
+        assert_eq!(plan.trigger, CompactionTrigger::MultiTableLevel);
+        assert_eq!(decision.skip, None);
+    }
+
+    #[test]
+    fn deep_level_stays_lazy_below_depth_budget() {
+        // L2 holds two non-overlapping tables but its depth-scaled budget is 3,
+        // so the no-pressure fallback leaves it lazy and reports the skip.
+        let tables = vec![
+            table(1, 1, b"a", b"z"),
+            table(2, 2, b"a", b"b"),
+            table(3, 2, b"c", b"d"),
+        ];
+
+        let decision = plan_compaction(
+            "default",
+            &tables,
+            &KeyRange::all(),
+            Sequence::ZERO,
+            options(),
+        )
+        .expect("planning succeeds");
+
+        assert_eq!(decision.plan, None);
+        assert_eq!(
+            decision.skip,
+            Some(crate::stats::CompactionSkip::LowerLevelLazy)
+        );
+    }
+
+    #[test]
+    fn deep_level_merges_once_budget_is_reached() {
+        // Three non-overlapping L2 tables reach the L2 budget of 3, so the
+        // fallback merges one guard-local input downward.
+        let tables = vec![
+            table(1, 1, b"a", b"z"),
+            table(2, 2, b"a", b"b"),
+            table(3, 2, b"d", b"e"),
+            table(4, 2, b"h", b"i"),
+        ];
+
+        let decision = plan_compaction(
+            "default",
+            &tables,
+            &KeyRange::all(),
+            Sequence::ZERO,
+            options(),
+        )
+        .expect("planning succeeds");
+
+        let plan = decision.plan.expect("plan exists");
+        assert_eq!(plan.trigger, CompactionTrigger::MultiTableLevel);
+        assert_eq!(plan.output_level, TableLevel(3));
+        assert_eq!(plan.input_tables.len(), 1);
+        assert_eq!(decision.skip, None);
+    }
+
+    #[test]
+    fn deep_level_size_pressure_still_compacts_when_over_target() {
+        // Even under the lazy budget, a level above its byte target compacts via
+        // the LevelSize trigger: lower levels are lazy only without a trigger.
+        let tables = vec![
+            table_with_bytes(1, 1, b"a", b"z", 1),
+            table_with_bytes(2, 2, b"a", b"b", 5_000),
+            table_with_bytes(3, 2, b"c", b"d", 5_000),
+        ];
+
+        let decision = plan_compaction(
+            "default",
+            &tables,
+            &KeyRange::all(),
+            Sequence::ZERO,
+            options(),
+        )
+        .expect("planning succeeds");
+
+        let plan = decision.plan.expect("plan exists");
+        assert_eq!(plan.trigger, CompactionTrigger::LevelSize);
+        assert_eq!(decision.skip, None);
     }
 
     fn table(id: u64, level: u32, smallest: &[u8], largest: &[u8]) -> CompactionTable {

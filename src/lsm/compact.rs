@@ -8,7 +8,7 @@ use crate::{
     iterator::{Direction, RecordGroup, ScanSelector},
     options::BucketOptions,
     range_tombstone,
-    stats::CompactionTrigger,
+    stats::{CompactionSkip, CompactionTrigger},
     table::{self, Table, TablePointCursor, TableRangeTombstone},
     types::{KeyRange, Sequence},
 };
@@ -33,6 +33,17 @@ pub(crate) struct CompactionOutput {
     pub(crate) tables: Vec<Arc<Table>>,
 }
 
+/// Result of planning compaction for one bucket.
+///
+/// `input` is the compaction to run, if any. `skip` records a deliberate
+/// non-uniform per-level policy decision (such as leaving a deep level lazy) so
+/// the caller can surface it through stats even when nothing is compacted.
+#[derive(Debug)]
+pub(crate) struct CompactionPlanResult {
+    pub(crate) input: Option<CompactionInput>,
+    pub(crate) skip: Option<CompactionSkip>,
+}
+
 #[derive(Debug)]
 pub(crate) struct CompactionTablePayload {
     pub(crate) point_records: Vec<(InternalKey, Option<ValueRef>)>,
@@ -52,7 +63,7 @@ impl LsmTree {
         range: &KeyRange,
         oldest_active_snapshot: Sequence,
         options: compaction::CompactionOptions,
-    ) -> Result<Option<CompactionInput>> {
+    ) -> Result<CompactionPlanResult> {
         let version = self.current_version()?;
         let tables = version.table_handles();
         let plan_tables = tables
@@ -64,15 +75,16 @@ impl LsmTree {
                 )
             })
             .collect::<Vec<_>>();
-        let Some(plan) = compaction::plan_compaction(
+        let decision = compaction::plan_compaction(
             bucket,
             &plan_tables,
             range,
             oldest_active_snapshot,
             options,
-        )?
-        else {
-            return Ok(None);
+        )?;
+        let skip = decision.skip;
+        let Some(plan) = decision.plan else {
+            return Ok(CompactionPlanResult { input: None, skip });
         };
         let input_table_ids = plan.input_tables.iter().copied().collect::<BTreeSet<_>>();
         let full_bucket_compaction = range_is_all(range)
@@ -90,16 +102,19 @@ impl LsmTree {
             .collect::<Vec<_>>();
         let trivial_move = can_move_without_rewrite(&input_tables, plan.output_level);
 
-        Ok(Some(CompactionInput {
-            table_level: plan.output_level,
-            table_options: table_write_options(&self.options),
-            input_table_ids,
-            compaction_range: plan.key_range,
-            trigger: plan.trigger,
-            trivial_move,
-            full_bucket_compaction,
-            input_tables,
-        }))
+        Ok(CompactionPlanResult {
+            input: Some(CompactionInput {
+                table_level: plan.output_level,
+                table_options: table_write_options(&self.options),
+                input_table_ids,
+                compaction_range: plan.key_range,
+                trigger: plan.trigger,
+                trivial_move,
+                full_bucket_compaction,
+                input_tables,
+            }),
+            skip,
+        })
     }
 
     pub(crate) fn build_compaction_table_payloads(
@@ -601,6 +616,7 @@ mod tests {
         compaction::CompactionOptions,
         lsm::LsmTree,
         options::BucketOptions,
+        stats::CompactionSkip,
         table::{self, TableId, TableLevel},
         types::{KeyRange, Sequence},
     };
@@ -766,6 +782,7 @@ mod tests {
                 },
             )
             .expect("planning succeeds")
+            .input
             .expect("plan exists");
 
         assert_eq!(input.input_tables.len(), 1);
@@ -798,10 +815,48 @@ mod tests {
                 },
             )
             .expect("planning succeeds")
+            .input
             .expect("plan exists");
 
         assert_eq!(input.input_tables.len(), 2);
         assert!(input.full_bucket_compaction);
+        fs::remove_dir_all(table_dir).expect("cleanup table dir");
+    }
+
+    #[test]
+    fn deep_level_under_budget_reports_lower_level_lazy_skip() {
+        let table_dir = temp_table_dir("lower-level-lazy");
+        // L1 holds one in-range table while L2 holds two non-overlapping tables.
+        // L2's depth-scaled budget is 3, so the no-pressure fallback leaves it
+        // lazy and reports the policy skip instead of merging it into L3.
+        let tree = LsmTree::new(
+            BucketOptions::default(),
+            vec![
+                test_table(&table_dir, 1, 1, "m"),
+                test_table(&table_dir, 2, 2, "a"),
+                test_table(&table_dir, 3, 2, "z"),
+            ],
+        )
+        .expect("tree builds");
+
+        let result = tree
+            .plan_compaction(
+                "default",
+                &KeyRange::all(),
+                Sequence::ZERO,
+                CompactionOptions {
+                    // A huge target keeps every level under its byte target so no
+                    // LevelSize trigger fires and the no-pressure policy is tested.
+                    target_table_bytes: u64::MAX / 4,
+                    level_size_multiplier: 2,
+                    max_l0_files: 4,
+                    local_l0_compaction: true,
+                },
+            )
+            .expect("planning succeeds");
+
+        assert!(result.input.is_none(), "deep level stays lazy");
+        assert_eq!(result.skip, Some(CompactionSkip::LowerLevelLazy));
         fs::remove_dir_all(table_dir).expect("cleanup table dir");
     }
 
