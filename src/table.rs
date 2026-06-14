@@ -2493,6 +2493,8 @@ pub(crate) struct TablePointCursor {
     block_index: Option<usize>,
     record_index: usize,
     current_block: Option<(usize, Arc<DecodedDataBlock>)>,
+    current_block_had_prefix_filter: bool,
+    current_block_matched_selector: bool,
     pending: Option<ScanRecord>,
     exhausted: bool,
 }
@@ -2520,6 +2522,8 @@ impl TablePointCursor {
             block_index,
             record_index: 0,
             current_block: None,
+            current_block_had_prefix_filter: false,
+            current_block_matched_selector: false,
             pending: None,
             exhausted: false,
         }
@@ -2604,7 +2608,9 @@ impl TablePointCursor {
             };
             if !self.current_block_is(block_index) {
                 match self.forward_block_state(block_index)? {
-                    CursorBlockState::Scan => {}
+                    CursorBlockState::Scan { had_prefix_filter } => {
+                        self.prepare_current_block_scan(had_prefix_filter);
+                    }
                     CursorBlockState::Skip => {
                         self.move_to_next_block();
                         continue;
@@ -2626,9 +2632,11 @@ impl TablePointCursor {
                 {
                     ForwardKeyState::Before => {}
                     ForwardKeyState::Match => {
+                        self.current_block_matched_selector = true;
                         return Ok(Some((record.internal_key, record.value)));
                     }
                     ForwardKeyState::After => {
+                        self.finish_current_block_scan();
                         self.exhausted = true;
                         return Ok(None);
                     }
@@ -2648,7 +2656,9 @@ impl TablePointCursor {
             };
             if !self.current_block_is(block_index) {
                 match self.forward_block_state_async(block_index).await? {
-                    CursorBlockState::Scan => {}
+                    CursorBlockState::Scan { had_prefix_filter } => {
+                        self.prepare_current_block_scan(had_prefix_filter);
+                    }
                     CursorBlockState::Skip => {
                         self.move_to_next_block();
                         continue;
@@ -2672,9 +2682,11 @@ impl TablePointCursor {
                 {
                     ForwardKeyState::Before => {}
                     ForwardKeyState::Match => {
+                        self.current_block_matched_selector = true;
                         return Ok(Some((record.internal_key, record.value)));
                     }
                     ForwardKeyState::After => {
+                        self.finish_current_block_scan();
                         self.exhausted = true;
                         return Ok(None);
                     }
@@ -2694,7 +2706,9 @@ impl TablePointCursor {
             };
             if !self.current_block_is(block_index) {
                 match self.reverse_block_state(block_index)? {
-                    CursorBlockState::Scan => {}
+                    CursorBlockState::Scan { had_prefix_filter } => {
+                        self.prepare_current_block_scan(had_prefix_filter);
+                    }
                     CursorBlockState::Skip => {
                         self.move_to_previous_block();
                         continue;
@@ -2717,9 +2731,11 @@ impl TablePointCursor {
                 {
                     ReverseKeyState::Above => {}
                     ReverseKeyState::Match => {
+                        self.current_block_matched_selector = true;
                         return Ok(Some((record.internal_key, record.value)));
                     }
                     ReverseKeyState::Below => {
+                        self.finish_current_block_scan();
                         self.exhausted = true;
                         return Ok(None);
                     }
@@ -2739,7 +2755,9 @@ impl TablePointCursor {
             };
             if !self.current_block_is(block_index) {
                 match self.reverse_block_state_async(block_index).await? {
-                    CursorBlockState::Scan => {}
+                    CursorBlockState::Scan { had_prefix_filter } => {
+                        self.prepare_current_block_scan(had_prefix_filter);
+                    }
                     CursorBlockState::Skip => {
                         self.move_to_previous_block();
                         continue;
@@ -2764,9 +2782,11 @@ impl TablePointCursor {
                 {
                     ReverseKeyState::Above => {}
                     ReverseKeyState::Match => {
+                        self.current_block_matched_selector = true;
                         return Ok(Some((record.internal_key, record.value)));
                     }
                     ReverseKeyState::Below => {
+                        self.finish_current_block_scan();
                         self.exhausted = true;
                         return Ok(None);
                     }
@@ -2794,7 +2814,9 @@ impl TablePointCursor {
                         if key_is_after_end(block.smallest_internal_key.user_key(), &range.end) {
                             Ok(CursorBlockState::Done)
                         } else if block.overlaps_range(range) {
-                            Ok(CursorBlockState::Scan)
+                            Ok(CursorBlockState::Scan {
+                                had_prefix_filter: false,
+                            })
                         } else {
                             Ok(CursorBlockState::Skip)
                         }
@@ -2811,15 +2833,19 @@ impl TablePointCursor {
                             .as_ref()
                             .is_some_and(|(current_index, _)| *current_index == block_index)
                         {
-                            Ok(CursorBlockState::Scan)
+                            Ok(CursorBlockState::Scan {
+                                had_prefix_filter: false,
+                            })
                         } else {
-                            let (allowed, _) = self.table.block_prefix_filter_allows(
+                            let (allowed, had_filter) = self.table.block_prefix_filter_allows(
                                 block,
                                 prefix,
                                 &self.prefix_extractor,
                             );
                             if allowed {
-                                Ok(CursorBlockState::Scan)
+                                Ok(CursorBlockState::Scan {
+                                    had_prefix_filter: had_filter,
+                                })
                             } else {
                                 self.table.read_path_stats.record_prefix_filter_miss();
                                 Ok(CursorBlockState::Skip)
@@ -2843,7 +2869,9 @@ impl TablePointCursor {
                         if key_is_after_end(block.smallest_internal_key.user_key(), &range.end) {
                             Ok(CursorBlockState::Done)
                         } else if block.overlaps_range(range) {
-                            Ok(CursorBlockState::Scan)
+                            Ok(CursorBlockState::Scan {
+                                had_prefix_filter: false,
+                            })
                         } else {
                             Ok(CursorBlockState::Skip)
                         }
@@ -2860,15 +2888,19 @@ impl TablePointCursor {
                             .as_ref()
                             .is_some_and(|(current_index, _)| *current_index == block_index)
                         {
-                            Ok(CursorBlockState::Scan)
+                            Ok(CursorBlockState::Scan {
+                                had_prefix_filter: false,
+                            })
                         } else {
-                            let (allowed, _) = self.table.block_prefix_filter_allows(
+                            let (allowed, had_filter) = self.table.block_prefix_filter_allows(
                                 block,
                                 prefix,
                                 &self.prefix_extractor,
                             );
                             if allowed {
-                                Ok(CursorBlockState::Scan)
+                                Ok(CursorBlockState::Scan {
+                                    had_prefix_filter: had_filter,
+                                })
                             } else {
                                 self.table.read_path_stats.record_prefix_filter_miss();
                                 Ok(CursorBlockState::Skip)
@@ -2896,7 +2928,9 @@ impl TablePointCursor {
                         {
                             Ok(CursorBlockState::Done)
                         } else if block.overlaps_range(range) {
-                            Ok(CursorBlockState::Scan)
+                            Ok(CursorBlockState::Scan {
+                                had_prefix_filter: false,
+                            })
                         } else {
                             Ok(CursorBlockState::Skip)
                         }
@@ -2911,15 +2945,19 @@ impl TablePointCursor {
                             .as_ref()
                             .is_some_and(|(current_index, _)| *current_index == block_index)
                         {
-                            Ok(CursorBlockState::Scan)
+                            Ok(CursorBlockState::Scan {
+                                had_prefix_filter: false,
+                            })
                         } else {
-                            let (allowed, _) = self.table.block_prefix_filter_allows(
+                            let (allowed, had_filter) = self.table.block_prefix_filter_allows(
                                 block,
                                 prefix,
                                 &self.prefix_extractor,
                             );
                             if allowed {
-                                Ok(CursorBlockState::Scan)
+                                Ok(CursorBlockState::Scan {
+                                    had_prefix_filter: had_filter,
+                                })
                             } else {
                                 self.table.read_path_stats.record_prefix_filter_miss();
                                 Ok(CursorBlockState::Skip)
@@ -2944,7 +2982,9 @@ impl TablePointCursor {
                         {
                             Ok(CursorBlockState::Done)
                         } else if block.overlaps_range(range) {
-                            Ok(CursorBlockState::Scan)
+                            Ok(CursorBlockState::Scan {
+                                had_prefix_filter: false,
+                            })
                         } else {
                             Ok(CursorBlockState::Skip)
                         }
@@ -2959,15 +2999,19 @@ impl TablePointCursor {
                             .as_ref()
                             .is_some_and(|(current_index, _)| *current_index == block_index)
                         {
-                            Ok(CursorBlockState::Scan)
+                            Ok(CursorBlockState::Scan {
+                                had_prefix_filter: false,
+                            })
                         } else {
-                            let (allowed, _) = self.table.block_prefix_filter_allows(
+                            let (allowed, had_filter) = self.table.block_prefix_filter_allows(
                                 block,
                                 prefix,
                                 &self.prefix_extractor,
                             );
                             if allowed {
-                                Ok(CursorBlockState::Scan)
+                                Ok(CursorBlockState::Scan {
+                                    had_prefix_filter: had_filter,
+                                })
                             } else {
                                 self.table.read_path_stats.record_prefix_filter_miss();
                                 Ok(CursorBlockState::Skip)
@@ -2984,6 +3028,7 @@ impl TablePointCursor {
             self.exhausted = true;
             return;
         };
+        self.finish_current_block_scan();
         let next = block_index + 1;
         self.block_index = (next < self.table.data_block_count).then_some(next);
         self.record_index = 0;
@@ -2995,9 +3040,26 @@ impl TablePointCursor {
             self.exhausted = true;
             return;
         };
+        self.finish_current_block_scan();
         self.block_index = block_index.checked_sub(1);
         self.record_index = 0;
         self.current_block = None;
+    }
+
+    fn prepare_current_block_scan(&mut self, had_prefix_filter: bool) {
+        self.current_block_had_prefix_filter = had_prefix_filter;
+        self.current_block_matched_selector = false;
+    }
+
+    fn finish_current_block_scan(&mut self) {
+        if self.selector.prefix().is_some()
+            && self.current_block_had_prefix_filter
+            && !self.current_block_matched_selector
+        {
+            self.table.filter_stats.record_block_prefix_false_positive();
+        }
+        self.current_block_had_prefix_filter = false;
+        self.current_block_matched_selector = false;
     }
 
     fn ensure_current_block(&mut self, block_index: usize) -> Result<()> {
@@ -3011,23 +3073,6 @@ impl TablePointCursor {
         let block = self
             .table
             .load_data_block(block_index, self.block_cache.as_deref())?;
-        if let ScanSelector::Prefix(prefix) = &self.selector {
-            self.table
-                .read_path_stats
-                .record_prefix_block_metadata_probe();
-            if self.table.with_data_block_metadata(
-                block_index,
-                self.block_cache.as_deref(),
-                |table_block| {
-                    Ok(table_block
-                        .prefix_filter_result(prefix, &self.prefix_extractor)
-                        .is_some())
-                },
-            )? && !data_block_has_prefix(&block, prefix, self.policy)?
-            {
-                self.table.filter_stats.record_block_prefix_false_positive();
-            }
-        }
         self.record_index = match self.direction {
             Direction::Forward => {
                 first_record_index_for_decoded_block(&block, &self.selector, self.policy)?
@@ -3050,27 +3095,6 @@ impl TablePointCursor {
             .table
             .load_data_block_async(block_index, self.block_cache.as_deref())
             .await?;
-        if let ScanSelector::Prefix(prefix) = &self.selector {
-            self.table
-                .read_path_stats
-                .record_prefix_block_metadata_probe();
-            if self
-                .table
-                .with_data_block_metadata_async(
-                    block_index,
-                    self.block_cache.as_deref(),
-                    |table_block| {
-                        Ok(table_block
-                            .prefix_filter_result(prefix, &self.prefix_extractor)
-                            .is_some())
-                    },
-                )
-                .await?
-                && !data_block_has_prefix(&block, prefix, self.policy)?
-            {
-                self.table.filter_stats.record_block_prefix_false_positive();
-            }
-        }
         self.record_index = match self.direction {
             Direction::Forward => {
                 first_record_index_for_decoded_block(&block, &self.selector, self.policy)?
@@ -3172,7 +3196,7 @@ enum PrefixBlockDecision {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CursorBlockState {
-    Scan,
+    Scan { had_prefix_filter: bool },
     Skip,
     Done,
 }
@@ -3330,21 +3354,6 @@ fn data_block_point_records_with_prefix(
         records.push(record.to_owned());
     }
     Ok(records)
-}
-
-fn data_block_has_prefix(
-    block: &DecodedDataBlock,
-    prefix: &[u8],
-    policy: IndexSearchPolicy,
-) -> Result<bool> {
-    let start = data_block_restart_index_for_key(block, prefix, policy)?;
-    for record_index in start..block.record_count() {
-        let record = block.record_view(record_index)?;
-        if record.user_key >= prefix {
-            return Ok(record.user_key.starts_with(prefix));
-        }
-    }
-    Ok(false)
 }
 
 fn data_block_restart_index_for_bound(

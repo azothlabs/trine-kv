@@ -4384,7 +4384,7 @@ flush, WAL append, or sync boundaries as the next largest risk.
 
 ### Phase 178: Range And Prefix Scan Read-Amplification
 
-**Status**: Planned
+**Status**: Complete
 
 **Goal**: Reduce range and prefix scan table/block work when grouped evidence
 shows scan workloads are the next target.

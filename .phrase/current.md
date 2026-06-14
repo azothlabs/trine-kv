@@ -6,63 +6,66 @@ Complete
 
 ## Goal
 
-Measure and reduce confirmed-write latency and write/flush throughput cost
-without weakening durability defaults or changing storage formats.
+Measure and reduce range/prefix scan table and block work while preserving
+MVCC visibility, range-delete behavior, prefix-filter semantics, and storage
+formats.
 
 ## Scope
 
-- Persistent write diagnostics for default-bucket puts and explicit
-  `WriteBatch` commits.
-- WAL append, WAL persist, memtable publication, flush-triggered work, and
-  storage operation counters.
-- One measured write-path optimization if diagnostics expose a safe dominant
+- Range and prefix scan diagnostics for memory, active memtable, persistent
+  table, and prefix-partition workloads.
+- Table candidate selection, prefix filters, block metadata probes, data block
+  reads, range tombstone checks, and iterator advancement costs.
+- One measured scan-path optimization if diagnostics expose a safe dominant
   cost.
 
 ## Out Of Scope
 
 - Storage format changes.
-- Durability weakening or making confirmed writes less recoverable.
-- Manifest, WAL, SSTable, blob, MVCC, transaction, compaction, platform-io
-  backend, publishing, tagging, pushing, or release workflow changes.
-- Scan, cache, codec, and blob-value optimization.
+- MVCC visibility, snapshot, range-delete, prefix-filter, table format, WAL,
+  manifest, compaction, platform-io, publishing, tagging, pushing, or release
+  workflow changes.
+- Block-cache policy, compression codec, blob-value, write durability, and
+  startup/recovery optimization.
 
 ## Acceptance Gate
 
-- Write diagnostics classify WAL append, WAL persist, publication, and flush
-  work before optimization.
-- Any retained code change preserves documented durability and storage formats.
-- Focused write/WAL tests pass.
+- Scan diagnostics classify table candidate selection, prefix filters, block
+  metadata probes, data block reads, range tombstone checks, and iterator
+  advancement before optimization.
+- Any retained code change preserves MVCC visibility, range-delete behavior,
+  prefix-filter semantics, and storage formats.
+- Focused range/prefix/table tests pass.
 - Strict clippy passes.
 - Single-run and grouped benchmark evidence records before/after behavior.
 
 ## Active Task Slice
 
 ```text
-task786 [x] goal:add persistent write-path diagnostics | scope:benches/v1_bench.rs | verify:TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench
-task787 [x] goal:optimize measured write-path bottleneck | scope:src/wal.rs | verify:cargo test -q wal_front_door_persists_only_dirty_shards --lib
-task788 [x] goal:record write-path evidence | scope:docs/benchmarks .phrase/evidence.md | verify:git diff review
+task789 [x] goal:add scan diagnostics | scope:benches/v1_bench.rs | verify:TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench
+task790 [x] goal:optimize measured scan-path bottleneck | scope:src/table.rs | verify:cargo test -q prefix --lib && cargo test -q range --lib
+task791 [x] goal:record scan evidence | scope:docs/benchmarks .phrase/evidence.md | verify:git diff review
 ```
 
 ## Evidence
 
-- Current `single-key put` and `batch write` benchmark rows use an in-memory
-  database, so they do not diagnose WAL/fsync behavior.
-- The engine already preaccepts normal non-transaction WAL writes before
-  entering the global publish barrier when the WAL front door is available.
-- The measured dominant avoidable cost was explicit `persist_sync(SyncData)`
-  repeatedly syncing clean WAL shards: 256 commits produced 1018 persist
-  requests before the fix.
-- After tracking per-lane WAL durability, the same diagnostic produced 256
-  persist requests and reduced median persist wall time from about 1.21s to
-  about 0.49s.
+- Phase 177 completed WAL dirty-lane persist optimization.
+- Prefix table-partition matching scans were the clearest measured scan target:
+  baseline median was 3052 us, with 472 block metadata probes and 152 data
+  block reads across 128 scans.
+- The retained change keeps block-level prefix filter state in the table cursor
+  and records false positives when the cursor leaves a block instead of
+  re-reading metadata and scanning the decoded block after load.
+- After the change, prefix table-partition matching scans recorded 320 block
+  metadata probes, the same 152 data block reads, and 2880 us median.
 
 ## Known Residuals
 
-- Per-commit `SyncData`/`SyncAll` confirmed writes remain dominated by real
-  storage sync cost. Avoiding that requires caller-side batching or a larger
-  group-commit design with explicit visibility and durability semantics.
+- General in-memory `prefix scan` is not on the table cursor path and showed
+  run-to-run noise in this phase. The retained optimization is scoped to
+  persistent table prefix scans.
 
 ## Next Recommendation
 
-- Move next to the remaining benchmark-backed optimization item selected by
-  current evidence, likely scan/search-policy or block-cache/decode work.
+- Move next to block-cache/decode or search-policy work, whichever the latest
+  grouped benchmark evidence makes most valuable.

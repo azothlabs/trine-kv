@@ -12076,3 +12076,52 @@ Negative check:
 - Treat write-path dirty-lane persist as complete.
 - Choose the next measured optimization from remaining benchmark evidence,
   likely scan/search-policy or block-cache/decode work.
+
+## 2026-06-14: Prefix Scan Cursor Metadata Reuse
+
+### Observation
+
+- Phase 178 benchmark baseline selected the persistent prefix table-partition
+  scan as the clearest scan-path target.
+- Before the change:
+  - `prefix scan table partitions matching`: 3052 us median.
+  - `read pruning prefix matching block metadata probes`: 472.
+  - `read pruning prefix matching data block reads`: 152.
+- The table prefix cursor checked block metadata/prefix filter before loading
+  a data block, then checked metadata again and scanned the decoded block only
+  to decide whether to record a prefix-filter false positive.
+- After keeping the block prefix-filter state in the cursor and recording
+  false positives when leaving a block:
+  - `prefix scan table partitions matching`: 2880 us median.
+  - `read pruning prefix matching block metadata probes`: 320.
+  - `read pruning prefix matching data block reads`: 152.
+
+### Interpretation
+
+- The avoided cost is redundant metadata and decoded-block prefix checking in
+  persistent table prefix scans.
+- The change does not alter table format, prefix-filter decisions, MVCC
+  visibility, or range-delete behavior. It only moves false-positive accounting
+  to the point where the cursor knows whether the block returned a matching
+  record.
+- The general `prefix scan` benchmark is in-memory and does not use the table
+  cursor; its run-to-run movement is noise for this retained change.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q prefix --lib`
+- `cargo test -q range --lib`
+- `cargo clippy --lib -- -D warnings`
+- `cargo test -q --lib`
+- `cargo test -q persistent_prefix`
+- `cargo test -q persistent_async_range_and_prefix_advance_flushed_tables`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench`
+- `git diff --check`
+
+### Recommended Next Action
+
+- Treat Phase 178 as complete.
+- Move next to block-cache/decode or search-policy work based on grouped
+  benchmark evidence.
