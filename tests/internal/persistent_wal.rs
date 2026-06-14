@@ -1681,6 +1681,106 @@ fn persistent_flush_auto_compacts_overlapping_l0_below_file_limit() {
 }
 
 #[test]
+fn persistent_tombstone_only_table_hides_range_and_prefix_scans() {
+    let path = temp_db_path("tombstone-only-scan-guard");
+    let mut options = DbOptions::persistent(&path);
+    options.max_l0_files = 64;
+
+    {
+        let db = Db::open_sync(options.clone()).expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
+
+        bucket.put_sync(b"user:1", b"old").expect("write user 1");
+        bucket.put_sync(b"user:2", b"old").expect("write user 2");
+        bucket.put_sync(b"order:1", b"keep").expect("write order");
+        db.flush_sync().expect("flush point table");
+        let snapshot = db.snapshot();
+
+        bucket
+            .delete_range_sync(KeyRange::all())
+            .expect("delete all range");
+        db.flush_sync().expect("flush tombstone-only table");
+
+        assert_eq!(bucket.get_sync(b"user:1").expect("point hidden"), None);
+
+        let before_range = db.stats();
+        assert_eq!(
+            collect_rows(bucket.range_sync(&KeyRange::all()).expect("range hidden")),
+            Vec::<(Vec<u8>, Vec<u8>)>::new()
+        );
+        let after_range = db.stats();
+        assert!(
+            after_range
+                .read_path
+                .range_tombstone_table_probes
+                .saturating_sub(before_range.read_path.range_tombstone_table_probes)
+                > 0,
+            "range scans must inspect candidate tombstone tables"
+        );
+
+        assert_eq!(
+            collect_rows(
+                bucket
+                    .range_reverse_sync(&KeyRange::all())
+                    .expect("reverse range hidden")
+            ),
+            Vec::<(Vec<u8>, Vec<u8>)>::new()
+        );
+
+        let before_prefix = db.stats();
+        assert_eq!(
+            collect_rows(bucket.prefix_sync(b"user:").expect("prefix hidden")),
+            Vec::<(Vec<u8>, Vec<u8>)>::new()
+        );
+        let after_prefix = db.stats();
+        assert!(
+            after_prefix
+                .read_path
+                .prefix_tombstone_table_probes
+                .saturating_sub(before_prefix.read_path.prefix_tombstone_table_probes)
+                > 0,
+            "prefix scans must inspect candidate tombstone tables"
+        );
+        assert_eq!(
+            collect_rows(
+                bucket
+                    .prefix_reverse_sync(b"user:")
+                    .expect("reverse prefix hidden")
+            ),
+            Vec::<(Vec<u8>, Vec<u8>)>::new()
+        );
+
+        assert_eq!(
+            collect_rows(
+                snapshot
+                    .range_sync(&bucket, &KeyRange::all())
+                    .expect("snapshot still sees old rows")
+            ),
+            vec![
+                (b"order:1".to_vec(), b"keep".to_vec()),
+                (b"user:1".to_vec(), b"old".to_vec()),
+                (b"user:2".to_vec(), b"old".to_vec()),
+            ]
+        );
+    }
+
+    {
+        let db = Db::open_sync(options).expect("persistent db reopens");
+        let bucket = db.default_bucket_sync().expect("bucket reopens");
+        assert_eq!(
+            collect_rows(bucket.range_sync(&KeyRange::all()).expect("range hidden")),
+            Vec::<(Vec<u8>, Vec<u8>)>::new()
+        );
+        assert_eq!(
+            collect_rows(bucket.prefix_sync(b"user:").expect("prefix hidden")),
+            Vec::<(Vec<u8>, Vec<u8>)>::new()
+        );
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_budgeted_compaction_reports_exhaustion_and_resumes() {
     let path = temp_db_path("budgeted-compaction-resumes");
     let mut options = DbOptions::persistent(&path);

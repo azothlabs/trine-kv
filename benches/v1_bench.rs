@@ -2552,6 +2552,7 @@ fn bench_read_pruning_diagnostics() -> Vec<BenchResult> {
     extend_cold_table_read_diagnostics(&mut results, false);
     extend_cold_table_read_diagnostics(&mut results, true);
     extend_l0_stack_read_diagnostics(&mut results);
+    extend_range_guard_diagnostics(&mut results);
     extend_prefix_partition_diagnostics(&mut results);
     results
 }
@@ -2663,6 +2664,97 @@ fn extend_l0_stack_read_diagnostics(results: &mut Vec<BenchResult>) {
 
     drop(db);
     cleanup_dir(&dir);
+}
+
+fn extend_range_guard_diagnostics(results: &mut Vec<BenchResult>) {
+    const L0_TABLES: usize = 4;
+    const ROWS_PER_TABLE: usize = 16;
+
+    let dir = temp_dir("read-pruning-range-guard");
+    let mut options = benchmark_persistent_options(&dir);
+    options.background_worker_count = 0;
+    options.max_l0_files = L0_TABLES * 4;
+    let db = Db::open_sync(options).expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+    for table_index in 0..L0_TABLES {
+        for row_index in 0..ROWS_PER_TABLE {
+            let index = table_index * ROWS_PER_TABLE + row_index;
+            bucket
+                .put_sync(key(index), value(index))
+                .expect("put succeeds");
+        }
+        db.flush_sync().expect("flush succeeds");
+    }
+
+    let range = KeyRange::half_open(key(ROWS_PER_TABLE), key(ROWS_PER_TABLE * 2));
+    let before = db.stats();
+    let checksum = range_checksum(&bucket, &range);
+    assert!(checksum > 0, "range guard diagnostic must read rows");
+    let after = db.stats();
+    push_range_diagnostics(results, "read pruning range guarded", &before, &after);
+
+    bucket
+        .delete_range_sync(range.clone())
+        .expect("range delete succeeds");
+    db.flush_sync().expect("flush tombstone-only table");
+
+    let before = db.stats();
+    let checksum = range_checksum(&bucket, &range);
+    assert_eq!(checksum, 0, "range tombstone diagnostic must hide rows");
+    let after = db.stats();
+    push_range_diagnostics(
+        results,
+        "read pruning range tombstone guarded",
+        &before,
+        &after,
+    );
+
+    drop(db);
+    cleanup_dir(&dir);
+}
+
+fn range_checksum(bucket: &trine_kv::Bucket, range: &KeyRange) -> u64 {
+    bucket
+        .range_sync(range)
+        .expect("range succeeds")
+        .map(|item| item.expect("range item").value.len() as u64)
+        .sum()
+}
+
+fn push_range_diagnostics(
+    results: &mut Vec<BenchResult>,
+    name_prefix: &'static str,
+    before: &trine_kv::DbStats,
+    after: &trine_kv::DbStats,
+) {
+    results.push(BenchResult::diagnostic(
+        labelled(name_prefix, "table probes"),
+        after
+            .read_path
+            .range_table_probes
+            .saturating_sub(before.read_path.range_table_probes),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(name_prefix, "L0 table probes"),
+        after
+            .read_path
+            .range_l0_table_probes
+            .saturating_sub(before.read_path.range_l0_table_probes),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(name_prefix, "non-L0 table probes"),
+        after
+            .read_path
+            .range_non_l0_table_probes
+            .saturating_sub(before.read_path.range_non_l0_table_probes),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(name_prefix, "tombstone table probes"),
+        after
+            .read_path
+            .range_tombstone_table_probes
+            .saturating_sub(before.read_path.range_tombstone_table_probes),
+    ));
 }
 
 #[derive(Default)]
@@ -3306,6 +3398,13 @@ fn push_prefix_diagnostics(
             .read_path
             .prefix_table_probes
             .saturating_sub(before.read_path.prefix_table_probes),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(name_prefix, "tombstone table probes"),
+        after
+            .read_path
+            .prefix_tombstone_table_probes
+            .saturating_sub(before.read_path.prefix_tombstone_table_probes),
     ));
     results.push(BenchResult::diagnostic(
         labelled(name_prefix, "block metadata probes"),

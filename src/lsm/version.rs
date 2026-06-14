@@ -676,10 +676,33 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_tombstone_tables_remain_scan_candidates() {
+        let tombstone_table = Arc::new(test_tombstone_only_table(
+            46,
+            TableLevel::ZERO,
+            KeyRange::all(),
+        ));
+        let point_table = Arc::new(test_table(47, TableLevel::ZERO, b"z", 1));
+        let version = LsmVersion::new(vec![Arc::clone(&tombstone_table), point_table])
+            .expect("valid version");
+
+        assert_eq!(
+            table_ids(version.range_scan_tables(&KeyRange::half_open(b"m", b"n"))),
+            vec![tombstone_table.properties().id],
+            "ambiguous tombstone bounds must stay conservative for scans"
+        );
+        assert_eq!(
+            table_ids(version.range_tombstone_tables_for_key(b"m")),
+            vec![tombstone_table.properties().id],
+            "point reads must still find tombstones when bounds are ambiguous"
+        );
+    }
+
+    #[test]
     fn replace_tables_installs_outputs_and_removes_inputs() {
-        let old_l0 = Arc::new(test_table(46, TableLevel::ZERO, b"a", 10));
-        let old_l1 = Arc::new(test_table(47, TableLevel(1), b"z", 10));
-        let output = Arc::new(test_table(48, TableLevel(1), b"a", 20));
+        let old_l0 = Arc::new(test_table(52, TableLevel::ZERO, b"a", 10));
+        let old_l1 = Arc::new(test_table(53, TableLevel(1), b"z", 10));
+        let output = Arc::new(test_table(54, TableLevel(1), b"a", 20));
         let version =
             LsmVersion::new(vec![Arc::clone(&old_l0), Arc::clone(&old_l1)]).expect("valid version");
 
@@ -771,6 +794,24 @@ mod tests {
             }],
         )
         .expect("test table writes")
+    }
+
+    fn test_tombstone_only_table(id: u64, level: TableLevel, range: KeyRange) -> table::Table {
+        let path = test_table_path(id);
+        let _ = fs::remove_file(&path);
+        table::write_table(
+            &path,
+            TableId(id),
+            level,
+            &test_table_options_with_filter(),
+            &[],
+            &[table::TableRangeTombstone {
+                range,
+                sequence: Sequence::new(2),
+                batch_index: 0,
+            }],
+        )
+        .expect("test tombstone-only table writes")
     }
 
     fn test_table_path(id: u64) -> PathBuf {

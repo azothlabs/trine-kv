@@ -572,8 +572,18 @@ pub struct ReadPathStats {
     pub point_data_block_reads: u64,
     /// Point reads skipped because filters ruled out a table or block.
     pub point_filter_misses: u64,
+    /// Table files considered by range scans.
+    pub range_table_probes: u64,
+    /// Level-0 table files considered by range scans.
+    pub range_l0_table_probes: u64,
+    /// Non-level-0 table files considered by range scans.
+    pub range_non_l0_table_probes: u64,
+    /// Table files inspected for range tombstones during range scans.
+    pub range_tombstone_table_probes: u64,
     /// Table files considered by prefix scans.
     pub prefix_table_probes: u64,
+    /// Table files inspected for range tombstones during prefix scans.
+    pub prefix_tombstone_table_probes: u64,
     /// Data-block metadata entries considered by prefix scans.
     pub prefix_block_metadata_probes: u64,
     /// Data blocks read by prefix scans.
@@ -626,9 +636,24 @@ impl ReadPathStats {
         self.point_filter_misses = self
             .point_filter_misses
             .saturating_add(other.point_filter_misses);
+        self.range_table_probes = self
+            .range_table_probes
+            .saturating_add(other.range_table_probes);
+        self.range_l0_table_probes = self
+            .range_l0_table_probes
+            .saturating_add(other.range_l0_table_probes);
+        self.range_non_l0_table_probes = self
+            .range_non_l0_table_probes
+            .saturating_add(other.range_non_l0_table_probes);
+        self.range_tombstone_table_probes = self
+            .range_tombstone_table_probes
+            .saturating_add(other.range_tombstone_table_probes);
         self.prefix_table_probes = self
             .prefix_table_probes
             .saturating_add(other.prefix_table_probes);
+        self.prefix_tombstone_table_probes = self
+            .prefix_tombstone_table_probes
+            .saturating_add(other.prefix_tombstone_table_probes);
         self.prefix_block_metadata_probes = self
             .prefix_block_metadata_probes
             .saturating_add(other.prefix_block_metadata_probes);

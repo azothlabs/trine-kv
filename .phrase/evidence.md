@@ -26,6 +26,67 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-06-14: Guard-Aware Scan And Range Delete Safety
+
+### Observation
+
+- Added range scan candidate counters to `ReadPathStats`: total range table
+  probes, L0 range table probes, non-L0 range table probes, and range
+  tombstone-table probes.
+- Added prefix tombstone-table probes to `ReadPathStats`.
+- Range scan source selection now records candidate tables. Range and prefix
+  tombstone collection now records candidate tombstone tables.
+- Tables with ambiguous key bounds and range tombstones now remain conservative
+  point/range candidates instead of being skipped by key-bound guard checks.
+- Added a version unit test for ambiguous tombstone-table candidate selection.
+- Added a persistent regression test where a tombstone-only table hides range,
+  reverse range, prefix, and reverse prefix scans, while a pre-delete snapshot
+  still sees the old rows and reopen keeps the hidden state.
+- Added benchmark diagnostics:
+  - `read pruning range guarded`;
+  - `read pruning range tombstone guarded`;
+  - prefix tombstone-table probe rows.
+
+### Interpretation
+
+- Phase C is complete. Guard-aware scan pruning now has a conservative safety
+  rule for tables whose bounds are incomplete but whose range tombstones may
+  hide records.
+- Diagnostics now expose scan candidate selection directly, so later
+  range/prefix optimization can compare table candidates separately from
+  filter and data-block work.
+- Transaction conflict checks stayed conservative because this phase did not
+  narrow conflict validation table scans.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q ambiguous_tombstone_tables_remain_scan_candidates --lib`
+- `cargo test -q persistent_tombstone_only_table_hides_range_and_prefix_scans`
+- `cargo check -q --benches`
+- `cargo test -q range_delete`
+- `cargo test -q snapshot`
+- `cargo test -q range_reverse`
+- `cargo test -q prefix`
+- `cargo bench --bench v1_bench`
+- `target/release/deps/v1_bench-25cc53c2c6358df4 | rg "read pruning (range|prefix) .*table probes"`
+- `cargo clippy -q --all-targets --all-features -- -D warnings`
+- `cargo test -q`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test --doc --all-features`
+
+### Remaining Blockers
+
+- No Phase C blocker remains. Future range-scan optimization should add
+  workload-specific data-block or range-block counters before changing scan
+  ordering or table layout.
+
+### Recommended Next Action
+
+- Start the next phase from explicit read-frequency or range-scan workload
+  evidence before broadening compaction policy beyond the current L0 picker
+  gate.
+
 ## 2026-06-14: Compaction Trigger Diagnostics
 
 ### Observation

@@ -151,11 +151,14 @@ impl LsmTree {
 
         let query_range = selector_query_range(selector);
         for table in version.range_scan_tables(&query_range) {
-            if let Some(prefix) = selector.prefix() {
-                table.record_prefix_table_probe();
-                if !table.may_contain_prefix(prefix, &self.options.prefix_extractor) {
-                    table.record_prefix_filter_miss();
-                    continue;
+            match selector {
+                ScanSelector::Range(_) => table.record_range_table_probe(),
+                ScanSelector::Prefix(prefix) => {
+                    table.record_prefix_table_probe();
+                    if !table.may_contain_prefix(prefix, &self.options.prefix_extractor) {
+                        table.record_prefix_filter_miss();
+                        continue;
+                    }
                 }
             }
 
@@ -185,6 +188,10 @@ impl LsmTree {
             .collect::<Vec<_>>();
 
         for table in version.range_scan_tables(&range) {
+            match selector {
+                ScanSelector::Range(_) => table.record_range_tombstone_table_probe(),
+                ScanSelector::Prefix(_) => table.record_prefix_tombstone_table_probe(),
+            }
             tombstones.extend(
                 table
                     .range_tombstones_overlapping_range(&range)?
@@ -220,6 +227,10 @@ impl LsmTree {
             .collect::<Vec<_>>();
 
         for table in version.range_scan_tables(&range) {
+            match selector {
+                ScanSelector::Range(_) => table.record_range_tombstone_table_probe(),
+                ScanSelector::Prefix(_) => table.record_prefix_tombstone_table_probe(),
+            }
             tombstones.extend(
                 table
                     .range_tombstones_overlapping_range_async(&range)

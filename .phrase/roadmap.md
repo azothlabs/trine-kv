@@ -4670,3 +4670,30 @@ per-level compaction rewritten-byte diagnostics.
 - Persisted guard metadata, manifest/SSTable format changes, public API names,
   durability changes, platform I/O backend changes, publishing, tagging, or
   pushing changes.
+
+### Phase 189: Guard-Aware Scan And Range Delete Safety
+
+**Status**: Complete
+
+**Goal**: Complete Phase C from the guard-aware LSM strategy by making range
+and prefix scan candidate selection safe around range tombstones and ambiguous
+table bounds.
+
+**Entry Condition**: Phase 188 completed the first compaction picker gate, and
+the next recommended boundary was guard-aware safety beyond point reads.
+
+**Acceptance Gate**:
+
+- Range, prefix, reverse, snapshot, and range-delete tests pass.
+- Diagnostics report range scan table candidates and range/prefix
+  tombstone-table candidates.
+- Tombstone-only or ambiguous-bound tables remain visible to point and scan
+  tombstone checks.
+- Transaction conflict checks remain conservative and are not narrowed by this
+  phase.
+
+**Major Out Of Scope**:
+
+- Persisted guard metadata, manifest/SSTable format changes, public API names,
+  durability changes, platform I/O backend changes, publishing, tagging,
+  compaction policy changes, or bottom-level tiering changes.

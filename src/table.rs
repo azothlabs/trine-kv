@@ -642,7 +642,12 @@ struct TableReadPathStatsShard {
     point_block_metadata_probes: AtomicU64,
     point_data_block_reads: AtomicU64,
     point_filter_misses: AtomicU64,
+    range_table_probes: AtomicU64,
+    range_l0_table_probes: AtomicU64,
+    range_non_l0_table_probes: AtomicU64,
+    range_tombstone_table_probes: AtomicU64,
     prefix_table_probes: AtomicU64,
+    prefix_tombstone_table_probes: AtomicU64,
     prefix_block_metadata_probes: AtomicU64,
     prefix_data_block_reads: AtomicU64,
     prefix_filter_misses: AtomicU64,
@@ -706,9 +711,24 @@ impl TableReadPathStats {
             stats.point_filter_misses = stats
                 .point_filter_misses
                 .saturating_add(shard.point_filter_misses.load(Ordering::Acquire));
+            stats.range_table_probes = stats
+                .range_table_probes
+                .saturating_add(shard.range_table_probes.load(Ordering::Acquire));
+            stats.range_l0_table_probes = stats
+                .range_l0_table_probes
+                .saturating_add(shard.range_l0_table_probes.load(Ordering::Acquire));
+            stats.range_non_l0_table_probes = stats
+                .range_non_l0_table_probes
+                .saturating_add(shard.range_non_l0_table_probes.load(Ordering::Acquire));
+            stats.range_tombstone_table_probes = stats
+                .range_tombstone_table_probes
+                .saturating_add(shard.range_tombstone_table_probes.load(Ordering::Acquire));
             stats.prefix_table_probes = stats
                 .prefix_table_probes
                 .saturating_add(shard.prefix_table_probes.load(Ordering::Acquire));
+            stats.prefix_tombstone_table_probes = stats
+                .prefix_tombstone_table_probes
+                .saturating_add(shard.prefix_tombstone_table_probes.load(Ordering::Acquire));
             stats.prefix_block_metadata_probes = stats
                 .prefix_block_metadata_probes
                 .saturating_add(shard.prefix_block_metadata_probes.load(Ordering::Acquire));
@@ -758,9 +778,33 @@ impl TableReadPathStats {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_range_table_probe(&self, level: TableLevel) {
+        let shard = self.shard();
+        shard.range_table_probes.fetch_add(1, Ordering::Relaxed);
+        if level == TableLevel::ZERO {
+            shard.range_l0_table_probes.fetch_add(1, Ordering::Relaxed);
+        } else {
+            shard
+                .range_non_l0_table_probes
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_range_tombstone_table_probe(&self) {
+        self.shard()
+            .range_tombstone_table_probes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     fn record_prefix_table_probe(&self) {
         self.shard()
             .prefix_table_probes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_prefix_tombstone_table_probe(&self) {
+        self.shard()
+            .prefix_tombstone_table_probes
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1209,8 +1253,21 @@ impl Table {
             .record_point_table_probe(self.properties.level);
     }
 
+    pub(crate) fn record_range_table_probe(&self) {
+        self.read_path_stats
+            .record_range_table_probe(self.properties.level);
+    }
+
+    pub(crate) fn record_range_tombstone_table_probe(&self) {
+        self.read_path_stats.record_range_tombstone_table_probe();
+    }
+
     pub(crate) fn record_prefix_table_probe(&self) {
         self.read_path_stats.record_prefix_table_probe();
+    }
+
+    pub(crate) fn record_prefix_tombstone_table_probe(&self) {
+        self.read_path_stats.record_prefix_tombstone_table_probe();
     }
 
     pub(crate) fn record_prefix_filter_miss(&self) {
@@ -1883,15 +1940,19 @@ impl Table {
 
     #[must_use]
     pub(crate) fn key_bounds_may_contain_key(&self, key: &[u8]) -> bool {
-        self.has_key_bounds()
-            && self.properties.smallest_user_key.as_slice() <= key
+        if !self.has_key_bounds() {
+            return self.may_have_range_tombstones;
+        }
+        self.properties.smallest_user_key.as_slice() <= key
             && key <= self.properties.largest_user_key.as_slice()
     }
 
     #[must_use]
     pub(crate) fn key_bounds_overlap_range(&self, range: &KeyRange) -> bool {
-        self.has_key_bounds()
-            && !key_is_after_end(self.properties.smallest_user_key.as_slice(), &range.end)
+        if !self.has_key_bounds() {
+            return self.may_have_range_tombstones;
+        }
+        !key_is_after_end(self.properties.smallest_user_key.as_slice(), &range.end)
             && !key_is_before_start(self.properties.largest_user_key.as_slice(), &range.start)
     }
 
