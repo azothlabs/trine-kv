@@ -497,6 +497,10 @@ pub struct FilterStats {
 pub struct ReadPathStats {
     /// Table files considered by point reads.
     pub point_table_probes: u64,
+    /// Level-0 table files considered by point reads.
+    pub point_l0_table_probes: u64,
+    /// Non-level-0 table files considered by point reads.
+    pub point_non_l0_table_probes: u64,
     /// Index partitions considered by point reads.
     pub point_index_partition_probes: u64,
     /// Data-block metadata entries considered by point reads.
@@ -520,6 +524,12 @@ impl ReadPathStats {
         self.point_table_probes = self
             .point_table_probes
             .saturating_add(other.point_table_probes);
+        self.point_l0_table_probes = self
+            .point_l0_table_probes
+            .saturating_add(other.point_l0_table_probes);
+        self.point_non_l0_table_probes = self
+            .point_non_l0_table_probes
+            .saturating_add(other.point_non_l0_table_probes);
         self.point_index_partition_probes = self
             .point_index_partition_probes
             .saturating_add(other.point_index_partition_probes);

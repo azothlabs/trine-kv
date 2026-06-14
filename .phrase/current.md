@@ -65,7 +65,7 @@ format change is allowed in the first slices.
 ## Active Task Slice
 
 ```text
-task823 [ ] goal:add guard candidate diagnostics without behavior change | scope:src/lsm/version.rs src/lsm/read.rs src/stats.rs src/db.rs benches/v1_bench.rs | verify:cargo test -q get_many_sync + targeted benchmark diagnostics
+task823 [x] goal:add guard candidate diagnostics without behavior change | scope:src/lsm/version.rs src/lsm/read.rs src/stats.rs src/db.rs benches/v1_bench.rs | verify:cargo test -q get_many_sync + targeted benchmark diagnostics
 task824 [ ] goal:record L0/overlap candidate depth for point/missing/get_many | scope:src/lsm/version.rs benches/v1_bench.rs | verify:diagnostics show candidate depth separate from filter/data-block counters
 task825 [ ] goal:derive first in-memory guard index only if diagnostics prove avoidable L0/overlap probes | scope:src/lsm/version.rs src/lsm/read.rs | verify:point/missing/get_many counters improve without extra data-block reads
 task826 [ ] goal:add compaction rewrite-depth diagnostics before policy changes | scope:src/lsm/compact.rs src/db.rs benches/v1_bench.rs | verify:bench reports rewrite bytes and trigger reason by level
@@ -85,6 +85,10 @@ task826 [ ] goal:add compaction rewrite-depth diagnostics before policy changes 
   churn; guard work should build on this rather than replacing the cache policy.
 - The accepted design direction is recorded in
   `.phrase/protocol/guard-aware-lsm-strategy.md`.
+- Task823 added point-read L0/non-L0 table-probe stats and a focused L0-stack
+  diagnostic without changing read behavior. The local `cargo bench --bench
+  v1_bench` run recorded 2048 repeated reads through an 8-table L0 stack as
+  16384 L0 table probes, 2048 block metadata probes, and 2048 data-block reads.
 
 ## Known Risks
 
@@ -99,6 +103,5 @@ task826 [ ] goal:add compaction rewrite-depth diagnostics before policy changes 
 
 ## Next Recommendation
 
-- Implement `task823` first: add candidate-depth diagnostics without changing
-  read behavior, then run targeted benchmark rows before any guard index is
-  introduced.
+- Implement `task824`: add explicit L0/overlap candidate-depth diagnostics for
+  point, missing, and `get_many` before introducing the in-memory guard index.

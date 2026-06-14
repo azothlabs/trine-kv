@@ -2282,6 +2282,7 @@ fn bench_read_pruning_diagnostics() -> Vec<BenchResult> {
     let mut results = Vec::new();
     extend_cold_table_read_diagnostics(&mut results, false);
     extend_cold_table_read_diagnostics(&mut results, true);
+    extend_l0_stack_read_diagnostics(&mut results);
     extend_prefix_partition_diagnostics(&mut results);
     results
 }
@@ -2334,9 +2335,56 @@ fn extend_cold_table_read_diagnostics(results: &mut Vec<BenchResult>, read_only:
     first_read_diagnostics.push_phase_results(results, read_only, "first read");
 }
 
+fn extend_l0_stack_read_diagnostics(results: &mut Vec<BenchResult>) {
+    const L0_TABLES: usize = 8;
+    const ROWS_PER_TABLE: usize = 16;
+
+    let dir = temp_dir("read-pruning-l0-stack");
+    let mut options = benchmark_persistent_options(&dir);
+    options.background_worker_count = 0;
+    options.max_l0_files = L0_TABLES * 4;
+    let db = Db::open_sync(options).expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+    for table_index in 0..L0_TABLES {
+        for row_index in 0..ROWS_PER_TABLE {
+            let index = table_index * ROWS_PER_TABLE + row_index;
+            bucket
+                .put_sync(key(index), value(index))
+                .expect("put succeeds");
+        }
+        db.flush_sync().expect("flush succeeds");
+    }
+
+    let stats = db.stats();
+    assert_eq!(stats.l0_tables, L0_TABLES, "diagnostic needs an L0 stack");
+
+    let target_index = ROWS_PER_TABLE / 2;
+    let keys = (0..OPS).map(|_| key(target_index)).collect::<Vec<_>>();
+    let before = db.stats();
+    let start = Instant::now();
+    let checksum = sequential_point_batch_checksum(&bucket, &keys);
+    assert!(checksum > 0, "L0 stack diagnostic must read values");
+    let elapsed_micros = duration_micros(start.elapsed());
+    let after = db.stats();
+
+    let label = "read pruning L0 stack diagnostic sequential";
+    let mut diagnostics = ColdReadDiagnostics::default();
+    diagnostics.record_delta(&before, &after);
+    results.push(BenchResult::diagnostic(
+        labelled(label, "wall micros"),
+        elapsed_micros,
+    ));
+    diagnostics.push_results_with_label(results, label);
+
+    drop(db);
+    cleanup_dir(&dir);
+}
+
 #[derive(Default)]
 struct ColdReadDiagnostics {
     table_probes: u64,
+    l0_table_probes: u64,
+    non_l0_table_probes: u64,
     block_metadata_probes: u64,
     data_block_reads: u64,
     filter_misses: u64,
@@ -2366,6 +2414,12 @@ impl ColdReadDiagnostics {
         self.table_probes = self
             .table_probes
             .saturating_add(stats.read_path.point_table_probes);
+        self.l0_table_probes = self
+            .l0_table_probes
+            .saturating_add(stats.read_path.point_l0_table_probes);
+        self.non_l0_table_probes = self
+            .non_l0_table_probes
+            .saturating_add(stats.read_path.point_non_l0_table_probes);
         self.block_metadata_probes = self
             .block_metadata_probes
             .saturating_add(stats.read_path.point_block_metadata_probes);
@@ -2459,6 +2513,18 @@ impl ColdReadDiagnostics {
                 .read_path
                 .point_table_probes
                 .saturating_sub(before.read_path.point_table_probes),
+        );
+        self.l0_table_probes = self.l0_table_probes.saturating_add(
+            after
+                .read_path
+                .point_l0_table_probes
+                .saturating_sub(before.read_path.point_l0_table_probes),
+        );
+        self.non_l0_table_probes = self.non_l0_table_probes.saturating_add(
+            after
+                .read_path
+                .point_non_l0_table_probes
+                .saturating_sub(before.read_path.point_non_l0_table_probes),
         );
         self.block_metadata_probes = self.block_metadata_probes.saturating_add(
             after
@@ -2677,6 +2743,14 @@ impl ColdReadDiagnostics {
         results.push(BenchResult::diagnostic(
             labelled(label, "point table probes"),
             self.table_probes,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled(label, "point L0 table probes"),
+            self.l0_table_probes,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled(label, "point non-L0 table probes"),
+            self.non_l0_table_probes,
         ));
         results.push(BenchResult::diagnostic(
             labelled(label, "point block metadata probes"),

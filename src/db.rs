@@ -9952,6 +9952,52 @@ mod tests {
         fs::remove_dir_all(path).expect("cleanup test db");
     }
 
+    #[test]
+    fn point_read_stats_split_l0_and_non_l0_probes() {
+        let path = temp_db_path("point-read-l0-probe-stats");
+        let mut options = DbOptions::persistent(&path);
+        options.background_worker_count = 0;
+        options.max_l0_files = 16;
+        let db = Db::open_sync(options).expect("persistent db opens");
+        for table_index in 0..2 {
+            for row_index in 0..4 {
+                let key = format!("key-{table_index}-{row_index}");
+                let value = format!("value-{table_index}-{row_index}");
+                db.put_sync(key.as_bytes(), value.as_bytes())
+                    .expect("write key");
+            }
+            db.flush_sync().expect("flush table");
+        }
+
+        let before = db.stats();
+        assert_eq!(before.l0_tables, 2, "test needs two L0 tables");
+        let value = db
+            .get_sync(b"key-0-2")
+            .expect("point read succeeds")
+            .expect("value exists");
+        let after = db.stats();
+
+        assert_eq!(value, b"value-0-2".to_vec());
+        let table_probes = after
+            .read_path
+            .point_table_probes
+            .saturating_sub(before.read_path.point_table_probes);
+        let l0_probes = after
+            .read_path
+            .point_l0_table_probes
+            .saturating_sub(before.read_path.point_l0_table_probes);
+        let non_l0_probes = after
+            .read_path
+            .point_non_l0_table_probes
+            .saturating_sub(before.read_path.point_non_l0_table_probes);
+        assert_eq!(table_probes, l0_probes.saturating_add(non_l0_probes));
+        assert_eq!(l0_probes, 2);
+        assert_eq!(non_l0_probes, 0);
+
+        drop(db);
+        fs::remove_dir_all(path).expect("cleanup test db");
+    }
+
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     #[test]
     fn browser_persistent_open_async_requires_browser_target() {

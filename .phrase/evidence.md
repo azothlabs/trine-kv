@@ -26,6 +26,54 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-06-14: L0 Read Candidate Diagnostics
+
+### Observation
+
+- Added point-read stats that split table probes into L0 and non-L0 counters.
+- Added a focused benchmark diagnostic that builds an 8-table L0 stack and
+  repeatedly reads a key from the oldest table.
+- The local `cargo bench --bench v1_bench` run recorded
+  `read pruning L0 stack diagnostic sequential` with 16384 point table probes,
+  all from L0, for 2048 point reads. The same row recorded 2048 block metadata
+  probes, 2048 data-block reads, and 1 cache miss.
+- The existing cold-read diagnostic now exposes a mixed level shape: writable
+  cold first reads recorded 1 L0 table probe and 31 non-L0 table probes across
+  32 first reads; read-only cold first reads recorded 32 L0 table probes and 0
+  non-L0 table probes.
+
+### Interpretation
+
+- The new counters separate level-placement cost from Bloom/filter and
+  data-block cost without changing lookup behavior.
+- The L0-stack diagnostic proves a real guard target: many table-level L0
+  probes can precede the single data block that actually provides the value.
+- A first retained guard optimization should reduce L0 table probes for this
+  shape while keeping block metadata reads, data-block reads, MVCC ordering, and
+  range tombstone behavior stable.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q point_read_stats_split_l0_and_non_l0_probes`
+- `cargo test -q get_many_sync_groups_persistent_keys_by_data_block`
+- `cargo bench --bench v1_bench`
+- `cargo clippy -q --all-targets --all-features -- -D warnings`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test -q`
+- `git diff --check`
+
+### Remaining Blockers
+
+- Explicit overlap depth and `get_many` guard-group diagnostics are not yet
+  recorded; the current slice only splits point table probes by L0/non-L0.
+
+### Recommended Next Action
+
+- Implement task824: record L0/overlap candidate depth for point, missing, and
+  `get_many`, then decide the first in-memory guard index shape from those
+  counters.
+
 ## 2026-06-14: Point Batch And Negative Lookup Diagnostics
 
 ### Observation

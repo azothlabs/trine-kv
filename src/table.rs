@@ -636,6 +636,8 @@ struct TableReadPathStats {
 #[repr(align(64))]
 struct TableReadPathStatsShard {
     point_table_probes: AtomicU64,
+    point_l0_table_probes: AtomicU64,
+    point_non_l0_table_probes: AtomicU64,
     point_index_partition_probes: AtomicU64,
     point_block_metadata_probes: AtomicU64,
     point_data_block_reads: AtomicU64,
@@ -686,6 +688,12 @@ impl TableReadPathStats {
             stats.point_table_probes = stats
                 .point_table_probes
                 .saturating_add(shard.point_table_probes.load(Ordering::Acquire));
+            stats.point_l0_table_probes = stats
+                .point_l0_table_probes
+                .saturating_add(shard.point_l0_table_probes.load(Ordering::Acquire));
+            stats.point_non_l0_table_probes = stats
+                .point_non_l0_table_probes
+                .saturating_add(shard.point_non_l0_table_probes.load(Ordering::Acquire));
             stats.point_index_partition_probes = stats
                 .point_index_partition_probes
                 .saturating_add(shard.point_index_partition_probes.load(Ordering::Acquire));
@@ -714,10 +722,16 @@ impl TableReadPathStats {
         stats
     }
 
-    fn record_point_table_probe(&self) {
-        self.shard()
-            .point_table_probes
-            .fetch_add(1, Ordering::Relaxed);
+    fn record_point_table_probe(&self, level: TableLevel) {
+        let shard = self.shard();
+        shard.point_table_probes.fetch_add(1, Ordering::Relaxed);
+        if level == TableLevel::ZERO {
+            shard.point_l0_table_probes.fetch_add(1, Ordering::Relaxed);
+        } else {
+            shard
+                .point_non_l0_table_probes
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn record_point_index_partition_probe(&self) {
@@ -1191,7 +1205,8 @@ impl Table {
     }
 
     pub(crate) fn record_point_table_probe(&self) {
-        self.read_path_stats.record_point_table_probe();
+        self.read_path_stats
+            .record_point_table_probe(self.properties.level);
     }
 
     pub(crate) fn record_prefix_table_probe(&self) {
