@@ -6,113 +6,99 @@ Active
 
 ## Goal
 
-Make Trine's LSM read-path advantages measurable and improve the first
-high-signal batch/negative lookup bottleneck.
+Start Phase 187: make guard-aware LSM read and compaction decisions measurable,
+then use the evidence to implement the first in-memory read-pruning slice.
+
+## Design Assessment
+
+The guard-aware design is a good database-engine direction for Trine, provided
+we treat it as structural LSM work rather than a quick cache tweak.
+
+It fits Trine because current evidence already shows the next useful boundary:
+point reads, missing reads, `get_many`, cache residency, and compaction rewrite
+cost are now measurable. Guards can reduce candidate work before Bloom/index and
+data-block access, while non-uniform compaction can keep upper levels read-aware
+without forcing the largest levels to rewrite too often.
+
+The design is also risky. It touches version layout, point reads, range scans,
+range tombstones, transaction conflict checks, compaction input selection,
+manifest recovery assumptions, and background maintenance. Therefore the first
+implementation must be diagnostics and in-memory structures derived from
+existing table key bounds. No manifest, WAL, SSTable, public API, or recovery
+format change is allowed in the first slices.
 
 ## Scope
 
-- Persistent local-file point reads first.
-- `get_many` and localized point batches.
-- Negative lookup / missing point reads.
-- Metadata/data-block cache and filter counters that prove whether reads avoid
-  unnecessary table, index, and data-block work.
-- Compression read bandwidth is discovery-only until batch/missing evidence is
-  clear.
+- Guard candidate diagnostics for point reads, missing reads, and `get_many`.
+- L0 and overlapping-run candidate depth before any behavior change.
+- In-memory guard index derived from existing `LsmVersion` table bounds after
+  diagnostics prove avoidable candidate work.
+- Guard-aware `get_many` grouping before table/block grouping.
+- Compaction diagnostics for local rewrite cost, overlap depth, and per-level
+  input/output bytes.
+- Design and implementation must follow
+  `.phrase/protocol/guard-aware-lsm-strategy.md`.
 
 ## Out Of Scope
 
-- Storage format changes.
-- Public API changes unless existing `get_many` cannot express the optimized
-  path.
-- Compaction throughput and blob GC write-side tuning.
-- Platform-io backend work.
-- Publishing, tagging, pushing, or release workflow changes.
+- Persisted guard metadata.
+- Manifest, WAL, SSTable, or table-format changes.
+- Public API naming changes.
+- Durability, recovery, writer lease, platform I/O, or release workflow changes.
+- Global "more compaction" as a read optimization.
+- Bottom-level rewrite policy changes before guard diagnostics exist.
 
 ## Acceptance Gate
 
-- Benchmark diagnostics distinguish sequential versus batched point reads for
-  localized hits and missing keys.
-- Evidence reports table probes, block metadata probes, data block reads,
-  filter skips, cache misses, and storage read requests.
-- A retained optimization improves at least one of: localized batch reads,
-  missing batch reads, or metadata/data-block reuse without weakening MVCC or
-  read visibility.
-- Focused tests cover the changed read-path behavior.
-- Formatting, strict clippy, relevant tests, and diff whitespace checks pass
-  before commit.
+- Diagnostics distinguish candidate pruning from Bloom/filter pruning and
+  data-block avoidance.
+- Candidate tables/runs are reported by level, including L0 overlap depth.
+- `get_many` diagnostics report input keys, unique keys, guard groups, table
+  groups, and data-block groups.
+- Compaction diagnostics report input tables, overlap range width, input bytes,
+  output bytes, rewritten bytes by level, and compaction trigger reason.
+- First retained behavior change is in-memory only and preserves MVCC,
+  range-delete, scan ordering, transaction conflict, manifest recovery, and
+  storage formats.
+- Focused tests and targeted benchmark evidence pass before each commit.
 
 ## Active Task Slice
 
 ```text
-task818 [x] goal:add persistent missing batch benchmark diagnostics | scope:benches/v1_bench.rs | verify:cargo check -q --benches + targeted bench rows
-task819 [x] goal:separate out-of-bounds miss from in-bounds filter miss diagnostics | scope:benches/v1_bench.rs | verify:cargo check -q --benches + targeted bench rows
-task820 [x] goal:measure read-path diagnostics and choose first retained optimization | scope:src/lsm src/table.rs benches/v1_bench.rs | verify:TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench
-task821 [x] goal:reduce missing get CPU overhead before table lookup | scope:src/lsm/read.rs benches/v1_bench.rs | verify:TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench
-task822 [x] goal:protect hot metadata from data-block churn in small cache | scope:src/cache.rs src/table.rs | verify:cache/table tests + TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench
+task823 [ ] goal:add guard candidate diagnostics without behavior change | scope:src/lsm/version.rs src/lsm/read.rs src/stats.rs src/db.rs benches/v1_bench.rs | verify:cargo test -q get_many_sync + targeted benchmark diagnostics
+task824 [ ] goal:record L0/overlap candidate depth for point/missing/get_many | scope:src/lsm/version.rs benches/v1_bench.rs | verify:diagnostics show candidate depth separate from filter/data-block counters
+task825 [ ] goal:derive first in-memory guard index only if diagnostics prove avoidable L0/overlap probes | scope:src/lsm/version.rs src/lsm/read.rs | verify:point/missing/get_many counters improve without extra data-block reads
+task826 [ ] goal:add compaction rewrite-depth diagnostics before policy changes | scope:src/lsm/compact.rs src/db.rs benches/v1_bench.rs | verify:bench reports rewrite bytes and trigger reason by level
 ```
 
 ## Evidence
 
-- `get_many` already exists for `Db`, `Bucket`, and `BucketReader`.
-- Table point batch reads already group keys by data block and have a regression
-  test proving multiple keys in one persistent data block share one data-block
-  read.
-- Existing localized point diagnostics cover hit-heavy sequential versus batched
-  reads, but missing-key persistent batch diagnostics were not separated from
-  memory-only `missing get`.
-- The first persistent missing diagnostic used `missing-*` keys, which sort
-  outside the `key-*` table bounds and therefore measure key-bound rejection
-  rather than Bloom/filter negative lookup.
-- New bounded missing diagnostics use absent `key-*`-range keys. They report
-  2048 point filter skips, 18 block metadata probes, 0 data-block reads, and
-  0 storage read-owned requests, proving the in-bounds negative path is filter
-  gated.
-- Retained optimization: small all-unique `get_many` slices choose the single
-  key loop before allocating/deduplicating a `PointReadBatch`; small duplicate
-  slices still use the batch path for shared lookup.
-- Three-run V1 benchmark evidence after the optimization:
-  - `missing batched point read persistent` median 124 us versus 328 us before.
-  - `bounded missing batched point read persistent` median 224 us versus 386 us
-    before.
-  - `localized batched point read persistent` median 1125 us and remains faster
-    than localized sequential median 1348 us.
-- Negative lookup follow-up retained two more changes:
-  - Single-key and batch reads build the memtable range-tombstone index only
-    after a point candidate exists; all-missing unique batches scatter `None`
-    without building that index.
-  - Memtable point lookup checks the first and last user key before building
-    internal key bounds, so range-outside misses skip the BTree range search.
-- The `missing get` benchmark now prebuilds missing keys outside the measured
-  closure, so it measures database lookup rather than repeated benchmark string
-  formatting.
-- Three-run V1 benchmark evidence after the negative lookup follow-up:
-  - `missing get` median 216 us versus 719 us before this follow-up.
-  - `merged delta missing get` median 163 us.
-  - `missing batched point read persistent` median 125 us.
-  - `bounded missing batched point read persistent` median 221 us.
-- Hot/cold cache follow-up retained the existing priority split: index/filter
-  metadata is high priority and data/blob blocks are low priority. The cache now
-  allows one high-priority entry to exceed its shard target when the total cache
-  can hold it, so a large hot index partition is not inserted and immediately
-  evicted by a small per-shard budget.
-- A new L2 table test proves hot lazy index metadata survives same-partition
-  data-block churn under a small cache. Cache tests also prove oversized
-  high-priority entries survive low-priority churn.
-- Three-run V1 benchmark evidence after the cache follow-up:
-  - `block cache random hit diagnostic` remains 2048 cache hits, 0 cache
-    misses, and 0 storage read-owned requests.
-  - `block decode forced diagnostic` remains 2048 cache misses and 2048 storage
-    read-owned requests.
-  - `random get` median 775 us, `missing get` median 210 us, and persistent
-    missing/bounded-missing rows remain in the same range as the prior slice.
+- Recent read-path work proves point, missing, cache, and data-block counters
+  are available and useful for deciding retained optimizations.
+- Persistent in-bounds missing reads already show Bloom/filter pruning can avoid
+  data-block reads: 2048 filter skips, 0 data-block reads, and 0 read-owned
+  storage requests in the bounded missing diagnostic.
+- L0 can still contain overlapping tables; L1+ currently validates
+  non-overlapping key ranges and usually selects at most one table per key per
+  non-overlapping level.
+- Hot/cold cache work already protects high-priority metadata from data-block
+  churn; guard work should build on this rather than replacing the cache policy.
+- The accepted design direction is recorded in
+  `.phrase/protocol/guard-aware-lsm-strategy.md`.
 
-## Known Residuals
+## Known Risks
 
-- Missing-key advantage must be proven by low data-block reads and high filter
-  skips, not just wall-clock time.
-- Out-of-bounds missing keys should remain a separate diagnostic because they
-  exercise key-bound rejection rather than table filters.
+- Guard pruning must not skip a newer L0 table, a range tombstone, or a table
+  needed by an old snapshot.
+- Range and prefix scans need range-to-guard routing, not only point-key
+  routing.
+- Transaction conflict checks should remain conservative until guard coverage is
+  proven for write/write and read/write conflicts.
+- Non-uniform compaction must not hide obsolete data or blob references by
+  simply delaying all lower-level work.
 
 ## Next Recommendation
 
-- Run the strict local gate and commit this hot/cold cache slice.
+- Implement `task823` first: add candidate-depth diagnostics without changing
+  read behavior, then run targeted benchmark rows before any guard index is
+  introduced.

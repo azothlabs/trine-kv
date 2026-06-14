@@ -30,6 +30,13 @@ Record only evidence that can change planning or durable decisions.
 
 ### Observation
 
+- User selected guard-aware key-space routing and non-uniform per-level
+  compaction as the next structural LSM direction.
+- The design has been recorded in
+  `.phrase/protocol/guard-aware-lsm-strategy.md`, with the first slices limited
+  to diagnostics and in-memory guard indexing derived from existing table key
+  bounds.
+- Roadmap Phase 187 now tracks guard-aware LSM read and compaction strategy.
 - Hot/cold cache follow-up confirmed the intended split: L0/L1 table metadata
   is pinned per table, while L2+ lazy index partitions depend on the global
   block cache. Cache keys already classify index/filter/range-tombstone
@@ -88,6 +95,10 @@ Record only evidence that can change planning or durable decisions.
   read-owned storage requests.
 - The hot/cold cache follow-up strengthens metadata residency for large
   datasets without changing storage format, MVCC visibility, or public APIs.
+- Guard-aware LSM work is likely valuable for Trine, but it must start with
+  diagnostics and in-memory structures. Persisted guard metadata and
+  non-uniform compaction policy changes require evidence and, if formats or
+  recovery behavior change, protocol updates before implementation.
 
 ### Verification
 
@@ -101,6 +112,9 @@ Record only evidence that can change planning or durable decisions.
 - `cargo check -q --benches`
 - `cargo clippy -q --all-targets --all-features -- -D warnings`
 - `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench`
+- Documentation update for Phase 187:
+  `.phrase/protocol/guard-aware-lsm-strategy.md`, `.phrase/roadmap.md`,
+  `.phrase/current.md`, and `.phrase/decision.md`.
 
 ### Remaining Blockers
 
@@ -108,9 +122,8 @@ Record only evidence that can change planning or durable decisions.
 
 ### Recommended Next Action
 
-- Continue the KV optimization queue from grouped benchmark evidence; keep
-  larger structural read optimizations, such as metadata cache policy and
-  compressed read bandwidth, behind fresh diagnostics.
+- Start Phase 187 with guard candidate diagnostics before any guard index or
+  compaction policy behavior change.
 
 ## 2026-06-13: Startup And Recovery Benchmark Boundary
 

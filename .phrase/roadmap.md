@@ -4607,3 +4607,37 @@ budget exhaustions.
 
 - Storage format changes, platform-io backend changes, new compaction
   selection policy, publishing, tagging, or pushing changes.
+
+### Phase 187: Guard-Aware LSM Read And Compaction Strategy
+
+**Status**: Active
+
+**Goal**: Use key-space guard diagnostics, then an in-memory guard index, to
+reduce unnecessary read candidates and prepare non-uniform compaction policy
+without changing storage formats first.
+
+**Entry Condition**: Recent point-read, negative-lookup, and hot/cold cache
+evidence shows table/filter/data-block work is measurable, and user review
+selects guard-aware LSM layout plus per-level compaction policy as the next
+structural optimization direction.
+
+**Acceptance Gate**:
+
+- `guard-aware-lsm-strategy.md` records the design boundary, non-goals, phase
+  order, and verification gates.
+- Diagnostics report candidate tables/runs by level, L0 overlap depth,
+  guard/table/block grouping for `get_many`, and compaction rewrite bytes by
+  level.
+- The first implementation slice changes no storage format, public API,
+  recovery contract, WAL, manifest, or SSTable layout.
+- Any retained read-path change reduces candidate probes without increasing
+  data-block reads or weakening MVCC/range-delete behavior.
+- Any retained compaction-picker change reports why compaction ran and reduces
+  local rewrite cost or read candidate depth without increasing lower-level
+  rewrite churn unexpectedly.
+
+**Major Out Of Scope**:
+
+- Persisted guard metadata, manifest/SSTable format changes, public API names,
+  durability changes, platform I/O backend changes, publishing, tagging, or
+  pushing changes.

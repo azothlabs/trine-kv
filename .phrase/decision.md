@@ -49,6 +49,8 @@ Evidence notes should separate:
 - Native platform I/O backend matrix:
   `.phrase/adr/0002-native-platform-io-backend-matrix.md`.
 - V1 protocol and storage contract: `.phrase/protocol/trine-kv-v1-spec.md`.
+- Guard-aware LSM read and compaction strategy:
+  `.phrase/protocol/guard-aware-lsm-strategy.md`.
 - Trine specs, ADRs, tests, and local design notes are the source of truth.
 - Do not implement Trine by depending on another storage engine.
 - V1 compression uses only `none` and `lz4_flex`-backed fast block compression;
