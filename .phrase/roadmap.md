@@ -4533,7 +4533,34 @@ shared payload owner.
 - Storage format changes, LZ4 decode buffer reuse, platform I/O backend
   changes, publishing, tagging, or pushing changes.
 
-### Phase 184: Concurrent Read/Write And Background Maintenance
+### Phase 184: LZ4 Decode Allocation Policy
+
+**Status**: Complete
+
+**Goal**: Reduce `fast-lz4-block` decode allocation overhead by narrowing
+`lz4_flex` features to the block APIs and checked decode behavior Trine
+actually uses.
+
+**Entry Condition**: Phase 183 is complete, `fast-lz4-block` decode allocation
+is the remaining serialization/decode boundary, and the selected change can
+preserve the V1 table/blob format.
+
+**Acceptance Gate**:
+
+- Trine keeps the V1 `fast-lz4-block` codec id and `lz4_flex` block
+  compression implementation.
+- `safe-decode` and `frame` are not enabled by Trine's default dependency set,
+  while `checked-decode` remains enabled.
+- Focused codec/table tests, full lib tests, all-feature tests, strict clippy,
+  and grouped benchmark evidence pass.
+- Dependency-internal unsafe decode risk is documented instead of being hidden.
+
+**Major Out Of Scope**:
+
+- Storage format changes, new codecs, cross-block decode buffer reuse,
+  platform-io backend changes, publishing, tagging, or pushing changes.
+
+### Phase 185: Concurrent Read/Write And Background Maintenance
 
 **Status**: Planned
 

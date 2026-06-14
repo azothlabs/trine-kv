@@ -34,7 +34,13 @@ crossbeam-channel = { version = "0.5.15", optional = true }
 # Async primitives (e.g. `futures::lock::Mutex` for serializing object-store
 # manifest publishes Send-safely). Available on every target.
 futures = "0.3.32"
-lz4_flex = "0.13.1"
+# Trine uses only lz4_flex block compression. Keep checked decode enabled, but
+# avoid the default `safe-decode` zero-fill path on the table block read path.
+lz4_flex = { version = "0.13.1", default-features = false, features = [
+    "std",
+    "safe-encode",
+    "checked-decode",
+] }
 # Real object-storage backend (S3 and compatible) behind the `s3` feature. The
 # `aws` feature provides the S3 client builder; the core gives the in-memory
 # store used to test the ObjectClient adapter without a network.

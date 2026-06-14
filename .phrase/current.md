@@ -6,19 +6,16 @@ Complete
 
 ## Goal
 
-Reduce metadata and index block payload copies at the table decode boundary
-while preserving MVCC visibility, table/blob formats, prefix/range filters,
-compression contracts, and read-path correctness.
+Reduce `fast-lz4-block` decode allocation overhead by narrowing the `lz4_flex`
+dependency feature set while preserving V1 codec ids, malformed-block checks,
+table/blob formats, MVCC visibility, and read-path correctness.
 
 ## Scope
 
-- Properties, top-level index, index partition, filter, and range tombstone
-  block reads.
-- Full table verification decode.
-- Source-offset checked block reads used by multi-block sections.
-- Focused pointer tests proving shared source-offset payload reuse.
-- Benchmark evidence showing whether metadata/index shared payload reads are
-  visible in current startup/cache/decode rows.
+- `lz4_flex` Cargo feature policy for Trine's block compression implementation.
+- Codec, table, and benchmark coverage for `fast-lz4-block`.
+- Protocol documentation for the dependency feature boundary.
+- Benchmark evidence showing whether the decode-only and table read rows move.
 
 ## Out Of Scope
 
@@ -27,52 +24,55 @@ compression contracts, and read-path correctness.
   compaction, blob-GC, platform-io, publishing, tagging, pushing, or release
   workflow changes.
 - New compression formats beyond the V1 `none` and `fast-lz4-block` contract.
-- LZ4 decode buffer reuse.
+- LZ4 decode buffer reuse across blocks.
 - Changing manifest, WAL, blob file, table file, or block encoding.
+- Adding unsafe code to `trine-kv`.
 
 ## Acceptance Gate
 
-- Normal metadata/index/filter/range-tombstone decoders consume shared checked
-  block payload slices instead of compatibility payload `Vec`s.
-- Full table verification decodes data blocks from shared checked blocks instead
-  of first copying the payload into a `Vec`.
-- Focused block/table tests pass.
+- `cargo tree -e features -i lz4_flex` confirms `safe-decode` and `frame` are
+  not enabled through Trine's default dependency set.
+- Checked LZ4 decode remains enabled and codec ids remain unchanged.
+- Focused codec/table tests pass.
 - Full lib tests, all-feature tests, and strict clippy pass.
-- Grouped benchmark evidence records current startup/cache/decode behavior
+- Grouped benchmark evidence records decode-only and table read behavior
   without overstating noisy timing results.
 
 ## Active Task Slice
 
 ```text
-task804 [x] goal:classify metadata/index compatibility payload Vec paths | scope:src/table.rs src/block.rs | verify:code audit
-task805 [x] goal:consume metadata/index checked blocks as shared payload slices | scope:src/table.rs src/block.rs | verify:cargo test -q table --lib
-task806 [x] goal:record metadata/index shared payload evidence | scope:docs/benchmarks .phrase/evidence.md | verify:git diff review
+task807 [x] goal:classify lz4_flex feature impact | scope:Cargo.toml Cargo.lock src/codec.rs benches/v1_bench.rs | verify:cargo tree -e features -i lz4_flex
+task808 [x] goal:use checked lz4 block decode without default safe-decode zero-fill | scope:Cargo.toml Cargo.lock | verify:cargo test -q codec --lib && cargo test -q table --lib
+task809 [x] goal:record lz4 decode allocation evidence | scope:docs/benchmarks .phrase/current.md .phrase/evidence.md .phrase/protocol/trine-kv-v1-spec.md | verify:git diff review
 ```
 
 ## Evidence
 
-- Phase 182 removed the read-owned storage buffer copy, but normal metadata and
-  index helpers still converted checked block payloads into compatibility
-  `Vec`s before decoding structures from `&[u8]`.
-- Properties, top-level index, index partitions, filters, range tombstones, and
-  full-table verification now decode from shared checked block payload slices.
-- `BlockManager::read_checked_at_source_offset_shared` supports multi-block
-  section reads such as the top-level index without returning a payload `Vec`.
-- The focused test `shared_source_offset_read_reuses_owned_payload_bytes` proves
-  source-offset shared reads keep the decoded payload inside the full owned
-  block read buffer.
+- Trine uses only `lz4_flex::block` encode/decode APIs; `frame` support is not
+  used by the database format or benchmark harness.
+- With default `lz4_flex` features, `safe-decode` creates an initialized output
+  buffer before decoding. The dependency also exposes a checked decode path
+  without `safe-decode`, which avoids that zero-fill while still rejecting
+  malformed compressed input.
+- `Cargo.toml` now disables default `lz4_flex` features and enables only
+  `std`, `safe-encode`, and `checked-decode`.
+- `cargo tree -e features -i lz4_flex` confirms Trine no longer enables
+  `safe-decode` or `frame`.
+- The dependency feature change removes the unused `twox-hash` lockfile entry
+  that was pulled in by default frame support.
 - `TRINE_BENCH_RUNS=5 cargo bench --bench v1_bench` after the change reported
-  improved but still noisy rows: cold table read median 21586 us, cold table
-  read-only median 4447 us, random cached block read median 1541 us, warm
-  cached read median 1363 us, inline runtime block decode read median 7421 us,
-  native runtime block decode read median 7586 us, and forced decode diagnostic
-  wall median 7967 us.
+  `codec decode only fast block compression Trine data blocks` at 2235 us
+  median and `codec decode only fast block compression Trine index blocks` at
+  1121 us median. End-to-end cache/decode and cold-open rows remained noisy.
 
 ## Known Residuals
 
-- Current end-to-end benchmark rows still did not prove a stable wall-time win
-  from the structural copy removals.
-- `fast-lz4-block` still decodes into a new buffer.
+- This phase changes dependency feature policy, not the V1 block format.
+- `fast-lz4-block` still returns a newly owned decoded buffer for compressed
+  blocks; this phase reduces the buffer initialization cost instead of reusing
+  one output buffer across independent cached blocks.
+- The high-performance decode implementation is inside the `lz4_flex`
+  dependency. Trine itself still has no new unsafe code in this phase.
 - Whole-object native storage APIs still return `Arc<[u8]>` in a few places
   outside the hot table data-block path.
 - Some `#[cfg(test)]` compatibility helpers still return payload `Vec`s for old
@@ -80,6 +80,5 @@ task806 [x] goal:record metadata/index shared payload evidence | scope:docs/benc
 
 ## Next Recommendation
 
-- If continuing serialization/decode work, measure LZ4 decode allocation before
-  changing it.
-- Otherwise, move next to concurrent read/write and background maintenance.
+- Move next to concurrent read/write and background maintenance unless new
+  benchmark evidence points to another serialization/decode boundary.

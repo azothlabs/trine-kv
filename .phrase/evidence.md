@@ -12435,3 +12435,69 @@ Negative check:
 - If continuing serialization/decode work, measure LZ4 decode allocation before
   changing it.
 - Otherwise, move next to concurrent read/write and background maintenance.
+
+## 2026-06-14: LZ4 Decode Allocation Policy
+
+### Observation
+
+- Trine uses only `lz4_flex::block` encode/decode APIs for the V1
+  `fast-lz4-block` codec id; frame compression is not used by the storage
+  format or benchmark harness.
+- The previous default `lz4_flex` feature set enabled `safe-decode` and
+  `frame`. `safe-decode` initializes the output buffer before decode, while
+  `frame` pulled in the unused `twox-hash` dependency.
+- `Cargo.toml` now disables default `lz4_flex` features and enables only
+  `std`, `safe-encode`, and `checked-decode`.
+- `cargo tree -e features -i lz4_flex` confirms Trine now enables only those
+  three features by default.
+- After the change, `TRINE_BENCH_RUNS=5 cargo bench --bench v1_bench` reported:
+  - `codec decode only fast block compression Trine data blocks`: 2235 us
+    median.
+  - `codec decode only fast block compression Trine index blocks`: 1121 us
+    median.
+  - `codec decode only fast block compression Trine range tombstone blocks`:
+    1026 us median.
+  - `block cache random block read`: 2036 us median.
+  - `block cache warm read`: 1685 us median.
+  - `inline runtime block decode read`: 8981 us median.
+  - `native runtime block decode read`: 8702 us median.
+  - `block decode forced diagnostic wall micros`: 9760 us median.
+
+### Interpretation
+
+- The retained change removes a dependency feature mismatch while preserving V1
+  codec ids, the `lz4_flex` block implementation, checked malformed-block
+  rejection, decoded-length validation, and table/blob formats.
+- The codec decode-only data and index rows support the feature change; the
+  table-level rows remain noisy and should not be interpreted as a stable
+  end-to-end read latency win.
+- The high-performance decode implementation is dependency-internal. Trine did
+  not add unsafe code in this phase, but the dependency feature policy now
+  intentionally selects the checked non-`safe-decode` path.
+
+### Verification
+
+- `cargo check -q`
+- `cargo tree -e features -i lz4_flex`
+- `cargo test -q codec --lib`
+- `cargo test -q table --lib`
+- `cargo test -q --lib`
+- `cargo test -q --all-features`
+- `cargo fmt --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `git diff --check`
+- `TRINE_BENCH_RUNS=5 cargo bench --bench v1_bench`
+
+### Remaining Blockers
+
+- None for the `lz4_flex` feature-policy correction.
+- Compressed blocks still return a newly owned decoded buffer; cross-block
+  decode buffer reuse would need a separate design because decoded data blocks
+  can be shared by cache entries and lazy value reads.
+- A few whole-object storage compatibility helpers still return `Arc<[u8]>`
+  outside the hot data-block path.
+
+### Recommended Next Action
+
+- Move next to concurrent read/write and background maintenance unless new
+  benchmark evidence points to another serialization/decode boundary.

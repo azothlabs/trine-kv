@@ -713,6 +713,10 @@ Crate binding rule:
 The public format uses Trine codec ids such as `none` and `fast-lz4-block`.
 The implementation uses `lz4_flex`, but crate names do not become on-disk
 compatibility names.
+Trine uses the `lz4_flex` block API only. The dependency must keep checked
+decode enabled for malformed-block rejection, and the default `safe-decode` and
+`frame` features are not part of the V1 requirement because the table read path
+does not use frame compression and already validates decoded block lengths.
 
 ## 18. Large Values
 
