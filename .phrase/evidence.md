@@ -12246,3 +12246,70 @@ Negative check:
 
 - Move next to concurrent read/write and background maintenance, unless a
   dedicated LZ4 decode-allocation phase is selected first.
+
+## 2026-06-14: Serialization And Decode Copy Cost
+
+### Observation
+
+- Phase 180 and user review redirected the next cache/decode step away from
+  broader cache policy and toward serialization/deserialization overhead.
+- Owned checked block reads previously decoded through a `(CodecId, Vec<u8>)`
+  payload result. For `CodecId::None`, that copied the checked-block payload
+  before table data block decode wrapped the payload for shared cached records.
+- Added `BlockManager::decode_checked_owned`, which returns a shared decoded
+  block. For `CodecId::None`, the payload is a range inside the original
+  read-owned checked-block bytes after header, length, codec, and checksum
+  validation.
+- `DecodedDataBlock` now stores shared bytes plus a payload range, so record
+  views, point lookup validation, restart points, and inline value sources can
+  operate on data block payload offsets even when the shared bytes also include
+  a checked-block header.
+- The focused test `none_codec_owned_decode_reuses_payload_bytes` proves the
+  decoded uncompressed payload pointer is the original read buffer pointer plus
+  `BLOCK_HEADER_LEN`.
+- After the change, `TRINE_BENCH_RUNS=5 cargo bench --bench v1_bench` reported
+  mixed/noisy cache-decode timing:
+  - `block cache random block read`: 1714 us median.
+  - `block cache warm read`: 1553 us median.
+  - `inline runtime block decode read`: 8170 us median.
+  - `native runtime block decode read`: 7979 us median.
+  - `block decode forced diagnostic wall micros`: 8716 us median.
+  - `codec decode only none Trine data blocks`: 189 us median.
+  - `codec decode only fast block compression Trine data blocks`: 3681 us
+    median.
+
+### Interpretation
+
+- The retained change removes an avoidable payload duplicate copy in the
+  uncompressed owned data-block read path without changing table format,
+  compression format, MVCC visibility, filters, point lookup behavior, or inline
+  value semantics.
+- Current end-to-end benchmark rows did not prove a stable wall-time win. The
+  change should be treated as fixing the decode ownership boundary, not as
+  completing cache/decode performance work.
+- `fast-lz4-block` decode allocation, metadata/index compatibility payload
+  `Vec`s, and the storage read buffer backing type remain separate measurable
+  decode/allocation boundaries.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q block --lib`
+- `cargo test -q data_block --lib`
+- `cargo test -q table --lib`
+- `cargo test -q --lib`
+- `cargo test -q --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `TRINE_BENCH_RUNS=5 cargo bench --bench v1_bench`
+
+### Remaining Blockers
+
+- None for the uncompressed owned data-block payload copy removal.
+- Whole-path read-buffer copy removal and LZ4 decode buffer reuse are still open
+  performance targets.
+
+### Recommended Next Action
+
+- If continuing serialization/decode work, measure the remaining storage buffer
+  backing and LZ4 decode allocation boundaries before changing them.
+- Otherwise, move next to concurrent read/write and background maintenance.

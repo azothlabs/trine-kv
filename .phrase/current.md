@@ -6,19 +6,18 @@ Complete
 
 ## Goal
 
-Measure and reduce hot-read block-cache and block-decode costs while preserving
-MVCC visibility, table/blob formats, prefix/range filters, compression
-contracts, and read-path correctness.
+Reduce avoidable table block decode byte copies while preserving MVCC
+visibility, table/blob formats, prefix/range filters, compression contracts,
+and read-path correctness.
 
 ## Scope
 
-- Block cache keys, admission, eviction, and hit promotion costs.
-- Metadata/data block cache separation and whether metadata survives data churn.
-- Repeated data-block decode paths when cache is disabled or undersized.
-- Compression-block decode costs and avoidable allocation in benchmark-visible
-  paths.
-- Benchmark diagnostics that distinguish cache hits, cache misses, table data
-  block reads, metadata probes, storage reads, and codec decode work.
+- Owned checked block reads.
+- `CodecId::None` block decode.
+- Data block payload ownership and inline value sharing.
+- Focused tests proving payload reuse and table read correctness.
+- Benchmark evidence showing whether the structural copy removal is visible in
+  current end-to-end rows.
 
 ## Out Of Scope
 
@@ -27,57 +26,61 @@ contracts, and read-path correctness.
   compaction, blob-GC, platform-io, publishing, tagging, pushing, or release
   workflow changes.
 - New compression formats beyond the V1 `none` and `fast-lz4-block` contract.
-- Broad cache replacement algorithm rewrites without benchmark evidence.
+- LZ4 decode buffer reuse.
+- Replacing the storage read buffer backing type across the whole engine.
 
 ## Acceptance Gate
 
-- Diagnostics classify warm cache hit behavior, forced block decode reads,
-  metadata/data cache behavior, and codec decode behavior before optimization.
-- Any retained code change is justified by benchmark evidence and keeps table
-  reads, filters, cache key separation, and compression behavior unchanged.
-- Focused cache/table tests pass.
-- Strict clippy passes.
-- Single-run and grouped benchmark evidence records before/after behavior.
+- `CodecId::None` owned block decode reuses the read-owned block payload bytes
+  instead of duplicating the payload into a new `Vec`.
+- Data block reads can consume shared decoded block payload ranges without
+  changing record, filter, inline value, or point lookup semantics.
+- Focused block/table tests pass.
+- Full lib tests and strict clippy pass.
+- Grouped benchmark evidence records current cache/decode behavior without
+  overstating noisy timing results.
 
 ## Active Task Slice
 
 ```text
-task795 [x] goal:add block-cache/decode diagnostics | scope:benches/v1_bench.rs | verify:TRINE_BENCH_RUNS=1 cargo bench --bench v1_bench
-task796 [x] goal:optimize measured cache/decode bottleneck | scope:src/cache.rs benches/v1_bench.rs | verify:cargo test -q cache --lib
-task797 [x] goal:record cache/decode evidence | scope:docs/benchmarks .phrase/evidence.md | verify:git diff review
+task798 [x] goal:classify decode byte-copy boundary | scope:src/block.rs src/table.rs | verify:code audit
+task799 [x] goal:reuse none-codec owned block payload bytes | scope:src/block.rs src/table.rs | verify:cargo test -q block --lib && cargo test -q table --lib
+task800 [x] goal:record decode-copy evidence | scope:docs/benchmarks .phrase/evidence.md | verify:git diff review
 ```
 
 ## Evidence
 
-- Phase 179 completed maintenance write-amplification diagnostics and reduced
-  foreground manifest publishes for blob maintenance cleanup.
-- Grouped benchmark evidence currently points to cache/decode, point reads,
-  startup/recovery, search-policy, and concurrent maintenance as remaining
-  optimization candidates.
-- Initial audit found block cache keys already include kind/table/block and
-  metadata entries use higher eviction priority than data/blob entries.
-- Initial audit found cache hits clone the cached value and then attempt
-  best-effort recency promotion; promotion currently scans the priority queue
-  even when the hot key is already the newest entry.
-- Added benchmark rows and diagnostics for random hot block-cache reads, warm
-  cache-hit counters, random cache-hit counters, forced block decode counters,
-  and codec decode-only costs.
-- A/B `TRINE_BENCH_RUNS=5 cargo bench --bench v1_bench` kept the cache change:
-  random cached block read median improved from 1532 us to 1488 us, warm cached
-  read median improved from 1361 us to 1285 us, random hit diagnostic improved
-  from 1681 us to 1657 us, and warm hit diagnostic improved from 1421 us to
-  1316 us.
-- Cache-hit diagnostics still reported 2048 cache hits, zero misses, and zero
-  storage read-owned requests; forced decode diagnostics still reported zero
-  hits, 2048 misses, and 2049 storage read-owned requests.
+- Phase 180 proved block-cache hit maintenance was a small but real cost, while
+  forced decode and codec rows kept decode/allocation cost visible.
+- `BlockManager::decode_checked_owned` now returns a shared decoded block. For
+  `CodecId::None`, the decoded payload is a range inside the original
+  read-owned block bytes after checksum and length validation.
+- `DecodedDataBlock` now stores shared bytes plus a payload range, so data block
+  record views and inline point values can reference the payload even when the
+  shared bytes include a checked-block header.
+- The focused test `none_codec_owned_decode_reuses_payload_bytes` proves the
+  decoded `none` payload pointer is the original read buffer pointer plus the
+  checked-block header length.
+- `TRINE_BENCH_RUNS=5 cargo bench --bench v1_bench` after the change reported
+  mixed/noisy cache-decode timing: random cached block read median 1714 us,
+  warm cached read median 1553 us, inline runtime block decode read median
+  8170 us, native runtime block decode read median 7979 us, and forced decode
+  diagnostic wall median 8716 us.
 
 ## Known Residuals
 
-- LZ4 block decode remains much more expensive than `none` decode in the
-  decode-only rows. Reducing that further likely requires a separate table
-  block ownership or compression-boundary phase.
+- Current end-to-end benchmark rows did not prove a stable wall-time win from
+  this structural copy removal.
+- `fast-lz4-block` still decodes into a new buffer.
+- Metadata and index block helpers still use the compatibility path that
+  returns a payload `Vec`.
+- `StorageReadBuffer::from_vec` still wraps read buffers into `Arc<[u8]>`; a
+  whole-path zero-copy read buffer would need a separate shared byte backing
+  type that also works with value sources and caches.
 
 ## Next Recommendation
 
-- Move next to concurrent read/write and background maintenance, unless the
-  user wants a dedicated LZ4 decode-allocation phase first.
+- If continuing serialization/decode work, measure and reduce the remaining
+  storage-read buffer copy and LZ4 decode allocation boundary as a separate
+  phase.
+- Otherwise, move next to concurrent read/write and background maintenance.

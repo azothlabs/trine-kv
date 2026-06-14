@@ -3,6 +3,7 @@ use crate::{
     error::{Error, Result},
     storage::StorageReadBuffer,
 };
+use std::{ops::Range, sync::Arc};
 
 const BLOCK_HEADER_LEN: usize = 13;
 
@@ -14,6 +15,27 @@ pub(crate) struct BlockHandle {
 
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct BlockManager;
+
+#[derive(Debug, Clone)]
+pub(crate) struct DecodedBlock {
+    codec: CodecId,
+    bytes: Arc<[u8]>,
+    payload_range: Range<usize>,
+}
+
+impl DecodedBlock {
+    pub(crate) const fn codec(&self) -> CodecId {
+        self.codec
+    }
+
+    pub(crate) fn payload(&self) -> &[u8] {
+        &self.bytes[self.payload_range.clone()]
+    }
+
+    pub(crate) fn into_shared_payload(self) -> (Arc<[u8]>, Range<usize>) {
+        (self.bytes, self.payload_range)
+    }
+}
 
 pub(crate) trait BlockReadSource {
     fn read_exact_at(&self, offset: usize, bytes: &mut [u8]) -> Result<()>;
@@ -115,7 +137,29 @@ impl BlockManager {
             .checked_add(start)
             .ok_or_else(|| invalid_table("block file offset overflow"))?;
         let block_bytes = source.read_exact_at_owned(source_offset, end - start)?;
-        Self::decode_checked(block_bytes.as_slice())
+        Self::decode_checked_owned(block_bytes).map(|block| {
+            let codec = block.codec();
+            let payload = block.payload().to_vec();
+            (codec, payload)
+        })
+    }
+
+    pub(crate) fn read_checked_from_source_shared(
+        payload_len: usize,
+        payload_base_offset: usize,
+        block: BlockHandle,
+        source: &impl BlockReadSource,
+    ) -> Result<DecodedBlock> {
+        let (start, end) = block_bounds(block)?;
+        if end > payload_len {
+            return Err(invalid_table("block outside table payload"));
+        }
+
+        let source_offset = payload_base_offset
+            .checked_add(start)
+            .ok_or_else(|| invalid_table("block file offset overflow"))?;
+        let block_bytes = source.read_exact_at_owned(source_offset, end - start)?;
+        Self::decode_checked_owned(block_bytes)
     }
 
     pub(crate) fn read_checked_at_source_offset(
@@ -139,7 +183,9 @@ impl BlockManager {
             return Err(invalid_table("block outside table payload"));
         }
         let block_bytes = source.read_exact_at_owned(source_offset, len)?;
-        let (codec, decoded) = Self::decode_checked(block_bytes.as_slice())?;
+        let decoded_block = Self::decode_checked_owned(block_bytes)?;
+        let codec = decoded_block.codec();
+        let decoded = decoded_block.payload().to_vec();
         Ok((
             BlockHandle {
                 offset: usize_to_u64(offset, "block offset")?,
@@ -150,6 +196,7 @@ impl BlockManager {
         ))
     }
 
+    #[cfg(test)]
     pub(crate) fn decode_checked(block_bytes: &[u8]) -> Result<(CodecId, Vec<u8>)> {
         if block_bytes.len() < BLOCK_HEADER_LEN {
             return Err(invalid_table("short block header"));
@@ -177,6 +224,46 @@ impl BlockManager {
             codec::decode_block(codec, encoded, uncompressed_len)?,
         ))
     }
+
+    pub(crate) fn decode_checked_owned(block_bytes: StorageReadBuffer) -> Result<DecodedBlock> {
+        let bytes = block_bytes.as_slice();
+        let block = decoded_block_header(bytes)?;
+        let encoded = &bytes[BLOCK_HEADER_LEN..];
+        if checksum(encoded) != block.expected_checksum {
+            return Err(Error::Corruption {
+                message: "block checksum mismatch".to_owned(),
+            });
+        }
+
+        if block.codec == CodecId::None {
+            if block.encoded_len != block.uncompressed_len {
+                return Err(Error::InvalidFormat {
+                    message: "uncompressed block length mismatch".to_owned(),
+                });
+            }
+            return Ok(DecodedBlock {
+                codec: block.codec,
+                bytes: block_bytes.into_bytes(),
+                payload_range: BLOCK_HEADER_LEN..BLOCK_HEADER_LEN + block.encoded_len,
+            });
+        }
+
+        let decoded = codec::decode_block(block.codec, encoded, block.uncompressed_len)?;
+        let payload_len = decoded.len();
+        Ok(DecodedBlock {
+            codec: block.codec,
+            bytes: Arc::from(decoded),
+            payload_range: 0..payload_len,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DecodedBlockHeader {
+    codec: CodecId,
+    uncompressed_len: usize,
+    encoded_len: usize,
+    expected_checksum: u32,
 }
 
 pub(crate) fn block_bounds(handle: BlockHandle) -> Result<(usize, usize)> {
@@ -201,6 +288,29 @@ fn checked_block_len(header: &[u8]) -> Result<usize> {
     BLOCK_HEADER_LEN
         .checked_add(encoded_len)
         .ok_or_else(|| invalid_table("block length overflow"))
+}
+
+fn decoded_block_header(block_bytes: &[u8]) -> Result<DecodedBlockHeader> {
+    if block_bytes.len() < BLOCK_HEADER_LEN {
+        return Err(invalid_table("short block header"));
+    }
+
+    let codec = CodecId::from_tag(block_bytes[0])?;
+    let uncompressed_len = read_u32_at(block_bytes, 1)? as usize;
+    let encoded_len = read_u32_at(block_bytes, 5)? as usize;
+    let expected_checksum = read_u32_at(block_bytes, 9)?;
+    if block_bytes.len() != BLOCK_HEADER_LEN + encoded_len {
+        return Err(Error::Corruption {
+            message: "block length mismatch".to_owned(),
+        });
+    }
+
+    Ok(DecodedBlockHeader {
+        codec,
+        uncompressed_len,
+        encoded_len,
+        expected_checksum,
+    })
 }
 
 fn put_u32(bytes: &mut Vec<u8>, value: u32) {
@@ -276,6 +386,21 @@ mod tests {
                 .expect("read checked block");
         assert_eq!(codec, CodecId::None);
         assert_eq!(decoded, block_payload);
+    }
+
+    #[test]
+    fn none_codec_owned_decode_reuses_payload_bytes() {
+        let block_payload = b"owned none payload";
+        let block =
+            BlockManager::encode_checked(CodecId::None, block_payload).expect("block encodes");
+        let buffer = StorageReadBuffer::from_vec(0, block);
+        let expected_payload_ptr = buffer.as_slice().as_ptr().wrapping_add(BLOCK_HEADER_LEN);
+
+        let decoded = BlockManager::decode_checked_owned(buffer).expect("block decodes");
+
+        assert_eq!(decoded.codec(), CodecId::None);
+        assert_eq!(decoded.payload(), block_payload);
+        assert_eq!(decoded.payload().as_ptr(), expected_payload_ptr);
     }
 
     #[test]

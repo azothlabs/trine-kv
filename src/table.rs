@@ -11,7 +11,7 @@ use std::{
 
 use crate::{
     blob::{BlobIndex, ValueRef},
-    block::{BlockHandle, BlockManager, BlockReadSource, block_bounds, checksum},
+    block::{BlockHandle, BlockManager, BlockReadSource, DecodedBlock, block_bounds, checksum},
     cache::{BlockCache, BlockCacheKey, CacheKind},
     codec::CodecId,
     error::{Error, Result},
@@ -242,6 +242,7 @@ struct IndexPartitionEntry {
 #[derive(Debug, Clone)]
 pub(crate) struct DecodedDataBlock {
     bytes: Arc<[u8]>,
+    payload_range: Range<usize>,
     record_headers: Box<[DataBlockRecordHeader]>,
     restart_indices: Box<[u32]>,
     point_lookup_index: DataBlockPointLookupIndex,
@@ -273,10 +274,11 @@ impl DecodedDataBlock {
     }
 
     fn record_view(&self, index: usize) -> Result<DataBlockRecordView<'_>> {
+        let payload = self.payload_bytes();
         self.record_headers
             .get(index)
             .ok_or_else(|| invalid_table("record index outside data block"))?
-            .view(&self.bytes)
+            .view(payload)
     }
 
     fn record_owned(&self, index: usize) -> Result<TablePointRecord> {
@@ -288,14 +290,18 @@ impl DecodedDataBlock {
             .record_headers
             .get(index)
             .ok_or_else(|| invalid_table("record index outside data block"))?;
-        let record = header.view(&self.bytes)?;
+        let payload = self.payload_bytes();
+        let record = header.view(payload)?;
         let value = match header.value {
-            Some(ValueRefHeader::Inline { offset, len }) => Some(PointValueSource::from_shared(
-                Arc::clone(&self.bytes),
-                inline_value_range(offset, len, self.bytes.len())?,
-            )?),
+            Some(ValueRefHeader::Inline { offset, len }) => {
+                let range = inline_value_range(offset, len, payload.len())?;
+                Some(PointValueSource::from_shared(
+                    Arc::clone(&self.bytes),
+                    self.payload_absolute_range(range)?,
+                )?)
+            }
             Some(value) => Some(PointValueSource::from_value_ref(
-                value.view(&self.bytes)?.to_owned(),
+                value.view(payload)?.to_owned(),
             )),
             None => None,
         };
@@ -324,10 +330,34 @@ impl DecodedDataBlock {
             .collect()
     }
 
+    fn payload_bytes(&self) -> &[u8] {
+        &self.bytes[self.payload_range.clone()]
+    }
+
+    fn payload_absolute_range(&self, range: Range<usize>) -> Result<Range<usize>> {
+        let start = self
+            .payload_range
+            .start
+            .checked_add(range.start)
+            .ok_or_else(|| invalid_table("data block payload range overflow"))?;
+        let end = self
+            .payload_range
+            .start
+            .checked_add(range.end)
+            .ok_or_else(|| invalid_table("data block payload range overflow"))?;
+        if end > self.payload_range.end {
+            return Err(invalid_table(
+                "data block payload range outside shared bytes",
+            ));
+        }
+        Ok(start..end)
+    }
+
     #[cfg(test)]
     pub(crate) fn empty_for_cache_test() -> Self {
         Self {
             bytes: Arc::from([]),
+            payload_range: 0..0,
             record_headers: Box::default(),
             restart_indices: Box::default(),
             point_lookup_index: DataBlockPointLookupIndex::empty(),
@@ -5038,6 +5068,14 @@ fn read_checked_block_from_source(
     BlockManager::read_checked_from_source(payload_len, HEADER_LEN, block, source)
 }
 
+fn read_checked_block_from_source_shared(
+    source: &impl BlockReadSource,
+    payload_len: usize,
+    block: BlockHandle,
+) -> Result<DecodedBlock> {
+    BlockManager::read_checked_from_source_shared(payload_len, HEADER_LEN, block, source)
+}
+
 fn read_checked_block_at_source_offset(
     source: &impl BlockReadSource,
     payload_len: usize,
@@ -5078,9 +5116,10 @@ fn read_data_block_from_source(
     expected_codec: CodecId,
     entry: &DataBlockIndexEntry,
 ) -> Result<DecodedDataBlock> {
-    let (actual_codec, payload) = read_checked_block_from_source(source, payload_len, entry.block)?;
+    let block = read_checked_block_from_source_shared(source, payload_len, entry.block)?;
+    let actual_codec = block.codec();
     validate_block_codec(actual_codec, expected_codec, TableSection::DataBlocks)?;
-    let decoded = decode_data_block(payload)?;
+    let decoded = decode_data_block_from_block(block, false)?;
     validate_decoded_data_block_entry(entry, &decoded)?;
     validate_decoded_data_block_filters(entry, &decoded)?;
     Ok(decoded)
@@ -5092,10 +5131,12 @@ async fn read_data_block_from_storage_object_async(
     expected_codec: CodecId,
     entry: &DataBlockIndexEntry,
 ) -> Result<DecodedDataBlock> {
-    let (actual_codec, payload) =
-        read_checked_block_from_storage_object_async(object, payload_len, entry.block).await?;
+    let block =
+        read_checked_block_from_storage_object_shared_async(object, payload_len, entry.block)
+            .await?;
+    let actual_codec = block.codec();
     validate_block_codec(actual_codec, expected_codec, TableSection::DataBlocks)?;
-    let decoded = decode_data_block(payload)?;
+    let decoded = decode_data_block_from_block(block, false)?;
     validate_decoded_data_block_entry(entry, &decoded)?;
     validate_decoded_data_block_filters(entry, &decoded)?;
     Ok(decoded)
@@ -5106,6 +5147,18 @@ async fn read_checked_block_from_storage_object_async(
     payload_len: usize,
     block: BlockHandle,
 ) -> Result<(CodecId, Vec<u8>)> {
+    let block =
+        read_checked_block_from_storage_object_shared_async(object, payload_len, block).await?;
+    let codec = block.codec();
+    let payload = block.payload().to_vec();
+    Ok((codec, payload))
+}
+
+async fn read_checked_block_from_storage_object_shared_async(
+    object: &impl StorageReadObject,
+    payload_len: usize,
+    block: BlockHandle,
+) -> Result<DecodedBlock> {
     let (start, end) = block_bounds(block)?;
     if end > payload_len {
         return Err(invalid_table("block outside table payload"));
@@ -5117,7 +5170,7 @@ async fn read_checked_block_from_storage_object_async(
     let block_bytes = object
         .read_exact_at_owned(source_offset, end - start)
         .await?;
-    BlockManager::decode_checked(block_bytes.as_slice())
+    BlockManager::decode_checked_owned(block_bytes)
 }
 
 fn validate_block_codec(actual: CodecId, expected: CodecId, section: TableSection) -> Result<()> {
@@ -5276,19 +5329,34 @@ fn read_value_ref_header(cursor: &mut Cursor<'_>) -> Result<Option<ValueRefHeade
 }
 
 fn decode_data_block(bytes: Vec<u8>) -> Result<DecodedDataBlock> {
-    decode_data_block_with_hash_validation(bytes, false)
+    let len = bytes.len();
+    let bytes: Arc<[u8]> = Arc::from(bytes);
+    decode_data_block_shared(bytes, 0..len, false)
 }
 
 fn decode_data_block_for_verify(bytes: Vec<u8>) -> Result<DecodedDataBlock> {
-    decode_data_block_with_hash_validation(bytes, true)
+    let len = bytes.len();
+    let bytes: Arc<[u8]> = Arc::from(bytes);
+    decode_data_block_shared(bytes, 0..len, true)
 }
 
-fn decode_data_block_with_hash_validation(
-    bytes: Vec<u8>,
+fn decode_data_block_from_block(
+    block: DecodedBlock,
     validate_full_hash_index: bool,
 ) -> Result<DecodedDataBlock> {
-    let bytes = Arc::<[u8]>::from(bytes);
-    let mut cursor = Cursor::new(&bytes);
+    let (bytes, payload_range) = block.into_shared_payload();
+    decode_data_block_shared(bytes, payload_range, validate_full_hash_index)
+}
+
+fn decode_data_block_shared(
+    bytes: Arc<[u8]>,
+    payload_range: Range<usize>,
+    validate_full_hash_index: bool,
+) -> Result<DecodedDataBlock> {
+    let payload = bytes
+        .get(payload_range.clone())
+        .ok_or_else(|| invalid_table("data block payload outside shared bytes"))?;
+    let mut cursor = Cursor::new(payload);
     let record_count = cursor.read_u32()? as usize;
     ensure_count_fits_remaining(
         record_count,
@@ -5303,7 +5371,7 @@ fn decode_data_block_with_hash_validation(
     let restart_indices = decode_restart_points(&mut cursor, &record_headers)?;
     let point_lookup_index = decode_data_block_point_lookup_index(
         &mut cursor,
-        &bytes,
+        payload,
         &record_headers,
         validate_full_hash_index,
     )?;
@@ -5312,6 +5380,7 @@ fn decode_data_block_with_hash_validation(
     }
     Ok(DecodedDataBlock {
         bytes,
+        payload_range,
         record_headers: record_headers.into_boxed_slice(),
         restart_indices,
         point_lookup_index,

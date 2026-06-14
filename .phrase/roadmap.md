@@ -4451,7 +4451,36 @@ table-block decode, or codec rows as the next selected target.
 - Compaction/blob, startup/recovery, write durability, scan algorithm,
   publishing, tagging, or pushing changes.
 
-### Phase 181: Concurrent Read/Write And Background Maintenance
+### Phase 181: Serialization And Decode Copy Cost
+
+**Status**: Complete
+
+**Goal**: Reduce avoidable serialization/decode byte copies after Phase 180
+evidence and user review identify decode ownership as the better next target
+than broader cache-policy tuning.
+
+**Entry Condition**: Phase 180 is complete, cache/decode diagnostics still show
+decode and allocation-sensitive rows, and the selected change can preserve the
+V1 table format.
+
+**Acceptance Gate**:
+
+- `CodecId::None` owned checked block decode can reuse the read-owned payload
+  bytes after checksum and length validation.
+- Data block reads consume shared decoded block payload ranges without changing
+  table record, filter, inline value, or point lookup semantics.
+- Focused block/table tests, full lib tests, strict clippy, and grouped
+  benchmark evidence pass.
+- Remaining decode/storage-buffer allocation boundaries are recorded instead of
+  being hidden inside the completed phase.
+
+**Major Out Of Scope**:
+
+- Storage format changes, LZ4 decode buffer reuse, full storage read buffer
+  backing replacement, platform I/O backend changes, publishing, tagging, or
+  pushing changes.
+
+### Phase 182: Concurrent Read/Write And Background Maintenance
 
 **Status**: Planned
 
