@@ -2788,6 +2788,68 @@ fn persistent_blob_level_merge_auto_rewrites_retained_blob_indexes() {
 }
 
 #[test]
+fn persistent_blob_level_merge_defers_pending_blob_clear_publish() {
+    let path = temp_db_path("blob-level-merge-deferred-clear");
+    let mut options = DbOptions::persistent(&path);
+    options.blob_gc_enabled = false;
+    options.default_bucket_options = BucketOptions {
+        blob_threshold_bytes: 8,
+        blob_level_merge_policy: BlobLevelMergePolicy::Always,
+        ..BucketOptions::default()
+    };
+
+    {
+        let db = Db::open_sync(options).expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
+        bucket
+            .put_sync(b"a", b"large-value-a-old-large-value-a-old".to_vec())
+            .expect("write old a");
+        bucket
+            .put_sync(b"b", b"large-value-b-old-large-value-b-old".to_vec())
+            .expect("write old b");
+        db.flush_sync().expect("flush shared old blob file");
+        bucket
+            .put_sync(b"a", b"large-value-a-new-large-value-a-new".to_vec())
+            .expect("write new a");
+        db.flush_sync().expect("flush new a blob file");
+
+        let before = db.stats();
+        db.compact_range_sync(KeyRange::all())
+            .expect("level merge compaction succeeds");
+        let after = db.stats();
+        assert_eq!(
+            after
+                .storage_operations
+                .publish_manifest
+                .requests
+                .saturating_sub(before.storage_operations.publish_manifest.requests),
+            1,
+            "foreground level merge should not publish a second manifest only to clear cleanup metadata"
+        );
+        assert_eq!(
+            blob_file_paths(&path).len(),
+            1,
+            "obsolete blob files are still deleted during foreground compaction"
+        );
+
+        let manifest_state =
+            manifest::read_manifest(&manifest::manifest_path(&path)).expect("manifest reads");
+        assert!(
+            !manifest_state.pending_blob_deletions().is_empty(),
+            "deleted blob ids stay pending until the next cleanup boundary"
+        );
+
+        db.flush_sync()
+            .expect("later flush clears pending blob deletion metadata");
+        let manifest_state =
+            manifest::read_manifest(&manifest::manifest_path(&path)).expect("manifest rereads");
+        assert!(manifest_state.pending_blob_deletions().is_empty());
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_blob_level_merge_can_be_disabled() {
     let path = temp_db_path("blob-level-merge-disabled");
     let mut options = DbOptions::persistent(&path);

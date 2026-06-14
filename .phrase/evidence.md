@@ -12125,3 +12125,63 @@ Negative check:
 - Treat Phase 178 as complete.
 - Move next to block-cache/decode or search-policy work based on grouped
   benchmark evidence.
+
+## 2026-06-14: Maintenance Write-Amplification Cleanup Publish
+
+### Observation
+
+- Added write-amplification diagnostics for flush, compaction, blob-GC rewrite,
+  and blob-level merge.
+- Flush and ordinary compaction were already bounded to one output-table write,
+  one directory sync, and one manifest publish in the diagnostic workloads.
+- The blob maintenance paths exposed the extra foreground cost:
+  - `write amp blob GC diagnostic` wrote three storage objects, synced two
+    directory batches, deleted four objects, and published the manifest three
+    times before the change.
+  - `write amp blob level merge diagnostic` wrote two storage objects, synced
+    one directory batch, deleted four objects, and published the manifest two
+    times before the change.
+- The extra manifest publish came from clearing pending blob-deletion metadata
+  immediately after deleting obsolete blob files.
+- After the change:
+  - `write amp blob GC diagnostic` still writes three objects, syncs two
+    directory batches, and deletes four objects, but publishes the manifest two
+    times.
+  - `write amp blob level merge diagnostic` still writes two objects, syncs one
+    directory batch, and deletes four objects, but publishes the manifest once.
+  - A focused regression test proves foreground level merge still deletes
+    obsolete blob files immediately, while pending deletion metadata is cleared
+    by a later cleanup boundary.
+
+### Interpretation
+
+- The safe write-amplification reduction was not fewer table/blob outputs; those
+  are required by the selected compaction/blob policy.
+- The avoidable foreground work was the cleanup-only manifest publish. Keeping
+  deleted blob ids in pending-deletion metadata is safe because native delete is
+  idempotent for missing files, open/flush/close cleanup still clears the
+  metadata, and pending ids remain allowed during recovery.
+- This keeps existing blob reachability and snapshot-delayed cleanup behavior:
+  obsolete blob files are removed before foreground compaction returns when no
+  read pin can reach them.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q persistent_blob_level_merge_defers_pending_blob_clear_publish --lib`
+- `cargo test -q blob_gc --lib`
+- `cargo test -q blob_level_merge --lib`
+- `cargo test -q compaction --lib`
+- `cargo clippy --bench v1_bench -- -D warnings`
+- `cargo test -q --lib`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `TRINE_BENCH_RUNS=1 cargo bench --bench v1_bench`
+- `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench`
+- Filtered grouped benchmark rerun for maintenance write-amplification rows.
+- `git diff --check`
+
+### Recommended Next Action
+
+- Treat maintenance write-amplification cleanup publish as complete.
+- Move next to block-cache/decode or search-policy work based on grouped
+  benchmark evidence.

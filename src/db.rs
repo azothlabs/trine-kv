@@ -5401,7 +5401,7 @@ impl Db {
             &output_table_ids_for_stats,
         );
         self.retire_obsolete_table_files(db_path, &obsolete_table_ids)?;
-        self.cleanup_pending_obsolete_blob_files(db_path)?;
+        self.delete_pending_obsolete_blob_files(db_path)?;
         if self.inner.options.blob_gc_enabled {
             self.run_blob_gc_once_locked(db_path)?;
         }
@@ -5552,7 +5552,7 @@ impl Db {
         );
         self.retire_obsolete_table_files_native_async(db_path, &obsolete_table_ids)
             .await?;
-        self.cleanup_pending_obsolete_blob_files_native_async(db_path)
+        self.delete_pending_obsolete_blob_files_native_async(db_path)
             .await?;
         if self.inner.options.blob_gc_enabled {
             self.run_blob_gc_once_native_async(db_path).await?;
@@ -5668,7 +5668,7 @@ impl Db {
         );
         self.retire_obsolete_table_files_browser_async(db_path, &obsolete_table_ids)
             .await?;
-        self.cleanup_pending_obsolete_blob_files_browser_async(db_path)
+        self.delete_pending_obsolete_blob_files_browser_async(db_path)
             .await?;
         if self.inner.options.blob_gc_enabled {
             self.run_blob_gc_once_browser_async(db_path).await?;
@@ -6074,7 +6074,7 @@ impl Db {
         self.inner
             .blob_gc_discarded_bytes
             .fetch_add(discarded_bytes, Ordering::AcqRel);
-        self.cleanup_pending_obsolete_blob_files(db_path)
+        self.delete_pending_obsolete_blob_files(db_path)
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -6179,8 +6179,10 @@ impl Db {
         self.inner
             .blob_gc_discarded_bytes
             .fetch_add(discarded_bytes, Ordering::AcqRel);
-        self.cleanup_pending_obsolete_blob_files_native_async(db_path)
-            .await
+        let _ = self
+            .delete_pending_obsolete_blob_files_native_async(db_path)
+            .await?;
+        Ok(())
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -6288,8 +6290,10 @@ impl Db {
         self.inner
             .blob_gc_discarded_bytes
             .fetch_add(discarded_bytes, Ordering::AcqRel);
-        self.cleanup_pending_obsolete_blob_files_browser_async(db_path)
-            .await
+        let _ = self
+            .delete_pending_obsolete_blob_files_browser_async(db_path)
+            .await?;
+        Ok(())
     }
 
     fn build_blob_gc_rewrite_plan(&self, db_path: &Path) -> Result<Option<BlobGcRewritePlan>> {
@@ -6978,10 +6982,56 @@ impl Db {
         )
     }
 
+    fn delete_pending_obsolete_blob_files(&self, db_path: &Path) -> Result<()> {
+        let _ = delete_pending_obsolete_blob_files(
+            &self.inner.native_storage,
+            Some(db_path),
+            &self.inner.snapshots,
+            self.inner.manifest.as_ref(),
+        )?;
+        Ok(())
+    }
+
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     async fn cleanup_pending_obsolete_blob_files_native_async(&self, db_path: &Path) -> Result<()> {
-        if self.inner.snapshots.active_count() != 0 {
+        let (manifest, pending_file_ids) = self
+            .delete_pending_obsolete_blob_files_native_async(db_path)
+            .await?;
+        if pending_file_ids.is_empty() {
             return Ok(());
+        }
+
+        let prepared = {
+            let manifest = manifest
+                .lock()
+                .map_err(|_| lock_poisoned("manifest store"))?;
+            manifest.prepare_clear_pending_blob_deletions_publish(&pending_file_ids)
+        };
+        let Some(prepared) = prepared else {
+            return Ok(());
+        };
+        prepared.publish_async().await?;
+        manifest
+            .lock()
+            .map_err(|_| lock_poisoned("manifest store"))?
+            .install_prepared_publish(prepared)
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    async fn delete_pending_obsolete_blob_files_native_async(
+        &self,
+        db_path: &Path,
+    ) -> Result<(&Mutex<ManifestStore>, Vec<u64>)> {
+        if self.inner.snapshots.active_count() != 0 {
+            return Ok((
+                self.inner
+                    .manifest
+                    .as_ref()
+                    .ok_or_else(|| Error::Corruption {
+                        message: "persistent database is missing manifest store".to_owned(),
+                    })?,
+                Vec::new(),
+            ));
         }
         let manifest = self
             .inner
@@ -7005,7 +7055,7 @@ impl Db {
                 .collect::<Vec<_>>()
         };
         if pending_file_ids.is_empty() {
-            return Ok(());
+            return Ok((manifest, Vec::new()));
         }
 
         let storage = self.inner.native_storage.clone();
@@ -7016,6 +7066,22 @@ impl Db {
                 &blob::blob_path(db_path, *file_id),
             )
             .await?;
+        }
+
+        Ok((manifest, pending_file_ids))
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    async fn cleanup_pending_obsolete_blob_files_browser_async(
+        &self,
+        db_path: &Path,
+    ) -> Result<()> {
+        let _manifest_publish = self.inner.browser_manifest_async_lock.lock().await;
+        let (manifest, pending_file_ids) = self
+            .delete_pending_obsolete_blob_files_browser_async(db_path)
+            .await?;
+        if pending_file_ids.is_empty() {
+            return Ok(());
         }
 
         let prepared = {
@@ -7035,15 +7101,22 @@ impl Db {
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    async fn cleanup_pending_obsolete_blob_files_browser_async(
+    async fn delete_pending_obsolete_blob_files_browser_async(
         &self,
         db_path: &Path,
-    ) -> Result<()> {
+    ) -> Result<(&Mutex<ManifestStore>, Vec<u64>)> {
         if self.inner.snapshots.active_count() != 0 {
-            return Ok(());
+            return Ok((
+                self.inner
+                    .manifest
+                    .as_ref()
+                    .ok_or_else(|| Error::Corruption {
+                        message: "persistent database is missing manifest store".to_owned(),
+                    })?,
+                Vec::new(),
+            ));
         }
 
-        let _manifest_publish = self.inner.browser_manifest_async_lock.lock().await;
         let manifest = self
             .inner
             .manifest
@@ -7065,7 +7138,7 @@ impl Db {
                 .collect::<Vec<_>>()
         };
         if pending_file_ids.is_empty() {
-            return Ok(());
+            return Ok((manifest, Vec::new()));
         }
 
         let storage = self.browser_storage()?;
@@ -7078,20 +7151,7 @@ impl Db {
                 .await?;
         }
 
-        let prepared = {
-            let manifest = manifest
-                .lock()
-                .map_err(|_| lock_poisoned("manifest store"))?;
-            manifest.prepare_clear_pending_blob_deletions_publish(&pending_file_ids)
-        };
-        let Some(prepared) = prepared else {
-            return Ok(());
-        };
-        prepared.publish_async().await?;
-        manifest
-            .lock()
-            .map_err(|_| lock_poisoned("manifest store"))?
-            .install_prepared_publish(prepared)
+        Ok((manifest, pending_file_ids))
     }
 
     fn obsolete_blob_ids_for_compaction(
@@ -8982,15 +9042,38 @@ fn cleanup_pending_obsolete_blob_files(
     snapshots: &SnapshotTracker,
     manifest: Option<&Mutex<ManifestStore>>,
 ) -> Result<()> {
-    let Some(db_path) = db_path else {
-        return Ok(());
-    };
-    if snapshots.active_count() != 0 {
+    if db_path.is_none() {
         return Ok(());
     }
+    let (manifest, pending_file_ids) =
+        delete_pending_obsolete_blob_files(backend, db_path, snapshots, manifest)?;
+    if pending_file_ids.is_empty() {
+        return Ok(());
+    }
+
+    manifest
+        .lock()
+        .map_err(|_| lock_poisoned("manifest store"))?
+        .clear_pending_blob_deletions(&pending_file_ids)
+}
+
+fn delete_pending_obsolete_blob_files<'manifest>(
+    backend: &NativeFileBackend,
+    db_path: Option<&Path>,
+    snapshots: &SnapshotTracker,
+    manifest: Option<&'manifest Mutex<ManifestStore>>,
+) -> Result<(&'manifest Mutex<ManifestStore>, Vec<u64>)> {
+    let Some(db_path) = db_path else {
+        return Err(Error::Corruption {
+            message: "persistent blob cleanup is missing database path".to_owned(),
+        });
+    };
     let manifest = manifest.ok_or_else(|| Error::Corruption {
         message: "persistent database is missing manifest store".to_owned(),
     })?;
+    if snapshots.active_count() != 0 {
+        return Ok((manifest, Vec::new()));
+    }
 
     let pending_file_ids = {
         let manifest = manifest
@@ -9009,7 +9092,7 @@ fn cleanup_pending_obsolete_blob_files(
             .collect::<Vec<_>>()
     };
     if pending_file_ids.is_empty() {
-        return Ok(());
+        return Ok((manifest, Vec::new()));
     }
 
     for file_id in &pending_file_ids {
@@ -9020,10 +9103,7 @@ fn cleanup_pending_obsolete_blob_files(
         )?;
     }
 
-    manifest
-        .lock()
-        .map_err(|_| lock_poisoned("manifest store"))?
-        .clear_pending_blob_deletions(&pending_file_ids)
+    Ok((manifest, pending_file_ids))
 }
 
 fn remove_table_files(

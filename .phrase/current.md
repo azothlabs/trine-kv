@@ -6,66 +6,77 @@ Complete
 
 ## Goal
 
-Measure and reduce range/prefix scan table and block work while preserving
-MVCC visibility, range-delete behavior, prefix-filter semantics, and storage
-formats.
+Measure and reduce flush, compaction, and blob-GC write amplification while
+preserving MVCC visibility, manifest publish semantics, blob reference safety,
+durability, and storage formats.
 
 ## Scope
 
-- Range and prefix scan diagnostics for memory, active memtable, persistent
-  table, and prefix-partition workloads.
-- Table candidate selection, prefix filters, block metadata probes, data block
-  reads, range tombstone checks, and iterator advancement costs.
-- One measured scan-path optimization if diagnostics expose a safe dominant
-  cost.
+- Flush throughput, compaction throughput, blob-GC rewrite, and blob-level
+  merge benchmark rows.
+- Output table/blob write counts and bytes, manifest publish counts and
+  latency, directory sync counts and latency, obsolete cleanup timing, object
+  delete counts, and compaction selection behavior.
+- One or more measured write-amplification reductions if diagnostics expose a
+  safe dominant cost.
 
 ## Out Of Scope
 
 - Storage format changes.
-- MVCC visibility, snapshot, range-delete, prefix-filter, table format, WAL,
-  manifest, compaction, platform-io, publishing, tagging, pushing, or release
-  workflow changes.
-- Block-cache policy, compression codec, blob-value, write durability, and
-  startup/recovery optimization.
+- MVCC visibility, snapshot, range-delete, prefix-filter, table format,
+  manifest durable-cutover behavior, blob reference safety, platform-io,
+  publishing, tagging, pushing, or release workflow changes.
+- Read-path block-cache policy, compression codec changes, public durability
+  defaults, and startup/recovery optimization.
 
 ## Acceptance Gate
 
-- Scan diagnostics classify table candidate selection, prefix filters, block
-  metadata probes, data block reads, range tombstone checks, and iterator
-  advancement before optimization.
-- Any retained code change preserves MVCC visibility, range-delete behavior,
-  prefix-filter semantics, and storage formats.
-- Focused range/prefix/table tests pass.
+- Diagnostics classify table/blob write requests, manifest publish requests,
+  directory sync requests, object delete requests, compaction table input and
+  output bytes, blob-GC input/output/discarded bytes, and cleanup publish
+  behavior before optimization.
+- Any retained code change preserves manifest publish semantics, blob file
+  reachability, snapshot-delayed cleanup, durability, and storage formats.
+- Focused flush/compaction/blob tests pass.
 - Strict clippy passes.
 - Single-run and grouped benchmark evidence records before/after behavior.
 
 ## Active Task Slice
 
 ```text
-task789 [x] goal:add scan diagnostics | scope:benches/v1_bench.rs | verify:TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench
-task790 [x] goal:optimize measured scan-path bottleneck | scope:src/table.rs | verify:cargo test -q prefix --lib && cargo test -q range --lib
-task791 [x] goal:record scan evidence | scope:docs/benchmarks .phrase/evidence.md | verify:git diff review
+task792 [x] goal:add write-amplification diagnostics | scope:benches/v1_bench.rs | verify:TRINE_BENCH_RUNS=1 cargo bench --bench v1_bench
+task793 [x] goal:optimize measured maintenance write-amplification cost | scope:src/db.rs benches/v1_bench.rs | verify:cargo test -q compaction --lib && cargo test -q blob --lib
+task794 [x] goal:record maintenance write-amplification evidence | scope:docs/benchmarks .phrase/evidence.md | verify:git diff review
 ```
 
 ## Evidence
 
-- Phase 177 completed WAL dirty-lane persist optimization.
-- Prefix table-partition matching scans were the clearest measured scan target:
-  baseline median was 3052 us, with 472 block metadata probes and 152 data
-  block reads across 128 scans.
-- The retained change keeps block-level prefix filter state in the table cursor
-  and records false positives when the cursor leaves a block instead of
-  re-reading metadata and scanning the decoded block after load.
-- After the change, prefix table-partition matching scans recorded 320 block
-  metadata probes, the same 152 data block reads, and 2880 us median.
+- Phase 178 completed prefix table cursor metadata reuse.
+- Benchmark baseline refresh previously identified compaction throughput,
+  blob-GC rewrite, and blob-level merge as the largest grouped write-side
+  costs.
+- Added write-amplification diagnostics for flush, compaction, blob-GC rewrite,
+  and blob-level merge. The diagnostics classify output writes, manifest
+  publishes, directory syncs, object deletes, compaction bytes, blob-GC bytes,
+  and wall time.
+- The measured foreground amplification was cleanup metadata publication after
+  blob maintenance. Blob-GC rewrite previously used three manifest publishes;
+  blob-level merge used two. Both still had to delete obsolete files
+  immediately.
+- The retained change keeps foreground blob-file deletion immediate but defers
+  clearing manifest pending-deletion metadata to later cleanup boundaries such
+  as flush, open, or close.
+- After the change, blob-GC rewrite uses two manifest publishes and blob-level
+  merge uses one, while write-object, directory-sync, and delete counts remain
+  unchanged.
 
 ## Known Residuals
 
-- General in-memory `prefix scan` is not on the table cursor path and showed
-  run-to-run noise in this phase. The retained optimization is scoped to
-  persistent table prefix scans.
+- The optimization intentionally reduces foreground manifest publishes, not
+  physical table/blob output count. Obsolete blob files are still deleted before
+  foreground compaction returns when no snapshot pin keeps them reachable.
 
 ## Next Recommendation
 
-- Move next to block-cache/decode or search-policy work, whichever the latest
-  grouped benchmark evidence makes most valuable.
+- Move next to block-cache/decode or search-policy work based on grouped
+  benchmark evidence.

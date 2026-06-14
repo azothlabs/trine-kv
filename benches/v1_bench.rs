@@ -75,6 +75,7 @@ fn run_benchmarks() -> Vec<BenchResult> {
     results.push(bench_blob_range_lazy_keys());
     results.push(bench_blob_gc_rewrite());
     results.push(bench_blob_level_merge());
+    extend_maintenance_write_amplification_diagnostics(&mut results);
     results.push(bench_block_cache_warm_read());
     results.push(bench_cold_table_read());
     results.push(bench_cold_table_read_only());
@@ -871,6 +872,207 @@ fn extend_flush_wall_diagnostics(results: &mut Vec<BenchResult>) {
     diagnostics.push_results(results, label);
 }
 
+fn extend_maintenance_write_amplification_diagnostics(results: &mut Vec<BenchResult>) {
+    extend_flush_write_amplification_diagnostic(results);
+    extend_compaction_write_amplification_diagnostic(results);
+    extend_blob_gc_write_amplification_diagnostic(results);
+    extend_blob_level_merge_write_amplification_diagnostic(results);
+}
+
+fn extend_flush_write_amplification_diagnostic(results: &mut Vec<BenchResult>) {
+    let dir = temp_dir("write-amp-flush-diagnostic");
+    let db = Db::open_sync(benchmark_persistent_options(&dir)).expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+    for index in 0..ROWS {
+        bucket
+            .put_sync(key(index), value(index))
+            .expect("put succeeds");
+    }
+
+    let before = db.stats();
+    let started = Instant::now();
+    db.flush_sync().expect("flush succeeds");
+    let after = db.stats();
+    push_maintenance_write_amp_results(
+        results,
+        "write amp flush diagnostic",
+        &before,
+        &after,
+        duration_micros(started.elapsed()),
+    );
+    drop(db);
+    cleanup_dir(&dir);
+}
+
+fn extend_compaction_write_amplification_diagnostic(results: &mut Vec<BenchResult>) {
+    let dir = temp_dir("write-amp-compaction-diagnostic");
+    let db = Db::open_sync(benchmark_persistent_options(&dir)).expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+    for chunk in 0..4 {
+        for index in 0..(ROWS / 4) {
+            let row = chunk * (ROWS / 4) + index;
+            bucket.put_sync(key(row), value(row)).expect("put succeeds");
+        }
+        db.flush_sync().expect("flush succeeds");
+    }
+
+    let before = db.stats();
+    let started = Instant::now();
+    db.compact_range_sync(KeyRange::all())
+        .expect("compaction succeeds");
+    let after = db.stats();
+    push_maintenance_write_amp_results(
+        results,
+        "write amp compaction diagnostic",
+        &before,
+        &after,
+        duration_micros(started.elapsed()),
+    );
+    drop(db);
+    cleanup_dir(&dir);
+}
+
+fn extend_blob_gc_write_amplification_diagnostic(results: &mut Vec<BenchResult>) {
+    let dir = temp_dir("write-amp-blob-gc-diagnostic");
+    let (db, bucket) = open_blob_maintenance_db(&dir, BlobLevelMergePolicy::Disabled, true);
+    prepare_blob_overwrite_workload(&db, &bucket);
+
+    let before = db.stats();
+    let started = Instant::now();
+    db.compact_range_sync(KeyRange::all())
+        .expect("blob GC compaction succeeds");
+    let after = db.stats();
+    push_maintenance_write_amp_results(
+        results,
+        "write amp blob GC diagnostic",
+        &before,
+        &after,
+        duration_micros(started.elapsed()),
+    );
+    drop(db);
+    cleanup_dir(&dir);
+}
+
+fn extend_blob_level_merge_write_amplification_diagnostic(results: &mut Vec<BenchResult>) {
+    let dir = temp_dir("write-amp-blob-level-merge-diagnostic");
+    let (db, bucket) = open_blob_maintenance_db(&dir, BlobLevelMergePolicy::Always, false);
+    prepare_blob_overwrite_workload(&db, &bucket);
+
+    let before = db.stats();
+    let started = Instant::now();
+    db.compact_range_sync(KeyRange::all())
+        .expect("blob level merge compaction succeeds");
+    let after = db.stats();
+    push_maintenance_write_amp_results(
+        results,
+        "write amp blob level merge diagnostic",
+        &before,
+        &after,
+        duration_micros(started.elapsed()),
+    );
+    drop(db);
+    cleanup_dir(&dir);
+}
+
+fn open_blob_maintenance_db(
+    dir: &Path,
+    blob_level_merge_policy: BlobLevelMergePolicy,
+    blob_gc_enabled: bool,
+) -> (Db, trine_kv::Bucket) {
+    let mut options = benchmark_persistent_options(dir);
+    options.blob_gc_enabled = blob_gc_enabled;
+    options.blob_gc_min_file_bytes = 1;
+    options.blob_gc_discardable_ratio = BlobGcRatio::from_millionths(300_000);
+    options.default_bucket_options = BucketOptions {
+        blob_level_merge_policy,
+        ..large_blob_options()
+    };
+    let db = Db::open_sync(options).expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+    (db, bucket)
+}
+
+fn prepare_blob_overwrite_workload(db: &Db, bucket: &trine_kv::Bucket) {
+    for index in 0..LARGE_ROWS {
+        bucket
+            .put_sync(key(index), large_value(index))
+            .expect("initial large put succeeds");
+    }
+    db.flush_sync().expect("initial blob flush succeeds");
+    for index in (0..LARGE_ROWS).step_by(2) {
+        bucket
+            .put_sync(key(index), large_value(index + LARGE_ROWS))
+            .expect("overwrite large put succeeds");
+    }
+    db.flush_sync().expect("overwrite blob flush succeeds");
+}
+
+fn push_maintenance_write_amp_results(
+    results: &mut Vec<BenchResult>,
+    label: &'static str,
+    before: &trine_kv::DbStats,
+    after: &trine_kv::DbStats,
+    wall_micros: u64,
+) {
+    let mut diagnostics = WritePathDiagnostics::default();
+    diagnostics.record_delta(before, after);
+    results.push(BenchResult::diagnostic(
+        labelled(label, "wall micros"),
+        wall_micros,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "compaction runs"),
+        after.compaction_runs.saturating_sub(before.compaction_runs),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "compaction input tables"),
+        after
+            .compaction_input_tables
+            .saturating_sub(before.compaction_input_tables),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "compaction output tables"),
+        after
+            .compaction_output_tables
+            .saturating_sub(before.compaction_output_tables),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "compaction input bytes"),
+        after
+            .compaction_input_bytes
+            .saturating_sub(before.compaction_input_bytes),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "compaction output bytes"),
+        after
+            .compaction_output_bytes
+            .saturating_sub(before.compaction_output_bytes),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "blob GC runs"),
+        after.blob_gc_runs.saturating_sub(before.blob_gc_runs),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "blob GC input bytes"),
+        after
+            .blob_gc_input_bytes
+            .saturating_sub(before.blob_gc_input_bytes),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "blob GC output bytes"),
+        after
+            .blob_gc_output_bytes
+            .saturating_sub(before.blob_gc_output_bytes),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "blob GC discarded bytes"),
+        after
+            .blob_gc_discarded_bytes
+            .saturating_sub(before.blob_gc_discarded_bytes),
+    ));
+    diagnostics.push_results(results, label);
+}
+
 #[derive(Default)]
 struct WritePathDiagnostics {
     open_append_requests: u64,
@@ -879,12 +1081,14 @@ struct WritePathDiagnostics {
     write_object_requests: u64,
     publish_manifest_requests: u64,
     sync_directory_requests: u64,
+    delete_object_requests: u64,
     open_append_micros: u64,
     append_micros: u64,
     persist_micros: u64,
     write_object_micros: u64,
     publish_manifest_micros: u64,
     sync_directory_micros: u64,
+    delete_object_micros: u64,
     pending_sync_bytes: u64,
 }
 
@@ -936,6 +1140,13 @@ impl WritePathDiagnostics {
                         .sync_directory_after_renames
                         .requests,
                 ),
+        );
+        self.delete_object_requests = self.delete_object_requests.saturating_add(
+            after
+                .storage_operations
+                .delete_object
+                .requests
+                .saturating_sub(before.storage_operations.delete_object.requests),
         );
         self.record_latency_delta(before, after);
         self.pending_sync_bytes = self
@@ -996,6 +1207,13 @@ impl WritePathDiagnostics {
                         .total_latency_micros,
                 ),
         );
+        self.delete_object_micros = self.delete_object_micros.saturating_add(
+            after
+                .storage_operations
+                .delete_object
+                .total_latency_micros
+                .saturating_sub(before.storage_operations.delete_object.total_latency_micros),
+        );
     }
 
     fn push_results(&self, results: &mut Vec<BenchResult>, label: &'static str) {
@@ -1024,6 +1242,10 @@ impl WritePathDiagnostics {
             self.sync_directory_requests,
         ));
         results.push(BenchResult::diagnostic(
+            labelled(label, "storage delete object requests"),
+            self.delete_object_requests,
+        ));
+        results.push(BenchResult::diagnostic(
             labelled(label, "storage open append micros"),
             self.open_append_micros,
         ));
@@ -1046,6 +1268,10 @@ impl WritePathDiagnostics {
         results.push(BenchResult::diagnostic(
             labelled(label, "storage sync directory micros"),
             self.sync_directory_micros,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled(label, "storage delete object micros"),
+            self.delete_object_micros,
         ));
         results.push(BenchResult::diagnostic(
             labelled(label, "pending sync bytes"),

@@ -4404,7 +4404,30 @@ costs or diagnostics as the next selected bottleneck.
 - Compaction/blob, startup/recovery, write durability, cache policy, platform
   I/O, publishing, tagging, or pushing changes.
 
-### Phase 179: Block Cache And Decode Path Optimization
+### Phase 179: Maintenance Write-Amplification
+
+**Status**: Complete
+
+**Goal**: Reduce flush, compaction, and blob maintenance write amplification
+when grouped evidence points to maintenance as the next selected cost.
+
+**Entry Condition**: Grouped benchmark evidence identifies compaction
+throughput, blob-GC rewrite, blob-level merge, manifest publish, directory
+sync, or obsolete cleanup as the next selected bottleneck.
+
+**Acceptance Gate**:
+
+- Diagnostics separate output table/blob writes, manifest publishes, directory
+  syncs, object deletes, compaction bytes, blob-GC bytes, and cleanup timing.
+- Any retained optimization preserves manifest publish semantics, blob
+  reachability, snapshot-delayed cleanup, durability, and storage formats.
+
+**Major Out Of Scope**:
+
+- Storage format changes, public durability defaults, platform I/O backend
+  changes, publishing, tagging, or pushing changes.
+
+### Phase 180: Block Cache And Decode Path Optimization
 
 **Status**: Planned
 
@@ -4426,7 +4449,7 @@ table-block decode, or codec rows as the next selected target.
 - Compaction/blob, startup/recovery, write durability, scan algorithm,
   publishing, tagging, or pushing changes.
 
-### Phase 180: Concurrent Read/Write And Background Maintenance
+### Phase 181: Concurrent Read/Write And Background Maintenance
 
 **Status**: Planned
 
