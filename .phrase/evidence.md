@@ -74,6 +74,53 @@ Record only evidence that can change planning or durable decisions.
 - Implement task828: add the comparison workload before retaining any new
   compaction-picker behavior.
 
+## 2026-06-14: Local Vs Broad Compaction Comparison
+
+### Observation
+
+- Added a benchmark comparison workload that prepares four disjoint L0 tables
+  without compaction, then compares one local foreground-maintenance compaction
+  with one broad manual compaction over the same logical data shape.
+- The filtered local benchmark output reported:
+  - local maintenance: 1 run, 1 input table, 1 output table, 9177 input bytes,
+    9177 output bytes, and 18354 rewritten bytes;
+  - broad manual compaction: 1 run, 4 input tables, 1 output table, 35950 input
+    bytes, 34931 output bytes, and 70881 rewritten bytes.
+- The after-read comparison over the same keys reported:
+  - local maintenance: 2048 total point table probes, 1536 L0 probes, 512
+    non-L0 probes, 2048 data-block reads;
+  - broad manual compaction: 2048 total point table probes, 0 L0 probes, 2048
+    non-L0 probes, 2048 data-block reads.
+
+### Interpretation
+
+- The workload proves the tradeoff that Phase 188 needs to handle: local L0
+  compaction greatly reduces immediate rewrite bytes, but broad compaction
+  removes more L0 read candidates.
+- The next picker policy should not simply prefer one path globally. It should
+  use rewrite-byte and read-candidate evidence to decide when the local rewrite
+  saving is worth the remaining L0 candidates.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo check -q --benches`
+- `cargo bench --bench v1_bench`
+- `target/release/deps/v1_bench-25cc53c2c6358df4 | rg "write amp (local|broad) compaction comparison (compaction|level|trigger|after read point)"`
+- `cargo clippy -q --all-targets --all-features -- -D warnings`
+- `cargo test -q`
+- `git diff --check`
+
+### Remaining Blockers
+
+- No retained picker policy change has been made yet.
+
+### Recommended Next Action
+
+- Implement task829: retain the first guard-aware compaction picker change only
+  if it has an explicit rewrite/read-candidate gate backed by the comparison
+  rows.
+
 ## 2026-06-14: L0 Read Candidate Diagnostics
 
 ### Observation

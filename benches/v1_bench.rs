@@ -10,8 +10,8 @@ use std::{
 
 use trine_kv::{
     BlobGcRatio, BlobLevelMergePolicy, BucketOptions, CompactionTrigger, Db, DbOptions,
-    DurabilityMode, FilterPolicy, IndexSearchPolicy, KeyRange, PrefixExtractor, PrefixFilterPolicy,
-    RuntimeOptions, TransactionOptions, WriteBatch, WriteOptions, search,
+    DurabilityMode, FilterPolicy, IndexSearchPolicy, KeyRange, MaintenanceBudget, PrefixExtractor,
+    PrefixFilterPolicy, RuntimeOptions, TransactionOptions, WriteBatch, WriteOptions, search,
 };
 
 const ROWS: usize = 1_024;
@@ -1017,6 +1017,7 @@ fn extend_flush_wall_diagnostics(results: &mut Vec<BenchResult>) {
 fn extend_maintenance_write_amplification_diagnostics(results: &mut Vec<BenchResult>) {
     extend_flush_write_amplification_diagnostic(results);
     extend_compaction_write_amplification_diagnostic(results);
+    extend_compaction_scope_comparison_diagnostic(results);
     extend_blob_gc_write_amplification_diagnostic(results);
     extend_blob_level_merge_write_amplification_diagnostic(results);
 }
@@ -1229,6 +1230,96 @@ fn extend_compaction_write_amplification_diagnostic(results: &mut Vec<BenchResul
     );
     drop(db);
     cleanup_dir(&dir);
+}
+
+fn extend_compaction_scope_comparison_diagnostic(results: &mut Vec<BenchResult>) {
+    push_compaction_scope_comparison_diagnostic(
+        results,
+        "write amp local compaction comparison",
+        CompactionScope::LocalMaintenance,
+    );
+    push_compaction_scope_comparison_diagnostic(
+        results,
+        "write amp broad compaction comparison",
+        CompactionScope::BroadManual,
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CompactionScope {
+    LocalMaintenance,
+    BroadManual,
+}
+
+fn push_compaction_scope_comparison_diagnostic(
+    results: &mut Vec<BenchResult>,
+    label: &'static str,
+    scope: CompactionScope,
+) {
+    let dir = temp_dir(label);
+    prepare_disjoint_l0_compaction_workload(&dir);
+    let mut options = benchmark_persistent_options(&dir);
+    options.background_worker_count = 0;
+    if matches!(scope, CompactionScope::LocalMaintenance) {
+        options.max_l0_files = 1;
+    }
+    let db = Db::open_sync(options).expect("persistent db reopens");
+
+    let before = db.stats();
+    let started = Instant::now();
+    match scope {
+        CompactionScope::LocalMaintenance => {
+            db.run_maintenance_with_budget_sync(MaintenanceBudget::unbounded())
+                .expect("local maintenance compaction succeeds");
+        }
+        CompactionScope::BroadManual => {
+            db.compact_range_sync(KeyRange::all())
+                .expect("broad compaction succeeds");
+        }
+    }
+    let after = db.stats();
+    push_maintenance_write_amp_results(
+        results,
+        label,
+        &before,
+        &after,
+        duration_micros(started.elapsed()),
+    );
+    push_compaction_scope_after_read_diagnostics(results, label, &db);
+    drop(db);
+    cleanup_dir(&dir);
+}
+
+fn push_compaction_scope_after_read_diagnostics(
+    results: &mut Vec<BenchResult>,
+    label: &'static str,
+    db: &Db,
+) {
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+    let keys = localized_point_read_keys(ROWS, OPS);
+    let before = db.stats();
+    let checksum = sequential_point_batch_checksum(&bucket, &keys);
+    assert!(checksum > 0, "comparison workload must read existing rows");
+    let after = db.stats();
+    let mut diagnostics = ColdReadDiagnostics::default();
+    diagnostics.record_delta(&before, &after);
+    diagnostics.push_read_path_results(results, labelled(label, "after read"));
+}
+
+fn prepare_disjoint_l0_compaction_workload(dir: &Path) {
+    let mut options = benchmark_persistent_options(dir);
+    options.background_worker_count = 0;
+    options.max_l0_files = 64;
+    let db = Db::open_sync(options).expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+    for chunk in 0..4 {
+        for index in 0..(ROWS / 4) {
+            let row = chunk * (ROWS / 4) + index;
+            bucket.put_sync(key(row), value(row)).expect("put succeeds");
+        }
+        db.flush_sync().expect("flush succeeds");
+    }
+    drop(db);
 }
 
 fn extend_blob_gc_write_amplification_diagnostic(results: &mut Vec<BenchResult>) {

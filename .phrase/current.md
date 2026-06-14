@@ -57,7 +57,7 @@ visible would make later benchmark changes hard to explain.
 
 ```text
 task827 [x] goal:add compaction trigger diagnostics without changing picker behavior | scope:src/compaction.rs src/lsm/compact.rs src/db.rs src/stats.rs benches/v1_bench.rs tests/internal/persistent_wal.rs | verify:planner tests + persistent stats tests + bench trigger rows
-task828 [ ] goal:add local-vs-broad compaction comparison workload | scope:benches/v1_bench.rs | verify:bench rows compare trigger/per-level rewritten bytes and read candidate counters
+task828 [x] goal:add local-vs-broad compaction comparison workload | scope:benches/v1_bench.rs | verify:bench rows compare trigger/per-level rewritten bytes and read candidate counters
 task829 [ ] goal:retain first guard-aware compaction picker change only if task828 proves avoidable rewrite | scope:src/compaction.rs src/db.rs | verify:compaction/blob/recovery tests + rewrite/candidate benchmark evidence
 ```
 
@@ -72,6 +72,12 @@ task829 [ ] goal:retain first guard-aware compaction picker change only if task8
   bench output now reports `trigger l0-overlap` with 1 run, 4 input tables, 1
   output table, 35950 input bytes, 34931 output bytes, and 70881 rewritten
   bytes for the standard compaction write-amplification diagnostic.
+- Task828 added local-vs-broad comparison rows. On the disjoint L0 comparison
+  workload, local maintenance rewrote 18354 bytes for one input table and left
+  1536 L0 point probes after reads. Broad manual compaction rewrote 70881 bytes
+  for four input tables and left 0 L0 point probes after reads. Both paths kept
+  total point table probes and data-block reads at 2048 for the after-read
+  measurement.
 
 ## Known Risks
 
@@ -80,8 +86,10 @@ task829 [ ] goal:retain first guard-aware compaction picker change only if task8
   GC replacement-table writes.
 - A picker change that reduces one compaction's rewritten bytes may increase
   future read depth or lower-level rewrite churn.
+- Local L0 compaction saves rewrite bytes in the comparison workload, but it
+  intentionally leaves more L0 read candidates than broad compaction.
 
 ## Next Recommendation
 
-- Implement `task828`: add a local-vs-broad compaction comparison workload
-  before retaining any new compaction-picker behavior.
+- Implement `task829`: retain a picker policy only if it explicitly balances
+  the observed rewrite-byte saving against remaining L0 read candidates.
