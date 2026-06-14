@@ -351,6 +351,9 @@ impl LsmTree {
         }
 
         let batch = PointReadBatch::from_keys(keys);
+        snapshot
+            .version
+            .record_batch_point_shape(keys.len(), batch.unique_keys.len());
         let mut candidates = Vec::with_capacity(batch.unique_keys.len());
         candidates.resize_with(batch.unique_keys.len(), || None);
         for (index, key) in batch.unique_keys.iter().enumerate() {
@@ -559,6 +562,9 @@ impl LsmTree {
         }
 
         let batch = PointReadBatch::from_keys(keys);
+        snapshot
+            .version
+            .record_batch_point_shape(keys.len(), batch.unique_keys.len());
         let mut candidates = Vec::with_capacity(batch.unique_keys.len());
         candidates.resize_with(batch.unique_keys.len(), || None);
         for (index, key) in batch.unique_keys.iter().enumerate() {

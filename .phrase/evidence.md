@@ -74,6 +74,56 @@ Record only evidence that can change planning or durable decisions.
   `get_many`, then decide the first in-memory guard index shape from those
   counters.
 
+## 2026-06-14: L0 Overlap Depth And Batch Shape Diagnostics
+
+### Observation
+
+- Added version-level read-path stats for point L0 lookup keys, point L0 extra
+  overlap probes, grouped point-batch input keys, unique keys, table groups,
+  batch L0 lookup keys, and batch L0 extra overlap probes.
+- The stats are recorded from `LsmVersion`, not individual tables, because
+  overlap depth is a per-lookup shape rather than a table-local fact.
+- The local `cargo bench --bench v1_bench` run recorded
+  `read pruning L0 stack diagnostic sequential` with 2048 L0 lookup keys and
+  14336 extra L0 table probes, while block metadata probes and data-block reads
+  remained 2048.
+- The same run recorded `read pruning L0 stack diagnostic batch 4` with 2048
+  batch input keys, 512 unique keys, 512 table groups, 512 batch L0 lookup
+  keys, and 3584 extra batch L0 table probes. Block metadata probes and
+  data-block reads were 512.
+
+### Interpretation
+
+- The diagnostics now separate batch grouping, L0 overlap depth, and actual
+  block access. This gives a direct acceptance signal for the first guard index:
+  reduce extra L0 probes without increasing block metadata probes or data-block
+  reads.
+- A guard index derived from existing table key bounds should target L0 first.
+  Non-overlapping levels already choose at most one table by key in the current
+  point path, so the first useful behavior change should avoid unrelated L0
+  table probes.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q point_read_stats_split_l0_and_non_l0_probes`
+- `cargo check -q --benches`
+- `cargo clippy -q --all-targets --all-features -- -D warnings`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo bench --bench v1_bench`
+- `cargo test -q`
+- `git diff --check`
+
+### Remaining Blockers
+
+- No retained guard pruning has been implemented yet; task825 must prove the
+  first in-memory guard index preserves lookup semantics.
+
+### Recommended Next Action
+
+- Implement task825: derive an in-memory L0 guard index from table key bounds
+  and use it to reduce point/missing/get_many L0 overlap probes.
+
 ## 2026-06-14: Point Batch And Negative Lookup Diagnostics
 
 ### Observation

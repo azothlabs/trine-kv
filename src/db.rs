@@ -3639,6 +3639,9 @@ impl Db {
             let Ok(version) = state.current_version() else {
                 continue;
             };
+            stats
+                .read_path
+                .saturating_add_assign(version.read_path_stats());
 
             for (level_state, tables) in version.level_table_handles() {
                 let level = level_state.get();
@@ -9993,6 +9996,61 @@ mod tests {
         assert_eq!(table_probes, l0_probes.saturating_add(non_l0_probes));
         assert_eq!(l0_probes, 2);
         assert_eq!(non_l0_probes, 0);
+        assert_eq!(
+            after
+                .read_path
+                .point_l0_lookup_keys
+                .saturating_sub(before.read_path.point_l0_lookup_keys),
+            1
+        );
+        assert_eq!(
+            after
+                .read_path
+                .point_l0_overlap_extra_table_probes
+                .saturating_sub(before.read_path.point_l0_overlap_extra_table_probes),
+            1
+        );
+
+        let before = db.stats();
+        let keys = [b"key-0-2".as_slice(); 8];
+        let values = db.get_many_sync(&keys).expect("batch read succeeds");
+        let after = db.stats();
+        assert_eq!(values, vec![Some(b"value-0-2".to_vec()); 8]);
+        assert_eq!(
+            after
+                .read_path
+                .batch_point_input_keys
+                .saturating_sub(before.read_path.batch_point_input_keys),
+            8
+        );
+        assert_eq!(
+            after
+                .read_path
+                .batch_point_unique_keys
+                .saturating_sub(before.read_path.batch_point_unique_keys),
+            1
+        );
+        assert_eq!(
+            after
+                .read_path
+                .batch_point_table_groups
+                .saturating_sub(before.read_path.batch_point_table_groups),
+            1
+        );
+        assert_eq!(
+            after
+                .read_path
+                .batch_point_l0_lookup_keys
+                .saturating_sub(before.read_path.batch_point_l0_lookup_keys),
+            1
+        );
+        assert_eq!(
+            after
+                .read_path
+                .batch_point_l0_overlap_extra_table_probes
+                .saturating_sub(before.read_path.batch_point_l0_overlap_extra_table_probes),
+            1
+        );
 
         drop(db);
         fs::remove_dir_all(path).expect("cleanup test db");

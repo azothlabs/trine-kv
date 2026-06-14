@@ -501,6 +501,20 @@ pub struct ReadPathStats {
     pub point_l0_table_probes: u64,
     /// Non-level-0 table files considered by point reads.
     pub point_non_l0_table_probes: u64,
+    /// Point lookup keys that considered at least one level-0 table.
+    pub point_l0_lookup_keys: u64,
+    /// Extra level-0 table probes after the first level-0 probe for a point key.
+    pub point_l0_overlap_extra_table_probes: u64,
+    /// Input keys accepted by grouped point-batch reads.
+    pub batch_point_input_keys: u64,
+    /// Unique keys planned by grouped point-batch reads.
+    pub batch_point_unique_keys: u64,
+    /// Table groups visited by grouped point-batch reads.
+    pub batch_point_table_groups: u64,
+    /// Unique grouped point-batch keys that considered at least one level-0 table.
+    pub batch_point_l0_lookup_keys: u64,
+    /// Extra level-0 table probes after the first probe for grouped point-batch keys.
+    pub batch_point_l0_overlap_extra_table_probes: u64,
     /// Index partitions considered by point reads.
     pub point_index_partition_probes: u64,
     /// Data-block metadata entries considered by point reads.
@@ -530,6 +544,27 @@ impl ReadPathStats {
         self.point_non_l0_table_probes = self
             .point_non_l0_table_probes
             .saturating_add(other.point_non_l0_table_probes);
+        self.point_l0_lookup_keys = self
+            .point_l0_lookup_keys
+            .saturating_add(other.point_l0_lookup_keys);
+        self.point_l0_overlap_extra_table_probes = self
+            .point_l0_overlap_extra_table_probes
+            .saturating_add(other.point_l0_overlap_extra_table_probes);
+        self.batch_point_input_keys = self
+            .batch_point_input_keys
+            .saturating_add(other.batch_point_input_keys);
+        self.batch_point_unique_keys = self
+            .batch_point_unique_keys
+            .saturating_add(other.batch_point_unique_keys);
+        self.batch_point_table_groups = self
+            .batch_point_table_groups
+            .saturating_add(other.batch_point_table_groups);
+        self.batch_point_l0_lookup_keys = self
+            .batch_point_l0_lookup_keys
+            .saturating_add(other.batch_point_l0_lookup_keys);
+        self.batch_point_l0_overlap_extra_table_probes = self
+            .batch_point_l0_overlap_extra_table_probes
+            .saturating_add(other.batch_point_l0_overlap_extra_table_probes);
         self.point_index_partition_probes = self
             .point_index_partition_probes
             .saturating_add(other.point_index_partition_probes);

@@ -1,11 +1,15 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
 };
 
 use crate::{
     error::{Error, Result},
+    stats::ReadPathStats,
     table::{Table, TableId, TableLevel},
     types::KeyRange,
 };
@@ -13,6 +17,71 @@ use crate::{
 #[derive(Debug, Clone)]
 pub(crate) struct LsmVersion {
     levels: Vec<LevelState>,
+    read_path_stats: Arc<VersionReadPathStats>,
+}
+
+#[derive(Debug, Default)]
+struct VersionReadPathStats {
+    point_l0_lookup_keys: AtomicU64,
+    point_l0_overlap_extra_table_probes: AtomicU64,
+    batch_point_input_keys: AtomicU64,
+    batch_point_unique_keys: AtomicU64,
+    batch_point_table_groups: AtomicU64,
+    batch_point_l0_lookup_keys: AtomicU64,
+    batch_point_l0_overlap_extra_table_probes: AtomicU64,
+}
+
+impl VersionReadPathStats {
+    fn snapshot(&self) -> ReadPathStats {
+        ReadPathStats {
+            point_l0_lookup_keys: self.point_l0_lookup_keys.load(AtomicOrdering::Acquire),
+            point_l0_overlap_extra_table_probes: self
+                .point_l0_overlap_extra_table_probes
+                .load(AtomicOrdering::Acquire),
+            batch_point_input_keys: self.batch_point_input_keys.load(AtomicOrdering::Acquire),
+            batch_point_unique_keys: self.batch_point_unique_keys.load(AtomicOrdering::Acquire),
+            batch_point_table_groups: self.batch_point_table_groups.load(AtomicOrdering::Acquire),
+            batch_point_l0_lookup_keys: self
+                .batch_point_l0_lookup_keys
+                .load(AtomicOrdering::Acquire),
+            batch_point_l0_overlap_extra_table_probes: self
+                .batch_point_l0_overlap_extra_table_probes
+                .load(AtomicOrdering::Acquire),
+            ..ReadPathStats::default()
+        }
+    }
+
+    fn record_point_l0_lookup_depth(&self, table_probes: u64) {
+        if table_probes == 0 {
+            return;
+        }
+        self.point_l0_lookup_keys
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.point_l0_overlap_extra_table_probes
+            .fetch_add(table_probes.saturating_sub(1), AtomicOrdering::Relaxed);
+    }
+
+    fn record_batch_point_shape(&self, input_keys: usize, unique_keys: usize) {
+        self.batch_point_input_keys
+            .fetch_add(usize_to_u64(input_keys), AtomicOrdering::Relaxed);
+        self.batch_point_unique_keys
+            .fetch_add(usize_to_u64(unique_keys), AtomicOrdering::Relaxed);
+    }
+
+    fn record_batch_point_table_group(&self) {
+        self.batch_point_table_groups
+            .fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    fn record_batch_point_l0_lookup_depth(&self, table_probes: u64) {
+        if table_probes == 0 {
+            return;
+        }
+        self.batch_point_l0_lookup_keys
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.batch_point_l0_overlap_extra_table_probes
+            .fetch_add(table_probes.saturating_sub(1), AtomicOrdering::Relaxed);
+    }
 }
 
 impl LsmVersion {
@@ -30,7 +99,19 @@ impl LsmVersion {
             levels.push(LevelState::new(level, tables)?);
         }
 
-        Ok(Self { levels })
+        Ok(Self {
+            levels,
+            read_path_stats: Arc::new(VersionReadPathStats::default()),
+        })
+    }
+
+    pub(crate) fn read_path_stats(&self) -> ReadPathStats {
+        self.read_path_stats.snapshot()
+    }
+
+    pub(crate) fn record_batch_point_shape(&self, input_keys: usize, unique_keys: usize) {
+        self.read_path_stats
+            .record_batch_point_shape(input_keys, unique_keys);
     }
 
     #[must_use]
@@ -54,16 +135,20 @@ impl LsmVersion {
         let mut tables = Vec::new();
         for level in &self.levels {
             if level.level == TableLevel::ZERO {
+                let mut l0_table_probes = 0;
                 tables.extend(
                     level
                         .tables
                         .iter()
                         .filter(|table| {
                             table.record_point_table_probe();
+                            l0_table_probes += 1;
                             table.may_contain_key(key)
                         })
                         .cloned(),
                 );
+                self.read_path_stats
+                    .record_point_l0_lookup_depth(l0_table_probes);
             } else if let Some(table) = level.table_for_key(key) {
                 table.record_point_table_probe();
                 if table.may_contain_key(key) {
@@ -82,15 +167,19 @@ impl LsmVersion {
     ) -> Result<()> {
         for level in &self.levels {
             if level.level == TableLevel::ZERO {
+                let mut l0_table_probes = 0;
                 for table in &level.tables {
                     if !should_probe(table) {
                         continue;
                     }
                     table.record_point_table_probe();
+                    l0_table_probes += 1;
                     if table.may_contain_key(key) {
                         visit(table)?;
                     }
                 }
+                self.read_path_stats
+                    .record_point_l0_lookup_depth(l0_table_probes);
             } else if let Some(table) = level.table_for_key(key) {
                 if !should_probe(table) {
                     continue;
@@ -115,6 +204,7 @@ impl LsmVersion {
     {
         for level in &self.levels {
             if level.level == TableLevel::ZERO {
+                let mut l0_table_probes_by_key = vec![0; keys.len()];
                 for table in &level.tables {
                     let mut key_indices = Vec::new();
                     for (key_index, key) in keys.iter().enumerate() {
@@ -123,13 +213,19 @@ impl LsmVersion {
                             continue;
                         }
                         table.record_point_table_probe();
+                        l0_table_probes_by_key[key_index] += 1;
                         if table.may_contain_key(key) {
                             key_indices.push(key_index);
                         }
                     }
                     if !key_indices.is_empty() {
+                        self.read_path_stats.record_batch_point_table_group();
                         visit(table, &key_indices)?;
                     }
+                }
+                for table_probes in l0_table_probes_by_key {
+                    self.read_path_stats
+                        .record_batch_point_l0_lookup_depth(table_probes);
                 }
                 continue;
             }
@@ -155,6 +251,7 @@ impl LsmVersion {
                     let table = current_table
                         .take()
                         .expect("current table exists when key indices exist");
+                    self.read_path_stats.record_batch_point_table_group();
                     visit(&table, &key_indices)?;
                     key_indices.clear();
                 }
@@ -164,6 +261,7 @@ impl LsmVersion {
                 key_indices.push(key_index);
             }
             if let Some(table) = current_table {
+                self.read_path_stats.record_batch_point_table_group();
                 visit(&table, &key_indices)?;
             }
         }
@@ -259,6 +357,10 @@ impl LsmVersion {
         tables.extend(output_tables);
         Self::new(tables)
     }
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 #[derive(Debug, Clone)]

@@ -2376,6 +2376,22 @@ fn extend_l0_stack_read_diagnostics(results: &mut Vec<BenchResult>) {
     ));
     diagnostics.push_results_with_label(results, label);
 
+    let before = db.stats();
+    let start = Instant::now();
+    let checksum = batched_point_read_checksum(&bucket, &keys, POINT_READ_BATCH);
+    assert!(checksum > 0, "L0 stack batch diagnostic must read values");
+    let elapsed_micros = duration_micros(start.elapsed());
+    let after = db.stats();
+
+    let label = "read pruning L0 stack diagnostic batch 4";
+    let mut diagnostics = ColdReadDiagnostics::default();
+    diagnostics.record_delta(&before, &after);
+    results.push(BenchResult::diagnostic(
+        labelled(label, "wall micros"),
+        elapsed_micros,
+    ));
+    diagnostics.push_results_with_label(results, label);
+
     drop(db);
     cleanup_dir(&dir);
 }
@@ -2385,6 +2401,13 @@ struct ColdReadDiagnostics {
     table_probes: u64,
     l0_table_probes: u64,
     non_l0_table_probes: u64,
+    l0_lookup_keys: u64,
+    l0_overlap_extra_table_probes: u64,
+    batch_input_keys: u64,
+    batch_unique_keys: u64,
+    batch_table_groups: u64,
+    batch_l0_lookup_keys: u64,
+    batch_l0_overlap_extra_table_probes: u64,
     block_metadata_probes: u64,
     data_block_reads: u64,
     filter_misses: u64,
@@ -2411,6 +2434,12 @@ struct ColdReadDiagnostics {
 
 impl ColdReadDiagnostics {
     fn record(&mut self, stats: &trine_kv::DbStats) {
+        self.record_read_path(stats);
+        self.record_storage_requests(stats);
+        self.record_storage_latencies(stats);
+    }
+
+    fn record_read_path(&mut self, stats: &trine_kv::DbStats) {
         self.table_probes = self
             .table_probes
             .saturating_add(stats.read_path.point_table_probes);
@@ -2420,6 +2449,27 @@ impl ColdReadDiagnostics {
         self.non_l0_table_probes = self
             .non_l0_table_probes
             .saturating_add(stats.read_path.point_non_l0_table_probes);
+        self.l0_lookup_keys = self
+            .l0_lookup_keys
+            .saturating_add(stats.read_path.point_l0_lookup_keys);
+        self.l0_overlap_extra_table_probes = self
+            .l0_overlap_extra_table_probes
+            .saturating_add(stats.read_path.point_l0_overlap_extra_table_probes);
+        self.batch_input_keys = self
+            .batch_input_keys
+            .saturating_add(stats.read_path.batch_point_input_keys);
+        self.batch_unique_keys = self
+            .batch_unique_keys
+            .saturating_add(stats.read_path.batch_point_unique_keys);
+        self.batch_table_groups = self
+            .batch_table_groups
+            .saturating_add(stats.read_path.batch_point_table_groups);
+        self.batch_l0_lookup_keys = self
+            .batch_l0_lookup_keys
+            .saturating_add(stats.read_path.batch_point_l0_lookup_keys);
+        self.batch_l0_overlap_extra_table_probes = self
+            .batch_l0_overlap_extra_table_probes
+            .saturating_add(stats.read_path.batch_point_l0_overlap_extra_table_probes);
         self.block_metadata_probes = self
             .block_metadata_probes
             .saturating_add(stats.read_path.point_block_metadata_probes);
@@ -2430,6 +2480,9 @@ impl ColdReadDiagnostics {
             .filter_misses
             .saturating_add(stats.read_path.point_filter_misses);
         self.cache_misses = self.cache_misses.saturating_add(stats.block_cache_misses);
+    }
+
+    fn record_storage_requests(&mut self, stats: &trine_kv::DbStats) {
         self.open_read_requests = self
             .open_read_requests
             .saturating_add(stats.storage_operations.open_read.requests);
@@ -2457,6 +2510,9 @@ impl ColdReadDiagnostics {
         self.list_objects_requests = self
             .list_objects_requests
             .saturating_add(stats.storage_operations.list_objects.requests);
+    }
+
+    fn record_storage_latencies(&mut self, stats: &trine_kv::DbStats) {
         self.open_read_micros = self
             .open_read_micros
             .saturating_add(stats.storage_operations.open_read.total_latency_micros);
@@ -2526,6 +2582,49 @@ impl ColdReadDiagnostics {
                 .point_non_l0_table_probes
                 .saturating_sub(before.read_path.point_non_l0_table_probes),
         );
+        self.l0_lookup_keys = self.l0_lookup_keys.saturating_add(
+            after
+                .read_path
+                .point_l0_lookup_keys
+                .saturating_sub(before.read_path.point_l0_lookup_keys),
+        );
+        self.l0_overlap_extra_table_probes = self.l0_overlap_extra_table_probes.saturating_add(
+            after
+                .read_path
+                .point_l0_overlap_extra_table_probes
+                .saturating_sub(before.read_path.point_l0_overlap_extra_table_probes),
+        );
+        self.batch_input_keys = self.batch_input_keys.saturating_add(
+            after
+                .read_path
+                .batch_point_input_keys
+                .saturating_sub(before.read_path.batch_point_input_keys),
+        );
+        self.batch_unique_keys = self.batch_unique_keys.saturating_add(
+            after
+                .read_path
+                .batch_point_unique_keys
+                .saturating_sub(before.read_path.batch_point_unique_keys),
+        );
+        self.batch_table_groups = self.batch_table_groups.saturating_add(
+            after
+                .read_path
+                .batch_point_table_groups
+                .saturating_sub(before.read_path.batch_point_table_groups),
+        );
+        self.batch_l0_lookup_keys = self.batch_l0_lookup_keys.saturating_add(
+            after
+                .read_path
+                .batch_point_l0_lookup_keys
+                .saturating_sub(before.read_path.batch_point_l0_lookup_keys),
+        );
+        self.batch_l0_overlap_extra_table_probes =
+            self.batch_l0_overlap_extra_table_probes.saturating_add(
+                after
+                    .read_path
+                    .batch_point_l0_overlap_extra_table_probes
+                    .saturating_sub(before.read_path.batch_point_l0_overlap_extra_table_probes),
+            );
         self.block_metadata_probes = self.block_metadata_probes.saturating_add(
             after
                 .read_path
@@ -2740,6 +2839,12 @@ impl ColdReadDiagnostics {
     }
 
     fn push_results_with_label(&self, results: &mut Vec<BenchResult>, label: &'static str) {
+        self.push_read_path_results(results, label);
+        self.push_storage_request_results(results, label);
+        self.push_storage_latency_results(results, label);
+    }
+
+    fn push_read_path_results(&self, results: &mut Vec<BenchResult>, label: &'static str) {
         results.push(BenchResult::diagnostic(
             labelled(label, "point table probes"),
             self.table_probes,
@@ -2751,6 +2856,34 @@ impl ColdReadDiagnostics {
         results.push(BenchResult::diagnostic(
             labelled(label, "point non-L0 table probes"),
             self.non_l0_table_probes,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled(label, "point L0 lookup keys"),
+            self.l0_lookup_keys,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled(label, "point L0 overlap extra table probes"),
+            self.l0_overlap_extra_table_probes,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled(label, "batch point input keys"),
+            self.batch_input_keys,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled(label, "batch point unique keys"),
+            self.batch_unique_keys,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled(label, "batch point table groups"),
+            self.batch_table_groups,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled(label, "batch point L0 lookup keys"),
+            self.batch_l0_lookup_keys,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled(label, "batch point L0 overlap extra table probes"),
+            self.batch_l0_overlap_extra_table_probes,
         ));
         results.push(BenchResult::diagnostic(
             labelled(label, "point block metadata probes"),
@@ -2768,6 +2901,9 @@ impl ColdReadDiagnostics {
             labelled(label, "point cache misses"),
             self.cache_misses,
         ));
+    }
+
+    fn push_storage_request_results(&self, results: &mut Vec<BenchResult>, label: &'static str) {
         results.push(BenchResult::diagnostic(
             labelled(label, "storage open read requests"),
             self.open_read_requests,
@@ -2804,6 +2940,9 @@ impl ColdReadDiagnostics {
             labelled(label, "storage list objects requests"),
             self.list_objects_requests,
         ));
+    }
+
+    fn push_storage_latency_results(&self, results: &mut Vec<BenchResult>, label: &'static str) {
         results.push(BenchResult::diagnostic(
             labelled(label, "storage open read micros"),
             self.open_read_micros,
