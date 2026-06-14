@@ -12692,3 +12692,57 @@ Negative check:
 
 - Continue this phase with focused profiling of table/blob encode and payload
   rewrite. Do not revisit output-file `SyncData` as a generic fix.
+
+## 2026-06-14: Blob Level Merge Reuses Blob Read Objects
+
+### Observation
+
+- Sync blob level merge rewrites retained `BlobIndex` values by inlining old
+  blob values before writing the replacement table/blob layout.
+- Before this slice, each retained `BlobIndex` opened the blob file, queried its
+  length, validated the header, and then read the indexed record. A level-merge
+  rewrite with many retained values from the same blob file repeated that setup
+  once per record.
+- The retained change caches native blob read objects by file id within one
+  `inline_blob_values_with_backend` pass.
+- `inline_blob_values_reuses_open_blob_file` proves two retained `BlobIndex`
+  values from the same blob file cause one `open_read` request during inline
+  rewrite.
+- `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench` after this slice reported:
+  - `blob level merge`: 190770 us median versus 201652 us baseline.
+  - `write amp blob level merge diagnostic wall micros`: 47328 us median versus
+    47439 us baseline.
+  - `compaction throughput`: 228572 us median versus 206932 us baseline.
+
+### Interpretation
+
+- Blob level merge had a concrete repeated-open cost in the sync inline rewrite
+  path. Caching by blob file id removes that repeated setup without changing
+  blob format, checksums, or durability.
+- The grouped blob level merge row improved by about 5% in this run. The
+  diagnostic row is roughly flat, so the retained change fixes one clear local
+  inefficiency but does not exhaust the blob rewrite cost.
+- Ordinary compaction throughput is unaffected and remains a separate blocker.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q inline_blob_values_reuses_open_blob_file --lib`
+- `cargo test -q blob --lib`
+- `cargo test -q blob_level_merge --lib`
+- `cargo test -q compaction --lib`
+- `cargo test -q blob_gc --lib`
+- `cargo check -q --benches`
+- `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench`
+
+### Remaining Blockers
+
+- Ordinary `compaction throughput` still regresses/noises against baseline in
+  grouped benchmark evidence.
+- Blob level merge still has payload rewrite and table/blob encode cost beyond
+  repeated blob file opens.
+
+### Recommended Next Action
+
+- Commit this blob level merge slice, then continue with ordinary compaction
+  profiling.

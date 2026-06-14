@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -11,7 +11,7 @@ use crate::{
     options::DurabilityMode,
     storage::{
         BlockingStorageObjectListBackend, BlockingStorageObjectWriteBackend,
-        BlockingStorageReadBackend, BlockingStorageReadObject, NativeFileBackend,
+        BlockingStorageReadBackend, BlockingStorageReadObject, NativeFileBackend, NativeFileObject,
         StorageCapability, StorageObjectId, StorageObjectKind, StorageObjectListBackend,
         StorageObjectListRequest, StorageObjectWriteBackend, StorageReadBackend, StorageReadObject,
     },
@@ -359,15 +359,17 @@ pub(crate) fn inline_blob_values_with_backend(
     records: &[(InternalKey, Option<ValueRef>)],
 ) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
     let mut rewritten = Vec::with_capacity(records.len());
+    let mut blob_files = BTreeMap::new();
     for (internal_key, value) in records {
         let value = match value {
             Some(ValueRef::Inline(bytes)) => Some(ValueRef::Inline(bytes.clone())),
             Some(value @ (ValueRef::BlobIndex(_) | ValueRef::Blob { .. })) => {
-                Some(ValueRef::Inline(read_value_for_internal_key_with_backend(
+                Some(ValueRef::Inline(read_value_for_internal_key_cached(
                     backend,
                     db_path,
                     value,
                     Some(internal_key),
+                    &mut blob_files,
                 )?))
             }
             None => None,
@@ -375,6 +377,80 @@ pub(crate) fn inline_blob_values_with_backend(
         rewritten.push((internal_key.clone(), value));
     }
     Ok(rewritten)
+}
+
+struct CachedBlobFile {
+    object: NativeFileObject,
+    len: u64,
+}
+
+fn read_value_for_internal_key_cached(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+    value: &ValueRef,
+    expected_internal_key: Option<&InternalKey>,
+    blob_files: &mut BTreeMap<u64, CachedBlobFile>,
+) -> Result<Vec<u8>> {
+    match value {
+        ValueRef::Inline(bytes) => Ok(bytes.clone()),
+        ValueRef::BlobIndex(index) => {
+            let blob_file = cached_blob_file(backend, db_path, index.file_id, blob_files)?;
+            let record = read_indexed_blob_record(&blob_file.object, blob_file.len, index)?;
+            if record.index != *index {
+                return Err(Error::Corruption {
+                    message: "blob index metadata mismatch".to_owned(),
+                });
+            }
+            if expected_internal_key.is_some_and(|expected| record.record.internal_key != *expected)
+            {
+                return Err(Error::Corruption {
+                    message: "blob record internal key mismatch".to_owned(),
+                });
+            }
+            Ok(record.record.value)
+        }
+        ValueRef::Blob {
+            file_id,
+            offset,
+            len,
+            checksum: expected_checksum,
+        } => {
+            let len = usize::try_from(*len).map_err(|_| Error::Corruption {
+                message: "blob length exceeds usize".to_owned(),
+            })?;
+            let blob_file = cached_blob_file(backend, db_path, *file_id, blob_files)?;
+            let mut bytes = vec![0_u8; len];
+            read_blob_exact_at(
+                &blob_file.object,
+                *offset,
+                &mut bytes,
+                "referenced blob bytes cannot be read",
+            )?;
+            if checksum(&bytes) != *expected_checksum {
+                return Err(Error::Corruption {
+                    message: "blob checksum mismatch".to_owned(),
+                });
+            }
+            Ok(bytes)
+        }
+    }
+}
+
+fn cached_blob_file<'files>(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+    file_id: u64,
+    blob_files: &'files mut BTreeMap<u64, CachedBlobFile>,
+) -> Result<&'files CachedBlobFile> {
+    match blob_files.entry(file_id) {
+        Entry::Occupied(entry) => Ok(entry.into_mut()),
+        Entry::Vacant(entry) => {
+            let object = open_blob_read_object_with_backend(backend, db_path, file_id)?;
+            let len = blob_object_len(&object, "referenced blob file metadata cannot be read")?;
+            validate_indexed_blob_header(&object, file_id)?;
+            Ok(entry.insert(CachedBlobFile { object, len }))
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -1509,7 +1585,7 @@ mod tests {
         },
         codec::CodecId,
         internal_key::{InternalKey, ValueKind},
-        storage::{MemoryStorageBackend, StorageObjectId, StorageObjectKind},
+        storage::{MemoryStorageBackend, NativeFileBackend, StorageObjectId, StorageObjectKind},
         types::Sequence,
     };
 
@@ -1580,6 +1656,50 @@ mod tests {
         ))
         .expect("async indexed blob reads");
         assert_eq!(value, b"value-one");
+    }
+
+    #[test]
+    fn inline_blob_values_reuses_open_blob_file() {
+        let temp = temp_blob_dir("inline-cache");
+        let backend = NativeFileBackend::new();
+        let header = BlobFileHeader::new(51, Sequence::new(3), 16, CodecId::None);
+        let records = vec![
+            blob_record("user:1", 3, 0, b"value-one".to_vec(), CodecId::None),
+            blob_record("user:2", 2, 0, b"value-two".to_vec(), CodecId::None),
+        ];
+        let indexes = super::write_blob_file_with_backend(&backend, &temp, 51, header, &records)
+            .expect("blob file writes");
+        let table_records = vec![
+            (
+                records[0].internal_key.clone(),
+                Some(ValueRef::BlobIndex(indexes[0])),
+            ),
+            (
+                records[1].internal_key.clone(),
+                Some(ValueRef::BlobIndex(indexes[1])),
+            ),
+        ];
+        let before = backend.stats().operations.open_read.requests;
+
+        let rewritten = super::inline_blob_values_with_backend(&backend, &temp, &table_records)
+            .expect("blob values inline");
+        let after = backend.stats().operations.open_read.requests;
+
+        assert_eq!(after.saturating_sub(before), 1);
+        assert_eq!(
+            rewritten,
+            vec![
+                (
+                    records[0].internal_key.clone(),
+                    Some(ValueRef::Inline(b"value-one".to_vec()))
+                ),
+                (
+                    records[1].internal_key.clone(),
+                    Some(ValueRef::Inline(b"value-two".to_vec()))
+                ),
+            ]
+        );
+        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
 
     #[test]

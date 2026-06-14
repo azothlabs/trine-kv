@@ -44,7 +44,8 @@ weakening confirmed-write durability or changing V1 storage formats.
 ```text
 task814 [x] goal:reject unsafe/unhelpful output-file durability change | scope:src/table.rs src/blob.rs src/db.rs | verify:targeted bench
 task815 [ ] goal:record sync-write classification and maintenance evidence | scope:docs/benchmarks .phrase/evidence.md | verify:evidence review
-task816 [ ] goal:profile and reduce table/blob payload rewrite cost | scope:src/table.rs src/blob.rs src/lsm src/db.rs | verify:compaction/blob diagnostics + grouped bench
+task816 [x] goal:cache blob read objects during level-merge inline rewrite | scope:src/blob.rs | verify:blob tests + grouped bench
+task817 [ ] goal:profile and reduce ordinary compaction throughput cost | scope:src/table.rs src/lsm src/db.rs | verify:compaction diagnostics + grouped bench
 ```
 
 ## Evidence
@@ -62,17 +63,21 @@ task816 [ ] goal:profile and reduce table/blob payload rewrite cost | scope:src/
 - A retained table-writer cleanup skips redundant sorting for already-sorted
   flush/compaction payloads and lets encoded table metadata be reused after
   blocking writes instead of re-reading table metadata from disk.
+- Blob level merge no longer reopens and revalidates the same blob file for
+  every retained `BlobIndex` during sync inline rewrite; one rewrite pass caches
+  blob read objects by file id.
 
 ## Known Residuals
 
 - Sequential single-key `SyncData`/`SyncAll` cannot be made cheap without
   relaxing the meaning of a confirmed write or adding a different explicit
   group-commit API.
-- Blob level merge and compaction are still dominated outside output-file
-  durability; the next blocker is likely table/blob encode, blob rewrite, or
-  compaction payload assembly.
+- Ordinary compaction remains unresolved. Blob level merge improved in grouped
+  benchmark evidence, but compaction still needs profiling around payload
+  assembly, table encoding, validation, publish, and cleanup.
 
 ## Next Recommendation
 
-- Continue with compaction/blob encode and rewrite profiling; do not revisit
-  output-file `SyncData` without new filesystem-specific evidence.
+- Commit the blob level merge cache slice, then continue with ordinary
+  compaction profiling. Do not revisit output-file `SyncData` without new
+  filesystem-specific evidence.
