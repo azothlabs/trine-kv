@@ -1802,22 +1802,23 @@ fn persistent_background_workers_flush_and_compact_pressure() {
     let mut options = DbOptions::persistent(&path);
     options.write_buffer_bytes = 1;
     options.max_immutable_memtables = 4;
-    options.max_l0_files = 1;
+    options.max_l0_files = 2;
 
     {
         let db = Db::open_sync(options.clone()).expect("persistent db opens");
         let bucket = db.default_bucket_sync().expect("bucket opens");
 
         bucket.put_sync(b"a", b"a1").expect("write a");
-        wait_until("background flush of first immutable memtable", || {
+        bucket.put_sync(b"b", b"b1").expect("write b");
+        bucket.put_sync(b"c", b"c1").expect("write c");
+        wait_until("background batched flush of immutable memtables", || {
             let stats = db.stats();
-            stats.total_tables == 1 && stats.immutable_memtables == 0
+            stats.immutable_memtables == 0 && (stats.l0_tables >= 3 || level_table_count(&stats, 1) >= 1)
         });
 
-        bucket.put_sync(b"b", b"b1").expect("write b");
         wait_until("background compaction after L0 pressure", || {
             let stats = db.stats();
-            stats.l0_tables <= 1 && level_table_count(&stats, 1) >= 1
+            stats.l0_tables <= 2 && level_table_count(&stats, 1) >= 1
         });
 
         assert_eq!(
@@ -1832,6 +1833,12 @@ fn persistent_background_workers_flush_and_compact_pressure() {
                 .expect("b reads after background work"),
             Some(b"b1".to_vec())
         );
+        assert_eq!(
+            bucket
+                .get_sync(b"c")
+                .expect("c reads after background work"),
+            Some(b"c1".to_vec())
+        );
         db.close_sync();
     }
 
@@ -1839,7 +1846,7 @@ fn persistent_background_workers_flush_and_compact_pressure() {
         let db = Db::open_sync(options).expect("persistent db reopens");
         let bucket = db.default_bucket_sync().expect("bucket reopens");
         let stats = db.stats();
-        assert!(stats.l0_tables <= 1);
+        assert!(stats.l0_tables <= 2);
         assert!(level_table_count(&stats, 1) >= 1);
         assert_eq!(
             bucket.get_sync(b"a").expect("a reopens"),
@@ -1848,6 +1855,10 @@ fn persistent_background_workers_flush_and_compact_pressure() {
         assert_eq!(
             bucket.get_sync(b"b").expect("b reopens"),
             Some(b"b1".to_vec())
+        );
+        assert_eq!(
+            bucket.get_sync(b"c").expect("c reopens"),
+            Some(b"c1".to_vec())
         );
     }
 

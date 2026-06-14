@@ -4584,7 +4584,7 @@ foreground latency under background work is the next risk.
 
 ### Phase 186: Background Maintenance Budget Tuning
 
-**Status**: Planned
+**Status**: Complete
 
 **Goal**: Reduce foreground write latency under maintenance pressure by tuning
 background-worker maintenance budget and foreground backpressure waiting.

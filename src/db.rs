@@ -10,6 +10,8 @@ use std::{
     time::Duration,
 };
 
+const BACKGROUND_MAINTENANCE_PROGRESS_WAIT: Duration = Duration::from_millis(2);
+
 use crate::{
     blob::{self, ValueRef},
     bucket::{Bucket, BucketName, BucketReader, DEFAULT_BUCKET_NAME},
@@ -3924,6 +3926,25 @@ impl Db {
             .fetch_add(1, Ordering::AcqRel);
     }
 
+    fn background_maintenance_budget(&self) -> MaintenanceBudget {
+        MaintenanceBudget::new(
+            self.inner.options.max_immutable_memtables,
+            self.inner.options.max_l0_files.saturating_add(1),
+        )
+    }
+
+    fn background_flush_request_threshold(&self) -> usize {
+        self.inner
+            .options
+            .max_immutable_memtables
+            .saturating_sub(1)
+            .max(3)
+    }
+
+    const fn background_maintenance_progress_wait() -> Duration {
+        BACKGROUND_MAINTENANCE_PROGRESS_WAIT
+    }
+
     #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
     fn run_background_maintenance(&self, request: MaintenanceRequest) -> Result<()> {
         self.ensure_open()?;
@@ -3936,20 +3957,16 @@ impl Db {
         };
         let db_path = path.to_path_buf();
         let mut should_compact = request.compaction || self.l0_pressure_exceeded()?;
+        let budget = self.background_maintenance_budget();
 
         if request.flush && self.has_immutable_memtables()? {
             let (flush_should_compact, _) =
-                self.run_flush_once_with_budget(&db_path, false, MaintenanceBudget::single_unit())?;
+                self.run_flush_once_with_budget(&db_path, false, budget)?;
             should_compact |= flush_should_compact;
         }
 
         if should_compact {
-            self.run_compaction_once_with_budget(
-                &db_path,
-                &KeyRange::all(),
-                true,
-                MaintenanceBudget::single_unit(),
-            )?;
+            self.run_compaction_once_with_budget(&db_path, &KeyRange::all(), true, budget)?;
         }
         if self.has_immutable_memtables()? {
             self.request_background_flush();
@@ -4587,21 +4604,24 @@ impl Db {
                 return Ok(());
             }
 
-            self.inner.maintenance.request(pressure.request());
+            let outcome = self.run_maintenance_for_pressure(&db_path, pressure)?;
+            if outcome.made_progress() {
+                continue;
+            }
+
             if self.background_workers_enabled() {
+                self.inner.maintenance.request(pressure.request());
                 let progress = self.inner.maintenance.progress();
                 self.record_cooperative_maintenance_yield();
                 if self
                     .inner
                     .maintenance
-                    .wait_for_progress(progress, Duration::from_millis(20))
+                    .wait_for_progress(progress, Self::background_maintenance_progress_wait())
                 {
                     continue;
                 }
                 self.record_maintenance_budget_exhaustion();
             }
-
-            self.run_maintenance_for_pressure(&db_path, pressure)?;
         }
     }
 
@@ -4625,27 +4645,34 @@ impl Db {
         Ok(pressure)
     }
 
-    fn run_maintenance_for_pressure(&self, db_path: &Path, pressure: WritePressure) -> Result<()> {
+    fn run_maintenance_for_pressure(
+        &self,
+        db_path: &Path,
+        pressure: WritePressure,
+    ) -> Result<MaintenanceOutcome> {
         let mut should_compact = pressure.compaction;
+        let mut outcome = MaintenanceOutcome::default();
         if pressure.flush {
-            should_compact |= self.run_pressure_flush_once(db_path)?;
+            let (flush_should_compact, flush_outcome) =
+                self.run_pressure_flush_once_with_budget(db_path, MaintenanceBudget::unbounded())?;
+            should_compact |= flush_should_compact;
+            outcome.flushes += flush_outcome.flushes;
+            outcome.budget_exhausted |= flush_outcome.budget_exhausted;
+            outcome.busy |= flush_outcome.busy;
         }
         if should_compact {
-            self.run_compaction_once_with_budget(
+            let compaction_outcome = self.run_compaction_once_with_budget(
                 db_path,
                 &KeyRange::all(),
                 true,
                 MaintenanceBudget::single_unit(),
             )?;
+            outcome.compactions += compaction_outcome.compactions;
+            outcome.budget_exhausted |= compaction_outcome.budget_exhausted;
+            outcome.busy |= compaction_outcome.busy;
         }
 
-        Ok(())
-    }
-
-    fn run_pressure_flush_once(&self, db_path: &Path) -> Result<bool> {
-        let (should_compact, _) =
-            self.run_pressure_flush_once_with_budget(db_path, MaintenanceBudget::unbounded())?;
-        Ok(should_compact)
+        Ok(outcome)
     }
 
     fn run_pressure_flush_once_with_budget(
@@ -4731,7 +4758,10 @@ impl Db {
             }
         }
 
-        Ok(frozen_count != 0)
+        Ok(frozen_count != 0
+            && states.iter().any(|state| {
+                state.immutable_memtable_count() >= self.background_flush_request_threshold()
+            }))
     }
 
     fn freeze_public_flush_target(&self) -> Result<Sequence> {
@@ -9253,8 +9283,9 @@ mod tests {
     };
 
     use super::{
-        CompactionReservation, Db, Error, MaintenanceBudget, MaintenanceCoordinator,
-        compaction_reservations_conflict, record_maintenance_success, shutdown_background_workers,
+        BACKGROUND_MAINTENANCE_PROGRESS_WAIT, CompactionReservation, Db, Error, MaintenanceBudget,
+        MaintenanceCoordinator, compaction_reservations_conflict, record_maintenance_success,
+        shutdown_background_workers,
     };
     use crate::{
         bucket::DEFAULT_BUCKET_NAME,
@@ -9542,6 +9573,61 @@ mod tests {
         shutdown_background_workers(&maintenance, &runtime_shutdown, &workers);
 
         assert!(runtime_shutdown.is_cancelled());
+    }
+
+    #[test]
+    fn background_maintenance_budget_tracks_pressure_thresholds() {
+        let mut options = DbOptions::memory();
+        options.max_immutable_memtables = 6;
+        options.max_l0_files = 3;
+        let db = Db::open_sync(options).expect("memory db opens");
+
+        let budget = db.background_maintenance_budget();
+
+        assert_eq!(budget.max_flush_inputs(), 6);
+        assert_eq!(budget.max_compaction_inputs(), 4);
+        assert_eq!(db.background_flush_request_threshold(), 5);
+        assert_eq!(
+            Db::background_maintenance_progress_wait(),
+            BACKGROUND_MAINTENANCE_PROGRESS_WAIT
+        );
+    }
+
+    #[test]
+    fn background_flush_request_threshold_keeps_tiny_pressure_foreground() {
+        let mut options = DbOptions::memory();
+        options.max_immutable_memtables = 2;
+        let db = Db::open_sync(options).expect("memory db opens");
+
+        assert_eq!(db.background_flush_request_threshold(), 3);
+    }
+
+    #[test]
+    fn write_pressure_maintenance_reports_foreground_progress() {
+        let path = temp_db_path("write-pressure-foreground-maintenance");
+        let mut options = DbOptions::persistent(&path);
+        options.background_worker_count = 0;
+        options.write_buffer_bytes = 1;
+        options.max_immutable_memtables = 2;
+        options.max_l0_files = 64;
+        let db = Db::open_sync(options).expect("open db");
+
+        db.put_sync(b"a", b"one").expect("write first immutable");
+        db.put_sync(b"b", b"two").expect("write second immutable");
+        let pressure = db.write_pressure().expect("inspect write pressure");
+        assert!(pressure.flush);
+
+        let outcome = db
+            .run_maintenance_for_pressure(&path, pressure)
+            .expect("foreground pressure maintenance");
+
+        assert!(outcome.made_progress());
+        assert_eq!(outcome.flushes, 2);
+        assert!(!outcome.busy());
+        assert_eq!(db.stats().immutable_memtables, 0);
+
+        drop(db);
+        fs::remove_dir_all(path).expect("cleanup test db");
     }
 
     #[test]

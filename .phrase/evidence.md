@@ -12562,3 +12562,67 @@ Negative check:
 
 - Start Phase 186 and tune background-worker maintenance budget plus foreground
   backpressure waiting, then rerun the contention diagnostic.
+
+## 2026-06-14: Background Maintenance Budget And Admission Tuning
+
+### Observation
+
+- Phase 185 showed the background-worker contention diagnostic was slower than
+  the foreground-only row because background maintenance split flush and
+  compaction pressure into too many small turns.
+- A budget-only experiment did not improve the row: storage operation counts
+  remained high and background write wall stayed around 2.25 seconds.
+- A shorter foreground wait experiment only moved background write wall to
+  about 2.11 seconds while increasing cooperative yields and budget exhaustions
+  to 258 each; storage operation counts still did not fall.
+- The retained change makes write pressure foreground-first, lets background
+  workers use an internal pressure-sized maintenance budget, and delays
+  post-commit background flush requests until there is a useful immutable
+  memtable batch.
+- `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench` after the retained change
+  reported:
+  - background-worker write wall: 1491161 us median.
+  - background-worker read wall: 2227 us median.
+  - background-worker cooperative yields: 0 median.
+  - background-worker budget exhaustions: 0 median.
+  - background-worker manifest publishes: 69 median.
+  - background-worker persists: 92 median.
+  - background-worker directory syncs: 23 median.
+  - foreground-only write wall in the same run: 1338208 us median.
+
+### Interpretation
+
+- The first two rejected experiments prove the blocker was not simply the
+  single-unit worker budget or the 20 ms foreground wait; the real cost was
+  early background flush admission splitting small batches into redundant
+  manifest/persist/directory-sync turns.
+- The retained admission policy removes the redundant storage-maintenance turns
+  in the background-worker row and improves foreground write wall by about 31%
+  against Phase 185.
+- The read-wall median is noisier in this run but remains low-millisecond; it
+  does not overturn the Phase 185 conclusion that writes are the pressure
+  bottleneck.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q background_maintenance_budget_tracks_pressure_thresholds --lib`
+- `cargo test -q background_flush_request_threshold_keeps_tiny_pressure_foreground --lib`
+- `cargo test -q write_pressure_maintenance_reports_foreground_progress --lib`
+- `cargo test -q persistent_background_workers_flush_and_compact_pressure --lib`
+- `cargo check -q --benches`
+- `cargo test -q --lib`
+- `cargo test -q --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `git diff --check`
+- `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench`
+
+### Remaining Blockers
+
+- None for Phase 186.
+- The remaining gap between the foreground-only and background-worker write
+  wall rows belongs to a broader write-path/storage durability phase.
+
+### Recommended Next Action
+
+- Choose the next KV optimization phase from fresh grouped benchmark evidence.

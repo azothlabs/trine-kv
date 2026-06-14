@@ -6,79 +6,65 @@ Complete
 
 ## Goal
 
-Measure foreground read/write latency while background flush, compaction, and
-maintenance pressure are active, then use that evidence to classify the next
-worker-budget and backpressure tuning phase.
+Reduce foreground write latency under maintenance pressure by tuning
+background-worker maintenance budget, foreground backpressure ownership, and
+post-commit background flush admission.
 
 ## Scope
 
-- Benchmark rows for foreground point reads and writes under maintenance
-  pressure.
-- Diagnostics for background worker participation, cooperative foreground
-  maintenance, budget exhaustion, compaction runs, and storage operation cost.
-- Native persistent local-file workloads using existing sync public APIs.
-- Evidence sufficient to classify the next blocker before changing engine
-  behavior.
+- Native persistent local-file background maintenance behavior.
+- Internal worker budget and post-commit flush request admission.
+- Foreground write-pressure maintenance ownership.
+- Benchmark evidence from the existing V1 contention diagnostics.
 
 ## Out Of Scope
 
 - Storage format changes.
 - Platform-io backend changes.
 - Public API changes.
-- Object-store, browser, or WASI maintenance behavior changes.
-- New compaction-picking policy unless diagnostics prove it is the current
-  blocker.
+- New compaction selection policy.
 - Publishing, tagging, pushing, or release workflow changes.
 
 ## Acceptance Gate
 
-- Benchmarks report foreground read and write wall time while maintenance
-  pressure is present.
-- Diagnostics distinguish foreground cooperative maintenance from background
-  worker progress.
-- Diagnostics include compaction/storage counters needed to explain whether
-  latency comes from locks, storage queueing, or maintenance budgeting.
-- Focused benchmark run records current behavior.
-- Full lib tests, all-feature tests, strict clippy, formatting, and diff
-  whitespace checks pass before the phase is closed.
+- Background maintenance contention diagnostic improves write wall time or
+  reduces redundant storage maintenance operations without a meaningful read
+  regression.
+- Tests cover the selected worker-budget and pressure ownership behavior.
+- Full lib tests, all-feature tests, strict clippy, formatting, diff whitespace
+  checks, and grouped benchmark evidence pass before commit.
 
 ## Active Task Slice
 
 ```text
-task810 [x] goal:add concurrent maintenance diagnostics | scope:benches/v1_bench.rs | verify:TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench
-task811 [x] goal:classify first maintenance contention blocker | scope:docs/benchmarks .phrase/evidence.md | verify:benchmark evidence review
+task812 [x] goal:tune background maintenance budget/admission | scope:src/db.rs | verify:focused tests + TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench
+task813 [x] goal:record Phase 186 evidence | scope:docs/benchmarks .phrase | verify:evidence review
 ```
 
 ## Evidence
 
-- Phase 184 completed the remaining LZ4 feature-policy work and recommended
-  moving next to concurrent read/write plus background maintenance.
-- Existing benchmark rows measure flush, compaction, blob GC, and write
-  amplification one operation at a time, but they do not directly measure
-  foreground reads/writes while background maintenance is active.
-- Existing stats already expose cooperative maintenance yields, maintenance
-  budget exhaustions, compaction counters, and per-storage-operation latency.
-- The new contention diagnostic compares `background_worker_count = 0` against
-  `background_worker_count = 1` under the same small-buffer write pressure.
-- `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench` reported foreground writes
-  at 1353150 us median and background-worker writes at 2148083 us median. Read
-  wall stayed small in both cases: 1352 us median foreground and 1445 us median
-  with a worker.
-- The background-worker row reported 129 cooperative yields and 47 budget
-  exhaustions median. It also performed more storage work than the foreground
-  row: 88 manifest publishes vs 69, 180 persists vs 92, and 45 directory syncs
-  vs 23.
+- Phase 185 background-worker row reported 2148083 us median write wall, 129
+  cooperative yields, 47 budget exhaustions, 88 manifest publishes, 180
+  persists, and 45 directory syncs.
+- Budget-only and shorter-wait experiments were rejected: they did not reduce
+  storage operation counts, and the shorter wait raised cooperative yields and
+  budget exhaustions.
+- The retained change makes pressure maintenance foreground-first, gives
+  background workers an internal pressure-sized budget, and delays background
+  flush requests until they can batch useful work.
+- `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench` reported the background
+  contention row at 1491161 us median write wall, 0 cooperative yields, 0 budget
+  exhaustions, 69 manifest publishes, 92 persists, and 23 directory syncs.
 
 ## Known Residuals
 
-- Foreground point reads are not the first bottleneck in this pressure model.
-- Background maintenance currently uses too many small maintenance turns under
-  write pressure, causing extra manifest publishes, persists, directory syncs,
-  cooperative waits, and budget exhaustions.
-- This phase intentionally did not change coordinator behavior; the evidence now
-  justifies a follow-up tuning phase.
+- The background-worker read-wall median in the Phase 186 run was noisier
+  (2227 us) but remained low-millisecond and did not drive the original blocker.
+- The remaining write-wall gap to the foreground-only row belongs to broader
+  write-path/storage durability tuning, not this worker contention slice.
 
 ## Next Recommendation
 
-- Tune background-worker maintenance budget and foreground backpressure waits,
-  then rerun the contention diagnostic.
+- Continue the KV optimization queue from fresh grouped benchmark evidence.
+  Good next candidates are the broader write path durability costs or the
+  remaining cold-open/recovery costs, depending on the next selected phase.
