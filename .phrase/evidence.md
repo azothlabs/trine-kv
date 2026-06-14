@@ -30,6 +30,21 @@ Record only evidence that can change planning or durable decisions.
 
 ### Observation
 
+- Hot/cold cache follow-up confirmed the intended split: L0/L1 table metadata
+  is pinned per table, while L2+ lazy index partitions depend on the global
+  block cache. Cache keys already classify index/filter/range-tombstone
+  metadata as high priority and data/blob blocks as low priority.
+- The cache eviction policy now lets a single high-priority entry exceed its
+  shard target when the total cache can hold that entry. This prevents a hot
+  index partition from being inserted and immediately evicted only because the
+  per-shard budget is smaller than the partition.
+- A new L2 table test proves hot lazy index metadata survives same-partition
+  data-block churn under a small cache. Cache tests prove oversized
+  high-priority entries survive low-priority churn.
+- The local 3-run summary after the cache follow-up recorded
+  `block cache random hit diagnostic` with 2048 cache hits, 0 cache misses, and
+  0 read-owned storage requests. `block decode forced diagnostic` still recorded
+  2048 cache misses and 2048 read-owned storage requests.
 - Follow-up negative lookup work moved `missing get` benchmark key generation
   outside the measured closure, delayed memtable range-tombstone index
   construction until a point candidate exists, returned all-missing unique
@@ -71,12 +86,17 @@ Record only evidence that can change planning or durable decisions.
 - The negative lookup follow-up reduces CPU-side miss overhead before table
   reads; persistent negative lookups still report 0 data block reads and 0
   read-owned storage requests.
+- The hot/cold cache follow-up strengthens metadata residency for large
+  datasets without changing storage format, MVCC visibility, or public APIs.
 
 ### Verification
 
 - `cargo fmt --check`
 - `git diff --check`
 - `cargo test -q lsm::read::tests::`
+- `cargo test -q cache::tests::`
+- `cargo test -q deeper_table_metadata_survives_data_block_churn_in_small_cache`
+- `cargo test -q deeper_table_uses_block_cache_for_lazy_index_partitions`
 - `cargo test -q get_many_sync`
 - `cargo check -q --benches`
 - `cargo clippy -q --all-targets --all-features -- -D warnings`

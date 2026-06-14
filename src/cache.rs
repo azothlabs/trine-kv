@@ -421,16 +421,13 @@ impl BlockCacheState {
         while self.total_bytes() > capacity_bytes {
             // Metadata entries are cheap and prevent extra table I/O, so data
             // churn gives up low-priority entries before touching metadata.
-            let Some(key) = self
-                .low_order
-                .pop_front()
-                .or_else(|| self.high_order.pop_front())
-            else {
-                self.entries.clear();
-                self.high_order.clear();
-                self.low_order.clear();
-                self.high_bytes = 0;
-                self.low_bytes = 0;
+            let key = if let Some(key) = self.low_order.pop_front() {
+                key
+            } else if self.high_order.len() > 1 {
+                self.high_order
+                    .pop_front()
+                    .expect("high order has more than one entry")
+            } else {
                 return;
             };
             if let Some(entry) = self.entries.remove(&key) {
@@ -484,12 +481,15 @@ fn promote_order(order: &mut VecDeque<BlockCacheKey>, key: BlockCacheKey) {
 mod tests {
     use std::{
         collections::VecDeque,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use super::{
-        BLOCK_CACHE_SHARD_COUNT, BlockCache, BlockCacheKey, CacheKind, block_cache_shard_index,
-        promote_order,
+        BLOCK_CACHE_SHARD_COUNT, BlockCache, BlockCacheKey, BlockCacheState, CacheKind, CacheValue,
+        block_cache_shard_index, promote_order,
     };
     use crate::table::{DecodedDataBlock, TableId};
 
@@ -552,8 +552,10 @@ mod tests {
         let low_loads = AtomicUsize::new(0);
 
         cache
-            .get_or_insert_data_block_with(high_key, || Ok(load_counted_block(&high_loads)))
-            .expect("high-priority block loads");
+            .get_or_insert_index_partition_with(high_key, || {
+                Ok(load_counted_partition(&high_loads))
+            })
+            .expect("high-priority partition loads");
         cache
             .get_or_insert_data_block_with(low_a, || Ok(load_counted_block(&low_loads)))
             .expect("first low-priority block loads");
@@ -562,14 +564,42 @@ mod tests {
             .expect("second low-priority block loads and evicts low-priority first");
 
         cache
-            .get_or_insert_data_block_with(high_key, || Ok(load_counted_block(&high_loads)))
-            .expect("high-priority block hits");
+            .get_or_insert_index_partition_with(high_key, || {
+                Ok(load_counted_partition(&high_loads))
+            })
+            .expect("high-priority partition hits");
         assert_eq!(high_loads.load(Ordering::Acquire), 1);
 
         cache
             .get_or_insert_data_block_with(low_a, || Ok(load_counted_block(&low_loads)))
             .expect("low-priority block reloads");
         assert_eq!(low_loads.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn oversized_high_priority_entry_survives_low_priority_churn() {
+        let target_shard = 0;
+        let high_key = key_in_shard(CacheKind::IndexBlock, target_shard, 1);
+        let low_key = key_in_shard(
+            CacheKind::DataBlock,
+            target_shard,
+            high_key.table_id.get() + 1,
+        );
+        let mut state = BlockCacheState::default();
+
+        state.insert(
+            high_key,
+            4,
+            CacheValue::IndexPartition(Arc::new(Vec::new())),
+        );
+        state.evict_to(2);
+        assert!(state.entries.contains_key(&high_key));
+
+        state.insert(low_key, 1, CacheValue::DataBlock(Arc::new(empty_block())));
+        state.evict_to(2);
+
+        assert!(state.entries.contains_key(&high_key));
+        assert!(!state.entries.contains_key(&low_key));
     }
 
     #[test]
@@ -584,6 +614,15 @@ mod tests {
 
     fn load_counted_block(loads: &AtomicUsize) -> DecodedDataBlock {
         loads.fetch_add(1, Ordering::AcqRel);
+        empty_block()
+    }
+
+    fn load_counted_partition(loads: &AtomicUsize) -> Vec<crate::table::TableDataBlock> {
+        loads.fetch_add(1, Ordering::AcqRel);
+        Vec::new()
+    }
+
+    fn empty_block() -> DecodedDataBlock {
         DecodedDataBlock::empty_for_cache_test()
     }
 

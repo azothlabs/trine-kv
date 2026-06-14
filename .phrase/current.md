@@ -48,6 +48,7 @@ task818 [x] goal:add persistent missing batch benchmark diagnostics | scope:benc
 task819 [x] goal:separate out-of-bounds miss from in-bounds filter miss diagnostics | scope:benches/v1_bench.rs | verify:cargo check -q --benches + targeted bench rows
 task820 [x] goal:measure read-path diagnostics and choose first retained optimization | scope:src/lsm src/table.rs benches/v1_bench.rs | verify:TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench
 task821 [x] goal:reduce missing get CPU overhead before table lookup | scope:src/lsm/read.rs benches/v1_bench.rs | verify:TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench
+task822 [x] goal:protect hot metadata from data-block churn in small cache | scope:src/cache.rs src/table.rs | verify:cache/table tests + TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench
 ```
 
 ## Evidence
@@ -89,6 +90,21 @@ task821 [x] goal:reduce missing get CPU overhead before table lookup | scope:src
   - `merged delta missing get` median 163 us.
   - `missing batched point read persistent` median 125 us.
   - `bounded missing batched point read persistent` median 221 us.
+- Hot/cold cache follow-up retained the existing priority split: index/filter
+  metadata is high priority and data/blob blocks are low priority. The cache now
+  allows one high-priority entry to exceed its shard target when the total cache
+  can hold it, so a large hot index partition is not inserted and immediately
+  evicted by a small per-shard budget.
+- A new L2 table test proves hot lazy index metadata survives same-partition
+  data-block churn under a small cache. Cache tests also prove oversized
+  high-priority entries survive low-priority churn.
+- Three-run V1 benchmark evidence after the cache follow-up:
+  - `block cache random hit diagnostic` remains 2048 cache hits, 0 cache
+    misses, and 0 storage read-owned requests.
+  - `block decode forced diagnostic` remains 2048 cache misses and 2048 storage
+    read-owned requests.
+  - `random get` median 775 us, `missing get` median 210 us, and persistent
+    missing/bounded-missing rows remain in the same range as the prior slice.
 
 ## Known Residuals
 
@@ -99,4 +115,4 @@ task821 [x] goal:reduce missing get CPU overhead before table lookup | scope:src
 
 ## Next Recommendation
 
-- Run the strict local gate and commit this negative lookup slice.
+- Run the strict local gate and commit this hot/cold cache slice.

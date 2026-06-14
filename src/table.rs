@@ -6885,6 +6885,79 @@ mod tests {
     }
 
     #[test]
+    fn deeper_table_metadata_survives_data_block_churn_in_small_cache() {
+        let path = std::env::temp_dir().join(format!(
+            "trine-kv-hot-cold-index-partition-{}-{}.trinet",
+            std::process::id(),
+            table_time_suffix()
+        ));
+        let mut options = test_table_options(CodecId::None, true);
+        options.block_bytes = 1;
+        let point_records = (0..260)
+            .map(|index| {
+                (
+                    InternalKey::new(
+                        format!("key-{index:03}").into_bytes(),
+                        Sequence::new(u64::try_from(index + 1).expect("test sequence fits u64")),
+                        ValueKind::Put,
+                        0,
+                    ),
+                    Some(ValueRef::Inline(format!("value-{index:03}").into_bytes())),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let table = write_table(
+            &path,
+            TableId(1000),
+            TableLevel(2),
+            &options,
+            &point_records,
+            &[],
+        )
+        .expect("table writes and reopens");
+        let block_cache = BlockCache::new(64 * 1024);
+        table
+            .point_records_for_key_with_cache(
+                b"key-250",
+                IndexSearchPolicy::Binary,
+                Some(&block_cache),
+            )
+            .expect("hot point lookup warms metadata");
+
+        for index in 128..256 {
+            if index == 250 {
+                continue;
+            }
+            let key = format!("key-{index:03}");
+            table
+                .point_records_for_key_with_cache(
+                    key.as_bytes(),
+                    IndexSearchPolicy::Binary,
+                    Some(&block_cache),
+                )
+                .expect("same-partition point lookup churns data blocks");
+        }
+
+        let before_hot = block_cache.stats();
+        table
+            .point_records_for_key_with_cache(
+                b"key-250",
+                IndexSearchPolicy::Binary,
+                Some(&block_cache),
+            )
+            .expect("hot point lookup reuses metadata after data churn");
+        let after_hot = block_cache.stats();
+
+        assert!(
+            after_hot.hits > before_hot.hits,
+            "hot metadata should survive low-priority data block churn"
+        );
+
+        std::fs::remove_file(path).expect("test table file removes");
+    }
+
+    #[test]
     fn point_lookup_enters_partition_at_binary_located_block() {
         let path = std::env::temp_dir().join(format!(
             "trine-kv-partition-binary-seek-{}-{}.trinet",
