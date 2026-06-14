@@ -6,18 +6,19 @@ Complete
 
 ## Goal
 
-Reduce the remaining read-owned buffer copy at the storage/decode boundary
+Reduce metadata and index block payload copies at the table decode boundary
 while preserving MVCC visibility, table/blob formats, prefix/range filters,
 compression contracts, and read-path correctness.
 
 ## Scope
 
-- `StorageReadBuffer` backing ownership.
-- Checked block and data block shared payload ownership.
-- Inline point value sharing from decoded data blocks.
-- Focused pointer tests proving read-owned buffer reuse.
-- Benchmark evidence showing whether the backing change is visible in current
-  cache/decode rows.
+- Properties, top-level index, index partition, filter, and range tombstone
+  block reads.
+- Full table verification decode.
+- Source-offset checked block reads used by multi-block sections.
+- Focused pointer tests proving shared source-offset payload reuse.
+- Benchmark evidence showing whether metadata/index shared payload reads are
+  visible in current startup/cache/decode rows.
 
 ## Out Of Scope
 
@@ -31,55 +32,54 @@ compression contracts, and read-path correctness.
 
 ## Acceptance Gate
 
-- `StorageReadBuffer::from_vec` reuses the input `Vec<u8>` allocation as shared
-  bytes instead of copying the payload into `Arc<[u8]>`.
-- `CodecId::None` owned block decode and decoded data blocks keep using shared
-  byte ranges without changing record, filter, inline value, or point lookup
-  semantics.
-- Focused storage/block/table tests pass.
+- Normal metadata/index/filter/range-tombstone decoders consume shared checked
+  block payload slices instead of compatibility payload `Vec`s.
+- Full table verification decodes data blocks from shared checked blocks instead
+  of first copying the payload into a `Vec`.
+- Focused block/table tests pass.
 - Full lib tests, all-feature tests, and strict clippy pass.
-- Grouped benchmark evidence records current cache/decode behavior without
-  overstating noisy timing results.
+- Grouped benchmark evidence records current startup/cache/decode behavior
+  without overstating noisy timing results.
 
 ## Active Task Slice
 
 ```text
-task801 [x] goal:classify read-owned buffer backing copy | scope:src/storage.rs src/block.rs src/table.rs src/point_value.rs | verify:code audit
-task802 [x] goal:reuse Vec read buffer allocation as shared bytes | scope:Cargo.toml src/storage.rs src/block.rs src/table.rs src/point_value.rs src/blob.rs | verify:cargo test -q storage_read_buffer_from_vec_reuses_vec_allocation --lib
-task803 [x] goal:record storage buffer evidence | scope:docs/benchmarks .phrase/evidence.md | verify:git diff review
+task804 [x] goal:classify metadata/index compatibility payload Vec paths | scope:src/table.rs src/block.rs | verify:code audit
+task805 [x] goal:consume metadata/index checked blocks as shared payload slices | scope:src/table.rs src/block.rs | verify:cargo test -q table --lib
+task806 [x] goal:record metadata/index shared payload evidence | scope:docs/benchmarks .phrase/evidence.md | verify:git diff review
 ```
 
 ## Evidence
 
-- Phase 181 removed the uncompressed checked-block payload duplicate copy, but
-  still left `StorageReadBuffer::from_vec` wrapping the read buffer into
-  `Arc<[u8]>`.
-- `StorageReadBuffer` now stores `bytes::Bytes`. `Bytes::from(Vec<u8>)`
-  reuses the input allocation and still gives cheap cloneable shared read-only
-  bytes for decoded blocks, block cache entries, and inline point values.
-- `DecodedBlock`, `DecodedDataBlock`, and shared `PointValue` backing now use
-  `Bytes`, preserving the payload range model introduced in Phase 181.
-- The focused test `storage_read_buffer_from_vec_reuses_vec_allocation` proves
-  the storage read buffer slice pointer is the original `Vec<u8>` pointer.
+- Phase 182 removed the read-owned storage buffer copy, but normal metadata and
+  index helpers still converted checked block payloads into compatibility
+  `Vec`s before decoding structures from `&[u8]`.
+- Properties, top-level index, index partitions, filters, range tombstones, and
+  full-table verification now decode from shared checked block payload slices.
+- `BlockManager::read_checked_at_source_offset_shared` supports multi-block
+  section reads such as the top-level index without returning a payload `Vec`.
+- The focused test `shared_source_offset_read_reuses_owned_payload_bytes` proves
+  source-offset shared reads keep the decoded payload inside the full owned
+  block read buffer.
 - `TRINE_BENCH_RUNS=5 cargo bench --bench v1_bench` after the change reported
-  mixed/noisy cache-decode timing: random cached block read median 1741 us,
-  warm cached read median 1494 us, inline runtime block decode read median
-  8129 us, native runtime block decode read median 7958 us, and forced decode
-  diagnostic wall median 8873 us. The forced decode diagnostic storage
-  read-owned micros median was 566 us.
+  improved but still noisy rows: cold table read median 21586 us, cold table
+  read-only median 4447 us, random cached block read median 1541 us, warm
+  cached read median 1363 us, inline runtime block decode read median 7421 us,
+  native runtime block decode read median 7586 us, and forced decode diagnostic
+  wall median 7967 us.
 
 ## Known Residuals
 
 - Current end-to-end benchmark rows still did not prove a stable wall-time win
   from the structural copy removals.
 - `fast-lz4-block` still decodes into a new buffer.
-- Metadata and index block helpers still use the compatibility path that
-  returns a payload `Vec`.
 - Whole-object native storage APIs still return `Arc<[u8]>` in a few places
   outside the hot table data-block path.
+- Some `#[cfg(test)]` compatibility helpers still return payload `Vec`s for old
+  corruption tests.
 
 ## Next Recommendation
 
-- If continuing serialization/decode work, measure LZ4 decode allocation and
-  metadata/index compatibility payload `Vec` paths before changing them.
+- If continuing serialization/decode work, measure LZ4 decode allocation before
+  changing it.
 - Otherwise, move next to concurrent read/write and background maintenance.

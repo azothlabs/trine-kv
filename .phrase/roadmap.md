@@ -4509,7 +4509,31 @@ uses shared decoded block payload ranges.
   redesign, platform I/O backend changes, publishing, tagging, or pushing
   changes.
 
-### Phase 183: Concurrent Read/Write And Background Maintenance
+### Phase 183: Metadata And Index Shared Payload Decode
+
+**Status**: Complete
+
+**Goal**: Remove compatibility payload `Vec` copies from normal table metadata
+and index decode paths after Phase 182 establishes shared checked block bytes.
+
+**Entry Condition**: Phase 182 is complete and checked block reads can return a
+shared payload owner.
+
+**Acceptance Gate**:
+
+- Properties, top-level index, index partitions, filters, and range tombstones
+  decode from shared checked block payload slices on normal paths.
+- Full table verification decodes data blocks from shared checked blocks.
+- Focused block/table tests, persistent tests, full lib tests, all-feature
+  tests, strict clippy, and grouped benchmark evidence pass.
+- Remaining LZ4 decode allocation is recorded separately.
+
+**Major Out Of Scope**:
+
+- Storage format changes, LZ4 decode buffer reuse, platform I/O backend
+  changes, publishing, tagging, or pushing changes.
+
+### Phase 184: Concurrent Read/Write And Background Maintenance
 
 **Status**: Planned
 

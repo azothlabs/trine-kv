@@ -12376,3 +12376,62 @@ Negative check:
 - If continuing serialization/decode work, measure LZ4 decode allocation and
   metadata/index compatibility payload paths before changing them.
 - Otherwise, move next to concurrent read/write and background maintenance.
+
+## 2026-06-14: Metadata And Index Shared Payload Decode
+
+### Observation
+
+- Phase 182 removed the read-owned storage buffer copy, but normal table
+  metadata/index helpers still converted checked block payloads into
+  compatibility `Vec<u8>` values before decoding structures from `&[u8]`.
+- Properties, top-level index, index partitions, filters, range tombstones, and
+  full-table verification now decode from shared checked block payload slices.
+- `BlockManager::read_checked_at_source_offset_shared` supports multi-block
+  section reads such as the top-level index without returning a payload `Vec`.
+- The focused test `shared_source_offset_read_reuses_owned_payload_bytes` proves
+  source-offset shared reads keep the decoded payload inside the full owned
+  block read buffer.
+- After the change, `TRINE_BENCH_RUNS=5 cargo bench --bench v1_bench` reported:
+  - `cold table read`: 21586 us median.
+  - `cold table read-only`: 4447 us median.
+  - `block cache random block read`: 1541 us median.
+  - `block cache warm read`: 1363 us median.
+  - `inline runtime block decode read`: 7421 us median.
+  - `native runtime block decode read`: 7586 us median.
+  - `block decode forced diagnostic wall micros`: 7967 us median.
+  - `block decode forced diagnostic storage read owned micros`: 109 us median.
+
+### Interpretation
+
+- The retained change removes avoidable metadata/index payload `Vec` copies
+  from normal table decode paths without changing table format, compression
+  format, metadata validation, filters, point lookup behavior, full table
+  verification, or lazy value semantics.
+- The grouped benchmark run moved the relevant startup and cache/decode rows in
+  the right direction, but prior runs showed noise in this area. This should be
+  treated as supportive evidence for a copy reduction, not proof that all decode
+  latency is complete.
+- `fast-lz4-block` decode allocation remains the main serialization/decode
+  boundary still open.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q shared_source_offset_read_reuses_owned_payload_bytes --lib`
+- `cargo test -q table --lib`
+- `cargo test -q persistent --lib`
+- `cargo test -q --lib`
+- `cargo test -q --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `TRINE_BENCH_RUNS=5 cargo bench --bench v1_bench`
+
+### Remaining Blockers
+
+- None for normal metadata/index payload `Vec` removal.
+- LZ4 decode allocation and a few compatibility helpers remain open targets.
+
+### Recommended Next Action
+
+- If continuing serialization/decode work, measure LZ4 decode allocation before
+  changing it.
+- Otherwise, move next to concurrent read/write and background maintenance.

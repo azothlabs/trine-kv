@@ -123,6 +123,7 @@ impl BlockManager {
         Ok((block, codec, decoded))
     }
 
+    #[cfg(test)]
     pub(crate) fn read_checked_from_source(
         payload_len: usize,
         payload_base_offset: usize,
@@ -163,6 +164,7 @@ impl BlockManager {
         Self::decode_checked_owned(block_bytes)
     }
 
+    #[cfg(test)]
     pub(crate) fn read_checked_at_source_offset(
         payload_len: usize,
         payload_base_offset: usize,
@@ -194,6 +196,37 @@ impl BlockManager {
             },
             codec,
             decoded,
+        ))
+    }
+
+    pub(crate) fn read_checked_at_source_offset_shared(
+        payload_len: usize,
+        payload_base_offset: usize,
+        offset: usize,
+        source: &impl BlockReadSource,
+    ) -> Result<(BlockHandle, DecodedBlock)> {
+        if offset > payload_len {
+            return Err(invalid_table("block offset outside table payload"));
+        }
+        let source_offset = payload_base_offset
+            .checked_add(offset)
+            .ok_or_else(|| invalid_table("block file offset overflow"))?;
+        let header = source.read_exact_at_owned(source_offset, BLOCK_HEADER_LEN)?;
+        let len = checked_block_len(header.as_slice())?;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| invalid_table("block length overflow"))?;
+        if end > payload_len {
+            return Err(invalid_table("block outside table payload"));
+        }
+        let block_bytes = source.read_exact_at_owned(source_offset, len)?;
+        let decoded_block = Self::decode_checked_owned(block_bytes)?;
+        Ok((
+            BlockHandle {
+                offset: usize_to_u64(offset, "block offset")?,
+                len: usize_to_u64(len, "block length")?,
+            },
+            decoded_block,
         ))
     }
 
@@ -342,6 +375,7 @@ fn invalid_table(message: &'static str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     /// Slice-backed source that exercises the default (borrowed-fallback) owned
     /// read seam: it only implements the borrowed read, so `read_exact_at_owned`
@@ -361,6 +395,41 @@ mod tests {
                 .ok_or_else(|| invalid_table("read past end"))?;
             bytes.copy_from_slice(slice);
             Ok(())
+        }
+    }
+
+    struct RecordingOwnedSource<'a> {
+        bytes: &'a [u8],
+        full_payload_ptr: Cell<*const u8>,
+    }
+
+    impl BlockReadSource for RecordingOwnedSource<'_> {
+        fn read_exact_at(&self, offset: usize, bytes: &mut [u8]) -> Result<()> {
+            let end = offset
+                .checked_add(bytes.len())
+                .ok_or_else(|| invalid_table("read offset overflow"))?;
+            let slice = self
+                .bytes
+                .get(offset..end)
+                .ok_or_else(|| invalid_table("read past end"))?;
+            bytes.copy_from_slice(slice);
+            Ok(())
+        }
+
+        fn read_exact_at_owned(&self, offset: usize, len: usize) -> Result<StorageReadBuffer> {
+            let end = offset
+                .checked_add(len)
+                .ok_or_else(|| invalid_table("read offset overflow"))?;
+            let bytes = self
+                .bytes
+                .get(offset..end)
+                .ok_or_else(|| invalid_table("read past end"))?
+                .to_vec();
+            if len > BLOCK_HEADER_LEN {
+                self.full_payload_ptr
+                    .set(bytes.as_ptr().wrapping_add(BLOCK_HEADER_LEN));
+            }
+            Ok(StorageReadBuffer::from_vec(offset, bytes))
         }
     }
 
@@ -419,5 +488,27 @@ mod tests {
         assert_eq!(read_handle, handle);
         assert_eq!(codec, CodecId::None);
         assert_eq!(decoded, block_payload);
+    }
+
+    #[test]
+    fn shared_source_offset_read_reuses_owned_payload_bytes() {
+        let mut payload = Vec::new();
+        let block_payload = b"shared offset addressed block";
+        let handle = BlockManager::append_checked(&mut payload, CodecId::None, block_payload)
+            .expect("append block");
+        let source = RecordingOwnedSource {
+            bytes: &payload,
+            full_payload_ptr: Cell::new(std::ptr::null()),
+        };
+
+        let offset = usize::try_from(handle.offset).expect("offset fits usize");
+        let (read_handle, decoded) =
+            BlockManager::read_checked_at_source_offset_shared(payload.len(), 0, offset, &source)
+                .expect("read checked block at offset");
+
+        assert_eq!(read_handle, handle);
+        assert_eq!(decoded.codec(), CodecId::None);
+        assert_eq!(decoded.payload(), block_payload);
+        assert_eq!(decoded.payload().as_ptr(), source.full_payload_ptr.get());
     }
 }

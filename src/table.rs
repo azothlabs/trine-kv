@@ -1930,14 +1930,15 @@ impl Table {
                 message: "table range tombstones are not loaded".to_owned(),
             });
         };
-        let (codec, payload) = read_single_block_section_from_file(
+        let block = read_single_block_section_from_file_shared(
             path,
             self.file.as_deref(),
             self.payload_len,
             self.footer.range_tombstones,
         )?;
+        let codec = block.codec();
         validate_block_codec(codec, self.properties.codec, TableSection::RangeTombstones)?;
-        decode_range_tombstone_block(&payload)
+        decode_range_tombstone_block(block.payload())
     }
 
     async fn load_range_tombstones_async(&self) -> Result<Vec<TableRangeTombstone>> {
@@ -1946,15 +1947,16 @@ impl Table {
                 message: "table range tombstones are not loaded".to_owned(),
             });
         };
-        let (codec, payload) = read_single_block_section_from_file_async(
+        let block = read_single_block_section_from_file_shared_async(
             path,
             self.file.as_deref(),
             self.payload_len,
             self.footer.range_tombstones,
         )
         .await?;
+        let codec = block.codec();
         validate_block_codec(codec, self.properties.codec, TableSection::RangeTombstones)?;
-        decode_range_tombstone_block(&payload)
+        decode_range_tombstone_block(block.payload())
     }
 
     fn with_data_block_metadata<R>(
@@ -3844,15 +3846,17 @@ fn read_table_metadata_from_source(
     let footer = read_footer_from_source(source, payload_len)?;
     validate_footer_sections_by_len(payload_len, &footer)?;
 
-    let (properties_codec, properties_payload) =
-        read_single_block_section_from_source(source, payload_len, footer.properties)?;
-    let properties = decode_properties_block(&properties_payload)?;
+    let properties_block =
+        read_single_block_section_from_source_shared(source, payload_len, footer.properties)?;
+    let properties_codec = properties_block.codec();
+    let properties = decode_properties_block(properties_block.payload())?;
     validate_block_codec(properties_codec, properties.codec, TableSection::Properties)?;
 
-    let (top_level_block, index_codec, index_payload) =
-        read_first_block_in_section_from_source(source, payload_len, footer.indexes)?;
+    let (top_level_block, index_block) =
+        read_first_block_in_section_from_source_shared(source, payload_len, footer.indexes)?;
+    let index_codec = index_block.codec();
     validate_index_top_level_codec(index_codec, properties.codec)?;
-    let index_partitions = decode_index_top_level(&index_payload)?;
+    let index_partitions = decode_index_top_level(index_block.payload())?;
     let data_block_count =
         validate_index_top_level(top_level_block, &index_partitions, footer.indexes)?;
     let (point_key_filter, prefix_filter) =
@@ -4006,10 +4010,11 @@ fn read_pinned_table_filters(
         return Ok((None, None));
     }
 
-    let (filter_codec, filter_payload) =
-        read_single_block_section_from_source(source, payload_len, filter_section)?;
+    let filter_block =
+        read_single_block_section_from_source_shared(source, payload_len, filter_section)?;
+    let filter_codec = filter_block.codec();
     validate_block_codec(filter_codec, properties.codec, TableSection::Filters)?;
-    decode_filter_block(&filter_payload)
+    decode_filter_block(filter_block.payload())
 }
 
 fn read_pinned_index_partitions(
@@ -4045,9 +4050,10 @@ fn read_index_partition_from_source(
     expected_codec: CodecId,
     partition: &IndexPartitionEntry,
 ) -> Result<Vec<TableDataBlock>> {
-    let (codec, payload) = read_checked_block_from_source(source, payload_len, partition.block)?;
+    let block = read_checked_block_from_source_shared(source, payload_len, partition.block)?;
+    let codec = block.codec();
     validate_block_codec(codec, expected_codec, TableSection::Indexes)?;
-    let entries = decode_index_block(&payload)?;
+    let entries = decode_index_block(block.payload())?;
     validate_index_partition(partition, &entries, data_blocks_section)?;
     entries
         .into_iter()
@@ -4091,10 +4097,12 @@ async fn read_index_partition_from_storage_object_async(
     expected_codec: CodecId,
     partition: &IndexPartitionEntry,
 ) -> Result<Vec<TableDataBlock>> {
-    let (codec, payload) =
-        read_checked_block_from_storage_object_async(object, payload_len, partition.block).await?;
+    let block =
+        read_checked_block_from_storage_object_shared_async(object, payload_len, partition.block)
+            .await?;
+    let codec = block.codec();
     validate_block_codec(codec, expected_codec, TableSection::Indexes)?;
-    let entries = decode_index_block(&payload)?;
+    let entries = decode_index_block(block.payload())?;
     validate_index_partition(partition, &entries, data_blocks_section)?;
     entries
         .into_iter()
@@ -4426,15 +4434,17 @@ fn decode_table_from_storage_object(
     let footer = read_footer_from_source(&source, payload_len)?;
     validate_footer_sections_by_len(payload_len, &footer)?;
 
-    let (properties_codec, properties_payload) =
-        read_single_block_section_from_source(&source, payload_len, footer.properties)?;
-    let properties = decode_properties_block(&properties_payload)?;
+    let properties_block =
+        read_single_block_section_from_source_shared(&source, payload_len, footer.properties)?;
+    let properties_codec = properties_block.codec();
+    let properties = decode_properties_block(properties_block.payload())?;
     validate_block_codec(properties_codec, properties.codec, TableSection::Properties)?;
 
-    let (top_level_block, index_codec, index_payload) =
-        read_first_block_in_section_from_source(&source, payload_len, footer.indexes)?;
+    let (top_level_block, index_block) =
+        read_first_block_in_section_from_source_shared(&source, payload_len, footer.indexes)?;
+    let index_codec = index_block.codec();
     validate_index_top_level_codec(index_codec, properties.codec)?;
-    let index_partitions = decode_index_top_level(&index_payload)?;
+    let index_partitions = decode_index_top_level(index_block.payload())?;
     let data_block_count =
         validate_index_top_level(top_level_block, &index_partitions, footer.indexes)?;
 
@@ -4446,18 +4456,23 @@ fn decode_table_from_storage_object(
         footer.data_blocks,
     )?;
 
-    let (tombstone_codec, tombstone_payload) =
-        read_single_block_section_from_source(&source, payload_len, footer.range_tombstones)?;
+    let tombstone_block = read_single_block_section_from_source_shared(
+        &source,
+        payload_len,
+        footer.range_tombstones,
+    )?;
+    let tombstone_codec = tombstone_block.codec();
     validate_block_codec(
         tombstone_codec,
         properties.codec,
         TableSection::RangeTombstones,
     )?;
-    let range_tombstones = decode_range_tombstone_block(&tombstone_payload)?;
-    let (filter_codec, filter_payload) =
-        read_single_block_section_from_source(&source, payload_len, footer.filters)?;
+    let range_tombstones = decode_range_tombstone_block(tombstone_block.payload())?;
+    let filter_block =
+        read_single_block_section_from_source_shared(&source, payload_len, footer.filters)?;
+    let filter_codec = filter_block.codec();
     validate_block_codec(filter_codec, properties.codec, TableSection::Filters)?;
-    let (point_key_filter, prefix_filter) = decode_filter_block(&filter_payload)?;
+    let (point_key_filter, prefix_filter) = decode_filter_block(filter_block.payload())?;
     if properties
         != table_properties(
             properties.id,
@@ -4506,16 +4521,17 @@ fn decode_point_records_and_blocks_from_source(
     let mut point_records = Vec::new();
     let mut data_blocks = Vec::new();
     for partition in index_partitions {
-        let (index_codec, index_payload) =
-            read_checked_block_from_source(source, payload_len, partition.block)?;
+        let index_block =
+            read_checked_block_from_source_shared(source, payload_len, partition.block)?;
+        let index_codec = index_block.codec();
         validate_block_codec(index_codec, properties.codec, TableSection::Indexes)?;
-        let index_entries = decode_index_block(&index_payload)?;
+        let index_entries = decode_index_block(index_block.payload())?;
         validate_index_partition(partition, &index_entries, data_blocks_section)?;
         for entry in index_entries {
-            let (block_codec, block_payload) =
-                read_checked_block_from_source(source, payload_len, entry.block)?;
+            let block = read_checked_block_from_source_shared(source, payload_len, entry.block)?;
+            let block_codec = block.codec();
             validate_block_codec(block_codec, properties.codec, TableSection::DataBlocks)?;
-            let decoded_block = decode_data_block_for_verify(block_payload)?;
+            let decoded_block = decode_data_block_from_block(block, true)?;
             validate_decoded_data_block_entry(&entry, &decoded_block)?;
             validate_decoded_data_block_filters(&entry, &decoded_block)?;
             let block_records = decoded_block.records_owned()?;
@@ -4925,35 +4941,39 @@ fn read_first_block_in_section(
     Ok((block, codec, decoded))
 }
 
-fn read_single_block_section_from_file(
+fn read_single_block_section_from_file_shared(
     path: &Path,
     file: Option<&NativeFileObject>,
     payload_len: usize,
     section: SectionHandle,
-) -> Result<(CodecId, Vec<u8>)> {
+) -> Result<DecodedBlock> {
     let source = table_read_source(path, file);
-    read_single_block_section_from_source(&source, payload_len, section)
+    read_single_block_section_from_source_shared(&source, payload_len, section)
 }
 
-async fn read_single_block_section_from_file_async(
+async fn read_single_block_section_from_file_shared_async(
     path: &Path,
     file: Option<&NativeFileObject>,
     payload_len: usize,
     section: SectionHandle,
-) -> Result<(CodecId, Vec<u8>)> {
+) -> Result<DecodedBlock> {
     if let Some(file) = file {
-        return read_single_block_section_from_storage_object_async(file, payload_len, section)
-            .await;
+        return read_single_block_section_from_storage_object_shared_async(
+            file,
+            payload_len,
+            section,
+        )
+        .await;
     }
 
-    read_single_block_section_from_file(path, None, payload_len, section)
+    read_single_block_section_from_file_shared(path, None, payload_len, section)
 }
 
-fn read_single_block_section_from_source(
+fn read_single_block_section_from_source_shared(
     source: &impl BlockReadSource,
     payload_len: usize,
     section: SectionHandle,
-) -> Result<(CodecId, Vec<u8>)> {
+) -> Result<DecodedBlock> {
     if payload_len < FOOTER_LEN {
         return Err(invalid_table("short footer"));
     }
@@ -4976,14 +4996,14 @@ fn read_single_block_section_from_source(
             message: "section block length mismatch".to_owned(),
         });
     }
-    read_checked_block_from_source(source, payload_len, block)
+    read_checked_block_from_source_shared(source, payload_len, block)
 }
 
-async fn read_single_block_section_from_storage_object_async(
+async fn read_single_block_section_from_storage_object_shared_async(
     object: &impl StorageReadObject,
     payload_len: usize,
     section: SectionHandle,
-) -> Result<(CodecId, Vec<u8>)> {
+) -> Result<DecodedBlock> {
     if payload_len < FOOTER_LEN {
         return Err(invalid_table("short footer"));
     }
@@ -5006,14 +5026,14 @@ async fn read_single_block_section_from_storage_object_async(
             message: "section block length mismatch".to_owned(),
         });
     }
-    read_checked_block_from_storage_object_async(object, payload_len, block).await
+    read_checked_block_from_storage_object_shared_async(object, payload_len, block).await
 }
 
-fn read_first_block_in_section_from_source(
+fn read_first_block_in_section_from_source_shared(
     source: &impl BlockReadSource,
     payload_len: usize,
     section: SectionHandle,
-) -> Result<(BlockHandle, CodecId, Vec<u8>)> {
+) -> Result<(BlockHandle, DecodedBlock)> {
     if payload_len < FOOTER_LEN {
         return Err(invalid_table("short footer"));
     }
@@ -5026,15 +5046,15 @@ fn read_first_block_in_section_from_source(
             message: "table section layout is inconsistent".to_owned(),
         });
     }
-    let (block, codec, decoded) =
-        read_checked_block_at_source_offset(source, payload_len, section_start)?;
+    let (block, decoded_block) =
+        read_checked_block_at_source_offset_shared(source, payload_len, section_start)?;
     let (_, block_end) = block_bounds(block)?;
     if block_end > section_end {
         return Err(Error::Corruption {
             message: "section block length mismatch".to_owned(),
         });
     }
-    Ok((block, codec, decoded))
+    Ok((block, decoded_block))
 }
 
 #[cfg(test)]
@@ -5061,6 +5081,7 @@ fn read_checked_block_from_file(
     read_checked_block_from_source(&source, payload_len, block)
 }
 
+#[cfg(test)]
 fn read_checked_block_from_source(
     source: &impl BlockReadSource,
     payload_len: usize,
@@ -5077,12 +5098,12 @@ fn read_checked_block_from_source_shared(
     BlockManager::read_checked_from_source_shared(payload_len, HEADER_LEN, block, source)
 }
 
-fn read_checked_block_at_source_offset(
+fn read_checked_block_at_source_offset_shared(
     source: &impl BlockReadSource,
     payload_len: usize,
     offset: usize,
-) -> Result<(BlockHandle, CodecId, Vec<u8>)> {
-    BlockManager::read_checked_at_source_offset(payload_len, HEADER_LEN, offset, source)
+) -> Result<(BlockHandle, DecodedBlock)> {
+    BlockManager::read_checked_at_source_offset_shared(payload_len, HEADER_LEN, offset, source)
 }
 
 fn read_data_block_from_file(
@@ -5141,18 +5162,6 @@ async fn read_data_block_from_storage_object_async(
     validate_decoded_data_block_entry(entry, &decoded)?;
     validate_decoded_data_block_filters(entry, &decoded)?;
     Ok(decoded)
-}
-
-async fn read_checked_block_from_storage_object_async(
-    object: &impl StorageReadObject,
-    payload_len: usize,
-    block: BlockHandle,
-) -> Result<(CodecId, Vec<u8>)> {
-    let block =
-        read_checked_block_from_storage_object_shared_async(object, payload_len, block).await?;
-    let codec = block.codec();
-    let payload = block.payload().to_vec();
-    Ok((codec, payload))
 }
 
 async fn read_checked_block_from_storage_object_shared_async(
@@ -5335,6 +5344,7 @@ fn decode_data_block(bytes: Vec<u8>) -> Result<DecodedDataBlock> {
     decode_data_block_shared(bytes, 0..len, false)
 }
 
+#[cfg(test)]
 fn decode_data_block_for_verify(bytes: Vec<u8>) -> Result<DecodedDataBlock> {
     let len = bytes.len();
     let bytes = Bytes::from(bytes);
