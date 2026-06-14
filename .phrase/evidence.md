@@ -176,6 +176,51 @@ Record only evidence that can change planning or durable decisions.
 - Implement task826: add compaction rewrite-depth diagnostics before changing
   compaction policy.
 
+## 2026-06-14: Compaction Rewrite-Depth Diagnostics
+
+### Observation
+
+- Added per-level compaction stats to `DbStats`: input tables, output tables,
+  input bytes, and output bytes by LSM level.
+- Write-amplification benchmark diagnostics now emit total compaction rewritten
+  bytes and per-level input/output/rewritten byte rows.
+- The filtered local benchmark output for `write amp compaction diagnostic`
+  recorded 1 compaction run, 4 input tables, 1 output table, 35950 input bytes,
+  34931 output bytes, and 70881 rewritten bytes.
+- The same filtered output recorded level 0 as 4 input tables and 35950 input
+  bytes, and level 1 as 1 output table and 34931 output bytes.
+
+### Interpretation
+
+- Compaction rewrite cost is now visible by level before any guard-aware or
+  non-uniform compaction policy change.
+- The next compaction policy phase can compare whether local compaction or
+  non-uniform policies reduce rewritten bytes instead of only reducing table
+  count or read candidates.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo check -q --benches`
+- `cargo test -q compaction`
+- `cargo test -q blob_gc`
+- `cargo clippy -q --all-targets --all-features -- -D warnings`
+- `cargo test -q`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo bench --bench v1_bench`
+- `target/release/deps/v1_bench-25cc53c2c6358df4 | rg "write amp compaction diagnostic (compaction|level)"`
+- `git diff --check`
+
+### Remaining Blockers
+
+- None for Phase 187's diagnostics and first L0 point-read guard pruning slice.
+
+### Recommended Next Action
+
+- Start the next phase from the new evidence: evaluate guard-aware compaction
+  picker changes against per-level rewritten bytes and read-path candidate
+  counters.
+
 ## 2026-06-14: Point Batch And Negative Lookup Diagnostics
 
 ### Observation

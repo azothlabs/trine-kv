@@ -2,7 +2,7 @@
 
 ## Status
 
-Active
+Complete
 
 ## Goal
 
@@ -68,7 +68,7 @@ format change is allowed in the first slices.
 task823 [x] goal:add guard candidate diagnostics without behavior change | scope:src/lsm/version.rs src/lsm/read.rs src/stats.rs src/db.rs benches/v1_bench.rs | verify:cargo test -q get_many_sync + targeted benchmark diagnostics
 task824 [x] goal:record L0/overlap candidate depth for point/missing/get_many | scope:src/lsm/version.rs benches/v1_bench.rs | verify:diagnostics show candidate depth separate from filter/data-block counters
 task825 [x] goal:derive first in-memory guard index only if diagnostics prove avoidable L0/overlap probes | scope:src/lsm/version.rs src/lsm/read.rs | verify:point/missing/get_many counters improve without extra data-block reads
-task826 [ ] goal:add compaction rewrite-depth diagnostics before policy changes | scope:src/lsm/compact.rs src/db.rs benches/v1_bench.rs | verify:bench reports rewrite bytes and trigger reason by level
+task826 [x] goal:add compaction rewrite-depth diagnostics before policy changes | scope:src/lsm/compact.rs src/db.rs benches/v1_bench.rs | verify:bench reports rewrite bytes and trigger reason by level
 ```
 
 ## Evidence
@@ -101,6 +101,10 @@ task826 [ ] goal:add compaction rewrite-depth diagnostics before policy changes 
   probes and 0 extra L0 probes, and reduced the L0-stack batch-4 row to 512 L0
   table probes and 0 extra batch L0 probes. Block metadata probes and
   data-block reads stayed at 2048 for sequential and 512 for batch-4.
+- Task826 added per-level compaction input/output table and byte diagnostics,
+  plus rewritten-byte rows. The filtered benchmark row for `write amp
+  compaction diagnostic` recorded 35950 input bytes from level 0, 34931 output
+  bytes to level 1, and 70881 rewritten bytes total.
 
 ## Known Risks
 
@@ -115,5 +119,6 @@ task826 [ ] goal:add compaction rewrite-depth diagnostics before policy changes 
 
 ## Next Recommendation
 
-- Implement `task826`: add compaction rewrite-depth diagnostics before changing
+- Close Phase 187 diagnostics and first point-read guard pruning. The next
+  phase should use the new compaction level evidence before changing
   guard-aware or non-uniform compaction policy.

@@ -1348,6 +1348,18 @@ fn push_maintenance_write_amp_results(
             .saturating_sub(before.compaction_output_bytes),
     ));
     results.push(BenchResult::diagnostic(
+        labelled(label, "compaction rewritten bytes"),
+        after
+            .compaction_input_bytes
+            .saturating_sub(before.compaction_input_bytes)
+            .saturating_add(
+                after
+                    .compaction_output_bytes
+                    .saturating_sub(before.compaction_output_bytes),
+            ),
+    ));
+    push_compaction_level_diagnostics(results, label, before, after);
+    results.push(BenchResult::diagnostic(
         labelled(label, "blob GC runs"),
         after.blob_gc_runs.saturating_sub(before.blob_gc_runs),
     ));
@@ -1370,6 +1382,84 @@ fn push_maintenance_write_amp_results(
             .saturating_sub(before.blob_gc_discarded_bytes),
     ));
     diagnostics.push_results(results, label);
+}
+
+fn push_compaction_level_diagnostics(
+    results: &mut Vec<BenchResult>,
+    label: &'static str,
+    before: &trine_kv::DbStats,
+    after: &trine_kv::DbStats,
+) {
+    for level in &after.compaction_levels {
+        let before_level = before
+            .compaction_levels
+            .iter()
+            .find(|before_level| before_level.level == level.level);
+        let input_tables = level
+            .input_tables
+            .saturating_sub(before_level.map_or(0, |level| level.input_tables));
+        let output_tables = level
+            .output_tables
+            .saturating_sub(before_level.map_or(0, |level| level.output_tables));
+        let input_bytes = level
+            .input_bytes
+            .saturating_sub(before_level.map_or(0, |level| level.input_bytes));
+        let output_bytes = level
+            .output_bytes
+            .saturating_sub(before_level.map_or(0, |level| level.output_bytes));
+        if input_tables == 0 && output_tables == 0 && input_bytes == 0 && output_bytes == 0 {
+            continue;
+        }
+        push_compaction_level_rows(
+            results,
+            label,
+            CompactionLevelDiagnostic {
+                level: level.level,
+                input_tables,
+                output_tables,
+                input_bytes,
+                output_bytes,
+                rewritten_bytes: input_bytes.saturating_add(output_bytes),
+            },
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CompactionLevelDiagnostic {
+    level: u32,
+    input_tables: u64,
+    output_tables: u64,
+    input_bytes: u64,
+    output_bytes: u64,
+    rewritten_bytes: u64,
+}
+
+fn push_compaction_level_rows(
+    results: &mut Vec<BenchResult>,
+    label: &'static str,
+    diagnostic: CompactionLevelDiagnostic,
+) {
+    results.push(BenchResult::diagnostic(
+        labelled_level(label, diagnostic.level, "compaction input tables"),
+        diagnostic.input_tables,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled_level(label, diagnostic.level, "compaction output tables"),
+        diagnostic.output_tables,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled_level(label, diagnostic.level, "compaction input bytes"),
+        diagnostic.input_bytes,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled_level(label, diagnostic.level, "compaction output bytes"),
+        diagnostic.output_bytes,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled_level(label, diagnostic.level, "compaction rewritten bytes"),
+        diagnostic.rewritten_bytes,
+    ));
 }
 
 #[derive(Default)]
@@ -3700,4 +3790,8 @@ fn labelled(name: &'static str, label: &'static str) -> &'static str {
 
 fn labelled3(name: &'static str, first: &'static str, second: &'static str) -> &'static str {
     Box::leak(format!("{name} {first} {second}").into_boxed_str())
+}
+
+fn labelled_level(name: &'static str, level: u32, label: &'static str) -> &'static str {
+    Box::leak(format!("{name} level {level} {label}").into_boxed_str())
 }

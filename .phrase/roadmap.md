@@ -4610,7 +4610,7 @@ budget exhaustions.
 
 ### Phase 187: Guard-Aware LSM Read And Compaction Strategy
 
-**Status**: Active
+**Status**: Complete
 
 **Goal**: Use key-space guard diagnostics, then an in-memory guard index, to
 reduce unnecessary read candidates and prepare non-uniform compaction policy

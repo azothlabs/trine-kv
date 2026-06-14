@@ -34,7 +34,7 @@ use crate::{
     recovery,
     runtime::{self, CancellationToken, Runtime, RuntimeTask},
     snapshot::{Snapshot, SnapshotTracker},
-    stats::{BlobReadMetrics, DbStats, LevelStats},
+    stats::{BlobReadMetrics, CompactionLevelStats, DbStats, LevelStats},
     storage::{
         BlockingStorageDirectoryCreateBackend, BlockingStorageDirectoryListBackend,
         BlockingStorageDirectorySyncBackend, BlockingStorageObjectDeleteBackend,
@@ -235,6 +235,7 @@ pub(crate) struct DbInner {
     compaction_output_tables: AtomicU64,
     compaction_input_bytes: AtomicU64,
     compaction_output_bytes: AtomicU64,
+    compaction_level_stats: Mutex<BTreeMap<u32, CompactionLevelStats>>,
     blob_gc_runs: AtomicU64,
     blob_gc_input_bytes: AtomicU64,
     blob_gc_output_bytes: AtomicU64,
@@ -1148,6 +1149,7 @@ impl Db {
                 compaction_output_tables: AtomicU64::new(0),
                 compaction_input_bytes: AtomicU64::new(0),
                 compaction_output_bytes: AtomicU64::new(0),
+                compaction_level_stats: Mutex::new(BTreeMap::new()),
                 blob_gc_runs: AtomicU64::new(0),
                 blob_gc_input_bytes: AtomicU64::new(0),
                 blob_gc_output_bytes: AtomicU64::new(0),
@@ -1283,6 +1285,7 @@ impl Db {
                 compaction_output_tables: AtomicU64::new(0),
                 compaction_input_bytes: AtomicU64::new(0),
                 compaction_output_bytes: AtomicU64::new(0),
+                compaction_level_stats: Mutex::new(BTreeMap::new()),
                 blob_gc_runs: AtomicU64::new(0),
                 blob_gc_input_bytes: AtomicU64::new(0),
                 blob_gc_output_bytes: AtomicU64::new(0),
@@ -1387,6 +1390,7 @@ impl Db {
                 compaction_output_tables: AtomicU64::new(0),
                 compaction_input_bytes: AtomicU64::new(0),
                 compaction_output_bytes: AtomicU64::new(0),
+                compaction_level_stats: Mutex::new(BTreeMap::new()),
                 blob_gc_runs: AtomicU64::new(0),
                 blob_gc_input_bytes: AtomicU64::new(0),
                 blob_gc_output_bytes: AtomicU64::new(0),
@@ -1648,6 +1652,7 @@ impl Db {
                 compaction_output_tables: AtomicU64::new(0),
                 compaction_input_bytes: AtomicU64::new(0),
                 compaction_output_bytes: AtomicU64::new(0),
+                compaction_level_stats: Mutex::new(BTreeMap::new()),
                 blob_gc_runs: AtomicU64::new(0),
                 blob_gc_input_bytes: AtomicU64::new(0),
                 blob_gc_output_bytes: AtomicU64::new(0),
@@ -3616,6 +3621,7 @@ impl Db {
         let (blob_read_count, blob_read_bytes) = self.inner.blob_reads.snapshot();
         stats.blob_read_count = blob_read_count;
         stats.blob_read_bytes = blob_read_bytes;
+        self.add_compaction_level_stats(&mut stats);
         let cache_stats = self.inner.block_cache.stats();
         stats.block_cache_hits = cache_stats.hits;
         stats.block_cache_misses = cache_stats.misses;
@@ -3692,6 +3698,12 @@ impl Db {
         }
 
         stats
+    }
+
+    fn add_compaction_level_stats(&self, stats: &mut DbStats) {
+        if let Ok(compaction_levels) = self.inner.compaction_level_stats.lock() {
+            stats.compaction_levels = compaction_levels.values().cloned().collect();
+        }
     }
 
     fn add_wal_stats(&self, stats: &mut DbStats) {
@@ -5388,9 +5400,13 @@ impl Db {
                     .map(|table| table.properties().id)
             })
             .collect::<BTreeSet<_>>();
-        let input_table_ids_for_stats = compaction_inputs
+        let input_tables_for_stats = compaction_inputs
             .iter()
-            .flat_map(|input| input.input.input_table_ids.iter().copied())
+            .flat_map(|input| input.input.input_tables.iter().cloned())
+            .collect::<Vec<_>>();
+        let output_tables_for_stats = written_tables
+            .iter()
+            .flat_map(|output| output.output.tables.iter().cloned())
             .collect::<Vec<_>>();
         // A direct table move keeps the input file alive under the same id, so
         // cleanup must use only ids that disappeared from the published output.
@@ -5399,7 +5415,6 @@ impl Db {
             .flat_map(|input| input.input.input_table_ids.iter().copied())
             .filter(|table_id| !output_table_ids.contains(table_id))
             .collect::<Vec<_>>();
-        let output_table_ids_for_stats = output_table_ids.iter().copied().collect::<Vec<_>>();
         let obsolete_blob_ids =
             self.obsolete_blob_ids_for_compaction(&compaction_inputs, &written_tables)?;
 
@@ -5427,11 +5442,10 @@ impl Db {
         }
 
         self.install_compacted_tables(written_tables)?;
-        self.record_compaction_stats(
-            db_path,
+        self.record_compaction_stats_from_tables(
             compaction_inputs.len(),
-            &input_table_ids_for_stats,
-            &output_table_ids_for_stats,
+            &input_tables_for_stats,
+            &output_tables_for_stats,
         );
         self.retire_obsolete_table_files(db_path, &obsolete_table_ids)?;
         self.delete_pending_obsolete_blob_files(db_path)?;
@@ -7454,42 +7468,6 @@ impl Db {
         Ok(false)
     }
 
-    fn record_compaction_stats(
-        &self,
-        db_path: &Path,
-        runs: usize,
-        input_table_ids: &[table::TableId],
-        output_table_ids: &[table::TableId],
-    ) {
-        let input_bytes = input_table_ids
-            .iter()
-            .map(|table_id| table_file_bytes(&self.inner.native_storage, db_path, *table_id))
-            .sum::<u64>();
-        let output_bytes = output_table_ids
-            .iter()
-            .map(|table_id| table_file_bytes(&self.inner.native_storage, db_path, *table_id))
-            .sum::<u64>();
-
-        self.inner
-            .compaction_runs
-            .fetch_add(usize_to_u64_saturating(runs), Ordering::AcqRel);
-        self.inner.compaction_input_tables.fetch_add(
-            usize_to_u64_saturating(input_table_ids.len()),
-            Ordering::AcqRel,
-        );
-        self.inner.compaction_output_tables.fetch_add(
-            usize_to_u64_saturating(output_table_ids.len()),
-            Ordering::AcqRel,
-        );
-        self.inner
-            .compaction_input_bytes
-            .fetch_add(input_bytes, Ordering::AcqRel);
-        self.inner
-            .compaction_output_bytes
-            .fetch_add(output_bytes, Ordering::AcqRel);
-    }
-
-    // Used by the async (browser + object-store) compaction paths.
     fn record_compaction_stats_from_tables(
         &self,
         runs: usize,
@@ -7522,6 +7500,45 @@ impl Db {
         self.inner
             .compaction_output_bytes
             .fetch_add(output_bytes, Ordering::AcqRel);
+        self.record_compaction_level_stats(input_tables, output_tables);
+    }
+
+    fn record_compaction_level_stats(
+        &self,
+        input_tables: &[Arc<Table>],
+        output_tables: &[Arc<Table>],
+    ) {
+        let Ok(mut levels) = self.inner.compaction_level_stats.lock() else {
+            return;
+        };
+        for table in input_tables {
+            let properties = table.properties();
+            let entry =
+                levels
+                    .entry(properties.level.get())
+                    .or_insert_with(|| CompactionLevelStats {
+                        level: properties.level.get(),
+                        ..CompactionLevelStats::default()
+                    });
+            entry.input_tables = entry.input_tables.saturating_add(1);
+            entry.input_bytes = entry
+                .input_bytes
+                .saturating_add(table.estimated_file_bytes());
+        }
+        for table in output_tables {
+            let properties = table.properties();
+            let entry =
+                levels
+                    .entry(properties.level.get())
+                    .or_insert_with(|| CompactionLevelStats {
+                        level: properties.level.get(),
+                        ..CompactionLevelStats::default()
+                    });
+            entry.output_tables = entry.output_tables.saturating_add(1);
+            entry.output_bytes = entry
+                .output_bytes
+                .saturating_add(table.estimated_file_bytes());
+        }
     }
 }
 

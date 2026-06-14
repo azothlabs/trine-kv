@@ -55,6 +55,8 @@ pub struct DbStats {
     pub compaction_input_bytes: u64,
     /// Table bytes written by compaction.
     pub compaction_output_bytes: u64,
+    /// Per-level table and byte counts read and written by compaction.
+    pub compaction_levels: Vec<CompactionLevelStats>,
     /// Commit sequences allocated by writers.
     pub commit_sequences_allocated: u64,
     /// Highest commit sequence visible to readers.
@@ -461,6 +463,21 @@ pub struct LevelStats {
     pub tables: usize,
     /// Total bytes in the level's table files.
     pub bytes: u64,
+}
+
+/// Per-level table and byte totals read and written by compaction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompactionLevelStats {
+    /// LSM level number.
+    pub level: u32,
+    /// Number of input table files read from this level.
+    pub input_tables: u64,
+    /// Number of output table files written to this level.
+    pub output_tables: u64,
+    /// Input table bytes read from this level.
+    pub input_bytes: u64,
+    /// Output table bytes written to this level.
+    pub output_bytes: u64,
 }
 
 /// Filter counters for table-level and block-level filters.
