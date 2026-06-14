@@ -247,7 +247,6 @@ impl LsmTree {
             key,
             read_sequence,
         )?;
-        let memtable_range_tombstones = memtable_range_tombstones_in_snapshot(snapshot);
         let newest_candidate_sequence = Cell::new(
             candidate
                 .as_ref()
@@ -289,6 +288,7 @@ impl LsmTree {
 
         match internal_key.kind() {
             ValueKind::Put => {
+                let memtable_range_tombstones = memtable_range_tombstones_in_snapshot(snapshot);
                 let covered_by_memtable_tombstone = range_tombstones_cover(
                     &memtable_range_tombstones,
                     key,
@@ -411,6 +411,11 @@ impl LsmTree {
             },
         )?;
 
+        if candidates.iter().all(Option::is_none) {
+            let unique_values = vec![None; batch.unique_keys.len()];
+            return Ok(batch.scatter(&unique_values));
+        }
+
         let memtable_range_tombstones = memtable_range_tombstones_in_snapshot(snapshot);
         let mut unique_values = Vec::with_capacity(batch.unique_keys.len());
         for (key_index, candidate) in candidates.into_iter().enumerate() {
@@ -443,7 +448,6 @@ impl LsmTree {
             key,
             read_sequence,
         )?;
-        let memtable_range_tombstones = memtable_range_tombstones_in_snapshot(snapshot);
         let newest_candidate_sequence = Cell::new(
             candidate
                 .as_ref()
@@ -482,6 +486,7 @@ impl LsmTree {
 
         match internal_key.kind() {
             ValueKind::Put => {
+                let memtable_range_tombstones = memtable_range_tombstones_in_snapshot(snapshot);
                 let covered_by_memtable_tombstone = range_tombstones_cover(
                     &memtable_range_tombstones,
                     key,
@@ -619,6 +624,11 @@ impl LsmTree {
                         .map(|candidate| candidate.internal_key.sequence()),
                 );
             }
+        }
+
+        if candidates.iter().all(Option::is_none) {
+            let unique_values = vec![None; batch.unique_keys.len()];
+            return Ok(batch.scatter(&unique_values));
         }
 
         let memtable_range_tombstones = memtable_range_tombstones_in_snapshot(snapshot);
@@ -961,6 +971,16 @@ fn keep_newest_visible_memtable_point_candidate(
     let entries = memtable
         .read_entries()
         .map_err(|_| lock_poisoned("memtable entries"))?;
+    let Some((smallest, _)) = entries.first_key_value() else {
+        return Ok(());
+    };
+    let Some((largest, _)) = entries.last_key_value() else {
+        return Ok(());
+    };
+    if key < smallest.user_key() || key > largest.user_key() {
+        return Ok(());
+    }
+
     let start = Bound::Included(first_internal_key_for_user(key));
     let end = Bound::Included(last_internal_key_for_user(key));
 

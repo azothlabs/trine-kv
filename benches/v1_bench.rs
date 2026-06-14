@@ -423,7 +423,10 @@ fn bench_random_get() -> BenchResult {
 fn bench_missing_get() -> BenchResult {
     let db = populated_memory_db(ROWS);
     let bucket = db.default_bucket_sync().expect("bucket opens");
-    measure("missing get", OPS, || missing_get_checksum(&bucket, OPS))
+    let keys = missing_point_read_keys(OPS);
+    measure("missing get", OPS, || {
+        sequential_point_batch_checksum(&bucket, &keys)
+    })
 }
 
 fn bench_memory_sequential_point_batch() -> BenchResult {
@@ -690,8 +693,9 @@ fn bench_delta_backed_random_get() -> BenchResult {
 fn bench_delta_backed_missing_get() -> BenchResult {
     let db = populated_delta_memory_db(ROWS);
     let bucket = db.default_bucket_sync().expect("bucket opens");
+    let keys = missing_point_read_keys(OPS);
     measure("merged delta missing get", OPS, || {
-        missing_get_checksum(&bucket, OPS)
+        sequential_point_batch_checksum(&bucket, &keys)
     })
 }
 
@@ -3253,17 +3257,6 @@ fn random_get_checksum(bucket: &trine_kv::Bucket, rows: usize, ops: usize, mut s
         checksum += bucket
             .get_sync(&key(index))
             .expect("get succeeds")
-            .map_or(0, |value| value.len() as u64);
-    }
-    checksum
-}
-
-fn missing_get_checksum(bucket: &trine_kv::Bucket, ops: usize) -> u64 {
-    let mut checksum = 0;
-    for index in 0..ops {
-        checksum += bucket
-            .get_sync(format!("missing-{index:04}").as_bytes())
-            .expect("missing get succeeds")
             .map_or(0, |value| value.len() as u64);
     }
     checksum

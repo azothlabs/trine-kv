@@ -30,6 +30,15 @@ Record only evidence that can change planning or durable decisions.
 
 ### Observation
 
+- Follow-up negative lookup work moved `missing get` benchmark key generation
+  outside the measured closure, delayed memtable range-tombstone index
+  construction until a point candidate exists, returned all-missing unique
+  batches without building that index, and added a memtable first/last user-key
+  range check before BTree range lookup.
+- The local 3-run summary after the follow-up recorded `missing get` at 216 us
+  median, down from 719 us before the follow-up. It also recorded
+  `merged delta missing get` at 163 us, `missing batched point read persistent`
+  at 125 us, and `bounded missing batched point read persistent` at 221 us.
 - Existing `get_many` already grouped table reads by data block for localized
   point hits, but missing-key persistent batch diagnostics did not distinguish
   out-of-bounds keys from in-bounds filter misses.
@@ -59,6 +68,9 @@ Record only evidence that can change planning or durable decisions.
 - The retained optimization improves small all-unique `get_many` calls without
   weakening duplicate sharing, MVCC visibility, or table/block grouping for
   larger batches.
+- The negative lookup follow-up reduces CPU-side miss overhead before table
+  reads; persistent negative lookups still report 0 data block reads and 0
+  read-owned storage requests.
 
 ### Verification
 

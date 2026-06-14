@@ -47,6 +47,7 @@ high-signal batch/negative lookup bottleneck.
 task818 [x] goal:add persistent missing batch benchmark diagnostics | scope:benches/v1_bench.rs | verify:cargo check -q --benches + targeted bench rows
 task819 [x] goal:separate out-of-bounds miss from in-bounds filter miss diagnostics | scope:benches/v1_bench.rs | verify:cargo check -q --benches + targeted bench rows
 task820 [x] goal:measure read-path diagnostics and choose first retained optimization | scope:src/lsm src/table.rs benches/v1_bench.rs | verify:TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench
+task821 [x] goal:reduce missing get CPU overhead before table lookup | scope:src/lsm/read.rs benches/v1_bench.rs | verify:TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench
 ```
 
 ## Evidence
@@ -74,6 +75,20 @@ task820 [x] goal:measure read-path diagnostics and choose first retained optimiz
     before.
   - `localized batched point read persistent` median 1125 us and remains faster
     than localized sequential median 1348 us.
+- Negative lookup follow-up retained two more changes:
+  - Single-key and batch reads build the memtable range-tombstone index only
+    after a point candidate exists; all-missing unique batches scatter `None`
+    without building that index.
+  - Memtable point lookup checks the first and last user key before building
+    internal key bounds, so range-outside misses skip the BTree range search.
+- The `missing get` benchmark now prebuilds missing keys outside the measured
+  closure, so it measures database lookup rather than repeated benchmark string
+  formatting.
+- Three-run V1 benchmark evidence after the negative lookup follow-up:
+  - `missing get` median 216 us versus 719 us before this follow-up.
+  - `merged delta missing get` median 163 us.
+  - `missing batched point read persistent` median 125 us.
+  - `bounded missing batched point read persistent` median 221 us.
 
 ## Known Residuals
 
@@ -84,4 +99,4 @@ task820 [x] goal:measure read-path diagnostics and choose first retained optimiz
 
 ## Next Recommendation
 
-- Run the strict local gate and commit this read-path slice.
+- Run the strict local gate and commit this negative lookup slice.
