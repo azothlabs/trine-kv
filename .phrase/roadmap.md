@@ -4641,3 +4641,32 @@ structural optimization direction.
 - Persisted guard metadata, manifest/SSTable format changes, public API names,
   durability changes, platform I/O backend changes, publishing, tagging, or
   pushing changes.
+
+### Phase 188: Guard-Aware Compaction Policy
+
+**Status**: Active
+
+**Goal**: Use trigger-level and per-level compaction diagnostics to retain the
+first guard-aware compaction policy change only when it reduces local rewrite
+cost or read candidate depth without increasing lower-level churn unexpectedly.
+
+**Entry Condition**: Phase 187 completed L0 read-candidate pruning and
+per-level compaction rewritten-byte diagnostics.
+
+**Acceptance Gate**:
+
+- `DbStats` and benchmark diagnostics report compaction work by trigger reason.
+- Local-vs-broad compaction comparison rows show rewritten bytes by trigger and
+  by level before behavior changes.
+- Any retained picker change keeps manifest, WAL, SSTable, public API, and
+  recovery formats unchanged.
+- Compaction, blob reachability, recovery/reopen, MVCC, range-delete, and
+  targeted benchmark evidence pass.
+- Lower-level rewritten bytes and read-path candidate depth are compared before
+  claiming a policy improvement.
+
+**Major Out Of Scope**:
+
+- Persisted guard metadata, manifest/SSTable format changes, public API names,
+  durability changes, platform I/O backend changes, publishing, tagging, or
+  pushing changes.

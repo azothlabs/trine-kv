@@ -26,6 +26,54 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-06-14: Compaction Trigger Diagnostics
+
+### Observation
+
+- Added `CompactionTrigger` and per-trigger compaction stats to `DbStats`.
+- Compaction plans now carry the picker reason through `LsmCompactionInput`;
+  successful compactions aggregate runs, input/output tables, and input/output
+  bytes by trigger reason.
+- Benchmark write-amplification diagnostics now emit trigger rows alongside
+  total and per-level compaction rows.
+- The filtered local benchmark output for `write amp compaction diagnostic`
+  reported `trigger l0-overlap` with 1 run, 4 input tables, 1 output table,
+  35950 input bytes, 34931 output bytes, and 70881 rewritten bytes.
+- The same filtered output reported `trigger l0-overlap` rows for blob GC and
+  blob level merge compaction diagnostics, while replacement-table blob GC work
+  remains counted by the existing blob GC counters.
+
+### Interpretation
+
+- Compaction work can now be compared by picker reason before retaining
+  guard-aware or non-uniform compaction policy changes.
+- The next policy slice should add a local-vs-broad compaction comparison
+  workload, then change the picker only where trigger/per-level counters prove
+  avoidable rewrite or read-candidate cost.
+
+### Verification
+
+- `cargo fmt`
+- `cargo test -q compaction --lib`
+- `cargo test -q persistent_single_l0_compaction_moves_table_without_rewrite`
+- `cargo test -q persistent_stats_report_tables_blobs_and_compactions`
+- `cargo check -q --benches`
+- `cargo bench --bench v1_bench`
+- `target/release/deps/v1_bench-25cc53c2c6358df4 | rg "write amp compaction diagnostic trigger|write amp blob GC diagnostic trigger|write amp blob level merge diagnostic trigger"`
+- `cargo clippy -q --all-targets --all-features -- -D warnings`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test -q`
+- `git diff --check`
+
+### Remaining Blockers
+
+- No local-vs-broad compaction comparison workload exists yet.
+
+### Recommended Next Action
+
+- Implement task828: add the comparison workload before retaining any new
+  compaction-picker behavior.
+
 ## 2026-06-14: L0 Read Candidate Diagnostics
 
 ### Observation

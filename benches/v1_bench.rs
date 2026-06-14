@@ -9,9 +9,9 @@ use std::{
 };
 
 use trine_kv::{
-    BlobGcRatio, BlobLevelMergePolicy, BucketOptions, Db, DbOptions, DurabilityMode, FilterPolicy,
-    IndexSearchPolicy, KeyRange, PrefixExtractor, PrefixFilterPolicy, RuntimeOptions,
-    TransactionOptions, WriteBatch, WriteOptions, search,
+    BlobGcRatio, BlobLevelMergePolicy, BucketOptions, CompactionTrigger, Db, DbOptions,
+    DurabilityMode, FilterPolicy, IndexSearchPolicy, KeyRange, PrefixExtractor, PrefixFilterPolicy,
+    RuntimeOptions, TransactionOptions, WriteBatch, WriteOptions, search,
 };
 
 const ROWS: usize = 1_024;
@@ -1359,6 +1359,7 @@ fn push_maintenance_write_amp_results(
             ),
     ));
     push_compaction_level_diagnostics(results, label, before, after);
+    push_compaction_trigger_diagnostics(results, label, before, after);
     results.push(BenchResult::diagnostic(
         labelled(label, "blob GC runs"),
         after.blob_gc_runs.saturating_sub(before.blob_gc_runs),
@@ -1423,6 +1424,93 @@ fn push_compaction_level_diagnostics(
             },
         );
     }
+}
+
+fn push_compaction_trigger_diagnostics(
+    results: &mut Vec<BenchResult>,
+    label: &'static str,
+    before: &trine_kv::DbStats,
+    after: &trine_kv::DbStats,
+) {
+    for trigger in &after.compaction_triggers {
+        let before_trigger = before
+            .compaction_triggers
+            .iter()
+            .find(|before_trigger| before_trigger.trigger == trigger.trigger);
+        let runs = trigger
+            .runs
+            .saturating_sub(before_trigger.map_or(0, |trigger| trigger.runs));
+        let input_tables = trigger
+            .input_tables
+            .saturating_sub(before_trigger.map_or(0, |trigger| trigger.input_tables));
+        let output_tables = trigger
+            .output_tables
+            .saturating_sub(before_trigger.map_or(0, |trigger| trigger.output_tables));
+        let input_bytes = trigger
+            .input_bytes
+            .saturating_sub(before_trigger.map_or(0, |trigger| trigger.input_bytes));
+        let output_bytes = trigger
+            .output_bytes
+            .saturating_sub(before_trigger.map_or(0, |trigger| trigger.output_bytes));
+        if runs == 0 && input_tables == 0 && output_tables == 0 {
+            continue;
+        }
+        push_compaction_trigger_rows(
+            results,
+            label,
+            CompactionTriggerDiagnostic {
+                trigger: trigger.trigger,
+                runs,
+                input_tables,
+                output_tables,
+                input_bytes,
+                output_bytes,
+                rewritten_bytes: input_bytes.saturating_add(output_bytes),
+            },
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CompactionTriggerDiagnostic {
+    trigger: CompactionTrigger,
+    runs: u64,
+    input_tables: u64,
+    output_tables: u64,
+    input_bytes: u64,
+    output_bytes: u64,
+    rewritten_bytes: u64,
+}
+
+fn push_compaction_trigger_rows(
+    results: &mut Vec<BenchResult>,
+    label: &'static str,
+    diagnostic: CompactionTriggerDiagnostic,
+) {
+    results.push(BenchResult::diagnostic(
+        labelled_trigger(label, diagnostic.trigger, "compaction runs"),
+        diagnostic.runs,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled_trigger(label, diagnostic.trigger, "compaction input tables"),
+        diagnostic.input_tables,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled_trigger(label, diagnostic.trigger, "compaction output tables"),
+        diagnostic.output_tables,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled_trigger(label, diagnostic.trigger, "compaction input bytes"),
+        diagnostic.input_bytes,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled_trigger(label, diagnostic.trigger, "compaction output bytes"),
+        diagnostic.output_bytes,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled_trigger(label, diagnostic.trigger, "compaction rewritten bytes"),
+        diagnostic.rewritten_bytes,
+    ));
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3794,4 +3882,26 @@ fn labelled3(name: &'static str, first: &'static str, second: &'static str) -> &
 
 fn labelled_level(name: &'static str, level: u32, label: &'static str) -> &'static str {
     Box::leak(format!("{name} level {level} {label}").into_boxed_str())
+}
+
+fn labelled_trigger(
+    name: &'static str,
+    trigger: CompactionTrigger,
+    label: &'static str,
+) -> &'static str {
+    Box::leak(
+        format!(
+            "{name} trigger {} {label}",
+            compaction_trigger_label(trigger)
+        )
+        .into_boxed_str(),
+    )
+}
+
+const fn compaction_trigger_label(trigger: CompactionTrigger) -> &'static str {
+    match trigger {
+        CompactionTrigger::L0Overlap => "l0-overlap",
+        CompactionTrigger::LevelSize => "level-size",
+        CompactionTrigger::MultiTableLevel => "multi-table-level",
+    }
 }

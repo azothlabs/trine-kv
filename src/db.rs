@@ -34,7 +34,10 @@ use crate::{
     recovery,
     runtime::{self, CancellationToken, Runtime, RuntimeTask},
     snapshot::{Snapshot, SnapshotTracker},
-    stats::{BlobReadMetrics, CompactionLevelStats, DbStats, LevelStats},
+    stats::{
+        BlobReadMetrics, CompactionLevelStats, CompactionTrigger, CompactionTriggerStats, DbStats,
+        LevelStats,
+    },
     storage::{
         BlockingStorageDirectoryCreateBackend, BlockingStorageDirectoryListBackend,
         BlockingStorageDirectorySyncBackend, BlockingStorageObjectDeleteBackend,
@@ -236,6 +239,7 @@ pub(crate) struct DbInner {
     compaction_input_bytes: AtomicU64,
     compaction_output_bytes: AtomicU64,
     compaction_level_stats: Mutex<BTreeMap<u32, CompactionLevelStats>>,
+    compaction_trigger_stats: Mutex<BTreeMap<CompactionTrigger, CompactionTriggerStats>>,
     blob_gc_runs: AtomicU64,
     blob_gc_input_bytes: AtomicU64,
     blob_gc_output_bytes: AtomicU64,
@@ -476,6 +480,7 @@ struct NamedCompactionInput {
 
 struct NamedCompactionOutput {
     bucket: String,
+    trigger: Option<CompactionTrigger>,
     output: LsmCompactionOutput,
 }
 
@@ -1150,6 +1155,7 @@ impl Db {
                 compaction_input_bytes: AtomicU64::new(0),
                 compaction_output_bytes: AtomicU64::new(0),
                 compaction_level_stats: Mutex::new(BTreeMap::new()),
+                compaction_trigger_stats: Mutex::new(BTreeMap::new()),
                 blob_gc_runs: AtomicU64::new(0),
                 blob_gc_input_bytes: AtomicU64::new(0),
                 blob_gc_output_bytes: AtomicU64::new(0),
@@ -1286,6 +1292,7 @@ impl Db {
                 compaction_input_bytes: AtomicU64::new(0),
                 compaction_output_bytes: AtomicU64::new(0),
                 compaction_level_stats: Mutex::new(BTreeMap::new()),
+                compaction_trigger_stats: Mutex::new(BTreeMap::new()),
                 blob_gc_runs: AtomicU64::new(0),
                 blob_gc_input_bytes: AtomicU64::new(0),
                 blob_gc_output_bytes: AtomicU64::new(0),
@@ -1391,6 +1398,7 @@ impl Db {
                 compaction_input_bytes: AtomicU64::new(0),
                 compaction_output_bytes: AtomicU64::new(0),
                 compaction_level_stats: Mutex::new(BTreeMap::new()),
+                compaction_trigger_stats: Mutex::new(BTreeMap::new()),
                 blob_gc_runs: AtomicU64::new(0),
                 blob_gc_input_bytes: AtomicU64::new(0),
                 blob_gc_output_bytes: AtomicU64::new(0),
@@ -1653,6 +1661,7 @@ impl Db {
                 compaction_input_bytes: AtomicU64::new(0),
                 compaction_output_bytes: AtomicU64::new(0),
                 compaction_level_stats: Mutex::new(BTreeMap::new()),
+                compaction_trigger_stats: Mutex::new(BTreeMap::new()),
                 blob_gc_runs: AtomicU64::new(0),
                 blob_gc_input_bytes: AtomicU64::new(0),
                 blob_gc_output_bytes: AtomicU64::new(0),
@@ -2739,6 +2748,7 @@ impl Db {
             .iter()
             .flat_map(|input| input.input.input_tables.iter().cloned())
             .collect::<Vec<_>>();
+        let trigger_stats = compaction_trigger_stat_deltas(&compaction_inputs, &written_tables);
         let obsolete_blob_ids =
             self.obsolete_blob_ids_for_compaction(&compaction_inputs, &written_tables)?;
 
@@ -2784,6 +2794,7 @@ impl Db {
             compaction_inputs.len(),
             &input_tables,
             &output_tables,
+            &trigger_stats,
         );
         // The replaced input table objects and obsolete blob objects are now
         // unreferenced by the manifest; orphan GC reclaims them snapshot-safely.
@@ -2818,6 +2829,7 @@ impl Db {
             if input.input.trivial_move && !force_rewrite_trivial {
                 outputs.push(NamedCompactionOutput {
                     bucket: input.bucket.clone(),
+                    trigger: Some(input.input.trigger),
                     output: LsmCompactionOutput {
                         input_table_ids: input.input.input_table_ids.clone(),
                         tables: vec![input.input.moved_table()?],
@@ -2861,6 +2873,7 @@ impl Db {
             }
             outputs.push(NamedCompactionOutput {
                 bucket: input.bucket.clone(),
+                trigger: Some(input.input.trigger),
                 output: LsmCompactionOutput {
                     input_table_ids: input.input.input_table_ids.clone(),
                     tables: output_tables,
@@ -3591,37 +3604,14 @@ impl Db {
     /// Returns a point-in-time copy of live database statistics.
     #[must_use]
     pub fn stats(&self) -> DbStats {
-        let mut stats = DbStats {
-            active_snapshots: self.inner.snapshots.active_count(),
-            compaction_runs: self.inner.compaction_runs.load(Ordering::Acquire),
-            compaction_input_tables: self.inner.compaction_input_tables.load(Ordering::Acquire),
-            compaction_output_tables: self.inner.compaction_output_tables.load(Ordering::Acquire),
-            compaction_input_bytes: self.inner.compaction_input_bytes.load(Ordering::Acquire),
-            compaction_output_bytes: self.inner.compaction_output_bytes.load(Ordering::Acquire),
-            commit_sequences_allocated: self.inner.commit_tracker.last_reserved_sequence().get(),
-            commit_visible_sequence: self.inner.commit_tracker.visible_sequence().get(),
-            commit_open_slots: self.inner.commit_tracker.open_slot_count(),
-            commit_skipped_slots: self.inner.commit_tracker.skipped_slot_count(),
-            blob_gc_runs: self.inner.blob_gc_runs.load(Ordering::Acquire),
-            blob_gc_input_bytes: self.inner.blob_gc_input_bytes.load(Ordering::Acquire),
-            blob_gc_output_bytes: self.inner.blob_gc_output_bytes.load(Ordering::Acquire),
-            blob_gc_discarded_bytes: self.inner.blob_gc_discarded_bytes.load(Ordering::Acquire),
-            maintenance_cooperative_yields: self
-                .inner
-                .maintenance_cooperative_yields
-                .load(Ordering::Acquire),
-            maintenance_budget_exhaustions: self
-                .inner
-                .maintenance_budget_exhaustions
-                .load(Ordering::Acquire),
-            ..DbStats::default()
-        };
+        let mut stats = self.base_stats();
         self.add_wal_stats(&mut stats);
         self.add_storage_runtime_stats(&mut stats);
         let (blob_read_count, blob_read_bytes) = self.inner.blob_reads.snapshot();
         stats.blob_read_count = blob_read_count;
         stats.blob_read_bytes = blob_read_bytes;
         self.add_compaction_level_stats(&mut stats);
+        self.add_compaction_trigger_stats(&mut stats);
         let cache_stats = self.inner.block_cache.stats();
         stats.block_cache_hits = cache_stats.hits;
         stats.block_cache_misses = cache_stats.misses;
@@ -3700,9 +3690,43 @@ impl Db {
         stats
     }
 
+    fn base_stats(&self) -> DbStats {
+        DbStats {
+            active_snapshots: self.inner.snapshots.active_count(),
+            compaction_runs: self.inner.compaction_runs.load(Ordering::Acquire),
+            compaction_input_tables: self.inner.compaction_input_tables.load(Ordering::Acquire),
+            compaction_output_tables: self.inner.compaction_output_tables.load(Ordering::Acquire),
+            compaction_input_bytes: self.inner.compaction_input_bytes.load(Ordering::Acquire),
+            compaction_output_bytes: self.inner.compaction_output_bytes.load(Ordering::Acquire),
+            commit_sequences_allocated: self.inner.commit_tracker.last_reserved_sequence().get(),
+            commit_visible_sequence: self.inner.commit_tracker.visible_sequence().get(),
+            commit_open_slots: self.inner.commit_tracker.open_slot_count(),
+            commit_skipped_slots: self.inner.commit_tracker.skipped_slot_count(),
+            blob_gc_runs: self.inner.blob_gc_runs.load(Ordering::Acquire),
+            blob_gc_input_bytes: self.inner.blob_gc_input_bytes.load(Ordering::Acquire),
+            blob_gc_output_bytes: self.inner.blob_gc_output_bytes.load(Ordering::Acquire),
+            blob_gc_discarded_bytes: self.inner.blob_gc_discarded_bytes.load(Ordering::Acquire),
+            maintenance_cooperative_yields: self
+                .inner
+                .maintenance_cooperative_yields
+                .load(Ordering::Acquire),
+            maintenance_budget_exhaustions: self
+                .inner
+                .maintenance_budget_exhaustions
+                .load(Ordering::Acquire),
+            ..DbStats::default()
+        }
+    }
+
     fn add_compaction_level_stats(&self, stats: &mut DbStats) {
         if let Ok(compaction_levels) = self.inner.compaction_level_stats.lock() {
             stats.compaction_levels = compaction_levels.values().cloned().collect();
+        }
+    }
+
+    fn add_compaction_trigger_stats(&self, stats: &mut DbStats) {
+        if let Ok(compaction_triggers) = self.inner.compaction_trigger_stats.lock() {
+            stats.compaction_triggers = compaction_triggers.values().cloned().collect();
         }
     }
 
@@ -5390,16 +5414,7 @@ impl Db {
             written_table_ids,
         } = self.build_compaction_outputs(db_path, oldest_active_snapshot, &compaction_inputs)?;
 
-        let output_table_ids = written_tables
-            .iter()
-            .flat_map(|output| {
-                output
-                    .output
-                    .tables
-                    .iter()
-                    .map(|table| table.properties().id)
-            })
-            .collect::<BTreeSet<_>>();
+        let output_table_ids = compaction_output_table_ids(&written_tables);
         let input_tables_for_stats = compaction_inputs
             .iter()
             .flat_map(|input| input.input.input_tables.iter().cloned())
@@ -5408,6 +5423,7 @@ impl Db {
             .iter()
             .flat_map(|output| output.output.tables.iter().cloned())
             .collect::<Vec<_>>();
+        let trigger_stats = compaction_trigger_stat_deltas(&compaction_inputs, &written_tables);
         // A direct table move keeps the input file alive under the same id, so
         // cleanup must use only ids that disappeared from the published output.
         let obsolete_table_ids = compaction_inputs
@@ -5446,6 +5462,7 @@ impl Db {
             compaction_inputs.len(),
             &input_tables_for_stats,
             &output_tables_for_stats,
+            &trigger_stats,
         );
         self.retire_obsolete_table_files(db_path, &obsolete_table_ids)?;
         self.delete_pending_obsolete_blob_files(db_path)?;
@@ -5555,6 +5572,7 @@ impl Db {
             .iter()
             .flat_map(|input| input.input.input_tables.iter().cloned())
             .collect::<Vec<_>>();
+        let trigger_stats = compaction_trigger_stat_deltas(&compaction_inputs, &written_tables);
         let output_table_ids = output_tables
             .iter()
             .map(|table| table.properties().id)
@@ -5596,6 +5614,7 @@ impl Db {
             compaction_inputs.len(),
             &input_tables,
             &output_tables,
+            &trigger_stats,
         );
         self.retire_obsolete_table_files_native_async(db_path, &obsolete_table_ids)
             .await?;
@@ -5676,6 +5695,7 @@ impl Db {
             .iter()
             .flat_map(|input| input.input.input_tables.iter().cloned())
             .collect::<Vec<_>>();
+        let trigger_stats = compaction_trigger_stat_deltas(&compaction_inputs, &written_tables);
         let output_table_ids = output_tables
             .iter()
             .map(|table| table.properties().id)
@@ -5712,6 +5732,7 @@ impl Db {
             compaction_inputs.len(),
             &input_tables,
             &output_tables,
+            &trigger_stats,
         );
         self.retire_obsolete_table_files_browser_async(db_path, &obsolete_table_ids)
             .await?;
@@ -5748,6 +5769,7 @@ impl Db {
             if input.input.trivial_move && !force_rewrite_trivial {
                 outputs.push(NamedCompactionOutput {
                     bucket: input.bucket.clone(),
+                    trigger: Some(input.input.trigger),
                     output: LsmCompactionOutput {
                         input_table_ids: input.input.input_table_ids.clone(),
                         tables: vec![input.input.moved_table()?],
@@ -5819,6 +5841,7 @@ impl Db {
             }
             outputs.push(NamedCompactionOutput {
                 bucket: input.bucket.clone(),
+                trigger: Some(input.input.trigger),
                 output: LsmCompactionOutput {
                     input_table_ids: input.input.input_table_ids.clone(),
                     tables: output_tables,
@@ -5850,6 +5873,7 @@ impl Db {
             if input.input.trivial_move && !force_rewrite_trivial {
                 outputs.push(NamedCompactionOutput {
                     bucket: input.bucket.clone(),
+                    trigger: Some(input.input.trigger),
                     output: LsmCompactionOutput {
                         input_table_ids: input.input.input_table_ids.clone(),
                         tables: vec![input.input.moved_table()?],
@@ -5913,6 +5937,7 @@ impl Db {
             }
             outputs.push(NamedCompactionOutput {
                 bucket: input.bucket.clone(),
+                trigger: Some(input.input.trigger),
                 output: LsmCompactionOutput {
                     input_table_ids: input.input.input_table_ids.clone(),
                     tables: output_tables,
@@ -5944,6 +5969,7 @@ impl Db {
             if input.input.trivial_move && !force_rewrite_trivial {
                 outputs.push(NamedCompactionOutput {
                     bucket: input.bucket.clone(),
+                    trigger: Some(input.input.trigger),
                     output: LsmCompactionOutput {
                         input_table_ids: input.input.input_table_ids.clone(),
                         tables: vec![input.input.moved_table()?],
@@ -6012,6 +6038,7 @@ impl Db {
             }
             outputs.push(NamedCompactionOutput {
                 bucket: input.bucket.clone(),
+                trigger: Some(input.input.trigger),
                 output: LsmCompactionOutput {
                     input_table_ids: input.input.input_table_ids.clone(),
                     tables: output_tables,
@@ -6788,6 +6815,7 @@ impl Db {
 
             outputs.push(NamedCompactionOutput {
                 bucket: rewrite_table.bucket,
+                trigger: None,
                 output: LsmCompactionOutput {
                     input_table_ids: vec![rewrite_table.input_table_id],
                     tables: vec![table],
@@ -6829,6 +6857,7 @@ impl Db {
 
             outputs.push(NamedCompactionOutput {
                 bucket: rewrite_table.bucket,
+                trigger: None,
                 output: LsmCompactionOutput {
                     input_table_ids: vec![rewrite_table.input_table_id],
                     tables: vec![table],
@@ -7473,6 +7502,7 @@ impl Db {
         runs: usize,
         input_tables: &[Arc<Table>],
         output_tables: &[Arc<Table>],
+        trigger_stats: &[CompactionTriggerStats],
     ) {
         let input_bytes = input_tables
             .iter()
@@ -7501,6 +7531,7 @@ impl Db {
             .compaction_output_bytes
             .fetch_add(output_bytes, Ordering::AcqRel);
         self.record_compaction_level_stats(input_tables, output_tables);
+        self.record_compaction_trigger_stats(trigger_stats);
     }
 
     fn record_compaction_level_stats(
@@ -7539,6 +7570,97 @@ impl Db {
                 .output_bytes
                 .saturating_add(table.estimated_file_bytes());
         }
+    }
+
+    fn record_compaction_trigger_stats(&self, deltas: &[CompactionTriggerStats]) {
+        let Ok(mut triggers) = self.inner.compaction_trigger_stats.lock() else {
+            return;
+        };
+        for delta in deltas {
+            let entry = triggers
+                .entry(delta.trigger)
+                .or_insert_with(|| CompactionTriggerStats {
+                    trigger: delta.trigger,
+                    runs: 0,
+                    input_tables: 0,
+                    output_tables: 0,
+                    input_bytes: 0,
+                    output_bytes: 0,
+                });
+            entry.runs = entry.runs.saturating_add(delta.runs);
+            entry.input_tables = entry.input_tables.saturating_add(delta.input_tables);
+            entry.output_tables = entry.output_tables.saturating_add(delta.output_tables);
+            entry.input_bytes = entry.input_bytes.saturating_add(delta.input_bytes);
+            entry.output_bytes = entry.output_bytes.saturating_add(delta.output_bytes);
+        }
+    }
+}
+
+fn compaction_trigger_stat_deltas(
+    inputs: &[NamedCompactionInput],
+    outputs: &[NamedCompactionOutput],
+) -> Vec<CompactionTriggerStats> {
+    let mut triggers = BTreeMap::<CompactionTrigger, CompactionTriggerStats>::new();
+    for input in inputs {
+        let entry = triggers
+            .entry(input.input.trigger)
+            .or_insert_with(|| empty_compaction_trigger_stats(input.input.trigger));
+        entry.runs = entry.runs.saturating_add(1);
+        entry.input_tables = entry
+            .input_tables
+            .saturating_add(usize_to_u64_saturating(input.input.input_tables.len()));
+        entry.input_bytes = entry.input_bytes.saturating_add(
+            input
+                .input
+                .input_tables
+                .iter()
+                .map(|table| table.estimated_file_bytes())
+                .sum::<u64>(),
+        );
+    }
+    for output in outputs {
+        let Some(trigger) = output.trigger else {
+            continue;
+        };
+        let entry = triggers
+            .entry(trigger)
+            .or_insert_with(|| empty_compaction_trigger_stats(trigger));
+        entry.output_tables = entry
+            .output_tables
+            .saturating_add(usize_to_u64_saturating(output.output.tables.len()));
+        entry.output_bytes = entry.output_bytes.saturating_add(
+            output
+                .output
+                .tables
+                .iter()
+                .map(|table| table.estimated_file_bytes())
+                .sum::<u64>(),
+        );
+    }
+    triggers.into_values().collect()
+}
+
+fn compaction_output_table_ids(outputs: &[NamedCompactionOutput]) -> BTreeSet<table::TableId> {
+    outputs
+        .iter()
+        .flat_map(|output| {
+            output
+                .output
+                .tables
+                .iter()
+                .map(|table| table.properties().id)
+        })
+        .collect()
+}
+
+const fn empty_compaction_trigger_stats(trigger: CompactionTrigger) -> CompactionTriggerStats {
+    CompactionTriggerStats {
+        trigger,
+        runs: 0,
+        input_tables: 0,
+        output_tables: 0,
+        input_bytes: 0,
+        output_bytes: 0,
     }
 }
 
@@ -8974,6 +9096,7 @@ fn write_blob_gc_replacement_tables(
 
         outputs.push(NamedCompactionOutput {
             bucket: rewrite_table.bucket,
+            trigger: None,
             output: LsmCompactionOutput {
                 input_table_ids: vec![rewrite_table.input_table_id],
                 tables: vec![table],

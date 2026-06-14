@@ -57,6 +57,8 @@ pub struct DbStats {
     pub compaction_output_bytes: u64,
     /// Per-level table and byte counts read and written by compaction.
     pub compaction_levels: Vec<CompactionLevelStats>,
+    /// Per-trigger table and byte counts read and written by compaction.
+    pub compaction_triggers: Vec<CompactionTriggerStats>,
     /// Commit sequences allocated by writers.
     pub commit_sequences_allocated: u64,
     /// Highest commit sequence visible to readers.
@@ -477,6 +479,36 @@ pub struct CompactionLevelStats {
     /// Input table bytes read from this level.
     pub input_bytes: u64,
     /// Output table bytes written to this level.
+    pub output_bytes: u64,
+}
+
+/// Reason the compaction picker selected a compaction input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CompactionTrigger {
+    /// Level-0 tables overlapped each other or the next level and needed to be
+    /// closed into a safe output range.
+    L0Overlap,
+    /// A non-level-0 table level was above its configured byte target.
+    LevelSize,
+    /// No higher-priority trigger existed, but a shallow non-level-0 level had
+    /// multiple tables in the requested range that could be merged downward.
+    MultiTableLevel,
+}
+
+/// Per-trigger table and byte totals read and written by compaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionTriggerStats {
+    /// Picker reason shared by the compaction inputs counted in this row.
+    pub trigger: CompactionTrigger,
+    /// Number of compaction inputs selected for this reason.
+    pub runs: u64,
+    /// Number of input table files read for this reason.
+    pub input_tables: u64,
+    /// Number of output table files written for this reason.
+    pub output_tables: u64,
+    /// Input table bytes read for this reason.
+    pub input_bytes: u64,
+    /// Output table bytes written for this reason.
     pub output_bytes: u64,
 }
 

@@ -8,10 +8,10 @@ use std::{
 };
 
 use trine_kv::{
-    BlobGcRatio, BlobLevelMergePolicy, BucketOptions, CompressionProfile, Db, DbOptions,
-    DurabilityMode, Error, FailOnCorruptionPolicy, FilterPolicy, IndexSearchPolicy, KeyRange,
-    MaintenanceBudget, PrefixExtractor, PrefixFilterPolicy, TransactionOptions, WriteBatch,
-    WriteOptions, blob, codec::CodecId, manifest, recovery, table, wal,
+    BlobGcRatio, BlobLevelMergePolicy, BucketOptions, CompactionTrigger, CompressionProfile, Db,
+    DbOptions, DurabilityMode, Error, FailOnCorruptionPolicy, FilterPolicy, IndexSearchPolicy,
+    KeyRange, MaintenanceBudget, PrefixExtractor, PrefixFilterPolicy, TransactionOptions,
+    WriteBatch, WriteOptions, blob, codec::CodecId, manifest, recovery, table, wal,
     write_batch::BatchOperation,
 };
 
@@ -130,6 +130,14 @@ fn level_table_bytes(stats: &trine_kv::DbStats, level: u32) -> u64 {
         .iter()
         .find(|level_stats| level_stats.level == level)
         .map_or(0, |level_stats| level_stats.bytes)
+}
+
+fn compaction_trigger_runs(stats: &trine_kv::DbStats, trigger: CompactionTrigger) -> u64 {
+    stats
+        .compaction_triggers
+        .iter()
+        .find(|trigger_stats| trigger_stats.trigger == trigger)
+        .map_or(0, |trigger_stats| trigger_stats.runs)
 }
 
 fn write_file(path: &std::path::Path, bytes: &[u8]) {
@@ -1569,6 +1577,7 @@ fn persistent_single_l0_compaction_moves_table_without_rewrite() {
         assert_eq!(stats.compaction_output_tables, 1);
         assert!(stats.compaction_input_bytes > 0);
         assert!(stats.compaction_output_bytes > 0);
+        assert_eq!(compaction_trigger_runs(&stats, CompactionTrigger::L0Overlap), 1);
     }
 
     {
@@ -2033,6 +2042,7 @@ fn persistent_stats_report_tables_blobs_and_compactions() {
         assert_eq!(stats.compaction_output_tables, 1);
         assert!(stats.compaction_input_bytes > 0);
         assert!(stats.compaction_output_bytes > 0);
+        assert_eq!(compaction_trigger_runs(&stats, CompactionTrigger::L0Overlap), 1);
 
         let obsolete_blob_path = blob::blob_path(&path, 999);
         write_file(&obsolete_blob_path, b"obsolete");

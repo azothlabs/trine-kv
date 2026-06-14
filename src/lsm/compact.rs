@@ -8,6 +8,7 @@ use crate::{
     iterator::{Direction, RecordGroup, ScanSelector},
     options::BucketOptions,
     range_tombstone,
+    stats::CompactionTrigger,
     table::{self, Table, TablePointCursor, TableRangeTombstone},
     types::{KeyRange, Sequence},
 };
@@ -20,6 +21,7 @@ pub(crate) struct CompactionInput {
     pub(crate) table_options: table::TableWriteOptions,
     pub(crate) input_table_ids: Vec<table::TableId>,
     pub(crate) compaction_range: KeyRange,
+    pub(crate) trigger: CompactionTrigger,
     pub(crate) trivial_move: bool,
     full_bucket_compaction: bool,
     pub(crate) input_tables: Vec<Arc<Table>>,
@@ -93,6 +95,7 @@ impl LsmTree {
             table_options: table_write_options(&self.options),
             input_table_ids,
             compaction_range: plan.key_range,
+            trigger: plan.trigger,
             trivial_move,
             full_bucket_compaction,
             input_tables,

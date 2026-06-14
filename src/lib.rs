@@ -157,7 +157,10 @@ pub use prefix::PrefixExtractor;
 pub use recovery::RecoveryReport;
 pub use runtime::{CancellationToken, RuntimeCapabilities, RuntimeMode, RuntimeOptions};
 pub use snapshot::Snapshot;
-pub use stats::{DbStats, PlatformIoClassCounters, PlatformIoOperationStats};
+pub use stats::{
+    CompactionTrigger, CompactionTriggerStats, DbStats, PlatformIoClassCounters,
+    PlatformIoOperationStats,
+};
 pub use transaction::{Transaction, TransactionOptions};
 pub use types::{CommitInfo, KeyRange, KeyValue, ReadVersion, Value};
 pub use write_batch::WriteBatch;

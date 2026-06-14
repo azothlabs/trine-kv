@@ -2,6 +2,7 @@ use std::{cmp::Ordering, ops::Bound};
 
 use crate::{
     error::{Error, Result},
+    stats::CompactionTrigger,
     table::{TableId, TableLevel, TableProperties},
     types::{KeyRange, Sequence},
 };
@@ -13,6 +14,7 @@ pub struct CompactionPlan {
     pub output_level: TableLevel,
     pub oldest_active_snapshot: Sequence,
     pub key_range: KeyRange,
+    pub trigger: CompactionTrigger,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +87,7 @@ pub(crate) fn plan_compaction(
             output_level: TableLevel(1),
             oldest_active_snapshot,
             key_range,
+            trigger: CompactionTrigger::L0Overlap,
         }));
     }
 
@@ -99,6 +102,7 @@ pub(crate) fn plan_compaction(
                 output_level,
                 oldest_active_snapshot,
                 key_range,
+                trigger: CompactionTrigger::LevelSize,
             }));
         }
     }
@@ -118,6 +122,7 @@ pub(crate) fn plan_compaction(
         input_tables,
         output_level,
         oldest_active_snapshot,
+        trigger: CompactionTrigger::MultiTableLevel,
     }))
 }
 
@@ -437,6 +442,7 @@ mod tests {
 
     use super::{CompactionOptions, CompactionTable, plan_compaction};
     use crate::{
+        stats::CompactionTrigger,
         table::{TableId, TableLevel},
         types::{KeyRange, Sequence},
     };
@@ -463,6 +469,7 @@ mod tests {
         assert_eq!(plan.input_tables, vec![TableId(1), TableId(2), TableId(3)]);
         assert_eq!(plan.output_level, TableLevel(1));
         assert_eq!(plan.oldest_active_snapshot, Sequence::new(7));
+        assert_eq!(plan.trigger, CompactionTrigger::L0Overlap);
     }
 
     #[test]
@@ -545,6 +552,7 @@ mod tests {
 
         assert_eq!(plan.input_tables, vec![TableId(1), TableId(2), TableId(3)]);
         assert_eq!(plan.output_level, TableLevel(2));
+        assert_eq!(plan.trigger, CompactionTrigger::MultiTableLevel);
     }
 
     #[test]
@@ -567,6 +575,7 @@ mod tests {
 
         assert_eq!(plan.input_tables, vec![TableId(2), TableId(3)]);
         assert_eq!(plan.output_level, TableLevel(3));
+        assert_eq!(plan.trigger, CompactionTrigger::LevelSize);
     }
 
     #[test]
