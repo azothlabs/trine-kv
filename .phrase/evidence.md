@@ -12501,3 +12501,64 @@ Negative check:
 
 - Move next to concurrent read/write and background maintenance unless new
   benchmark evidence points to another serialization/decode boundary.
+
+## 2026-06-14: Background Maintenance Contention Diagnostics
+
+### Observation
+
+- Existing benchmark rows measured flush, compaction, blob GC, and write
+  amplification one operation at a time, but did not directly measure
+  foreground reads/writes while maintenance pressure was active.
+- The benchmark harness now reports:
+  - `foreground maintenance contention diagnostic`, with
+    `background_worker_count = 0`;
+  - `background maintenance contention diagnostic`, with
+    `background_worker_count = 1`.
+- Both rows pre-load readable table data, then run a reader thread and writer
+  thread together while a small memtable target and low L0 threshold create
+  flush/compaction pressure.
+- `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench` reported:
+  - foreground read wall: 1352 us median.
+  - foreground write wall: 1353150 us median.
+  - foreground cooperative yields: 0 median.
+  - foreground budget exhaustions: 0 median.
+  - foreground manifest publishes: 69 median.
+  - foreground persists: 92 median.
+  - foreground directory syncs: 23 median.
+  - background-worker read wall: 1445 us median.
+  - background-worker write wall: 2148083 us median.
+  - background-worker cooperative yields: 129 median.
+  - background-worker budget exhaustions: 47 median.
+  - background-worker manifest publishes: 88 median.
+  - background-worker persists: 180 median.
+  - background-worker directory syncs: 45 median.
+
+### Interpretation
+
+- Foreground point reads are not the first bottleneck in this pressure model;
+  read wall time remained small in both rows.
+- The background-worker row is worse for foreground writes because maintenance
+  is split into too many small turns. That creates extra manifest publishes,
+  persists, directory syncs, cooperative foreground waits, and budget
+  exhaustions.
+- The next behavior change should tune background-worker maintenance budget and
+  foreground backpressure waiting before changing compaction selection or
+  read-path behavior.
+
+### Verification
+
+- `cargo check -q --benches`
+- `cargo clippy --bench v1_bench -- -D warnings`
+- `cargo fmt --check`
+- `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench`
+
+### Remaining Blockers
+
+- None for adding the diagnostics and classifying the first blocker.
+- Background maintenance still needs behavior tuning; this phase only measured
+  and classified the issue.
+
+### Recommended Next Action
+
+- Start Phase 186 and tune background-worker maintenance budget plus foreground
+  backpressure waiting, then rerun the contention diagnostic.

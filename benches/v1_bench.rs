@@ -3,6 +3,8 @@ use std::{
     env, fs,
     hint::black_box,
     path::{Path, PathBuf},
+    sync::{Arc, Barrier},
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -17,6 +19,8 @@ const OPS: usize = 2_048;
 const POINT_READ_BATCH: usize = 4;
 const LOCALIZED_POINT_READ_BATCH: usize = 16;
 const WRITE_DIAGNOSTIC_OPS: usize = 256;
+const BACKGROUND_CONTENTION_ROWS: usize = 256;
+const BACKGROUND_CONTENTION_OPS: usize = 512;
 const LARGE_ROWS: usize = 128;
 const LARGE_OPS: usize = 256;
 const LARGE_VALUE_BYTES: usize = 16 * 1024;
@@ -76,6 +80,7 @@ fn run_benchmarks() -> Vec<BenchResult> {
     results.push(bench_blob_gc_rewrite());
     results.push(bench_blob_level_merge());
     extend_maintenance_write_amplification_diagnostics(&mut results);
+    extend_background_maintenance_contention_diagnostics(&mut results);
     results.push(bench_block_cache_warm_read());
     results.push(bench_block_cache_random_block_read());
     extend_block_cache_decode_diagnostics(&mut results);
@@ -879,6 +884,163 @@ fn extend_maintenance_write_amplification_diagnostics(results: &mut Vec<BenchRes
     extend_compaction_write_amplification_diagnostic(results);
     extend_blob_gc_write_amplification_diagnostic(results);
     extend_blob_level_merge_write_amplification_diagnostic(results);
+}
+
+fn extend_background_maintenance_contention_diagnostics(results: &mut Vec<BenchResult>) {
+    push_background_maintenance_contention_diagnostic(
+        results,
+        "foreground maintenance contention diagnostic",
+        0,
+    );
+    push_background_maintenance_contention_diagnostic(
+        results,
+        "background maintenance contention diagnostic",
+        1,
+    );
+}
+
+fn push_background_maintenance_contention_diagnostic(
+    results: &mut Vec<BenchResult>,
+    label: &'static str,
+    background_workers: usize,
+) {
+    let dir = temp_dir(label);
+    let mut options = benchmark_persistent_options(&dir);
+    options.background_worker_count = background_workers;
+    options.write_buffer_bytes = 512;
+    options.max_immutable_memtables = 2;
+    options.max_l0_files = 2;
+    options.target_table_bytes = 2 * 1024;
+
+    let db = Db::open_sync(options).expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+    for index in 0..BACKGROUND_CONTENTION_ROWS {
+        bucket
+            .put_sync(key(index), value(index))
+            .expect("initial put succeeds");
+    }
+    db.flush_sync().expect("initial flush succeeds");
+
+    let before = db.stats();
+    let start = Arc::new(Barrier::new(2));
+    let reader_bucket = bucket.clone();
+    let reader_start = Arc::clone(&start);
+    let reader = thread::spawn(move || {
+        reader_start.wait();
+        let started = Instant::now();
+        let checksum = random_get_checksum(
+            &reader_bucket,
+            BACKGROUND_CONTENTION_ROWS,
+            BACKGROUND_CONTENTION_OPS,
+            0xfeed_beef_cafe_babe,
+        );
+        (duration_micros(started.elapsed()), checksum)
+    });
+
+    start.wait();
+    let write_started = Instant::now();
+    let mut write_bytes = 0;
+    for index in 0..BACKGROUND_CONTENTION_OPS {
+        let row = BACKGROUND_CONTENTION_ROWS + index;
+        let value = value(row);
+        write_bytes += value.len() as u64;
+        bucket.put_sync(key(row), value).expect("write succeeds");
+    }
+    let write_wall_micros = duration_micros(write_started.elapsed());
+    let (read_wall_micros, read_bytes) = reader.join().expect("reader joins");
+    assert!(
+        read_bytes > 0,
+        "background contention reader must read rows"
+    );
+    assert!(
+        write_bytes > 0,
+        "background contention writer must write rows"
+    );
+
+    let after = db.stats();
+    let measurement = BackgroundMaintenanceContentionMeasurement {
+        read_wall_micros,
+        write_wall_micros,
+        read_bytes,
+        write_bytes,
+    };
+    push_background_maintenance_contention_results(results, label, &before, &after, measurement);
+    drop(bucket);
+    drop(db);
+    cleanup_dir(&dir);
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BackgroundMaintenanceContentionMeasurement {
+    read_wall_micros: u64,
+    write_wall_micros: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+}
+
+fn push_background_maintenance_contention_results(
+    results: &mut Vec<BenchResult>,
+    label: &'static str,
+    before: &trine_kv::DbStats,
+    after: &trine_kv::DbStats,
+    measurement: BackgroundMaintenanceContentionMeasurement,
+) {
+    results.push(BenchResult::diagnostic(
+        labelled(label, "read wall micros"),
+        measurement.read_wall_micros,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "write wall micros"),
+        measurement.write_wall_micros,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "read bytes"),
+        measurement.read_bytes,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "write bytes"),
+        measurement.write_bytes,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "cooperative yields"),
+        after
+            .maintenance_cooperative_yields
+            .saturating_sub(before.maintenance_cooperative_yields),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "budget exhaustions"),
+        after
+            .maintenance_budget_exhaustions
+            .saturating_sub(before.maintenance_budget_exhaustions),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "compaction runs"),
+        after.compaction_runs.saturating_sub(before.compaction_runs),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "compaction input tables"),
+        after
+            .compaction_input_tables
+            .saturating_sub(before.compaction_input_tables),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "compaction output tables"),
+        after
+            .compaction_output_tables
+            .saturating_sub(before.compaction_output_tables),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "remaining immutable memtables"),
+        after.immutable_memtables as u64,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "remaining l0 tables"),
+        after.l0_tables as u64,
+    ));
+
+    let mut diagnostics = WritePathDiagnostics::default();
+    diagnostics.record_delta(before, after);
+    diagnostics.push_results(results, label);
 }
 
 fn extend_flush_write_amplification_diagnostic(results: &mut Vec<BenchResult>) {

@@ -4562,7 +4562,7 @@ preserve the V1 table/blob format.
 
 ### Phase 185: Concurrent Read/Write And Background Maintenance
 
-**Status**: Planned
+**Status**: Complete
 
 **Goal**: Measure foreground latency under concurrent reads, writes, flush,
 compaction, and maintenance.
@@ -4581,3 +4581,29 @@ foreground latency under background work is the next risk.
 
 - Storage format changes, platform-io backend changes, publishing, tagging, or
   pushing changes.
+
+### Phase 186: Background Maintenance Budget Tuning
+
+**Status**: Planned
+
+**Goal**: Reduce foreground write latency under maintenance pressure by tuning
+background-worker maintenance budget and foreground backpressure waiting.
+
+**Entry Condition**: Phase 185 shows the background-worker contention workload
+has worse foreground write wall time than the foreground-only maintenance path,
+with more manifest publishes, persists, directory syncs, cooperative yields, and
+budget exhaustions.
+
+**Acceptance Gate**:
+
+- The background maintenance contention diagnostic improves write wall time or
+  reduces redundant storage maintenance operations without regressing read wall
+  time.
+- Tests cover the selected worker-budget or backpressure behavior.
+- Full lib tests, all-feature tests, strict clippy, and grouped benchmark
+  evidence pass.
+
+**Major Out Of Scope**:
+
+- Storage format changes, platform-io backend changes, new compaction
+  selection policy, publishing, tagging, or pushing changes.
