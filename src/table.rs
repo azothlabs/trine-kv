@@ -186,6 +186,13 @@ pub(crate) struct TableWriteOptions {
     pub(crate) rewrite_blob_indexes: bool,
 }
 
+fn sort_point_records_if_needed(point_records: &mut [(InternalKey, Option<ValueRef>)]) {
+    if point_records.windows(2).all(|pair| pair[0].0 <= pair[1].0) {
+        return;
+    }
+    point_records.sort_by(|left, right| left.0.cmp(&right.0));
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TablePointRecord {
     pub(crate) internal_key: InternalKey,
@@ -220,6 +227,15 @@ struct TableFooter {
     filters: SectionHandle,
     indexes: SectionHandle,
     properties: SectionHandle,
+}
+
+struct EncodedTable {
+    payload: Vec<u8>,
+    payload_len: usize,
+    footer: TableFooter,
+    data_block_count: usize,
+    index_partitions: Vec<IndexPartitionEntry>,
+    pinned_index_partitions: BTreeMap<usize, Arc<Vec<TableDataBlock>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3587,7 +3603,7 @@ pub(crate) fn write_table_with_backend(
     // writes and before publishing the manifest. That keeps table/blob file
     // names durable without forcing one directory sync per output file.
     let mut point_records = point_records.to_vec();
-    point_records.sort_by(|left, right| left.0.cmp(&right.0));
+    sort_point_records_if_needed(&mut point_records);
     let db_path = path
         .parent()
         .ok_or_else(|| Error::invalid_options("table path has no parent"))?;
@@ -3648,29 +3664,59 @@ pub(crate) fn write_table_with_backend(
         ))))),
         may_have_range_tombstones: !range_tombstones.is_empty(),
     };
-    let payload = encode_table(&table)?;
-    let payload_len = u32::try_from(payload.len())
+    let encoded = encode_table_for_write(&table)?;
+    let payload_len = u32::try_from(encoded.payload_len)
         .map_err(|_| Error::invalid_options("table payload exceeds u32::MAX"))?;
-    let payload_checksum = checksum(&payload);
-    let mut bytes = Vec::with_capacity(HEADER_LEN + payload.len());
+    let payload_checksum = checksum(&encoded.payload);
+    let mut bytes = Vec::with_capacity(HEADER_LEN + encoded.payload_len);
 
     bytes.extend_from_slice(&TABLE_MAGIC.to_le_bytes());
     bytes.extend_from_slice(&TABLE_VERSION.to_le_bytes());
     bytes.extend_from_slice(&payload_len.to_le_bytes());
     bytes.extend_from_slice(&payload_checksum.to_le_bytes());
-    bytes.extend_from_slice(&payload);
+    bytes.extend_from_slice(&encoded.payload);
 
     backend
         .capabilities()
         .require(StorageCapability::ObjectWrite)?;
     let object = table_storage_object(path);
     backend.write_object_blocking(
-        object,
+        object.clone(),
         Arc::from(bytes.into_boxed_slice()),
         DurabilityMode::SyncAll,
     )?;
+    backend
+        .capabilities()
+        .require(StorageCapability::RandomRead)?;
+    let file = Arc::new(backend.open_read_blocking(object)?);
 
-    read_table_with_backend(backend, path)
+    Ok(written_table_metadata(path, Some(file), table, encoded))
+}
+
+fn written_table_metadata(
+    path: &Path,
+    file: Option<Arc<NativeFileObject>>,
+    table: Table,
+    encoded: EncodedTable,
+) -> Table {
+    Table {
+        path: Some(path.to_path_buf()),
+        file,
+        payload_len: encoded.payload_len,
+        footer: encoded.footer,
+        properties: table.properties,
+        point_records: None,
+        data_blocks: None,
+        data_block_count: encoded.data_block_count,
+        index_partitions: encoded.index_partitions,
+        index_partition_cache: Arc::new(RwLock::new(encoded.pinned_index_partitions)),
+        range_tombstones: table.range_tombstones,
+        may_have_range_tombstones: table.may_have_range_tombstones,
+        point_key_filter: table.point_key_filter,
+        prefix_filter: table.prefix_filter,
+        filter_stats: table.filter_stats,
+        read_path_stats: table.read_path_stats,
+    }
 }
 
 #[allow(dead_code)]
@@ -3693,7 +3739,7 @@ where
     }
 
     let mut point_records = point_records.to_vec();
-    point_records.sort_by(|left, right| left.0.cmp(&right.0));
+    sort_point_records_if_needed(&mut point_records);
     let db_path = path
         .parent()
         .ok_or_else(|| Error::invalid_options("table path has no parent"))?;
@@ -3728,7 +3774,7 @@ where
         (None, None)
     };
 
-    let table = Table {
+    let mut table = Table {
         path: None,
         file: None,
         payload_len: 0,
@@ -3754,17 +3800,19 @@ where
         ))))),
         may_have_range_tombstones: !range_tombstones.is_empty(),
     };
-    let payload = encode_table(&table)?;
-    let payload_len = u32::try_from(payload.len())
+    let encoded = encode_table_for_write(&table)?;
+    table.payload_len = encoded.payload_len;
+    table.footer = encoded.footer.clone();
+    let payload_len = u32::try_from(encoded.payload_len)
         .map_err(|_| Error::invalid_options("table payload exceeds u32::MAX"))?;
-    let payload_checksum = checksum(&payload);
-    let mut bytes = Vec::with_capacity(HEADER_LEN + payload.len());
+    let payload_checksum = checksum(&encoded.payload);
+    let mut bytes = Vec::with_capacity(HEADER_LEN + encoded.payload_len);
 
     bytes.extend_from_slice(&TABLE_MAGIC.to_le_bytes());
     bytes.extend_from_slice(&TABLE_VERSION.to_le_bytes());
     bytes.extend_from_slice(&payload_len.to_le_bytes());
     bytes.extend_from_slice(&payload_checksum.to_le_bytes());
-    bytes.extend_from_slice(&payload);
+    bytes.extend_from_slice(&encoded.payload);
 
     backend
         .capabilities()
@@ -3774,7 +3822,7 @@ where
         .write_object(object, Arc::from(bytes.into_boxed_slice()), durability)
         .await?;
 
-    read_table_with_backend_async(backend, path).await
+    Ok(table)
 }
 
 #[allow(dead_code)]
@@ -4333,7 +4381,12 @@ fn index_partitions_for_loaded_blocks(data_blocks: &[TableDataBlock]) -> Vec<Ind
         .collect()
 }
 
+#[cfg(test)]
 fn encode_table(table: &Table) -> Result<Vec<u8>> {
+    Ok(encode_table_for_write(table)?.payload)
+}
+
+fn encode_table_for_write(table: &Table) -> Result<EncodedTable> {
     let mut bytes = Vec::new();
     let codec = table.properties.codec;
     let point_records = table
@@ -4349,24 +4402,32 @@ fn encode_table(table: &Table) -> Result<Vec<u8>> {
     let range_tombstones =
         append_single_block_section(&mut bytes, codec, &encode_range_tombstone_block(table)?)?;
     let filters = append_single_block_section(&mut bytes, codec, &encode_filter_block(table)?)?;
-    let indexes = append_index_section(&mut bytes, codec, &index_entries)?;
+    let (indexes, index_partitions) = append_index_section(&mut bytes, codec, &index_entries)?;
     let properties = append_single_block_section(
         &mut bytes,
         codec,
         &encode_properties_block(&table.properties)?,
     )?;
-    put_footer(
-        &mut bytes,
-        &TableFooter {
-            data_blocks,
-            range_tombstones,
-            filters,
-            indexes,
-            properties,
-        },
-    );
+    let footer = TableFooter {
+        data_blocks,
+        range_tombstones,
+        filters,
+        indexes,
+        properties,
+    };
+    put_footer(&mut bytes, &footer);
 
-    Ok(bytes)
+    Ok(EncodedTable {
+        payload_len: bytes.len(),
+        payload: bytes,
+        footer,
+        data_block_count: index_entries.len(),
+        index_partitions,
+        pinned_index_partitions: pinned_index_partitions_from_entries(
+            &index_entries,
+            table.properties.level,
+        )?,
+    })
 }
 
 #[cfg(test)]
@@ -4586,7 +4647,7 @@ fn append_index_section(
     bytes: &mut Vec<u8>,
     codec: CodecId,
     index_entries: &[DataBlockIndexEntry],
-) -> Result<SectionHandle> {
+) -> Result<(SectionHandle, Vec<IndexPartitionEntry>)> {
     let section_start = bytes.len();
     let partition_payloads = index_entries
         .chunks(INDEX_PARTITION_TARGET_ENTRIES)
@@ -4641,7 +4702,33 @@ fn append_index_section(
         bytes.extend_from_slice(&block);
     }
 
-    SectionHandle::from_span(section_start, bytes.len())
+    Ok((
+        SectionHandle::from_span(section_start, bytes.len())?,
+        partitions,
+    ))
+}
+
+fn pinned_index_partitions_from_entries(
+    index_entries: &[DataBlockIndexEntry],
+    level: TableLevel,
+) -> Result<BTreeMap<usize, Arc<Vec<TableDataBlock>>>> {
+    let mut pinned = BTreeMap::new();
+    if !should_pin_read_metadata(level) {
+        return Ok(pinned);
+    }
+
+    for (partition_index, entries) in index_entries
+        .chunks(INDEX_PARTITION_TARGET_ENTRIES)
+        .enumerate()
+    {
+        let blocks = entries
+            .iter()
+            .cloned()
+            .map(TableDataBlock::from_index_entry)
+            .collect::<Result<Vec<_>>>()?;
+        pinned.insert(partition_index, Arc::new(blocks));
+    }
+    Ok(pinned)
 }
 
 fn append_single_block_section(
@@ -6349,6 +6436,92 @@ mod tests {
                 .to_vec();
             Ok(StorageReadBuffer::from_vec(offset, bytes))
         }
+    }
+
+    #[test]
+    fn table_write_sort_skips_sorted_point_records() {
+        let mut records = vec![
+            table_write_sort_record(b"a", 2),
+            table_write_sort_record(b"a", 1),
+            table_write_sort_record(b"b", 1),
+        ];
+
+        sort_point_records_if_needed(&mut records);
+
+        assert_eq!(records[0].0.user_key(), b"a");
+        assert_eq!(records[0].0.sequence(), Sequence::new(2));
+        assert_eq!(records[1].0.user_key(), b"a");
+        assert_eq!(records[1].0.sequence(), Sequence::new(1));
+        assert_eq!(records[2].0.user_key(), b"b");
+    }
+
+    #[test]
+    fn table_write_sort_repairs_unsorted_point_records() {
+        let mut records = vec![
+            table_write_sort_record(b"b", 1),
+            table_write_sort_record(b"a", 1),
+            table_write_sort_record(b"a", 2),
+        ];
+
+        sort_point_records_if_needed(&mut records);
+
+        assert_eq!(records[0].0.user_key(), b"a");
+        assert_eq!(records[0].0.sequence(), Sequence::new(2));
+        assert_eq!(records[1].0.user_key(), b"a");
+        assert_eq!(records[1].0.sequence(), Sequence::new(1));
+        assert_eq!(records[2].0.user_key(), b"b");
+    }
+
+    fn table_write_sort_record(user_key: &[u8], sequence: u64) -> (InternalKey, Option<ValueRef>) {
+        (
+            InternalKey::new(
+                user_key.to_vec(),
+                Sequence::new(sequence),
+                ValueKind::Put,
+                0,
+            ),
+            Some(ValueRef::Inline(Vec::new())),
+        )
+    }
+
+    #[test]
+    fn async_table_write_returns_loaded_table_without_readback() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-async-table-write-{}",
+            table_time_suffix()
+        ));
+        std::fs::create_dir_all(&root).expect("test dir creates");
+        let backend = crate::storage::StorageBackend::Native(NativeFileBackend::new());
+        let path = root.join("table-1.trinet");
+        let options = test_table_options(CodecId::None, false);
+        let records = vec![
+            table_write_sort_record(b"a", 2),
+            table_write_sort_record(b"b", 1),
+        ];
+
+        let table = futures::executor::block_on(write_table_with_backend_async(
+            &backend,
+            &path,
+            TableId(1),
+            TableLevel::ZERO,
+            &options,
+            &records,
+            &[],
+            DurabilityMode::Flush,
+        ))
+        .expect("async table writes");
+
+        assert_eq!(table.point_records().expect("records stay loaded").len(), 2);
+        assert!(table.estimated_file_bytes() > HEADER_LEN as u64);
+        assert_eq!(
+            futures::executor::block_on(read_table_with_backend_async(&backend, &path))
+                .expect("written table reads")
+                .point_records()
+                .expect("read records load")
+                .len(),
+            2
+        );
+        std::fs::remove_dir_all(root).expect("test dir removes");
     }
 
     #[test]

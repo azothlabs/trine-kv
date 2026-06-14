@@ -12626,3 +12626,69 @@ Negative check:
 ### Recommended Next Action
 
 - Choose the next KV optimization phase from fresh grouped benchmark evidence.
+
+## 2026-06-14: Sync Write Classification And Table Writer Cleanup
+
+### Observation
+
+- Fresh `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench` evidence before this
+  slice put `persistent single-key put sync-data` at 523738 us median and
+  `persistent single-key put sync-all` at 521558 us median for 256 sequential
+  writes.
+- The corresponding `persistent batch write sync-data` row was 21938 us median
+  for 1024 writes, so the existing safe path for many confirmed writes is
+  batching rather than weakening per-commit durability.
+- WAL append lanes already keep the append writer open; the single-key
+  sync-data/sync-all rows still issue one storage sync for each confirmed
+  commit.
+- An experiment that changed native table/blob output files from `SyncAll` to
+  `SyncData` did not improve grouped maintenance rows and made flush/blob GC
+  noisy or slower, so it was rejected.
+- The retained table-writer cleanup skips sorting when flush/compaction payloads
+  are already ordered, returns loaded tables directly from async table writes,
+  and reuses encoded metadata after blocking table writes instead of reopening
+  and reading table metadata.
+- Final `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench` for the retained
+  cleanup reported:
+  - `blob level merge`: 196166 us median versus 201652 us baseline.
+  - `compaction throughput`: 234338 us median versus 206932 us baseline.
+  - `flush throughput`: 83791 us median versus 70004 us baseline.
+  - `write amp compaction diagnostic wall micros`: 17993 us median versus
+    18290 us baseline.
+  - `write amp blob level merge diagnostic wall micros`: 49955 us median versus
+    47439 us baseline.
+
+### Interpretation
+
+- Single-key sync-data/sync-all is an inherent per-confirmed-commit storage
+  sync cost under the current durability contract. A silent implementation
+  change would alter what a confirmed write means; the safe existing answer is
+  `WriteBatch`.
+- Output-file durability is not the current compaction/blob level merge
+  blocker. The `SyncData` experiment is a rejected path unless future evidence
+  is filesystem-specific and clearly positive.
+- Reusing table metadata removes redundant work inside the table writer, but
+  does not close the grouped compaction throughput row. The next blocker is
+  likely table/blob encode, blob value rewrite, or compaction payload assembly.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q table --lib`
+- `cargo test -q compaction --lib`
+- `cargo test -q flush --lib`
+- `cargo test -q blob_level_merge --lib`
+- `cargo test -q blob_gc --lib`
+- `cargo check -q --benches`
+- `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench`
+
+### Remaining Blockers
+
+- `compaction throughput` is not improved by this slice.
+- `blob level merge` grouped median improved in one run, but the diagnostic row
+  does not prove the underlying rewrite cost is fixed.
+
+### Recommended Next Action
+
+- Continue this phase with focused profiling of table/blob encode and payload
+  rewrite. Do not revisit output-file `SyncData` as a generic fix.

@@ -2,69 +2,77 @@
 
 ## Status
 
-Complete
+Active
 
 ## Goal
 
-Reduce foreground write latency under maintenance pressure by tuning
-background-worker maintenance budget, foreground backpressure ownership, and
-post-commit background flush admission.
+Reduce the current largest persistent-write and maintenance costs without
+weakening confirmed-write durability or changing V1 storage formats.
 
 ## Scope
 
-- Native persistent local-file background maintenance behavior.
-- Internal worker budget and post-commit flush request admission.
-- Foreground write-pressure maintenance ownership.
-- Benchmark evidence from the existing V1 contention diagnostics.
+- Classify `persistent single-key put sync-data/sync-all` against the durability
+  contract and existing batch write path.
+- Improve blob level merge and compaction throughput when a safe table/blob
+  rewrite optimization exists.
+- Native persistent local-file workloads first; object-store/browser behavior
+  stays on its existing durability path unless separately proven.
+- Evidence from `v1_bench` grouped rows and targeted diagnostics.
 
 ## Out Of Scope
 
+- Reducing `SyncData` or `SyncAll` semantics for confirmed single-key writes.
 - Storage format changes.
-- Platform-io backend changes.
-- Public API changes.
+- Public API changes unless evidence shows existing batch APIs cannot express
+  the safe path.
 - New compaction selection policy.
+- Platform-io backend changes.
 - Publishing, tagging, pushing, or release workflow changes.
 
 ## Acceptance Gate
 
-- Background maintenance contention diagnostic improves write wall time or
-  reduces redundant storage maintenance operations without a meaningful read
-  regression.
-- Tests cover the selected worker-budget and pressure ownership behavior.
-- Full lib tests, all-feature tests, strict clippy, formatting, diff whitespace
-  checks, and grouped benchmark evidence pass before commit.
+- The single-key sync write row is classified as inherent per-commit sync cost
+  unless a safe implementation change lowers it without changing durability.
+- A retained maintenance optimization improves or explains blob level merge and
+  compaction throughput with benchmark evidence.
+- Focused tests cover the behavior boundary.
+- Formatting, strict clippy, relevant tests, and diff whitespace checks pass
+  before any commit.
 
 ## Active Task Slice
 
 ```text
-task812 [x] goal:tune background maintenance budget/admission | scope:src/db.rs | verify:focused tests + TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench
-task813 [x] goal:record Phase 186 evidence | scope:docs/benchmarks .phrase | verify:evidence review
+task814 [x] goal:reject unsafe/unhelpful output-file durability change | scope:src/table.rs src/blob.rs src/db.rs | verify:targeted bench
+task815 [ ] goal:record sync-write classification and maintenance evidence | scope:docs/benchmarks .phrase/evidence.md | verify:evidence review
+task816 [ ] goal:profile and reduce table/blob payload rewrite cost | scope:src/table.rs src/blob.rs src/lsm src/db.rs | verify:compaction/blob diagnostics + grouped bench
 ```
 
 ## Evidence
 
-- Phase 185 background-worker row reported 2148083 us median write wall, 129
-  cooperative yields, 47 budget exhaustions, 88 manifest publishes, 180
-  persists, and 45 directory syncs.
-- Budget-only and shorter-wait experiments were rejected: they did not reduce
-  storage operation counts, and the shorter wait raised cooperative yields and
-  budget exhaustions.
-- The retained change makes pressure maintenance foreground-first, gives
-  background workers an internal pressure-sized budget, and delays background
-  flush requests until they can batch useful work.
-- `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench` reported the background
-  contention row at 1491161 us median write wall, 0 cooperative yields, 0 budget
-  exhaustions, 69 manifest publishes, 92 persists, and 23 directory syncs.
+- Current grouped benchmark medians put `persistent single-key put sync-data`
+  around 523738 us and `sync-all` around 521558 us for 256 sequential writes.
+- `persistent batch write sync-data` is much lower, around 21938 us for 1024
+  writes, which shows the safe user-facing path for many confirmed writes is
+  batching.
+- WAL append lanes already keep the append writer open; sequential single-key
+  sync cost is dominated by one storage sync per confirmed commit.
+- WAL append lanes already keep the append writer open; changing output table
+  or blob file durability from `SyncAll` to `SyncData` did not improve grouped
+  maintenance rows and was rejected.
+- A retained table-writer cleanup skips redundant sorting for already-sorted
+  flush/compaction payloads and lets encoded table metadata be reused after
+  blocking writes instead of re-reading table metadata from disk.
 
 ## Known Residuals
 
-- The background-worker read-wall median in the Phase 186 run was noisier
-  (2227 us) but remained low-millisecond and did not drive the original blocker.
-- The remaining write-wall gap to the foreground-only row belongs to broader
-  write-path/storage durability tuning, not this worker contention slice.
+- Sequential single-key `SyncData`/`SyncAll` cannot be made cheap without
+  relaxing the meaning of a confirmed write or adding a different explicit
+  group-commit API.
+- Blob level merge and compaction are still dominated outside output-file
+  durability; the next blocker is likely table/blob encode, blob rewrite, or
+  compaction payload assembly.
 
 ## Next Recommendation
 
-- Continue the KV optimization queue from fresh grouped benchmark evidence.
-  Good next candidates are the broader write path durability costs or the
-  remaining cold-open/recovery costs, depending on the next selected phase.
+- Continue with compaction/blob encode and rewrite profiling; do not revisit
+  output-file `SyncData` without new filesystem-specific evidence.
