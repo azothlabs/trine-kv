@@ -13379,3 +13379,61 @@ Negative check:
 
 - Evaluate Phase F (persisted guard metadata) only if deriving guards from table
   bounds at open/recovery becomes a measured cost.
+
+## 2026-06-15: Phase F Persisted Guard Metadata Decision
+
+### Observation
+
+- The manifest table record already encodes and decodes each table's
+  `smallest_user_key` and `largest_user_key` (`src/manifest.rs` ~1477-1478
+  encode, ~1744-1745 decode). Guard bounds are already persisted.
+- Recovery builds the version from `manifest.tables()` (table properties with
+  bounds); `LsmVersion::new` (`src/lsm/version.rs`) only groups tables into
+  levels and sorts each level (L0 by read order via `compare_l0_tables_for_
+  reads`, L1+ by key range via `compare_non_overlapping_tables`). No guard-only
+  derivation pass and no extra I/O for guards.
+- `TRINE_BENCH_RUNS=5 cargo bench --bench v1_bench` startup-recovery rows:
+  - cold table open wall micros: 6723 median (writable).
+  - cold table read-only open wall micros: 2013 median.
+  - WAL replay open: ~490-896 median.
+  Open cost is dominated by manifest/table metadata I/O and WAL replay; the
+  `LsmVersion` level sort is `O(tables * log)` over already-read data.
+
+### Interpretation
+
+- Guards are table key bounds, which are already implicitly durable in the
+  manifest. The Phase F option "persist guard metadata" assumes guards are not
+  persisted and must be rebuilt; that premise does not hold.
+- A separate persisted guard structure would duplicate manifest data and add
+  format-version, migration, and recovery-validation burden for negligible
+  derive-cost savings. The Phase F entry condition (deriving guards became a
+  measured open/recovery bottleneck) is not met.
+
+### Decision
+
+- Keep guards derived in memory from manifest-persisted table bounds via
+  `LsmVersion`. Do not add a persisted guard-metadata format. No manifest or
+  SSTable format change. This satisfies the Phase F acceptance gate (no format
+  change without protocol update and migration/recovery tests).
+- Recorded as a durable boundary in `decision.md` and resolved in
+  `guard-aware-lsm-strategy.md`.
+
+### Verification
+
+- Code inspection: `src/manifest.rs` (bounds persisted), `src/lsm/version.rs`
+  (`LsmVersion::new` sort-only), `src/recovery.rs` (`manifest.tables()` source).
+- `TRINE_BENCH_RUNS=5 cargo bench --bench v1_bench` (startup-recovery rows).
+- No Rust behavior or format change in this decision phase.
+
+### Remaining Blockers
+
+- None. Re-open only if `LsmVersion` build is later measured to dominate open
+  for very large table counts; the first response would be a manifest-side
+  pre-sorted level cache (manifest optimization, not a new guard format), still
+  gated by a protocol update and migration/recovery tests.
+
+### Recommended Next Action
+
+- The guard-aware LSM strategy (Phases A-F) is complete. Choose the next KV
+  engine phase from fresh benchmark evidence (for example single-key sync write
+  fsync cost or compaction/blob rewrite throughput).

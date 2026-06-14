@@ -1,7 +1,7 @@
 # Guard-Aware LSM Strategy
 
 Date: 2026-06-14
-Status: Draft for phased implementation
+Status: Phases A-F resolved (A-E implemented, F decided to keep guards derived)
 
 ## Purpose
 
@@ -241,6 +241,38 @@ Implementation scope:
 Acceptance gate:
 
 - No format change occurs without protocol update and migration/recovery tests.
+
+#### Phase F Decision (2026-06-15): Keep Guards Derived
+
+Status: Resolved. No format change.
+
+Decision: guards remain derived in memory from existing table key bounds. Trine
+does not add a separate persisted guard-metadata structure.
+
+Evidence:
+
+- The manifest table record already persists each table's `smallest_user_key`
+  and `largest_user_key` (`src/manifest.rs` encode/decode). Guard bounds are
+  therefore already implicitly durable. On open, `manifest.tables()` yields the
+  table properties and `LsmVersion::new` only sorts them into the level layout
+  (L0 read-order, L1+ by key range). There is no separate guard derivation pass
+  and no extra I/O performed for guards.
+- Cold open wall time is dominated by manifest/table metadata I/O and WAL
+  replay, not by guard work: benchmark cold table open ~6.7 ms writable /
+  ~2.0 ms read-only, WAL replay open well under 1 ms. The `LsmVersion` level
+  sort is `O(tables * log)` over data already read for table open and is not a
+  measured bottleneck.
+
+Rationale: a separate persisted guard structure would duplicate the table
+bounds the manifest already stores while adding format-version, migration, and
+recovery-validation burden. The Phase F entry condition (deriving guards became
+a measured open/recovery cost) is not met.
+
+Future re-open condition: revisit only if the `LsmVersion` build/sort is later
+measured to dominate open for very large table counts. The first response would
+be caching a pre-sorted level layout inside the existing manifest, which is a
+manifest optimization rather than a new guard format, and would still require a
+protocol update plus migration/recovery tests before any format change.
 
 ## Non-Goals
 

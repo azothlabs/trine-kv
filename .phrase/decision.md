@@ -105,6 +105,13 @@ Evidence notes should separate:
   storage backend boundaries.
 - Titan and other external storage engines may be used as design references,
   but Trine must keep its own code, file formats, tests, and recovery contract.
+- Guard-aware routing uses guards derived in memory from table key bounds, not a
+  separate persisted guard-metadata structure (Phase F decision). Table bounds
+  are already persisted in the manifest table record, so guards are implicitly
+  durable; `LsmVersion` only sorts them into the level layout at open. Do not add
+  a persisted guard format without first proving the `LsmVersion` build is a
+  measured open/recovery bottleneck and updating this protocol plus
+  migration/recovery tests.
 
 ## Phase Gate Rules
 
