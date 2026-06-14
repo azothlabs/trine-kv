@@ -29,6 +29,7 @@ name = "trine_kv"
 path = "src/lib.rs"
 
 [dependencies]
+bytes = "1.11.1"
 crossbeam-channel = { version = "0.5.15", optional = true }
 # Async primitives (e.g. `futures::lock::Mutex` for serializing object-store
 # manifest publishes Send-safely). Available on every target.

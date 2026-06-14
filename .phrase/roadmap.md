@@ -4480,7 +4480,36 @@ V1 table format.
   backing replacement, platform I/O backend changes, publishing, tagging, or
   pushing changes.
 
-### Phase 182: Concurrent Read/Write And Background Maintenance
+### Phase 182: Storage Read Buffer Shared Bytes
+
+**Status**: Complete
+
+**Goal**: Remove the remaining read-owned buffer payload copy at the
+storage/decode boundary after Phase 181 identifies `StorageReadBuffer::from_vec`
+as a separate allocation boundary.
+
+**Entry Condition**: Phase 181 is complete and table data-block decode already
+uses shared decoded block payload ranges.
+
+**Acceptance Gate**:
+
+- Read-owned `Vec<u8>` buffers become shared read-only bytes without copying the
+  payload.
+- Checked block decode, data block decode, block cache entries, and inline point
+  values use the shared byte owner without changing record, filter, point
+  lookup, or lazy value semantics.
+- Focused storage/block/table tests, full lib tests, all-feature tests, strict
+  clippy, and grouped benchmark evidence pass.
+- Remaining LZ4 decode and metadata/index compatibility payload allocation
+  boundaries are recorded separately.
+
+**Major Out Of Scope**:
+
+- Storage format changes, LZ4 decode buffer reuse, metadata/index decode
+  redesign, platform I/O backend changes, publishing, tagging, or pushing
+  changes.
+
+### Phase 183: Concurrent Read/Write And Background Maintenance
 
 **Status**: Planned
 

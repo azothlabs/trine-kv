@@ -26,6 +26,7 @@ use crate::{
     runtime::Runtime,
     stats::{PlatformIoOperationStats, StorageOperationMetric, StorageOperationStats},
 };
+use bytes::Bytes;
 
 #[cfg(feature = "platform-io")]
 use crate::io::{PlatformIoDriver, PlatformIoOperation, PlatformIoTaskClass};
@@ -209,18 +210,18 @@ impl<T: Send + Sync + ?Sized> StorageSharedBound for T {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageReadBuffer {
     offset: usize,
-    bytes: Arc<[u8]>,
+    bytes: Bytes,
 }
 
 impl StorageReadBuffer {
-    fn new(offset: usize, bytes: Arc<[u8]>) -> Self {
+    fn new(offset: usize, bytes: Bytes) -> Self {
         Self { offset, bytes }
     }
 
     /// Wraps an owned byte vector as a read completion. Used by block decode
     /// fallbacks that read into a heap buffer before handing it to the decoder.
     pub(crate) fn from_vec(offset: usize, bytes: Vec<u8>) -> Self {
-        Self::new(offset, Arc::from(bytes))
+        Self::new(offset, Bytes::from(bytes))
     }
 
     pub(crate) const fn offset(&self) -> usize {
@@ -231,8 +232,12 @@ impl StorageReadBuffer {
         &self.bytes
     }
 
-    pub(crate) fn into_bytes(self) -> Arc<[u8]> {
+    pub(crate) fn into_bytes(self) -> Bytes {
         self.bytes
+    }
+
+    pub(crate) fn into_arc_bytes(self) -> Arc<[u8]> {
+        Arc::from(self.bytes.as_ref())
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -444,7 +449,7 @@ pub(crate) trait StorageReadObject: StorageSharedBound {
         Box::pin(async move {
             let mut bytes = allocate_read_buffer(len)?;
             self.read_exact_at(offset, &mut bytes).await?;
-            Ok(StorageReadBuffer::new(offset, Arc::from(bytes)))
+            Ok(StorageReadBuffer::from_vec(offset, bytes))
         })
     }
 }
@@ -3266,7 +3271,7 @@ fn read_exact_at_native_file_owned(
 ) -> Result<StorageReadBuffer> {
     let mut bytes = allocate_read_buffer(len)?;
     read_exact_from_native_file(object, offset, &mut bytes)?;
-    Ok(StorageReadBuffer::new(offset, Arc::from(bytes)))
+    Ok(StorageReadBuffer::from_vec(offset, bytes))
 }
 
 fn lock_native_read_file<'file>(
@@ -3305,7 +3310,7 @@ fn read_exact_at_native_file_handle_owned(
 ) -> Result<StorageReadBuffer> {
     let mut bytes = allocate_read_buffer(len)?;
     read_exact_at_native_file_handle(file, object, offset, &mut bytes)?;
-    Ok(StorageReadBuffer::new(offset, Arc::from(bytes)))
+    Ok(StorageReadBuffer::from_vec(offset, bytes))
 }
 
 fn open_native_file(object: &StorageObjectId) -> Result<File> {
@@ -3498,7 +3503,7 @@ fn read_native_file_object_bytes(object: &StorageObjectId) -> Result<Option<Arc<
     debug_assert_eq!(buffer.offset(), 0);
     debug_assert_eq!(buffer.len(), len);
     debug_assert_eq!(buffer.is_empty(), len == 0);
-    Ok(Some(buffer.into_bytes()))
+    Ok(Some(buffer.into_arc_bytes()))
 }
 
 fn open_native_append_file(object: &StorageObjectId) -> Result<File> {
@@ -4373,6 +4378,18 @@ mod tests {
                 .expect("system clock is after epoch")
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn storage_read_buffer_from_vec_reuses_vec_allocation() {
+        let bytes = b"owned read bytes".to_vec();
+        let expected_ptr = bytes.as_ptr();
+
+        let buffer = StorageReadBuffer::from_vec(7, bytes);
+
+        assert_eq!(buffer.offset(), 7);
+        assert_eq!(buffer.as_slice(), b"owned read bytes");
+        assert_eq!(buffer.as_slice().as_ptr(), expected_ptr);
     }
 
     #[test]

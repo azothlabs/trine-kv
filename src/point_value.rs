@@ -1,4 +1,4 @@
-use std::{ops::Range, sync::Arc};
+use std::ops::Range;
 
 use crate::{
     blob::{self, ValueRef},
@@ -8,6 +8,7 @@ use crate::{
     storage::StorageReadBackend,
     types::Value,
 };
+use bytes::Bytes;
 
 /// Value returned by `BucketReader::get`.
 ///
@@ -22,10 +23,7 @@ pub struct PointValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PointValueInner {
     Owned(Value),
-    Shared {
-        bytes: Arc<[u8]>,
-        range: Range<usize>,
-    },
+    Shared { bytes: Bytes, range: Range<usize> },
 }
 
 impl PointValue {
@@ -65,7 +63,7 @@ impl PointValue {
         }
     }
 
-    pub(crate) fn from_shared(bytes: Arc<[u8]>, range: Range<usize>) -> Result<Self> {
+    pub(crate) fn from_shared(bytes: Bytes, range: Range<usize>) -> Result<Self> {
         if range.start > range.end || range.end > bytes.len() {
             return Err(Error::Corruption {
                 message: "point value range outside data block".to_owned(),
@@ -97,7 +95,7 @@ impl PointValueSource {
         }
     }
 
-    pub(crate) fn from_shared(bytes: Arc<[u8]>, range: Range<usize>) -> Result<Self> {
+    pub(crate) fn from_shared(bytes: Bytes, range: Range<usize>) -> Result<Self> {
         PointValue::from_shared(bytes, range).map(Self::Value)
     }
 

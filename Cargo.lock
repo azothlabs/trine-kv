@@ -1774,6 +1774,7 @@ name = "trine-kv"
 version = "0.4.0"
 dependencies = [
  "block2",
+ "bytes",
  "compio",
  "compio-driver",
  "compio-fs",

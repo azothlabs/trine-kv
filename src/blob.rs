@@ -17,6 +17,7 @@ use crate::{
     },
     types::Sequence,
 };
+use bytes::Bytes;
 
 pub const BLOB_FILE_EXTENSION: &str = "trineb";
 pub const BLOB_FILE_FORMAT_VERSION: u16 = 3;
@@ -731,7 +732,7 @@ async fn read_blob_file_bytes_with_backend_async<B>(
     backend: &B,
     db_path: &Path,
     file_id: u64,
-) -> Result<Arc<[u8]>>
+) -> Result<Bytes>
 where
     B: StorageReadBackend,
 {

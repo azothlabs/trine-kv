@@ -3,7 +3,8 @@ use crate::{
     error::{Error, Result},
     storage::StorageReadBuffer,
 };
-use std::{ops::Range, sync::Arc};
+use bytes::Bytes;
+use std::ops::Range;
 
 const BLOCK_HEADER_LEN: usize = 13;
 
@@ -19,7 +20,7 @@ pub(crate) struct BlockManager;
 #[derive(Debug, Clone)]
 pub(crate) struct DecodedBlock {
     codec: CodecId,
-    bytes: Arc<[u8]>,
+    bytes: Bytes,
     payload_range: Range<usize>,
 }
 
@@ -32,7 +33,7 @@ impl DecodedBlock {
         &self.bytes[self.payload_range.clone()]
     }
 
-    pub(crate) fn into_shared_payload(self) -> (Arc<[u8]>, Range<usize>) {
+    pub(crate) fn into_shared_payload(self) -> (Bytes, Range<usize>) {
         (self.bytes, self.payload_range)
     }
 }
@@ -252,7 +253,7 @@ impl BlockManager {
         let payload_len = decoded.len();
         Ok(DecodedBlock {
             codec: block.codec,
-            bytes: Arc::from(decoded),
+            bytes: Bytes::from(decoded),
             payload_range: 0..payload_len,
         })
     }

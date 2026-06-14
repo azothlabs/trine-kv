@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use std::{
     collections::{BTreeMap, BTreeSet},
     mem::size_of,
@@ -241,7 +242,7 @@ struct IndexPartitionEntry {
 
 #[derive(Debug, Clone)]
 pub(crate) struct DecodedDataBlock {
-    bytes: Arc<[u8]>,
+    bytes: Bytes,
     payload_range: Range<usize>,
     record_headers: Box<[DataBlockRecordHeader]>,
     restart_indices: Box<[u32]>,
@@ -296,7 +297,7 @@ impl DecodedDataBlock {
             Some(ValueRefHeader::Inline { offset, len }) => {
                 let range = inline_value_range(offset, len, payload.len())?;
                 Some(PointValueSource::from_shared(
-                    Arc::clone(&self.bytes),
+                    self.bytes.clone(),
                     self.payload_absolute_range(range)?,
                 )?)
             }
@@ -356,7 +357,7 @@ impl DecodedDataBlock {
     #[cfg(test)]
     pub(crate) fn empty_for_cache_test() -> Self {
         Self {
-            bytes: Arc::from([]),
+            bytes: Bytes::new(),
             payload_range: 0..0,
             record_headers: Box::default(),
             restart_indices: Box::default(),
@@ -5330,13 +5331,13 @@ fn read_value_ref_header(cursor: &mut Cursor<'_>) -> Result<Option<ValueRefHeade
 
 fn decode_data_block(bytes: Vec<u8>) -> Result<DecodedDataBlock> {
     let len = bytes.len();
-    let bytes: Arc<[u8]> = Arc::from(bytes);
+    let bytes = Bytes::from(bytes);
     decode_data_block_shared(bytes, 0..len, false)
 }
 
 fn decode_data_block_for_verify(bytes: Vec<u8>) -> Result<DecodedDataBlock> {
     let len = bytes.len();
-    let bytes: Arc<[u8]> = Arc::from(bytes);
+    let bytes = Bytes::from(bytes);
     decode_data_block_shared(bytes, 0..len, true)
 }
 
@@ -5349,7 +5350,7 @@ fn decode_data_block_from_block(
 }
 
 fn decode_data_block_shared(
-    bytes: Arc<[u8]>,
+    bytes: Bytes,
     payload_range: Range<usize>,
     validate_full_hash_index: bool,
 ) -> Result<DecodedDataBlock> {

@@ -12313,3 +12313,66 @@ Negative check:
 - If continuing serialization/decode work, measure the remaining storage buffer
   backing and LZ4 decode allocation boundaries before changing them.
 - Otherwise, move next to concurrent read/write and background maintenance.
+
+## 2026-06-14: Storage Read Buffer Shared Bytes
+
+### Observation
+
+- Phase 181 removed the uncompressed checked-block payload duplicate copy, but
+  `StorageReadBuffer::from_vec` still converted read-owned `Vec<u8>` buffers
+  into `Arc<[u8]>`, which copied the payload before decode could share it.
+- `StorageReadBuffer` now stores `bytes::Bytes`. `Bytes::from(Vec<u8>)` reuses
+  the input allocation and still provides cheap cloneable shared read-only bytes
+  for decoded blocks, block cache entries, and inline point values.
+- `DecodedBlock`, `DecodedDataBlock`, and shared `PointValue` backing now use
+  `Bytes`, preserving the Phase 181 payload range model.
+- The focused test `storage_read_buffer_from_vec_reuses_vec_allocation` proves
+  the storage read buffer slice pointer is the original `Vec<u8>` pointer.
+- The existing `none_codec_owned_decode_reuses_payload_bytes` test still proves
+  uncompressed checked-block decode points into the shared read buffer after the
+  checked-block header.
+- After the change, `TRINE_BENCH_RUNS=5 cargo bench --bench v1_bench` reported:
+  - `block cache random block read`: 1741 us median.
+  - `block cache warm read`: 1494 us median.
+  - `inline runtime block decode read`: 8129 us median.
+  - `native runtime block decode read`: 7958 us median.
+  - `block decode forced diagnostic wall micros`: 8873 us median.
+  - `block decode forced diagnostic storage read owned micros`: 566 us median.
+  - `codec decode only none Trine data blocks`: 193 us median.
+  - `codec decode only fast block compression Trine data blocks`: 4101 us
+    median.
+
+### Interpretation
+
+- The retained change removes the read-owned payload copy at the storage/decode
+  boundary without changing table format, compression format, MVCC visibility,
+  filters, point lookup behavior, block cache behavior, or inline value
+  semantics.
+- Current end-to-end benchmark rows remain noisy. This phase should be treated
+  as a proven ownership/copy cleanup, not as completion of cache/decode
+  latency work.
+- `fast-lz4-block` decode allocation and metadata/index compatibility payload
+  `Vec`s remain separate measurable boundaries.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q storage_read_buffer_from_vec_reuses_vec_allocation --lib`
+- `cargo test -q none_codec_owned_decode_reuses_payload_bytes --lib`
+- `cargo test -q table --lib`
+- `cargo test -q --lib`
+- `cargo test -q --all-features`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `TRINE_BENCH_RUNS=5 cargo bench --bench v1_bench`
+
+### Remaining Blockers
+
+- None for the read-owned storage buffer copy removal.
+- LZ4 decode allocation, metadata/index compatibility payload `Vec`s, and a few
+  whole-object `Arc<[u8]>` compatibility helpers remain open targets.
+
+### Recommended Next Action
+
+- If continuing serialization/decode work, measure LZ4 decode allocation and
+  metadata/index compatibility payload paths before changing them.
+- Otherwise, move next to concurrent read/write and background maintenance.
