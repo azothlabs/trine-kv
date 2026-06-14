@@ -2,6 +2,55 @@
 
 All public crate releases use Semantic Versioning.
 
+## 0.4.1 - 2026-06-14
+
+Performance release. This release tunes write-path, storage-read, blob, and
+background-maintenance hot paths and trims a transitive dependency. The public
+API and the storage format are unchanged from `0.4.0`; this is a pre-`1.0` patch
+release.
+
+### Changed
+
+- Table writer reuses encoded table metadata across blocking writes, returns the
+  loaded table from async writes, and skips re-sorting already ordered table
+  payloads.
+- Level-merge rewrite caches native blob read objects by file id and inlines
+  retained `BlobIndex` values, avoiding repeated open, length, and header
+  validation work for the same blob file.
+- Background maintenance admission is now foreground-first: pressure maintenance
+  runs in the foreground, background maintenance gets an internal pressure-sized
+  budget, and post-commit background flush admission waits for a useful
+  immutable-memtable batch instead of splitting work into many small manifest,
+  persist, and directory-sync turns.
+- Table metadata decodes from shared block payloads, storage reads reuse buffers
+  as shared bytes, and the none-codec data-block path avoids a payload copy.
+- Block-cache hit maintenance, blob maintenance cleanup publishing, prefix-scan
+  cursor metadata, WAL dirty-lane persist, localized point batch setup, and
+  writer lease reopen are each made cheaper on their hot paths.
+- `lz4_flex` is pinned to `default-features = false` with only the checked block
+  decode features Trine uses.
+
+### Added
+
+- Foreground/background maintenance contention benchmark diagnostics for
+  classifying read/write latency under flush and compaction pressure.
+- Grouped multi-run benchmark summaries.
+
+### Fixed
+
+- Startup recovery benchmark boundaries.
+
+### Dependencies
+
+- Dropped the `twox-hash` transitive dependency, which followed from narrowing
+  `lz4_flex` to its checked-decode feature set.
+
+### Notes
+
+- Background flush admission now waits for a useful immutable-memtable batch, so
+  tiny write bursts may stay in memory longer until pressure, an explicit flush,
+  close, or later writes trigger maintenance.
+
 ## 0.4.0 - 2026-06-13
 
 Platform I/O release. This release makes `platform-io` the portable async
