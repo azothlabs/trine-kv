@@ -111,8 +111,8 @@ pub(crate) fn plan_compaction(
         return Ok(None);
     };
     let output_level = level.next().ok_or_else(level_overflow)?;
-    let input_tables = leveled_inputs(tables, range, level, output_level);
-    if input_tables.len() < 2 {
+    let input_tables = narrow_leveled_inputs(tables, range, level, output_level);
+    if input_tables.is_empty() {
         return Ok(None);
     }
 
@@ -346,22 +346,6 @@ fn level_target_bytes(level: TableLevel, options: CompactionOptions) -> u64 {
         target = target.saturating_mul(options.level_size_multiplier.max(2));
     }
     target
-}
-
-fn leveled_inputs(
-    tables: &[CompactionTable],
-    range: &KeyRange,
-    input_level: TableLevel,
-    output_level: TableLevel,
-) -> Vec<TableId> {
-    let mut input_tables = tables
-        .iter()
-        .filter(|table| table.level == input_level && table.overlaps_range(range))
-        .map(|table| table.id)
-        .collect::<Vec<_>>();
-    let span = key_span_for_inputs(tables, &input_tables);
-    include_overlapping_level(tables, &mut input_tables, output_level, span.as_ref());
-    input_tables
 }
 
 fn narrow_leveled_inputs(
@@ -599,7 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn no_l0_fallback_moves_shallowest_overlapping_level_down() {
+    fn multi_table_fallback_uses_guard_local_input() {
         let tables = vec![
             table(1, 1, b"a", b"b"),
             table(2, 1, b"c", b"d"),
@@ -616,8 +600,34 @@ mod tests {
         .expect("planning succeeds")
         .expect("plan exists");
 
-        assert_eq!(plan.input_tables, vec![TableId(1), TableId(2), TableId(3)]);
+        assert_eq!(plan.input_tables, vec![TableId(1), TableId(3)]);
         assert_eq!(plan.output_level, TableLevel(2));
+        assert_eq!(plan.trigger, CompactionTrigger::MultiTableLevel);
+    }
+
+    #[test]
+    fn multi_table_fallback_closes_lower_level_overlaps() {
+        let tables = vec![
+            table(1, 1, b"a", b"b"),
+            table(2, 1, b"m", b"n"),
+            table(3, 2, b"b", b"c"),
+            table(4, 2, b"c", b"d"),
+        ];
+
+        let plan = plan_compaction(
+            "default",
+            &tables,
+            &KeyRange::all(),
+            Sequence::ZERO,
+            options(),
+        )
+        .expect("planning succeeds")
+        .expect("plan exists");
+
+        assert_eq!(plan.input_tables, vec![TableId(1), TableId(3), TableId(4)]);
+        assert_eq!(plan.output_level, TableLevel(2));
+        assert_eq!(plan.key_range.start, Bound::Included(b"a".to_vec()));
+        assert_eq!(plan.key_range.end, Bound::Included(b"d".to_vec()));
         assert_eq!(plan.trigger, CompactionTrigger::MultiTableLevel);
     }
 

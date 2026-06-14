@@ -401,7 +401,7 @@ impl LevelState {
             table_has_key_bounds(table) && properties.largest_user_key.as_slice() < key
         });
         let table = self.tables.get(index)?;
-        table_has_key_bounds(table).then_some(table)
+        table.key_bounds_may_contain_key(key).then_some(table)
     }
 
     fn tables_overlapping_range(&self, range: &KeyRange) -> Vec<Arc<Table>> {
@@ -616,6 +616,20 @@ mod tests {
                 l1_hit.properties().id,
                 l2_hit.properties().id,
             ]
+        );
+    }
+
+    #[test]
+    fn point_lookup_skips_gap_before_next_deeper_table() {
+        let left = Arc::new(test_table(52, TableLevel(1), b"a", 5));
+        let right = Arc::new(test_table(53, TableLevel(1), b"c", 5));
+        let version = LsmVersion::new(vec![left, Arc::clone(&right)]).expect("valid version");
+
+        assert!(version.point_lookup_tables(b"b").is_empty());
+        assert_eq!(
+            right.read_path_stats().point_non_l0_table_probes,
+            0,
+            "gap lookup must not probe the next table in the level"
         );
     }
 

@@ -6,83 +6,82 @@ Complete
 
 ## Goal
 
-Complete Phase C from `.phrase/protocol/guard-aware-lsm-strategy.md`: make
-guard-aware range and prefix scan pruning safe for range-shaped operations,
-including range tombstones that can hide returned records.
+Complete Phase D from `.phrase/protocol/guard-aware-lsm-strategy.md`: make
+the compaction picker use guard-local inputs for multi-table level cleanup when
+it can reduce rewrite work without increasing point-read candidate depth.
 
 ## Design Assessment
 
-Phase B made point and grouped point reads use existing table key bounds to
-avoid unrelated L0 candidates. Phase C needed the same guard boundary for scans,
-but scan correctness is stricter: a table can matter even when it has no point
-records in the queried range if it carries a range tombstone that hides those
-records.
+Phase D now keeps compaction inside the existing Trine LSM boundary. It does
+not add persisted guard metadata and does not change WAL, manifest, SSTable,
+blob, MVCC, or public API contracts. The retained picker change uses the
+current table key bounds as in-memory guards.
 
-The retained change is intentionally conservative. Tables with complete key
-bounds still use those bounds for point and scan candidate selection. Tables
-with ambiguous bounds and range tombstones are treated as possible candidates,
-so scan and point-read tombstone checks cannot skip a table only because its
-guard bounds are incomplete.
+The important correction exposed by benchmark verification was on the read
+side: moving one L1 table to L2 created a guard hole in L1. The non-L0 table
+lookup previously used the next table whose largest key was high enough but
+did not confirm that the key was also above that table's smallest key. That
+could add a false table probe before reaching the moved table in L2. Phase D
+therefore includes the read-bound fix needed for the acceptance gate.
 
 ## Scope
 
-- Range scan candidate diagnostics.
-- Range and prefix scan tombstone-table diagnostics.
-- Conservative key-bound handling for tombstone tables with ambiguous bounds.
-- Persistent regression coverage for tombstone-only table scans, reverse scans,
-  prefix scans, snapshots, and reopen.
+- Guard-local multi-table compaction fallback.
+- Lower-level overlap closure for the selected guard-local input range.
+- Persistent regression coverage for moving one guard-local L1 table to L2.
+- Non-L0 point lookup guard-hole fix.
+- Benchmark diagnostics for broad-estimate vs actual guard-local rewrite work.
 
 ## Out Of Scope
 
 - Persisted guard metadata.
-- Manifest, WAL, SSTable, or table-format changes.
+- Manifest, WAL, SSTable, blob, or table-format changes.
 - Public read/write API naming changes.
-- Compaction policy changes beyond the already closed Phase 188 picker gate.
-- Bottom-level lazy/tiered policy work.
+- Non-uniform per-level compaction policy.
+- Bottom-level lazy or tiered compaction.
 
 ## Acceptance Gate
 
-- Range, prefix, reverse, snapshot, and range-delete tests pass.
-- Diagnostics show range scan table candidates and tombstone-table candidates.
-- Prefix diagnostics show tombstone-table candidates.
-- Tombstone-only or ambiguous-bound tables remain visible to point and scan
-  tombstone checks.
-- Transaction conflict checks remain conservative; no narrower conflict scan is
-  introduced in this phase.
+- Compaction input and output bytes drop for guard-local multi-table cleanup.
+- Point-read candidate depth stays flat after guard-local compaction.
+- L0 and lower-level overlap closure behavior is preserved.
+- Table output splitting, manifest publish, and snapshot-delayed cleanup stay
+  on the existing paths.
+- Blob reachability, tombstone retention, and recovery tests pass.
 
 ## Active Task Slice
 
 ```text
-task830 [x] goal:complete guard-aware scan and range-delete safety | scope:src/table.rs src/lsm/scan.rs src/lsm/version.rs src/stats.rs benches/v1_bench.rs tests/internal/persistent_wal.rs | verify:range/prefix/reverse/snapshot/range-delete tests + bench diagnostics + full gate
+task831 [x] goal:complete guard-aware compaction picker | scope:src/compaction.rs src/lsm/version.rs benches/v1_bench.rs tests/internal/persistent_wal.rs | verify:compaction/version/persistent/blob/range-delete/snapshot/recovery tests + bench diagnostics + full gate
 ```
 
 ## Evidence
 
-- `ReadPathStats` now reports range scan table probes, L0/non-L0 range table
-  probes, range tombstone-table probes, and prefix tombstone-table probes.
-- `LsmTree::scan_sources` records range table candidates and keeps prefix
-  table candidate recording.
-- `scan_range_tombstones` records tombstone-table candidates for both range and
-  prefix selectors.
-- `Table::key_bounds_may_contain_key` and `Table::key_bounds_overlap_range`
-  now keep tables with ambiguous bounds and range tombstones conservative.
-- A version unit test proves ambiguous tombstone tables remain scan and point
-  tombstone candidates.
-- A persistent regression test proves a tombstone-only table hides range,
-  reverse range, prefix, and reverse prefix scans while snapshots and reopen
-  behavior remain correct.
-- Bench diagnostics now include `read pruning range guarded`, `read pruning
-  range tombstone guarded`, and prefix tombstone-table probe rows.
+- Multi-table fallback now calls `narrow_leveled_inputs`, so the picker chooses
+  one overlapping same-level table and then closes only the lower-level overlap
+  for that selected guard range.
+- Planner tests cover guard-local multi-table selection and lower-level overlap
+  closure.
+- Persistent regression coverage proves three L1 tables become two L1 tables
+  plus one L2 table, with one `MultiTableLevel` input table and reopen-visible
+  data.
+- Non-L0 point lookup now verifies `smallest_user_key <= key <=
+  largest_user_key` after binary positioning, avoiding false probes into the
+  next table when a level has a guard hole.
+- Benchmark diagnostics reported guard multi-table compaction broad estimate
+  of 4 input tables and 35950 input bytes versus actual 1 input table, 9177
+  input bytes, and 9177 output bytes. Point table probes stayed flat at 2048
+  before and after compaction.
 
 ## Known Risks
 
-- The conservative ambiguous-bound path may inspect more tombstone tables when
-  table bounds are incomplete. That is intentional for correctness.
-- Range scan diagnostics currently focus on table and tombstone-table
-  candidates, not range data-block metadata counters.
+- Guard ranges are still derived from table key bounds in memory. Persisted
+  guard metadata remains a future decision.
+- This phase narrows candidate inputs but does not yet implement non-uniform
+  per-level compaction budgets.
 
 ## Next Recommendation
 
-- Start the next phase from explicit read-frequency or range-scan workload
-  evidence before broadening compaction policy beyond the current L0 picker
-  gate.
+- Start Phase E only if new evidence targets non-uniform per-level policy:
+  upper-level overlap budget, middle-level guard-local cleanup, and lower-level
+  lazy or tiered behavior with explicit space/read/write amplification stats.

@@ -26,6 +26,70 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-06-14: Guard-Aware Compaction Picker Completion
+
+### Observation
+
+- Multi-table compaction fallback now uses `narrow_leveled_inputs` instead of
+  selecting every same-level table in the requested range.
+- The selected same-level input still closes overlapping lower-level tables
+  before producing a compaction plan.
+- Added planner coverage for guard-local multi-table selection and
+  lower-level overlap closure.
+- Added a persistent regression where three L1 tables compact into two L1
+  tables plus one L2 table with one `MultiTableLevel` input table, one output
+  table, readable data, and reopen-visible placement.
+- Benchmark verification exposed a read-depth bug after moving a table down:
+  non-L0 point lookup could probe the next table in a level gap because it
+  checked only the candidate table's largest key. Point lookup now confirms
+  the key is inside the table key bounds after binary positioning.
+- The guard multi-table benchmark reported:
+  - broad estimate: 4 input tables, 35950 input bytes, 35950 output bytes;
+  - actual guard-local compaction: 1 input table, 9177 input bytes, 9177
+    output bytes, 18354 rewritten bytes;
+  - point table probes before compaction: 2048;
+  - point table probes after compaction: 2048.
+
+### Interpretation
+
+- Phase D is complete. Guard-aware compaction picker behavior now applies to
+  the multi-table fallback path, not only L0 local maintenance.
+- The retained behavior reduces local rewrite work while preserving lower-level
+  overlap closure and keeping point-read candidate depth flat on the diagnostic
+  workload.
+- The read-bound correction is part of the Phase D acceptance proof because
+  guard-local compaction can create key-space holes in shallower levels.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q point_lookup_skips_gap_before_next_deeper_table --lib`
+- `cargo test -q compaction --lib`
+- `cargo test -q persistent_multi_table_compaction_moves_one_guard_local_input`
+- `cargo test -q persistent_compaction_splits_outputs_and_moves_overfull_l1_down`
+- `cargo test -q blob_gc`
+- `cargo test -q range_delete`
+- `cargo test -q snapshot`
+- `cargo test -q recovery`
+- `cargo check -q --benches`
+- `cargo bench --bench v1_bench`
+- `target/release/deps/v1_bench-25cc53c2c6358df4 | rg "write amp guard multi-table compaction|write amp local compaction comparison (compaction|after read point|trigger)|write amp broad compaction comparison (compaction|after read point|trigger)|write amp blob GC diagnostic (compaction|blob GC|trigger)|write amp blob level merge diagnostic (compaction|blob GC|trigger)"`
+- `cargo clippy -q --all-targets --all-features -- -D warnings`
+- `cargo test -q`
+- `cargo test -q --all-features`
+- `git diff --check`
+
+### Remaining Blockers
+
+- No Phase D blocker remains. Persisted guard metadata and non-uniform
+  per-level compaction policy remain future phases.
+
+### Recommended Next Action
+
+- Start Phase E only with explicit evidence and acceptance gates for
+  non-uniform per-level policy: upper-level overlap budgets, middle-level
+  guard-local cleanup, and lower-level lazy or tiered behavior.
+
 ## 2026-06-14: Guard-Aware Scan And Range Delete Safety
 
 ### Observation

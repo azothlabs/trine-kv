@@ -4697,3 +4697,32 @@ the next recommended boundary was guard-aware safety beyond point reads.
 - Persisted guard metadata, manifest/SSTable format changes, public API names,
   durability changes, platform I/O backend changes, publishing, tagging,
   compaction policy changes, or bottom-level tiering changes.
+
+### Phase 190: Guard-Aware Compaction Picker
+
+**Status**: Complete
+
+**Goal**: Complete Phase D from the guard-aware LSM strategy by narrowing
+multi-table compaction fallback to guard-local inputs when it reduces rewrite
+work without increasing point-read candidate depth.
+
+**Entry Condition**: Phase 189 completed guard-aware scan and range-delete
+safety, and the next required boundary was Phase D compaction picker
+completion.
+
+**Acceptance Gate**:
+
+- Multi-table level fallback selects a guard-local input range and keeps
+  lower-level overlap closure.
+- Compaction input and output bytes drop on the guard-local cleanup workload.
+- Point-read candidate depth improves or stays flat after compaction.
+- Blob reachability, tombstone retention, recovery/reopen, compaction, and
+  grouped benchmark evidence pass.
+- Manifest, WAL, SSTable, blob, MVCC, and public API contracts remain
+  unchanged.
+
+**Major Out Of Scope**:
+
+- Persisted guard metadata, manifest/SSTable format changes, public API names,
+  durability changes, platform I/O backend changes, publishing, tagging,
+  non-uniform per-level compaction policy, or bottom-level tiering changes.

@@ -2089,6 +2089,76 @@ fn persistent_compaction_splits_outputs_and_moves_overfull_l1_down() {
 }
 
 #[test]
+fn persistent_multi_table_compaction_moves_one_guard_local_input() {
+    let path = temp_db_path("multi-table-local-compaction");
+    let mut options = DbOptions::persistent(&path);
+    options.target_table_bytes = usize::MAX / 4;
+    options.max_l0_files = 64;
+
+    {
+        let db = Db::open_sync(options.clone()).expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
+
+        for chunk in 0..3 {
+            let key = format!("key-{chunk:03}").into_bytes();
+            let value = format!("value-{chunk:03}").into_bytes();
+            bucket.put_sync(key, value).expect("write chunk key");
+            db.flush_sync().expect("flush L0 table");
+            db.compact_range_sync(KeyRange::all())
+                .expect("move flushed table to L1");
+        }
+        assert_eq!(default_table_levels(&path), vec![1, 1, 1]);
+
+        let before = db.stats();
+        db.compact_range_sync(KeyRange::all())
+            .expect("multi-table fallback moves one guard-local input");
+        let after = db.stats();
+
+        assert_eq!(default_table_levels(&path), vec![1, 1, 2]);
+        assert_eq!(
+            after
+                .compaction_input_tables
+                .saturating_sub(before.compaction_input_tables),
+            1,
+            "guard-local fallback should avoid rewriting every same-level table"
+        );
+        assert_eq!(
+            after
+                .compaction_output_tables
+                .saturating_sub(before.compaction_output_tables),
+            1
+        );
+        assert_eq!(
+            compaction_trigger_runs(&after, CompactionTrigger::MultiTableLevel).saturating_sub(
+                compaction_trigger_runs(&before, CompactionTrigger::MultiTableLevel)
+            ),
+            1
+        );
+
+        for chunk in 0..3 {
+            let key = format!("key-{chunk:03}").into_bytes();
+            let value = bucket
+                .get_sync(&key)
+                .expect("guard-local compaction reads")
+                .expect("key exists");
+            assert_eq!(value, format!("value-{chunk:03}").into_bytes());
+        }
+    }
+
+    {
+        let db = Db::open_sync(options).expect("persistent db reopens");
+        let bucket = db.default_bucket_sync().expect("bucket reopens");
+        assert_eq!(default_table_levels(&path), vec![1, 1, 2]);
+        assert_eq!(
+            bucket.get_sync(b"key-002").expect("key reopens"),
+            Some(b"value-002".to_vec())
+        );
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_stats_report_tables_blobs_and_compactions() {
     let path = temp_db_path("live-stats");
     let mut options = DbOptions::persistent(&path);

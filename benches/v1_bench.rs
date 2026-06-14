@@ -1018,6 +1018,7 @@ fn extend_maintenance_write_amplification_diagnostics(results: &mut Vec<BenchRes
     extend_flush_write_amplification_diagnostic(results);
     extend_compaction_write_amplification_diagnostic(results);
     extend_compaction_scope_comparison_diagnostic(results);
+    extend_guard_multi_table_compaction_diagnostic(results);
     extend_blob_gc_write_amplification_diagnostic(results);
     extend_blob_level_merge_write_amplification_diagnostic(results);
 }
@@ -1320,6 +1321,117 @@ fn prepare_disjoint_l0_compaction_workload(dir: &Path) {
         db.flush_sync().expect("flush succeeds");
     }
     drop(db);
+}
+
+fn extend_guard_multi_table_compaction_diagnostic(results: &mut Vec<BenchResult>) {
+    let label = "write amp guard multi-table compaction";
+    let dir = temp_dir(label);
+    let db = prepare_guard_multi_table_compaction_workload(&dir);
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+    let read_keys = localized_point_read_keys(ROWS, OPS);
+
+    let before_read_stats = db.stats();
+    let checksum = sequential_point_batch_checksum(&bucket, &read_keys);
+    assert!(checksum > 0, "guard multi-table workload must read rows");
+    let after_before_read_stats = db.stats();
+    let mut before_read_diagnostics = ColdReadDiagnostics::default();
+    before_read_diagnostics.record_delta(&before_read_stats, &after_before_read_stats);
+    before_read_diagnostics.push_read_path_results(results, labelled(label, "before read"));
+
+    let compaction_before = db.stats();
+    let broad_input_tables = bench_level_table_count(&compaction_before, 1);
+    let broad_input_bytes = bench_level_table_bytes(&compaction_before, 1);
+    assert_eq!(
+        broad_input_tables, 4,
+        "diagnostic starts with four L1 tables"
+    );
+    assert_eq!(
+        compaction_before.l0_tables, 0,
+        "diagnostic starts without L0"
+    );
+
+    let started = Instant::now();
+    db.compact_range_sync(KeyRange::all())
+        .expect("guard-local multi-table compaction succeeds");
+    let compaction_after = db.stats();
+    let wall_micros = duration_micros(started.elapsed());
+    let actual_input_tables = compaction_after
+        .compaction_input_tables
+        .saturating_sub(compaction_before.compaction_input_tables);
+    let actual_input_bytes = compaction_after
+        .compaction_input_bytes
+        .saturating_sub(compaction_before.compaction_input_bytes);
+    let actual_output_bytes = compaction_after
+        .compaction_output_bytes
+        .saturating_sub(compaction_before.compaction_output_bytes);
+    assert_eq!(
+        actual_input_tables, 1,
+        "guard-local fallback should choose one same-level input"
+    );
+    assert!(
+        actual_input_bytes < broad_input_bytes,
+        "guard-local input bytes should be below the broad same-level estimate"
+    );
+    assert!(
+        actual_output_bytes < broad_input_bytes,
+        "guard-local output bytes should be below the broad same-level estimate"
+    );
+
+    push_maintenance_write_amp_results(
+        results,
+        label,
+        &compaction_before,
+        &compaction_after,
+        wall_micros,
+    );
+    results.push(BenchResult::diagnostic(
+        labelled(label, "estimated broad input tables"),
+        usize_to_u64(broad_input_tables),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "estimated broad input bytes"),
+        broad_input_bytes,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(label, "estimated broad output bytes"),
+        broad_input_bytes,
+    ));
+
+    let before_after_read_stats = db.stats();
+    let checksum = sequential_point_batch_checksum(&bucket, &read_keys);
+    assert!(checksum > 0, "guard multi-table workload must read rows");
+    let after_after_read_stats = db.stats();
+    let mut after_read_diagnostics = ColdReadDiagnostics::default();
+    after_read_diagnostics.record_delta(&before_after_read_stats, &after_after_read_stats);
+    after_read_diagnostics.push_read_path_results(results, labelled(label, "after read"));
+    assert!(
+        after_read_diagnostics.table_probes <= before_read_diagnostics.table_probes,
+        "guard-local compaction must not increase point table probes"
+    );
+
+    drop(bucket);
+    drop(db);
+    cleanup_dir(&dir);
+}
+
+fn prepare_guard_multi_table_compaction_workload(dir: &Path) -> Db {
+    let mut options = benchmark_persistent_options(dir);
+    options.background_worker_count = 0;
+    options.max_l0_files = 64;
+    options.target_table_bytes = usize::MAX / 4;
+    let db = Db::open_sync(options).expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+    for chunk in 0..4 {
+        for index in 0..(ROWS / 4) {
+            let row = chunk * (ROWS / 4) + index;
+            bucket.put_sync(key(row), value(row)).expect("put succeeds");
+        }
+        db.flush_sync().expect("flush succeeds");
+        db.compact_range_sync(KeyRange::all())
+            .expect("move flushed table to L1");
+    }
+    drop(bucket);
+    db
 }
 
 fn extend_blob_gc_write_amplification_diagnostic(results: &mut Vec<BenchResult>) {
@@ -1639,6 +1751,26 @@ fn push_compaction_level_rows(
         labelled_level(label, diagnostic.level, "compaction rewritten bytes"),
         diagnostic.rewritten_bytes,
     ));
+}
+
+fn bench_level_table_count(stats: &trine_kv::DbStats, level: u32) -> usize {
+    stats
+        .level_tables
+        .iter()
+        .find(|level_stats| level_stats.level == level)
+        .map_or(0, |level_stats| level_stats.tables)
+}
+
+fn bench_level_table_bytes(stats: &trine_kv::DbStats, level: u32) -> u64 {
+    stats
+        .level_tables
+        .iter()
+        .find(|level_stats| level_stats.level == level)
+        .map_or(0, |level_stats| level_stats.bytes)
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 #[derive(Default)]
