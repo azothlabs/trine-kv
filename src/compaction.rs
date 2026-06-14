@@ -147,29 +147,32 @@ fn l0_inputs_with_overlap(
     range: &KeyRange,
     options: CompactionOptions,
 ) -> Vec<TableId> {
+    let broad_inputs = broad_l0_inputs(tables, range);
     let mut inputs = if options.local_l0_compaction {
-        let Some(seed) = pick_l0_seed_table(tables, range) else {
-            return Vec::new();
-        };
-        vec![seed.id]
+        let local_inputs = local_l0_inputs(tables, range);
+        if local_l0_inputs_save_rewrite(tables, &local_inputs, &broad_inputs) {
+            local_inputs
+        } else {
+            broad_inputs
+        }
     } else {
-        tables
-            .iter()
-            .filter(|table| table.level == TableLevel::ZERO && table.overlaps_range(range))
-            .map(|table| table.id)
-            .collect::<Vec<_>>()
+        broad_inputs
     };
     if inputs.is_empty() {
         return inputs;
     }
+    close_overlapping_l0_inputs(tables, &mut inputs);
+    inputs
+}
 
+fn close_overlapping_l0_inputs(tables: &[CompactionTable], inputs: &mut Vec<TableId>) {
     // L0 tables may overlap each other. Start from one local seed and then
     // close only the L0 span that touches it; unrelated L0 files remain for a
     // later pass instead of being rewritten just because the request range was
     // broad.
     loop {
-        let Some(span) = key_span_for_inputs(tables, &inputs) else {
-            return inputs;
+        let Some(span) = key_span_for_inputs(tables, inputs) else {
+            return;
         };
         let before = inputs.len();
         for table in tables {
@@ -181,9 +184,47 @@ fn l0_inputs_with_overlap(
             }
         }
         if inputs.len() == before {
-            return inputs;
+            return;
         }
     }
+}
+
+fn broad_l0_inputs(tables: &[CompactionTable], range: &KeyRange) -> Vec<TableId> {
+    tables
+        .iter()
+        .filter(|table| table.level == TableLevel::ZERO && table.overlaps_range(range))
+        .map(|table| table.id)
+        .collect()
+}
+
+fn local_l0_inputs(tables: &[CompactionTable], range: &KeyRange) -> Vec<TableId> {
+    let mut inputs = pick_l0_seed_table(tables, range).map_or_else(Vec::new, |seed| vec![seed.id]);
+    close_overlapping_l0_inputs(tables, &mut inputs);
+    inputs
+}
+
+fn local_l0_inputs_save_rewrite(
+    tables: &[CompactionTable],
+    local_inputs: &[TableId],
+    broad_inputs: &[TableId],
+) -> bool {
+    if local_inputs.is_empty() || local_inputs.len() >= broad_inputs.len() {
+        return false;
+    }
+    let local_bytes = compaction_input_bytes(tables, local_inputs);
+    let broad_bytes = compaction_input_bytes(tables, broad_inputs);
+    if broad_bytes == 0 {
+        return local_inputs.len().saturating_mul(2) < broad_inputs.len();
+    }
+    local_bytes.saturating_mul(2) < broad_bytes
+}
+
+fn compaction_input_bytes(tables: &[CompactionTable], input_tables: &[TableId]) -> u64 {
+    tables
+        .iter()
+        .filter(|table| input_tables.contains(&table.id))
+        .map(|table| table.bytes)
+        .sum()
 }
 
 fn pick_l0_seed_table<'table>(
@@ -509,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn l0_plan_uses_local_seed_for_disjoint_l0_files() {
+    fn l0_plan_uses_broad_inputs_when_local_rewrite_saving_is_small() {
         let tables = vec![
             table_with_bytes(1, 0, b"a", b"b", 10),
             table_with_bytes(2, 0, b"m", b"n", 20),
@@ -526,9 +567,34 @@ mod tests {
         .expect("planning succeeds")
         .expect("plan exists");
 
-        assert_eq!(plan.input_tables, vec![TableId(2)]);
-        assert_eq!(plan.key_range.start, Bound::Included(b"m".to_vec()));
+        assert_eq!(plan.input_tables, vec![TableId(1), TableId(2)]);
+        assert_eq!(plan.key_range.start, Bound::Included(b"a".to_vec()));
         assert_eq!(plan.key_range.end, Bound::Included(b"n".to_vec()));
+        assert_eq!(plan.output_level, TableLevel(1));
+    }
+
+    #[test]
+    fn l0_plan_uses_local_seed_when_rewrite_saving_is_large() {
+        let tables = vec![
+            table_with_bytes(1, 0, b"a", b"b", 10),
+            table_with_bytes(2, 0, b"m", b"n", 10),
+            table_with_bytes(3, 0, b"q", b"r", 10),
+            table_with_bytes(4, 0, b"x", b"z", 10),
+        ];
+
+        let plan = plan_compaction(
+            "default",
+            &tables,
+            &KeyRange::all(),
+            Sequence::ZERO,
+            options(),
+        )
+        .expect("planning succeeds")
+        .expect("plan exists");
+
+        assert_eq!(plan.input_tables, vec![TableId(1)]);
+        assert_eq!(plan.key_range.start, Bound::Included(b"a".to_vec()));
+        assert_eq!(plan.key_range.end, Bound::Included(b"b".to_vec()));
         assert_eq!(plan.output_level, TableLevel(1));
     }
 

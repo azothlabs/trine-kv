@@ -4644,7 +4644,7 @@ structural optimization direction.
 
 ### Phase 188: Guard-Aware Compaction Policy
 
-**Status**: Active
+**Status**: Complete
 
 **Goal**: Use trigger-level and per-level compaction diagnostics to retain the
 first guard-aware compaction policy change only when it reduces local rewrite

@@ -2,11 +2,11 @@
 
 ## Status
 
-Active
+Complete
 
 ## Goal
 
-Start Phase 188: use the Phase 187 read-path and rewrite-cost counters to make
+Complete Phase 188: use the Phase 187 read-path and rewrite-cost counters to make
 guard-aware compaction policy changes measurable before retaining behavior
 changes.
 
@@ -58,7 +58,7 @@ visible would make later benchmark changes hard to explain.
 ```text
 task827 [x] goal:add compaction trigger diagnostics without changing picker behavior | scope:src/compaction.rs src/lsm/compact.rs src/db.rs src/stats.rs benches/v1_bench.rs tests/internal/persistent_wal.rs | verify:planner tests + persistent stats tests + bench trigger rows
 task828 [x] goal:add local-vs-broad compaction comparison workload | scope:benches/v1_bench.rs | verify:bench rows compare trigger/per-level rewritten bytes and read candidate counters
-task829 [ ] goal:retain first guard-aware compaction picker change only if task828 proves avoidable rewrite | scope:src/compaction.rs src/db.rs | verify:compaction/blob/recovery tests + rewrite/candidate benchmark evidence
+task829 [x] goal:retain first guard-aware compaction picker change only if task828 proves avoidable rewrite | scope:src/compaction.rs src/db.rs | verify:compaction/blob/recovery tests + rewrite/candidate benchmark evidence
 ```
 
 ## Evidence
@@ -78,6 +78,10 @@ task829 [ ] goal:retain first guard-aware compaction picker change only if task8
   for four input tables and left 0 L0 point probes after reads. Both paths kept
   total point table probes and data-block reads at 2048 for the after-read
   measurement.
+- Task829 retained the first picker policy gate: local L0 maintenance is used
+  only when the closed local L0 input bytes are less than half of broad L0 input
+  bytes. When local saving is small, maintenance now compacts the broad L0
+  input instead of leaving extra L0 read candidates for little rewrite benefit.
 
 ## Known Risks
 
@@ -88,8 +92,11 @@ task829 [ ] goal:retain first guard-aware compaction picker change only if task8
   future read depth or lower-level rewrite churn.
 - Local L0 compaction saves rewrite bytes in the comparison workload, but it
   intentionally leaves more L0 read candidates than broad compaction.
+- The current gate uses input table bytes as the rewrite proxy. It does not yet
+  include predicted output bytes or future read frequency.
 
 ## Next Recommendation
 
-- Implement `task829`: retain a picker policy only if it explicitly balances
-  the observed rewrite-byte saving against remaining L0 read candidates.
+- Start the next phase from guard-aware safety beyond point reads, especially
+  range/prefix scans or explicit read-frequency evidence, before broader
+  per-level compaction policy work.

@@ -121,6 +121,59 @@ Record only evidence that can change planning or durable decisions.
   if it has an explicit rewrite/read-candidate gate backed by the comparison
   rows.
 
+## 2026-06-14: Guard-Aware L0 Compaction Policy Gate
+
+### Observation
+
+- Added a retained picker gate for local L0 maintenance compaction.
+- The picker now computes closed local L0 input bytes and broad L0 input bytes.
+  It keeps the local L0 input only when local input bytes are less than half of
+  broad input bytes; otherwise it uses the broad L0 input.
+- Focused planner tests now cover both sides:
+  - large local rewrite saving keeps a single local L0 input;
+  - small local rewrite saving selects broad L0 inputs.
+- The persistent stats test now observes the small-saving case compacting two
+  L0 inputs into one L1 output.
+- The local-vs-broad comparison workload still reports the large-saving case as
+  local: 18354 rewritten bytes locally versus 70881 rewritten bytes broadly,
+  with local after-read L0 probes at 1536 and broad after-read L0 probes at 0.
+
+### Interpretation
+
+- Phase 188 now has its first retained picker policy: local L0 compaction is no
+  longer unconditional whenever maintenance asks for local work.
+- The gate explicitly balances rewrite-byte savings against remaining read
+  candidates. It preserves local compaction for clearly disjoint L0 groups while
+  avoiding local compaction when the immediate rewrite saving is too small.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q compaction --lib`
+- `cargo test -q persistent_flush_auto_compacts_when_l0_pressure_exceeds_limit`
+- `cargo test -q persistent_stats_report_tables_blobs_and_compactions`
+- `cargo test -q blob_gc`
+- `cargo test -q range_delete`
+- `cargo test -q snapshot`
+- `cargo check -q --benches`
+- `cargo bench --bench v1_bench`
+- `target/release/deps/v1_bench-25cc53c2c6358df4 | rg "write amp (local|broad) compaction comparison (compaction|level|trigger|after read point)"`
+- `cargo clippy -q --all-targets --all-features -- -D warnings`
+- `cargo test -q`
+- `git diff --check`
+
+### Remaining Blockers
+
+- No Phase 188 blocker remains. The policy gate uses input bytes as the
+  retained rewrite proxy; future phases still need predicted output bytes, read
+  frequency, or bottom-level tiering before broader policy changes.
+
+### Recommended Next Action
+
+- Close Phase 188. The next phase should extend guard-aware safety to
+  range/prefix scans or start a narrower per-level policy phase with explicit
+  read-frequency evidence.
+
 ## 2026-06-14: L0 Read Candidate Diagnostics
 
 ### Observation

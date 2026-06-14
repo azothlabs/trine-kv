@@ -1610,7 +1610,7 @@ fn persistent_flush_auto_compacts_when_l0_pressure_exceeds_limit() {
 
         bucket.put_sync(b"b", b"b1").expect("write b");
         db.flush_sync().expect("second flush triggers compaction");
-        assert_eq!(default_table_levels(&path), vec![0, 1]);
+        assert_eq!(default_table_levels(&path), vec![1]);
         assert_eq!(
             bucket
                 .get_sync(b"a")
@@ -1626,7 +1626,7 @@ fn persistent_flush_auto_compacts_when_l0_pressure_exceeds_limit() {
 
         bucket.put_sync(b"a", b"a2").expect("write newer a");
         db.flush_sync().expect("new L0 below pressure limit");
-        assert_eq!(default_table_levels(&path), vec![0, 1, 1]);
+        assert_eq!(default_table_levels(&path), vec![0, 1]);
         assert_eq!(
             bucket.get_sync(b"a").expect("newer a reads over L1"),
             Some(b"a2".to_vec())
@@ -1636,7 +1636,7 @@ fn persistent_flush_auto_compacts_when_l0_pressure_exceeds_limit() {
     {
         let db = Db::open_sync(options).expect("persistent db reopens");
         let bucket = db.default_bucket_sync().expect("bucket reopens");
-        assert_eq!(default_table_levels(&path), vec![0, 1, 1]);
+        assert_eq!(default_table_levels(&path), vec![0, 1]);
         assert_eq!(
             bucket.get_sync(b"a").expect("newer a reopens"),
             Some(b"a2".to_vec())
@@ -2028,17 +2028,18 @@ fn persistent_stats_report_tables_blobs_and_compactions() {
             .expect("write large b");
         db.flush_sync().expect("second flush triggers compaction");
         let stats = db.stats();
-        assert_eq!(stats.total_tables, 2);
-        assert_eq!(stats.l0_tables, 1);
+        assert_eq!(stats.total_tables, 1);
+        assert_eq!(stats.l0_tables, 0);
+        assert_eq!(level_table_count(&stats, 0), 0);
         assert_eq!(level_table_count(&stats, 1), 1);
         assert!(level_table_bytes(&stats, 1) > 0);
-        assert_eq!(stats.live_blob_files, 2);
+        assert_eq!(stats.live_blob_files, 1);
         assert_eq!(
             stats.live_blob_bytes,
             (large_a.len() + large_b.len()) as u64
         );
         assert_eq!(stats.compaction_runs, 1);
-        assert_eq!(stats.compaction_input_tables, 1);
+        assert_eq!(stats.compaction_input_tables, 2);
         assert_eq!(stats.compaction_output_tables, 1);
         assert!(stats.compaction_input_bytes > 0);
         assert!(stats.compaction_output_bytes > 0);
