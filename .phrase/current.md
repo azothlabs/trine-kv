@@ -6,62 +6,61 @@ Complete
 
 ## Goal
 
-Phase 3 of `.phrase/protocol/delete-gc-lifecycle.md`: drop wholly-covered files
-during bulk delete (DeleteFilesInRange-style) instead of reading and rewriting
-them, general and layout-agnostic, MVCC-correct.
+Phase 4 of `.phrase/protocol/delete-gc-lifecycle.md`: skip reading source tables
+fully hidden by a visible range tombstone during scans, cutting read
+amplification from deleted-but-not-yet-compacted data. ROI confirmed first by
+Phase 1 measurement (10x scan read amplification).
 
 ## Design Assessment
 
-Investigating the snapshot model showed Trine point reads use the current
-version + sequence filter (no per-snapshot version pin), so an instant
-"remove files now" API would break older snapshots (MVCC violation). The
-MVCC-correct bulk delete is already a range tombstone (`delete_range`, any
-range). File drop is therefore a retention-gated compaction optimization, not a
-new unsafe API, and it stays layout-agnostic (no tenant==bucket assumption).
-Deeper "snapshots pin a version handle" (LMDB-grade MVCC) is a separate future
-initiative, deliberately not in this phase.
+A scan cannot blindly skip a covered span: a write newer than the tombstone
+inside it must still surface. The safe v1 is table-level: skip a source table
+only when one visible tombstone (`seq <= read_sequence`) spatially covers the
+whole table span and is strictly newer than every record in it
+(`table.largest_sequence < tombstone.seq`). Then the table is provably all-hidden
+for this read and is never read. Complements Phase 3 (physical drop when
+retention-safe for all readers) by skipping on a per-read basis even while the
+table must stay for older readers.
 
 ## Scope
 
-- Compaction skips reading/rewriting an input table entirely covered by one
-  range tombstone when (a) it spatially covers the table span, (b) the table's
-  largest sequence <= the tombstone sequence, (c) the tombstone sequence <=
-  `oldest_active_snapshot`. The table drops by file via the existing
-  `input_table_ids` -> obsolete -> snapshot-safe cleanup.
-- Pure coverage decision function, unit-tested.
+- `ScanRangeTombstone::fully_hides_table` (visible + spatial cover + strictly
+  newer than the table).
+- `scan_sources` skips building a cursor for any fully-hidden source table;
+  `scan`/`scan_async` compute tombstones first and pass them + `read_sequence`.
 
 ## Out Of Scope
 
-- `truncate_bucket` / `drop_range` ergonomic wrappers (deferred sugar).
-- Multi-tombstone coverage of one table (single-tombstone only; conservative).
-- Snapshot version-handle pinning (separate LMDB-grade MVCC initiative).
-- A dedicated covered-files-dropped counter (4-caller ripple; deferred).
+- Within-table block-level skip for partially-covered tables (Phase 4b; needs
+  per-block max-sequence metadata = table-format change).
+- A skipped-tables counter.
 
 ## Acceptance Gate
 
-- Coverage decision unit-tested: covered / record-too-new / snapshot-too-old /
-  partial-spatial. Met.
-- Bulk `delete_range(all)` drops covered data tables by file: data gone, durable
-  across reopen, table bytes not grown by a rewrite. Met.
-- No storage-format change; range-delete + snapshot correctness suites pass
-  (the gate matches the merge's own retention). Met.
+- A scan over a fully-covered-but-present table skips it: only live keys return,
+  `scan_internal_records ~= scan_user_keys`, covered keys not read as
+  delete-hidden. Met (`scan_skips_fully_covered_table_on_read_path`).
+- Range-delete + snapshot scan correctness preserved (gate matches range
+  tombstone visibility; newer-than-tombstone writes still surface). Met.
 - Full local gate. Met (one pre-existing background-timing flake).
 
 ## Evidence
 
-- Unit tests `*_droppable*` / `partially_covered_table_is_not_droppable`.
-- `bulk_range_delete_drops_covered_tables_by_file`: 200 keys, delete_range(all),
-  compact -> all keys gone, durable across reopen, `table_bytes` not grown.
-- `cargo test --lib` (368) and `--all-features` (372) green; fmt/clippy/diff clean.
+- `scan_skips_fully_covered_table_on_read_path`: two tables (a*, z*), delete a*
+  with a fresh tombstone, scan -> 50 z keys, `internal ~= user`, hidden ~0
+  (the a* table skipped without reading).
+- Single-table-partial diagnostic still 10x (unchanged): that case is Phase 4b.
+- `cargo test --lib` (368) and `--all-features` (373) green; fmt/clippy/diff clean.
 
 ## Known Risks
 
-- Conservative single-tombstone coverage: a table covered only by several
-  tombstones together is not dropped by file (falls back to rewrite); correct,
-  just not optimized.
+- v1 only skips whole tables; a single table with an internal covered hole still
+  pays per-key (Phase 4b). Conservative single-tombstone coverage.
 
 ## Next Recommendation
 
-- Phase 4 (read-path whole-range skip: skip blocks fully covered by visible
-  tombstones during scans), gated by Phase 1 scan-waste evidence. Optional sugar:
-  `truncate_bucket`/`drop_range`. Optional: covered-files-dropped counter.
+- delete-gc-lifecycle Phases 1-4 (v1) are complete. Remaining optional: Phase 4b
+  (block-level skip, table-format change), `truncate_bucket`/`drop_range` sugar,
+  point-tombstone density (manifest bump), covered/skipped counters. Do per
+  demand. Separate big direction recorded: snapshot version-handle pinning
+  (LMDB-grade MVCC).

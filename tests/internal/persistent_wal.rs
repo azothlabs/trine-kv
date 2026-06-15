@@ -2317,6 +2317,71 @@ fn scan_waste_and_snapshot_lag_metrics_report_gc_health() {
 }
 
 #[test]
+fn scan_skips_fully_covered_table_on_read_path() {
+    let path = temp_db_path("scan-skip-covered");
+    let mut options = DbOptions::persistent(&path);
+    options.background_worker_count = 0;
+    let db = Db::open_sync(options).expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+
+    // Table 1: 50 "a*" keys. Table 2: 50 "z*" keys. Separate flushes.
+    for i in 0..50_u32 {
+        bucket
+            .put_sync(format!("a{i:02}").into_bytes(), b"v".to_vec())
+            .expect("put a");
+    }
+    db.flush_sync().expect("flush table a");
+    for i in 0..50_u32 {
+        bucket
+            .put_sync(format!("z{i:02}").into_bytes(), b"v".to_vec())
+            .expect("put z");
+    }
+    db.flush_sync().expect("flush table z");
+
+    // Delete the whole "a*" table with one range tombstone (fresh, not compacted,
+    // so the "a*" table is still physically present but fully hidden on read).
+    db.delete_range_sync(KeyRange::half_open(b"a".to_vec(), b"b".to_vec()))
+        .expect("range delete a*");
+    db.flush_sync().expect("flush tombstone");
+
+    let before = db.stats();
+    let mut iter = bucket.range_sync(&KeyRange::all()).expect("range scan");
+    let mut returned = 0_u64;
+    while let Some(row) = iter.next_sync() {
+        row.expect("scan row");
+        returned += 1;
+    }
+    drop(iter);
+    let after = db.stats();
+
+    // Correctness: only the live "z*" keys come back.
+    assert_eq!(returned, 50, "only z* keys are live");
+
+    let internal = after
+        .scan_internal_records
+        .saturating_sub(before.scan_internal_records);
+    let user = after.scan_user_keys.saturating_sub(before.scan_user_keys);
+    let hidden = after
+        .scan_tombstone_hidden_keys
+        .saturating_sub(before.scan_tombstone_hidden_keys);
+    assert_eq!(user, 50);
+    // The covered "a*" table was skipped without reading: its 50 records are
+    // neither merged (internal stays ~= user) nor counted as delete-hidden.
+    assert!(
+        internal <= user + 5,
+        "covered table should be skipped, not merged: internal {internal} user {user}"
+    );
+    assert!(
+        hidden <= 5,
+        "skipped table keys must not be read as delete-hidden: {hidden}"
+    );
+
+    drop(bucket);
+    drop(db);
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn bulk_range_delete_drops_covered_tables_by_file() {
     let path = temp_db_path("drop-covered-by-file");
     let mut options = DbOptions::persistent(&path);

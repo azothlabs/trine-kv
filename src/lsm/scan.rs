@@ -42,15 +42,19 @@ impl LsmTree {
     ) -> Result<LsmScan> {
         let source_snapshot = self.scan_source_snapshot(read_sequence)?;
         let version = self.current_version()?;
+        let range_tombstones = Self::scan_range_tombstones(&source_snapshot, &version, selector)?;
+        let sources = self.scan_sources(
+            &source_snapshot,
+            &version,
+            selector,
+            direction,
+            read_sequence,
+            &range_tombstones,
+            block_cache,
+        );
         Ok(LsmScan {
-            range_tombstones: Self::scan_range_tombstones(&source_snapshot, &version, selector)?,
-            sources: self.scan_sources(
-                &source_snapshot,
-                &version,
-                selector,
-                direction,
-                block_cache,
-            ),
+            range_tombstones,
+            sources,
         })
     }
 
@@ -63,20 +67,20 @@ impl LsmTree {
     ) -> Result<LsmScan> {
         let source_snapshot = self.scan_source_snapshot(read_sequence)?;
         let version = self.current_version()?;
+        let range_tombstones =
+            Self::scan_range_tombstones_async(&source_snapshot, &version, selector).await?;
+        let sources = self.scan_sources(
+            &source_snapshot,
+            &version,
+            selector,
+            direction,
+            read_sequence,
+            &range_tombstones,
+            block_cache,
+        );
         Ok(LsmScan {
-            range_tombstones: Self::scan_range_tombstones_async(
-                &source_snapshot,
-                &version,
-                selector,
-            )
-            .await?,
-            sources: self.scan_sources(
-                &source_snapshot,
-                &version,
-                selector,
-                direction,
-                block_cache,
-            ),
+            range_tombstones,
+            sources,
         })
     }
 
@@ -120,12 +124,15 @@ impl LsmTree {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scan_sources(
         &self,
         source_snapshot: &LsmScanSourceSnapshot,
         version: &LsmVersion,
         selector: &ScanSelector,
         direction: Direction,
+        read_sequence: Sequence,
+        range_tombstones: &[ScanRangeTombstone],
         block_cache: Option<&Arc<cache::BlockCache>>,
     ) -> Vec<RecordSource> {
         let mut sources = Vec::new();
@@ -160,6 +167,22 @@ impl LsmTree {
                         continue;
                     }
                 }
+            }
+
+            // Phase 4 read-path skip: a table fully hidden by a visible range
+            // tombstone (it covers the whole span and is strictly newer than
+            // every record) contributes nothing to this read, so skip building a
+            // cursor and never touch its data blocks.
+            let properties = table.properties();
+            if range_tombstones.iter().any(|tombstone| {
+                tombstone.fully_hides_table(
+                    &properties.smallest_user_key,
+                    &properties.largest_user_key,
+                    properties.largest_sequence,
+                    read_sequence,
+                )
+            }) {
+                continue;
             }
 
             let cursor = table.point_cursor(
@@ -375,15 +398,19 @@ mod tests {
         selector: &ScanSelector,
     ) -> Result<LsmScan> {
         let version = tree.current_version()?;
+        let range_tombstones = LsmTree::scan_range_tombstones(source_snapshot, &version, selector)?;
+        let sources = tree.scan_sources(
+            source_snapshot,
+            &version,
+            selector,
+            Direction::Forward,
+            Sequence::new(u64::MAX),
+            &range_tombstones,
+            None,
+        );
         Ok(LsmScan {
-            range_tombstones: LsmTree::scan_range_tombstones(source_snapshot, &version, selector)?,
-            sources: tree.scan_sources(
-                source_snapshot,
-                &version,
-                selector,
-                Direction::Forward,
-                None,
-            ),
+            range_tombstones,
+            sources,
         })
     }
 

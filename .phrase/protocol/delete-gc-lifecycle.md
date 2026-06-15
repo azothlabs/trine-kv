@@ -157,9 +157,37 @@ Acceptance gate:
 
 ### Phase 4: Read-Path Whole-Range Skip
 
-Goal: skip blocks/ranges fully covered by visible tombstones during scans
-(tombstone skyline), and harden tombstone truncation. Gated by Phase 1
-scan-waste evidence showing it is worth it.
+Status: Implemented (2026-06-15), table-level read-path skip (v1).
+
+ROI confirmed first (Phase 1 measurement): a partially-covering big range delete
+leaves 10x scan read amplification (1024 internal / 102 user, 922 tombstone
+hidden per scan) that compaction does not remove.
+
+Correctness constraint: a scan cannot blindly skip a covered span because a write
+newer than the tombstone inside it must still surface. The safe skip is therefore
+gated by per-source sequence knowledge.
+
+v1: at scan source construction, skip building a cursor for a source TABLE that
+is fully hidden for this read - one visible range tombstone (`seq <=
+read_sequence`) spatially covers the whole table key span and is strictly newer
+than every record in the table (`table.largest_sequence < tombstone.seq`, strict
+to avoid the equal-sequence batch-index corner case). The table is never read.
+This handles the common "many fully-covered tables, not yet compacted, new
+readers see the tombstone" case, and complements Phase 3 (which physically drops
+fully-covered tables only when retention-safe for all readers).
+
+Acceptance gate:
+
+- A scan over a fully-covered-but-still-present table skips it: only live keys
+  return; `scan_internal_records ~= scan_user_keys` and the covered keys are not
+  even counted as delete-hidden (`scan_skips_fully_covered_table_on_read_path`).
+- Range-delete + snapshot scan correctness is preserved (the gate matches range
+  tombstone visibility; newer-than-tombstone writes still surface).
+
+Deferred (Phase 4b): within-table block-level skip for a partially-covered table
+(the single-table 10x diagnostic case). It needs per-block max-sequence metadata
+(a table-format change) to keep the newer-write-in-span guarantee at block
+granularity; left until a workload needs sub-table skip.
 
 ## Non-Goals
 

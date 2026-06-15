@@ -13923,3 +13923,50 @@ Negative check:
 
 - `cargo fmt --check`, `cargo check --benches`, `cargo clippy --bench v1_bench
   -D warnings`. `TRINE_BENCH_RUNS=1 cargo bench` rows above. No engine change.
+
+## 2026-06-15: Delete/GC Lifecycle Phase 4 (Read-Path Table Skip)
+
+### Observation
+
+- Correctness constraint: a scan cannot blindly skip a covered span because a
+  write newer than the tombstone inside it must still surface. So the safe skip
+  is gated by per-source sequence knowledge.
+- v1 (table-level): `ScanRangeTombstone::fully_hides_table` + `scan_sources`
+  skips building a cursor for a source table when one visible tombstone (`seq <=
+  read_sequence`) spatially covers the whole table span and is strictly newer
+  than every record (`table.largest_sequence < tombstone.seq`). The table is
+  never read. `scan`/`scan_async` now compute tombstones first and pass them +
+  `read_sequence` into `scan_sources`.
+
+### Interpretation
+
+- Complements Phase 3: Phase 3 physically drops fully-covered tables when
+  retention-safe for ALL readers; Phase 4 skips a fully-hidden table on a
+  per-read basis even while it must stay for older readers (fresh delete, not yet
+  compacted). MVCC-correct: the gate matches range tombstone visibility, and the
+  strict `<` plus full-span requirement guarantee no newer-than-tombstone write
+  is skipped.
+- Within-table partial coverage (the single-table 10x diagnostic) is NOT helped
+  by table-level skip and is deferred to Phase 4b (needs per-block max-sequence
+  metadata = table-format change).
+
+### Verification
+
+- `cargo test -q --lib` (368) and `--all-features` (373, 1 ignored flake) green.
+- `scan_skips_fully_covered_table_on_read_path`: a*/z* tables, delete a* fresh,
+  scan returns 50 z keys with `internal ~= user` and ~0 delete-hidden (a* skipped
+  unread). The single-table-partial diagnostic stays 10x (Phase 4b).
+- Range-delete + snapshot scan correctness suites pass.
+- `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`,
+  `cargo check --benches`, `git diff --check`.
+
+### Remaining Blockers
+
+- Phase 4b (within-table block-level skip), `truncate_bucket`/`drop_range` sugar,
+  point-tombstone density, counters - all deferred per demand. Separate larger
+  direction: snapshot version-handle pinning (LMDB-grade MVCC).
+
+### Recommended Next Action
+
+- delete-gc-lifecycle Phases 1-4 (v1) complete. Pick further work from demand /
+  fresh benchmark evidence.

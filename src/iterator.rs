@@ -1018,6 +1018,24 @@ impl ScanRangeTombstone {
         }
     }
 
+    /// Whether this tombstone, visible at `read_sequence`, hides an entire table
+    /// for this read: it must be visible, spatially cover the whole table key
+    /// span, and be strictly newer than every record in the table so all of them
+    /// are hidden (strict `<` avoids the equal-sequence batch-index corner case).
+    /// Lets a scan skip building a cursor for the table without reading it.
+    pub(crate) fn fully_hides_table(
+        &self,
+        smallest_user_key: &[u8],
+        largest_user_key: &[u8],
+        table_largest_sequence: Sequence,
+        read_sequence: Sequence,
+    ) -> bool {
+        self.sequence <= read_sequence
+            && table_largest_sequence < self.sequence
+            && key_is_in_range(smallest_user_key, &self.range)
+            && key_is_in_range(largest_user_key, &self.range)
+    }
+
     fn covers_visible_point(
         &self,
         key: &[u8],
