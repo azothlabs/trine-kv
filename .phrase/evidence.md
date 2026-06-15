@@ -14019,3 +14019,41 @@ Negative check:
 - Stop speculative read-path optimization. Next work should come from a real
   workload, a measured regression, or the deliberately deferred big direction
   (snapshot version-handle pinning toward LMDB-grade MVCC), not from the lists.
+
+## 2026-06-15 — Snapshot version-pinning Phase 1 (liveness-gated cleanup)
+
+### Observation
+
+- Obsolete table-file cleanup was globally gated: `snapshots.active_count() != 0`
+  blocked ALL deletion. One long-lived snapshot stalled all space reclamation.
+- `Arc<Table>` is held only by versions + transient per-read super-versions
+  (manifest stores properties only). After a table leaves the current version no
+  new reader can acquire it, so its strong count is monotonically non-increasing.
+
+### Interpretation
+
+- A cleanup queue holding the obsolete `Arc<Table>` can delete a file exactly
+  when `strong_count == 1` (queue is sole owner) — TOCTOU-safe. Normal
+  compaction stays correct: a snapshot reads the current version, whose output
+  retains the snapshot's data via `oldest_active_snapshot` retention; only the
+  rewritten input files drop.
+- Trap found: cleanup must run AFTER the compaction call returns, or the
+  compactor's own input `Arc` locals (`compaction_inputs`,
+  `input_tables_for_stats`) keep strong_count > 1 and nothing is deleted.
+  `flush_sync` already did this; `compact_range_sync` needed a trailing pass.
+
+### Verification
+
+- New: `obsolete_tables_drop_while_point_snapshot_open` (deleted despite open
+  snapshot; snapshot reads correct), `obsolete_table_files_kept_until_inflight_iterator_drops`
+  (iterator pins files until dropped). Updated
+  `persistent_compaction_rewrites_tables_and_preserves_reads` to the new
+  semantics (reclaimed despite pinned snapshot; snapshot still reads old view).
+- fmt + clippy --all-targets --all-features clean; `--lib` 371,
+  `--all-features` 375 pass / 1 ignored; `check --benches` clean.
+
+### Recommended Next Action
+
+- Phase 2 (Snapshot reads through a pinned super-version) then Phase 3 (instant
+  truncate decoupled from `oldest_active_snapshot`). Blob cleanup stays
+  snapshot-gated until table liveness is extended to blob reachability.

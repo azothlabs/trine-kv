@@ -340,31 +340,37 @@ impl LsmVersion {
         Self::new(tables)
     }
 
+    /// Installs `output_tables` in place of `input_table_ids`, returning the new
+    /// version and the `Arc<Table>` handles that left the version. The removed
+    /// handles let the caller gate obsolete-file deletion on liveness: once a
+    /// table is out of the current version no new reader can acquire it, so its
+    /// `Arc` strong count only falls and reaches the cleanup-queue-only count
+    /// exactly when no in-flight reader still needs the file.
     pub(crate) fn with_replaced_tables(
         &self,
         input_table_ids: &[TableId],
         output_tables: Vec<Arc<Table>>,
-    ) -> Result<Self> {
+    ) -> Result<(Self, Vec<Arc<Table>>)> {
         let input_table_ids = input_table_ids.iter().copied().collect::<BTreeSet<_>>();
-        let mut removed = 0_usize;
+        let mut removed = Vec::new();
         let mut tables = Vec::new();
 
         for table in self.table_handles() {
             if input_table_ids.contains(&table.properties().id) {
-                removed += 1;
+                removed.push(table);
             } else {
                 tables.push(table);
             }
         }
 
-        if removed != input_table_ids.len() {
+        if removed.len() != input_table_ids.len() {
             return Err(Error::Corruption {
                 message: "compaction tried to replace a table outside current version".to_owned(),
             });
         }
 
         tables.extend(output_tables);
-        Self::new(tables)
+        Ok((Self::new(tables)?, removed))
     }
 }
 
@@ -720,9 +726,15 @@ mod tests {
         let version =
             LsmVersion::new(vec![Arc::clone(&old_l0), Arc::clone(&old_l1)]).expect("valid version");
 
-        let next = version
+        let (next, removed) = version
             .with_replaced_tables(&[old_l0.properties().id], vec![Arc::clone(&output)])
             .expect("compaction installs");
+
+        let removed_ids = removed
+            .iter()
+            .map(|table| table.properties().id)
+            .collect::<Vec<_>>();
+        assert_eq!(removed_ids, vec![old_l0.properties().id]);
 
         let ids = next
             .table_handles()
@@ -741,7 +753,7 @@ mod tests {
         let version = Arc::new(LsmVersion::new(vec![Arc::clone(&old)]).expect("valid version"));
 
         let held_version = Arc::clone(&version);
-        let next = version
+        let (next, _removed) = version
             .with_replaced_tables(&[old.properties().id], vec![Arc::clone(&output)])
             .expect("compaction installs");
 

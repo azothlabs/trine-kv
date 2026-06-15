@@ -2,65 +2,62 @@
 
 ## Status
 
-Complete
+Phase 1 complete (liveness-gated obsolete cleanup). Phases 2-3 planned.
 
 ## Goal
 
-Phase 4 of `.phrase/protocol/delete-gc-lifecycle.md`: skip reading source tables
-fully hidden by a visible range tombstone during scans, cutting read
-amplification from deleted-but-not-yet-compacted data. ROI confirmed first by
-Phase 1 measurement (10x scan read amplification).
+Phase 1 of `.phrase/protocol/snapshot-version-pinning.md`: replace the coarse
+"any active snapshot blocks all obsolete-file cleanup" gate with per-table
+liveness, so a long-lived snapshot no longer stalls space reclamation. Foundation
+for the reader-pins-the-tables-it-needs (LMDB-grade) direction.
 
 ## Design Assessment
 
-A scan cannot blindly skip a covered span: a write newer than the tombstone
-inside it must still surface. The safe v1 is table-level: skip a source table
-only when one visible tombstone (`seq <= read_sequence`) spatially covers the
-whole table span and is strictly newer than every record in it
-(`table.largest_sequence < tombstone.seq`). Then the table is provably all-hidden
-for this read and is never read. Complements Phase 3 (physical drop when
-retention-safe for all readers) by skipping on a per-read basis even while the
-table must stay for older readers.
+`Arc<Table>` is held only by versions (current + iterator-pinned old versions)
+and transient per-read super-versions; the manifest stores only properties.
+Once a table leaves the current version no new reader can acquire it, so its
+`Arc` strong count only falls. A cleanup queue that holds the obsolete
+`Arc<Table>` can therefore delete a file exactly when `strong_count == 1` (queue
+is sole owner) — TOCTOU-safe. Normal compaction stays correct because a snapshot
+reads the current version, whose output retains its data (retention is gated by
+`oldest_active_snapshot`, which includes the snapshot); only the rewritten input
+files are dropped.
 
-## Scope
+## Scope (done)
 
-- `ScanRangeTombstone::fully_hides_table` (visible + spatial cover + strictly
-  newer than the table).
-- `scan_sources` skips building a cursor for any fully-hidden source table;
-  `scan`/`scan_async` compute tombstones first and pass them + `read_sequence`.
+- `LsmVersion::with_replaced_tables` returns the removed `Arc<Table>`;
+  `install_compaction` excludes trivial-move ids and returns the obsolete
+  handles; `install_compacted_tables` aggregates them.
+- `pending_obsolete_tables: Mutex<Vec<Arc<Table>>>` replaces the id set.
+- `retire_obsolete_table_files*` enqueue handles; cleanup drains via
+  `take_deletable_obsolete_tables` (`strong_count == 1`), retries the rest, and
+  re-queues on delete failure. The coarse `active_count()` gate is gone.
+- Cleanup runs after the compaction call returns (locals dropped) so deletion is
+  prompt in the same `compact_range_sync` / `flush_sync` call.
 
-## Out Of Scope
+## Out Of Scope (Phase 1)
 
-- Within-table block-level skip for partially-covered tables (Phase 4b; needs
-  per-block max-sequence metadata = table-format change).
-- A skipped-tables counter.
+- Blob-file cleanup stays snapshot-gated (table liveness first; blobs are
+  reachable through pinned tables — Phase 2/later).
+- Snapshot reading through a pinned version (Phase 2) and instant
+  truncate-with-old-snapshot (Phase 3).
 
 ## Acceptance Gate
 
-- A scan over a fully-covered-but-present table skips it: only live keys return,
-  `scan_internal_records ~= scan_user_keys`, covered keys not read as
-  delete-hidden. Met (`scan_skips_fully_covered_table_on_read_path`).
-- Range-delete + snapshot scan correctness preserved (gate matches range
-  tombstone visibility; newer-than-tombstone writes still surface). Met.
-- Full local gate. Met (one pre-existing background-timing flake).
-
-## Evidence
-
-- `scan_skips_fully_covered_table_on_read_path`: two tables (a*, z*), delete a*
-  with a fresh tombstone, scan -> 50 z keys, `internal ~= user`, hidden ~0
-  (the a* table skipped without reading).
-- Single-table-partial diagnostic still 10x (unchanged): that case is Phase 4b.
-- `cargo test --lib` (368) and `--all-features` (373) green; fmt/clippy/diff clean.
-
-## Known Risks
-
-- v1 only skips whole tables; a single table with an internal covered hole still
-  pays per-key (Phase 4b). Conservative single-tombstone coverage.
+- `obsolete_tables_drop_while_point_snapshot_open`: obsolete inputs deleted even
+  with a snapshot open; snapshot reads stay correct. Met.
+- `obsolete_table_files_kept_until_inflight_iterator_drops`: a live iterator
+  pins the files; after it drops, cleanup reclaims them. Met.
+- `persistent_compaction_rewrites_tables_and_preserves_reads` updated: obsolete
+  inputs reclaimed despite a pinned snapshot, which still reads its old view from
+  the retained output. Met.
+- Full local gate: fmt + clippy --all-targets --all-features clean; `--lib` 371,
+  `--all-features` 375 pass / 1 ignored; `check --benches` clean.
 
 ## Next Recommendation
 
-- delete-gc-lifecycle Phases 1-4 (v1) are complete. Remaining optional: Phase 4b
-  (block-level skip, table-format change), `truncate_bucket`/`drop_range` sugar,
-  point-tombstone density (manifest bump), covered/skipped counters. Do per
-  demand. Separate big direction recorded: snapshot version-handle pinning
-  (LMDB-grade MVCC).
+- Phase 2: `Snapshot` captures a consistent read super-version (version +
+  memtable sources, lazily per bucket) and reads through it. Then Phase 3: instant
+  file-drop / truncate decoupled from `oldest_active_snapshot`.
+- After this initiative: remaining committed backlog — layered-filter Phase 5
+  ([[layered-filter-followups]]) and delete-gc Phase 4b ([[delete-gc-lifecycle]]).

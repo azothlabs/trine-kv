@@ -209,11 +209,25 @@ impl LsmTree {
         ))
     }
 
-    pub(crate) fn install_compaction(&self, output: CompactionOutput) -> Result<()> {
+    /// Installs the compaction output and returns the obsolete input table
+    /// handles whose files are now eligible for liveness-gated deletion. A
+    /// trivial move reuses the input file under the same id, so any removed
+    /// handle whose id reappears in the output is excluded (its file lives on).
+    pub(crate) fn install_compaction(&self, output: CompactionOutput) -> Result<Vec<Arc<Table>>> {
+        let output_ids = output
+            .tables
+            .iter()
+            .map(|table| table.properties().id)
+            .collect::<BTreeSet<_>>();
         let version = self.current_version()?;
-        let version = version.with_replaced_tables(&output.input_table_ids, output.tables)?;
+        let (version, removed) =
+            version.with_replaced_tables(&output.input_table_ids, output.tables)?;
         self.install_version(version)?;
-        Ok(())
+        let obsolete = removed
+            .into_iter()
+            .filter(|table| !output_ids.contains(&table.properties().id))
+            .collect();
+        Ok(obsolete)
     }
 
     pub(crate) fn validate_compaction(&self, output: &CompactionOutput) -> Result<()> {

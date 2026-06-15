@@ -4038,23 +4038,27 @@ fn persistent_compaction_rewrites_tables_and_preserves_reads() {
             .expect("default compacted table list");
         assert_eq!(after_tables.len(), 1);
         assert!(table::table_path(&path, after_tables[0].id).exists());
+        // The data the snapshot needs is retained in the compaction output, so
+        // the obsolete inputs are reclaimed immediately by liveness-gated
+        // cleanup even though the snapshot is still pinned (no reader holds the
+        // obsolete table handles).
         for old_path in &before_table_paths {
             assert!(
-                old_path.exists(),
-                "obsolete compacted table is kept while snapshot is pinned at {}",
+                !old_path.exists(),
+                "obsolete compacted table is reclaimed despite the pinned snapshot at {}",
                 old_path.display()
             );
         }
 
+        // The pinned snapshot still reads its consistent old view from the
+        // retained output table.
+        assert_eq!(
+            snapshot
+                .get_sync(&bucket, b"a")
+                .expect("snapshot still reads old a after cleanup"),
+            Some(b"v1".to_vec())
+        );
         drop(snapshot);
-        db.flush_sync().expect("cleanup pending obsolete tables");
-        for old_path in before_table_paths {
-            assert!(
-                !old_path.exists(),
-                "obsolete compacted table still exists at {}",
-                old_path.display()
-            );
-        }
     }
 
     fs::remove_file(wal::wal_path(&path)).expect("remove WAL after flushed compaction");
@@ -4448,6 +4452,103 @@ fn persistent_wal_checksum_corruption_fails_closed() {
 
     let error = Db::open_sync(options).expect_err("checksum corruption must fail closed");
     assert!(matches!(error, Error::Corruption { .. }));
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn obsolete_tables_drop_while_point_snapshot_open() {
+    let path = temp_db_path("obsolete-drop-with-snapshot");
+    let mut options = DbOptions::persistent(&path);
+    options.background_worker_count = 0;
+
+    {
+        let db = Db::open_sync(options.clone()).expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
+
+        bucket.put_sync(b"a", b"a0").expect("write a");
+        db.flush_sync().expect("flush first L0 table");
+        bucket.put_sync(b"b", b"b0").expect("write b");
+        db.flush_sync().expect("flush second L0 table");
+        assert_eq!(table_file_paths(&path).len(), 2);
+
+        // A point snapshot pins only a read sequence, not any table handle.
+        let snapshot = db.snapshot();
+
+        db.compact_range_sync(KeyRange::all())
+            .expect("compact L0 tables into L1");
+
+        // The coarse model kept every obsolete file while any snapshot was open;
+        // liveness-gated cleanup frees them because no reader pins their handles.
+        assert_eq!(
+            table_file_paths(&path).len(),
+            1,
+            "obsolete inputs are deleted even though a snapshot is open"
+        );
+
+        // Reads through the still-open snapshot remain correct (current version).
+        assert_eq!(
+            snapshot.get_sync(&bucket, b"a").expect("snapshot reads a"),
+            Some(b"a0".to_vec())
+        );
+        assert_eq!(
+            snapshot.get_sync(&bucket, b"b").expect("snapshot reads b"),
+            Some(b"b0".to_vec())
+        );
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn obsolete_table_files_kept_until_inflight_iterator_drops() {
+    let path = temp_db_path("obsolete-keep-until-iter-drops");
+    let mut options = DbOptions::persistent(&path);
+    options.background_worker_count = 0;
+
+    {
+        let db = Db::open_sync(options.clone()).expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
+
+        bucket.put_sync(b"a", b"a0").expect("write a");
+        db.flush_sync().expect("flush first L0 table");
+        bucket.put_sync(b"b", b"b0").expect("write b");
+        db.flush_sync().expect("flush second L0 table");
+        assert_eq!(table_file_paths(&path).len(), 2);
+
+        // A live iterator pins the pre-compaction tables: its scan sources hold
+        // their `Arc<Table>` handles for the iterator's whole lifetime.
+        let iter = bucket.range_sync(&KeyRange::all()).expect("range iterator");
+
+        db.compact_range_sync(KeyRange::all())
+            .expect("compact L0 tables into L1");
+
+        // The output is installed (one new file) but the two obsolete inputs are
+        // still pinned by the live iterator, so their files must remain on disk.
+        assert_eq!(
+            table_file_paths(&path).len(),
+            3,
+            "obsolete inputs stay on disk while an iterator pins them"
+        );
+
+        // The iterator still reads its consistent pre-compaction view.
+        let rows = collect_rows(iter);
+        assert_eq!(
+            rows,
+            vec![
+                (b"a".to_vec(), b"a0".to_vec()),
+                (b"b".to_vec(), b"b0".to_vec()),
+            ]
+        );
+
+        // With the pin released, the next cleanup pass deletes the obsolete files.
+        db.flush_sync().expect("run cleanup pass");
+        assert_eq!(
+            table_file_paths(&path).len(),
+            1,
+            "obsolete inputs are reclaimed once no reader pins them"
+        );
+    }
 
     fs::remove_dir_all(path).expect("cleanup test db");
 }

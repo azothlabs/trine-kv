@@ -226,7 +226,11 @@ pub(crate) struct DbInner {
     buckets: RwLock<BTreeMap<String, Arc<LsmTree>>>,
     snapshots: Arc<SnapshotTracker>,
     checkpoints: Mutex<BTreeMap<String, Sequence>>,
-    pending_obsolete_table_ids: Mutex<BTreeSet<table::TableId>>,
+    // Obsolete table handles awaiting file deletion. Holding the `Arc<Table>`
+    // (not just the id) lets cleanup delete a file only once no in-flight reader
+    // still pins it (`Arc::strong_count == 1`), instead of blocking all deletion
+    // while any snapshot is open. See `.phrase/protocol/snapshot-version-pinning.md`.
+    pending_obsolete_tables: Mutex<Vec<Arc<Table>>>,
     manifest: Option<Mutex<ManifestStore>>,
     // The write-ahead log + single-writer lease behind the Band 3 durability
     // substrate (see `src/substrate.rs`). The native/WASI persistent path holds a
@@ -874,8 +878,7 @@ impl Drop for DbInner {
         let _ = cleanup_pending_obsolete_table_files(
             &self.native_storage,
             persistent_path_from_options(&self.options),
-            &self.snapshots,
-            &self.pending_obsolete_table_ids,
+            &self.pending_obsolete_tables,
         );
         let _ = cleanup_pending_obsolete_blob_files(
             &self.native_storage,
@@ -1146,7 +1149,7 @@ impl Db {
                 buckets: RwLock::new(buckets),
                 snapshots: Arc::new(SnapshotTracker::default()),
                 checkpoints: Mutex::new(BTreeMap::new()),
-                pending_obsolete_table_ids: Mutex::new(BTreeSet::new()),
+                pending_obsolete_tables: Mutex::new(Vec::new()),
                 manifest: Some(Mutex::new(manifest)),
                 // Browser durability rides the `browser_*` fields; the substrate
                 // is inert here.
@@ -1287,7 +1290,7 @@ impl Db {
                 buckets: RwLock::new(buckets),
                 snapshots: Arc::new(SnapshotTracker::default()),
                 checkpoints: Mutex::new(BTreeMap::new()),
-                pending_obsolete_table_ids: Mutex::new(BTreeSet::new()),
+                pending_obsolete_tables: Mutex::new(Vec::new()),
                 manifest: Some(Mutex::new(manifest)),
                 substrate,
                 block_cache: Arc::new(cache::BlockCache::new(block_cache_bytes)),
@@ -1394,7 +1397,7 @@ impl Db {
                 buckets: RwLock::new(buckets),
                 snapshots: Arc::new(SnapshotTracker::default()),
                 checkpoints: Mutex::new(BTreeMap::new()),
-                pending_obsolete_table_ids: Mutex::new(BTreeSet::new()),
+                pending_obsolete_tables: Mutex::new(Vec::new()),
                 manifest: None,
                 // In-memory: no WAL, no lease.
                 substrate: DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(None, None)),
@@ -1661,7 +1664,7 @@ impl Db {
                 buckets: RwLock::new(buckets),
                 snapshots: Arc::new(SnapshotTracker::default()),
                 checkpoints: Mutex::new(BTreeMap::new()),
-                pending_obsolete_table_ids: Mutex::new(BTreeSet::new()),
+                pending_obsolete_tables: Mutex::new(Vec::new()),
                 manifest: Some(Mutex::new(manifest)),
                 substrate: DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(
                     wal,
@@ -3168,6 +3171,10 @@ impl Db {
         };
         let db_path = path.to_path_buf();
         self.run_compaction_barrier(&db_path, &range, false)?;
+        // Run cleanup after the compaction call returns so its input table
+        // handles are dropped; obsolete files are then uniquely owned by the
+        // cleanup queue and reclaimed without waiting for a later pass.
+        self.cleanup_pending_obsolete_table_files(&db_path)?;
 
         Ok(())
     }
@@ -5478,7 +5485,6 @@ impl Db {
             written_table_ids,
         } = self.build_compaction_outputs(db_path, oldest_active_snapshot, &compaction_inputs)?;
 
-        let output_table_ids = compaction_output_table_ids(&written_tables);
         let input_tables_for_stats = compaction_inputs
             .iter()
             .flat_map(|input| input.input.input_tables.iter().cloned())
@@ -5488,13 +5494,6 @@ impl Db {
             .flat_map(|output| output.output.tables.iter().cloned())
             .collect::<Vec<_>>();
         let trigger_stats = compaction_trigger_stat_deltas(&compaction_inputs, &written_tables);
-        // A direct table move keeps the input file alive under the same id, so
-        // cleanup must use only ids that disappeared from the published output.
-        let obsolete_table_ids = compaction_inputs
-            .iter()
-            .flat_map(|input| input.input.input_table_ids.iter().copied())
-            .filter(|table_id| !output_table_ids.contains(table_id))
-            .collect::<Vec<_>>();
         let obsolete_blob_ids =
             self.obsolete_blob_ids_for_compaction(&compaction_inputs, &written_tables)?;
 
@@ -5521,14 +5520,14 @@ impl Db {
             return Err(error);
         }
 
-        self.install_compacted_tables(written_tables)?;
+        let obsolete_tables = self.install_compacted_tables(written_tables)?;
         self.record_compaction_stats_from_tables(
             compaction_inputs.len(),
             &input_tables_for_stats,
             &output_tables_for_stats,
             &trigger_stats,
         );
-        self.retire_obsolete_table_files(db_path, &obsolete_table_ids)?;
+        self.retire_obsolete_table_files(db_path, obsolete_tables)?;
         self.delete_pending_obsolete_blob_files(db_path)?;
         if self.inner.options.blob_gc_enabled {
             self.run_blob_gc_once_locked(db_path)?;
@@ -5637,15 +5636,6 @@ impl Db {
             .flat_map(|input| input.input.input_tables.iter().cloned())
             .collect::<Vec<_>>();
         let trigger_stats = compaction_trigger_stat_deltas(&compaction_inputs, &written_tables);
-        let output_table_ids = output_tables
-            .iter()
-            .map(|table| table.properties().id)
-            .collect::<BTreeSet<_>>();
-        let obsolete_table_ids = compaction_inputs
-            .iter()
-            .flat_map(|input| input.input.input_table_ids.iter().copied())
-            .filter(|table_id| !output_table_ids.contains(table_id))
-            .collect::<Vec<_>>();
         let obsolete_blob_ids =
             self.obsolete_blob_ids_for_compaction(&compaction_inputs, &written_tables)?;
 
@@ -5673,14 +5663,14 @@ impl Db {
             return Err(error);
         }
 
-        self.install_compacted_tables(written_tables)?;
+        let obsolete_tables = self.install_compacted_tables(written_tables)?;
         self.record_compaction_stats_from_tables(
             compaction_inputs.len(),
             &input_tables,
             &output_tables,
             &trigger_stats,
         );
-        self.retire_obsolete_table_files_native_async(db_path, &obsolete_table_ids)
+        self.retire_obsolete_table_files_native_async(db_path, obsolete_tables)
             .await?;
         self.delete_pending_obsolete_blob_files_native_async(db_path)
             .await?;
@@ -5760,15 +5750,6 @@ impl Db {
             .flat_map(|input| input.input.input_tables.iter().cloned())
             .collect::<Vec<_>>();
         let trigger_stats = compaction_trigger_stat_deltas(&compaction_inputs, &written_tables);
-        let output_table_ids = output_tables
-            .iter()
-            .map(|table| table.properties().id)
-            .collect::<BTreeSet<_>>();
-        let obsolete_table_ids = compaction_inputs
-            .iter()
-            .flat_map(|input| input.input.input_table_ids.iter().copied())
-            .filter(|table_id| !output_table_ids.contains(table_id))
-            .collect::<Vec<_>>();
         let obsolete_blob_ids =
             self.obsolete_blob_ids_for_compaction(&compaction_inputs, &written_tables)?;
 
@@ -5791,14 +5772,14 @@ impl Db {
             return Err(error);
         }
 
-        self.install_compacted_tables(written_tables)?;
+        let obsolete_tables = self.install_compacted_tables(written_tables)?;
         self.record_compaction_stats_from_tables(
             compaction_inputs.len(),
             &input_tables,
             &output_tables,
             &trigger_stats,
         );
-        self.retire_obsolete_table_files_browser_async(db_path, &obsolete_table_ids)
+        self.retire_obsolete_table_files_browser_async(db_path, obsolete_tables)
             .await?;
         self.delete_pending_obsolete_blob_files_browser_async(db_path)
             .await?;
@@ -6146,11 +6127,6 @@ impl Db {
             .iter()
             .map(|table| table.output_table_id)
             .collect::<Vec<_>>();
-        let obsolete_table_ids = plan
-            .tables
-            .iter()
-            .map(|table| table.input_table_id)
-            .collect::<Vec<_>>();
         let indexes = match blob::write_blob_file_with_backend(
             &self.inner.native_storage,
             db_path,
@@ -6200,8 +6176,8 @@ impl Db {
             return Err(error);
         }
 
-        self.install_compacted_tables(outputs)?;
-        self.retire_obsolete_table_files(db_path, &obsolete_table_ids)?;
+        let obsolete_tables = self.install_compacted_tables(outputs)?;
+        self.retire_obsolete_table_files(db_path, obsolete_tables)?;
         self.inner.blob_gc_runs.fetch_add(1, Ordering::AcqRel);
         self.inner
             .blob_gc_input_bytes
@@ -6248,11 +6224,6 @@ impl Db {
             .tables
             .iter()
             .map(|table| table.output_table_id)
-            .collect::<Vec<_>>();
-        let obsolete_table_ids = plan
-            .tables
-            .iter()
-            .map(|table| table.input_table_id)
             .collect::<Vec<_>>();
         let storage = self.inner.native_storage.clone();
         let indexes = match blob::write_blob_file_with_backend_async(
@@ -6304,8 +6275,8 @@ impl Db {
             return Err(error);
         }
 
-        self.install_compacted_tables(outputs)?;
-        self.retire_obsolete_table_files_native_async(db_path, &obsolete_table_ids)
+        let obsolete_tables = self.install_compacted_tables(outputs)?;
+        self.retire_obsolete_table_files_native_async(db_path, obsolete_tables)
             .await?;
         self.inner.blob_gc_runs.fetch_add(1, Ordering::AcqRel);
         self.inner
@@ -6415,8 +6386,8 @@ impl Db {
             return Err(error);
         }
 
-        self.install_compacted_tables(outputs)?;
-        self.retire_obsolete_table_files_browser_async(db_path, &obsolete_table_ids)
+        let obsolete_tables = self.install_compacted_tables(outputs)?;
+        self.retire_obsolete_table_files_browser_async(db_path, obsolete_tables)
             .await?;
         self.inner.blob_gc_runs.fetch_add(1, Ordering::AcqRel);
         self.inner
@@ -7071,13 +7042,22 @@ impl Db {
         Ok(())
     }
 
-    fn install_compacted_tables(&self, outputs: Vec<NamedCompactionOutput>) -> Result<()> {
+    /// Installs each compaction output and returns the obsolete input table
+    /// handles whose files are now eligible for liveness-gated deletion. Callers
+    /// that manage table files through the pending-obsolete queue pass the result
+    /// to `retire_obsolete_table_files`; object-store mode ignores it and relies
+    /// on snapshot-safe orphan GC instead.
+    fn install_compacted_tables(
+        &self,
+        outputs: Vec<NamedCompactionOutput>,
+    ) -> Result<Vec<Arc<Table>>> {
+        let mut obsolete = Vec::new();
         for output in outputs {
             let state = self.bucket_state(&output.bucket)?;
-            state.install_compaction(output.output)?;
+            obsolete.extend(state.install_compaction(output.output)?);
         }
 
-        Ok(())
+        Ok(obsolete)
     }
 
     fn validate_compacted_tables(&self, outputs: &[NamedCompactionOutput]) -> Result<()> {
@@ -7349,17 +7329,9 @@ impl Db {
     fn retire_obsolete_table_files(
         &self,
         db_path: &Path,
-        table_ids: &[table::TableId],
+        obsolete_tables: Vec<Arc<Table>>,
     ) -> Result<()> {
-        {
-            let mut pending = self
-                .inner
-                .pending_obsolete_table_ids
-                .lock()
-                .map_err(|_| lock_poisoned("obsolete table cleanup queue"))?;
-            pending.extend(table_ids.iter().copied());
-        }
-
+        self.enqueue_obsolete_tables(obsolete_tables)?;
         self.cleanup_pending_obsolete_table_files(db_path)
     }
 
@@ -7367,17 +7339,9 @@ impl Db {
     async fn retire_obsolete_table_files_native_async(
         &self,
         db_path: &Path,
-        table_ids: &[table::TableId],
+        obsolete_tables: Vec<Arc<Table>>,
     ) -> Result<()> {
-        {
-            let mut pending = self
-                .inner
-                .pending_obsolete_table_ids
-                .lock()
-                .map_err(|_| lock_poisoned("obsolete table cleanup queue"))?;
-            pending.extend(table_ids.iter().copied());
-        }
-
+        self.enqueue_obsolete_tables(obsolete_tables)?;
         self.cleanup_pending_obsolete_table_files_native_async(db_path)
             .await
     }
@@ -7386,27 +7350,39 @@ impl Db {
     async fn retire_obsolete_table_files_browser_async(
         &self,
         db_path: &Path,
-        table_ids: &[table::TableId],
+        obsolete_tables: Vec<Arc<Table>>,
     ) -> Result<()> {
-        {
-            let mut pending = self
-                .inner
-                .pending_obsolete_table_ids
-                .lock()
-                .map_err(|_| lock_poisoned("obsolete table cleanup queue"))?;
-            pending.extend(table_ids.iter().copied());
-        }
-
+        self.enqueue_obsolete_tables(obsolete_tables)?;
         self.cleanup_pending_obsolete_table_files_browser_async(db_path)
             .await
+    }
+
+    fn enqueue_obsolete_tables(&self, obsolete_tables: Vec<Arc<Table>>) -> Result<()> {
+        if obsolete_tables.is_empty() {
+            return Ok(());
+        }
+        self.inner
+            .pending_obsolete_tables
+            .lock()
+            .map_err(|_| lock_poisoned("obsolete table cleanup queue"))?
+            .extend(obsolete_tables);
+        Ok(())
+    }
+
+    fn requeue_obsolete_tables(&self, obsolete_tables: Vec<Arc<Table>>) -> Result<()> {
+        self.inner
+            .pending_obsolete_tables
+            .lock()
+            .map_err(|_| lock_poisoned("obsolete table cleanup queue"))?
+            .extend(obsolete_tables);
+        Ok(())
     }
 
     fn cleanup_pending_obsolete_table_files(&self, db_path: &Path) -> Result<()> {
         cleanup_pending_obsolete_table_files(
             &self.inner.native_storage,
             Some(db_path),
-            &self.inner.snapshots,
-            &self.inner.pending_obsolete_table_ids,
+            &self.inner.pending_obsolete_tables,
         )
     }
 
@@ -7415,42 +7391,35 @@ impl Db {
         &self,
         db_path: &Path,
     ) -> Result<()> {
-        if self.inner.snapshots.active_count() != 0 {
+        let deletable = take_deletable_obsolete_tables(&self.inner.pending_obsolete_tables)?;
+        if deletable.is_empty() {
             return Ok(());
         }
 
-        let table_ids = {
-            let pending = self
-                .inner
-                .pending_obsolete_table_ids
-                .lock()
-                .map_err(|_| lock_poisoned("obsolete table cleanup queue"))?;
-            if pending.is_empty() {
-                return Ok(());
-            }
-            pending.iter().copied().collect::<Vec<_>>()
-        };
-
         let storage = self.inner.native_storage.clone();
-        for table_id in &table_ids {
-            delete_storage_object_async(
-                &storage,
-                StorageObjectKind::Table,
-                &table::table_path(db_path, *table_id),
-            )
-            .await?;
+        let mut result = Ok(());
+        let mut remaining = Vec::new();
+        for table in deletable {
+            if result.is_ok() {
+                match delete_storage_object_async(
+                    &storage,
+                    StorageObjectKind::Table,
+                    &table::table_path(db_path, table.properties().id),
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(error) => {
+                        result = Err(error);
+                        remaining.push(table);
+                    }
+                }
+            } else {
+                remaining.push(table);
+            }
         }
-
-        let mut pending = self
-            .inner
-            .pending_obsolete_table_ids
-            .lock()
-            .map_err(|_| lock_poisoned("obsolete table cleanup queue"))?;
-        for table_id in table_ids {
-            pending.remove(&table_id);
-        }
-
-        Ok(())
+        self.requeue_obsolete_tables(remaining)?;
+        result
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -7458,42 +7427,35 @@ impl Db {
         &self,
         db_path: &Path,
     ) -> Result<()> {
-        if self.inner.snapshots.active_count() != 0 {
+        let deletable = take_deletable_obsolete_tables(&self.inner.pending_obsolete_tables)?;
+        if deletable.is_empty() {
             return Ok(());
         }
 
-        let table_ids = {
-            let pending = self
-                .inner
-                .pending_obsolete_table_ids
-                .lock()
-                .map_err(|_| lock_poisoned("obsolete table cleanup queue"))?;
-            if pending.is_empty() {
-                return Ok(());
-            }
-            pending.iter().copied().collect::<Vec<_>>()
-        };
-
         let storage = self.browser_storage()?;
-        for table_id in &table_ids {
-            storage
-                .delete_object(StorageObjectId::native_file(
-                    StorageObjectKind::Table,
-                    table::table_path(db_path, *table_id),
-                ))
-                .await?;
+        let mut result = Ok(());
+        let mut remaining = Vec::new();
+        for table in deletable {
+            if result.is_ok() {
+                match storage
+                    .delete_object(StorageObjectId::native_file(
+                        StorageObjectKind::Table,
+                        table::table_path(db_path, table.properties().id),
+                    ))
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(error) => {
+                        result = Err(error);
+                        remaining.push(table);
+                    }
+                }
+            } else {
+                remaining.push(table);
+            }
         }
-
-        let mut pending = self
-            .inner
-            .pending_obsolete_table_ids
-            .lock()
-            .map_err(|_| lock_poisoned("obsolete table cleanup queue"))?;
-        for table_id in table_ids {
-            pending.remove(&table_id);
-        }
-
-        Ok(())
+        self.requeue_obsolete_tables(remaining)?;
+        result
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -7713,19 +7675,6 @@ fn compaction_trigger_stat_deltas(
         );
     }
     triggers.into_values().collect()
-}
-
-fn compaction_output_table_ids(outputs: &[NamedCompactionOutput]) -> BTreeSet<table::TableId> {
-    outputs
-        .iter()
-        .flat_map(|output| {
-            output
-                .output
-                .tables
-                .iter()
-                .map(|table| table.properties().id)
-        })
-        .collect()
 }
 
 const fn empty_compaction_trigger_stats(trigger: CompactionTrigger) -> CompactionTriggerStats {
@@ -9253,36 +9202,58 @@ fn persistent_path_from_options(options: &DbOptions) -> Option<&Path> {
 fn cleanup_pending_obsolete_table_files(
     backend: &NativeFileBackend,
     db_path: Option<&Path>,
-    snapshots: &SnapshotTracker,
-    pending_table_ids: &Mutex<BTreeSet<table::TableId>>,
+    pending_tables: &Mutex<Vec<Arc<Table>>>,
 ) -> Result<()> {
     let Some(db_path) = db_path else {
         return Ok(());
     };
-    if snapshots.active_count() != 0 {
+
+    let deletable = take_deletable_obsolete_tables(pending_tables)?;
+    if deletable.is_empty() {
         return Ok(());
     }
 
-    let table_ids = {
-        let pending = pending_table_ids
+    let table_ids = deletable
+        .iter()
+        .map(|table| table.properties().id)
+        .collect::<Vec<_>>();
+    if let Err(error) = remove_table_files(backend, db_path, &table_ids) {
+        pending_tables
             .lock()
-            .map_err(|_| lock_poisoned("obsolete table cleanup queue"))?;
-        if pending.is_empty() {
-            return Ok(());
-        }
-        pending.iter().copied().collect::<Vec<_>>()
-    };
-
-    remove_table_files(backend, db_path, &table_ids)?;
-
-    let mut pending = pending_table_ids
-        .lock()
-        .map_err(|_| lock_poisoned("obsolete table cleanup queue"))?;
-    for table_id in table_ids {
-        pending.remove(&table_id);
+            .map_err(|_| lock_poisoned("obsolete table cleanup queue"))?
+            .extend(deletable);
+        return Err(error);
     }
 
     Ok(())
+}
+
+/// Takes the obsolete tables whose files are safe to delete now: those the
+/// cleanup queue is the sole owner of (`Arc::strong_count == 1`). Once a table
+/// leaves the current version no new reader can acquire it, so its strong count
+/// only falls; a count of 1 proves no in-flight reader still pins the file.
+/// Tables still pinned stay queued and are retried on the next pass.
+fn take_deletable_obsolete_tables(
+    pending_tables: &Mutex<Vec<Arc<Table>>>,
+) -> Result<Vec<Arc<Table>>> {
+    let mut pending = pending_tables
+        .lock()
+        .map_err(|_| lock_poisoned("obsolete table cleanup queue"))?;
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut deletable = Vec::new();
+    let mut retained = Vec::with_capacity(pending.len());
+    for table in pending.drain(..) {
+        if Arc::strong_count(&table) == 1 {
+            deletable.push(table);
+        } else {
+            retained.push(table);
+        }
+    }
+    *pending = retained;
+    Ok(deletable)
 }
 
 fn cleanup_pending_obsolete_blob_files(
