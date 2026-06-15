@@ -13884,3 +13884,42 @@ Negative check:
 
 - Phase 4: read-path whole-range skip (skip blocks fully covered by visible
   tombstones during scans), gated by Phase 1 scan-waste evidence.
+
+## 2026-06-15: Phase 4 ROI Measurement (tombstone scan waste)
+
+### Observation
+
+- Added a `tombstone scan waste diagnostic` benchmark: write `ROWS` keys to one
+  table, `delete_range` the middle ~90% (one big range tombstone), then full-scan
+  and diff the Phase 1 scan-waste counters, before and after a compaction.
+- Result (single-threaded, no snapshots):
+  - user keys 102, internal records 1024, tombstone-hidden 922, internal/user
+    = 10.0x — both BEFORE and AFTER `compact_range(all)` (identical).
+
+### Interpretation
+
+- Phase 4 ROI is confirmed high: a partially-covering big range tombstone leaves
+  every covered key physically in the table, so each scan reads 1024 records to
+  return 102 (10x read amplification, 922 wasted reads per scan).
+- Compaction does not remove it here, and this is correct, not a bug: (a) the
+  data table spans the whole range while the tombstone covers only the middle, so
+  it is partially covered and Phase 3 file-drop (whole-table only) rightly does
+  not fire; (b) the merge can only drop covered records when `tombstone_seq <=
+  oldest_retained`, but a fresh bulk delete sits above the retention floor, so the
+  covered data is correctly retained until retention advances. This is exactly
+  Phase 4's window: data physically present, read-path pays per key.
+- Note on the earlier Phase 3 test: `get -> None` proves the tombstone hides the
+  key, not that the file dropped; Phase 3 file-drop only fires on whole-table
+  coverage with `tombstone_seq <= oldest_retained`. The two phases are
+  complementary: Phase 3 removes fully-covered retention-safe tables; Phase 4
+  skips covered runs on the read path for everything else.
+
+### Decision
+
+- Proceed with Phase 4 (read-path whole-range / tombstone-skyline skip). Keep the
+  diagnostic as a regression baseline (target: internal/user drops toward ~1x).
+
+### Verification
+
+- `cargo fmt --check`, `cargo check --benches`, `cargo clippy --bench v1_bench
+  -D warnings`. `TRINE_BENCH_RUNS=1 cargo bench` rows above. No engine change.

@@ -90,6 +90,7 @@ fn run_benchmarks() -> Vec<BenchResult> {
     extend_background_maintenance_contention_diagnostics(&mut results);
     extend_layered_filter_fpr_diagnostic(&mut results);
     extend_group_commit_diagnostic(&mut results);
+    extend_tombstone_scan_waste_diagnostic(&mut results);
     results.push(bench_block_cache_warm_read());
     results.push(bench_block_cache_random_block_read());
     extend_block_cache_decode_diagnostics(&mut results);
@@ -1435,6 +1436,91 @@ fn prepare_guard_multi_table_compaction_workload(dir: &Path) -> Db {
     }
     drop(bucket);
     db
+}
+
+fn extend_tombstone_scan_waste_diagnostic(results: &mut Vec<BenchResult>) {
+    // Measure-first for Phase 4 (read-path whole-range skip): how much does a
+    // range scan wade through deleted keys while a big range tombstone is still
+    // on the read path (not yet compacted), versus after compaction drops it?
+    let label = "tombstone scan waste diagnostic";
+    let dir = temp_dir(label);
+    let mut options = benchmark_persistent_options(&dir);
+    options.background_worker_count = 0;
+    let db = Db::open_sync(options).expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+
+    let total = ROWS;
+    for index in 0..total {
+        bucket.put_sync(key(index), value(index)).expect("put");
+    }
+    db.flush_sync().expect("flush data");
+    // Delete the middle ~90% as one big range tombstone; keep the edges live.
+    let low = key(total / 20);
+    let high = key(total - total / 20);
+    db.delete_range_sync(KeyRange::half_open(low, high))
+        .expect("range delete");
+    db.flush_sync().expect("flush tombstone");
+
+    push_scan_waste_row(results, label, "before compaction", &db, &bucket);
+    // Phase 3 file-drop cleans the covered tables; scan again for the baseline.
+    db.compact_range_sync(KeyRange::all()).expect("compact");
+    push_scan_waste_row(results, label, "after compaction", &db, &bucket);
+
+    drop(bucket);
+    drop(db);
+    cleanup_dir(&dir);
+}
+
+fn push_scan_waste_row(
+    results: &mut Vec<BenchResult>,
+    label: &'static str,
+    phase: &'static str,
+    db: &Db,
+    bucket: &trine_kv::Bucket,
+) {
+    let before = db.stats();
+    let mut iter = bucket
+        .range_sync(&KeyRange::all())
+        .expect("range scan opens");
+    let mut returned = 0_u64;
+    while let Some(row) = iter.next_sync() {
+        row.expect("scan row");
+        returned += 1;
+    }
+    drop(iter);
+    let after = db.stats();
+
+    let internal = after
+        .scan_internal_records
+        .saturating_sub(before.scan_internal_records);
+    let user = after.scan_user_keys.saturating_sub(before.scan_user_keys);
+    let hidden = after
+        .scan_tombstone_hidden_keys
+        .saturating_sub(before.scan_tombstone_hidden_keys);
+    let ratio_x1000 = if user == 0 {
+        0
+    } else {
+        internal.saturating_mul(1_000) / user
+    };
+
+    let base = labelled(label, phase);
+    results.push(BenchResult::diagnostic(labelled(base, "user keys"), user));
+    results.push(BenchResult::diagnostic(
+        labelled(base, "internal records"),
+        internal,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(base, "tombstone hidden keys"),
+        hidden,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(base, "internal per user x1000"),
+        ratio_x1000,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(base, "rows returned"),
+        returned,
+    ));
 }
 
 fn extend_group_commit_diagnostic(results: &mut Vec<BenchResult>) {
