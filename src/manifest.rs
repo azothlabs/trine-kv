@@ -29,8 +29,10 @@ use crate::storage::BrowserStorageBackend;
 
 pub const MANIFEST_FILE_NAME: &str = "MANIFEST";
 const MANIFEST_MAGIC: u32 = 0x5452_4d46;
-const MANIFEST_VERSION: u16 = 10;
-const MIN_SUPPORTED_MANIFEST_VERSION: u16 = 8;
+const MANIFEST_VERSION: u16 = 11;
+// Clean break: only the current manifest format is read. Older on-disk manifests
+// are rejected rather than decoded through version-gated fallbacks.
+const MIN_SUPPORTED_MANIFEST_VERSION: u16 = MANIFEST_VERSION;
 const HEADER_LEN: usize = 14;
 // The lower bound for one table entry: fixed fields plus two empty byte fields.
 // Decoding uses this to reject impossible counts before reserving memory.
@@ -1298,10 +1300,10 @@ fn decode_manifest(bytes: &[u8]) -> Result<ManifestState> {
         });
     }
 
-    decode_state(payload, version)
+    decode_state(payload)
 }
 
-fn decode_state(payload: &[u8], version: u16) -> Result<ManifestState> {
+fn decode_state(payload: &[u8]) -> Result<ManifestState> {
     let mut cursor = Cursor::new(payload);
     let wal_replay_floor = Sequence::new(cursor.read_u64()?);
     let bucket_count = cursor.read_u32()? as usize;
@@ -1312,20 +1314,12 @@ fn decode_state(payload: &[u8], version: u16) -> Result<ManifestState> {
             String::from_utf8(cursor.read_bytes()?.to_vec()).map_err(|_| Error::InvalidFormat {
                 message: "manifest bucket name is not valid UTF-8".to_owned(),
             })?;
-        let options = cursor.read_bucket_options(version)?;
+        let options = cursor.read_bucket_options()?;
         buckets.insert(name, options);
     }
     let tables = cursor.read_tables()?;
-    let pending_blob_deletions = if version >= 5 {
-        cursor.read_pending_blob_deletions()?
-    } else {
-        BTreeMap::new()
-    };
-    let checkpoints = if version >= 9 {
-        cursor.read_checkpoints()?
-    } else {
-        BTreeMap::new()
-    };
+    let pending_blob_deletions = cursor.read_pending_blob_deletions()?;
+    let checkpoints = cursor.read_checkpoints()?;
 
     if !cursor.is_finished() {
         return Err(invalid_manifest("trailing payload bytes"));
@@ -1658,7 +1652,7 @@ impl<'payload> Cursor<'payload> {
         Ok(value)
     }
 
-    fn read_bucket_options(&mut self, version: u16) -> Result<BucketOptions> {
+    fn read_bucket_options(&mut self) -> Result<BucketOptions> {
         Ok(BucketOptions {
             allow_empty_keys: self.read_bool()?,
             compression: self.read_compression_profile()?,
@@ -1668,22 +1662,8 @@ impl<'payload> Cursor<'payload> {
             prefix_filter_policy: self.read_prefix_filter_policy()?,
             index_search_policy: self.read_index_search_policy()?,
             blob_threshold_bytes: self.read_usize()?,
-            blob_level_merge_policy: if version >= 7 {
-                self.read_blob_level_merge_policy()?
-            } else if version >= 6 {
-                if self.read_bool()? {
-                    BlobLevelMergePolicy::Always
-                } else {
-                    BlobLevelMergePolicy::Auto
-                }
-            } else {
-                BlobLevelMergePolicy::Auto
-            },
-            filter_depth_curve: if version >= 10 {
-                self.read_filter_depth_curve()?
-            } else {
-                FilterDepthCurve::Auto
-            },
+            blob_level_merge_policy: self.read_blob_level_merge_policy()?,
+            filter_depth_curve: self.read_filter_depth_curve()?,
         })
     }
 
@@ -1967,7 +1947,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{MANIFEST_VERSION, ManifestStore, decode_state, manifest_path};
+    use super::{ManifestStore, decode_state, manifest_path};
     use crate::{
         options::{
             BlobLevelMergePolicy, BucketOptions, CompressionProfile, FilterDepthCurve,
@@ -1986,8 +1966,7 @@ mod tests {
         payload.extend_from_slice(&0_u32.to_le_bytes());
         payload.extend_from_slice(&u32::MAX.to_le_bytes());
 
-        let error = decode_state(&payload, MANIFEST_VERSION)
-            .expect_err("impossible table count should fail");
+        let error = decode_state(&payload).expect_err("impossible table count should fail");
         assert!(
             error
                 .to_string()
@@ -1996,74 +1975,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn manifest_decode_accepts_previous_version_without_pending_blob_deletions() {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&0_u64.to_le_bytes());
-        payload.extend_from_slice(&0_u32.to_le_bytes());
-        payload.extend_from_slice(&0_u32.to_le_bytes());
-
-        let state = decode_state(&payload, 4).expect("v4 manifest decodes");
-        assert!(state.buckets().is_empty());
-        assert!(state.tables().is_empty());
-        assert!(state.pending_blob_deletions().is_empty());
-    }
-
-    #[test]
-    fn manifest_decode_v5_bucket_options_default_blob_level_merge_policy() {
-        let mut payload = Vec::new();
-        super::put_u64(&mut payload, 0);
-        super::put_u32(&mut payload, 1);
-        super::put_bytes(&mut payload, b"users").expect("bucket name encodes");
-        super::put_bool(&mut payload, true);
-        super::put_compression_profile(&mut payload, CompressionProfile::Fast);
-        super::put_usize(&mut payload, 4096).expect("block size encodes");
-        super::put_filter_policy(&mut payload, FilterPolicy::Bloom { bits_per_key: 12 });
-        super::put_prefix_extractor(&mut payload, &PrefixExtractor::Separator(b':'))
-            .expect("prefix extractor encodes");
-        super::put_prefix_filter_policy(
-            &mut payload,
-            PrefixFilterPolicy::Bloom { bits_per_prefix: 8 },
-        );
-        super::put_index_search_policy(&mut payload, IndexSearchPolicy::Binary);
-        super::put_usize(&mut payload, 128 * 1024).expect("threshold encodes");
-        super::put_u32(&mut payload, 0);
-        super::put_u32(&mut payload, 0);
-
-        let state = decode_state(&payload, 5).expect("v5 manifest decodes");
-        let options = state.buckets().get("users").expect("bucket options exist");
-        assert_eq!(options.blob_level_merge_policy, BlobLevelMergePolicy::Auto);
-        assert_eq!(options.blob_threshold_bytes, 128 * 1024);
-    }
-
-    #[test]
-    fn manifest_decode_v6_bool_bucket_options_as_policy() {
-        let mut payload = Vec::new();
-        super::put_u64(&mut payload, 0);
-        super::put_u32(&mut payload, 1);
-        super::put_bytes(&mut payload, b"users").expect("bucket name encodes");
-        super::put_bool(&mut payload, true);
-        super::put_compression_profile(&mut payload, CompressionProfile::Fast);
-        super::put_usize(&mut payload, 4096).expect("block size encodes");
-        super::put_filter_policy(&mut payload, FilterPolicy::Disabled);
-        super::put_prefix_extractor(&mut payload, &PrefixExtractor::Disabled)
-            .expect("prefix extractor encodes");
-        super::put_prefix_filter_policy(&mut payload, PrefixFilterPolicy::Disabled);
-        super::put_index_search_policy(&mut payload, IndexSearchPolicy::Auto);
-        super::put_usize(&mut payload, 128 * 1024).expect("threshold encodes");
-        super::put_bool(&mut payload, true);
-        super::put_u32(&mut payload, 0);
-        super::put_u32(&mut payload, 0);
-
-        let state = decode_state(&payload, 6).expect("v6 manifest decodes");
-        let options = state.buckets().get("users").expect("bucket options exist");
-        assert_eq!(
-            options.blob_level_merge_policy,
-            BlobLevelMergePolicy::Always
-        );
-    }
-
-    fn put_v9_bucket_options_header(payload: &mut Vec<u8>) {
+    fn put_bucket_options_header(payload: &mut Vec<u8>) {
         super::put_u64(payload, 0);
         super::put_u32(payload, 1);
         super::put_bytes(payload, b"users").expect("bucket name encodes");
@@ -2080,30 +1992,16 @@ mod tests {
     }
 
     #[test]
-    fn manifest_decode_v9_bucket_options_default_filter_depth_curve() {
-        // A v9 manifest has no filter-depth-curve field; it must default to Auto.
+    fn manifest_round_trips_custom_filter_depth_curve() {
+        // The current format persists a custom curve and decodes it back exactly.
         let mut payload = Vec::new();
-        put_v9_bucket_options_header(&mut payload);
-        super::put_u32(&mut payload, 0); // tables
-        super::put_u32(&mut payload, 0); // pending blob deletions
-        super::put_u32(&mut payload, 0); // checkpoints (version >= 9)
-
-        let state = decode_state(&payload, 9).expect("v9 manifest decodes");
-        let options = state.buckets().get("users").expect("bucket options exist");
-        assert_eq!(options.filter_depth_curve, FilterDepthCurve::Auto);
-    }
-
-    #[test]
-    fn manifest_v10_bucket_options_round_trip_filter_depth_curve() {
-        // v10 persists a custom curve and decodes it back exactly.
-        let mut payload = Vec::new();
-        put_v9_bucket_options_header(&mut payload);
+        put_bucket_options_header(&mut payload);
         super::put_filter_depth_curve(&mut payload, FilterDepthCurve::Custom { step: 3, floor: 6 });
         super::put_u32(&mut payload, 0); // tables
         super::put_u32(&mut payload, 0); // pending blob deletions
-        super::put_u32(&mut payload, 0); // checkpoints (version >= 9)
+        super::put_u32(&mut payload, 0); // checkpoints
 
-        let state = decode_state(&payload, MANIFEST_VERSION).expect("v10 manifest decodes");
+        let state = decode_state(&payload).expect("manifest decodes");
         let options = state.buckets().get("users").expect("bucket options exist");
         assert_eq!(
             options.filter_depth_curve,
@@ -2115,57 +2013,21 @@ mod tests {
     fn manifest_round_trips_cost_weighted_filter_depth_curve() {
         // The ascending remote curve persists and decodes back exactly.
         let mut payload = Vec::new();
-        put_v9_bucket_options_header(&mut payload);
+        put_bucket_options_header(&mut payload);
         super::put_filter_depth_curve(
             &mut payload,
             FilterDepthCurve::CostWeighted { step: 4, ceil: 24 },
         );
         super::put_u32(&mut payload, 0); // tables
         super::put_u32(&mut payload, 0); // pending blob deletions
-        super::put_u32(&mut payload, 0); // checkpoints (version >= 9)
+        super::put_u32(&mut payload, 0); // checkpoints
 
-        let state = decode_state(&payload, MANIFEST_VERSION).expect("manifest decodes");
+        let state = decode_state(&payload).expect("manifest decodes");
         let options = state.buckets().get("users").expect("bucket options exist");
         assert_eq!(
             options.filter_depth_curve,
             FilterDepthCurve::CostWeighted { step: 4, ceil: 24 }
         );
-    }
-
-    #[test]
-    fn manifest_decode_legacy_search_policy_tags_as_auto() {
-        let mut payload = Vec::new();
-        super::put_u64(&mut payload, 0);
-        super::put_u32(&mut payload, 1);
-        super::put_bytes(&mut payload, b"users").expect("bucket name encodes");
-        super::put_bool(&mut payload, true);
-        super::put_compression_profile(&mut payload, CompressionProfile::Fast);
-        super::put_usize(&mut payload, 4096).expect("block size encodes");
-        super::put_filter_policy(&mut payload, FilterPolicy::Disabled);
-        super::put_prefix_extractor(&mut payload, &PrefixExtractor::Disabled)
-            .expect("prefix extractor encodes");
-        super::put_prefix_filter_policy(&mut payload, PrefixFilterPolicy::Disabled);
-        super::put_u8(&mut payload, 2);
-        super::put_usize(&mut payload, 128 * 1024).expect("threshold encodes");
-        super::put_blob_level_merge_policy(&mut payload, BlobLevelMergePolicy::Auto);
-        super::put_u32(&mut payload, 0);
-        super::put_u32(&mut payload, 0);
-
-        let state = decode_state(&payload, 7).expect("v7 manifest decodes");
-        let options = state.buckets().get("users").expect("bucket options exist");
-        assert_eq!(options.index_search_policy, IndexSearchPolicy::Auto);
-    }
-
-    #[test]
-    fn manifest_decode_v8_defaults_empty_checkpoints() {
-        let mut payload = Vec::new();
-        super::put_u64(&mut payload, 0);
-        super::put_u32(&mut payload, 0);
-        super::put_u32(&mut payload, 0);
-        super::put_u32(&mut payload, 0);
-
-        let state = decode_state(&payload, 8).expect("v8 manifest decodes");
-        assert!(state.checkpoints().is_empty());
     }
 
     #[test]

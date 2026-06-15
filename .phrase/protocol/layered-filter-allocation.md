@@ -206,7 +206,9 @@ Acceptance gate:
   *gain* `step` bits up to `ceil` while pinned shallow levels keep the base -
   the inverse of classic Monkey, for remote/cold backends (the `s3` feature)
   where a deep-level filter miss costs a network round-trip, not a cheap local
-  read. Persisted via manifest curve tag 3 (no version bump; default unchanged).
+  read. Persisted via manifest curve tag 3 at `MANIFEST_VERSION = 11` (clean
+  break: `MIN_SUPPORTED = 11`, older manifests are rejected, not migrated -
+  backward compatibility is deliberately not kept for this project).
   It is **opt-in only and the default is not flipped**: the benefit is the remote
   read-cost asymmetry, which cannot be validated on local SSD (locally it only
   raises memory). Auto-selecting it for `s3`, and tuning `step`/`ceil`, is gated

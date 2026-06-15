@@ -14135,3 +14135,28 @@ Negative check:
 
 - Build an s3 (or simulated-latency) read-path benchmark before auto-selecting
   the cost-weighted curve for remote backends or tuning step/ceil defaults.
+
+## 2026-06-15 — Manifest: clean break (no backward compat)
+
+### Observation
+
+- I had added the cost-weighted curve as manifest tag 3 within v10 *without* a
+  version bump to keep old data readable. The user rejected that: do not preserve
+  compatibility on my own, and ask first (see [[no-backward-compat-without-asking]]).
+
+### Decision
+
+- Clean break: `MANIFEST_VERSION = 11`, `MIN_SUPPORTED_MANIFEST_VERSION = 11`.
+  Removed the version-gated read fallbacks (v5 pending-blob, v6/v7 blob policy,
+  v9 checkpoints, v10 curve gate) and the `version` parameter from
+  `decode_state`/`read_bucket_options`; deleted the v4–v10 decode tests. Old
+  on-disk manifests are now rejected with `UnsupportedFormat`.
+
+### Verification
+
+- fmt + clippy --all-targets --all-features clean; `--lib` 370,
+  `--all-features` 374 pass / 1 ignored; `check --benches` clean.
+
+### Recommended Next Action
+
+- Going forward, ask before keeping format compatibility; default to clean breaks.
