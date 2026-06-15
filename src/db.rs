@@ -6337,11 +6337,6 @@ impl Db {
             .iter()
             .map(|table| table.output_table_id)
             .collect::<Vec<_>>();
-        let obsolete_table_ids = plan
-            .tables
-            .iter()
-            .map(|table| table.input_table_id)
-            .collect::<Vec<_>>();
         let storage = self.browser_storage()?;
         let indexes = match blob::write_blob_file_with_backend_async(
             &storage,

@@ -20,6 +20,9 @@ pub(crate) fn requires_file_sync(durability: DurabilityMode) -> bool {
 }
 
 /// Whether `durability` is the strict tier that must survive sudden power loss.
+// Used by the native sync paths and tests; the browser backend performs no
+// device sync, so it is dead code there.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 #[must_use]
 pub(crate) const fn durability_is_strict(durability: DurabilityMode) -> bool {
     matches!(durability, DurabilityMode::SyncAllStrict)
