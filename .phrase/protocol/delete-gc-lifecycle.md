@@ -184,10 +184,41 @@ Acceptance gate:
 - Range-delete + snapshot scan correctness is preserved (the gate matches range
   tombstone visibility; newer-than-tombstone writes still surface).
 
-Deferred (Phase 4b): within-table block-level skip for a partially-covered table
-(the single-table 10x diagnostic case). It needs per-block max-sequence metadata
-(a table-format change) to keep the newer-write-in-span guarantee at block
-granularity; left until a workload needs sub-table skip.
+### Phase 4b: Source-level range-tombstone GC during compaction
+
+Status: Implemented (2026-06-15). Supersedes the originally-planned block-level
+read-skip.
+
+The 10x diagnostic case (a partially-covering big `delete_range` leaving
+covered-but-present rows) was traced to the real cause: compaction merged the
+range tombstone with the data but **never dropped the covered point records** -
+`compact_point_record_group` only drops by version/retention, and
+`mark_tombstones_covering_records` only decides whether to keep the tombstone.
+So range-deleted rows survived compaction and were filtered on *every* read
+(`scan_tombstone_hidden_keys` stayed ~10x forever).
+
+Fix (no table-format change): `drop_records_covered_by_droppable_tombstone`
+removes a point record during the merge when a range tombstone covers its user
+key, is strictly newer than the record (`record.seq < tombstone.seq`), and is
+visible to every retained reader (`tombstone.seq <= oldest_active_snapshot`).
+The strict sequence test preserves a write made after the delete; the retention
+gate matches the merge's own retention, so a reader that could still observe the
+record never loses it (verified: an older snapshot keeps the covered rows until
+it drops). A partial compaction still keeps the tombstone, so older values at
+lower levels stay hidden.
+
+Verified: the tombstone-scan-waste diagnostic drops from ~10x (1024 internal /
+102 user, 922 hidden) to 1.0x (102/102, 0 hidden) after compaction;
+`compaction_drops_range_deleted_keys_at_source`,
+`compaction_keeps_range_deleted_keys_for_older_snapshot`, and two unit tests
+for the drop predicate.
+
+The original block-level read-skip (per-block max-sequence metadata, a
+table-format change) is **dropped as unnecessary**: source-level GC removes the
+waste once compaction runs, so there is no partially-covered table left to skip.
+A transient pre-compaction read still wades through fresh deletes, which the
+whole-table skip (Phase 4) and the tombstone-debt trigger (Phase 2) already
+bound; build sub-table read-skip only if a workload shows it matters.
 
 ## Non-Goals
 

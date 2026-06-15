@@ -14057,3 +14057,44 @@ Negative check:
 - Phase 2 (Snapshot reads through a pinned super-version) then Phase 3 (instant
   truncate decoupled from `oldest_active_snapshot`). Blob cleanup stays
   snapshot-gated until table liveness is extended to blob reachability.
+
+## 2026-06-15 — delete-gc Phase 4b: source-level range-tombstone GC
+
+### Observation
+
+- The tombstone-scan-waste diagnostic stayed ~10x (1024 internal / 102 user, 922
+  hidden) even AFTER compaction. Tracing it: compaction merges the range
+  tombstone with the data but never drops the covered point records
+  (`compact_point_record_group` drops only by version/retention;
+  `mark_tombstones_covering_records` only decides tombstone retention). So
+  range-deleted rows survive compaction and are filtered on every read.
+
+### Interpretation
+
+- The planned Phase 4b (block-level read-skip needing per-block max-seq, a
+  table-format change) was the wrong tool. The waste should be removed at the
+  source: drop covered point records during the merge, gated exactly like the
+  tombstone's own retention (`tombstone.seq <= oldest_active_snapshot`,
+  `record.seq < tombstone.seq`, key in range). MVCC-safe; an older snapshot that
+  still needs the rows holds retention and keeps them until it drops.
+
+### Verification
+
+- `drop_records_covered_by_droppable_tombstone` in src/lsm/compact.rs. Diagnostic
+  10x -> 1.0x (0 hidden). New tests: compaction_drops_range_deleted_keys_at_source,
+  compaction_keeps_range_deleted_keys_for_older_snapshot, plus two unit tests for
+  the drop predicate. fmt + clippy --all-targets --all-features clean; --lib 375,
+  --all-features 379 pass / 1 ignored; check --benches clean.
+
+### Decision
+
+- Drop the block-level read-skip + table-format change as unnecessary: with
+  source-level GC there is no partially-covered table left to skip. Build
+  sub-table read-skip only if a workload shows the transient pre-compaction read
+  matters.
+
+### Recommended Next Action
+
+- layered-filter Phase 5 D1 (cost-weighted curve for the `s3` backend),
+  measure-first: confirm deep-level filter misses actually cost network reads on
+  s3 before flipping the curve. D2 (dynamic per-hot-guard) stays deferred.

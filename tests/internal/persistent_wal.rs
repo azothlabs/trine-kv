@@ -4552,3 +4552,133 @@ fn obsolete_table_files_kept_until_inflight_iterator_drops() {
 
     fs::remove_dir_all(path).expect("cleanup test db");
 }
+
+#[test]
+fn compaction_drops_range_deleted_keys_at_source() {
+    let path = temp_db_path("compaction-drops-range-deleted");
+    let mut options = DbOptions::persistent(&path);
+    options.background_worker_count = 0;
+
+    {
+        let db = Db::open_sync(options.clone()).expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
+
+        for index in 0..50u32 {
+            bucket
+                .put_sync(format!("k{index:03}"), b"v")
+                .expect("write key");
+        }
+        db.flush_sync().expect("flush data");
+
+        // Delete the middle band, then re-add one key inside it (a write made
+        // after the delete must survive).
+        bucket
+            .delete_range_sync(KeyRange::half_open(b"k010", b"k040"))
+            .expect("range delete middle band");
+        bucket.put_sync("k020", b"re-added").expect("re-add after delete");
+        db.flush_sync().expect("flush tombstone");
+
+        db.compact_range_sync(KeyRange::all()).expect("compact all");
+
+        // After compaction the covered rows are physically gone: a full scan
+        // wades through no hidden records (read amplification ~1x), not the ~10x
+        // it paid before source-level range-tombstone GC.
+        let before = db.stats();
+        let rows = collect_rows(bucket.range_sync(&KeyRange::all()).expect("scan opens"));
+        let after = db.stats();
+
+        let internal = after
+            .scan_internal_records
+            .saturating_sub(before.scan_internal_records);
+        let user = after.scan_user_keys.saturating_sub(before.scan_user_keys);
+        let hidden = after
+            .scan_tombstone_hidden_keys
+            .saturating_sub(before.scan_tombstone_hidden_keys);
+
+        // Live keys: k000..k009, the re-added k020, and k040..k049 = 21.
+        assert_eq!(user, 21, "only live keys returned");
+        assert_eq!(
+            hidden, 0,
+            "covered rows are dropped at compaction, not filtered every read"
+        );
+        assert_eq!(internal, user, "no obsolete records remain to wade through");
+
+        let keys = rows
+            .iter()
+            .map(|(key, _)| String::from_utf8(key.clone()).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            keys.contains(&"k020".to_string()),
+            "a write made after the delete survives"
+        );
+        assert!(
+            !keys.contains(&"k015".to_string()),
+            "a range-deleted key is gone"
+        );
+        assert_eq!(
+            bucket.get_sync(b"k020").expect("read re-added key"),
+            Some(b"re-added".to_vec())
+        );
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn compaction_keeps_range_deleted_keys_for_older_snapshot() {
+    let path = temp_db_path("compaction-keeps-for-snapshot");
+    let mut options = DbOptions::persistent(&path);
+    options.background_worker_count = 0;
+
+    {
+        let db = Db::open_sync(options.clone()).expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
+
+        for index in 0..20u32 {
+            bucket
+                .put_sync(format!("k{index:03}"), b"v")
+                .expect("write key");
+        }
+        db.flush_sync().expect("flush data");
+
+        // Snapshot taken before the delete: its read sequence holds retention, so
+        // compaction must NOT drop the covered rows it can still observe.
+        let snapshot = db.snapshot();
+
+        bucket
+            .delete_range_sync(KeyRange::half_open(b"k005", b"k015"))
+            .expect("range delete");
+        db.flush_sync().expect("flush tombstone");
+        db.compact_range_sync(KeyRange::all()).expect("compact all");
+
+        // The older snapshot still reads the pre-delete value.
+        assert_eq!(
+            snapshot
+                .get_sync(&bucket, b"k010")
+                .expect("snapshot reads covered key"),
+            Some(b"v".to_vec())
+        );
+        // Current readers see the delete.
+        assert_eq!(bucket.get_sync(b"k010").expect("current read"), None);
+
+        // After the snapshot drops, a fresh compaction drops the covered rows.
+        // Re-write a live key inside the bottom table's span so the next
+        // compaction overlaps and rewrites that run.
+        drop(snapshot);
+        bucket
+            .put_sync("k001", b"v")
+            .expect("rewrite live key to force overlap");
+        db.flush_sync().expect("flush");
+        db.compact_range_sync(KeyRange::all()).expect("compact again");
+
+        let before = db.stats();
+        let _ = collect_rows(bucket.range_sync(&KeyRange::all()).expect("scan opens"));
+        let after = db.stats();
+        let hidden = after
+            .scan_tombstone_hidden_keys
+            .saturating_sub(before.scan_tombstone_hidden_keys);
+        assert_eq!(hidden, 0, "covered rows reclaimed once no snapshot needs them");
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}

@@ -176,6 +176,20 @@ impl LsmTree {
                 oldest_active_snapshot,
                 input.full_bucket_compaction,
             );
+            // Drop point records hidden by a retention-safe range tombstone so a
+            // big `delete_range` stops leaving covered-but-present rows that every
+            // later scan must filter (the read-amplification the scan-waste
+            // diagnostic measured). Safe because the gate matches the tombstone's
+            // own retention: when `tombstone.seq <= oldest_active_snapshot` every
+            // retained reader already sees the delete, so the older record was
+            // hidden for all of them. A partial compaction keeps the tombstone
+            // (see `cleanup_range_tombstones_by_coverage`), so any older value at
+            // a lower level stays hidden.
+            let records = drop_records_covered_by_droppable_tombstone(
+                records,
+                &range_tombstones,
+                oldest_active_snapshot,
+            );
             if records.is_empty() {
                 continue;
             }
@@ -378,6 +392,33 @@ fn push_compaction_records_to_chunks(
 
     current_chunk.estimated_bytes = current_chunk.estimated_bytes.saturating_add(record_bytes);
     current_chunk.point_records.extend(records);
+}
+
+/// Drops point records hidden by a retention-safe range tombstone in the same
+/// compaction. A record is dropped when a tombstone covers its user key, is
+/// strictly newer than the record (`record.seq < tombstone.seq`), and is visible
+/// to every retained reader (`tombstone.seq <= oldest_active_snapshot`). The
+/// strict sequence test leaves a write made after the delete (a newer put) in
+/// place; the retention gate matches the merge's own retention so no reader that
+/// could still observe the record loses it.
+fn drop_records_covered_by_droppable_tombstone(
+    records: Vec<(InternalKey, Option<ValueRef>)>,
+    tombstones: &[TableRangeTombstone],
+    oldest_active_snapshot: Sequence,
+) -> Vec<(InternalKey, Option<ValueRef>)> {
+    if tombstones.is_empty() {
+        return records;
+    }
+    records
+        .into_iter()
+        .filter(|(internal_key, _)| {
+            !tombstones.iter().any(|tombstone| {
+                tombstone.sequence <= oldest_active_snapshot
+                    && internal_key.sequence() < tombstone.sequence
+                    && range_tombstone::key_is_in_range(internal_key.user_key(), &tombstone.range)
+            })
+        })
+        .collect()
 }
 
 fn mark_tombstones_covering_records(
@@ -663,7 +704,8 @@ mod tests {
         CompactionChunk, InternalKey, TableRangeTombstone, ValueKind, ValueRef,
         cleanup_point_tombstones, cleanup_range_tombstones, compact_point_record_group,
         compact_point_records, compaction_payloads_from_chunks,
-        table_fully_covered_by_droppable_tombstone, table_write_options,
+        drop_records_covered_by_droppable_tombstone, table_fully_covered_by_droppable_tombstone,
+        table_write_options,
     };
     use crate::{
         compaction::CompactionOptions,
@@ -673,6 +715,36 @@ mod tests {
         table::{self, TableId, TableLevel},
         types::{KeyRange, Sequence},
     };
+
+    #[test]
+    fn drops_records_hidden_by_retention_safe_range_tombstone() {
+        // tombstone [a, d) at seq 5, retention floor 10 (>= 5, so the delete is
+        // visible to every retained reader).
+        let records = vec![
+            record("a", 1), // covered + older than tombstone -> dropped
+            record("b", 6), // newer than tombstone (write after delete) -> kept
+            record("c", 2), // covered + older -> dropped
+            record("z", 1), // outside tombstone range -> kept
+        ];
+        let kept = drop_records_covered_by_droppable_tombstone(
+            records,
+            &[range_tombstone("a", "d", 5)],
+            Sequence::new(10),
+        );
+        assert_eq!(record_sequences(&kept), vec![("b", 6), ("z", 1)]);
+    }
+
+    #[test]
+    fn keeps_records_when_range_tombstone_is_not_retention_safe() {
+        // tombstone seq 5 > oldest_active_snapshot 3: a retained reader at a read
+        // sequence in [1, 5) still observes the record, so nothing is dropped.
+        let kept = drop_records_covered_by_droppable_tombstone(
+            vec![record("a", 1), record("c", 2)],
+            &[range_tombstone("a", "d", 5)],
+            Sequence::new(3),
+        );
+        assert_eq!(record_sequences(&kept), vec![("a", 1), ("c", 2)]);
+    }
 
     #[test]
     fn compaction_keeps_newer_versions_and_snapshot_floor() {

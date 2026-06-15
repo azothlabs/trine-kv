@@ -2,62 +2,49 @@
 
 ## Status
 
-Phase 1 complete (liveness-gated obsolete cleanup). Phases 2-3 planned.
+Backlog cleanup: delete-gc Phase 4b done (source-level range-tombstone GC).
+snapshot-version-pinning Phase 1 done+merged, Phases 2-3 deferred. Next:
+layered-filter Phase 5 (D1 cost-weighted remote curve), measure-first.
 
 ## Goal
 
-Phase 1 of `.phrase/protocol/snapshot-version-pinning.md`: replace the coarse
-"any active snapshot blocks all obsolete-file cleanup" gate with per-table
-liveness, so a long-lived snapshot no longer stalls space reclamation. Foundation
-for the reader-pins-the-tables-it-needs (LMDB-grade) direction.
+Reclaim the read amplification a partially-covering `delete_range` leaves behind
+(the measured 10x scan-waste case), at the source instead of at every read.
 
 ## Design Assessment
 
-`Arc<Table>` is held only by versions (current + iterator-pinned old versions)
-and transient per-read super-versions; the manifest stores only properties.
-Once a table leaves the current version no new reader can acquire it, so its
-`Arc` strong count only falls. A cleanup queue that holds the obsolete
-`Arc<Table>` can therefore delete a file exactly when `strong_count == 1` (queue
-is sole owner) — TOCTOU-safe. Normal compaction stays correct because a snapshot
-reads the current version, whose output retains its data (retention is gated by
-`oldest_active_snapshot`, which includes the snapshot); only the rewritten input
-files are dropped.
+Root cause (traced from the diagnostic, not assumed): compaction merged the range
+tombstone with the data but never dropped the covered point records, so deleted
+rows survived compaction and were filtered on every scan. The originally-planned
+fix (Phase 4b block-level read-skip needing per-block max-seq = a table-format
+change) was the wrong tool. The right fix is source-level: drop covered point
+records during the merge, retention-gated exactly like the tombstone.
 
 ## Scope (done)
 
-- `LsmVersion::with_replaced_tables` returns the removed `Arc<Table>`;
-  `install_compaction` excludes trivial-move ids and returns the obsolete
-  handles; `install_compacted_tables` aggregates them.
-- `pending_obsolete_tables: Mutex<Vec<Arc<Table>>>` replaces the id set.
-- `retire_obsolete_table_files*` enqueue handles; cleanup drains via
-  `take_deletable_obsolete_tables` (`strong_count == 1`), retries the rest, and
-  re-queues on delete failure. The coarse `active_count()` gate is gone.
-- Cleanup runs after the compaction call returns (locals dropped) so deletion is
-  prompt in the same `compact_range_sync` / `flush_sync` call.
-
-## Out Of Scope (Phase 1)
-
-- Blob-file cleanup stays snapshot-gated (table liveness first; blobs are
-  reachable through pinned tables — Phase 2/later).
-- Snapshot reading through a pinned version (Phase 2) and instant
-  truncate-with-old-snapshot (Phase 3).
+- `drop_records_covered_by_droppable_tombstone` in `src/lsm/compact.rs`: in the
+  per-user-key merge, drop a record when a range tombstone covers its key, is
+  strictly newer (`record.seq < tombstone.seq`), and is retention-safe
+  (`tombstone.seq <= oldest_active_snapshot`). Runs before
+  `mark_tombstones_covering_records` so a fully-covered tombstone is then cleaned
+  up in full compaction; partial compaction keeps the tombstone to hide lower
+  levels. No table-format change.
 
 ## Acceptance Gate
 
-- `obsolete_tables_drop_while_point_snapshot_open`: obsolete inputs deleted even
-  with a snapshot open; snapshot reads stay correct. Met.
-- `obsolete_table_files_kept_until_inflight_iterator_drops`: a live iterator
-  pins the files; after it drops, cleanup reclaims them. Met.
-- `persistent_compaction_rewrites_tables_and_preserves_reads` updated: obsolete
-  inputs reclaimed despite a pinned snapshot, which still reads its old view from
-  the retained output. Met.
-- Full local gate: fmt + clippy --all-targets --all-features clean; `--lib` 371,
-  `--all-features` 375 pass / 1 ignored; `check --benches` clean.
+- Tombstone-scan-waste diagnostic: ~10x (1024 internal / 102 user, 922 hidden)
+  → 1.0x (102/102, 0 hidden). Met.
+- `compaction_drops_range_deleted_keys_at_source` (covered rows physically gone;
+  a write after the delete survives), `compaction_keeps_range_deleted_keys_for_older_snapshot`
+  (an older snapshot still reads covered rows; reclaimed after it drops), and two
+  unit tests for the drop predicate. Met.
+- Full local gate: fmt + clippy --all-targets --all-features clean; `--lib` 375,
+  `--all-features` 379 pass / 1 ignored; `check --benches` clean.
 
 ## Next Recommendation
 
-- Phase 2: `Snapshot` captures a consistent read super-version (version +
-  memtable sources, lazily per bucket) and reads through it. Then Phase 3: instant
-  file-drop / truncate decoupled from `oldest_active_snapshot`.
-- After this initiative: remaining committed backlog — layered-filter Phase 5
-  ([[layered-filter-followups]]) and delete-gc Phase 4b ([[delete-gc-lifecycle]]).
+- layered-filter Phase 5 D1 (cost-weighted curve for the `s3` remote backend):
+  measure first — the classic-Monkey curve starves deep levels, which is wrong
+  when a deep-level filter miss costs a network read. D2 (dynamic per-hot-guard)
+  stays deferred until static evidence shows headroom.
+- Deferred: snapshot-version-pinning Phases 2-3 (see that protocol).
