@@ -13561,3 +13561,69 @@ Negative check:
 - Phase 3 (prefix filter negative-lookup tuning) or stop here and return to the
   single-key sync-write fsync bottleneck. Phase 4 (configurable curve) only if a
   workload needs to tune the deep-FPR/storage trade.
+
+## 2026-06-15: Group Commit For Durable Write Throughput
+
+### Observation
+
+- Single-key durable put is ~500 ops/s. Root cause confirmed in code: each
+  commit does exactly one `sync_data`/`sync_all` (`src/io/platform_threadpool.rs`,
+  `platform_backend.rs`); on macOS `std` maps these to `F_FULLFSYNC` (~2ms). No
+  over-syncing. This is the correct fsync floor for a lone serial writer, matching
+  SQLite synchronous=FULL on the same hardware.
+- The WAL lane worker processed one command per `recv()`, so concurrent commits
+  were not batched. Implemented group commit: `run_wal_lane_worker` blocks for one
+  command, drains queued commands with `try_recv` (bounded by `WAL_LANE_BATCH_MAX`
+  = 1024), appends all frames buffered, issues one fsync at the strongest
+  requested durability, and completes every waiter. A buffered append marks the
+  lane dirty (`persisted_level = Buffered`) so a later separate persist still
+  fsyncs. `Error` is not `Clone`, so per-waiter results are reproduced
+  (`duplicate_wal_lane_result`).
+- Finding: default 4 WAL shards + sequence round-robin spread concurrent commits
+  across lanes, so on single-device storage (fsyncs serialize) batching could not
+  engage. Made `DbOptions::wal_shard_count` configurable (runtime-only; WAL files
+  discovered by name, no manifest/format change).
+- Benchmark `group commit sync-data` (TRINE_BENCH_RUNS=3):
+  - 1-shard x1: 256 persists / 256 commits, ~400 ops/s.
+  - 1-shard x8: 511 persists / 2048 commits = 4.0 commits/fsync, ~1420 ops/s.
+  - 4-shard x8: ~1982 persists / 2048 commits = ~1.03, ~527 ops/s.
+
+### Interpretation
+
+- Group commit works: 1 lane + 8 concurrent writers amortizes ~4 commits per
+  fsync and raises throughput 3.5x over the single-writer floor, with the
+  durability contract intact (each waiter returns only after its covering fsync).
+- WAL sharding and group commit are in tension on single-device storage: sharding
+  parallelizes fsyncs (helps only where the device flushes in parallel) but
+  scatters concurrent commits and defeats batching. For Trine's embedded /
+  single-device target, 1 shard + group commit is the better configuration.
+- The single-thread synchronous number stays at the fsync floor; that is expected
+  and only movable via concurrency, async pipelining, or WriteBatch.
+
+### Decision
+
+- Group commit batch-drain is permanent. `wal_shard_count` is configurable,
+  default kept at 4 pending an explicit default decision (1 recommended for the
+  embedded target). Recorded as a durable boundary in `decision.md`.
+
+### Verification
+
+- `cargo test -q --lib` (352) green; `--all-features` green except the
+  pre-existing `persistent_background_maintenance_error_surfaces_to_later_write`
+  background-timing flake (passes 1/1 in isolation; unrelated to the WAL commit
+  path).
+- WAL test `wal_front_door_persists_only_dirty_shards` updated behavior verified
+  (buffered append marks the lane dirty for a later persist).
+- `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`,
+  `cargo check --benches`, `git diff --check`.
+- `TRINE_BENCH_RUNS=3 cargo bench` group-commit rows above.
+
+### Remaining Blockers
+
+- Default `wal_shard_count` decision (durable boundary) pending user.
+- Optional bounded commit-delay window for bursty single writers not implemented.
+
+### Recommended Next Action
+
+- Confirm the default `wal_shard_count` (recommend 1). Then resume the remembered
+  layered-filter Phase 3/4/5.

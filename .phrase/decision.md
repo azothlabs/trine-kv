@@ -97,6 +97,17 @@ Evidence notes should separate:
 - Native persistent constructors default to safety-first durability for
   confirmed writes. Lower durability modes such as `Buffered` are explicit
   advanced choices for data that can tolerate losing recent confirmed writes.
+- Durable commit throughput uses group commit at the WAL lane worker: the worker
+  batch-drains queued commits, appends all frames buffered, and serves the whole
+  batch with one fsync, completing each waiter only after the fsync that covers
+  its frame. The single-writer synchronous floor is the device fsync latency
+  (macOS `F_FULLFSYNC`) and is not an architecture defect; throughput scales only
+  via concurrency, async pipelining, or `WriteBatch`. `wal_shard_count` is a
+  runtime option (WAL files are discovered by name; no manifest/format change):
+  1 lane lets group commit coalesce concurrent commits on single-device storage,
+  more lanes parallelize fsyncs only where the device flushes in parallel. For
+  the embedded / single-device target, 1 shard is preferred. Do not weaken the
+  per-confirmed-write durability contract to raise this number.
 - WASI and browser persistence must be selected through explicit host backend
   options. WASI persistence may use the host-preopened filesystem on WASI
   targets; browser persistence must fail as `UnsupportedBackend` until its

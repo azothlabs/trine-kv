@@ -1496,7 +1496,7 @@ impl Db {
             Some(WalFrontDoor::open_sharded_with_discovered_paths(
                 &native_storage,
                 path,
-                wal::DEFAULT_WAL_SHARD_COUNT,
+                options.wal_shard_count.max(1),
                 wal_paths,
             )?)
         };
@@ -1604,7 +1604,7 @@ impl Db {
             Some(WalFrontDoor::open_sharded_with_discovered_paths(
                 &native_storage,
                 path,
-                wal::DEFAULT_WAL_SHARD_COUNT,
+                options.wal_shard_count.max(1),
                 wal_paths,
             )?)
         };

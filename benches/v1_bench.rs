@@ -88,6 +88,7 @@ fn run_benchmarks() -> Vec<BenchResult> {
     extend_maintenance_write_amplification_diagnostics(&mut results);
     extend_background_maintenance_contention_diagnostics(&mut results);
     extend_layered_filter_fpr_diagnostic(&mut results);
+    extend_group_commit_diagnostic(&mut results);
     results.push(bench_block_cache_warm_read());
     results.push(bench_block_cache_random_block_read());
     extend_block_cache_decode_diagnostics(&mut results);
@@ -1433,6 +1434,102 @@ fn prepare_guard_multi_table_compaction_workload(dir: &Path) -> Db {
     }
     drop(bucket);
     db
+}
+
+fn extend_group_commit_diagnostic(results: &mut Vec<BenchResult>) {
+    // Group commit: concurrent durable single-key writers should amortize fsyncs.
+    // With one WAL shard, concurrent commits share a lane and the worker batches
+    // them under one fsync, so throughput rises with concurrency. With multiple
+    // shards, sequence round-robin spreads concurrent commits across lanes and
+    // (on single-device storage where fsyncs serialize) batching cannot engage.
+    for wal_shards in [1_usize, 4] {
+        for concurrency in [1_usize, 8] {
+            push_group_commit_diagnostic(results, concurrency, wal_shards);
+        }
+    }
+}
+
+fn push_group_commit_diagnostic(
+    results: &mut Vec<BenchResult>,
+    concurrency: usize,
+    wal_shards: usize,
+) {
+    let base: &'static str = Box::leak(
+        format!("group commit sync-data {wal_shards}-shard x{concurrency}").into_boxed_str(),
+    );
+    let dir = temp_dir(base);
+    let mut options = benchmark_persistent_options(&dir);
+    options.background_worker_count = 0;
+    options.wal_shard_count = wal_shards;
+    options = options.with_durability(DurabilityMode::SyncData);
+    let db = Arc::new(Db::open_sync(options).expect("group commit db opens"));
+
+    let writes_per_thread = 256_usize;
+    let total = concurrency.saturating_mul(writes_per_thread);
+    let barrier = Arc::new(Barrier::new(concurrency));
+
+    let before = db.stats();
+    let started = Instant::now();
+    let mut handles = Vec::with_capacity(concurrency);
+    for thread_index in 0..concurrency {
+        let db = Arc::clone(&db);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            let bucket = db.default_bucket_sync().expect("group commit bucket opens");
+            barrier.wait();
+            for write_index in 0..writes_per_thread {
+                let row = thread_index * writes_per_thread + write_index;
+                bucket.put_sync(key(row), value(row)).expect("durable put");
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("group commit writer joins");
+    }
+    let elapsed = duration_micros(started.elapsed());
+    let after = db.stats();
+
+    let commits = usize_to_u64(total);
+    let persists = after
+        .storage_operations
+        .persist
+        .requests
+        .saturating_sub(before.storage_operations.persist.requests);
+    let ops_per_sec = if elapsed == 0 {
+        0
+    } else {
+        commits.saturating_mul(1_000_000) / elapsed
+    };
+    // Commits served per fsync, scaled by 1000; >1000 means group commit batched.
+    let commits_per_persist_x1000 = if persists == 0 {
+        0
+    } else {
+        commits.saturating_mul(1_000) / persists
+    };
+
+    results.push(BenchResult::diagnostic(
+        labelled(base, "total commits"),
+        commits,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(base, "wall micros"),
+        elapsed,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(base, "ops per sec"),
+        ops_per_sec,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(base, "wal persists"),
+        persists,
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(base, "commits per persist x1000"),
+        commits_per_persist_x1000,
+    ));
+
+    drop(db);
+    cleanup_dir(&dir);
 }
 
 fn extend_layered_filter_fpr_diagnostic(results: &mut Vec<BenchResult>) {

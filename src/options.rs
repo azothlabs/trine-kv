@@ -248,6 +248,15 @@ pub struct DbOptions {
     pub block_cache_bytes: usize,
     /// Number of background workers used by maintenance-capable runtimes.
     pub background_worker_count: usize,
+    /// Number of WAL shards (independent append lanes).
+    ///
+    /// Each shard is an independent fsync stream. More shards parallelize WAL
+    /// fsyncs across writers on hardware that can flush in parallel, but spread
+    /// concurrent commits across lanes, which weakens group commit. On a single
+    /// device where fsyncs serialize (typical embedded/consumer storage), fewer
+    /// shards let group commit coalesce concurrent commits under one fsync.
+    /// Must be at least 1.
+    pub wal_shard_count: usize,
     /// Runtime used for async, blocking, and background work.
     pub runtime: RuntimeOptions,
     /// Startup policy for safe temporary files left by interrupted writes.
@@ -274,6 +283,8 @@ impl DbOptions {
     pub const DEFAULT_BLOB_GC_MIN_FILE_BYTES: u64 = 64 * 1024 * 1024;
     /// Default number of recent read versions retained without explicit pins.
     pub const DEFAULT_KEEP_LAST_READ_VERSIONS: u64 = 1;
+    /// Default number of WAL shards (independent append lanes).
+    pub const DEFAULT_WAL_SHARD_COUNT: usize = crate::wal::DEFAULT_WAL_SHARD_COUNT;
 
     /// Creates persistent database options for `path`.
     ///
@@ -425,6 +436,15 @@ impl DbOptions {
         self.keep_last_read_versions = count;
         self
     }
+
+    /// Sets the number of WAL shards (independent append lanes). Use 1 to let
+    /// group commit coalesce concurrent commits under one fsync on single-device
+    /// storage; raise it to parallelize WAL fsyncs on hardware that supports it.
+    #[must_use]
+    pub const fn with_wal_shard_count(mut self, count: usize) -> Self {
+        self.wal_shard_count = count;
+        self
+    }
 }
 
 impl Default for DbOptions {
@@ -442,6 +462,7 @@ impl Default for DbOptions {
             max_l0_files: 8,
             block_cache_bytes: Self::DEFAULT_BLOCK_CACHE_BYTES,
             background_worker_count: 1,
+            wal_shard_count: Self::DEFAULT_WAL_SHARD_COUNT,
             runtime: RuntimeOptions::default(),
             fail_on_corruption: FailOnCorruptionPolicy::FailClosed,
             keep_last_read_versions: Self::DEFAULT_KEEP_LAST_READ_VERSIONS,

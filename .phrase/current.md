@@ -2,75 +2,74 @@
 
 ## Status
 
-Complete
+In Progress (group commit landed; WAL shard-count default decision pending user)
 
 ## Goal
 
-Phase 2 of `.phrase/protocol/layered-filter-allocation.md`: build the point
-filter with a depth-scaled `bits_per_key` at write time so deep levels cost less
-filter memory (Monkey-style, memory-first per Phase 1 evidence).
+Solve the single-key durable-write throughput bottleneck (~500 ops/s, fsync
+floor) with group commit: the WAL lane worker batch-drains queued commits and
+serves the whole batch with one fsync, amortizing fsync cost across concurrent
+(or async-pipelined) writers without weakening the per-confirmed-write
+durability contract.
 
 ## Design Assessment
 
-Trine has two point-filter tiers: the table-level filter (pinned shallow levels
-only) and the block-level filter (per data block, all levels). The block-level
-filter is the cross-level lever, so the curve applies there (and to the shallow
-table-level filter). The filter block is self-describing, so per-level
-`bits_per_key` is a write-time change with no read-path or storage-format
-impact.
+The single-threaded synchronous number (~500 ops/s) is the fsync latency floor
+(on macOS the std `sync_data`/`sync_all` use `F_FULLFSYNC`, ~2ms); it is correct
+durability cost, not an architecture bug, and cannot be beaten for a lone
+serial writer. The real lever is throughput under concurrency/pipelining.
 
-Phase 1 showed the two-level filter already drives negative-lookup data-block
-reads to zero, so the curve is memory-first: it only lowers deep levels (never
-above the base), so total filter memory can only drop. The trade is a higher
-deep-level false-positive rate (about 15% at the floor), bounded; hot shallow
-levels (L0/L1) stay fully accurate.
+The WAL lane worker already had the infrastructure (per-shard worker thread,
+command queue, per-commit completion replies, persist coalescing). What was
+missing: the worker processed one command per `recv()`. Now it blocks for one
+command, drains all immediately-queued commands (`try_recv`), appends every
+frame buffered (no per-frame fsync), issues one fsync at the strongest requested
+durability, and completes every waiter. A buffered append marks the lane dirty
+so a later persist still fsyncs.
+
+Finding: with the default 4 WAL shards, sequence round-robin spreads concurrent
+commits across lanes, and on single-device storage (fsyncs serialize at the
+device) batching cannot engage. So `wal_shard_count` is now configurable; 1 lane
+lets group commit coalesce.
 
 ## Scope
 
-- `level_adjusted_point_bits_per_key(base, level)`: L0/L1 keep base; deeper
-  levels drop by 2 bits, floor 4, never above base.
-- Applied to block-level point filter (`build_data_blocks`) and shallow
-  table-level filter.
-- `Table::resident_filter_bytes` + `DbStats::level_filters[*].filter_resident_bytes`.
+- `process_wal_lane_batch` / batch-drain in `run_wal_lane_worker` (`src/wal.rs`).
+- Configurable `DbOptions::wal_shard_count` (runtime-only; WAL files discovered
+  by name, no manifest/format change). Default kept at 4 pending decision.
+- Concurrent group-commit benchmark (1 vs 4 shards x concurrency).
 
 ## Out Of Scope
 
-- Storage-format / `BucketOptions` change (a user-configurable curve is Phase 4).
-- Prefix filter tuning (Phase 3).
-- Equal-budget reallocation (raising shallow above base): not needed since I/O is
-  already 0; memory-first avoids any memory regression.
+- Weakening durability (each waiter still returns only after its covering fsync).
+- Changing WAL frame format, replay, torn-tail, or recovery behavior.
+- A commit-delay window for bursty single writers (possible follow-up).
 
 ## Acceptance Gate
 
-- Deep levels write smaller filters at equal records (residency-independent via
-  encoded table size). Met (`deeper_levels_write_smaller_block_filters`).
-- Curve never exceeds base, so total filter memory cannot regress. Met (unit
-  test, including small-base clamp).
-- Hot shallow levels keep base accuracy: L0/L1 FPR and negative-lookup
-  data-block reads unchanged. Met (diagnostic: ~1% FPR, 0 data-block reads).
-- Full local gate. Met.
+- Concurrent durable writers amortize fsyncs and exceed the single-writer floor.
+  Met: 1-shard x8 = 4.0 commits/persist, ~1420 ops/s vs ~400 single (3.5x).
+- Durability contract preserved; WAL/recovery/persistent tests pass. Met.
+- Full local gate. Met (one pre-existing background-timing flake, passes in
+  isolation, unrelated to the WAL commit path).
 
 ## Evidence
 
-- `level_adjusted_point_bits_per_key`: 10,10,8,6,4,4 for L0..L5; base 3 -> 3.
-- `deeper_levels_write_smaller_block_filters`: same 600 records encode strictly
-  smaller at L4 than L2.
-- Diagnostic L0/L1: FPR ~1%, data-block reads 0, resident filter bytes 2560/level.
-- `cargo test --lib` (352) and `--all-features` (356) green; fmt/clippy/bench/diff
-  clean.
+- `group commit sync-data` benchmark (TRINE_BENCH_RUNS=3):
+  - 1-shard x1: 256 persists / 256 commits, ~400 ops/s (fsync floor).
+  - 1-shard x8: 511 persists / 2048 commits (4.0 commits/fsync), ~1420 ops/s.
+  - 4-shard x8: ~1982 persists / 2048 commits (~1.03, no batching), ~527 ops/s.
+- macOS `F_FULLFSYNC` confirmed as the per-commit cost (`std` sync_data/sync_all).
 
-## Known Risks
+## Known Risks / Open Decision
 
-- Deep FPR ~15% at the 4-bit floor: on slow embedded storage a truly-absent deep
-  key may incur a data-block read. The per-bucket base `bits_per_key` is the
-  lever; a configurable curve is the deferred Phase 4.
-- `filter_resident_bytes` reflects resident filters only; deep file-backed block
-  filters are lazy, so the deep memory win shows in encoded table size, not
-  resident bytes.
+- WAL shard-count default: evidence says 1 is far better for single-device
+  (embedded) under concurrency; >1 only helps where fsyncs parallelize. Default
+  left at 4 for now; flipping to 1 is a durable boundary to confirm with the
+  user. Changing it is recovery-safe (WAL discovery handles any prior count).
 
 ## Next Recommendation
 
-- Phase 3 (prefix filter tuning) is optional; otherwise return to the single-key
-  sync-write fsync bottleneck (~500 ops/s), the largest remaining throughput
-  hotspot. Phase 4 (configurable curve) only if a workload needs to tune the
-  deep-FPR/storage trade.
+- Decide the default `wal_shard_count` (recommend 1 for the embedded target).
+- Optional: bounded commit-delay window to help bursty single writers.
+- Then return to remembered layered-filter Phase 3/4/5.

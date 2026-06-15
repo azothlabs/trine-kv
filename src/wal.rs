@@ -1078,6 +1078,12 @@ fn enqueue_wal_lane_command(
 }
 
 #[allow(clippy::needless_pass_by_value)]
+/// Maximum commits coalesced into one group-commit fsync. Bounds the latency and
+/// memory of a single drain pass when the queue is flooded.
+const WAL_LANE_BATCH_MAX: usize = 1024;
+
+// Thread entry point: it owns its lane state for the worker's lifetime.
+#[allow(clippy::needless_pass_by_value)]
 fn run_wal_lane_worker(
     backend: NativeFileBackend,
     path: PathBuf,
@@ -1086,44 +1092,162 @@ fn run_wal_lane_worker(
 ) {
     let mut writer = None::<WalWriter>;
     let mut persisted_level = None::<DurabilityMode>;
-    while let Ok(command) = receiver.recv() {
+    // Group commit: block for one command, then drain everything already queued
+    // and serve the whole batch with a single fsync. Concurrent writers (or one
+    // writer with many in-flight async commits) amortize the fsync cost; each
+    // writer is still only completed after the fsync that covers its frame.
+    while let Ok(first) = receiver.recv() {
+        let mut batch = Vec::with_capacity(WAL_LANE_BATCH_MAX);
+        batch.push(first);
+        while batch.len() < WAL_LANE_BATCH_MAX {
+            match receiver.try_recv() {
+                Ok(command) => batch.push(command),
+                Err(_) => break,
+            }
+        }
+        process_wal_lane_batch(
+            &backend,
+            &path,
+            &mut writer,
+            &writer_open,
+            &mut persisted_level,
+            batch,
+        );
+    }
+}
+
+fn process_wal_lane_batch(
+    backend: &NativeFileBackend,
+    path: &Path,
+    writer: &mut Option<WalWriter>,
+    writer_open: &AtomicBool,
+    persisted_level: &mut Option<DurabilityMode>,
+    batch: Vec<WalLaneCommand>,
+) {
+    // Appended-but-not-yet-synced waiters and the strongest durability any of
+    // them requested. They are completed together by the next fsush.
+    let mut pending: Vec<WalLaneReply> = Vec::new();
+    let mut pending_durability = DurabilityMode::Buffered;
+
+    for command in batch {
         match command {
             WalLaneCommand::Append {
                 frame,
                 durability,
                 reply,
             } => {
-                let result = append_wal_lane_frame(
-                    &backend,
-                    &path,
-                    &mut writer,
-                    &writer_open,
+                // Append without syncing; the batch fsync below covers it.
+                match append_wal_lane_frame(
+                    backend,
+                    path,
+                    writer,
+                    writer_open,
                     &frame,
-                    durability,
-                );
-                if result.is_ok() {
-                    record_wal_lane_append_durability(&mut persisted_level, durability);
+                    DurabilityMode::Buffered,
+                ) {
+                    Ok(()) => {
+                        if wal_durability_rank(durability) > wal_durability_rank(pending_durability)
+                        {
+                            pending_durability = durability;
+                        }
+                        // Mark the lane dirty: these bytes are unsynced, so a
+                        // later persist (even in a separate batch) must fsync.
+                        *persisted_level = Some(DurabilityMode::Buffered);
+                        pending.push(reply);
+                    }
+                    Err(error) => reply.complete(Err(error)),
                 }
-                reply.complete(result);
             }
             WalLaneCommand::Persist { durability, reply } => {
-                let result = persist_wal_lane(&mut writer, &mut persisted_level, durability);
-                reply.complete(result);
+                let combined =
+                    if wal_durability_rank(durability) > wal_durability_rank(pending_durability) {
+                        durability
+                    } else {
+                        pending_durability
+                    };
+                let result = flush_wal_lane_batch(writer, persisted_level, combined, &mut pending);
+                reply.complete(duplicate_wal_lane_result(&result));
+                pending_durability = DurabilityMode::Buffered;
             }
             WalLaneCommand::Rewrite {
                 replay_floor,
                 reply,
             } => {
+                // A rewrite changes the file; flush queued appends first.
+                let _ =
+                    flush_wal_lane_batch(writer, persisted_level, pending_durability, &mut pending);
+                pending_durability = DurabilityMode::Buffered;
                 let result = rewrite_wal_lane_after_replay_floor(
-                    &backend,
-                    &path,
-                    &mut writer,
-                    &mut persisted_level,
+                    backend,
+                    path,
+                    writer,
+                    persisted_level,
                     replay_floor,
                 );
                 reply.complete(result);
             }
         }
+    }
+
+    let _ = flush_wal_lane_batch(writer, persisted_level, pending_durability, &mut pending);
+}
+
+/// Persist the buffered appends with a single fsync and complete their waiters.
+///
+/// When `pending` is non-empty there are freshly appended, unsynced bytes, so a
+/// sync at `durability` is forced; for a standalone persist with no new appends
+/// the existing `persisted_level` can satisfy it without a redundant fsync.
+fn flush_wal_lane_batch(
+    writer: &mut Option<WalWriter>,
+    persisted_level: &mut Option<DurabilityMode>,
+    durability: DurabilityMode,
+    pending: &mut Vec<WalLaneReply>,
+) -> Result<()> {
+    let has_new_appends = !pending.is_empty();
+    let result = persist_wal_lane_batch(writer, persisted_level, durability, has_new_appends);
+    for reply in pending.drain(..) {
+        reply.complete(duplicate_wal_lane_result(&result));
+    }
+    result
+}
+
+fn persist_wal_lane_batch(
+    writer: &mut Option<WalWriter>,
+    persisted_level: &mut Option<DurabilityMode>,
+    durability: DurabilityMode,
+    has_new_appends: bool,
+) -> Result<()> {
+    let Some(writer) = writer.as_mut() else {
+        return Ok(());
+    };
+    if !wal_durability_requires_sync(durability) {
+        return Ok(());
+    }
+    // Freshly appended bytes are unsynced, so a sync is mandatory; a standalone
+    // persist can skip when the lane is already synced at this level.
+    if has_new_appends || wal_lane_needs_persist(*persisted_level, durability) {
+        writer.persist(durability)?;
+        *persisted_level = Some(durability);
+    }
+    Ok(())
+}
+
+const fn wal_durability_requires_sync(durability: DurabilityMode) -> bool {
+    wal_durability_rank(durability) >= wal_durability_rank(DurabilityMode::SyncData)
+}
+
+/// `Error` is not `Clone`, so reproduce it for each fan-out waiter, preserving
+/// the I/O error kind and message for the common fsync-failure case.
+fn duplicate_wal_lane_result(result: &Result<()>) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(Error::Io(error)) => Err(Error::Io(std::io::Error::new(
+            error.kind(),
+            error.to_string(),
+        ))),
+        Err(error) => Err(Error::Corruption {
+            message: format!("group commit persist failed: {error}"),
+        }),
     }
 }
 
@@ -1157,18 +1281,6 @@ fn persist_wal_lane(
         }
     }
     Ok(())
-}
-
-fn record_wal_lane_append_durability(
-    persisted_level: &mut Option<DurabilityMode>,
-    durability: DurabilityMode,
-) {
-    *persisted_level = Some(match *persisted_level {
-        Some(existing) if wal_durability_rank(existing) <= wal_durability_rank(durability) => {
-            existing
-        }
-        Some(_) | None => durability,
-    });
 }
 
 fn wal_lane_needs_persist(
