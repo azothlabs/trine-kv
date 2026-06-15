@@ -10,8 +10,9 @@ use std::{
 use trine_kv::{
     BlobGcRatio, BlobLevelMergePolicy, BucketOptions, CompactionSkip, CompactionTrigger,
     CompressionProfile, Db,
-    DbOptions, DurabilityMode, Error, FailOnCorruptionPolicy, FilterPolicy, IndexSearchPolicy,
-    KeyRange, MaintenanceBudget, PrefixExtractor, PrefixFilterPolicy, TransactionOptions,
+    DbOptions, DurabilityMode, Error, FailOnCorruptionPolicy, FilterDepthCurve, FilterPolicy,
+    IndexSearchPolicy, KeyRange, MaintenanceBudget, PrefixExtractor, PrefixFilterPolicy,
+    TransactionOptions,
     WriteBatch, WriteOptions, blob, codec::CodecId, manifest, recovery, table, wal,
     write_batch::BatchOperation,
 };
@@ -472,6 +473,7 @@ fn persistent_manifest_keeps_bucket_options_across_reopen() {
         index_search_policy: IndexSearchPolicy::Binary,
         blob_threshold_bytes: 128 * 1024,
         blob_level_merge_policy: BlobLevelMergePolicy::Always,
+        filter_depth_curve: FilterDepthCurve::Auto,
     };
 
     {
@@ -3169,6 +3171,7 @@ fn persistent_blob_level_merge_defers_pending_blob_clear_publish() {
     options.default_bucket_options = BucketOptions {
         blob_threshold_bytes: 8,
         blob_level_merge_policy: BlobLevelMergePolicy::Always,
+        filter_depth_curve: FilterDepthCurve::Auto,
         ..BucketOptions::default()
     };
 
@@ -3231,6 +3234,7 @@ fn persistent_blob_level_merge_can_be_disabled() {
     options.default_bucket_options = BucketOptions {
         blob_threshold_bytes: 8,
         blob_level_merge_policy: BlobLevelMergePolicy::Disabled,
+        filter_depth_curve: FilterDepthCurve::Auto,
         ..BucketOptions::default()
     };
 
@@ -3526,6 +3530,7 @@ fn persistent_blob_gc_rewrites_live_records_from_partially_stale_file() {
     options.default_bucket_options = BucketOptions {
         blob_threshold_bytes: 8,
         blob_level_merge_policy: BlobLevelMergePolicy::Disabled,
+        filter_depth_curve: FilterDepthCurve::Auto,
         ..BucketOptions::default()
     };
     let old_a = b"large-value-a-old-large-value-a-old".to_vec();
@@ -3591,6 +3596,7 @@ fn persistent_blob_gc_batches_multiple_stale_candidates() {
     options.default_bucket_options = BucketOptions {
         blob_threshold_bytes: 8,
         blob_level_merge_policy: BlobLevelMergePolicy::Disabled,
+        filter_depth_curve: FilterDepthCurve::Auto,
         ..BucketOptions::default()
     };
     let new_a = b"large-value-a-new-large-value-a-new".to_vec();
@@ -3658,6 +3664,7 @@ fn persistent_blob_gc_keeps_old_blob_while_read_pin_can_reach_it() {
     options.default_bucket_options = BucketOptions {
         blob_threshold_bytes: 8,
         blob_level_merge_policy: BlobLevelMergePolicy::Disabled,
+        filter_depth_curve: FilterDepthCurve::Auto,
         ..BucketOptions::default()
     };
     let old_a = b"large-value-a-old-large-value-a-old".to_vec();

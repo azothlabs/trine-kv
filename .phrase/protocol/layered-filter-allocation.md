@@ -165,11 +165,39 @@ Acceptance gate:
 - Curve never exceeds the base (shared curve unit test).
 - Hot shallow levels keep base accuracy.
 
-### Phase 4: Configurable Curve (Only If Needed)
+### Phase 4: Configurable Curve
 
-Goal: if evidence requires user-tunable curves, add the option, which touches
-`BucketOptions` and therefore needs a manifest version bump plus
-migration/recovery tests before any format change.
+Status: Implemented (2026-06-15).
+
+Goal: let users tune (or disable) the per-level filter bits curve per bucket.
+
+Decision (designer): the curve lives in `BucketOptions` and is persisted, not a
+runtime `DbOptions` knob. Rationale: it is a filter property and the base
+`bits_per_key`/`bits_per_prefix` are already per-bucket persisted there
+(cohesion); the curve shapes durable SSTable filter sizing, so a non-persisted
+knob would let the curve silently drift across restarts and leave a dataset of
+tables written under different curves (worse than the ephemeral WAL-lane count,
+which is why `WalShardPolicy` could be runtime); per-bucket granularity is free
+once it is in `BucketOptions`; and the manifest already has a clean
+version-gated decode (`read_bucket_options(version)`), so the format change is a
+routine, tested pattern.
+
+Implementation:
+
+- `BucketOptions::filter_depth_curve: FilterDepthCurve` (`Auto` | `Uniform` |
+  `Custom { step, floor }`), default `Auto`; `with_filter_depth_curve` builder.
+  The shallow boundary stays tied to the pinned-metadata levels (not exposed).
+- `level_adjusted_filter_bits(curve, base, level)` applies it to both point and
+  prefix filters.
+- Manifest bumped to v10; `filter_depth_curve` appended to bucket options.
+  Versions < 10 decode to `Auto` (`read_bucket_options` version gate).
+
+Acceptance gate:
+
+- No format change without a protocol update and migration/recovery tests. Met:
+  v9 payload decodes to `Auto`; v10 round-trips a `Custom` curve; every
+  persistent test now round-trips a v10 manifest.
+- The curve is configurable and disablable (`Uniform`).
 
 ### Phase 5: Deferred Advanced Variants
 

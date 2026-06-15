@@ -22,7 +22,9 @@ use crate::{
         Direction, ForwardKeyState, RecordGroup, ReverseKeyState, ScanRecord, ScanSelector,
         prefix_successor, sort_group_records,
     },
-    options::{DurabilityMode, FilterPolicy, IndexSearchPolicy, PrefixFilterPolicy},
+    options::{
+        DurabilityMode, FilterDepthCurve, FilterPolicy, IndexSearchPolicy, PrefixFilterPolicy,
+    },
     point_value::PointValueSource,
     prefix::PrefixExtractor,
     range_tombstone::{self, RangeTombstoneIndex, RangeTombstoneLike},
@@ -182,6 +184,7 @@ pub(crate) struct TableWriteOptions {
     pub(crate) filter_policy: FilterPolicy,
     pub(crate) prefix_extractor: PrefixExtractor,
     pub(crate) prefix_filter_policy: PrefixFilterPolicy,
+    pub(crate) filter_depth_curve: FilterDepthCurve,
     pub(crate) blob_threshold_bytes: usize,
     pub(crate) rewrite_blob_indexes: bool,
 }
@@ -4406,7 +4409,7 @@ fn build_prefix_filter(
             point_records
                 .iter()
                 .map(|record| record.internal_key.user_key()),
-            level_adjusted_filter_bits(bits_per_prefix, level),
+            level_adjusted_filter_bits(options.filter_depth_curve, bits_per_prefix, level),
         ),
     }
 }
@@ -4422,7 +4425,7 @@ fn build_point_key_filter(
             point_records
                 .iter()
                 .map(|record| record.internal_key.user_key()),
-            level_adjusted_filter_bits(bits_per_key, level),
+            level_adjusted_filter_bits(options.filter_depth_curve, bits_per_key, level),
         )),
     }
 }
@@ -4440,13 +4443,19 @@ fn build_point_key_filter(
 /// extra block-filter / data-block probe, which is the classic Monkey trade of
 /// memory for worst-case lookup cost. Both filters are self-describing
 /// (`from_parts` carries bit and hash counts), so per-level bits need no
-/// storage-format change.
-fn level_adjusted_filter_bits(base: u8, level: TableLevel) -> u8 {
-    const BITS_PER_LEVEL_STEP: u8 = 2;
-    const MIN_FILTER_BITS: u8 = 4;
+/// storage-format change. The curve shape is configured per bucket via
+/// [`FilterDepthCurve`].
+fn level_adjusted_filter_bits(curve: FilterDepthCurve, base: u8, level: TableLevel) -> u8 {
+    const AUTO_BITS_PER_LEVEL_STEP: u8 = 2;
+    const AUTO_MIN_FILTER_BITS: u8 = 4;
+    let (step, floor) = match curve {
+        FilterDepthCurve::Uniform => return base,
+        FilterDepthCurve::Auto => (AUTO_BITS_PER_LEVEL_STEP, AUTO_MIN_FILTER_BITS),
+        FilterDepthCurve::Custom { step, floor } => (step, floor),
+    };
     let depth = level.get().saturating_sub(PINNED_READ_METADATA_MAX_LEVEL);
-    let reduction = BITS_PER_LEVEL_STEP.saturating_mul(u8::try_from(depth).unwrap_or(u8::MAX));
-    let floor = MIN_FILTER_BITS.min(base);
+    let reduction = step.saturating_mul(u8::try_from(depth).unwrap_or(u8::MAX));
+    let floor = floor.min(base);
     base.saturating_sub(reduction).max(floor)
 }
 
@@ -6752,18 +6761,30 @@ mod tests {
 
     #[test]
     fn level_adjusted_filter_bits_decreases_with_depth() {
-        // Pinned shallow levels keep the base; deeper levels get progressively
-        // fewer bits, clamped to the floor and never exceeding the base. The same
-        // curve drives both the point (bits_per_key) and prefix (bits_per_prefix)
-        // filters.
-        assert_eq!(level_adjusted_filter_bits(10, TableLevel::ZERO), 10);
-        assert_eq!(level_adjusted_filter_bits(10, TableLevel(1)), 10);
-        assert_eq!(level_adjusted_filter_bits(10, TableLevel(2)), 8);
-        assert_eq!(level_adjusted_filter_bits(10, TableLevel(3)), 6);
-        assert_eq!(level_adjusted_filter_bits(10, TableLevel(4)), 4);
-        assert_eq!(level_adjusted_filter_bits(10, TableLevel(9)), 4);
+        use crate::options::FilterDepthCurve;
+        // Auto: pinned shallow levels keep the base; deeper levels get
+        // progressively fewer bits, clamped to the floor and never exceeding the
+        // base. The same curve drives both the point and prefix filters.
+        let auto = FilterDepthCurve::Auto;
+        assert_eq!(level_adjusted_filter_bits(auto, 10, TableLevel::ZERO), 10);
+        assert_eq!(level_adjusted_filter_bits(auto, 10, TableLevel(1)), 10);
+        assert_eq!(level_adjusted_filter_bits(auto, 10, TableLevel(2)), 8);
+        assert_eq!(level_adjusted_filter_bits(auto, 10, TableLevel(3)), 6);
+        assert_eq!(level_adjusted_filter_bits(auto, 10, TableLevel(4)), 4);
+        assert_eq!(level_adjusted_filter_bits(auto, 10, TableLevel(9)), 4);
         // A small base is never raised above itself (no memory regression).
-        assert_eq!(level_adjusted_filter_bits(3, TableLevel(9)), 3);
+        assert_eq!(level_adjusted_filter_bits(auto, 3, TableLevel(9)), 3);
+
+        // Uniform: every level keeps the base.
+        let uniform = FilterDepthCurve::Uniform;
+        assert_eq!(level_adjusted_filter_bits(uniform, 10, TableLevel(9)), 10);
+
+        // Custom: tune step and floor; floor never exceeds the base.
+        let custom = FilterDepthCurve::Custom { step: 3, floor: 2 };
+        assert_eq!(level_adjusted_filter_bits(custom, 10, TableLevel(1)), 10);
+        assert_eq!(level_adjusted_filter_bits(custom, 10, TableLevel(2)), 7);
+        assert_eq!(level_adjusted_filter_bits(custom, 10, TableLevel(3)), 4);
+        assert_eq!(level_adjusted_filter_bits(custom, 10, TableLevel(9)), 2);
     }
 
     #[test]
@@ -6850,6 +6871,7 @@ mod tests {
             prefix_filter_policy: PrefixFilterPolicy::Bloom {
                 bits_per_prefix: 10,
             },
+            filter_depth_curve: FilterDepthCurve::Auto,
             blob_threshold_bytes: BucketOptions::DEFAULT_BLOB_THRESHOLD_BYTES,
             rewrite_blob_indexes: false,
         };
@@ -7716,6 +7738,7 @@ mod tests {
             } else {
                 PrefixFilterPolicy::Disabled
             },
+            filter_depth_curve: FilterDepthCurve::Auto,
             blob_threshold_bytes: BucketOptions::DEFAULT_BLOB_THRESHOLD_BYTES,
             rewrite_blob_indexes: false,
         }

@@ -13709,3 +13709,48 @@ Negative check:
 
 - Layered-filter Phases 1-3 complete. Do Phase 4/5 when a workload needs a
   tunable curve or a remote/dynamic variant.
+
+## 2026-06-15: Layered Filter Allocation Phase 4 (Configurable Curve)
+
+### Observation
+
+- Designer decision (user asked for the recommendation): the curve lives in
+  `BucketOptions` (persisted), not a runtime `DbOptions` knob. It is a filter
+  property next to the already-persisted base bits; it shapes durable SSTable
+  filter sizing, so a runtime knob would silently drift across restarts and mix
+  tables written under different curves (worse than the ephemeral WAL-lane count
+  that justified `WalShardPolicy` being runtime); per-bucket is free in
+  `BucketOptions`; and the manifest already has version-gated decode.
+- Added `FilterDepthCurve` (`Auto` | `Uniform` | `Custom { step, floor }`),
+  default `Auto`; `BucketOptions::filter_depth_curve` +
+  `with_filter_depth_curve`; `level_adjusted_filter_bits(curve, base, level)`
+  applies it to both point and prefix filters. The shallow boundary stays tied to
+  the pinned-metadata levels (not exposed).
+- Manifest bumped to v10 (min supported still 8): `filter_depth_curve` appended
+  to bucket options; versions < 10 decode to `Auto`.
+
+### Interpretation
+
+- Users can now tune memory-vs-deep-FPR (raise `floor` on slow storage, lower it
+  to save memory) or disable the curve (`Uniform`) for max accuracy, per bucket.
+  Default behavior is unchanged (`Auto`).
+
+### Verification
+
+- `cargo test -q --lib` (358) and `--all-features` (362, 1 ignored flake) green.
+- Migration/recovery: `manifest_decode_v9_bucket_options_default_filter_depth_curve`
+  (v9 -> Auto), `manifest_v10_bucket_options_round_trip_filter_depth_curve`
+  (Custom round-trips). Every persistent test now round-trips a v10 manifest.
+- `level_adjusted_filter_bits_decreases_with_depth` covers Auto/Uniform/Custom.
+- `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`,
+  `cargo check --benches`, `git diff --check`.
+
+### Remaining Blockers
+
+- Only Phase 5 remains (committed): cost-weighted remote curve + dynamic
+  per-hot-guard filter rewrite.
+
+### Recommended Next Action
+
+- Do Phase 5 when an S3/remote backend lands or a workload needs the dynamic
+  variant. The static layered-filter work (Phases 1-4) is complete.

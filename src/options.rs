@@ -601,6 +601,37 @@ pub enum BlobLevelMergePolicy {
     Always,
 }
 
+/// Layered (Monkey-style) filter bits-per-element curve across LSM levels.
+///
+/// Both the point filter (`bits_per_key`) and the prefix filter
+/// (`bits_per_prefix`) use this curve at write time. Pinned shallow levels keep
+/// the configured base bits so hot, recent data stays accurately filtered;
+/// deeper levels, which hold most keys and dominate filter memory, get fewer
+/// bits. The curve never raises a level above its base, so total filter memory
+/// cannot regress versus a flat allocation. Filters are self-describing, so this
+/// only affects how future tables are written, not how existing tables are read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FilterDepthCurve {
+    /// Built-in depth curve: deeper levels lose 2 bits each down to a floor of 4,
+    /// shallow (pinned) levels keep the base. The recommended default.
+    #[default]
+    Auto,
+    /// No curve: every level uses the base bits. Highest filter accuracy and
+    /// highest filter memory; choose when memory is not constrained.
+    Uniform,
+    /// Custom depth curve: deeper levels lose `step` bits each, clamped to
+    /// `floor` (and never above the base). The shallow boundary stays tied to the
+    /// pinned-metadata levels. Raise `floor` on slow storage to keep deep-level
+    /// false positives (and data-block reads) low at the cost of memory; lower it
+    /// to save more memory.
+    Custom {
+        /// Bits removed per level below the shallow (pinned) boundary.
+        step: u8,
+        /// Minimum bits per element for the deepest levels.
+        floor: u8,
+    },
+}
+
 /// Options fixed for a bucket when the bucket is created.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketOptions {
@@ -622,6 +653,10 @@ pub struct BucketOptions {
     pub blob_threshold_bytes: usize,
     /// Policy for merging blob values during compaction.
     pub blob_level_merge_policy: BlobLevelMergePolicy,
+    /// Layered (Monkey-style) filter bits-per-element curve across levels,
+    /// applied to both the point and prefix filters. Defaults to
+    /// [`FilterDepthCurve::Auto`].
+    pub filter_depth_curve: FilterDepthCurve,
 }
 
 impl BucketOptions {
@@ -661,6 +696,13 @@ impl BucketOptions {
         };
         self
     }
+
+    /// Sets the layered filter bits-per-element curve (see [`FilterDepthCurve`]).
+    #[must_use]
+    pub const fn with_filter_depth_curve(mut self, curve: FilterDepthCurve) -> Self {
+        self.filter_depth_curve = curve;
+        self
+    }
 }
 
 impl Default for BucketOptions {
@@ -675,6 +717,7 @@ impl Default for BucketOptions {
             index_search_policy: IndexSearchPolicy::Auto,
             blob_threshold_bytes: Self::DEFAULT_BLOB_THRESHOLD_BYTES,
             blob_level_merge_policy: BlobLevelMergePolicy::Auto,
+            filter_depth_curve: FilterDepthCurve::Auto,
         }
     }
 }

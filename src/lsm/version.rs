@@ -844,6 +844,7 @@ mod tests {
             filter_policy: FilterPolicy::Disabled,
             prefix_extractor: PrefixExtractor::Disabled,
             prefix_filter_policy: PrefixFilterPolicy::Disabled,
+            filter_depth_curve: crate::options::FilterDepthCurve::Auto,
             blob_threshold_bytes: usize::MAX,
             rewrite_blob_indexes: false,
         }
@@ -856,6 +857,7 @@ mod tests {
             filter_policy: FilterPolicy::Bloom { bits_per_key: 64 },
             prefix_extractor: PrefixExtractor::Disabled,
             prefix_filter_policy: PrefixFilterPolicy::Disabled,
+            filter_depth_curve: crate::options::FilterDepthCurve::Auto,
             blob_threshold_bytes: usize::MAX,
             rewrite_blob_indexes: false,
         }

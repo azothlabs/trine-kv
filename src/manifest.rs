@@ -11,8 +11,8 @@ use crate::{
     internal_key::{InternalKey, ValueKind},
     object_store::{ETag, ObjectClient, Precondition, PutIf},
     options::{
-        BlobLevelMergePolicy, BucketOptions, CompressionProfile, DurabilityMode, FilterPolicy,
-        IndexSearchPolicy, PrefixFilterPolicy,
+        BlobLevelMergePolicy, BucketOptions, CompressionProfile, DurabilityMode, FilterDepthCurve,
+        FilterPolicy, IndexSearchPolicy, PrefixFilterPolicy,
     },
     prefix::PrefixExtractor,
     storage::{
@@ -29,7 +29,7 @@ use crate::storage::BrowserStorageBackend;
 
 pub const MANIFEST_FILE_NAME: &str = "MANIFEST";
 const MANIFEST_MAGIC: u32 = 0x5452_4d46;
-const MANIFEST_VERSION: u16 = 9;
+const MANIFEST_VERSION: u16 = 10;
 const MIN_SUPPORTED_MANIFEST_VERSION: u16 = 8;
 const HEADER_LEN: usize = 14;
 // The lower bound for one table entry: fixed fields plus two empty byte fields.
@@ -1350,7 +1350,20 @@ fn put_bucket_options(bytes: &mut Vec<u8>, options: &BucketOptions) -> Result<()
     put_index_search_policy(bytes, options.index_search_policy);
     put_usize(bytes, options.blob_threshold_bytes)?;
     put_blob_level_merge_policy(bytes, options.blob_level_merge_policy);
+    put_filter_depth_curve(bytes, options.filter_depth_curve);
     Ok(())
+}
+
+fn put_filter_depth_curve(bytes: &mut Vec<u8>, value: FilterDepthCurve) {
+    match value {
+        FilterDepthCurve::Auto => put_u8(bytes, 0),
+        FilterDepthCurve::Uniform => put_u8(bytes, 1),
+        FilterDepthCurve::Custom { step, floor } => {
+            put_u8(bytes, 2);
+            put_u8(bytes, step);
+            put_u8(bytes, floor);
+        }
+    }
 }
 
 fn put_bool(bytes: &mut Vec<u8>, value: bool) {
@@ -1661,7 +1674,26 @@ impl<'payload> Cursor<'payload> {
             } else {
                 BlobLevelMergePolicy::Auto
             },
+            filter_depth_curve: if version >= 10 {
+                self.read_filter_depth_curve()?
+            } else {
+                FilterDepthCurve::Auto
+            },
         })
+    }
+
+    fn read_filter_depth_curve(&mut self) -> Result<FilterDepthCurve> {
+        match self.read_u8()? {
+            0 => Ok(FilterDepthCurve::Auto),
+            1 => Ok(FilterDepthCurve::Uniform),
+            2 => Ok(FilterDepthCurve::Custom {
+                step: self.read_u8()?,
+                floor: self.read_u8()?,
+            }),
+            other => Err(Error::Corruption {
+                message: format!("unknown filter depth curve tag {other}"),
+            }),
+        }
     }
 
     fn read_tables(&mut self) -> Result<BTreeMap<String, Vec<TableProperties>>> {
@@ -1929,8 +1961,8 @@ mod tests {
     use super::{MANIFEST_VERSION, ManifestStore, decode_state, manifest_path};
     use crate::{
         options::{
-            BlobLevelMergePolicy, BucketOptions, CompressionProfile, FilterPolicy,
-            IndexSearchPolicy, PrefixFilterPolicy,
+            BlobLevelMergePolicy, BucketOptions, CompressionProfile, FilterDepthCurve,
+            FilterPolicy, IndexSearchPolicy, PrefixFilterPolicy,
         },
         prefix::PrefixExtractor,
         storage::NativeFileBackend,
@@ -2019,6 +2051,54 @@ mod tests {
         assert_eq!(
             options.blob_level_merge_policy,
             BlobLevelMergePolicy::Always
+        );
+    }
+
+    fn put_v9_bucket_options_header(payload: &mut Vec<u8>) {
+        super::put_u64(payload, 0);
+        super::put_u32(payload, 1);
+        super::put_bytes(payload, b"users").expect("bucket name encodes");
+        super::put_bool(payload, true);
+        super::put_compression_profile(payload, CompressionProfile::Fast);
+        super::put_usize(payload, 4096).expect("block size encodes");
+        super::put_filter_policy(payload, FilterPolicy::Bloom { bits_per_key: 12 });
+        super::put_prefix_extractor(payload, &PrefixExtractor::Disabled)
+            .expect("prefix extractor encodes");
+        super::put_prefix_filter_policy(payload, PrefixFilterPolicy::Bloom { bits_per_prefix: 8 });
+        super::put_index_search_policy(payload, IndexSearchPolicy::Auto);
+        super::put_usize(payload, 128 * 1024).expect("threshold encodes");
+        super::put_blob_level_merge_policy(payload, BlobLevelMergePolicy::Auto);
+    }
+
+    #[test]
+    fn manifest_decode_v9_bucket_options_default_filter_depth_curve() {
+        // A v9 manifest has no filter-depth-curve field; it must default to Auto.
+        let mut payload = Vec::new();
+        put_v9_bucket_options_header(&mut payload);
+        super::put_u32(&mut payload, 0); // tables
+        super::put_u32(&mut payload, 0); // pending blob deletions
+        super::put_u32(&mut payload, 0); // checkpoints (version >= 9)
+
+        let state = decode_state(&payload, 9).expect("v9 manifest decodes");
+        let options = state.buckets().get("users").expect("bucket options exist");
+        assert_eq!(options.filter_depth_curve, FilterDepthCurve::Auto);
+    }
+
+    #[test]
+    fn manifest_v10_bucket_options_round_trip_filter_depth_curve() {
+        // v10 persists a custom curve and decodes it back exactly.
+        let mut payload = Vec::new();
+        put_v9_bucket_options_header(&mut payload);
+        super::put_filter_depth_curve(&mut payload, FilterDepthCurve::Custom { step: 3, floor: 6 });
+        super::put_u32(&mut payload, 0); // tables
+        super::put_u32(&mut payload, 0); // pending blob deletions
+        super::put_u32(&mut payload, 0); // checkpoints (version >= 9)
+
+        let state = decode_state(&payload, MANIFEST_VERSION).expect("v10 manifest decodes");
+        let options = state.buckets().get("users").expect("bucket options exist");
+        assert_eq!(
+            options.filter_depth_curve,
+            FilterDepthCurve::Custom { step: 3, floor: 6 }
         );
     }
 

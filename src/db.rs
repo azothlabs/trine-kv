@@ -9076,6 +9076,7 @@ fn blob_gc_table_write_options(options: &BucketOptions) -> table::TableWriteOpti
         filter_policy: options.filter_policy,
         prefix_extractor: options.prefix_extractor.clone(),
         prefix_filter_policy: options.prefix_filter_policy,
+        filter_depth_curve: options.filter_depth_curve,
         blob_threshold_bytes: usize::MAX,
         rewrite_blob_indexes: false,
     }

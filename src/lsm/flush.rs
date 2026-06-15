@@ -111,6 +111,7 @@ fn table_write_options(options: &BucketOptions) -> table::TableWriteOptions {
         filter_policy: options.filter_policy,
         prefix_extractor: options.prefix_extractor.clone(),
         prefix_filter_policy: options.prefix_filter_policy,
+        filter_depth_curve: options.filter_depth_curve,
         blob_threshold_bytes: options.blob_threshold_bytes,
         rewrite_blob_indexes: false,
     }
