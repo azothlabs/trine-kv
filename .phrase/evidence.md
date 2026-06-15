@@ -13836,3 +13836,51 @@ Negative check:
 
 - Phase 3: bulk drop via file drop (drop bucket/prefix by removing wholly-covered
   files), the biggest user-facing win. Then Phase 4 (read-path whole-range skip).
+
+## 2026-06-15: Delete/GC Lifecycle Phase 3 (File-Drop Compaction Optimization)
+
+### Observation
+
+- Snapshot-model investigation: Trine point reads use the current version +
+  read-sequence filter; `SnapshotTracker` is a per-sequence refcount, no
+  per-snapshot version pin. So an instant file-removal API would let an older
+  snapshot read the emptied current version and miss its data (MVCC violation).
+  The user also correctly noted a general KV must not assume key layout
+  (tenant==bucket), so `truncate_bucket` as the primitive was wrong.
+- Decision: keep it general and layout-agnostic, as a retention-gated compaction
+  optimization on any `delete_range` (RocksDB DeleteFilesInRange shape). During
+  compaction, an input table entirely covered by one range tombstone is dropped
+  by file (input_table_ids -> obsolete -> snapshot-safe cleanup) instead of being
+  read and rewritten, when: tombstone spatially covers the table span; table
+  largest_sequence <= tombstone sequence; tombstone sequence <=
+  oldest_active_snapshot. Edge (partial) tables merge/truncate normally.
+
+### Interpretation
+
+- MVCC-correct because the gate is the same retention floor the merge already
+  uses, so an older snapshot that still needs covered data keeps it (the table is
+  not dropped). In the common embedded case (no older snapshot) a whole drop
+  range's data tables are unlinked with no rewrite. Snapshot version-handle
+  pinning (LMDB-grade MVCC) is deferred as a separate larger initiative.
+
+### Verification
+
+- `cargo test -q --lib` (368) and `--all-features` (372, 1 ignored flake) green.
+- Pure coverage unit tests: covered / record-too-new / snapshot-too-old /
+  partial-spatial. Integration `bulk_range_delete_drops_covered_tables_by_file`:
+  delete_range(all) drops covered data tables by file, data gone, durable across
+  reopen, table bytes not grown by a rewrite.
+- Range-delete + snapshot correctness suites pass (the gate matches the merge's
+  own retention).
+- `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`,
+  `cargo check --benches`, `git diff --check`.
+
+### Remaining Blockers
+
+- Conservative single-tombstone coverage only. `truncate_bucket`/`drop_range`
+  sugar and a covered-files-dropped counter deferred. Phase 4 remains.
+
+### Recommended Next Action
+
+- Phase 4: read-path whole-range skip (skip blocks fully covered by visible
+  tombstones during scans), gated by Phase 1 scan-waste evidence.

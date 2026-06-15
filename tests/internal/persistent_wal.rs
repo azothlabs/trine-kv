@@ -2317,6 +2317,63 @@ fn scan_waste_and_snapshot_lag_metrics_report_gc_health() {
 }
 
 #[test]
+fn bulk_range_delete_drops_covered_tables_by_file() {
+    let path = temp_db_path("drop-covered-by-file");
+    let mut options = DbOptions::persistent(&path);
+    options.background_worker_count = 0;
+    let db = Db::open_sync(options).expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+
+    for index in 0..200_u32 {
+        bucket
+            .put_sync(format!("k{index:04}").into_bytes(), vec![b'x'; 64])
+            .expect("put");
+    }
+    db.flush_sync().expect("flush data");
+    db.compact_range_sync(KeyRange::all()).expect("settle into a level");
+    let before = db.stats();
+    assert!(before.total_tables >= 1, "data tables exist before the drop");
+
+    // Bulk-delete everything, then compact. No active snapshots, so the
+    // bucket-wide range tombstone is retention-safe and the fully covered data
+    // tables are dropped by file instead of rewritten.
+    db.delete_range_sync(KeyRange::all()).expect("range delete");
+    db.flush_sync().expect("flush range tombstone");
+    db.compact_range_sync(KeyRange::all())
+        .expect("compaction drops covered tables");
+
+    for index in 0..200_u32 {
+        assert_eq!(
+            bucket
+                .get_sync(format!("k{index:04}").as_bytes())
+                .expect("get after drop"),
+            None,
+            "covered key must be gone"
+        );
+    }
+    let after = db.stats();
+    assert!(
+        after.table_bytes <= before.table_bytes,
+        "covered data must not be rewritten: before {} after {}",
+        before.table_bytes,
+        after.table_bytes
+    );
+
+    // Reopen proves the drop is durable.
+    drop(bucket);
+    drop(db);
+    let db = Db::open_sync(DbOptions::persistent(&path)).expect("reopen");
+    let bucket = db.default_bucket_sync().expect("bucket reopens");
+    assert_eq!(
+        bucket.get_sync(b"k0000").expect("get after reopen"),
+        None
+    );
+    drop(bucket);
+    drop(db);
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_level_filter_stats_aggregate_by_level() {
     let path = temp_db_path("level-filter-stats");
     let mut options = DbOptions::persistent(&path);

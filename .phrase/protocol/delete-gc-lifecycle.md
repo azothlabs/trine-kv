@@ -117,11 +117,43 @@ Acceptance gate:
 
 ### Phase 3: Bulk Drop Via File Drop
 
-Goal: drop bucket / prefix ranges by removing wholly-covered SSTable/blob files
-(DeleteFilesInRange-style) with snapshot/version-handle safety, aligned to
-guard/level boundaries; only partially covered edge tables write or truncate a
-small tombstone. Turns drop-table/tenant/prefix into a metadata + background
-cleanup operation instead of read-path tombstone pollution.
+Status: Implemented (2026-06-15), compaction file-drop optimization.
+
+Design correction (from investigating the snapshot model): Trine snapshots do
+NOT pin a version handle; point reads use the current version filtered by read
+sequence (`SnapshotTracker` is a per-sequence refcount). So an instant
+"remove files now" API would let an older snapshot read the emptied current
+version and miss its data - an MVCC violation. The MVCC-correct bulk delete is
+already a range tombstone (`delete_range`, any range, layout-agnostic); file drop
+is only safe as a retention-gated optimization, exactly like RocksDB
+DeleteFilesInRange ("use when no snapshot needs the range").
+
+Decision: keep it general and layout-agnostic (do not assume tenant==bucket).
+The mechanism is a compaction optimization that applies to any `delete_range`:
+during compaction, an input table entirely covered by one range tombstone is
+dropped by file (via `input_table_ids` -> obsolete -> snapshot-safe cleanup)
+instead of being read and rewritten to empty, when all three hold:
+
+- the tombstone spatially covers the whole table key span;
+- the table's largest sequence <= the tombstone sequence (all records hidden);
+- the tombstone sequence <= `oldest_active_snapshot` (no retained reader needs it).
+
+Partially covered edge tables are merged/truncated normally; the range tombstone
+keeps correctness meanwhile. When everything in a drop range is covered and
+retention-safe (the common embedded case: no older snapshot), the whole set of
+data tables is unlinked with no rewrite.
+
+`truncate_bucket` / `drop_range` ergonomic wrappers are deferred sugar; the
+engine mechanism above is the value and needs no key-layout assumption.
+
+Acceptance gate:
+
+- Pure coverage decision unit-tested (covered / too-new / snapshot-too-old /
+  partial-spatial). A bulk `delete_range(all)` drops covered data tables by file:
+  data gone, durable across reopen, table bytes not grown by a rewrite.
+- No storage-format change; range-delete + snapshot correctness suites pass
+  (the retention gate matches the merge's own retention, so older snapshots that
+  still need covered data keep it).
 
 ### Phase 4: Read-Path Whole-Range Skip
 

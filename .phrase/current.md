@@ -6,60 +6,62 @@ Complete
 
 ## Goal
 
-Phase 2 of `.phrase/protocol/delete-gc-lifecycle.md`: add a tombstone-aware
-compaction trigger so range tombstones meet and drop the data they cover instead
-of lingering on the read path.
+Phase 3 of `.phrase/protocol/delete-gc-lifecycle.md`: drop wholly-covered files
+during bulk delete (DeleteFilesInRange-style) instead of reading and rewriting
+them, general and layout-agnostic, MVCC-correct.
 
 ## Design Assessment
 
-v1 targets range-tombstone debt using the cheap, format-free
-`Table::may_have_range_tombstones` footer flag (no manifest change). Point-
-tombstone density needs per-table entry/deletion counts that are not in
-`TableProperties`; that is a deferred manifest bump if Phase 1 scan-waste shows
-point-tombstone-heavy pressure. Range tombstones are the dangerous big-delete /
-drop-prefix case, so they are the high-leverage start. The trigger plugs into the
-Phase E guard-aware picker.
+Investigating the snapshot model showed Trine point reads use the current
+version + sequence filter (no per-snapshot version pin), so an instant
+"remove files now" API would break older snapshots (MVCC violation). The
+MVCC-correct bulk delete is already a range tombstone (`delete_range`, any
+range). File drop is therefore a retention-gated compaction optimization, not a
+new unsafe API, and it stays layout-agnostic (no tenant==bucket assumption).
+Deeper "snapshots pin a version handle" (LMDB-grade MVCC) is a separate future
+initiative, deliberately not in this phase.
 
 ## Scope
 
-- `CompactionTable.has_range_tombstones`; new `CompactionTrigger::TombstoneDebt`.
-- Picker fires `TombstoneDebt` after `L0Overlap`/`LevelSize` and before the
-  no-pressure spread, on the shallowest non-level-0, non-deepest level holding an
-  in-range range-tombstone table, compacting it down with overlapping lower data.
-- Termination/anti-storm: fires only with lower-level overlap (a pure move just
-  relocates the tombstone), excludes the deepest level, and is lower priority
-  than size pressure.
+- Compaction skips reading/rewriting an input table entirely covered by one
+  range tombstone when (a) it spatially covers the table span, (b) the table's
+  largest sequence <= the tombstone sequence, (c) the tombstone sequence <=
+  `oldest_active_snapshot`. The table drops by file via the existing
+  `input_table_ids` -> obsolete -> snapshot-safe cleanup.
+- Pure coverage decision function, unit-tested.
 
 ## Out Of Scope
 
-- Point-tombstone density score (needs `TableProperties` entry/deletion counts =
-  manifest bump); deferred.
-- Bulk file drop (Phase 3), read-path whole-range skip (Phase 4).
+- `truncate_bucket` / `drop_range` ergonomic wrappers (deferred sugar).
+- Multi-tombstone coverage of one table (single-tombstone only; conservative).
+- Snapshot version-handle pinning (separate LMDB-grade MVCC initiative).
+- A dedicated covered-files-dropped counter (4-caller ripple; deferred).
 
 ## Acceptance Gate
 
-- Range-tombstone table with lower overlap plans `TombstoneDebt`; without overlap
-  or at the deepest level it does not. Met (planner + `LsmTree` tests).
-- No storage-format change; compaction/range-delete/recovery suites pass. Met.
+- Coverage decision unit-tested: covered / record-too-new / snapshot-too-old /
+  partial-spatial. Met.
+- Bulk `delete_range(all)` drops covered data tables by file: data gone, durable
+  across reopen, table bytes not grown by a rewrite. Met.
+- No storage-format change; range-delete + snapshot correctness suites pass
+  (the gate matches the merge's own retention). Met.
 - Full local gate. Met (one pre-existing background-timing flake).
 
 ## Evidence
 
-- Planner tests: `range_tombstone_table_with_lower_overlap_triggers_tombstone_debt`,
-  `..._without_lower_overlap_is_left_alone`,
-  `range_tombstone_at_deepest_level_does_not_trigger_tombstone_debt`.
-- `LsmTree` test `range_tombstone_table_with_lower_overlap_plans_tombstone_debt`
-  proves the `may_have_range_tombstones` flag flows through to the trigger.
-- `cargo test --lib` (363) and `--all-features` (367) green; fmt/clippy/diff clean.
+- Unit tests `*_droppable*` / `partially_covered_table_is_not_droppable`.
+- `bulk_range_delete_drops_covered_tables_by_file`: 200 keys, delete_range(all),
+  compact -> all keys gone, durable across reopen, `table_bytes` not grown.
+- `cargo test --lib` (368) and `--all-features` (372) green; fmt/clippy/diff clean.
 
 ## Known Risks
 
-- A range tombstone whose covered data is pinned by a long snapshot re-fires
-  guard-locally as it migrates down, but terminates at the deepest level; bounded
-  work, lower priority than size pressure.
+- Conservative single-tombstone coverage: a table covered only by several
+  tombstones together is not dropped by file (falls back to rewrite); correct,
+  just not optimized.
 
 ## Next Recommendation
 
-- Phase 3 (bulk drop via file drop) is the biggest user-facing win for
-  drop-table/tenant/prefix. Then Phase 4 (read-path whole-range skip). Add
-  point-tombstone density (manifest bump) only if Phase 1 metrics demand it.
+- Phase 4 (read-path whole-range skip: skip blocks fully covered by visible
+  tombstones during scans), gated by Phase 1 scan-waste evidence. Optional sugar:
+  `truncate_bucket`/`drop_range`. Optional: covered-files-dropped counter.

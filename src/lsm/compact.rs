@@ -125,21 +125,29 @@ impl LsmTree {
         oldest_active_snapshot: Sequence,
         target_table_bytes: usize,
     ) -> Result<Vec<CompactionTablePayload>> {
-        let mut sources = input
-            .input_tables
-            .iter()
-            .cloned()
-            .map(|table| {
-                CompactionSource::new(table.point_cursor(
-                    ScanSelector::Range(range.clone()),
-                    input.table_options.prefix_extractor.clone(),
-                    Direction::Forward,
-                    self.options.index_search_policy,
-                    None,
-                ))
-            })
-            .collect::<Vec<_>>();
         let range_tombstones = collect_compaction_range_tombstones(input, range)?;
+        // Phase 3 file drop: an input table whose entire content is covered by a
+        // retention-safe range tombstone is dropped via `input_table_ids` without
+        // reading or rewriting it. Its range tombstones were already collected
+        // above, so skipping its point cursor loses nothing; the merge would have
+        // emitted none of its records anyway.
+        let mut sources = Vec::with_capacity(input.input_tables.len());
+        for table in &input.input_tables {
+            if table_fully_covered_by_droppable_tombstone(
+                table.properties(),
+                &range_tombstones,
+                oldest_active_snapshot,
+            ) {
+                continue;
+            }
+            sources.push(CompactionSource::new(table.clone().point_cursor(
+                ScanSelector::Range(range.clone()),
+                input.table_options.prefix_extractor.clone(),
+                Direction::Forward,
+                self.options.index_search_policy,
+                None,
+            )));
+        }
         let mut tombstone_has_remaining_put = vec![false; range_tombstones.len()];
         let mut chunks = Vec::new();
         let mut current_chunk = CompactionChunk::default();
@@ -235,6 +243,34 @@ fn can_move_without_rewrite(input_tables: &[Arc<Table>], output_level: table::Ta
         return false;
     };
     table.properties().level.next() == Some(output_level)
+}
+
+/// Whether a table can be dropped by file (skip read + rewrite) because one
+/// range tombstone in the compaction inputs covers all of it for every retained
+/// reader. All three must hold for a single tombstone:
+///
+/// - it spatially covers the whole table key span;
+/// - it is at least as new as every record in the table, so it hides them all
+///   (a put at seq `s` is hidden by a tombstone at seq `t` when `s <= t`);
+/// - it is visible to the oldest retained reader (`tombstone.seq <=
+///   oldest_active_snapshot`), so no snapshot still needs the covered data.
+///
+/// Conservative: requires a single covering tombstone and an empty table span is
+/// never considered covered.
+fn table_fully_covered_by_droppable_tombstone(
+    properties: &table::TableProperties,
+    range_tombstones: &[TableRangeTombstone],
+    oldest_active_snapshot: Sequence,
+) -> bool {
+    if properties.smallest_user_key.is_empty() && properties.largest_user_key.is_empty() {
+        return false;
+    }
+    range_tombstones.iter().any(|tombstone| {
+        tombstone.sequence <= oldest_active_snapshot
+            && properties.largest_sequence <= tombstone.sequence
+            && range_tombstone::key_is_in_range(&properties.smallest_user_key, &tombstone.range)
+            && range_tombstone::key_is_in_range(&properties.largest_user_key, &tombstone.range)
+    })
 }
 
 fn collect_compaction_range_tombstones(
@@ -612,7 +648,8 @@ mod tests {
     use super::{
         CompactionChunk, InternalKey, TableRangeTombstone, ValueKind, ValueRef,
         cleanup_point_tombstones, cleanup_range_tombstones, compact_point_record_group,
-        compact_point_records, compaction_payloads_from_chunks, table_write_options,
+        compact_point_records, compaction_payloads_from_chunks,
+        table_fully_covered_by_droppable_tombstone, table_write_options,
     };
     use crate::{
         compaction::CompactionOptions,
@@ -903,6 +940,72 @@ mod tests {
         assert_eq!(input.table_level, TableLevel(2));
         assert_eq!(input.input_tables.len(), 2);
         fs::remove_dir_all(table_dir).expect("cleanup table dir");
+    }
+
+    fn covered_props(
+        smallest: &str,
+        largest: &str,
+        largest_sequence: u64,
+    ) -> table::TableProperties {
+        table::TableProperties {
+            id: TableId(1),
+            level: TableLevel(2),
+            smallest_user_key: smallest.as_bytes().to_vec(),
+            largest_user_key: largest.as_bytes().to_vec(),
+            smallest_sequence: Sequence::ZERO,
+            largest_sequence: Sequence::new(largest_sequence),
+            codec: crate::codec::CodecId::None,
+            blob_file_ids: Vec::new(),
+            blob_references: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn fully_covered_table_is_droppable_when_retention_safe() {
+        let props = covered_props("c", "e", 5);
+        let tombstones = vec![range_tombstone("a", "z", 10)];
+        // tombstone seq 10 <= oldest 10, table seq 5 <= 10, span [c,e] in [a,z).
+        assert!(table_fully_covered_by_droppable_tombstone(
+            &props,
+            &tombstones,
+            Sequence::new(10)
+        ));
+    }
+
+    #[test]
+    fn table_newer_than_tombstone_is_not_droppable() {
+        let props = covered_props("c", "e", 12);
+        let tombstones = vec![range_tombstone("a", "z", 10)];
+        // A record at seq 12 is newer than the tombstone, so it is not hidden.
+        assert!(!table_fully_covered_by_droppable_tombstone(
+            &props,
+            &tombstones,
+            Sequence::new(20)
+        ));
+    }
+
+    #[test]
+    fn tombstone_above_retention_floor_is_not_droppable() {
+        let props = covered_props("c", "e", 5);
+        let tombstones = vec![range_tombstone("a", "z", 10)];
+        // An older snapshot (oldest 7 < tombstone 10) still needs the data.
+        assert!(!table_fully_covered_by_droppable_tombstone(
+            &props,
+            &tombstones,
+            Sequence::new(7)
+        ));
+    }
+
+    #[test]
+    fn partially_covered_table_is_not_droppable() {
+        let props = covered_props("a", "z", 5);
+        let tombstones = vec![range_tombstone("b", "m", 10)];
+        // The table's largest key "z" is outside the tombstone range.
+        assert!(!table_fully_covered_by_droppable_tombstone(
+            &props,
+            &tombstones,
+            Sequence::new(10)
+        ));
     }
 
     fn record(key: &str, sequence: u64) -> (InternalKey, Option<ValueRef>) {
