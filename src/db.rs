@@ -1054,7 +1054,7 @@ impl Db {
         }
         if matches!(
             options.durability,
-            DurabilityMode::SyncData | DurabilityMode::SyncAll
+            DurabilityMode::SyncData | DurabilityMode::SyncAll | DurabilityMode::SyncAllStrict
         ) {
             return Err(Error::unsupported_durability(options.durability));
         }
@@ -1353,7 +1353,7 @@ impl Db {
         }
         if matches!(
             options.durability,
-            DurabilityMode::SyncData | DurabilityMode::SyncAll
+            DurabilityMode::SyncData | DurabilityMode::SyncAll | DurabilityMode::SyncAllStrict
         ) {
             return Err(Error::unsupported_durability(options.durability));
         }
@@ -2412,7 +2412,10 @@ impl Db {
         self.ensure_open()?;
 
         if self.inner.options.storage_mode.is_wasi_persistent()
-            && matches!(mode, DurabilityMode::SyncData | DurabilityMode::SyncAll)
+            && matches!(
+                mode,
+                DurabilityMode::SyncData | DurabilityMode::SyncAll | DurabilityMode::SyncAllStrict
+            )
         {
             return Err(Error::unsupported_durability(mode));
         }
@@ -2923,7 +2926,10 @@ impl Db {
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     async fn persist_browser_async(&self, mode: DurabilityMode) -> Result<()> {
         self.ensure_open()?;
-        if matches!(mode, DurabilityMode::SyncData | DurabilityMode::SyncAll) {
+        if matches!(
+            mode,
+            DurabilityMode::SyncData | DurabilityMode::SyncAll | DurabilityMode::SyncAllStrict
+        ) {
             return Err(Error::unsupported_durability(mode));
         }
         let Some(wal) = &self.inner.browser_wal else {
@@ -2938,7 +2944,10 @@ impl Db {
         self.ensure_open()?;
 
         if self.inner.options.storage_mode.is_wasi_persistent()
-            && matches!(mode, DurabilityMode::SyncData | DurabilityMode::SyncAll)
+            && matches!(
+                mode,
+                DurabilityMode::SyncData | DurabilityMode::SyncAll | DurabilityMode::SyncAllStrict
+            )
         {
             return Err(Error::unsupported_durability(mode));
         }

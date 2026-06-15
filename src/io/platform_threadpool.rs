@@ -198,18 +198,11 @@ pub(super) fn acquire_writer_lease(path: &Path, owner: &[u8]) -> Result<()> {
 }
 
 fn persist_file(file: &File, durability: DurabilityMode) -> Result<()> {
-    match durability {
-        DurabilityMode::Buffered | DurabilityMode::Flush => Ok(()),
-        DurabilityMode::SyncData => file.sync_data().map_err(Error::Io),
-        DurabilityMode::SyncAll => file.sync_all().map_err(Error::Io),
-    }
+    crate::durability::sync_file_for_durability(file, durability)
 }
 
 fn requires_sync(durability: DurabilityMode) -> bool {
-    matches!(
-        durability,
-        DurabilityMode::SyncData | DurabilityMode::SyncAll
-    )
+    crate::durability::requires_file_sync(durability)
 }
 
 fn sync_parent_directory(path: &Path) -> Result<()> {

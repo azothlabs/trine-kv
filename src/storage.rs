@@ -412,7 +412,7 @@ impl StorageCapabilities {
             DurabilityMode::Buffered => true,
             DurabilityMode::Flush => self.supports(StorageCapability::Flush),
             DurabilityMode::SyncData => self.supports(StorageCapability::StrictDataSync),
-            DurabilityMode::SyncAll => {
+            DurabilityMode::SyncAll | DurabilityMode::SyncAllStrict => {
                 self.supports(StorageCapability::StrictDataSync)
                     && self.supports(StorageCapability::StrictMetadataSync)
             }
@@ -2554,7 +2554,7 @@ mod browser_persistent_storage {
     fn require_browser_durability(durability: DurabilityMode) -> Result<()> {
         match durability {
             DurabilityMode::Buffered | DurabilityMode::Flush => Ok(()),
-            DurabilityMode::SyncData | DurabilityMode::SyncAll => {
+            DurabilityMode::SyncData | DurabilityMode::SyncAll | DurabilityMode::SyncAllStrict => {
                 Err(Error::unsupported_durability(durability))
             }
         }
@@ -3556,13 +3556,8 @@ fn persist_native_append_file(file: &mut File, durability: DurabilityMode) -> Re
             file.flush()?;
             Ok(())
         }
-        DurabilityMode::SyncData => {
-            file.sync_data()?;
-            Ok(())
-        }
-        DurabilityMode::SyncAll => {
-            file.sync_all()?;
-            Ok(())
+        DurabilityMode::SyncData | DurabilityMode::SyncAll | DurabilityMode::SyncAllStrict => {
+            crate::durability::sync_file_for_durability(file, durability)
         }
     }
 }
@@ -3764,13 +3759,13 @@ fn publish_manifest_to_native_file(
 fn sync_native_file_for_durability(file: &File, durability: DurabilityMode) -> Result<()> {
     match durability {
         DurabilityMode::Buffered => Ok(()),
+        // This path treats `Flush` as a data sync (it publishes a file whose
+        // bytes must be on disk before the rename is made durable).
         DurabilityMode::Flush | DurabilityMode::SyncData => {
-            file.sync_data()?;
-            Ok(())
+            crate::durability::sync_file_for_durability(file, DurabilityMode::SyncData)
         }
-        DurabilityMode::SyncAll => {
-            file.sync_all()?;
-            Ok(())
+        DurabilityMode::SyncAll | DurabilityMode::SyncAllStrict => {
+            crate::durability::sync_file_for_durability(file, durability)
         }
     }
 }

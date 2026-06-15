@@ -101,9 +101,28 @@ pub enum DurabilityMode {
     /// Flush buffered bytes to the backend.
     Flush,
     /// Sync file data without requiring metadata sync where the backend allows it.
+    ///
+    /// Non-strict: on macOS this is a plain `fsync`, which flushes to the drive
+    /// but may leave the data in the drive's volatile cache, so it is not
+    /// guaranteed to survive sudden power loss (it does survive a process crash
+    /// or kernel panic). See [`SyncAllStrict`](Self::SyncAllStrict).
     SyncData,
     /// Sync file data and metadata where the backend allows it.
+    ///
+    /// Non-strict, same power-loss caveat as [`SyncData`](Self::SyncData) on
+    /// macOS. This is the default for persistent databases: it trades guaranteed
+    /// power-loss durability for much higher commit throughput.
     SyncAll,
+    /// Strict full sync: flush file data and metadata all the way through the
+    /// drive's volatile cache to permanent storage.
+    ///
+    /// On macOS this issues `fcntl(F_FULLFSYNC)`, the only call that survives
+    /// sudden power loss, at a large throughput cost (it is the per-commit fsync
+    /// floor). On Linux/Windows the ordinary full sync already flushes durably,
+    /// so this behaves like [`SyncAll`](Self::SyncAll) there. Choose this when a
+    /// commit must survive power loss; otherwise prefer the faster non-strict
+    /// modes.
+    SyncAllStrict,
 }
 
 impl DurabilityMode {
@@ -113,6 +132,7 @@ impl DurabilityMode {
             Self::Flush => "flush",
             Self::SyncData => "sync-data",
             Self::SyncAll => "sync-all",
+            Self::SyncAllStrict => "sync-all-strict",
         }
     }
 }
@@ -532,7 +552,9 @@ impl WalShardPolicy {
                 let per_commit_fsync = matches!(storage_mode, StorageMode::Persistent { .. })
                     && matches!(
                         durability,
-                        DurabilityMode::SyncData | DurabilityMode::SyncAll
+                        DurabilityMode::SyncData
+                            | DurabilityMode::SyncAll
+                            | DurabilityMode::SyncAllStrict
                     );
                 if per_commit_fsync {
                     // Group-commit regime: one lane lets the worker coalesce
@@ -802,13 +824,25 @@ impl WriteOptions {
         Self::new(DurabilityMode::SyncData)
     }
 
-    /// Creates full-sync write options.
+    /// Creates full-sync write options (non-strict).
     ///
-    /// The write requests the strongest durability mode supported by the
-    /// backend for WAL data and required metadata.
+    /// Syncs WAL data and required metadata. On macOS this is a plain `fsync`,
+    /// which is not guaranteed to survive sudden power loss; use
+    /// [`sync_all_strict`](Self::sync_all_strict) for that.
     #[must_use]
     pub const fn sync_all() -> Self {
         Self::new(DurabilityMode::SyncAll)
+    }
+
+    /// Creates strict full-sync write options.
+    ///
+    /// Requests the strongest durability: on macOS `fcntl(F_FULLFSYNC)`, which
+    /// survives sudden power loss at a large throughput cost. On Linux/Windows it
+    /// behaves like [`sync_all`](Self::sync_all). Use when a commit must be
+    /// power-loss durable.
+    #[must_use]
+    pub const fn sync_all_strict() -> Self {
+        Self::new(DurabilityMode::SyncAllStrict)
     }
 }
 

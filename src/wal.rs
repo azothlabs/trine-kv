@@ -1296,6 +1296,7 @@ const fn wal_durability_rank(mode: DurabilityMode) -> u8 {
         DurabilityMode::Flush => 1,
         DurabilityMode::SyncData => 2,
         DurabilityMode::SyncAll => 3,
+        DurabilityMode::SyncAllStrict => 4,
     }
 }
 

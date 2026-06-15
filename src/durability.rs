@@ -1,11 +1,127 @@
+use std::fs::File;
 use std::path::Path;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use std::io;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use crate::error::Error;
 use crate::error::Result;
+use crate::options::DurabilityMode;
+
+/// Whether `durability` asks for an actual device-level file sync (as opposed to
+/// buffering or a userspace flush).
+#[must_use]
+pub(crate) fn requires_file_sync(durability: DurabilityMode) -> bool {
+    matches!(
+        durability,
+        DurabilityMode::SyncData | DurabilityMode::SyncAll | DurabilityMode::SyncAllStrict
+    )
+}
+
+/// Whether `durability` is the strict tier that must survive sudden power loss.
+#[must_use]
+pub(crate) const fn durability_is_strict(durability: DurabilityMode) -> bool {
+    matches!(durability, DurabilityMode::SyncAllStrict)
+}
+
+/// The single place that decides *how hard* to flush a file for a durability
+/// mode, so call sites never special-case the platform.
+///
+/// macOS is the reason this abstraction exists. Apple's `fsync(2)` only pushes
+/// bytes to the drive; the drive may keep them in a volatile cache and lose them
+/// on sudden power loss or a kernel panic. Only `fcntl(fd, F_FULLFSYNC)` flushes
+/// that cache to the platters, and it is much slower (it is the per-commit floor
+/// behind single-key sync throughput). Trine therefore makes it opt-in:
+///
+/// - `SyncAllStrict` (strict) -> `F_FULLFSYNC` on macOS: true power-loss durability.
+/// - `SyncData` / `SyncAll` (non-strict, the default) -> plain `fsync` on macOS:
+///   faster, still durable across a process crash or kernel panic, but NOT
+///   guaranteed across sudden power loss.
+///
+/// On Linux and Windows the ordinary `fsync` / `FlushFileBuffers` already flushes
+/// durably, so strict and non-strict resolve to the same real sync there.
+pub(crate) fn sync_file_for_durability(file: &File, durability: DurabilityMode) -> Result<()> {
+    if !requires_file_sync(durability) {
+        return Ok(());
+    }
+    sync_file_platform(file, durability)
+}
+
+#[cfg(target_os = "macos")]
+fn sync_file_platform(file: &File, durability: DurabilityMode) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    sync_macos_fd(file.as_raw_fd(), durability)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sync_file_platform(file: &File, durability: DurabilityMode) -> Result<()> {
+    // fsync/fdatasync/FlushFileBuffers already flush durably here, so the strict
+    // tier maps to the same full sync as `SyncAll`.
+    match durability {
+        DurabilityMode::SyncData => file.sync_data().map_err(crate::error::Error::Io),
+        _ => file.sync_all().map_err(crate::error::Error::Io),
+    }
+}
+
+/// macOS device sync for a sync-requiring durability mode, working directly on a
+/// raw descriptor so the native (`DispatchIO`) backend shares the same decision
+/// as the std path.
+#[cfg(all(target_os = "macos", feature = "platform-io-native"))]
+pub(crate) fn sync_fd_for_durability(
+    fd: std::os::fd::RawFd,
+    durability: DurabilityMode,
+) -> Result<()> {
+    if !requires_file_sync(durability) {
+        return Ok(());
+    }
+    sync_macos_fd(fd, durability)
+}
+
+#[cfg(target_os = "macos")]
+fn sync_macos_fd(fd: std::os::fd::RawFd, durability: DurabilityMode) -> Result<()> {
+    if durability_is_strict(durability) {
+        full_fsync(fd)
+    } else {
+        plain_fsync(fd)
+    }
+}
+
+/// Forces `fd` to permanent storage with `F_FULLFSYNC`, the only macOS call that
+/// flushes the drive's volatile cache to the platters. Falls back to `fsync`
+/// only when the filesystem reports `F_FULLFSYNC` unsupported (e.g. some network
+/// mounts), where it is the strongest guarantee available.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn full_fsync(fd: std::os::fd::RawFd) -> Result<()> {
+    // SAFETY: `fcntl` with `F_FULLFSYNC` only reads `fd`; it is a valid open
+    // descriptor for the file being synced and is not retained past the call.
+    if unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) } != -1 {
+        return Ok(());
+    }
+    let full_error = io::Error::last_os_error();
+    if matches!(
+        full_error.raw_os_error(),
+        Some(libc::ENOTSUP | libc::ENOTTY | libc::EINVAL)
+    ) {
+        return plain_fsync(fd);
+    }
+    Err(Error::Io(full_error))
+}
+
+/// Plain `fsync`: flushes to the drive but not necessarily through its volatile
+/// cache (see [`sync_file_for_durability`]).
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn plain_fsync(fd: std::os::fd::RawFd) -> Result<()> {
+    // SAFETY: `fsync` only reads `fd`, a valid open descriptor for the file being
+    // synced; it is not retained past the call.
+    if unsafe { libc::fsync(fd) } == 0 {
+        Ok(())
+    } else {
+        Err(Error::Io(io::Error::last_os_error()))
+    }
+}
 
 pub(crate) fn sync_parent_dir_after_rename(path: &Path) -> Result<()> {
     let Some(parent) = path
@@ -90,7 +206,54 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{sync_dir_after_renames, sync_parent_dir_after_rename};
+    use super::{
+        durability_is_strict, requires_file_sync, sync_dir_after_renames,
+        sync_file_for_durability, sync_parent_dir_after_rename,
+    };
+    use crate::options::DurabilityMode;
+
+    #[test]
+    fn requires_file_sync_and_strictness_classify_modes() {
+        assert!(!requires_file_sync(DurabilityMode::Buffered));
+        assert!(!requires_file_sync(DurabilityMode::Flush));
+        assert!(requires_file_sync(DurabilityMode::SyncData));
+        assert!(requires_file_sync(DurabilityMode::SyncAll));
+        assert!(requires_file_sync(DurabilityMode::SyncAllStrict));
+
+        assert!(!durability_is_strict(DurabilityMode::SyncAll));
+        assert!(durability_is_strict(DurabilityMode::SyncAllStrict));
+    }
+
+    #[test]
+    fn sync_file_for_durability_succeeds_for_every_mode() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-fsync-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create test directory");
+        let path = root.join("data");
+
+        for mode in [
+            DurabilityMode::Buffered,
+            DurabilityMode::Flush,
+            DurabilityMode::SyncData,
+            DurabilityMode::SyncAll,
+            DurabilityMode::SyncAllStrict,
+        ] {
+            let mut file = File::create(&path).expect("create test file");
+            file.write_all(b"durable").expect("write test file");
+            // Both the strict (F_FULLFSYNC on macOS) and non-strict (fsync) paths
+            // must complete without error on a regular filesystem.
+            sync_file_for_durability(&file, mode).unwrap_or_else(|error| {
+                panic!("sync for {mode:?} failed: {error}");
+            });
+        }
+
+        fs::remove_dir_all(root).expect("cleanup test directory");
+    }
 
     #[test]
     fn sync_parent_dir_after_rename_accepts_published_file() {

@@ -2,41 +2,50 @@
 
 ## Status
 
-Backlog cleared. Done this session: snapshot-version-pinning Phase 1 (merged;
-Phases 2-3 deferred); delete-gc Phase 4b (source-level range-tombstone GC);
-layered-filter Phase 5 D1 (opt-in cost-weighted curve). D2 still deferred.
+Durability tiering done. Also this session: snapshot-version-pin Phase 1 (merged;
+2-3 deferred), delete-gc 4b (source-level GC), layered-filter Phase 5 D1 (opt-in
+curve), manifest clean break (v11, no back-compat).
 
 ## Goal
 
-Honor the committed backlog (delete-gc 4b, layered-filter Phase 5) under
-measure-first discipline: build only what has measured ROI or is a safe opt-in,
-never flip a default we cannot validate.
+Stop paying macOS `F_FULLFSYNC` on every durable commit. Expose a strict vs
+non-strict durability tier (default non-strict for throughput; strict opt-in for
+power-loss durability), routed through a single fsync abstraction.
 
-## What Shipped
+## Design Assessment
 
-- **delete-gc 4b** (`src/lsm/compact.rs`): `drop_records_covered_by_droppable_tombstone`
-  drops range-tombstone-covered point records during the merge (retention-gated).
-  Diagnostic 10x -> 1.0x. Supersedes the planned block-level read-skip + table
-  format change. See `.phrase/protocol/delete-gc-lifecycle.md` Phase 4b.
-- **layered-filter Phase 5 D1** (`FilterDepthCurve::CostWeighted { step, ceil }`):
-  ascending curve for remote/`s3` backends; opt-in only, default NOT flipped;
-  manifest curve tag 3 (no version bump). See
-  `.phrase/protocol/layered-filter-allocation.md` Phase 5.
+macOS std `sync_all`/`sync_data` always issue `F_FULLFSYNC` — the only call that
+flushes the drive's volatile cache (plain `fsync` does not; Apple `fsync(2)`,
+per https://bonsaidb.io/blog/acid-on-apple/). That was the ~500 ops/s floor. Make
+the strength a tier and centralize the platform decision in one place rather than
+editing every sync site (per the user's direction).
+
+## Scope (done)
+
+- `src/durability.rs`: single abstraction `sync_file_for_durability(&File, mode)`
+  (+ `sync_fd_for_durability` for the macOS DispatchIO backend,
+  `requires_file_sync`, `durability_is_strict`). macOS: strict → `F_FULLFSYNC`
+  (fallback `fsync` on ENOTSUP), non-strict → `fsync`. Non-macOS → std sync
+  (already durable; strict == non-strict).
+- `DurabilityMode::SyncAllStrict` + `WriteOptions::sync_all_strict()`; docs on the
+  enum spell out the power-loss caveat.
+- All sync sites (storage.rs, io/platform_threadpool.rs, io/platform_backend.rs,
+  apple_dispatch.rs) route through the abstraction. `libc` is a non-optional macOS
+  dependency.
+- Default persistent durability stays `SyncAll`, now non-strict (faster).
 
 ## Acceptance Gate
 
-- delete-gc 4b: diagnostic 10x -> 1.0x; covered rows physically dropped; a write
-  after the delete survives; an older snapshot keeps covered rows until it drops.
-- D1: `level_adjusted_filter_bits` ascending cases + manifest round-trip; default
-  Auto unchanged and existing data compatible.
-- Full local gate: fmt + clippy --all-targets --all-features clean; `--lib` 376,
-  `--all-features` 380 pass / 1 ignored; `check --benches` clean.
+- Measured (macOS, 200 single-key sync writes): non-strict ~8,234 ops/s vs strict
+  ~386 ops/s (~21x). Met.
+- Strict write persists across reopen (`strict_durability_write_persists_and_reopens`);
+  durability unit tests classify modes and sync every mode. Met.
+- Full gate: fmt + clippy (default and `--features platform-io-native`) clean;
+  `--lib` 373, `--all-features` 377 / 1 ignored, native `--lib` 374; benches ok.
 
 ## Next Recommendation
 
-- Deferred, measure-/demand-gated: snapshot-version-pinning Phases 2-3 (need a
-  workload that truncates while an older snapshot is held); layered-filter Phase 5
-  D1 default-flip + tuning (need an s3 benchmark) and D2 dynamic per-hot-guard
-  (need static-headroom evidence); delete-gc sub-table read-skip (need a workload
-  where the transient pre-compaction read matters). Drive any of these from a real
-  workload or measured regression, not speculatively.
+- Deferred/measure-gated as before: snapshot-version-pin Phases 2-3; layered-filter
+  Phase 5 D1 default-flip + D2 (need s3 benchmark / static-headroom evidence). A
+  future polish: surface a database-default `SyncAllStrict` option for users who
+  want power-loss durability by default.

@@ -4682,3 +4682,32 @@ fn compaction_keeps_range_deleted_keys_for_older_snapshot() {
 
     fs::remove_dir_all(path).expect("cleanup test db");
 }
+
+#[test]
+fn strict_durability_write_persists_and_reopens() {
+    let path = temp_db_path("strict-durability-write");
+    let mut options = DbOptions::persistent(&path);
+    options.background_worker_count = 0;
+
+    {
+        let db = Db::open_sync(options.clone()).expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
+        // Strict full sync (F_FULLFSYNC on macOS) for a power-loss-durable commit.
+        let commit = db
+            .put_with_options_sync(b"k", b"v", WriteOptions::sync_all_strict())
+            .expect("strict-durability write commits");
+        assert!(commit.read_version().as_u64() > 0);
+        assert_eq!(bucket.get_sync(b"k").expect("read back"), Some(b"v".to_vec()));
+    }
+
+    {
+        let db = Db::open_sync(options).expect("persistent db reopens");
+        let bucket = db.default_bucket_sync().expect("bucket reopens");
+        assert_eq!(
+            bucket.get_sync(b"k").expect("strict write survives reopen"),
+            Some(b"v".to_vec())
+        );
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}

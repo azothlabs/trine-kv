@@ -14160,3 +14160,39 @@ Negative check:
 ### Recommended Next Action
 
 - Going forward, ask before keeping format compatibility; default to clean breaks.
+
+## 2026-06-15 — Durability tiering + single fsync abstraction
+
+### Observation
+
+- macOS std `File::sync_all`/`sync_data` issue `F_FULLFSYNC` (the only call that
+  flushes the drive's volatile cache; plain `fsync` does not — Apple `fsync(2)`,
+  confirmed by https://bonsaidb.io/blog/acid-on-apple/). That was the hidden
+  cause of the ~500 ops/s single-key sync floor. Separately, the native
+  DispatchIO backend's barrier used plain `fsync` (a durability gap on macOS).
+
+### Interpretation
+
+- Expose the tradeoff instead of paying F_FULLFSYNC always: default non-strict
+  (plain fsync, fast) + opt-in strict (F_FULLFSYNC, power-loss durable). Per the
+  user, centralize the decision in ONE fsync abstraction rather than editing
+  every sync site.
+
+### Verification
+
+- `src/durability.rs`: `sync_file_for_durability` / `sync_fd_for_durability` /
+  `requires_file_sync` / `durability_is_strict`; macOS strict→F_FULLFSYNC
+  (fallback fsync on ENOTSUP), non-strict→fsync; non-macOS uses std sync.
+  `DurabilityMode::SyncAllStrict` + `WriteOptions::sync_all_strict()`. All sync
+  sites (storage, threadpool, compio, apple_dispatch) route through it. `libc`
+  made a non-optional macOS dep.
+- Measured (macOS, 200 single-key sync writes): non-strict ~8,234 ops/s vs strict
+  ~386 ops/s (~21x). New tests: durability unit tests + end-to-end
+  `strict_durability_write_persists_and_reopens`. fmt + clippy
+  (default and --features platform-io-native) clean; --lib 373, --all-features
+  377 / 1 ignored; native --lib 374; check --benches clean.
+
+### Decision
+
+- Default persistent durability stays `SyncAll` but is now non-strict (faster);
+  power-loss durability is opt-in via `SyncAllStrict`. Documented on the enum.

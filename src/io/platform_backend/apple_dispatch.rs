@@ -253,11 +253,10 @@ fn barrier_sync(channel: &DispatchIO, durability: DurabilityMode) -> Result<bool
 
     let (tx, rx) = mpsc::channel();
     let block: RcBlock<dyn Fn()> = RcBlock::new(move || {
-        let result = if unsafe { libc::fsync(fd) } == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        };
+        // Strict modes flush the drive cache with F_FULLFSYNC; non-strict modes
+        // use a plain fsync. The single source of truth for that decision lives
+        // in `crate::durability` (see `sync_file_for_durability`).
+        let result = crate::durability::sync_fd_for_durability(fd, durability);
         let _ = tx.send(result);
     });
     let block_ptr = RcBlock::as_ptr(&block);
@@ -268,7 +267,7 @@ fn barrier_sync(channel: &DispatchIO, durability: DurabilityMode) -> Result<bool
 
     match rx.recv() {
         Ok(Ok(())) => Ok(true),
-        Ok(Err(error)) => Err(Error::Io(error)),
+        Ok(Err(error)) => Err(error),
         Err(_) => Err(Error::runtime_busy(
             "macOS DispatchIO barrier channel closed",
         )),
@@ -289,11 +288,7 @@ fn sync_path_blocking(path: &Path, durability: DurabilityMode) -> Result<()> {
             ),
         ))
     })?;
-    match durability {
-        DurabilityMode::SyncData => file.sync_data().map_err(Error::Io),
-        DurabilityMode::SyncAll => file.sync_all().map_err(Error::Io),
-        DurabilityMode::Buffered | DurabilityMode::Flush => Ok(()),
-    }
+    crate::durability::sync_file_for_durability(&file, durability)
 }
 
 fn write_path_blocking(
@@ -341,11 +336,7 @@ fn write_path_blocking(
 }
 
 fn persist_file_blocking(file: &File, durability: DurabilityMode) -> Result<()> {
-    match durability {
-        DurabilityMode::SyncData => file.sync_data().map_err(Error::Io),
-        DurabilityMode::SyncAll => file.sync_all().map_err(Error::Io),
-        DurabilityMode::Buffered | DurabilityMode::Flush => Ok(()),
-    }
+    crate::durability::sync_file_for_durability(file, durability)
 }
 
 fn should_retry_with_blocking_write(error: &io::Error, flags: libc::c_int) -> bool {
@@ -407,10 +398,7 @@ fn new_queue() -> dispatch2::DispatchRetained<DispatchQueue> {
 }
 
 fn requires_sync(durability: DurabilityMode) -> bool {
-    matches!(
-        durability,
-        DurabilityMode::SyncData | DurabilityMode::SyncAll
-    )
+    crate::durability::requires_file_sync(durability)
 }
 
 fn platform_offset(offset: usize) -> Result<libc::off_t> {

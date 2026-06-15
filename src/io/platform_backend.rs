@@ -369,7 +369,10 @@ async fn persist_wal_file(file: &compio::fs::File, durability: DurabilityMode) -
     match durability {
         DurabilityMode::Buffered | DurabilityMode::Flush => Ok(()),
         DurabilityMode::SyncData => file.sync_data().await.map_err(Error::Io),
-        DurabilityMode::SyncAll => file.sync_all().await.map_err(Error::Io),
+        // Non-macOS fsync already flushes durably, so strict maps to a full sync.
+        DurabilityMode::SyncAll | DurabilityMode::SyncAllStrict => {
+            file.sync_all().await.map_err(Error::Io)
+        }
     }
 }
 
@@ -380,7 +383,9 @@ async fn persist_published_file(file: &compio::fs::File, durability: DurabilityM
         DurabilityMode::Flush | DurabilityMode::SyncData => {
             file.sync_data().await.map_err(Error::Io)
         }
-        DurabilityMode::SyncAll => file.sync_all().await.map_err(Error::Io),
+        DurabilityMode::SyncAll | DurabilityMode::SyncAllStrict => {
+            file.sync_all().await.map_err(Error::Io)
+        }
     }
 }
 

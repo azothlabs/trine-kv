@@ -73,7 +73,6 @@ platform-io-native = [
     "dep:compio-runtime",
     "dep:block2",
     "dep:dispatch2",
-    "dep:libc",
 ]
 # Real object-storage `ObjectClient` (S3 and compatible) via the `object_store` crate.
 s3 = ["dep:object_store"]
@@ -93,4 +92,6 @@ compio-runtime = { version = "0.7.0", default-features = false, features = ["io-
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = { version = "0.6.2", optional = true }
 dispatch2 = { version = "0.3.1", optional = true }
-libc = { version = "0.2.186", optional = true }
+# Non-optional on macOS: the durability abstraction needs F_FULLFSYNC/fsync via
+# libc even in the default (std) backend, not just under platform-io-native.
+libc = { version = "0.2.186" }
