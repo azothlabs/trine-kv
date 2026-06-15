@@ -112,6 +112,18 @@ Evidence notes should separate:
   a persisted guard format without first proving the `LsmVersion` build is a
   measured open/recovery bottleneck and updating this protocol plus
   migration/recovery tests.
+- Layered (Monkey-style) filter allocation is the planned filter direction
+  (`.phrase/protocol/layered-filter-allocation.md`): spend a fixed filter budget
+  non-uniformly by level, static per-output-level first, dynamic per-guard
+  deferred. Local/SSD backends use the classic Monkey curve (deep levels get
+  lower `bits_per_key`); remote backends would need a cost-weighted curve. Phase
+  1 evidence shows Trine's two-level filter already drives negative-lookup
+  data-block reads to zero, so the realizable benefit is filter memory and probe
+  CPU / block-cache pressure, not lookup I/O; optimize for memory at equal
+  leakage, not for I/O. Filter `bits_per_key` is self-describing per table, so a
+  per-output-level curve is a write-time change with no storage-format impact;
+  only a user-configurable curve touches `BucketOptions`/manifest and needs a
+  version bump plus migration/recovery tests.
 
 ## Phase Gate Rules
 

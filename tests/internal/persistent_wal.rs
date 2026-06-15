@@ -2248,6 +2248,99 @@ fn point_read_table_probes(db: &Db, bucket: &trine_kv::Bucket) -> u64 {
 }
 
 #[test]
+fn persistent_level_filter_stats_aggregate_by_level() {
+    let path = temp_db_path("level-filter-stats");
+    let mut options = DbOptions::persistent(&path);
+    options.max_l0_files = 64;
+    // Deterministic level layout: no background maintenance moves tables.
+    options.background_worker_count = 0;
+
+    let db = Db::open_sync(options).expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+
+    let write_chunk = |chunk: usize| {
+        for index in 0..64 {
+            let row = chunk * 64 + index;
+            let key = format!("key-{row:05}").into_bytes();
+            bucket.put_sync(key, b"v").expect("write key");
+        }
+    };
+
+    // First two chunks flush to L0 then compact down to L1.
+    for chunk in 0..2 {
+        write_chunk(chunk);
+        db.flush_sync().expect("flush L0 table");
+    }
+    db.compact_range_sync(KeyRange::all())
+        .expect("compact L0 into L1");
+    // Next two chunks flush to L0 and stay there (no compaction).
+    for chunk in 2..4 {
+        write_chunk(chunk);
+        db.flush_sync().expect("flush L0 table");
+    }
+    assert!(
+        db.stats().l0_tables >= 1,
+        "workload must leave tables on L0"
+    );
+
+    // In-range missing-key lookups exercise the table point filter (the keys sit
+    // inside existing tables' key bounds but were never written).
+    for row in 0..256 {
+        let key = format!("key-{row:05}-absent").into_bytes();
+        assert_eq!(bucket.get_sync(&key).expect("missing read"), None);
+    }
+
+    let stats = db.stats();
+    assert!(
+        !stats.level_filters.is_empty(),
+        "per-level filter stats must be reported"
+    );
+    assert!(
+        stats.level_filters.len() >= 2,
+        "more than one level should hold tables: {:?}",
+        stats.level_filters
+    );
+
+    // Per-level rollup must reconcile with the global totals and table counts.
+    let summed_hits: u64 = stats
+        .level_filters
+        .iter()
+        .map(|row| row.filters.table_point_hits)
+        .sum();
+    let summed_fp: u64 = stats
+        .level_filters
+        .iter()
+        .map(|row| row.filters.table_point_false_positives)
+        .sum();
+    let summed_misses: u64 = stats
+        .level_filters
+        .iter()
+        .map(|row| row.filters.table_point_misses)
+        .sum();
+    assert_eq!(summed_hits, stats.filters.table_point_hits);
+    assert_eq!(summed_fp, stats.filters.table_point_false_positives);
+    assert_eq!(summed_misses, stats.filters.table_point_misses);
+
+    let level_filter_tables: usize = stats.level_filters.iter().map(|row| row.tables).sum();
+    let level_tables: usize = stats.level_tables.iter().map(|row| row.tables).sum();
+    assert_eq!(level_filter_tables, level_tables);
+
+    // The missing-key sweep must have exercised the point filter somewhere.
+    let absent_probes = stats
+        .filters
+        .table_point_false_positives
+        .saturating_add(stats.filters.table_point_misses);
+    assert!(
+        absent_probes > 0,
+        "missing-key lookups should reach the table point filter"
+    );
+
+    drop(bucket);
+    drop(db);
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_stats_report_tables_blobs_and_compactions() {
     let path = temp_db_path("live-stats");
     let mut options = DbOptions::persistent(&path);

@@ -159,7 +159,7 @@ pub use runtime::{CancellationToken, RuntimeCapabilities, RuntimeMode, RuntimeOp
 pub use snapshot::Snapshot;
 pub use stats::{
     CompactionSkip, CompactionSkipStats, CompactionTrigger, CompactionTriggerStats, DbStats,
-    PlatformIoClassCounters, PlatformIoOperationStats,
+    FilterStats, LevelFilterStats, LevelStats, PlatformIoClassCounters, PlatformIoOperationStats,
 };
 pub use transaction::{Transaction, TransactionOptions};
 pub use types::{CommitInfo, KeyRange, KeyValue, ReadVersion, Value};

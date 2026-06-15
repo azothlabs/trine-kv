@@ -13437,3 +13437,60 @@ Negative check:
 - The guard-aware LSM strategy (Phases A-F) is complete. Choose the next KV
   engine phase from fresh benchmark evidence (for example single-key sync write
   fsync cost or compaction/blob rewrite throughput).
+
+## 2026-06-15: Layered Filter Allocation Phase 1 (Per-Level FPR Observability)
+
+### Observation
+
+- New direction recorded in `.phrase/protocol/layered-filter-allocation.md`
+  (Monkey-style: spend a fixed filter budget non-uniformly across levels).
+- Filter counters are already per-table and every table carries its level, so
+  per-level rollup is a zero-hot-path change in the `DbStats` build loop.
+- Added `DbStats::level_filters: Vec<LevelFilterStats>` and
+  `FilterStats::table_point_false_positive_rate` (fp / (fp + misses), `None`
+  when no absent probe hit the filter).
+- Added the `layered filter fpr diagnostic`: build L0+L1 layout, run in-range
+  negative lookups (odd keys absent between written even keys), report per-level
+  FPR. `TRINE_BENCH_RUNS=3`:
+  - level 0: 9286 ppm (19 false positives / 2046 allowed-absent probes), 2 tables.
+  - level 1: 10263 ppm (21 / 2046), 2 tables.
+  - negative lookup data block reads: 0.
+
+### Interpretation
+
+- Per-level FPR is uniform at ~1% (matches global `bits_per_key = 10`, whose
+  theoretical FPR is ~0.82%; the small excess is the table filter alone). This
+  flat allocation is exactly what Monkey targets.
+- Critical nuance: Trine's two-level filter (table filter then block filter)
+  already drives negative-lookup data-block reads to 0. So the realizable Monkey
+  benefit is in filter memory and probe CPU / block-cache pressure, not lookup
+  I/O. This is the honest scope for Phase 2.
+
+### Decision
+
+- Keep Phase 1 to observability only; no allocation or format change.
+- Recorded a durable boundary in `decision.md` (layered filter direction; gains
+  are memory/CPU-bound, not I/O-bound, because block filters already absorb
+  table false positives).
+
+### Verification
+
+- `cargo test -q --lib` (350) and `--all-features` (354, 1 ignored) green.
+- `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`,
+  `cargo check --benches`, `cargo clippy --bench v1_bench -D warnings`,
+  `git diff --check`.
+- New tests: `table_point_false_positive_rate_*` (helper),
+  `persistent_level_filter_stats_aggregate_by_level` (rollup reconciles with
+  global totals and table counts).
+- `TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench` (per-level FPR rows above).
+
+### Remaining Blockers
+
+- No per-level filter-memory metric yet; Phase 2 needs filter bytes/probes per
+  level to optimize "memory at equal leakage" rather than I/O.
+
+### Recommended Next Action
+
+- Phase 2: per-output-level `bits_per_key` curve aimed at cutting filter memory
+  at equal negative-lookup leakage (block-filter probes), since data-block-read
+  I/O is already ~0. Add a per-level filter-memory/probe metric first.

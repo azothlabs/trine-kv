@@ -36,7 +36,8 @@ use crate::{
     snapshot::{Snapshot, SnapshotTracker},
     stats::{
         BlobReadMetrics, CompactionLevelStats, CompactionSkip, CompactionSkipStats,
-        CompactionTrigger, CompactionTriggerStats, DbStats, LevelStats,
+        CompactionTrigger, CompactionTriggerStats, DbStats, FilterStats, LevelFilterStats,
+        LevelStats,
     },
     storage::{
         BlockingStorageDirectoryCreateBackend, BlockingStorageDirectoryListBackend,
@@ -3624,6 +3625,7 @@ impl Db {
 
         let persistent_path = self.persistent_path();
         let mut level_stats = BTreeMap::<u32, LevelStats>::new();
+        let mut level_filter_stats = BTreeMap::<u32, LevelFilterStats>::new();
         let mut live_blob_bytes_by_file = BTreeMap::<u64, u64>::new();
 
         let Ok(buckets) = self.inner.buckets.read() else {
@@ -3657,7 +3659,18 @@ impl Db {
                     let table_bytes = persistent_path.map_or(0, |db_path| {
                         table_file_bytes(&self.inner.native_storage, db_path, properties.id)
                     });
-                    stats.filters.saturating_add_assign(table.filter_stats());
+                    let table_filters = table.filter_stats();
+                    stats.filters.saturating_add_assign(table_filters);
+                    let level_filter_entry =
+                        level_filter_stats.entry(level).or_insert(LevelFilterStats {
+                            level,
+                            tables: 0,
+                            filters: FilterStats::default(),
+                        });
+                    level_filter_entry.tables += 1;
+                    level_filter_entry
+                        .filters
+                        .saturating_add_assign(table_filters);
                     stats
                         .read_path
                         .saturating_add_assign(table.read_path_stats());
@@ -3682,6 +3695,7 @@ impl Db {
         }
 
         stats.level_tables = level_stats.into_values().collect();
+        stats.level_filters = level_filter_stats.into_values().collect();
         stats.live_blob_files = live_blob_bytes_by_file.len();
         stats.live_blob_bytes = live_blob_bytes_by_file.values().copied().sum();
         if let Some(db_path) = persistent_path {

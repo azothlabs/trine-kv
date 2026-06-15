@@ -17,6 +17,9 @@ pub struct DbStats {
     pub total_tables: usize,
     /// Per-level table counts and byte sizes.
     pub level_tables: Vec<LevelStats>,
+    /// Per-level filter counters summed over each level's table files, for
+    /// layered (Monkey-style) filter allocation analysis.
+    pub level_filters: Vec<LevelFilterStats>,
     /// Total bytes held by table files.
     pub table_bytes: u64,
     /// WAL bytes accepted but not yet synced according to the selected durability.
@@ -568,6 +571,39 @@ pub struct FilterStats {
     pub block_prefix_false_positives: u64,
 }
 
+impl FilterStats {
+    /// Observed point false-positive rate: filter-allowed probes that turned out
+    /// not to contain the key, over all filter-allowed absent probes (false
+    /// positives plus correct negatives). Returns `None` when no absent probe
+    /// exercised the table point filter, so callers do not divide by zero.
+    #[must_use]
+    pub fn table_point_false_positive_rate(&self) -> Option<f64> {
+        let allowed_absent = self
+            .table_point_false_positives
+            .saturating_add(self.table_point_misses);
+        if allowed_absent == 0 {
+            return None;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        Some(self.table_point_false_positives as f64 / allowed_absent as f64)
+    }
+}
+
+/// Per-level aggregation of table filter counters.
+///
+/// Filter counters are recorded per table; this rolls them up by LSM level so
+/// layered (Monkey-style) filter allocation can see where false positives
+/// actually concentrate before any per-level `bits_per_key` change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LevelFilterStats {
+    /// LSM level these filter counters belong to.
+    pub level: u32,
+    /// Number of table files on this level that contributed counters.
+    pub tables: usize,
+    /// Table and block filter counters summed over this level's tables.
+    pub filters: FilterStats,
+}
+
 /// Read-path counters that describe how far reads travel through table metadata.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReadPathStats {
@@ -732,7 +768,27 @@ impl FilterStats {
 
 #[cfg(test)]
 mod tests {
-    use super::{PlatformIoClassCounters, PlatformIoOperationStats};
+    use super::{FilterStats, PlatformIoClassCounters, PlatformIoOperationStats};
+
+    #[test]
+    fn table_point_false_positive_rate_uses_allowed_absent_probes() {
+        // 1 false positive out of 1 false positive + 3 correct negatives = 0.25.
+        let stats = FilterStats {
+            table_point_false_positives: 1,
+            table_point_misses: 3,
+            ..FilterStats::default()
+        };
+        assert_eq!(stats.table_point_false_positive_rate(), Some(0.25));
+    }
+
+    #[test]
+    fn table_point_false_positive_rate_is_none_without_absent_probes() {
+        let stats = FilterStats {
+            table_point_hits: 10,
+            ..FilterStats::default()
+        };
+        assert_eq!(stats.table_point_false_positive_rate(), None);
+    }
 
     #[test]
     fn platform_io_class_counter_helpers_summarize_classes() {

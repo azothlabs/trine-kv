@@ -6,63 +6,58 @@ Complete
 
 ## Goal
 
-Complete Phase F from `.phrase/protocol/guard-aware-lsm-strategy.md`: decide
-whether guard information should stay derived in memory at open or become
-persisted metadata. Phase F is a decision gate, not a default implementation
-phase; "complete" means making the evidence-backed decision and recording it.
+Phase 1 of `.phrase/protocol/layered-filter-allocation.md`: make each LSM level's
+observed Bloom false-positive behavior measurable before changing any
+`bits_per_key` allocation (measure-first for the Monkey-style direction).
 
 ## Design Assessment
 
-Phase F is resolved as **keep guards derived**. Guards are simply table key
-bounds, which the manifest table record already persists. On open, recovery
-reads `manifest.tables()` (properties with bounds) and `LsmVersion::new` only
-sorts the tables into the level layout. There is no separate guard derivation
-pass and no extra I/O for guards, so guards are already implicitly durable.
-
-Adding a separate persisted guard structure would duplicate the manifest's
-bounds while adding format-version, migration, and recovery-validation burden.
-The Phase F entry condition (deriving guards became a measured open/recovery
-cost) is not met, so no format change is made.
+Filter counters are already recorded per table, and every table knows its level,
+so per-level rollup is a zero-hot-path change: aggregate `table.filter_stats()`
+by level when building `DbStats`. No new persisted state, no format change.
 
 ## Scope
 
-- Evidence: confirm guard bounds are manifest-persisted and measure open cost.
-- Decision recorded in `decision.md` (durable boundary) and
-  `guard-aware-lsm-strategy.md` (Phase F resolved).
-- No Rust behavior or storage-format change.
+- `DbStats::level_filters: Vec<LevelFilterStats>` aggregating table filter
+  counters by level, plus `FilterStats::table_point_false_positive_rate`.
+- A `layered filter fpr diagnostic` benchmark that builds a multi-level layout,
+  runs in-range negative lookups, and reports each level's observed FPR.
+- Tests: FPR helper unit tests + a persistent test proving per-level rollup
+  reconciles with the global totals and table counts.
 
 ## Out Of Scope
 
-- Any manifest/SSTable/blob format change.
-- A new persisted guard-metadata structure.
-- Manifest-side pre-sorted level cache (only revisited if `LsmVersion` build is
-  later measured to dominate open).
+- Any `bits_per_key` allocation change (that is Phase 2).
+- Storage-format or `BucketOptions` change.
 
 ## Acceptance Gate
 
-- No format change occurs without a protocol update and migration/recovery
-  tests. Met: the decision is to make no format change.
-- The decision is evidence-backed and recorded in the durable docs.
+- `DbStats` exposes per-level filter counters distinct from global totals. Met.
+- The diagnostic reports per-level `f_i`. Met.
+- No read/write/compaction behavior change, no format change. Met.
 
 ## Evidence
 
-- Manifest table record already encodes/decodes `smallest_user_key` and
-  `largest_user_key` (`src/manifest.rs`), so guard bounds are persisted.
-- `LsmVersion::new` (`src/lsm/version.rs`) only groups and sorts tables into
-  levels; recovery sources bounds from `manifest.tables()` (`src/recovery.rs`).
-- Benchmark startup-recovery: cold table open ~6.7 ms writable / ~2.0 ms
-  read-only, WAL replay open well under 1 ms; open is dominated by metadata I/O
-  and WAL replay, not the `LsmVersion` sort.
+- `layered filter fpr diagnostic` (TRINE_BENCH_RUNS=3): L0 FPR 9286 ppm
+  (19/2046), L1 FPR 10263 ppm (21/2046), each level 2 tables, **negative-lookup
+  data block reads = 0**.
+- Interpretation: per-level FPR is uniform (~1%, matching the global
+  `bits_per_key = 10`), exactly the flat allocation Monkey targets. But Trine's
+  two-level filter (table + block) already drives negative-lookup data-block
+  reads to zero, so the realizable Monkey gain is in **filter memory and probe
+  CPU / block-cache pressure**, not lookup I/O. This sharpens Phase 2's goal:
+  cut filter memory at equal leakage, not cut I/O.
 
 ## Known Risks
 
-- The decision relies on the current open path; if table counts grow very large
-  and `LsmVersion` build becomes a measured open bottleneck, a manifest-side
-  pre-sorted level cache (not a new guard format) would be the first response,
-  still gated by a protocol update and migration/recovery tests.
+- Per-table counters reset when compaction replaces a table, so `level_filters`
+  is "current live tables since open"; adequate for the diagnostic.
+- FPR is probabilistic; tests assert structural rollup reconciliation, not exact
+  rates (rates are checked via the deterministic helper unit tests).
 
 ## Next Recommendation
 
-- The guard-aware LSM strategy (Phases A-F) is complete. Pick the next KV engine
-  phase from fresh benchmark evidence, e.g. single-key sync-write fsync cost or
-  compaction/blob rewrite throughput.
+- Phase 2 (per-output-level `bits_per_key` curve) should target **filter-memory
+  reduction at equal negative-lookup leakage** (block-filter probes / bytes),
+  since data-block-read I/O is already ~0. Gather a filter-memory-per-level
+  metric before committing a curve.

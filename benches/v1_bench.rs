@@ -87,6 +87,7 @@ fn run_benchmarks() -> Vec<BenchResult> {
     results.push(bench_blob_level_merge());
     extend_maintenance_write_amplification_diagnostics(&mut results);
     extend_background_maintenance_contention_diagnostics(&mut results);
+    extend_layered_filter_fpr_diagnostic(&mut results);
     results.push(bench_block_cache_warm_read());
     results.push(bench_block_cache_random_block_read());
     extend_block_cache_decode_diagnostics(&mut results);
@@ -1432,6 +1433,84 @@ fn prepare_guard_multi_table_compaction_workload(dir: &Path) -> Db {
     }
     drop(bucket);
     db
+}
+
+fn extend_layered_filter_fpr_diagnostic(results: &mut Vec<BenchResult>) {
+    // Measure-first for Monkey-style layered filter allocation: report each
+    // level's observed point false-positive rate under a negative-lookup load,
+    // so a later per-level bits/key curve has real f_i numbers to optimize.
+    let label = "layered filter fpr diagnostic";
+    let dir = temp_dir(label);
+    let mut options = benchmark_persistent_options(&dir);
+    options.background_worker_count = 0;
+    options.max_l0_files = 64;
+    let db = Db::open_sync(options).expect("persistent db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+
+    // Write only even keys, so odd keys are in-range absent keys for negatives.
+    let total = ROWS * 4;
+    let chunk = total / 4;
+    for c in 0..4 {
+        for i in 0..chunk {
+            let row = (c * chunk + i) * 2;
+            bucket.put_sync(key(row), value(row)).expect("write key");
+        }
+        db.flush_sync().expect("flush L0 table");
+        if c < 2 {
+            db.compact_range_sync(KeyRange::all())
+                .expect("compact toward L1");
+        }
+    }
+
+    let before = db.stats();
+    let mut absent_seen = 0_u64;
+    for row in 0..total {
+        let odd = row * 2 + 1;
+        if bucket.get_sync(&key(odd)).expect("missing read").is_none() {
+            absent_seen += 1;
+        }
+    }
+    assert!(absent_seen > 0, "negative lookups must miss");
+    let after = db.stats();
+
+    for level in &after.level_filters {
+        let fp = level.filters.table_point_false_positives;
+        let allowed_absent = fp.saturating_add(level.filters.table_point_misses);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let fpr_ppm = level
+            .filters
+            .table_point_false_positive_rate()
+            .map_or(0, |rate| (rate * 1_000_000.0) as u64);
+        results.push(BenchResult::diagnostic(
+            labelled_level(label, level.level, "false positive rate ppm"),
+            fpr_ppm,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled_level(label, level.level, "false positives"),
+            fp,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled_level(label, level.level, "filter allowed absent probes"),
+            allowed_absent,
+        ));
+        results.push(BenchResult::diagnostic(
+            labelled_level(label, level.level, "tables"),
+            usize_to_u64(level.tables),
+        ));
+    }
+
+    let negative_data_block_reads = after
+        .read_path
+        .point_data_block_reads
+        .saturating_sub(before.read_path.point_data_block_reads);
+    results.push(BenchResult::diagnostic(
+        labelled(label, "negative lookup data block reads"),
+        negative_data_block_reads,
+    ));
+
+    drop(bucket);
+    drop(db);
+    cleanup_dir(&dir);
 }
 
 fn extend_blob_gc_write_amplification_diagnostic(results: &mut Vec<BenchResult>) {
