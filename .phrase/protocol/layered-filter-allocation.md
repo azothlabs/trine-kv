@@ -199,11 +199,22 @@ Acceptance gate:
   persistent test now round-trips a v10 manifest.
 - The curve is configurable and disablable (`Uniform`).
 
-### Phase 5: Deferred Advanced Variants
+### Phase 5: Advanced Variants
 
-- Cost-weighted curve for remote backends (D1 remote branch).
-- Dynamic per-hot-guard filter rewrite (D2 dynamic branch). Likely not done
-  unless static phases leave clear headroom.
+- **D1 remote branch (opt-in capability shipped 2026-06-15)**: the cost-weighted
+  (ascending) curve `FilterDepthCurve::CostWeighted { step, ceil }`. Deeper levels
+  *gain* `step` bits up to `ceil` while pinned shallow levels keep the base -
+  the inverse of classic Monkey, for remote/cold backends (the `s3` feature)
+  where a deep-level filter miss costs a network round-trip, not a cheap local
+  read. Persisted via manifest curve tag 3 (no version bump; default unchanged).
+  It is **opt-in only and the default is not flipped**: the benefit is the remote
+  read-cost asymmetry, which cannot be validated on local SSD (locally it only
+  raises memory). Auto-selecting it for `s3`, and tuning `step`/`ceil`, is gated
+  on an actual s3 benchmark - left until one exists. The capability is shipped so
+  a remote user can choose it now.
+- **D2 dynamic branch (still deferred)**: dynamic per-hot-guard filter rewrite at
+  compaction. A feedback system; deferred until static evidence shows clear
+  remaining headroom. Not started.
 
 ## Non-Goals
 

@@ -2,49 +2,41 @@
 
 ## Status
 
-Backlog cleanup: delete-gc Phase 4b done (source-level range-tombstone GC).
-snapshot-version-pinning Phase 1 done+merged, Phases 2-3 deferred. Next:
-layered-filter Phase 5 (D1 cost-weighted remote curve), measure-first.
+Backlog cleared. Done this session: snapshot-version-pinning Phase 1 (merged;
+Phases 2-3 deferred); delete-gc Phase 4b (source-level range-tombstone GC);
+layered-filter Phase 5 D1 (opt-in cost-weighted curve). D2 still deferred.
 
 ## Goal
 
-Reclaim the read amplification a partially-covering `delete_range` leaves behind
-(the measured 10x scan-waste case), at the source instead of at every read.
+Honor the committed backlog (delete-gc 4b, layered-filter Phase 5) under
+measure-first discipline: build only what has measured ROI or is a safe opt-in,
+never flip a default we cannot validate.
 
-## Design Assessment
+## What Shipped
 
-Root cause (traced from the diagnostic, not assumed): compaction merged the range
-tombstone with the data but never dropped the covered point records, so deleted
-rows survived compaction and were filtered on every scan. The originally-planned
-fix (Phase 4b block-level read-skip needing per-block max-seq = a table-format
-change) was the wrong tool. The right fix is source-level: drop covered point
-records during the merge, retention-gated exactly like the tombstone.
-
-## Scope (done)
-
-- `drop_records_covered_by_droppable_tombstone` in `src/lsm/compact.rs`: in the
-  per-user-key merge, drop a record when a range tombstone covers its key, is
-  strictly newer (`record.seq < tombstone.seq`), and is retention-safe
-  (`tombstone.seq <= oldest_active_snapshot`). Runs before
-  `mark_tombstones_covering_records` so a fully-covered tombstone is then cleaned
-  up in full compaction; partial compaction keeps the tombstone to hide lower
-  levels. No table-format change.
+- **delete-gc 4b** (`src/lsm/compact.rs`): `drop_records_covered_by_droppable_tombstone`
+  drops range-tombstone-covered point records during the merge (retention-gated).
+  Diagnostic 10x -> 1.0x. Supersedes the planned block-level read-skip + table
+  format change. See `.phrase/protocol/delete-gc-lifecycle.md` Phase 4b.
+- **layered-filter Phase 5 D1** (`FilterDepthCurve::CostWeighted { step, ceil }`):
+  ascending curve for remote/`s3` backends; opt-in only, default NOT flipped;
+  manifest curve tag 3 (no version bump). See
+  `.phrase/protocol/layered-filter-allocation.md` Phase 5.
 
 ## Acceptance Gate
 
-- Tombstone-scan-waste diagnostic: ~10x (1024 internal / 102 user, 922 hidden)
-  → 1.0x (102/102, 0 hidden). Met.
-- `compaction_drops_range_deleted_keys_at_source` (covered rows physically gone;
-  a write after the delete survives), `compaction_keeps_range_deleted_keys_for_older_snapshot`
-  (an older snapshot still reads covered rows; reclaimed after it drops), and two
-  unit tests for the drop predicate. Met.
-- Full local gate: fmt + clippy --all-targets --all-features clean; `--lib` 375,
-  `--all-features` 379 pass / 1 ignored; `check --benches` clean.
+- delete-gc 4b: diagnostic 10x -> 1.0x; covered rows physically dropped; a write
+  after the delete survives; an older snapshot keeps covered rows until it drops.
+- D1: `level_adjusted_filter_bits` ascending cases + manifest round-trip; default
+  Auto unchanged and existing data compatible.
+- Full local gate: fmt + clippy --all-targets --all-features clean; `--lib` 376,
+  `--all-features` 380 pass / 1 ignored; `check --benches` clean.
 
 ## Next Recommendation
 
-- layered-filter Phase 5 D1 (cost-weighted curve for the `s3` remote backend):
-  measure first — the classic-Monkey curve starves deep levels, which is wrong
-  when a deep-level filter miss costs a network read. D2 (dynamic per-hot-guard)
-  stays deferred until static evidence shows headroom.
-- Deferred: snapshot-version-pinning Phases 2-3 (see that protocol).
+- Deferred, measure-/demand-gated: snapshot-version-pinning Phases 2-3 (need a
+  workload that truncates while an older snapshot is held); layered-filter Phase 5
+  D1 default-flip + tuning (need an s3 benchmark) and D2 dynamic per-hot-guard
+  (need static-headroom evidence); delete-gc sub-table read-skip (need a workload
+  where the transient pre-compaction read matters). Drive any of these from a real
+  workload or measured regression, not speculatively.

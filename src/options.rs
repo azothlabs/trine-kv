@@ -607,9 +607,11 @@ pub enum BlobLevelMergePolicy {
 /// (`bits_per_prefix`) use this curve at write time. Pinned shallow levels keep
 /// the configured base bits so hot, recent data stays accurately filtered;
 /// deeper levels, which hold most keys and dominate filter memory, get fewer
-/// bits. The curve never raises a level above its base, so total filter memory
-/// cannot regress versus a flat allocation. Filters are self-describing, so this
-/// only affects how future tables are written, not how existing tables are read.
+/// bits under the descending variants (`Auto`/`Custom`), so total filter memory
+/// cannot regress versus a flat allocation. The ascending `CostWeighted` variant
+/// is the opposite shape for remote backends and may exceed the base. Filters are
+/// self-describing, so this only affects how future tables are written, not how
+/// existing tables are read.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FilterDepthCurve {
     /// Built-in depth curve: deeper levels lose 2 bits each down to a floor of 4,
@@ -629,6 +631,20 @@ pub enum FilterDepthCurve {
         step: u8,
         /// Minimum bits per element for the deepest levels.
         floor: u8,
+    },
+    /// Cost-weighted (ascending) curve for remote/cold backends: deeper levels
+    /// *gain* `step` bits each, clamped up to `ceil`, while shallow (pinned)
+    /// levels keep the base. This inverts classic Monkey: on the `s3` feature a
+    /// deep-level filter miss costs a network round-trip, not a cheap local read,
+    /// so deep levels deserve *more* filter budget, not less. Opt-in only; it can
+    /// raise total filter memory above a flat allocation, so it is never a default
+    /// and is unhelpful on local SSD. Measure before adopting on a real remote
+    /// workload.
+    CostWeighted {
+        /// Bits added per level below the shallow (pinned) boundary.
+        step: u8,
+        /// Maximum bits per element for the deepest levels.
+        ceil: u8,
     },
 }
 

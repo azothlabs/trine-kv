@@ -4448,13 +4448,23 @@ fn build_point_key_filter(
 fn level_adjusted_filter_bits(curve: FilterDepthCurve, base: u8, level: TableLevel) -> u8 {
     const AUTO_BITS_PER_LEVEL_STEP: u8 = 2;
     const AUTO_MIN_FILTER_BITS: u8 = 4;
+    let depth = level.get().saturating_sub(PINNED_READ_METADATA_MAX_LEVEL);
+    let depth = u8::try_from(depth).unwrap_or(u8::MAX);
     let (step, floor) = match curve {
         FilterDepthCurve::Uniform => return base,
         FilterDepthCurve::Auto => (AUTO_BITS_PER_LEVEL_STEP, AUTO_MIN_FILTER_BITS),
         FilterDepthCurve::Custom { step, floor } => (step, floor),
+        // Ascending (cost-weighted) curve: deeper levels gain bits up to `ceil`.
+        // The pinned shallow levels (depth 0) keep the base; below them each level
+        // adds `step`, clamped so the deepest never exceeds `ceil` (and `ceil`
+        // never drops below the base, so the curve only ever raises deep bits).
+        FilterDepthCurve::CostWeighted { step, ceil } => {
+            let gain = step.saturating_mul(depth);
+            let ceil = ceil.max(base);
+            return base.saturating_add(gain).min(ceil);
+        }
     };
-    let depth = level.get().saturating_sub(PINNED_READ_METADATA_MAX_LEVEL);
-    let reduction = step.saturating_mul(u8::try_from(depth).unwrap_or(u8::MAX));
+    let reduction = step.saturating_mul(depth);
     let floor = floor.min(base);
     base.saturating_sub(reduction).max(floor)
 }
@@ -6785,6 +6795,19 @@ mod tests {
         assert_eq!(level_adjusted_filter_bits(custom, 10, TableLevel(2)), 7);
         assert_eq!(level_adjusted_filter_bits(custom, 10, TableLevel(3)), 4);
         assert_eq!(level_adjusted_filter_bits(custom, 10, TableLevel(9)), 2);
+
+        // CostWeighted (ascending, for remote backends): pinned shallow levels
+        // keep the base; deeper levels gain bits up to the ceiling.
+        let remote = FilterDepthCurve::CostWeighted { step: 3, ceil: 20 };
+        assert_eq!(level_adjusted_filter_bits(remote, 10, TableLevel::ZERO), 10);
+        assert_eq!(level_adjusted_filter_bits(remote, 10, TableLevel(1)), 10);
+        assert_eq!(level_adjusted_filter_bits(remote, 10, TableLevel(2)), 13);
+        assert_eq!(level_adjusted_filter_bits(remote, 10, TableLevel(3)), 16);
+        assert_eq!(level_adjusted_filter_bits(remote, 10, TableLevel(4)), 19);
+        assert_eq!(level_adjusted_filter_bits(remote, 10, TableLevel(9)), 20);
+        // A ceiling below the base cannot lower bits: the curve only ever raises.
+        let clamped = FilterDepthCurve::CostWeighted { step: 3, ceil: 5 };
+        assert_eq!(level_adjusted_filter_bits(clamped, 10, TableLevel(9)), 10);
     }
 
     #[test]

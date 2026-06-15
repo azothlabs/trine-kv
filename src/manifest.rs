@@ -1363,6 +1363,11 @@ fn put_filter_depth_curve(bytes: &mut Vec<u8>, value: FilterDepthCurve) {
             put_u8(bytes, step);
             put_u8(bytes, floor);
         }
+        FilterDepthCurve::CostWeighted { step, ceil } => {
+            put_u8(bytes, 3);
+            put_u8(bytes, step);
+            put_u8(bytes, ceil);
+        }
     }
 }
 
@@ -1689,6 +1694,10 @@ impl<'payload> Cursor<'payload> {
             2 => Ok(FilterDepthCurve::Custom {
                 step: self.read_u8()?,
                 floor: self.read_u8()?,
+            }),
+            3 => Ok(FilterDepthCurve::CostWeighted {
+                step: self.read_u8()?,
+                ceil: self.read_u8()?,
             }),
             other => Err(Error::Corruption {
                 message: format!("unknown filter depth curve tag {other}"),
@@ -2099,6 +2108,27 @@ mod tests {
         assert_eq!(
             options.filter_depth_curve,
             FilterDepthCurve::Custom { step: 3, floor: 6 }
+        );
+    }
+
+    #[test]
+    fn manifest_round_trips_cost_weighted_filter_depth_curve() {
+        // The ascending remote curve persists and decodes back exactly.
+        let mut payload = Vec::new();
+        put_v9_bucket_options_header(&mut payload);
+        super::put_filter_depth_curve(
+            &mut payload,
+            FilterDepthCurve::CostWeighted { step: 4, ceil: 24 },
+        );
+        super::put_u32(&mut payload, 0); // tables
+        super::put_u32(&mut payload, 0); // pending blob deletions
+        super::put_u32(&mut payload, 0); // checkpoints (version >= 9)
+
+        let state = decode_state(&payload, MANIFEST_VERSION).expect("manifest decodes");
+        let options = state.buckets().get("users").expect("bucket options exist");
+        assert_eq!(
+            options.filter_depth_curve,
+            FilterDepthCurve::CostWeighted { step: 4, ceil: 24 }
         );
     }
 

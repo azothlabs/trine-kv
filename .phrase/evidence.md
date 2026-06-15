@@ -14098,3 +14098,40 @@ Negative check:
 - layered-filter Phase 5 D1 (cost-weighted curve for the `s3` backend),
   measure-first: confirm deep-level filter misses actually cost network reads on
   s3 before flipping the curve. D2 (dynamic per-hot-guard) stays deferred.
+
+## 2026-06-15 — layered-filter Phase 5 D1: opt-in cost-weighted curve
+
+### Observation
+
+- `level_adjusted_filter_bits` only ever reduces bits with depth (`step: u8`
+  unsigned), so the existing config cannot express cost-weighted Monkey (deep
+  levels favored). The `s3` remote backend exists, but there is no s3 benchmark
+  harness, so D1's benefit (deep-level filter miss = network read) cannot be
+  validated locally.
+
+### Interpretation
+
+- Flipping the default or baking an s3 curve in would repeat the speculative
+  trap. The honest move: ship the *capability* as opt-in, do not change defaults,
+  gate the default-flip on a real s3 benchmark.
+
+### Verification
+
+- Added `FilterDepthCurve::CostWeighted { step, ceil }` (ascending: deep levels
+  gain bits up to ceil; never below base; shallow pinned levels keep base).
+  Wired through `level_adjusted_filter_bits` (same write path as Auto/Custom),
+  persisted via manifest curve tag 3 (no version bump; default Auto = tag 0
+  unchanged, so existing data is fully compatible). Tests:
+  `level_adjusted_filter_bits` ascending cases, `manifest_round_trips_cost_weighted_filter_depth_curve`.
+  fmt + clippy --all-targets --all-features clean; --lib 376, --all-features 380
+  pass / 1 ignored; check --benches clean.
+
+### Decision
+
+- Default NOT flipped. D2 (dynamic per-hot-guard) stays deferred pending static
+  headroom evidence.
+
+### Recommended Next Action
+
+- Build an s3 (or simulated-latency) read-path benchmark before auto-selecting
+  the cost-weighted curve for remote backends or tuning step/ceil defaults.
