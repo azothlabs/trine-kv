@@ -3,7 +3,10 @@ use std::{
     env, fs,
     hint::black_box,
     path::{Path, PathBuf},
-    sync::{Arc, Barrier},
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -91,6 +94,7 @@ fn run_benchmarks() -> Vec<BenchResult> {
     extend_layered_filter_fpr_diagnostic(&mut results);
     extend_group_commit_diagnostic(&mut results);
     extend_tombstone_scan_waste_diagnostic(&mut results);
+    extend_read_tail_latency_diagnostic(&mut results);
     results.push(bench_block_cache_warm_read());
     results.push(bench_block_cache_random_block_read());
     extend_block_cache_decode_diagnostics(&mut results);
@@ -1436,6 +1440,127 @@ fn prepare_guard_multi_table_compaction_workload(dir: &Path) -> Db {
     }
     drop(bucket);
     db
+}
+
+fn extend_read_tail_latency_diagnostic(results: &mut Vec<BenchResult>) {
+    // Consolidated measure-first: point-read tail latency (p50/p99/p999) under
+    // three conditions decides whether scan-cache isolation and compaction rate
+    // limiting are worth building. Idle vs concurrent long scan answers cache
+    // pollution; idle vs concurrent compaction answers compaction interference.
+    let label = "read tail latency diagnostic";
+    let dir = temp_dir(label);
+    let mut options = benchmark_persistent_options(&dir);
+    options.background_worker_count = 0;
+    // A small cache and a dataset larger than it make pollution observable.
+    options.block_cache_bytes = 512 * 1024;
+    let db = Arc::new(Db::open_sync(options).expect("persistent db opens"));
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+
+    let total = 4096_usize;
+    for index in 0..total {
+        bucket
+            .put_sync(key(index), vec![b'v'; 256])
+            .expect("put padded value");
+    }
+    db.flush_sync().expect("flush data");
+    db.compact_range_sync(KeyRange::all())
+        .expect("settle layout");
+
+    // A small hot point-read set that fits the cache when nothing else churns it.
+    let hot: Vec<Vec<u8>> = (0..64).map(|i| key(i * 5)).collect();
+    let samples = 2000_usize;
+
+    push_point_tail_row(results, label, "idle", &db, &hot, samples);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let scanner = {
+        let db = Arc::clone(&db);
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            let bucket = db.default_bucket_sync().expect("scanner bucket");
+            while !stop.load(Ordering::Relaxed) {
+                let mut iter = bucket.range_sync(&KeyRange::all()).expect("scan");
+                while let Some(row) = iter.next_sync() {
+                    let _ = row.expect("scan row");
+                }
+            }
+        })
+    };
+    push_point_tail_row(results, label, "under scan", &db, &hot, samples);
+    stop.store(true, Ordering::Relaxed);
+    scanner.join().expect("scanner joins");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let compactor = {
+        let db = Arc::clone(&db);
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            let bucket = db.default_bucket_sync().expect("compactor bucket");
+            let mut round = 0_usize;
+            while !stop.load(Ordering::Relaxed) {
+                for i in 0..256_usize {
+                    let _ = bucket.put_sync(key(total + round * 256 + i), vec![b'w'; 256]);
+                }
+                let _ = db.flush_sync();
+                let _ = db.compact_range_sync(KeyRange::all());
+                round += 1;
+            }
+        })
+    };
+    push_point_tail_row(results, label, "under compaction", &db, &hot, samples);
+    stop.store(true, Ordering::Relaxed);
+    compactor.join().expect("compactor joins");
+
+    drop(bucket);
+    drop(db);
+    cleanup_dir(&dir);
+}
+
+fn push_point_tail_row(
+    results: &mut Vec<BenchResult>,
+    label: &'static str,
+    phase: &'static str,
+    db: &Db,
+    hot: &[Vec<u8>],
+    samples: usize,
+) {
+    let bucket = db.default_bucket_sync().expect("reader bucket");
+    let mut latencies = Vec::with_capacity(samples);
+    for i in 0..samples {
+        let probe = &hot[i % hot.len()];
+        let started = Instant::now();
+        let value = bucket.get_sync(probe).expect("point read");
+        black_box(value);
+        latencies.push(duration_micros(started.elapsed()));
+    }
+    latencies.sort_unstable();
+
+    let base = labelled(label, phase);
+    results.push(BenchResult::diagnostic(
+        labelled(base, "p50 micros"),
+        percentile(&latencies, 0.50),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(base, "p99 micros"),
+        percentile(&latencies, 0.99),
+    ));
+    results.push(BenchResult::diagnostic(
+        labelled(base, "p999 micros"),
+        percentile(&latencies, 0.999),
+    ));
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn percentile(sorted: &[u64], fraction: f64) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = (fraction * (sorted.len() - 1) as f64).round() as usize;
+    sorted[rank.min(sorted.len() - 1)]
 }
 
 fn extend_tombstone_scan_waste_diagnostic(results: &mut Vec<BenchResult>) {

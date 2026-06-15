@@ -13970,3 +13970,52 @@ Negative check:
 
 - delete-gc-lifecycle Phases 1-4 (v1) complete. Pick further work from demand /
   fresh benchmark evidence.
+
+## 2026-06-15: Read Tail-Latency / Contention Measurement (consolidated)
+
+### Observation
+
+- Across four review lists (tombstone, range fan-in/filter/merge, compaction
+  interference, cache pollution / tail), most items were already covered by prior
+  phases. To prioritize the rest without speculation, added a `read tail latency
+  diagnostic`: point-read p50/p99/p999 under three conditions (small block cache
+  512 KiB, dataset > cache), with a concurrent long scanner and a concurrent
+  compactor thread.
+- Result (`TRINE_BENCH_RUNS=1`, macOS/SSD):
+  - idle: p50 10, p99 12, p999 14 us.
+  - under scan: p50 9, p99 15, p999 18 us.
+  - under compaction: p50 9, p99 12, p999 13 us.
+
+### Interpretation
+
+- Compaction does not hurt read tail latency (under-compaction == idle). So a
+  compaction bytes/sec rate limiter and fg/bg I/O priority are NOT justified on
+  this profile (consistent with the earlier background-maintenance contention
+  finding that reads were not the victim).
+- Scan cache pollution is marginal: ~25% tail bump but microsecond-scale,
+  because the dataset is small and the OS page cache absorbs block-cache
+  evictions (re-decode from cached bytes is cheap). Scan-no-fill / scan-cache
+  isolation is therefore low ROI now.
+- Caveat: this is macOS/SSD with a ~1 MiB dataset. A memory-constrained embedded
+  device with slow flash and no OS page cache could differ; revisit only if such
+  a workload shows real tail problems.
+
+### Decision
+
+- Do NOT build compaction rate limiting, fg/bg I/O priority, scan-cache
+  isolation, SuRF range filters, REMIX, or hot-range dynamic compaction
+  speculatively. The read path is healthy under contention on the current
+  profile; remaining list items lack demonstrated ROI here. Keep the diagnostic
+  as a regression baseline; let a real workload/regression drive any of them.
+
+### Verification
+
+- `cargo fmt --check`, `cargo clippy --bench v1_bench -D warnings`,
+  `cargo check --benches`. `TRINE_BENCH_RUNS=1 cargo bench` rows above.
+  Benchmark-only; no engine change.
+
+### Recommended Next Action
+
+- Stop speculative read-path optimization. Next work should come from a real
+  workload, a measured regression, or the deliberately deferred big direction
+  (snapshot version-handle pinning toward LMDB-grade MVCC), not from the lists.
