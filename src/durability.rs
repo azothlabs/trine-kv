@@ -207,8 +207,8 @@ mod tests {
     };
 
     use super::{
-        durability_is_strict, requires_file_sync, sync_dir_after_renames,
-        sync_file_for_durability, sync_parent_dir_after_rename,
+        durability_is_strict, requires_file_sync, sync_dir_after_renames, sync_file_for_durability,
+        sync_parent_dir_after_rename,
     };
     use crate::options::DurabilityMode;
 

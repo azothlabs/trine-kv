@@ -2,6 +2,77 @@
 
 All public crate releases use Semantic Versioning.
 
+## 0.5.0 - 2026-06-15
+
+Performance, durability, and space-reclamation release. It adds guard-aware
+non-uniform compaction, layered (Monkey-style) per-level filter allocation, WAL
+group commit, read-path point-lookup optimizations, delete/GC space reclamation,
+and a tiered fsync durability model whose default is fast. Pre-`1.0`, so the
+breaking storage-format and durability-semantics changes below bump the minor
+version.
+
+### Breaking
+
+- Manifest format is now version `11` with a clean break: only the current
+  format is read (`MIN_SUPPORTED == MANIFEST_VERSION`). Databases written by
+  earlier versions are rejected with `UnsupportedFormat` instead of migrated.
+- `DurabilityMode::SyncData` and `DurabilityMode::SyncAll` are now **non-strict**:
+  on macOS they issue a plain `fsync`, which flushes to the drive but is not
+  guaranteed to survive sudden power loss (it does survive a process crash or
+  kernel panic). Previously they went through the standard library, which always
+  issues `F_FULLFSYNC` on macOS. Use the new strict tier for power-loss
+  durability. On Linux/Windows behavior is unchanged (their `fsync` already
+  flushes durably).
+
+### Added
+
+- Guard-aware, non-uniform per-level compaction: a picker that compacts based on
+  per-level pressure and rewrite savings, gates local L0 compaction on real
+  rewrite savings, and derives its guards at runtime (no storage-format change).
+- Layered (Monkey-style) per-level Bloom/filter allocation via
+  `FilterDepthCurve` (`Auto`, `Uniform`, `Custom { step, floor }`) applied to
+  both point and prefix filters: deeper levels get fewer bits where a miss is a
+  cheap local read, configurable per bucket.
+- `FilterDepthCurve::CostWeighted { step, ceil }`: an opt-in ascending
+  allocation for remote/cold backends (the `s3` feature) where a deep-level
+  filter miss costs a network read. Default unchanged; classic Monkey stays the
+  default for local storage.
+- WAL group commit with a configurable shard count, plus a scenario-adaptive
+  `WalShardPolicy` (`Auto` / `Fixed`): one lane under the per-commit-fsync
+  regime so the worker coalesces concurrent commits under a single sync.
+- `DurabilityMode::SyncAllStrict` and `WriteOptions::sync_all_strict()`: strict
+  full sync that flushes through the drive's volatile cache. On macOS this is
+  `fcntl(F_FULLFSYNC)` (the only call that survives sudden power loss), with a
+  `fsync` fallback when a filesystem does not support it. Configurable as the
+  database-wide floor via `DbOptions::with_durability(DurabilityMode::SyncAllStrict)`
+  or per write. On macOS the non-strict default measured ~21x faster than strict
+  for single-key sync writes.
+- A tombstone-debt compaction trigger and delete/GC health observability
+  (scan read-amplification and snapshot version-debt stats, per-level filter
+  stats, compaction trigger/skip stats).
+
+### Changed
+
+- Point-read optimizations: small batched point reads and negative point lookups
+  are faster, hot table metadata is protected in the block cache, and L0 point
+  reads are pruned by table key bounds.
+- Range deletes now reclaim space instead of lingering on the read path:
+  compaction drops range-tombstone-covered point records at the source when
+  retention-safe (measured scan read amplification dropped from ~10x to ~1x on
+  the covered-data diagnostic), drops wholly-covered tables by file without
+  rewriting them, and scans skip tables fully hidden by a visible tombstone.
+- Obsolete table files are reclaimed by per-table liveness (`Arc` strong count)
+  instead of being blocked whenever any snapshot is open, so a single long-lived
+  snapshot no longer stalls all space reclamation.
+- File-sync durability is centralized in one `durability` abstraction shared by
+  the std and native backends.
+
+### Fixed
+
+- The native macOS DispatchIO backend (`platform-io-native`) previously issued a
+  plain `fsync` for every sync mode; it now uses the same strict/non-strict
+  decision as the std backend.
+
 ## 0.4.1 - 2026-06-14
 
 Performance release. This release tunes write-path, storage-read, blob, and

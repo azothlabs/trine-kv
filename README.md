@@ -211,6 +211,7 @@ cargo run --example platform_io --features platform-io
 cargo run --example read_versions
 cargo run --example user_store
 cargo run --example event_index
+cargo run --example durability
 cargo bench --bench v1_bench
 ```
 
@@ -227,6 +228,8 @@ cargo bench --bench v1_bench
 - `user_store`: wraps Trine KV behind a small repository-style API.
 - `event_index`: stores event payloads and a secondary account index with one
   atomic write batch.
+- `durability`: shows the non-strict default versus strict (`SyncAllStrict` /
+  `F_FULLFSYNC`) writes, per write and as a database-wide floor.
 
 ## Documentation
 
@@ -248,10 +251,16 @@ cargo bench --bench v1_bench
 ## Current Boundaries
 
 - Persistent mode uses a single local database directory.
-- Native persistent open defaults to `SyncAll` for confirmed writes. `Buffered`
-  is an explicit advanced mode for data that can tolerate losing recent writes
-  after a crash or power loss.
-- WASI and browser persistent backends do not claim `SyncData` or `SyncAll`.
+- Native persistent open defaults to `SyncAll` (non-strict) for confirmed
+  writes: on macOS that is a plain `fsync`, which is fast and survives a crash or
+  kernel panic but is not guaranteed across sudden power loss. For power-loss
+  durability use `SyncAllStrict` (macOS `F_FULLFSYNC`), per write with
+  `WriteOptions::sync_all_strict()` or database-wide with
+  `DbOptions::with_durability`. `Buffered` is an explicit advanced mode for data
+  that can tolerate losing recent writes after a crash. See
+  [docs/durability.md](docs/durability.md).
+- WASI and browser persistent backends do not claim the device-sync modes
+  (`SyncData`, `SyncAll`, `SyncAllStrict`).
 - WASI persistent `Db::open` uses the host-preopened filesystem on WASI
   targets; current WASI file work completes inline and does not advertise
   platform async I/O.

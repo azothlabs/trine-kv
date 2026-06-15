@@ -39,16 +39,38 @@ batch:
 | --- | --- | --- |
 | `Buffered` | write the framed WAL record and return after `write_all` succeeds | Fastest mode. The write is in the OS path, but no explicit flush or sync is requested. A crash or power loss can lose it. |
 | `Flush` | call `File::flush` after the WAL append | Pushes Rust and OS-facing buffered bytes as far as `flush` provides. It is not a power-loss guarantee. |
-| `SyncData` | call `File::sync_data` after the WAL append | Requests durable WAL file data without requiring all metadata to be synced. |
-| `SyncAll` | call `File::sync_all` after the WAL append | Strongest commit mode for the WAL file. It asks the platform to sync file data and metadata. |
+| `SyncData` | non-strict data sync after the WAL append | Requests durable WAL file data. Non-strict: see the macOS note below. |
+| `SyncAll` | non-strict data + metadata sync after the WAL append | Syncs file data and metadata. Non-strict: see the macOS note below. This is the default floor for persistent databases. |
+| `SyncAllStrict` | strict full sync after the WAL append | Flushes data and metadata through the drive's volatile cache to permanent storage. The only mode that promises power-loss durability on macOS, and much slower. |
+
+### macOS: non-strict vs strict
+
+Apple's `fsync(2)` only flushes bytes to the drive; the drive may keep them in a
+volatile cache and lose them on sudden power loss or a kernel panic. The only
+call that flushes that cache to permanent storage is `fcntl(F_FULLFSYNC)`, which
+is much slower (it is the per-commit floor behind single-key sync throughput).
+Trine therefore tiers the sync modes:
+
+- non-strict (`SyncData`, `SyncAll`) issue a plain `fsync` on macOS: fast, and
+  durable across a process crash or kernel panic, but **not** guaranteed across
+  sudden power loss;
+- strict (`SyncAllStrict`) issues `F_FULLFSYNC` on macOS (with an `fsync`
+  fallback only when a filesystem reports it unsupported): power-loss durable.
+
+On Linux and Windows the ordinary `fsync` / `FlushFileBuffers` already flushes
+durably, so strict and non-strict resolve to the same real sync there. The
+file-sync decision lives in one place (`crate::durability`) shared by the std and
+native backends.
 
 `DbOptions::durability` is the database-level durability floor. Per-write
 `WriteOptions` can ask for a stronger mode, but cannot quietly weaken the mode
 selected at open time. Passing a path to `Db::open` uses native persistent
-options and defaults this floor to `SyncAll`, so ordinary callers get
-database-style durability for confirmed writes. `Buffered` is available only
-when callers explicitly choose it for data that can tolerate losing recent
-confirmed writes after a crash or power loss.
+options and defaults this floor to `SyncAll` (non-strict), so ordinary callers
+get fast crash-durable writes. Choose power-loss durability either per write with
+`WriteOptions::sync_all_strict()` or database-wide with
+`DbOptions::with_durability(DurabilityMode::SyncAllStrict)`. `Buffered` is
+available only when callers explicitly choose it for data that can tolerate
+losing recent confirmed writes after a crash or power loss.
 
 `Db::persist(mode).await` applies the same persistence request to the WAL
 through the primary async API. `Db::persist_sync(mode)` is the explicit sync
@@ -63,13 +85,13 @@ provide:
 
 - WASI persistence uses the host-preopened filesystem path on WASI targets,
   supports `Db::open` through that host boundary, defaults to `Flush`, and
-  rejects `SyncData` and `SyncAll` until strict host sync guarantees are proven.
-  Current WASI file work completes inline and does not advertise platform async
-  I/O.
+  rejects the device-sync modes (`SyncData`, `SyncAll`, `SyncAllStrict`) until
+  strict host sync guarantees are proven. Current WASI file work completes inline
+  and does not advertise platform async I/O.
 - Browser persistence is async-only on `wasm32-unknown-unknown`. It accepts
-  `Buffered` and `Flush`, defaults to `Flush`, rejects `SyncData` and
-  `SyncAll`, acquires a Web Locks writer lease for writable open, and uses
-  WAL-backed async writes.
+  `Buffered` and `Flush`, defaults to `Flush`, rejects the device-sync modes
+  (`SyncData`, `SyncAll`, `SyncAllStrict`), acquires a Web Locks writer lease for
+  writable open, and uses WAL-backed async writes.
 
 Synchronous browser persistent open, mutation, bucket creation, and maintenance
 `*_sync` adapters return typed unsupported errors. Browser callers should use
