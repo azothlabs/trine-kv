@@ -1366,6 +1366,18 @@ mod tests {
             effective_durability(DurabilityMode::SyncAll, DurabilityMode::Buffered),
             DurabilityMode::SyncAll
         );
+        // A database opened with the strict tier as its default makes every write
+        // strict: a per-write request cannot quietly drop below F_FULLFSYNC.
+        assert_eq!(
+            effective_durability(DurabilityMode::SyncAllStrict, DurabilityMode::SyncAll),
+            DurabilityMode::SyncAllStrict
+        );
+        // And a per-write request can still ask for the strict tier above a
+        // weaker database default.
+        assert_eq!(
+            effective_durability(DurabilityMode::SyncData, DurabilityMode::SyncAllStrict),
+            DurabilityMode::SyncAllStrict
+        );
     }
 
     #[test]

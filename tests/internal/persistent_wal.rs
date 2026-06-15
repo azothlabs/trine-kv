@@ -4711,3 +4711,29 @@ fn strict_durability_write_persists_and_reopens() {
 
     fs::remove_dir_all(path).expect("cleanup test db");
 }
+
+#[test]
+fn database_default_durability_can_be_configured_strict() {
+    let path = temp_db_path("configured-strict-default");
+    let mut options = DbOptions::persistent(&path).with_durability(DurabilityMode::SyncAllStrict);
+    options.background_worker_count = 0;
+
+    {
+        let db = Db::open_sync(options.clone()).expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
+        // A plain put (no per-write options) inherits the strict database floor.
+        bucket.put_sync(b"k", b"v").expect("write under strict default");
+        assert_eq!(bucket.get_sync(b"k").expect("read back"), Some(b"v".to_vec()));
+    }
+
+    {
+        let db = Db::open_sync(options).expect("persistent db reopens");
+        let bucket = db.default_bucket_sync().expect("bucket reopens");
+        assert_eq!(
+            bucket.get_sync(b"k").expect("strict default survives reopen"),
+            Some(b"v".to_vec())
+        );
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
