@@ -566,6 +566,10 @@ pub enum CompactionTrigger {
     /// No higher-priority trigger existed, but a shallow non-level-0 level had
     /// multiple tables in the requested range that could be merged downward.
     MultiTableLevel,
+    /// A non-bottom table carried range tombstones with overlapping lower-level
+    /// data, so it was compacted downward to let the tombstone meet and drop the
+    /// data it covers instead of lingering on the read path.
+    TombstoneDebt,
 }
 
 /// Per-trigger table and byte totals read and written by compaction.

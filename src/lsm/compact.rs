@@ -72,6 +72,7 @@ impl LsmTree {
                 compaction::CompactionTable::from_properties_with_bytes(
                     table.properties(),
                     table.estimated_file_bytes(),
+                    table.may_have_range_tombstones(),
                 )
             })
             .collect::<Vec<_>>();
@@ -617,7 +618,7 @@ mod tests {
         compaction::CompactionOptions,
         lsm::LsmTree,
         options::BucketOptions,
-        stats::CompactionSkip,
+        stats::{CompactionSkip, CompactionTrigger},
         table::{self, TableId, TableLevel},
         types::{KeyRange, Sequence},
     };
@@ -858,6 +859,49 @@ mod tests {
 
         assert!(result.input.is_none(), "deep level stays lazy");
         assert_eq!(result.skip, Some(CompactionSkip::LowerLevelLazy));
+        fs::remove_dir_all(table_dir).expect("cleanup table dir");
+    }
+
+    #[test]
+    fn range_tombstone_table_with_lower_overlap_plans_tombstone_debt() {
+        let table_dir = temp_table_dir("tombstone-debt");
+        // L1 table carries a range tombstone over [b, e); L2 (deepest) holds the
+        // covered key. The picker pushes the tombstone down to meet that data.
+        let l1 = Arc::new(
+            table::write_table(
+                &table::table_path(&table_dir, TableId(1)),
+                TableId(1),
+                TableLevel(1),
+                &table_write_options(&BucketOptions::default()),
+                &[record("c", 5)],
+                &[range_tombstone("b", "e", 6)],
+            )
+            .expect("L1 table writes"),
+        );
+        let tree = LsmTree::new(
+            BucketOptions::default(),
+            vec![l1, test_table(&table_dir, 2, 2, "c")],
+        )
+        .expect("tree builds");
+
+        let result = tree
+            .plan_compaction(
+                "default",
+                &KeyRange::all(),
+                Sequence::ZERO,
+                CompactionOptions {
+                    target_table_bytes: u64::MAX / 4,
+                    level_size_multiplier: 2,
+                    max_l0_files: 4,
+                    local_l0_compaction: true,
+                },
+            )
+            .expect("planning succeeds");
+
+        let input = result.input.expect("tombstone-debt plan exists");
+        assert_eq!(input.trigger, CompactionTrigger::TombstoneDebt);
+        assert_eq!(input.table_level, TableLevel(2));
+        assert_eq!(input.input_tables.len(), 2);
         fs::remove_dir_all(table_dir).expect("cleanup table dir");
     }
 

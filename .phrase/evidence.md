@@ -13796,3 +13796,43 @@ Negative check:
 - Phase 2: `CompactionTrigger::TombstoneDebt` on the guard-aware picker, driven by
   these metrics + per-guard tombstone counts. Then Phase 3 (bulk file drop),
   Phase 4 (read-path whole-range skip).
+
+## 2026-06-15: Delete/GC Lifecycle Phase 2 (Tombstone-Debt Compaction Trigger)
+
+### Observation
+
+- v1 targets range-tombstone debt using the cheap, format-free
+  `Table::may_have_range_tombstones` footer flag. Point-tombstone density needs
+  per-table entry/deletion counts absent from `TableProperties` (a manifest bump),
+  deferred unless Phase 1 scan-waste shows point-tombstone-heavy pressure.
+- `CompactionTable` gained `has_range_tombstones`; new
+  `CompactionTrigger::TombstoneDebt`. The picker fires it after L0Overlap/LevelSize
+  and before the no-pressure spread, on the shallowest non-level-0, non-deepest
+  level holding an in-range range-tombstone table, compacting it down with
+  overlapping lower-level data so the tombstone meets and drops what it covers.
+
+### Interpretation
+
+- Bounded and terminating: fires only with lower-level overlap (a pure move just
+  relocates the tombstone), excludes the deepest level, and is lower priority than
+  size pressure. A tombstone migrates down at most to where its covered data
+  lives, then stops; under a long snapshot it re-fires guard-locally but still
+  terminates at the deepest level.
+
+### Verification
+
+- `cargo test -q --lib` (363) and `--all-features` (367, 1 ignored flake) green.
+- Planner tests: lower-overlap -> TombstoneDebt; no-overlap -> none; deepest-level
+  -> none. `LsmTree` test proves the footer flag flows through to the trigger.
+- `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`,
+  `cargo check --benches`, `git diff --check`.
+
+### Remaining Blockers
+
+- Point-tombstone density score deferred (manifest bump). Phases 3 (bulk file
+  drop) and 4 (read-path skip) remain.
+
+### Recommended Next Action
+
+- Phase 3: bulk drop via file drop (drop bucket/prefix by removing wholly-covered
+  files), the biggest user-facing win. Then Phase 4 (read-path whole-range skip).

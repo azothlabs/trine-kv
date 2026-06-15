@@ -4406,5 +4406,6 @@ const fn compaction_trigger_label(trigger: CompactionTrigger) -> &'static str {
         CompactionTrigger::L0Overlap => "l0-overlap",
         CompactionTrigger::LevelSize => "level-size",
         CompactionTrigger::MultiTableLevel => "multi-table-level",
+        CompactionTrigger::TombstoneDebt => "tombstone-debt",
     }
 }

@@ -55,16 +55,22 @@ pub(crate) struct CompactionTable {
     pub(crate) id: TableId,
     pub(crate) level: TableLevel,
     pub(crate) bytes: u64,
+    has_range_tombstones: bool,
     smallest_user_key: Vec<u8>,
     largest_user_key: Vec<u8>,
 }
 
 impl CompactionTable {
-    pub(crate) fn from_properties_with_bytes(properties: &TableProperties, bytes: u64) -> Self {
+    pub(crate) fn from_properties_with_bytes(
+        properties: &TableProperties,
+        bytes: u64,
+        has_range_tombstones: bool,
+    ) -> Self {
         Self {
             id: properties.id,
             level: properties.level,
             bytes,
+            has_range_tombstones,
             smallest_user_key: properties.smallest_user_key.clone(),
             largest_user_key: properties.largest_user_key.clone(),
         }
@@ -130,6 +136,18 @@ pub(crate) fn plan_compaction(
                 trigger: CompactionTrigger::LevelSize,
             }));
         }
+    }
+
+    // Tombstone-debt cleanup. A non-bottom table carrying range tombstones with
+    // overlapping lower-level data is pushed down so the tombstone meets and
+    // drops the data it covers instead of lingering on the read path. This runs
+    // ahead of the no-pressure spread below because read-path pollution is worth
+    // more than spreading. It is bounded and terminating: it only fires when
+    // there is lower-level overlap to act on (a pure move would just relocate the
+    // tombstone), and the deepest populated level is excluded, so the tombstone
+    // migrates down at most to where its covered data already lives.
+    if let Some(plan) = tombstone_debt_plan(bucket, tables, range, oldest_active_snapshot)? {
+        return Ok(CompactionDecision::planned(plan));
     }
 
     // No-pressure fallback. The non-uniform per-level policy only merges a level
@@ -202,6 +220,78 @@ fn overlapping_table_count(
         .iter()
         .filter(|table| table.level == level && table.overlaps_range(range))
         .count()
+}
+
+fn deepest_nonzero_level(tables: &[CompactionTable]) -> Option<TableLevel> {
+    tables
+        .iter()
+        .filter(|table| table.level != TableLevel::ZERO)
+        .map(|table| table.level)
+        .max()
+}
+
+/// Plan a tombstone-debt compaction: the shallowest non-level-0, non-deepest
+/// level holding an in-range range-tombstone table, compacted down with its
+/// overlapping lower-level data so the tombstone can drop what it covers.
+///
+/// Returns `None` (no compaction) unless there is lower-level overlap to merge
+/// with, which both guarantees forward progress and prevents a re-trigger storm:
+/// a tombstone with no lower data to act on is left alone.
+fn tombstone_debt_plan(
+    bucket: &str,
+    tables: &[CompactionTable],
+    range: &KeyRange,
+    oldest_active_snapshot: Sequence,
+) -> Result<Option<CompactionPlan>> {
+    let deepest = deepest_nonzero_level(tables);
+    let Some(level) = level_set(tables, range).into_iter().find(|level| {
+        Some(*level) != deepest && level_has_range_tombstone_table(tables, range, *level)
+    }) else {
+        return Ok(None);
+    };
+    let output_level = level.next().ok_or_else(level_overflow)?;
+    let input_tables = narrow_tombstone_inputs(tables, range, level, output_level);
+    // A single input is a pure move that only relocates the tombstone; require
+    // lower-level overlap so the compaction actually drops covered data.
+    if input_tables.len() < 2 {
+        return Ok(None);
+    }
+
+    Ok(Some(CompactionPlan {
+        bucket: bucket.to_owned(),
+        key_range: key_range_for_inputs(tables, &input_tables),
+        input_tables,
+        output_level,
+        oldest_active_snapshot,
+        trigger: CompactionTrigger::TombstoneDebt,
+    }))
+}
+
+fn level_has_range_tombstone_table(
+    tables: &[CompactionTable],
+    range: &KeyRange,
+    level: TableLevel,
+) -> bool {
+    tables.iter().any(|table| {
+        table.level == level && table.has_range_tombstones && table.overlaps_range(range)
+    })
+}
+
+fn narrow_tombstone_inputs(
+    tables: &[CompactionTable],
+    range: &KeyRange,
+    input_level: TableLevel,
+    output_level: TableLevel,
+) -> Vec<TableId> {
+    let Some(table) = tables.iter().find(|table| {
+        table.level == input_level && table.has_range_tombstones && table.overlaps_range(range)
+    }) else {
+        return Vec::new();
+    };
+    let mut input_tables = vec![table.id];
+    let span = key_span_for_inputs(tables, &input_tables);
+    include_overlapping_level(tables, &mut input_tables, output_level, span.as_ref());
+    input_tables
 }
 
 fn l0_compaction_inputs(
@@ -878,6 +968,63 @@ mod tests {
         assert_eq!(decision.skip, None);
     }
 
+    #[test]
+    fn range_tombstone_table_with_lower_overlap_triggers_tombstone_debt() {
+        // L1 carries a range tombstone with overlapping L2 data, and L2 is the
+        // deepest level. The tombstone is pushed down to meet and drop the data.
+        let tables = vec![tombstone_table(1, 1, b"a", b"m"), table(2, 2, b"b", b"c")];
+
+        let decision = plan_compaction(
+            "default",
+            &tables,
+            &KeyRange::all(),
+            Sequence::ZERO,
+            options(),
+        )
+        .expect("planning succeeds");
+
+        let plan = decision.plan.expect("plan exists");
+        assert_eq!(plan.trigger, CompactionTrigger::TombstoneDebt);
+        assert_eq!(plan.output_level, TableLevel(2));
+        assert_eq!(plan.input_tables, vec![TableId(1), TableId(2)]);
+    }
+
+    #[test]
+    fn range_tombstone_table_without_lower_overlap_is_left_alone() {
+        // L1 range tombstone but no overlapping L2 data: a pure move would only
+        // relocate the tombstone, so the picker does not fire tombstone-debt.
+        let tables = vec![tombstone_table(1, 1, b"a", b"c"), table(2, 2, b"x", b"z")];
+
+        let decision = plan_compaction(
+            "default",
+            &tables,
+            &KeyRange::all(),
+            Sequence::ZERO,
+            options(),
+        )
+        .expect("planning succeeds");
+
+        assert_eq!(decision.plan, None);
+    }
+
+    #[test]
+    fn range_tombstone_at_deepest_level_does_not_trigger_tombstone_debt() {
+        // The deepest populated level is excluded: a tombstone there is already
+        // where its covered data lives, so it is left for size/full compaction.
+        let tables = vec![table(1, 1, b"a", b"z"), tombstone_table(2, 2, b"a", b"m")];
+
+        let decision = plan_compaction(
+            "default",
+            &tables,
+            &KeyRange::all(),
+            Sequence::ZERO,
+            options(),
+        )
+        .expect("planning succeeds");
+
+        assert_eq!(decision.plan, None);
+    }
+
     fn table(id: u64, level: u32, smallest: &[u8], largest: &[u8]) -> CompactionTable {
         table_with_bytes(id, level, smallest, largest, 1)
     }
@@ -893,8 +1040,16 @@ mod tests {
             id: TableId(id),
             level: TableLevel(level),
             bytes,
+            has_range_tombstones: false,
             smallest_user_key: smallest.to_vec(),
             largest_user_key: largest.to_vec(),
+        }
+    }
+
+    fn tombstone_table(id: u64, level: u32, smallest: &[u8], largest: &[u8]) -> CompactionTable {
+        CompactionTable {
+            has_range_tombstones: true,
+            ..table_with_bytes(id, level, smallest, largest, 1)
         }
     }
 

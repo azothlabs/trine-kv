@@ -84,10 +84,36 @@ Acceptance gate:
 
 ### Phase 2: Tombstone-Aware Compaction Trigger
 
-Goal: add `CompactionTrigger::TombstoneDebt` to the guard-aware picker, scored by
-tombstone density / scan waste / oldest-tombstone age, compacting the offending
-range down to where deletes can actually drop (covered data is met / bottom
-level), using Phase 1 metrics plus per-guard tombstone inventory.
+Status: Implemented (2026-06-15), range-tombstone scope.
+
+Goal: add `CompactionTrigger::TombstoneDebt` to the guard-aware picker so range
+tombstones meet and drop the data they cover instead of lingering on the read
+path.
+
+Decision: v1 uses the cheap, format-free `Table::may_have_range_tombstones`
+footer flag (no manifest change). Point-tombstone density (`tombstone_entries /
+total_entries`) needs per-table entry/deletion counts that are not in
+`TableProperties`; persisting those is a manifest bump deferred to a later slice
+if Phase 1 scan-waste shows point-tombstone-heavy pressure. Range tombstones are
+the dangerous big-DeleteRange / drop-prefix case and are the high-leverage start.
+
+Implementation:
+
+- `CompactionTable` carries `has_range_tombstones` (from the table flag).
+- The picker, after `L0Overlap`/`LevelSize` and before the no-pressure spread,
+  fires `TombstoneDebt` on the shallowest non-level-0, non-deepest level holding
+  an in-range range-tombstone table, compacting it down with overlapping
+  lower-level data.
+- Termination/anti-storm: it only fires when there is lower-level overlap (a pure
+  move just relocates the tombstone), and the deepest populated level is
+  excluded, so a tombstone migrates down at most to where its covered data lives,
+  then stops; it is also lower priority than size pressure.
+
+Acceptance gate:
+
+- A range-tombstone table with lower-level overlap plans `TombstoneDebt`; one
+  without overlap, or at the deepest level, does not (planner + `LsmTree` tests).
+- No storage-format change. Compaction/range-delete/recovery suites pass.
 
 ### Phase 3: Bulk Drop Via File Drop
 

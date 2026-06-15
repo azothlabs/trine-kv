@@ -6,62 +6,60 @@ Complete
 
 ## Goal
 
-Phase 1 of `.phrase/protocol/delete-gc-lifecycle.md`: make delete debt and
-snapshot version-debt measurable with zero behavior or storage-format change.
-Measure-first foundation for the tombstone/GC work.
+Phase 2 of `.phrase/protocol/delete-gc-lifecycle.md`: add a tombstone-aware
+compaction trigger so range tombstones meet and drop the data they cover instead
+of lingering on the read path.
 
 ## Design Assessment
 
-The external playbook for snapshot/tombstone is server/DBaaS-shaped (snapshot TTL
-with forced interruption, scan replicas, delete SLA, tenant/generation key
-encoding). For an embedded single-process library those do not apply; what does
-is observability + a tombstone-aware compaction trigger + bulk drop as file drop.
-Phase 1 builds only the observability, mirroring the existing `blob_reads` metric
-plumbing so counting is lock-light and off the hot allocation path.
+v1 targets range-tombstone debt using the cheap, format-free
+`Table::may_have_range_tombstones` footer flag (no manifest change). Point-
+tombstone density needs per-table entry/deletion counts that are not in
+`TableProperties`; that is a deferred manifest bump if Phase 1 scan-waste shows
+point-tombstone-heavy pressure. Range tombstones are the dangerous big-delete /
+drop-prefix case, so they are the high-leverage start. The trigger plugs into the
+Phase E guard-aware picker.
 
 ## Scope
 
-- `ScanWasteMetrics` threaded into the lazy scan; counted at the merge
-  chokepoint where a user-key version group resolves to visible / delete-hidden /
-  no-visible-version.
-- `DbStats`: `scan_internal_records`, `scan_user_keys`,
-  `scan_tombstone_hidden_keys` (north star = internal / user), plus
-  `oldest_snapshot_seq` and `oldest_snapshot_lag` (visible minus oldest pinned).
-- `active_snapshots` retained.
+- `CompactionTable.has_range_tombstones`; new `CompactionTrigger::TombstoneDebt`.
+- Picker fires `TombstoneDebt` after `L0Overlap`/`LevelSize` and before the
+  no-pressure spread, on the shallowest non-level-0, non-deepest level holding an
+  in-range range-tombstone table, compacting it down with overlapping lower data.
+- Termination/anti-storm: fires only with lower-level overlap (a pure move just
+  relocates the tombstone), excludes the deepest level, and is lower priority
+  than size pressure.
 
 ## Out Of Scope
 
-- Snapshot/iterator lease, TTL, or forced interruption (RAII + observability).
-- Tombstone-aware compaction trigger (Phase 2), bulk file drop (Phase 3),
-  read-path whole-range skip (Phase 4).
-- Any storage-format change.
+- Point-tombstone density score (needs `TableProperties` entry/deletion counts =
+  manifest bump); deferred.
+- Bulk file drop (Phase 3), read-path whole-range skip (Phase 4).
 
 ## Acceptance Gate
 
-- `DbStats` exposes scan read-amplification inputs and snapshot version-debt. Met.
-- A test over tombstone/version-heavy data shows internal > user and
-  tombstone-hidden > 0. Met.
-- No behavior/format change. Met. Full local gate. Met (one pre-existing
-  background-timing flake).
+- Range-tombstone table with lower overlap plans `TombstoneDebt`; without overlap
+  or at the deepest level it does not. Met (planner + `LsmTree` tests).
+- No storage-format change; compaction/range-delete/recovery suites pass. Met.
+- Full local gate. Met (one pre-existing background-timing flake).
 
 ## Evidence
 
-- `scan_waste_and_snapshot_lag_metrics_report_gc_health`: 3 versions x 4 keys + 2
-  point deletes; full scan returns 2 live keys, `scan_user_keys == 2`,
-  `scan_internal_records == 14 > 2`, `scan_tombstone_hidden_keys == 2`; holding a
-  snapshot makes `oldest_snapshot_lag > 0` and `active_snapshots == 1`, dropping
-  it returns lag to 0.
-- `cargo test --lib` (359) and `--all-features` (363) green; fmt/clippy/diff clean.
+- Planner tests: `range_tombstone_table_with_lower_overlap_triggers_tombstone_debt`,
+  `..._without_lower_overlap_is_left_alone`,
+  `range_tombstone_at_deepest_level_does_not_trigger_tombstone_debt`.
+- `LsmTree` test `range_tombstone_table_with_lower_overlap_plans_tombstone_debt`
+  proves the `may_have_range_tombstones` flag flows through to the trigger.
+- `cargo test --lib` (363) and `--all-features` (367) green; fmt/clippy/diff clean.
 
 ## Known Risks
 
-- `scan_internal_records` counts the per-user-key merge fan-out (full group),
-  which captures version bloat regardless of early-return; it is a since-open
-  cumulative counter, so consumers should diff across two `stats()` calls for a
-  per-scan ratio.
+- A range tombstone whose covered data is pinned by a long snapshot re-fires
+  guard-locally as it migrates down, but terminates at the deepest level; bounded
+  work, lower priority than size pressure.
 
 ## Next Recommendation
 
-- Phase 2 (`TombstoneDebt` compaction trigger) is the natural next step, driven by
-  these metrics plus a per-guard tombstone inventory. Then Phase 3 (bulk drop via
-  file drop) for the biggest user-facing win, and Phase 4 (read-path skip).
+- Phase 3 (bulk drop via file drop) is the biggest user-facing win for
+  drop-table/tenant/prefix. Then Phase 4 (read-path whole-range skip). Add
+  point-tombstone density (manifest bump) only if Phase 1 metrics demand it.
