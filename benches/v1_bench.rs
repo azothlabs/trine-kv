@@ -11,7 +11,8 @@ use std::{
 use trine_kv::{
     BlobGcRatio, BlobLevelMergePolicy, BucketOptions, CompactionTrigger, Db, DbOptions,
     DurabilityMode, FilterPolicy, IndexSearchPolicy, KeyRange, MaintenanceBudget, PrefixExtractor,
-    PrefixFilterPolicy, RuntimeOptions, TransactionOptions, WriteBatch, WriteOptions, search,
+    PrefixFilterPolicy, RuntimeOptions, TransactionOptions, WalShardPolicy, WriteBatch,
+    WriteOptions, search,
 };
 
 const ROWS: usize = 1_024;
@@ -1460,7 +1461,7 @@ fn push_group_commit_diagnostic(
     let dir = temp_dir(base);
     let mut options = benchmark_persistent_options(&dir);
     options.background_worker_count = 0;
-    options.wal_shard_count = wal_shards;
+    options.wal_shards = WalShardPolicy::Fixed(wal_shards);
     options = options.with_durability(DurabilityMode::SyncData);
     let db = Arc::new(Db::open_sync(options).expect("group commit db opens"));
 

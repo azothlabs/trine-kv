@@ -13627,3 +13627,46 @@ Negative check:
 
 - Confirm the default `wal_shard_count` (recommend 1). Then resume the remembered
   layered-filter Phase 3/4/5.
+
+## 2026-06-15: WAL Shard Policy Auto (Scenario-Adaptive)
+
+### Observation
+
+- User chose a scenario-adaptive default over a fixed one, and asked whether
+  "serialized fsyncs defeat batching" is actually unsolvable. It is not: one
+  `fsync` covers exactly one file (so commits cannot be merged across shard
+  files), but concentrating concurrent writers on fewer lanes lets the worker
+  batch them. The 4-shard "failure" was spreading 8 writers over 4 lanes; 1 lane
+  batched 4 commits/fsync. On a single device the optimum is 1 file + group
+  commit; more lanes help only with parallel-flush hardware.
+- Replaced `DbOptions::wal_shard_count: usize` with
+  `DbOptions::wal_shards: WalShardPolicy` (`Auto` | `Fixed(usize)`), default
+  `Auto`. `Auto::resolve` picks 1 lane for the per-commit-fsync regime
+  (persistent + SyncData/SyncAll) and `AUTO_PARALLEL_LANES` (4) otherwise.
+  `with_wal_shards` / `with_wal_shard_count` builders; runtime-only, no format
+  change.
+
+### Interpretation
+
+- Default behavior now fixes the durable-write bottleneck out of the box: the
+  default persistent durability is SyncAll, so Auto resolves to 1 lane and group
+  commit engages under concurrency. Buffered/Flush and in-memory keep parallel
+  lanes where batching is moot. Power users override with `Fixed(n)` on
+  parallel-flush hardware.
+
+### Verification
+
+- `cargo test -q --lib` (355) and `--all-features` (359, 1 ignored flake) green.
+- New `options::tests`: Auto -> 1 for SyncData/SyncAll, Auto -> 4 for
+  Buffered/in-memory, Fixed clamps to >= 1.
+- `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`,
+  `git diff --check`. Group-commit benchmark unchanged (uses `Fixed`).
+
+### Remaining Blockers
+
+- None for group commit / shard policy. Optional bounded commit-delay window for
+  bursty single writers remains a possible follow-up.
+
+### Recommended Next Action
+
+- Resume the remembered layered-filter Phase 3/4/5 (committed must-do work).

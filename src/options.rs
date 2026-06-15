@@ -248,15 +248,14 @@ pub struct DbOptions {
     pub block_cache_bytes: usize,
     /// Number of background workers used by maintenance-capable runtimes.
     pub background_worker_count: usize,
-    /// Number of WAL shards (independent append lanes).
+    /// Policy for the number of WAL shards (independent append lanes).
     ///
-    /// Each shard is an independent fsync stream. More shards parallelize WAL
-    /// fsyncs across writers on hardware that can flush in parallel, but spread
-    /// concurrent commits across lanes, which weakens group commit. On a single
-    /// device where fsyncs serialize (typical embedded/consumer storage), fewer
-    /// shards let group commit coalesce concurrent commits under one fsync.
-    /// Must be at least 1.
-    pub wal_shard_count: usize,
+    /// Defaults to [`WalShardPolicy::Auto`], which picks one lane for the
+    /// per-commit-fsync durable-write regime (so group commit engages) and a
+    /// small parallel set otherwise. See [`WalShardPolicy`] for the trade-offs
+    /// and use [`DbOptions::with_wal_shards`] / [`DbOptions::with_wal_shard_count`]
+    /// to override.
+    pub wal_shards: WalShardPolicy,
     /// Runtime used for async, blocking, and background work.
     pub runtime: RuntimeOptions,
     /// Startup policy for safe temporary files left by interrupted writes.
@@ -283,8 +282,6 @@ impl DbOptions {
     pub const DEFAULT_BLOB_GC_MIN_FILE_BYTES: u64 = 64 * 1024 * 1024;
     /// Default number of recent read versions retained without explicit pins.
     pub const DEFAULT_KEEP_LAST_READ_VERSIONS: u64 = 1;
-    /// Default number of WAL shards (independent append lanes).
-    pub const DEFAULT_WAL_SHARD_COUNT: usize = crate::wal::DEFAULT_WAL_SHARD_COUNT;
 
     /// Creates persistent database options for `path`.
     ///
@@ -437,12 +434,20 @@ impl DbOptions {
         self
     }
 
-    /// Sets the number of WAL shards (independent append lanes). Use 1 to let
-    /// group commit coalesce concurrent commits under one fsync on single-device
-    /// storage; raise it to parallelize WAL fsyncs on hardware that supports it.
+    /// Sets the WAL shard policy (see [`WalShardPolicy`]).
+    #[must_use]
+    pub const fn with_wal_shards(mut self, policy: WalShardPolicy) -> Self {
+        self.wal_shards = policy;
+        self
+    }
+
+    /// Sets a fixed WAL shard (lane) count. Convenience for
+    /// `with_wal_shards(WalShardPolicy::Fixed(count))`: use 1 to force group
+    /// commit on single-device storage, or a higher count to parallelize WAL
+    /// fsyncs on hardware that flushes files in parallel.
     #[must_use]
     pub const fn with_wal_shard_count(mut self, count: usize) -> Self {
-        self.wal_shard_count = count;
+        self.wal_shards = WalShardPolicy::Fixed(count);
         self
     }
 }
@@ -462,13 +467,81 @@ impl Default for DbOptions {
             max_l0_files: 8,
             block_cache_bytes: Self::DEFAULT_BLOCK_CACHE_BYTES,
             background_worker_count: 1,
-            wal_shard_count: Self::DEFAULT_WAL_SHARD_COUNT,
+            wal_shards: WalShardPolicy::Auto,
             runtime: RuntimeOptions::default(),
             fail_on_corruption: FailOnCorruptionPolicy::FailClosed,
             keep_last_read_versions: Self::DEFAULT_KEEP_LAST_READ_VERSIONS,
             blob_gc_enabled: true,
             blob_gc_discardable_ratio: BlobGcRatio::HALF,
             blob_gc_min_file_bytes: Self::DEFAULT_BLOB_GC_MIN_FILE_BYTES,
+        }
+    }
+}
+
+/// Policy for choosing the number of WAL shards (independent append lanes).
+///
+/// Each shard is one append-only WAL file served by its own worker thread, and
+/// each worker batches the commits queued on its lane into a single fsync (group
+/// commit). The number of lanes trades two things against each other:
+///
+/// - Fewer lanes concentrate concurrent commits on one worker, so group commit
+///   coalesces many commits under one fsync. On single-device storage, where
+///   fsyncs to different files serialize at the device, this is the only way to
+///   raise durable-write throughput, and one lane is the physical optimum (a
+///   single `fsync` covers exactly one file, so commits cannot be merged across
+///   lane files).
+/// - More lanes spread commits across files, which only helps when the hardware
+///   can flush multiple files in parallel (multiple devices, or an `NVMe` with
+///   parallel flush). On a serial-fsync device, more lanes give each lane too
+///   few concurrent commits to batch, so throughput stays at the fsync floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalShardPolicy {
+    /// Choose the lane count from the scenario, recomputed at open:
+    ///
+    /// - Persistent storage with per-commit fsync durability
+    ///   ([`DurabilityMode::SyncData`] / [`DurabilityMode::SyncAll`]) uses one
+    ///   lane, so group commit coalesces concurrent commits under one fsync.
+    ///   This is the durable-write bottleneck and the single-device optimum.
+    /// - Persistent storage without per-commit fsync ([`DurabilityMode::Buffered`]
+    ///   / [`DurabilityMode::Flush`]) uses a small parallel set of lanes, since
+    ///   there is no per-commit fsync to coalesce and parallel append lanes help.
+    /// - In-memory and host backends use one lane; there is no device fsync to
+    ///   parallelize.
+    ///
+    /// Override with [`WalShardPolicy::Fixed`] on hardware that flushes files in
+    /// parallel.
+    Auto,
+    /// Use exactly this many lanes (clamped to at least one). Set `Fixed(1)` to
+    /// force group commit on single-device storage, or a higher count to
+    /// parallelize WAL fsyncs where the device supports parallel flush.
+    Fixed(usize),
+}
+
+impl WalShardPolicy {
+    /// Lane count used when [`WalShardPolicy::Auto`] does not pick per-commit
+    /// fsync mode (no fsync per write, so parallel append lanes are harmless and
+    /// can help).
+    const AUTO_PARALLEL_LANES: usize = crate::wal::DEFAULT_WAL_SHARD_COUNT;
+
+    /// Resolve the policy to a concrete lane count (always at least one) for the
+    /// given storage mode and default durability.
+    pub(crate) fn resolve(self, storage_mode: &StorageMode, durability: DurabilityMode) -> usize {
+        match self {
+            Self::Fixed(count) => count.max(1),
+            Self::Auto => {
+                let per_commit_fsync = matches!(storage_mode, StorageMode::Persistent { .. })
+                    && matches!(
+                        durability,
+                        DurabilityMode::SyncData | DurabilityMode::SyncAll
+                    );
+                if per_commit_fsync {
+                    // Group-commit regime: one lane lets the worker coalesce
+                    // concurrent commits under a single fsync.
+                    1
+                } else {
+                    Self::AUTO_PARALLEL_LANES
+                }
+            }
         }
     }
 }
@@ -677,5 +750,55 @@ impl WriteOptions {
     #[must_use]
     pub const fn sync_all() -> Self {
         Self::new(DurabilityMode::SyncAll)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DurabilityMode, StorageMode, WalShardPolicy};
+    use std::path::PathBuf;
+
+    fn persistent() -> StorageMode {
+        StorageMode::Persistent {
+            path: PathBuf::from("/tmp/trine-wal-policy-test"),
+        }
+    }
+
+    #[test]
+    fn auto_uses_one_lane_for_per_commit_fsync_durability() {
+        // Persistent + sync durability is the group-commit regime: one lane.
+        assert_eq!(
+            WalShardPolicy::Auto.resolve(&persistent(), DurabilityMode::SyncAll),
+            1
+        );
+        assert_eq!(
+            WalShardPolicy::Auto.resolve(&persistent(), DurabilityMode::SyncData),
+            1
+        );
+    }
+
+    #[test]
+    fn auto_uses_parallel_lanes_without_per_commit_fsync() {
+        // No per-commit fsync (Buffered/Flush) or in-memory: parallel lanes.
+        assert_eq!(
+            WalShardPolicy::Auto.resolve(&persistent(), DurabilityMode::Buffered),
+            WalShardPolicy::AUTO_PARALLEL_LANES
+        );
+        assert_eq!(
+            WalShardPolicy::Auto.resolve(&StorageMode::InMemory, DurabilityMode::SyncAll),
+            WalShardPolicy::AUTO_PARALLEL_LANES
+        );
+    }
+
+    #[test]
+    fn fixed_clamps_to_at_least_one_lane() {
+        assert_eq!(
+            WalShardPolicy::Fixed(0).resolve(&persistent(), DurabilityMode::SyncAll),
+            1
+        );
+        assert_eq!(
+            WalShardPolicy::Fixed(8).resolve(&persistent(), DurabilityMode::SyncAll),
+            8
+        );
     }
 }

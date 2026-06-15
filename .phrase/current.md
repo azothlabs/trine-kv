@@ -2,7 +2,7 @@
 
 ## Status
 
-In Progress (group commit landed; WAL shard-count default decision pending user)
+Complete (group commit landed; WAL shard policy is scenario-adaptive `Auto`)
 
 ## Goal
 
@@ -61,15 +61,17 @@ lets group commit coalesce.
   - 4-shard x8: ~1982 persists / 2048 commits (~1.03, no batching), ~527 ops/s.
 - macOS `F_FULLFSYNC` confirmed as the per-commit cost (`std` sync_data/sync_all).
 
-## Known Risks / Open Decision
+## Resolution
 
-- WAL shard-count default: evidence says 1 is far better for single-device
-  (embedded) under concurrency; >1 only helps where fsyncs parallelize. Default
-  left at 4 for now; flipping to 1 is a durable boundary to confirm with the
-  user. Changing it is recovery-safe (WAL discovery handles any prior count).
+- `WalShardPolicy::Auto` (default) resolves to 1 lane for the per-commit-fsync
+  durable regime (persistent + SyncData/SyncAll) and a parallel set otherwise, so
+  the durable-write bottleneck is fixed out of the box while batching-irrelevant
+  modes keep parallel lanes. `Fixed(n)` overrides for parallel-flush hardware.
+- "Serialized fsyncs defeat batching" is solved by concentrating writers on one
+  lane, not by merging fsyncs across files (physically impossible: one fsync =
+  one file).
 
 ## Next Recommendation
 
-- Decide the default `wal_shard_count` (recommend 1 for the embedded target).
 - Optional: bounded commit-delay window to help bursty single writers.
-- Then return to remembered layered-filter Phase 3/4/5.
+- Resume the remembered layered-filter Phase 3/4/5 (committed must-do work).

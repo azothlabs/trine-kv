@@ -150,7 +150,7 @@ pub use object_store::{
 pub use options::{
     BlobGcRatio, BlobLevelMergePolicy, BucketOptions, CompressionProfile, DbOptions,
     DurabilityMode, FailOnCorruptionPolicy, FilterPolicy, HostStorageBackend, IndexSearchPolicy,
-    PrefixFilterPolicy, StorageMode, WriteOptions,
+    PrefixFilterPolicy, StorageMode, WalShardPolicy, WriteOptions,
 };
 pub use point_value::PointValue;
 pub use prefix::PrefixExtractor;

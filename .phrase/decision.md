@@ -102,11 +102,15 @@ Evidence notes should separate:
   batch with one fsync, completing each waiter only after the fsync that covers
   its frame. The single-writer synchronous floor is the device fsync latency
   (macOS `F_FULLFSYNC`) and is not an architecture defect; throughput scales only
-  via concurrency, async pipelining, or `WriteBatch`. `wal_shard_count` is a
-  runtime option (WAL files are discovered by name; no manifest/format change):
-  1 lane lets group commit coalesce concurrent commits on single-device storage,
-  more lanes parallelize fsyncs only where the device flushes in parallel. For
-  the embedded / single-device target, 1 shard is preferred. Do not weaken the
+  via concurrency, async pipelining, or `WriteBatch`. "Serialized fsyncs defeat
+  batching" is not a wall: one `fsync` covers exactly one file, so commits cannot
+  be merged across shard files, but concentrating concurrent writers on fewer
+  lanes lets the worker batch them. On a single device the optimum is 1 WAL file
+  + group commit; more lanes help only where the device flushes files in
+  parallel. `WalShardPolicy` (runtime option; WAL files discovered by name, no
+  manifest/format change) defaults to `Auto`: 1 lane for the per-commit-fsync
+  durable regime (persistent + SyncData/SyncAll), a small parallel set otherwise;
+  `Fixed(n)` overrides for parallel-flush hardware. Do not weaken the
   per-confirmed-write durability contract to raise this number.
 - WASI and browser persistence must be selected through explicit host backend
   options. WASI persistence may use the host-preopened filesystem on WASI
