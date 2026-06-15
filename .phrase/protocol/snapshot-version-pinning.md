@@ -1,7 +1,32 @@
 # Snapshot Version-Handle Pinning (LMDB-grade reader pins)
 
 Date: 2026-06-15
-Status: Draft for phased implementation
+Status: Phase 1 done and merged. Phases 2-3 DEFERRED (low ROI for embedded;
+re-open only when a real workload needs instant truncate/file-drop while an
+older snapshot is concurrently held).
+
+## Deferral decision (2026-06-15)
+
+After implementing Phase 1 and scoping Phases 2-3 against the code, the verdict
+is to stop here:
+
+- Phase 2 adds ~zero read-correctness benefit (the current
+  current-version + seq-filter model is already repeatable-read correct).
+- The only unique benefit of Phases 2-3 is instant truncate/file-drop while an
+  *older* snapshot is concurrently held — rare in a single-process embedded DB,
+  and the common case (no older snapshot) is already instant via the
+  retention-gated file-drop in [[delete-gc-lifecycle]] Phase 3.
+- The cost is high and indivisible: `db.snapshot()` would go from a free
+  refcount bump to an O(buckets) super-version capture pinned for the snapshot's
+  whole life, plus a rewrite of the hottest read path (~30 entry points) at the
+  most MVCC-sensitive point. Capture + read-reroute must land together to have
+  any value, so there is no small safe slice.
+- LMDB's reader-pins-root is intrinsic to its COW B+tree; bolting it onto an LSM
+  is changing the concurrency model, not adding a feature.
+
+Phase 1 already delivered the practical win (a long-lived snapshot no longer
+stalls all space reclamation). Phases 2-3 below are kept as a named, deliberately
+deferred future phase.
 
 ## Purpose
 
