@@ -602,6 +602,11 @@ pub struct LevelFilterStats {
     pub tables: usize,
     /// Table and block filter counters summed over this level's tables.
     pub filters: FilterStats,
+    /// Resident Bloom filter bytes held in memory for this level's tables
+    /// (table-level plus resident data-block filters). This is the layered
+    /// (Monkey-style) allocation memory metric; deeper levels with a lower
+    /// per-key budget hold fewer filter bytes per key.
+    pub filter_resident_bytes: u64,
 }
 
 /// Read-path counters that describe how far reads travel through table metadata.

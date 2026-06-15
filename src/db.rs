@@ -3666,11 +3666,15 @@ impl Db {
                             level,
                             tables: 0,
                             filters: FilterStats::default(),
+                            filter_resident_bytes: 0,
                         });
                     level_filter_entry.tables += 1;
                     level_filter_entry
                         .filters
                         .saturating_add_assign(table_filters);
+                    level_filter_entry.filter_resident_bytes = level_filter_entry
+                        .filter_resident_bytes
+                        .saturating_add(table.resident_filter_bytes());
                     stats
                         .read_path
                         .saturating_add_assign(table.read_path_stats());

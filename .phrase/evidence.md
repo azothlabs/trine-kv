@@ -13494,3 +13494,70 @@ Negative check:
 - Phase 2: per-output-level `bits_per_key` curve aimed at cutting filter memory
   at equal negative-lookup leakage (block-filter probes), since data-block-read
   I/O is already ~0. Add a per-level filter-memory/probe metric first.
+
+## 2026-06-15: Layered Filter Allocation Phase 2 (Per-Output-Level bits/key Curve)
+
+### Observation
+
+- Architecture finding while implementing: Trine has two point-filter tiers. The
+  table-level filter (`Table::point_key_filter`) is built only for pinned shallow
+  levels (`should_pin_read_metadata`, L0/L1). The block-level filter (one per
+  data block, in `TableDataBlock`) exists at all levels and is the actual
+  cross-level lever; it is what drives negative-lookup data-block reads to zero.
+- Added `level_adjusted_point_bits_per_key(base, level)`: L0/L1 keep the base;
+  each deeper level drops by 2 bits, clamped to a floor of 4 and never above the
+  base. Applied to the block-level filter (and the shallow table-level filter).
+- Added `Table::resident_filter_bytes` and
+  `DbStats::level_filters[*].filter_resident_bytes` (resident filter memory per
+  level).
+- Verification numbers:
+  - `deeper_levels_write_smaller_block_filters`: identical 600-key record set
+    written at L2 vs L4 produces a strictly smaller encoded table at L4
+    (residency-independent proof the curve flows through the real write path).
+  - `level_adjusted_point_bits_per_key`: 10,10,8,6,4,4 for L0..L5; base 3 stays 3
+    at L9 (no memory regression for small bases).
+  - Diagnostic (L0/L1 only): FPR unchanged ~1%, negative-lookup data-block reads
+    still 0, resident filter bytes 2560/level. Missing-read throughput unchanged.
+
+### Interpretation
+
+- The implemented curve is memory-first, not equal-budget reallocation: Phase 1
+  showed I/O is already 0, so the realizable win is filter memory. The curve only
+  lowers deep levels, so total filter memory can only drop; the cost is a higher
+  deep-level false-positive rate (about 15% at the 4-bit floor), which on local
+  storage costs an in-memory block-filter probe, and on slow embedded storage a
+  possible deep data-block read for truly-absent keys. Hot shallow levels stay
+  fully accurate.
+- The deep-FPR/storage trade is workload-dependent; the per-bucket base
+  `bits_per_key` remains the lever, and a user-configurable curve is the deferred
+  Phase 4.
+
+### Decision
+
+- Keep the curve internal and write-time (filter self-describing, zero storage-
+  format change). Floor 4 bits, step 2, shallow cutoff = pin boundary (L0/L1).
+- Protocol Phase 2 acceptance gate updated to the memory-first framing.
+
+### Verification
+
+- `cargo test -q --lib` (352) and `--all-features` (356, 1 ignored flake) green.
+- New tests: `level_adjusted_point_bits_per_key_decreases_with_depth`,
+  `deeper_levels_write_smaller_block_filters`,
+  `persistent_level_filter_stats_aggregate_by_level`,
+  `table_point_false_positive_rate_*`.
+- `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`,
+  `cargo check --benches`, `git diff --check`.
+- `TRINE_BENCH_RUNS=3 cargo bench` layered-filter diagnostic rows above.
+
+### Remaining Blockers
+
+- `filter_resident_bytes` reflects resident filters only; file-backed deep tables
+  keep block filters encoded/lazy, so the deep memory win shows in encoded table
+  size (tested) rather than resident bytes. A residency-independent per-level
+  encoded-filter-bytes stat would need filter-block size in table metadata.
+
+### Recommended Next Action
+
+- Phase 3 (prefix filter negative-lookup tuning) or stop here and return to the
+  single-key sync-write fsync bottleneck. Phase 4 (configurable curve) only if a
+  workload needs to tune the deep-FPR/storage trade.

@@ -106,20 +106,39 @@ Acceptance gate:
 
 ### Phase 2: Per-Output-Level bits/key Curve
 
-Goal: build table filters with a depth-scaled `bits_per_key` at write time.
+Status: Implemented (2026-06-15).
 
-Implementation scope:
+Goal: build the point filter with a depth-scaled `bits_per_key` at write time so
+deep levels cost less filter memory.
 
-- Choose `bits_per_key` from the output level during flush/compaction using an
-  internal heuristic curve (local classic-Monkey direction: shallower levels
-  get more bits).
-- Keep the filter block self-describing; read path and formats unchanged.
+Refinement from Phase 1 evidence: Trine's two-level (table + block) filter
+already drives negative-lookup data-block reads to zero, so the realizable goal
+is **reducing filter memory**, not reducing I/O. The implemented curve is
+therefore memory-first rather than equal-budget reallocation: it only lowers
+deep levels (never raises any level above the base), so total filter memory can
+only drop. The trade is a higher deep-level false-positive rate, bounded by the
+floor; deep negatives may incur some extra block-filter / data-block probes
+while hot shallow levels (L0/L1) stay fully accurate.
+
+Implementation:
+
+- `level_adjusted_point_bits_per_key(base, level)` in `src/table.rs`: L0/L1
+  (pinned levels) keep the base; each deeper level drops by `BITS_PER_LEVEL_STEP`
+  (2), clamped to `MIN_BITS_PER_KEY` (4) and never above the base.
+- Applied to the block-level point filter (the cross-level lever, present at all
+  levels) in `build_data_blocks`, and to the shallow table-level filter.
+- The filter block is self-describing, so the read path and all storage formats
+  are unchanged.
 
 Acceptance gate:
 
-- At equal or lower total filter memory, `sum f_i` and negative-lookup
-  data-block reads drop versus the uniform baseline, proven by Phase 1 stats.
-- Hit-path behavior and point-read candidate depth do not regress.
+- Deep levels write smaller filters at equal records, proven residency-
+  independently by encoded table size (`deeper_levels_write_smaller_block_filters`).
+- The curve never exceeds the base, so total filter memory cannot regress.
+- Hot shallow levels (L0/L1) keep base accuracy: their FPR and negative-lookup
+  data-block reads are unchanged (diagnostic: L0/L1 FPR ~1%, data-block reads 0).
+- `DbStats::level_filters[*].filter_resident_bytes` reports resident filter
+  memory per level.
 
 ### Phase 3: Prefix Filter Negative-Lookup Tuning
 

@@ -1497,6 +1497,10 @@ fn extend_layered_filter_fpr_diagnostic(results: &mut Vec<BenchResult>) {
             labelled_level(label, level.level, "tables"),
             usize_to_u64(level.tables),
         ));
+        results.push(BenchResult::diagnostic(
+            labelled_level(label, level.level, "resident filter bytes"),
+            level.filter_resident_bytes,
+        ));
     }
 
     let negative_data_block_reads = after

@@ -1120,6 +1120,28 @@ impl Table {
         &self.properties
     }
 
+    /// Resident Bloom filter bytes held in memory for this table: the table-level
+    /// filter (pinned shallow levels only) plus any resident data-block filters.
+    ///
+    /// This is the layered (Monkey-style) allocation memory metric. It measures
+    /// filter memory actually held in RAM, the quantity that matters under a
+    /// memory budget; lazily loaded deep filters that are not resident report
+    /// zero because they are not currently consuming memory.
+    pub(crate) fn resident_filter_bytes(&self) -> u64 {
+        let point = self
+            .point_key_filter
+            .as_ref()
+            .map_or(0, |filter| usize_to_u64_saturating(filter.bytes().len()));
+        let prefix = self
+            .prefix_filter
+            .as_ref()
+            .map_or(0, |filter| usize_to_u64_saturating(filter.bytes().len()));
+        let block_level = self.data_blocks.as_ref().map_or(0, |blocks| {
+            blocks.iter().map(TableDataBlock::filter_bytes).sum()
+        });
+        point.saturating_add(prefix).saturating_add(block_level)
+    }
+
     pub(crate) fn point_records(&self) -> Result<Vec<TablePointRecord>> {
         self.all_point_records()
     }
@@ -3704,10 +3726,10 @@ pub(crate) fn write_table_with_backend(
         value,
     })
     .collect::<Vec<_>>();
-    let data_blocks = build_data_blocks(&point_records, options)?;
+    let data_blocks = build_data_blocks(&point_records, options, level)?;
     let (point_key_filter, prefix_filter) = if should_pin_read_metadata(level) {
         (
-            build_point_key_filter(options, &point_records),
+            build_point_key_filter(options, &point_records, level),
             build_prefix_filter(options, &point_records),
         )
     } else {
@@ -3840,10 +3862,10 @@ where
         value,
     })
     .collect::<Vec<_>>();
-    let data_blocks = build_data_blocks(&point_records, options)?;
+    let data_blocks = build_data_blocks(&point_records, options, level)?;
     let (point_key_filter, prefix_filter) = if should_pin_read_metadata(level) {
         (
-            build_point_key_filter(options, &point_records),
+            build_point_key_filter(options, &point_records, level),
             build_prefix_filter(options, &point_records),
         )
     } else {
@@ -4391,6 +4413,7 @@ fn build_prefix_filter(
 fn build_point_key_filter(
     options: &TableWriteOptions,
     point_records: &[TablePointRecord],
+    level: TableLevel,
 ) -> Option<PointKeyFilter> {
     match options.filter_policy {
         FilterPolicy::Disabled => None,
@@ -4398,14 +4421,36 @@ fn build_point_key_filter(
             point_records
                 .iter()
                 .map(|record| record.internal_key.user_key()),
-            bits_per_key,
+            level_adjusted_point_bits_per_key(bits_per_key, level),
         )),
     }
+}
+
+/// Depth-scaled bits-per-key for layered (Monkey-style) point filter allocation.
+///
+/// Pinned shallow levels (L0/L1, see `PINNED_READ_METADATA_MAX_LEVEL`) keep the
+/// configured base so hot, recent data stays accurately filtered. Deeper levels
+/// hold exponentially more keys and dominate filter memory, so they get
+/// progressively fewer bits per key. The result never exceeds the base, so total
+/// filter memory cannot regress versus uniform allocation - important for
+/// memory-constrained embedded use. A deeper false positive costs at most one
+/// extra block-filter / data-block probe, which is the classic Monkey trade of
+/// memory for worst-case lookup cost. The point filter is self-describing
+/// (`PointKeyFilter::from_parts` carries bit and hash counts), so per-level bits
+/// need no storage-format change.
+fn level_adjusted_point_bits_per_key(base: u8, level: TableLevel) -> u8 {
+    const BITS_PER_LEVEL_STEP: u8 = 2;
+    const MIN_BITS_PER_KEY: u8 = 4;
+    let depth = level.get().saturating_sub(PINNED_READ_METADATA_MAX_LEVEL);
+    let reduction = BITS_PER_LEVEL_STEP.saturating_mul(u8::try_from(depth).unwrap_or(u8::MAX));
+    let floor = MIN_BITS_PER_KEY.min(base);
+    base.saturating_sub(reduction).max(floor)
 }
 
 fn build_data_blocks(
     point_records: &[TablePointRecord],
     options: &TableWriteOptions,
+    level: TableLevel,
 ) -> Result<Vec<TableDataBlock>> {
     let mut data_blocks = Vec::new();
     let mut block_start = 0;
@@ -4430,7 +4475,7 @@ fn build_data_blocks(
             point_records,
             block_start..block_end,
             &restart_indices,
-            build_point_key_filter(options, records),
+            build_point_key_filter(options, records, level),
             build_prefix_filter(options, records),
         )?);
         block_start = block_end;
@@ -6703,6 +6748,73 @@ mod tests {
     }
 
     #[test]
+    fn level_adjusted_point_bits_per_key_decreases_with_depth() {
+        // Pinned shallow levels keep the base; deeper levels get progressively
+        // fewer bits, clamped to the floor and never exceeding the base.
+        assert_eq!(level_adjusted_point_bits_per_key(10, TableLevel::ZERO), 10);
+        assert_eq!(level_adjusted_point_bits_per_key(10, TableLevel(1)), 10);
+        assert_eq!(level_adjusted_point_bits_per_key(10, TableLevel(2)), 8);
+        assert_eq!(level_adjusted_point_bits_per_key(10, TableLevel(3)), 6);
+        assert_eq!(level_adjusted_point_bits_per_key(10, TableLevel(4)), 4);
+        assert_eq!(level_adjusted_point_bits_per_key(10, TableLevel(9)), 4);
+        // A small base is never raised above itself (no memory regression).
+        assert_eq!(level_adjusted_point_bits_per_key(3, TableLevel(9)), 3);
+    }
+
+    #[test]
+    fn deeper_levels_write_smaller_block_filters() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-layered-filter-{}-{}",
+            std::process::id(),
+            table_time_suffix()
+        ));
+        let records = (0_u64..600)
+            .map(|index| {
+                (
+                    InternalKey::new(
+                        format!("key-{index:08}").into_bytes(),
+                        Sequence::new(index + 1),
+                        ValueKind::Put,
+                        0,
+                    ),
+                    Some(ValueRef::Inline(format!("value-{index:08}").into_bytes())),
+                )
+            })
+            .collect::<Vec<_>>();
+        let options = test_table_options(CodecId::None, true);
+
+        // Both levels are unpinned (no table-level filter), so the size gap is
+        // purely the block-level bits/key curve: L4 uses fewer bits than L2.
+        let shallow = write_table(
+            &table_path(&root, TableId(2)),
+            TableId(2),
+            TableLevel(2),
+            &options,
+            &records,
+            &[],
+        )
+        .expect("shallow table writes");
+        let deep = write_table(
+            &table_path(&root, TableId(4)),
+            TableId(4),
+            TableLevel(4),
+            &options,
+            &records,
+            &[],
+        )
+        .expect("deep table writes");
+
+        assert!(
+            deep.estimated_file_bytes() < shallow.estimated_file_bytes(),
+            "deep level should write smaller filters: deep={} shallow={}",
+            deep.estimated_file_bytes(),
+            shallow.estimated_file_bytes()
+        );
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[test]
     fn checked_block_index_round_trips_multiple_data_blocks() {
         let table = table_with_records(160, CodecId::None);
         let payload = encode_table(&table).expect("table encodes");
@@ -7434,7 +7546,8 @@ mod tests {
                 value: Some(ValueRef::Inline(format!("value-{index:03}").into_bytes())),
             })
             .collect::<Vec<_>>();
-        let data_blocks = build_data_blocks(&point_records, options).expect("test blocks build");
+        let data_blocks = build_data_blocks(&point_records, options, TableLevel::ZERO)
+            .expect("test blocks build");
         let data_block_count = data_blocks.len();
         let index_partitions = index_partitions_for_loaded_blocks(&data_blocks);
         Table {
@@ -7449,7 +7562,7 @@ mod tests {
                 &point_records,
                 &[],
             ),
-            point_key_filter: build_point_key_filter(options, &point_records),
+            point_key_filter: build_point_key_filter(options, &point_records, TableLevel::ZERO),
             prefix_filter: build_prefix_filter(options, &point_records),
             filter_stats: Arc::new(TableFilterStats::default()),
             read_path_stats: Arc::new(TableReadPathStats::default()),
