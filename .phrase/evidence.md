@@ -13670,3 +13670,42 @@ Negative check:
 ### Recommended Next Action
 
 - Resume the remembered layered-filter Phase 3/4/5 (committed must-do work).
+
+## 2026-06-15: Layered Filter Allocation Phase 3 (Prefix Filter Curve)
+
+### Observation
+
+- Generalized the Phase 2 point curve into one `level_adjusted_filter_bits(base,
+  level)` and applied it to the prefix filter `bits_per_prefix` in
+  `build_prefix_filter` (block-level at all levels + shallow table-level),
+  threading `level` through. Symmetric with the point filter.
+- Prefix filter is self-describing (`PrefixFilter::from_parts`), so no storage
+  format change. Per-level prefix FPR already observable
+  (`level_filters[*].filters.table_prefix_*`); prefix bytes already counted in
+  `filter_resident_bytes`.
+
+### Interpretation
+
+- Deep-level prefix filters now cost less memory for prefix-heavy workloads,
+  with the same bounded deep-FPR trade as the point filter. Memory-first and
+  embedded-aligned.
+
+### Verification
+
+- `cargo test -q --lib` (356) and `--all-features` (360, 1 ignored flake) green.
+- New/updated tests: `level_adjusted_filter_bits_decreases_with_depth` (shared
+  curve), `deeper_levels_write_smaller_prefix_filters` (prefix-isolated encoded
+  size: distinct 6-byte prefixes, point filter off, L4 < L2).
+- `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`,
+  `cargo check --benches`, `git diff --check`.
+
+### Remaining Blockers
+
+- None for Phase 3. Phase 4 (user-configurable curve; `BucketOptions` + manifest
+  version) and Phase 5 (cost-weighted remote / dynamic per-guard) remain the
+  committed follow-ups.
+
+### Recommended Next Action
+
+- Layered-filter Phases 1-3 complete. Do Phase 4/5 when a workload needs a
+  tunable curve or a remote/dynamic variant.

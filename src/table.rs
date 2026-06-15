@@ -3730,7 +3730,7 @@ pub(crate) fn write_table_with_backend(
     let (point_key_filter, prefix_filter) = if should_pin_read_metadata(level) {
         (
             build_point_key_filter(options, &point_records, level),
-            build_prefix_filter(options, &point_records),
+            build_prefix_filter(options, &point_records, level),
         )
     } else {
         (None, None)
@@ -3866,7 +3866,7 @@ where
     let (point_key_filter, prefix_filter) = if should_pin_read_metadata(level) {
         (
             build_point_key_filter(options, &point_records, level),
-            build_prefix_filter(options, &point_records),
+            build_prefix_filter(options, &point_records, level),
         )
     } else {
         (None, None)
@@ -4397,6 +4397,7 @@ fn update_largest(current: &mut Option<Vec<u8>>, candidate: Vec<u8>) {
 fn build_prefix_filter(
     options: &TableWriteOptions,
     point_records: &[TablePointRecord],
+    level: TableLevel,
 ) -> Option<PrefixFilter> {
     match options.prefix_filter_policy {
         PrefixFilterPolicy::Disabled => None,
@@ -4405,7 +4406,7 @@ fn build_prefix_filter(
             point_records
                 .iter()
                 .map(|record| record.internal_key.user_key()),
-            bits_per_prefix,
+            level_adjusted_filter_bits(bits_per_prefix, level),
         ),
     }
 }
@@ -4421,29 +4422,31 @@ fn build_point_key_filter(
             point_records
                 .iter()
                 .map(|record| record.internal_key.user_key()),
-            level_adjusted_point_bits_per_key(bits_per_key, level),
+            level_adjusted_filter_bits(bits_per_key, level),
         )),
     }
 }
 
-/// Depth-scaled bits-per-key for layered (Monkey-style) point filter allocation.
+/// Depth-scaled bits per element for layered (Monkey-style) filter allocation,
+/// shared by the point filter (`bits_per_key`) and the prefix filter
+/// (`bits_per_prefix`).
 ///
 /// Pinned shallow levels (L0/L1, see `PINNED_READ_METADATA_MAX_LEVEL`) keep the
 /// configured base so hot, recent data stays accurately filtered. Deeper levels
 /// hold exponentially more keys and dominate filter memory, so they get
-/// progressively fewer bits per key. The result never exceeds the base, so total
-/// filter memory cannot regress versus uniform allocation - important for
+/// progressively fewer bits per element. The result never exceeds the base, so
+/// total filter memory cannot regress versus uniform allocation - important for
 /// memory-constrained embedded use. A deeper false positive costs at most one
 /// extra block-filter / data-block probe, which is the classic Monkey trade of
-/// memory for worst-case lookup cost. The point filter is self-describing
-/// (`PointKeyFilter::from_parts` carries bit and hash counts), so per-level bits
-/// need no storage-format change.
-fn level_adjusted_point_bits_per_key(base: u8, level: TableLevel) -> u8 {
+/// memory for worst-case lookup cost. Both filters are self-describing
+/// (`from_parts` carries bit and hash counts), so per-level bits need no
+/// storage-format change.
+fn level_adjusted_filter_bits(base: u8, level: TableLevel) -> u8 {
     const BITS_PER_LEVEL_STEP: u8 = 2;
-    const MIN_BITS_PER_KEY: u8 = 4;
+    const MIN_FILTER_BITS: u8 = 4;
     let depth = level.get().saturating_sub(PINNED_READ_METADATA_MAX_LEVEL);
     let reduction = BITS_PER_LEVEL_STEP.saturating_mul(u8::try_from(depth).unwrap_or(u8::MAX));
-    let floor = MIN_BITS_PER_KEY.min(base);
+    let floor = MIN_FILTER_BITS.min(base);
     base.saturating_sub(reduction).max(floor)
 }
 
@@ -4476,7 +4479,7 @@ fn build_data_blocks(
             block_start..block_end,
             &restart_indices,
             build_point_key_filter(options, records, level),
-            build_prefix_filter(options, records),
+            build_prefix_filter(options, records, level),
         )?);
         block_start = block_end;
     }
@@ -6748,17 +6751,19 @@ mod tests {
     }
 
     #[test]
-    fn level_adjusted_point_bits_per_key_decreases_with_depth() {
+    fn level_adjusted_filter_bits_decreases_with_depth() {
         // Pinned shallow levels keep the base; deeper levels get progressively
-        // fewer bits, clamped to the floor and never exceeding the base.
-        assert_eq!(level_adjusted_point_bits_per_key(10, TableLevel::ZERO), 10);
-        assert_eq!(level_adjusted_point_bits_per_key(10, TableLevel(1)), 10);
-        assert_eq!(level_adjusted_point_bits_per_key(10, TableLevel(2)), 8);
-        assert_eq!(level_adjusted_point_bits_per_key(10, TableLevel(3)), 6);
-        assert_eq!(level_adjusted_point_bits_per_key(10, TableLevel(4)), 4);
-        assert_eq!(level_adjusted_point_bits_per_key(10, TableLevel(9)), 4);
+        // fewer bits, clamped to the floor and never exceeding the base. The same
+        // curve drives both the point (bits_per_key) and prefix (bits_per_prefix)
+        // filters.
+        assert_eq!(level_adjusted_filter_bits(10, TableLevel::ZERO), 10);
+        assert_eq!(level_adjusted_filter_bits(10, TableLevel(1)), 10);
+        assert_eq!(level_adjusted_filter_bits(10, TableLevel(2)), 8);
+        assert_eq!(level_adjusted_filter_bits(10, TableLevel(3)), 6);
+        assert_eq!(level_adjusted_filter_bits(10, TableLevel(4)), 4);
+        assert_eq!(level_adjusted_filter_bits(10, TableLevel(9)), 4);
         // A small base is never raised above itself (no memory regression).
-        assert_eq!(level_adjusted_point_bits_per_key(3, TableLevel(9)), 3);
+        assert_eq!(level_adjusted_filter_bits(3, TableLevel(9)), 3);
     }
 
     #[test]
@@ -6807,6 +6812,70 @@ mod tests {
         assert!(
             deep.estimated_file_bytes() < shallow.estimated_file_bytes(),
             "deep level should write smaller filters: deep={} shallow={}",
+            deep.estimated_file_bytes(),
+            shallow.estimated_file_bytes()
+        );
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[test]
+    fn deeper_levels_write_smaller_prefix_filters() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-layered-prefix-{}-{}",
+            std::process::id(),
+            table_time_suffix()
+        ));
+        // Distinct 6-byte prefixes so the prefix filter holds many elements and
+        // its per-prefix bit budget is visible in the encoded table size.
+        let records = (0_u64..600)
+            .map(|index| {
+                (
+                    InternalKey::new(
+                        format!("{index:06}---key").into_bytes(),
+                        Sequence::new(index + 1),
+                        ValueKind::Put,
+                        0,
+                    ),
+                    Some(ValueRef::Inline(format!("value-{index:08}").into_bytes())),
+                )
+            })
+            .collect::<Vec<_>>();
+        // Prefix filter only (point filter disabled) isolates the prefix curve.
+        let options = TableWriteOptions {
+            codec: CodecId::None,
+            block_bytes: 1024,
+            filter_policy: FilterPolicy::Disabled,
+            prefix_extractor: PrefixExtractor::FixedLen(6),
+            prefix_filter_policy: PrefixFilterPolicy::Bloom {
+                bits_per_prefix: 10,
+            },
+            blob_threshold_bytes: BucketOptions::DEFAULT_BLOB_THRESHOLD_BYTES,
+            rewrite_blob_indexes: false,
+        };
+
+        let shallow = write_table(
+            &table_path(&root, TableId(2)),
+            TableId(2),
+            TableLevel(2),
+            &options,
+            &records,
+            &[],
+        )
+        .expect("shallow table writes");
+        let deep = write_table(
+            &table_path(&root, TableId(4)),
+            TableId(4),
+            TableLevel(4),
+            &options,
+            &records,
+            &[],
+        )
+        .expect("deep table writes");
+
+        assert!(
+            deep.estimated_file_bytes() < shallow.estimated_file_bytes(),
+            "deep level should write smaller prefix filters: deep={} shallow={}",
             deep.estimated_file_bytes(),
             shallow.estimated_file_bytes()
         );
@@ -7563,7 +7632,7 @@ mod tests {
                 &[],
             ),
             point_key_filter: build_point_key_filter(options, &point_records, TableLevel::ZERO),
-            prefix_filter: build_prefix_filter(options, &point_records),
+            prefix_filter: build_prefix_filter(options, &point_records, TableLevel::ZERO),
             filter_stats: Arc::new(TableFilterStats::default()),
             read_path_stats: Arc::new(TableReadPathStats::default()),
             point_records: Some(point_records),

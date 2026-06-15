@@ -142,8 +142,28 @@ Acceptance gate:
 
 ### Phase 3: Prefix Filter Negative-Lookup Tuning
 
-Goal: tune the independent prefix filter budget for prefix-heavy negative
-lookups.
+Status: Implemented (2026-06-15).
+
+Goal: give the prefix filter the same depth-scaled budget as the point filter so
+deep-level prefix filters cost less memory for prefix-heavy workloads.
+
+Implementation:
+
+- Generalized the Phase 2 curve into `level_adjusted_filter_bits(base, level)`
+  and applied it to the prefix filter `bits_per_prefix` in `build_prefix_filter`
+  (block-level, all levels) and the shallow table-level prefix filter, mirroring
+  the point filter.
+- Prefix filter is self-describing (`PrefixFilter::from_parts`), so no
+  storage-format change. Per-level prefix false positives are already observable
+  via `DbStats::level_filters[*].filters.table_prefix_*`, and prefix filter bytes
+  are included in `filter_resident_bytes`.
+
+Acceptance gate:
+
+- Deep levels write smaller prefix filters at equal records, proven residency-
+  independently by encoded table size (`deeper_levels_write_smaller_prefix_filters`).
+- Curve never exceeds the base (shared curve unit test).
+- Hot shallow levels keep base accuracy.
 
 ### Phase 4: Configurable Curve (Only If Needed)
 

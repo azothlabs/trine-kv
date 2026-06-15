@@ -2,76 +2,61 @@
 
 ## Status
 
-Complete (group commit landed; WAL shard policy is scenario-adaptive `Auto`)
+Complete
 
 ## Goal
 
-Solve the single-key durable-write throughput bottleneck (~500 ops/s, fsync
-floor) with group commit: the WAL lane worker batch-drains queued commits and
-serves the whole batch with one fsync, amortizing fsync cost across concurrent
-(or async-pipelined) writers without weakening the per-confirmed-write
-durability contract.
+Phase 3 of `.phrase/protocol/layered-filter-allocation.md`: give the prefix
+filter the same depth-scaled bits curve as the point filter, so deep-level
+prefix filters cost less memory for prefix-heavy workloads.
 
 ## Design Assessment
 
-The single-threaded synchronous number (~500 ops/s) is the fsync latency floor
-(on macOS the std `sync_data`/`sync_all` use `F_FULLFSYNC`, ~2ms); it is correct
-durability cost, not an architecture bug, and cannot be beaten for a lone
-serial writer. The real lever is throughput under concurrency/pipelining.
-
-The WAL lane worker already had the infrastructure (per-shard worker thread,
-command queue, per-commit completion replies, persist coalescing). What was
-missing: the worker processed one command per `recv()`. Now it blocks for one
-command, drains all immediately-queued commands (`try_recv`), appends every
-frame buffered (no per-frame fsync), issues one fsync at the strongest requested
-durability, and completes every waiter. A buffered append marks the lane dirty
-so a later persist still fsyncs.
-
-Finding: with the default 4 WAL shards, sequence round-robin spreads concurrent
-commits across lanes, and on single-device storage (fsyncs serialize at the
-device) batching cannot engage. So `wal_shard_count` is now configurable; 1 lane
-lets group commit coalesce.
+Symmetric with Phase 2. The Phase 2 point curve was generalized into one shared
+`level_adjusted_filter_bits(base, level)` and applied to the prefix filter
+`bits_per_prefix` in `build_prefix_filter` (block-level at all levels, plus the
+shallow pinned table-level prefix filter). The prefix filter is self-describing,
+so this is a write-time change with no read-path or storage-format impact. Deep
+prefix false positives rise (bounded by the floor); hot shallow levels stay
+fully accurate.
 
 ## Scope
 
-- `process_wal_lane_batch` / batch-drain in `run_wal_lane_worker` (`src/wal.rs`).
-- Configurable `DbOptions::wal_shard_count` (runtime-only; WAL files discovered
-  by name, no manifest/format change). Default kept at 4 pending decision.
-- Concurrent group-commit benchmark (1 vs 4 shards x concurrency).
+- `build_prefix_filter` takes `level` and applies `level_adjusted_filter_bits`.
+- Curve helper renamed/generalized (point + prefix share it).
+- Tests: shared curve unit test; prefix-isolated encoded-size test proving deep
+  prefix filters shrink.
 
 ## Out Of Scope
 
-- Weakening durability (each waiter still returns only after its covering fsync).
-- Changing WAL frame format, replay, torn-tail, or recovery behavior.
-- A commit-delay window for bursty single writers (possible follow-up).
+- Storage-format / `BucketOptions` change (user-configurable curve is Phase 4).
+- Cost-weighted (remote) / dynamic per-guard variants (Phase 5).
 
 ## Acceptance Gate
 
-- Concurrent durable writers amortize fsyncs and exceed the single-writer floor.
-  Met: 1-shard x8 = 4.0 commits/persist, ~1420 ops/s vs ~400 single (3.5x).
-- Durability contract preserved; WAL/recovery/persistent tests pass. Met.
-- Full local gate. Met (one pre-existing background-timing flake, passes in
-  isolation, unrelated to the WAL commit path).
+- Deep levels write smaller prefix filters at equal records (residency-
+  independent via encoded size). Met (`deeper_levels_write_smaller_prefix_filters`).
+- Curve never exceeds base (shared unit test). Met.
+- Full local gate. Met (one pre-existing background-timing flake, isolated pass).
 
 ## Evidence
 
-- `group commit sync-data` benchmark (TRINE_BENCH_RUNS=3):
-  - 1-shard x1: 256 persists / 256 commits, ~400 ops/s (fsync floor).
-  - 1-shard x8: 511 persists / 2048 commits (4.0 commits/fsync), ~1420 ops/s.
-  - 4-shard x8: ~1982 persists / 2048 commits (~1.03, no batching), ~527 ops/s.
-- macOS `F_FULLFSYNC` confirmed as the per-commit cost (`std` sync_data/sync_all).
+- `level_adjusted_filter_bits`: 10,10,8,6,4,4 for L0..L5; base 3 -> 3.
+- `deeper_levels_write_smaller_prefix_filters`: same 600 distinct-prefix records
+  encode strictly smaller at L4 than L2 with point filter disabled (isolates the
+  prefix curve).
+- Per-level prefix FPR observable via `level_filters[*].filters.table_prefix_*`;
+  prefix bytes included in `filter_resident_bytes`.
+- `cargo test --lib` (356) and `--all-features` (360) green; fmt/clippy/diff clean.
 
-## Resolution
+## Known Risks
 
-- `WalShardPolicy::Auto` (default) resolves to 1 lane for the per-commit-fsync
-  durable regime (persistent + SyncData/SyncAll) and a parallel set otherwise, so
-  the durable-write bottleneck is fixed out of the box while batching-irrelevant
-  modes keep parallel lanes. `Fixed(n)` overrides for parallel-flush hardware.
-- "Serialized fsyncs defeat batching" is solved by concentrating writers on one
-  lane, not by merging fsyncs across files (physically impossible: one fsync =
-  one file).
+- Deep prefix FPR rises (~15% at the 4-bit floor); on slow embedded storage a
+  truly-absent deep prefix scan may touch a data block. Base `bits_per_prefix` is
+  the lever; a configurable curve is Phase 4.
 
 ## Next Recommendation
 
-- Optional: bounded commit-delay window to help bursty single writers.
-- Resume the remembered layered-filter Phase 3/4/5 (committed must-do work).
+- Layered-filter Phases 1-3 done. Phase 4 (user-configurable curve; manifest
+  version bump) and Phase 5 (cost-weighted remote / dynamic per-guard) remain the
+  committed must-do follow-ups. Tackle when a workload needs them.
