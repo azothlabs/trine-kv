@@ -13754,3 +13754,45 @@ Negative check:
 
 - Do Phase 5 when an S3/remote backend lands or a workload needs the dynamic
   variant. The static layered-filter work (Phases 1-4) is complete.
+
+## 2026-06-15: Delete/GC Lifecycle Phase 1 (Health Observability)
+
+### Observation
+
+- New protocol `.phrase/protocol/delete-gc-lifecycle.md` (embedded-calibrated
+  from a Codex review: dropped server/DBaaS parts - snapshot TTL/forced-kill,
+  scan replicas, delete SLA, tenant/generation key encoding; kept observability,
+  tombstone-aware compaction, and bulk file drop).
+- Phase 1 adds `ScanWasteMetrics` (mirrors the `blob_reads` Arc plumbing into the
+  lazy scan), counted at the merge chokepoint via a `LazyVisibility` outcome
+  (Visible / HiddenByDelete / NoVisibleVersion). New `DbStats` fields:
+  `scan_internal_records`, `scan_user_keys`, `scan_tombstone_hidden_keys`,
+  `oldest_snapshot_seq`, `oldest_snapshot_lag`.
+- North star = `scan_internal_records / scan_user_keys` (read amplification from
+  obsolete versions + tombstones).
+
+### Interpretation
+
+- Zero behavior/format change; pure measure-first. The ratio + snapshot lag are
+  the signals that will drive Phase 2 (TombstoneDebt trigger) and tell us whether
+  Phase 4 (read-path skip) is worth it.
+
+### Verification
+
+- `cargo test -q --lib` (359) and `--all-features` (363, 1 ignored flake) green.
+- `scan_waste_and_snapshot_lag_metrics_report_gc_health`: version bloat
+  (internal 14 > user 2), 2 delete-hidden keys, snapshot lag > 0 while held and 0
+  after drop.
+- `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`,
+  `cargo check --benches`, `git diff --check`.
+
+### Remaining Blockers
+
+- Per-guard tombstone inventory (static density) not yet exposed; Phase 2 needs it
+  for the trigger. Phase 1 deliberately measured effective read-time waste instead.
+
+### Recommended Next Action
+
+- Phase 2: `CompactionTrigger::TombstoneDebt` on the guard-aware picker, driven by
+  these metrics + per-guard tombstone counts. Then Phase 3 (bulk file drop),
+  Phase 4 (read-path whole-range skip).

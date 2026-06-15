@@ -7,6 +7,19 @@ pub struct DbStats {
     pub live_buckets: usize,
     /// Number of pinned snapshots.
     pub active_snapshots: usize,
+    /// Oldest read sequence still pinned by an active snapshot (or the current
+    /// visible sequence when none are pinned).
+    pub oldest_snapshot_seq: u64,
+    /// Version-debt held by the oldest snapshot: visible sequence minus
+    /// `oldest_snapshot_seq`. Larger values keep more obsolete versions alive.
+    pub oldest_snapshot_lag: u64,
+    /// Internal version records merged by range/prefix scans since open.
+    pub scan_internal_records: u64,
+    /// User keys returned by range/prefix scans since open. The scan
+    /// read-amplification ratio is `scan_internal_records / scan_user_keys`.
+    pub scan_user_keys: u64,
+    /// User-key groups hidden by a point or range delete during scans.
+    pub scan_tombstone_hidden_keys: u64,
     /// Approximate bytes held by active memtables.
     pub memtable_bytes: u64,
     /// Number of immutable memtables waiting for flush.
@@ -459,6 +472,61 @@ impl BlobReadMetrics {
             self.bytes.load(Ordering::Acquire),
         )
     }
+}
+
+/// Range/prefix scan GC-waste counters: how many internal version records the
+/// merge had to handle relative to the user keys it returned, and how many
+/// user-key groups were hidden by a delete. The north-star read-amplification
+/// ratio is `internal_records / user_keys`.
+#[derive(Debug, Default)]
+pub(crate) struct ScanWasteMetrics {
+    internal_records: AtomicU64,
+    user_keys: AtomicU64,
+    tombstone_hidden_keys: AtomicU64,
+}
+
+impl ScanWasteMetrics {
+    /// Records one resolved user-key version group: `group_records` versions
+    /// merged, and the outcome (a visible row, a delete-hidden row, or nothing).
+    pub(crate) fn record_group(&self, group_records: u64, outcome: ScanGroupOutcome) {
+        self.internal_records
+            .fetch_add(group_records, Ordering::Relaxed);
+        match outcome {
+            ScanGroupOutcome::Visible => {
+                self.user_keys.fetch_add(1, Ordering::Relaxed);
+            }
+            ScanGroupOutcome::HiddenByDelete => {
+                self.tombstone_hidden_keys.fetch_add(1, Ordering::Relaxed);
+            }
+            ScanGroupOutcome::NoVisibleVersion => {}
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> ScanWasteSnapshot {
+        ScanWasteSnapshot {
+            internal_records: self.internal_records.load(Ordering::Acquire),
+            user_keys: self.user_keys.load(Ordering::Acquire),
+            tombstone_hidden_keys: self.tombstone_hidden_keys.load(Ordering::Acquire),
+        }
+    }
+}
+
+/// Outcome of resolving one user-key version group during a scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanGroupOutcome {
+    /// A visible row was returned for the user key.
+    Visible,
+    /// The user key existed but was hidden by a point or range delete.
+    HiddenByDelete,
+    /// No version of the user key was visible to the read sequence.
+    NoVisibleVersion,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ScanWasteSnapshot {
+    pub(crate) internal_records: u64,
+    pub(crate) user_keys: u64,
+    pub(crate) tombstone_hidden_keys: u64,
 }
 
 /// Table count and byte size for one LSM level.

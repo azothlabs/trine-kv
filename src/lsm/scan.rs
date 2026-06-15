@@ -324,6 +324,7 @@ mod tests {
                 db_path: None,
                 native_storage: None,
                 blob_reads: None,
+                scan_waste: None,
                 range_tombstones: scan.range_tombstones,
                 sources: scan.sources,
             },

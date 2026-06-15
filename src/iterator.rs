@@ -11,7 +11,7 @@ use crate::{
     memtable::Memtable,
     range_tombstone::{RangeTombstoneIndex, RangeTombstoneLike},
     snapshot::Snapshot,
-    stats::BlobReadMetrics,
+    stats::{BlobReadMetrics, ScanGroupOutcome, ScanWasteMetrics},
     storage::NativeFileBackend,
     table::TablePointCursor,
     types::{KeyRange, KeyValue, Sequence, Value},
@@ -82,6 +82,7 @@ pub(crate) struct ScanSourceInput {
     pub(crate) db_path: Option<PathBuf>,
     pub(crate) native_storage: Option<NativeFileBackend>,
     pub(crate) blob_reads: Option<Arc<BlobReadMetrics>>,
+    pub(crate) scan_waste: Option<Arc<ScanWasteMetrics>>,
     pub(crate) range_tombstones: Vec<ScanRangeTombstone>,
     pub(crate) sources: Vec<RecordSource>,
 }
@@ -116,6 +117,7 @@ impl Iter {
                 db_path: input.db_path,
                 native_storage: input.native_storage,
                 blob_reads: input.blob_reads,
+                scan_waste: input.scan_waste,
                 range_tombstones: RangeTombstoneIndex::new(input.range_tombstones),
                 sources: input.sources,
                 source_heap: BinaryHeap::new(),
@@ -142,6 +144,7 @@ impl LazyIter {
                 db_path: input.db_path,
                 native_storage: input.native_storage,
                 blob_reads: input.blob_reads,
+                scan_waste: input.scan_waste,
                 range_tombstones: RangeTombstoneIndex::new(input.range_tombstones),
                 sources: input.sources,
                 source_heap: BinaryHeap::new(),
@@ -355,6 +358,7 @@ struct LazyScan {
     db_path: Option<PathBuf>,
     native_storage: Option<NativeFileBackend>,
     blob_reads: Option<Arc<BlobReadMetrics>>,
+    scan_waste: Option<Arc<ScanWasteMetrics>>,
     range_tombstones: RangeTombstoneIndex<ScanRangeTombstone>,
     sources: Vec<RecordSource>,
     source_heap: BinaryHeap<SourceHeapEntry>,
@@ -517,20 +521,27 @@ impl LazyScan {
         first_record: ScanRecord,
         mut rest_records: Vec<ScanRecord>,
     ) -> Result<Option<LazyKeyValue>> {
-        if rest_records.is_empty() {
-            return self.visible_lazy_item_from_sorted_records(std::iter::once(first_record));
+        // The merge handled this many version records for one user key; the ratio
+        // of these to returned user keys is the scan read-amplification signal.
+        let group_records = 1 + rest_records.len();
+        let visibility = if rest_records.is_empty() {
+            self.visible_lazy_item_from_sorted_records(std::iter::once(first_record))?
+        } else {
+            rest_records.push(first_record);
+            rest_records.sort_by(|left, right| left.0.cmp(&right.0));
+            self.visible_lazy_item_from_sorted_records(rest_records)?
+        };
+
+        if let Some(scan_waste) = &self.scan_waste {
+            scan_waste.record_group(group_records as u64, visibility.outcome());
         }
-
-        rest_records.push(first_record);
-        rest_records.sort_by(|left, right| left.0.cmp(&right.0));
-
-        self.visible_lazy_item_from_sorted_records(rest_records)
+        Ok(visibility.into_item())
     }
 
     fn visible_lazy_item_from_sorted_records(
         &self,
         records: impl IntoIterator<Item = ScanRecord>,
-    ) -> Result<Option<LazyKeyValue>> {
+    ) -> Result<LazyVisibility> {
         for (internal_key, value) in records {
             if internal_key.sequence() > self.read_sequence {
                 continue;
@@ -545,7 +556,7 @@ impl LazyScan {
                         internal_key.batch_index(),
                         self.read_sequence,
                     ) {
-                        return Ok(None);
+                        return Ok(LazyVisibility::HiddenByDelete);
                     }
 
                     let key = internal_key.user_key().to_vec();
@@ -557,14 +568,38 @@ impl LazyScan {
                         self.blob_reads.clone(),
                         Arc::clone(&self.read_pin),
                     )?;
-                    return Ok(Some(LazyKeyValue { key, value }));
+                    return Ok(LazyVisibility::Visible(LazyKeyValue { key, value }));
                 }
-                ValueKind::PointDelete => return Ok(None),
+                ValueKind::PointDelete => return Ok(LazyVisibility::HiddenByDelete),
                 ValueKind::RangeDelete => {}
             }
         }
 
-        Ok(None)
+        Ok(LazyVisibility::NoVisibleVersion)
+    }
+}
+
+/// Outcome of resolving one user-key version group during a lazy scan.
+enum LazyVisibility {
+    Visible(LazyKeyValue),
+    HiddenByDelete,
+    NoVisibleVersion,
+}
+
+impl LazyVisibility {
+    fn outcome(&self) -> ScanGroupOutcome {
+        match self {
+            Self::Visible(_) => ScanGroupOutcome::Visible,
+            Self::HiddenByDelete => ScanGroupOutcome::HiddenByDelete,
+            Self::NoVisibleVersion => ScanGroupOutcome::NoVisibleVersion,
+        }
+    }
+
+    fn into_item(self) -> Option<LazyKeyValue> {
+        match self {
+            Self::Visible(item) => Some(item),
+            Self::HiddenByDelete | Self::NoVisibleVersion => None,
+        }
     }
 }
 
@@ -1138,6 +1173,7 @@ mod tests {
                 db_path: None,
                 native_storage: None,
                 blob_reads: None,
+                scan_waste: None,
                 range_tombstones: Vec::new(),
                 sources: vec![
                     RecordSource::memtable(
@@ -1166,6 +1202,7 @@ mod tests {
                 db_path: None,
                 native_storage: None,
                 blob_reads: None,
+                scan_waste: None,
                 range_tombstones: Vec::new(),
                 sources: vec![
                     RecordSource::memtable(

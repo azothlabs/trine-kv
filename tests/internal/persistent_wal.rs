@@ -2250,6 +2250,73 @@ fn point_read_table_probes(db: &Db, bucket: &trine_kv::Bucket) -> u64 {
 }
 
 #[test]
+fn scan_waste_and_snapshot_lag_metrics_report_gc_health() {
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
+    let bucket = db.default_bucket_sync().expect("bucket opens");
+
+    // Version bloat: three versions of four keys.
+    for round in 0..3_u32 {
+        for k in 0..4_u32 {
+            bucket
+                .put_sync(
+                    format!("k{k}").into_bytes(),
+                    format!("v{round}-{k}").into_bytes(),
+                )
+                .expect("put version");
+        }
+    }
+    // Two keys hidden by a point delete.
+    bucket.delete_sync(b"k0".to_vec()).expect("delete k0");
+    bucket.delete_sync(b"k1".to_vec()).expect("delete k1");
+
+    // Drain a full range scan.
+    let mut returned = 0_u64;
+    let mut iter = bucket.range_sync(&KeyRange::all()).expect("range scan opens");
+    while let Some(row) = iter.next_sync() {
+        row.expect("scan row");
+        returned += 1;
+    }
+    drop(iter);
+
+    let stats = db.stats();
+    assert_eq!(returned, 2, "only k2 and k3 remain live");
+    assert_eq!(stats.scan_user_keys, returned);
+    assert!(
+        stats.scan_internal_records > stats.scan_user_keys,
+        "version bloat: internal {} should exceed user {}",
+        stats.scan_internal_records,
+        stats.scan_user_keys
+    );
+    assert!(
+        stats.scan_tombstone_hidden_keys >= 2,
+        "k0 and k1 are delete-hidden: {}",
+        stats.scan_tombstone_hidden_keys
+    );
+
+    // Snapshot version-debt: holding a snapshot pins old versions.
+    assert_eq!(db.stats().oldest_snapshot_lag, 0);
+    let snapshot = db.snapshot();
+    for k in 0..4_u32 {
+        bucket
+            .put_sync(format!("k{k}").into_bytes(), b"newer".to_vec())
+            .expect("put after snapshot");
+    }
+    let during = db.stats();
+    assert_eq!(during.active_snapshots, 1);
+    assert!(
+        during.oldest_snapshot_lag > 0,
+        "held snapshot should hold version debt: {}",
+        during.oldest_snapshot_lag
+    );
+    drop(snapshot);
+    assert_eq!(
+        db.stats().oldest_snapshot_lag,
+        0,
+        "dropping the snapshot clears version debt"
+    );
+}
+
+#[test]
 fn persistent_level_filter_stats_aggregate_by_level() {
     let path = temp_db_path("level-filter-stats");
     let mut options = DbOptions::persistent(&path);

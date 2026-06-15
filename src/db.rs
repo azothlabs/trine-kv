@@ -37,7 +37,7 @@ use crate::{
     stats::{
         BlobReadMetrics, CompactionLevelStats, CompactionSkip, CompactionSkipStats,
         CompactionTrigger, CompactionTriggerStats, DbStats, FilterStats, LevelFilterStats,
-        LevelStats,
+        LevelStats, ScanWasteMetrics,
     },
     storage::{
         BlockingStorageDirectoryCreateBackend, BlockingStorageDirectoryListBackend,
@@ -247,6 +247,7 @@ pub(crate) struct DbInner {
     blob_gc_output_bytes: AtomicU64,
     blob_gc_discarded_bytes: AtomicU64,
     blob_reads: Arc<BlobReadMetrics>,
+    scan_waste: Arc<ScanWasteMetrics>,
     maintenance_cooperative_yields: AtomicU64,
     maintenance_budget_exhaustions: AtomicU64,
     native_storage: NativeFileBackend,
@@ -1164,6 +1165,7 @@ impl Db {
                 blob_gc_output_bytes: AtomicU64::new(0),
                 blob_gc_discarded_bytes: AtomicU64::new(0),
                 blob_reads: Arc::new(BlobReadMetrics::default()),
+                scan_waste: Arc::new(ScanWasteMetrics::default()),
                 maintenance_cooperative_yields: AtomicU64::new(0),
                 maintenance_budget_exhaustions: AtomicU64::new(0),
                 native_storage: NativeFileBackend::new(),
@@ -1302,6 +1304,7 @@ impl Db {
                 blob_gc_output_bytes: AtomicU64::new(0),
                 blob_gc_discarded_bytes: AtomicU64::new(0),
                 blob_reads: Arc::new(BlobReadMetrics::default()),
+                scan_waste: Arc::new(ScanWasteMetrics::default()),
                 maintenance_cooperative_yields: AtomicU64::new(0),
                 maintenance_budget_exhaustions: AtomicU64::new(0),
                 native_storage: NativeFileBackend::new(),
@@ -1409,6 +1412,7 @@ impl Db {
                 blob_gc_output_bytes: AtomicU64::new(0),
                 blob_gc_discarded_bytes: AtomicU64::new(0),
                 blob_reads: Arc::new(BlobReadMetrics::default()),
+                scan_waste: Arc::new(ScanWasteMetrics::default()),
                 maintenance_cooperative_yields: AtomicU64::new(0),
                 maintenance_budget_exhaustions: AtomicU64::new(0),
                 native_storage: NativeFileBackend::new(),
@@ -1677,6 +1681,7 @@ impl Db {
                 blob_gc_output_bytes: AtomicU64::new(0),
                 blob_gc_discarded_bytes: AtomicU64::new(0),
                 blob_reads: Arc::new(BlobReadMetrics::default()),
+                scan_waste: Arc::new(ScanWasteMetrics::default()),
                 maintenance_cooperative_yields: AtomicU64::new(0),
                 maintenance_budget_exhaustions: AtomicU64::new(0),
                 native_storage,
@@ -3620,6 +3625,7 @@ impl Db {
         let (blob_read_count, blob_read_bytes) = self.inner.blob_reads.snapshot();
         stats.blob_read_count = blob_read_count;
         stats.blob_read_bytes = blob_read_bytes;
+        self.add_scan_and_snapshot_health_stats(&mut stats);
         self.add_compaction_level_stats(&mut stats);
         self.add_compaction_trigger_stats(&mut stats);
         self.add_compaction_skip_stats(&mut stats);
@@ -3756,6 +3762,19 @@ impl Db {
         if let Ok(compaction_triggers) = self.inner.compaction_trigger_stats.lock() {
             stats.compaction_triggers = compaction_triggers.values().cloned().collect();
         }
+    }
+
+    fn add_scan_and_snapshot_health_stats(&self, stats: &mut DbStats) {
+        let scan_waste = self.inner.scan_waste.snapshot();
+        stats.scan_internal_records = scan_waste.internal_records;
+        stats.scan_user_keys = scan_waste.user_keys;
+        stats.scan_tombstone_hidden_keys = scan_waste.tombstone_hidden_keys;
+        let visible = self.inner.commit_tracker.visible_sequence();
+        // Pure oldest active snapshot (falls back to the visible sequence when no
+        // snapshot is pinned), distinct from the keep-last-versions floor.
+        let oldest_snapshot = self.inner.snapshots.oldest_active_or(visible).min(visible);
+        stats.oldest_snapshot_seq = oldest_snapshot.get();
+        stats.oldest_snapshot_lag = visible.get().saturating_sub(oldest_snapshot.get());
     }
 
     fn add_compaction_skip_stats(&self, stats: &mut DbStats) {
@@ -4337,6 +4356,7 @@ impl Db {
                 db_path,
                 native_storage,
                 blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
+                scan_waste: Some(Arc::clone(&self.inner.scan_waste)),
                 range_tombstones: scan.range_tombstones,
                 sources: scan.sources,
             },
@@ -4374,6 +4394,7 @@ impl Db {
                 db_path,
                 native_storage,
                 blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
+                scan_waste: Some(Arc::clone(&self.inner.scan_waste)),
                 range_tombstones: scan.range_tombstones,
                 sources: scan.sources,
             },
@@ -4409,6 +4430,7 @@ impl Db {
                 db_path,
                 native_storage,
                 blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
+                scan_waste: Some(Arc::clone(&self.inner.scan_waste)),
                 range_tombstones: scan.range_tombstones,
                 sources: scan.sources,
             },
@@ -4446,6 +4468,7 @@ impl Db {
                 db_path,
                 native_storage,
                 blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
+                scan_waste: Some(Arc::clone(&self.inner.scan_waste)),
                 range_tombstones: scan.range_tombstones,
                 sources: scan.sources,
             },
@@ -4481,6 +4504,7 @@ impl Db {
                 db_path,
                 native_storage,
                 blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
+                scan_waste: Some(Arc::clone(&self.inner.scan_waste)),
                 range_tombstones: scan.range_tombstones,
                 sources: scan.sources,
             },
@@ -4518,6 +4542,7 @@ impl Db {
                 db_path,
                 native_storage,
                 blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
+                scan_waste: Some(Arc::clone(&self.inner.scan_waste)),
                 range_tombstones: scan.range_tombstones,
                 sources: scan.sources,
             },
@@ -4553,6 +4578,7 @@ impl Db {
                 db_path,
                 native_storage,
                 blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
+                scan_waste: Some(Arc::clone(&self.inner.scan_waste)),
                 range_tombstones: scan.range_tombstones,
                 sources: scan.sources,
             },
@@ -4590,6 +4616,7 @@ impl Db {
                 db_path,
                 native_storage,
                 blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
+                scan_waste: Some(Arc::clone(&self.inner.scan_waste)),
                 range_tombstones: scan.range_tombstones,
                 sources: scan.sources,
             },
