@@ -1841,60 +1841,69 @@ impl Db {
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
-        match &self.inner.options.storage_mode {
-            StorageMode::InMemory => {
-                let removed = self
-                    .inner
-                    .buckets
-                    .write()
-                    .map_err(|_| lock_poisoned("bucket registry"))?
-                    .remove(name.as_str());
-                if removed.is_none() {
-                    return Err(Error::invalid_options(
-                        "cannot drop a bucket that does not exist",
-                    ));
-                }
+        if matches!(self.inner.options.storage_mode, StorageMode::InMemory) {
+            let removed = self
+                .inner
+                .buckets
+                .write()
+                .map_err(|_| lock_poisoned("bucket registry"))?
+                .remove(name.as_str());
+            return if removed.is_none() {
+                Err(Error::invalid_options(
+                    "cannot drop a bucket that does not exist",
+                ))
+            } else {
                 Ok(())
-            }
-            StorageMode::Persistent { path } => {
-                let path = path.clone();
-                // Flush first so the bucket has no unflushed WAL records that
-                // recovery would replay into a now-missing bucket (this also
-                // advances the WAL replay floor past them).
-                self.flush_sync()?;
-                let removed = self
-                    .inner
-                    .buckets
-                    .write()
-                    .map_err(|_| lock_poisoned("bucket registry"))?
-                    .remove(name.as_str());
-                let Some(tree) = removed else {
-                    return Err(Error::invalid_options(
-                        "cannot drop a bucket that does not exist",
-                    ));
-                };
-                let tables = tree.tables_snapshot()?;
-                let blob_ids: Vec<u64> = tables
-                    .iter()
-                    .flat_map(|table| table.blob_file_ids())
-                    .collect();
-                let sequence = self.last_committed_sequence();
-                if let Some(manifest) = &self.inner.manifest {
-                    manifest
-                        .lock()
-                        .map_err(|_| lock_poisoned("manifest store"))?
-                        .drop_bucket(name.as_str(), blob_ids, sequence)?;
-                }
-                // Retire the bucket's table files (deferred while readers hold a
-                // reference) and its now-orphaned blob files.
-                self.retire_obsolete_table_files(&path, tables)?;
-                self.cleanup_pending_obsolete_blob_files(&path)?;
-                Ok(())
-            }
-            StorageMode::HostPersistent { .. } => Err(Error::unsupported_backend(
-                "dropping a bucket is not supported on this backend",
-            )),
+            };
         }
+        // A native filesystem path: the local-disk `Persistent` backend, and the
+        // WASI backend (which is the same native file machinery over a WASI
+        // preopened path). Both reclaim files the same way; object-store has its
+        // own async path ([`Db::drop_bucket`]) and other host backends are not
+        // supported here.
+        let native_path = match &self.inner.options.storage_mode {
+            StorageMode::Persistent { path }
+            | StorageMode::HostPersistent {
+                backend: HostStorageBackend::Wasi { path },
+            } => path.clone(),
+            _ => {
+                return Err(Error::unsupported_backend(
+                    "dropping a bucket is not supported on this backend",
+                ));
+            }
+        };
+        // Flush first so the bucket has no unflushed WAL records that recovery
+        // would replay into a now-missing bucket (this also advances the WAL
+        // replay floor past them).
+        self.flush_sync()?;
+        let removed = self
+            .inner
+            .buckets
+            .write()
+            .map_err(|_| lock_poisoned("bucket registry"))?
+            .remove(name.as_str());
+        let Some(tree) = removed else {
+            return Err(Error::invalid_options(
+                "cannot drop a bucket that does not exist",
+            ));
+        };
+        let tables = tree.tables_snapshot()?;
+        let blob_ids: Vec<u64> = tables
+            .iter()
+            .flat_map(|table| table.blob_file_ids())
+            .collect();
+        let sequence = self.last_committed_sequence();
+        if let Some(manifest) = &self.inner.manifest {
+            manifest
+                .lock()
+                .map_err(|_| lock_poisoned("manifest store"))?
+                .drop_bucket(name.as_str(), blob_ids, sequence)?;
+        }
+        // Retire the bucket's table files (deferred while readers hold a
+        // reference) and its now-orphaned blob files.
+        self.retire_obsolete_table_files(&native_path, tables)?;
+        self.cleanup_pending_obsolete_blob_files(&native_path)?;
+        Ok(())
     }
 
     /// Drops a named bucket, reclaiming its storage — the async form that also
@@ -1919,24 +1928,80 @@ impl Db {
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
-        if !self.inner.options.storage_mode.is_object_store_persistent() {
-            // In-memory / native: the synchronous path is correct from here.
-            return self.drop_bucket_sync(name);
+        if self.inner.options.storage_mode.is_object_store_persistent() {
+            // Object store: remove the bucket from the manifest via CAS; its table
+            // and blob objects are now unreferenced and reclaimed by orphan GC.
+            let (mut object, _serialize) = self.checkout_object_manifest().await?;
+            object.drop_bucket(name.as_str().to_owned()).await?;
+            self.install_object_manifest(object)?;
+            self.inner
+                .buckets
+                .write()
+                .map_err(|_| lock_poisoned("bucket registry"))?
+                .remove(name.as_str());
+            // Reclaim the now-orphaned objects (best effort: the bucket is already
+            // logically dropped; periodic orphan GC also collects them).
+            let _ = self.cleanup_object_store_orphans_async().await;
+            return Ok(());
         }
-        // Object store: remove the bucket from the manifest via CAS; its table and
-        // blob objects are now unreferenced and reclaimed by orphan GC.
-        let (mut object, _serialize) = self.checkout_object_manifest().await?;
-        object.drop_bucket(name.as_str().to_owned()).await?;
-        self.install_object_manifest(object)?;
-        self.inner
-            .buckets
-            .write()
-            .map_err(|_| lock_poisoned("bucket registry"))?
-            .remove(name.as_str());
-        // Reclaim the now-orphaned objects (best effort: the bucket is already
-        // logically dropped; periodic orphan GC also collects them).
-        let _ = self.cleanup_object_store_orphans_async().await;
-        Ok(())
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        if self.inner.options.storage_mode.is_browser_persistent() {
+            // Browser: publish the bucket removal to the IndexedDB-backed manifest
+            // (marking its blobs for deletion), then retire its table and blob
+            // files through the browser async cleanup.
+            let tree = self
+                .inner
+                .buckets
+                .read()
+                .map_err(|_| lock_poisoned("bucket registry"))?
+                .get(name.as_str())
+                .cloned();
+            let Some(tree) = tree else {
+                return Err(Error::invalid_options(
+                    "cannot drop a bucket that does not exist",
+                ));
+            };
+            let tables = tree.tables_snapshot()?;
+            let blob_ids: Vec<u64> = tables
+                .iter()
+                .flat_map(|table| table.blob_file_ids())
+                .collect();
+            let sequence = self.last_committed_sequence();
+            let _publish = self.inner.browser_manifest_async_lock.lock().await;
+            let manifest = self
+                .inner
+                .manifest
+                .as_ref()
+                .ok_or_else(|| Error::Corruption {
+                    message: "browser persistent database is missing manifest store".to_owned(),
+                })?;
+            let prepared = {
+                manifest
+                    .lock()
+                    .map_err(|_| lock_poisoned("manifest store"))?
+                    .prepare_drop_bucket_publish(name.as_str(), blob_ids, sequence)?
+            };
+            if let Some(prepared) = prepared {
+                prepared.publish_async().await?;
+                manifest
+                    .lock()
+                    .map_err(|_| lock_poisoned("manifest store"))?
+                    .install_prepared_publish(prepared)?;
+            }
+            self.inner
+                .buckets
+                .write()
+                .map_err(|_| lock_poisoned("bucket registry"))?
+                .remove(name.as_str());
+            let db_path = std::path::Path::new("");
+            self.retire_obsolete_table_files_browser_async(db_path, tables)
+                .await?;
+            self.cleanup_pending_obsolete_blob_files_browser_async(db_path)
+                .await?;
+            return Ok(());
+        }
+        // In-memory / native / WASI: the synchronous path is correct from here.
+        self.drop_bucket_sync(name)
     }
 
     async fn bucket_with_options_object_store_async(

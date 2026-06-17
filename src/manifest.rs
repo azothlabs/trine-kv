@@ -752,6 +752,35 @@ impl ManifestStore {
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    pub(crate) fn prepare_drop_bucket_publish(
+        &self,
+        name: &str,
+        pending_blob_deletions: Vec<u64>,
+        pending_deletion_sequence: Sequence,
+    ) -> Result<Option<PreparedManifestPublish>> {
+        if !self.state.buckets.contains_key(name) {
+            return Err(Error::invalid_options(
+                "cannot drop a bucket that does not exist",
+            ));
+        }
+        let mut next_state = self.state.clone();
+        next_state.buckets.remove(name);
+        next_state.tables.remove(name);
+        for file_id in pending_blob_deletions {
+            next_state
+                .pending_blob_deletions
+                .entry(file_id)
+                .or_insert(pending_deletion_sequence);
+        }
+        Ok(Some(PreparedManifestPublish {
+            path: self.path.clone(),
+            storage: self.storage.clone(),
+            base_state: self.state.clone(),
+            next_state,
+        }))
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     pub(crate) fn prepare_create_checkpoint_publish(
         &self,
         name: String,
