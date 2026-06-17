@@ -26,10 +26,13 @@
 //! and aggressive retention, with no manual retention configuration, until
 //! [`Db::delete_branch`] releases the pin.
 //!
-//! Scope: branches are single-level (forked from the database's own lineage; a
-//! branch of a branch is a later slice). [`Db::delete_branch`] releases a
-//! branch's fork pin and forgets it, but its data buckets are reclaimed only
-//! once a bucket-drop primitive exists (a later slice).
+//! Branches nest: [`Db::create_branch_from`] forks a branch off another branch,
+//! and a read walks the whole ancestor chain (branch → parent branch → … → root),
+//! each ancestor seen frozen at the version its child forked it. This is the
+//! git-style DAG. [`Db::delete_branch`] releases a branch's fork pin and forgets
+//! it; it refuses while the branch still has children (they read through it), and
+//! its data buckets are reclaimed only once a bucket-drop primitive exists (a
+//! later slice).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
@@ -55,12 +58,21 @@ fn data_bucket(branch: &str, user_bucket: &str) -> String {
     format!("{RESERVED}{branch}{SEP}{user_bucket}")
 }
 
-/// A durable branch's persisted metadata: where it forked and which user buckets
-/// it has written (so a read need not touch — or create — a data bucket the
-/// branch has never written, and so the parent is consulted directly there).
+/// A durable branch's persisted metadata: where it forked, the parent branch it
+/// forked from (`None` = the root lineage), and which user buckets it has written
+/// (so a read need not touch — or create — a data bucket the branch never wrote).
 struct RegistryEntry {
+    /// The global version this branch forked its parent at.
     fork: ReadVersion,
+    /// The parent branch name, or `None` when forked from the root lineage.
+    parent: Option<String>,
     written_buckets: BTreeSet<String>,
+}
+
+fn put_str(out: &mut Vec<u8>, value: &str) {
+    let len = u32::try_from(value.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(value.as_bytes());
 }
 
 impl RegistryEntry {
@@ -70,9 +82,16 @@ impl RegistryEntry {
         let count = u32::try_from(self.written_buckets.len()).unwrap_or(u32::MAX);
         out.extend_from_slice(&count.to_le_bytes());
         for bucket in &self.written_buckets {
-            let len = u32::try_from(bucket.len()).unwrap_or(u32::MAX);
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(bucket.as_bytes());
+            put_str(&mut out, bucket);
+        }
+        // Parent is a trailing optional field (a flag byte then the name) so an
+        // entry written before nesting existed still decodes (parent = None).
+        match &self.parent {
+            Some(parent) => {
+                out.push(1);
+                put_str(&mut out, parent);
+            }
+            None => out.push(0),
         }
         out
     }
@@ -81,31 +100,41 @@ impl RegistryEntry {
         let corrupt = || Error::Corruption {
             message: "malformed branch registry entry".to_owned(),
         };
-        let fork_bytes: [u8; 8] = bytes.get(0..8).ok_or_else(corrupt)?.try_into().expect("8");
-        let fork = ReadVersion::from_u64(u64::from_le_bytes(fork_bytes));
-        let mut pos = 8;
-        let count_bytes: [u8; 4] = bytes
-            .get(pos..pos + 4)
-            .ok_or_else(corrupt)?
-            .try_into()
-            .expect("4");
-        let count = u32::from_le_bytes(count_bytes);
-        pos += 4;
-        let mut written_buckets = BTreeSet::new();
-        for _ in 0..count {
-            let len_bytes: [u8; 4] = bytes
-                .get(pos..pos + 4)
+        let mut pos = 0usize;
+        let take_u32 = |pos: &mut usize| -> Result<u32> {
+            let raw: [u8; 4] = bytes
+                .get(*pos..*pos + 4)
                 .ok_or_else(corrupt)?
                 .try_into()
                 .expect("4");
-            let len = u32::from_le_bytes(len_bytes) as usize;
-            pos += 4;
+            *pos += 4;
+            Ok(u32::from_le_bytes(raw))
+        };
+        let fork_bytes: [u8; 8] = bytes.get(0..8).ok_or_else(corrupt)?.try_into().expect("8");
+        let fork = ReadVersion::from_u64(u64::from_le_bytes(fork_bytes));
+        pos += 8;
+        let count = take_u32(&mut pos)?;
+        let mut written_buckets = BTreeSet::new();
+        for _ in 0..count {
+            let len = take_u32(&mut pos)? as usize;
             let name = bytes.get(pos..pos + len).ok_or_else(corrupt)?;
             pos += len;
             written_buckets.insert(String::from_utf8(name.to_vec()).map_err(|_| corrupt())?);
         }
+        // Trailing optional parent (absent in pre-nesting entries).
+        let parent = match bytes.get(pos) {
+            None | Some(&0) => None,
+            Some(&1) => {
+                pos += 1;
+                let len = take_u32(&mut pos)? as usize;
+                let name = bytes.get(pos..pos + len).ok_or_else(corrupt)?;
+                Some(String::from_utf8(name.to_vec()).map_err(|_| corrupt())?)
+            }
+            Some(_) => return Err(corrupt()),
+        };
         Ok(Self {
             fork,
+            parent,
             written_buckets,
         })
     }
@@ -131,15 +160,34 @@ enum OverlayWrite {
     Delete,
 }
 
+/// One level of a durable branch's read chain. The leaf (the opened branch
+/// itself) reads its own latest writes (`at = None`); each ancestor is read
+/// frozen at the version the child forked it (`at = Some`). `written` is that
+/// branch's set of diverged user buckets, so untouched buckets are skipped
+/// without opening (or creating) a data bucket.
+struct DurableLayer {
+    name: String,
+    written: BTreeSet<String>,
+    at: Option<Snapshot>,
+}
+
+/// A durable branch's read chain (leaf first, then each ancestor branch), plus
+/// the leaf's own registry fields — needed to rewrite its entry when it first
+/// writes a user bucket. The root fall-through below the chain is the branch's
+/// pinned [`Branch::fork`] snapshot.
+struct DurableState {
+    chain: Vec<DurableLayer>,
+    leaf_fork: ReadVersion,
+    leaf_parent: Option<String>,
+}
+
 /// How a branch stores its divergent writes.
 enum Backing {
     /// In-memory, lost with the handle (ephemeral clone / `AS OF` view).
     Ephemeral(HashMap<(BucketName, Vec<u8>), OverlayWrite>),
-    /// Persisted in the branch's own buckets (durable named branch).
-    Durable {
-        name: String,
-        written_buckets: BTreeSet<String>,
-    },
+    /// Persisted in the branch's own buckets (durable named branch), as a read
+    /// chain from the branch up through its ancestor branches.
+    Durable(DurableState),
 }
 
 /// A copy-on-write branch forked from a parent database at a fixed
@@ -160,19 +208,11 @@ impl<'db> Branch<'db> {
         }
     }
 
-    fn durable(
-        db: &'db Db,
-        fork: Snapshot,
-        name: String,
-        written_buckets: BTreeSet<String>,
-    ) -> Self {
+    fn durable(db: &'db Db, fork: Snapshot, state: DurableState) -> Self {
         Self {
             db,
             fork,
-            backing: Backing::Durable {
-                name,
-                written_buckets,
-            },
+            backing: Backing::Durable(state),
         }
     }
 
@@ -187,7 +227,7 @@ impl<'db> Branch<'db> {
     /// only in memory (ephemeral clone).
     #[must_use]
     pub const fn is_durable(&self) -> bool {
-        matches!(self.backing, Backing::Durable { .. })
+        matches!(self.backing, Backing::Durable(_))
     }
 
     /// Reads a key on the branch: the branch's own write if it has one, otherwise
@@ -204,13 +244,22 @@ impl<'db> Branch<'db> {
                 Some(OverlayWrite::Delete) => return Ok(None),
                 None => {}
             },
-            Backing::Durable {
-                name,
-                written_buckets,
-            } => {
-                if written_buckets.contains(bucket.as_str()) {
-                    let data = self.db.bucket_sync(data_bucket(name, bucket.as_str()))?;
-                    if let Some(raw) = data.get_sync(key)? {
+            Backing::Durable(state) => {
+                // Walk the chain leaf-first: the first level that holds the key
+                // (a present value or a tombstone) is definitive; otherwise fall
+                // through to the next ancestor, and finally to the root snapshot.
+                for layer in &state.chain {
+                    if !layer.written.contains(bucket.as_str()) {
+                        continue;
+                    }
+                    let data = self
+                        .db
+                        .bucket_sync(data_bucket(&layer.name, bucket.as_str()))?;
+                    let raw = match &layer.at {
+                        None => data.get_sync(key)?,
+                        Some(at) => data.get_at_sync(at, key)?,
+                    };
+                    if let Some(raw) = raw {
                         return Ok(decode_branch_value(&raw));
                     }
                 }
@@ -252,29 +301,33 @@ impl<'db> Branch<'db> {
     }
 
     fn write(&mut self, bucket: BucketName, key: Vec<u8>, write: OverlayWrite) -> Result<()> {
+        let db = self.db;
         match &mut self.backing {
             Backing::Ephemeral(overlay) => {
                 overlay.insert((bucket, key), write);
                 Ok(())
             }
-            Backing::Durable {
-                name,
-                written_buckets,
-            } => {
-                let data = self.db.bucket_sync(data_bucket(name, bucket.as_str()))?;
+            Backing::Durable(state) => {
+                // Writes only ever touch the leaf (the opened branch's own data
+                // bucket); ancestors are read-only fall-through.
+                let leaf_fork = state.leaf_fork;
+                let leaf_parent = state.leaf_parent.clone();
+                let leaf = &mut state.chain[0];
+                let data = db.bucket_sync(data_bucket(&leaf.name, bucket.as_str()))?;
                 match write {
                     OverlayWrite::Put(value) => data.put_sync(key, encode_present(&value))?,
                     OverlayWrite::Delete => data.put_sync(key, vec![TAG_TOMBSTONE])?,
                 }
                 // Record the first write to a user bucket so reads consult it (and
                 // so the parent is consulted directly for never-written buckets).
-                if written_buckets.insert(bucket.as_str().to_owned()) {
+                if leaf.written.insert(bucket.as_str().to_owned()) {
                     persist_registry(
-                        self.db,
-                        name,
+                        db,
+                        &leaf.name,
                         &RegistryEntry {
-                            fork: self.fork.read_version(),
-                            written_buckets: written_buckets.clone(),
+                            fork: leaf_fork,
+                            parent: leaf_parent,
+                            written_buckets: leaf.written.clone(),
                         },
                     )?;
                 }
@@ -332,24 +385,29 @@ impl<'db> Branch<'db> {
                     }
                 }
             }
-            Backing::Durable {
-                name,
-                written_buckets,
-            } => {
-                if !written_buckets.contains(bucket.as_str()) {
-                    return Ok(());
-                }
-                // The branch data bucket holds the branch's own writes; read its
-                // own latest state (it is not versioned against the parent fork).
-                let data = self.db.bucket_sync(data_bucket(name, bucket.as_str()))?;
-                for row in data.range_sync(range)? {
-                    let row = row?;
-                    match decode_branch_value(&row.value) {
-                        Some(value) => {
-                            merged.insert(row.key, value);
-                        }
-                        None => {
-                            merged.remove(&row.key);
+            Backing::Durable(state) => {
+                // Overlay each branch level over the root rows, farthest ancestor
+                // first so the leaf wins (the chain is leaf-first, hence reversed).
+                for layer in state.chain.iter().rev() {
+                    if !layer.written.contains(bucket.as_str()) {
+                        continue;
+                    }
+                    let data = self
+                        .db
+                        .bucket_sync(data_bucket(&layer.name, bucket.as_str()))?;
+                    let rows = match &layer.at {
+                        None => data.range_sync(range)?,
+                        Some(at) => data.range_at_sync(at, range)?,
+                    };
+                    for row in rows {
+                        let row = row?;
+                        match decode_branch_value(&row.value) {
+                            Some(value) => {
+                                merged.insert(row.key, value);
+                            }
+                            None => {
+                                merged.remove(&row.key);
+                            }
                         }
                     }
                 }
@@ -458,29 +516,99 @@ impl Db {
             name,
             &RegistryEntry {
                 fork: from,
+                parent: None,
                 written_buckets: BTreeSet::new(),
             },
         )
     }
 
-    /// Opens a durable named branch created by [`Db::create_branch`], re-pinning
-    /// its fork. The returned handle sees the parent as of the fork with the
-    /// branch's persisted writes on top.
+    /// Creates a **durable** named branch forked from another branch `parent` at
+    /// its current state — a branch of a branch (the git-style DAG). The new
+    /// branch reads `parent`'s state (and `parent`'s own ancestors) with its own
+    /// writes on top; `parent` is unaffected. O(1), copies no data.
+    ///
+    /// The fork is pinned with a checkpoint just like [`Db::create_branch`], so
+    /// the chain stays readable. Do not delete `parent` while this branch exists
+    /// (see [`Db::delete_branch`]).
     ///
     /// # Errors
     ///
-    /// Returns an error if the branch does not exist, or if its fork version is no
-    /// longer retained (see the module docs on retention).
+    /// Returns an error if `parent` does not exist, if `name` already exists, or
+    /// if persisting the branch fails.
+    pub fn create_branch_from(&self, name: &str, parent: &str) -> Result<()> {
+        if self.read_registry(parent)?.is_none() {
+            return Err(Error::invalid_options("parent branch does not exist"));
+        }
+        if self.read_registry(name)?.is_some() {
+            return Err(Error::invalid_options("branch already exists"));
+        }
+        // Fork at the current global version: the child sees the parent's state as
+        // of now. Pinning it keeps the parent's (and its ancestors') history that
+        // the chain reads through retained.
+        let from = self.latest_read_version();
+        match self.create_checkpoint_at_sync(&fork_checkpoint(name), from) {
+            Ok(()) | Err(Error::CheckpointAlreadyExists { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        persist_registry(
+            self,
+            name,
+            &RegistryEntry {
+                fork: from,
+                parent: Some(parent.to_owned()),
+                written_buckets: BTreeSet::new(),
+            },
+        )
+    }
+
+    /// Opens a durable named branch, re-pinning its fork and assembling its read
+    /// chain (the branch, then each ancestor branch, then the root). The returned
+    /// handle sees that chain with the branch's persisted writes on top.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the branch (or an ancestor) does not exist, or if a
+    /// fork version is no longer retained (see the module docs on retention).
     pub fn open_branch(&self, name: &str) -> Result<Branch<'_>> {
-        let entry = self
+        let leaf = self
             .read_registry(name)?
             .ok_or_else(|| Error::invalid_options("no such branch"))?;
-        let fork = self.snapshot_at(entry.fork)?;
+        let leaf_fork = leaf.fork;
+        let leaf_parent = leaf.parent.clone();
+
+        // The leaf reads its own latest writes; each ancestor is read frozen at
+        // the version the child below it forked it.
+        let mut chain = vec![DurableLayer {
+            name: name.to_owned(),
+            written: leaf.written_buckets,
+            at: None,
+        }];
+        let mut child_fork = leaf.fork;
+        let mut parent = leaf.parent;
+        while let Some(parent_name) = parent {
+            let entry = self
+                .read_registry(&parent_name)?
+                .ok_or_else(|| Error::Corruption {
+                    message: format!("branch {parent_name} is missing (an ancestor of {name})"),
+                })?;
+            chain.push(DurableLayer {
+                name: parent_name,
+                written: entry.written_buckets,
+                at: Some(self.snapshot_at(child_fork)?),
+            });
+            child_fork = entry.fork;
+            parent = entry.parent;
+        }
+        // The base ancestor forked the root lineage at `child_fork`.
+        let root_fork = self.snapshot_at(child_fork)?;
         Ok(Branch::durable(
             self,
-            fork,
-            name.to_owned(),
-            entry.written_buckets,
+            root_fork,
+            DurableState {
+                chain,
+                leaf_fork,
+                leaf_parent,
+            },
         ))
     }
 
@@ -506,15 +634,31 @@ impl Db {
     ///
     /// The branch's data buckets are left in place for now (a bucket-drop
     /// primitive is a later slice); they become unreachable once the branch is
-    /// gone. Deleting a branch that does not exist is an error.
+    /// gone. Deleting a branch that does not exist, or one that still has child
+    /// branches forked from it, is an error (a child depends on this branch's
+    /// fork pin staying in place).
     ///
     /// # Errors
     ///
-    /// Returns an error if the branch does not exist or if releasing its state
-    /// fails.
+    /// Returns an error if the branch does not exist, still has children, or if
+    /// releasing its state fails.
     pub fn delete_branch(&self, name: &str) -> Result<()> {
         if self.read_registry(name)?.is_none() {
             return Err(Error::invalid_options("no such branch"));
+        }
+        // A child branch reads through this branch's history; refuse to drop the
+        // pin out from under it.
+        for other in self.list_branches()? {
+            if other == name {
+                continue;
+            }
+            if let Some(entry) = self.read_registry(&other)? {
+                if entry.parent.as_deref() == Some(name) {
+                    return Err(Error::invalid_options(
+                        "cannot delete a branch that still has child branches",
+                    ));
+                }
+            }
         }
         // Release the fork pin (the checkpoint may be absent if a prior delete was
         // interrupted after this step — tolerate that).
@@ -788,5 +932,106 @@ mod tests {
                 (b"d".to_vec(), b"4".to_vec()),
             ]
         );
+    }
+
+    #[test]
+    fn branch_of_branch_reads_through_the_whole_chain() {
+        let db = Db::open_sync(DbOptions::memory().with_keep_last_read_versions(64)).expect("open");
+        let bucket = db.bucket_sync("data").expect("bucket");
+        bucket
+            .put_sync(b"base".to_vec(), b"root".to_vec())
+            .expect("seed");
+        bucket
+            .put_sync(b"shared".to_vec(), b"root".to_vec())
+            .expect("seed");
+
+        // a forks root and overrides `shared`, adds `a-only`.
+        db.create_branch("a", db.latest_read_version())
+            .expect("create a");
+        {
+            let mut a = db.open_branch("a").expect("open a");
+            a.put("data", b"shared", b"a".to_vec()).expect("a override");
+            a.put("data", b"a-only", b"a".to_vec()).expect("a add");
+        }
+
+        // b forks a, overrides `shared` again, adds `b-only`, deletes `a-only`.
+        db.create_branch_from("b", "a").expect("create b from a");
+        let mut b = db.open_branch("b").expect("open b");
+        b.put("data", b"shared", b"b".to_vec()).expect("b override");
+        b.put("data", b"b-only", b"b".to_vec()).expect("b add");
+        b.delete("data", b"a-only").expect("b delete a-only");
+
+        // b sees: its own writes, then a's, then root's, in that precedence.
+        assert_eq!(b.get("data", b"shared").expect("get"), Some(b"b".to_vec()));
+        assert_eq!(b.get("data", b"b-only").expect("get"), Some(b"b".to_vec()));
+        assert_eq!(
+            b.get("data", b"a-only").expect("get"),
+            None,
+            "b deleted a's key"
+        );
+        assert_eq!(
+            b.get("data", b"base").expect("get"),
+            Some(b"root".to_vec()),
+            "falls through a (untouched) to the root"
+        );
+
+        // The range view merges the whole chain.
+        let rows = b.range("data", &KeyRange::all()).expect("range");
+        let got: Vec<(Vec<u8>, Vec<u8>)> = rows.into_iter().map(|kv| (kv.key, kv.value)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (b"b-only".to_vec(), b"b".to_vec()),
+                (b"base".to_vec(), b"root".to_vec()),
+                (b"shared".to_vec(), b"b".to_vec()),
+            ]
+        );
+
+        // a is unaffected by b.
+        let a = db.open_branch("a").expect("reopen a");
+        assert_eq!(a.get("data", b"shared").expect("get"), Some(b"a".to_vec()));
+        assert_eq!(a.get("data", b"a-only").expect("get"), Some(b"a".to_vec()));
+        assert_eq!(a.get("data", b"b-only").expect("get"), None);
+    }
+
+    #[test]
+    fn branch_of_branch_is_frozen_when_its_parent_advances() {
+        let db = Db::open_sync(DbOptions::memory().with_keep_last_read_versions(64)).expect("open");
+        db.bucket_sync("data").expect("bucket");
+        db.create_branch("a", db.latest_read_version())
+            .expect("create a");
+        {
+            let mut a = db.open_branch("a").expect("open a");
+            a.put("data", b"k", b"a1".to_vec()).expect("a write");
+        }
+        // b forks a at this point.
+        db.create_branch_from("b", "a").expect("create b");
+        // a keeps writing after the fork.
+        {
+            let mut a = db.open_branch("a").expect("reopen a");
+            a.put("data", b"k", b"a2".to_vec()).expect("a write later");
+        }
+        // b sees a's value as of the fork, not a's later write.
+        let b = db.open_branch("b").expect("open b");
+        assert_eq!(b.get("data", b"k").expect("get"), Some(b"a1".to_vec()));
+    }
+
+    #[test]
+    fn cannot_delete_branch_with_children() {
+        let db = Db::open_sync(DbOptions::memory().with_keep_last_read_versions(64)).expect("open");
+        db.bucket_sync("data").expect("bucket");
+        db.create_branch("a", db.latest_read_version())
+            .expect("create a");
+        db.create_branch_from("b", "a").expect("create b");
+
+        assert!(
+            db.delete_branch("a").is_err(),
+            "a still has child b, so it cannot be deleted"
+        );
+        // Delete the child first, then the parent.
+        db.delete_branch("b").expect("delete child");
+        db.delete_branch("a")
+            .expect("delete parent after child gone");
+        assert!(db.list_branches().expect("list").is_empty());
     }
 }

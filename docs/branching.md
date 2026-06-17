@@ -5,8 +5,10 @@ ephemeral instant clones + time travel (1); durable, writable named branches
 whose divergent writes persist in their own buckets (2); and branch-aware
 retention — a durable branch pins its fork with a checkpoint so the parent keeps
 its fork history across restarts and aggressive GC, with `delete_branch`
-releasing the pin (3). Slice 4 (branch-of-branch; bucket-drop on delete)
-designed. This document specifies copy-on-write
+releasing the pin (3); and branch-of-branch — the git-style DAG, where a branch
+reads through its whole ancestor chain (4). The remaining slice-4 item,
+reclaiming a deleted branch's data buckets, awaits a KV bucket-drop primitive.
+This document specifies copy-on-write
 **branches** (Neon-/git-style: an O(1) fork off a version point, history shared
 with the parent, divergent writes isolated) and read-only **time travel** (`AS
 OF` a past version) for trine-kv.
@@ -159,15 +161,22 @@ without a bespoke GC pass: each live branch contributes one checkpoint, and the
 floor is already their minimum. Per-branch compaction is automatic because each
 branch's data is its own buckets (slice 2).
 
-### Slice 4 — lifecycle completion & nesting
+### Slice 4 — nesting (done) & lifecycle completion (partial)
 
-`delete_branch` already releases the fork pin and forgets the branch (slice 3);
-what remains is **reclaiming its data buckets** (needs a bucket-drop primitive,
-which the KV does not yet expose) so a deleted branch leaves no garbage, and a
-**branch of a branch**: the registry already records the fork, so the read path
-would walk the ancestor chain (child bucket → parent branch bucket → … → root @
-the pinned fork). Merge/reset semantics are left to the application layer
-(trinedb decides merge policy; the KV exposes the version primitives).
+**Branch of a branch (done):** the registry entry records a `parent` (None = the
+root lineage), and `Db::create_branch_from(name, parent)` forks an existing
+branch at the current version. `open_branch` assembles a **read chain** — the
+branch (read at its own latest), then each ancestor branch read frozen at the
+version its child forked it, then the root snapshot at the base fork. A `get`
+walks the chain leaf-first (first present value or tombstone wins); a `range`
+merges the chain root-first so the leaf wins. Each level's fork is pinned by its
+own checkpoint, so the whole chain stays readable; `delete_branch` refuses while
+a branch still has children (a child reads through the parent's pinned history).
+
+**Remaining:** reclaiming a deleted branch's data buckets needs a KV bucket-drop
+primitive (not yet exposed) — until then a deleted branch's buckets linger as
+unreachable garbage. Merge/reset semantics stay at the application layer (trinedb
+decides merge policy; the KV exposes the version primitives).
 
 ## trinedb projection (out of scope here, for context)
 
