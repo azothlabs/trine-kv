@@ -79,6 +79,7 @@
 
 mod blob;
 mod block;
+pub mod branch;
 /// Bucket handles and bucket-bound readers.
 pub mod bucket;
 #[allow(dead_code)]
@@ -140,6 +141,7 @@ mod wal;
 /// Atomic write batch types.
 pub mod write_batch;
 
+pub use branch::Branch;
 pub use bucket::{Bucket, BucketName, BucketReader};
 pub use db::{Db, IntoOpenOptions, MaintenanceBudget, MaintenanceOutcome};
 pub use error::{Error, Result};
