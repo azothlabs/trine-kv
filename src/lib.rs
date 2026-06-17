@@ -141,7 +141,7 @@ mod wal;
 /// Atomic write batch types.
 pub mod write_batch;
 
-pub use branch::Branch;
+pub use branch::{Branch, BranchRange};
 pub use bucket::{Bucket, BucketName, BucketReader};
 pub use db::{Db, IntoOpenOptions, MaintenanceBudget, MaintenanceOutcome};
 pub use error::{Error, Result};

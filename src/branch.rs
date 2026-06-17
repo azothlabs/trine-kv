@@ -29,12 +29,18 @@
 //! Branches nest: [`Db::create_branch_from`] forks a branch off another branch,
 //! and a read walks the whole ancestor chain (branch → parent branch → … → root),
 //! each ancestor seen frozen at the version its child forked it. This is the
-//! git-style DAG. [`Db::delete_branch`] releases a branch's fork pin and forgets
-//! it; it refuses while the branch still has children (they read through it), and
-//! its data buckets are reclaimed only once a bucket-drop primitive exists (a
-//! later slice).
+//! git-style DAG. [`Db::delete_branch`] releases a branch's fork pin, clears its
+//! divergent data (so the space is reclaimed and a same-named branch starts
+//! clean), and forgets it; it refuses while the branch still has children (they
+//! read through it). The now-empty data-bucket shells are removed only once the
+//! KV gains a bucket-drop primitive (a later slice), but they hold no data and
+//! are never read after the branch is gone.
+//!
+//! [`Branch::range`] is a lazy [`BranchRange`] iterator: the branch level, each
+//! ancestor, and the root are streamed from their own sorted scans and k-way
+//! merged on the fly (no full materialization).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::ops::Bound;
 
 use crate::bucket::BucketName;
@@ -336,59 +342,43 @@ impl<'db> Branch<'db> {
         }
     }
 
-    /// Scans a key range on the branch, merging its writes over the parent's state
-    /// as of the fork: branch puts replace and branch deletes remove the parent's
-    /// rows. Returns the merged rows in key order (eager; a lazy iterator is a
-    /// later refinement).
+    /// Scans a key range on the branch, lazily merging its writes over the
+    /// parent's state as of the fork (and over each ancestor branch, for a nested
+    /// branch): branch puts replace and branch deletes hide the parent's rows.
+    /// Returns a [`BranchRange`] iterator yielding the merged rows in key order
+    /// without materializing them — each branch level and the root are streamed
+    /// from their own sorted scans and k-way merged on the fly.
     ///
     /// # Errors
     ///
-    /// Returns an error if a bucket cannot be opened or a scan fails.
-    pub fn range(&self, bucket: impl Into<BucketName>, range: &KeyRange) -> Result<Vec<KeyValue>> {
+    /// Returns an error if a bucket cannot be opened or a scan cannot be started;
+    /// per-row scan errors surface from the iterator.
+    pub fn range(&self, bucket: impl Into<BucketName>, range: &KeyRange) -> Result<BranchRange> {
         let bucket = bucket.into();
-        let mut merged: BTreeMap<Vec<u8>, Value> = BTreeMap::new();
-        for row in self
-            .db
-            .bucket_sync(bucket.clone())?
-            .range_at_sync(&self.fork, range)?
-        {
-            let row = row?;
-            merged.insert(row.key, row.value);
-        }
-        self.apply_branch_writes(&bucket, range, &mut merged)?;
-        Ok(merged
-            .into_iter()
-            .map(|(key, value)| KeyValue::new(key, value))
-            .collect())
-    }
-
-    /// Layers the branch's own writes for `bucket` within `range` over `merged`.
-    fn apply_branch_writes(
-        &self,
-        bucket: &BucketName,
-        range: &KeyRange,
-        merged: &mut BTreeMap<Vec<u8>, Value>,
-    ) -> Result<()> {
+        // Sources in precedence order, highest first; the root is lowest.
+        let mut sources: Vec<MergeSource> = Vec::new();
         match &self.backing {
             Backing::Ephemeral(overlay) => {
-                for ((overlay_bucket, key), write) in overlay {
-                    if overlay_bucket != bucket || !range_contains(range, key) {
-                        continue;
-                    }
-                    match write {
-                        OverlayWrite::Put(value) => {
-                            merged.insert(key.clone(), value.clone());
-                        }
-                        OverlayWrite::Delete => {
-                            merged.remove(key);
-                        }
-                    }
-                }
+                // The overlay is unsorted in memory, so collect its in-range
+                // entries for this bucket and sort them into one source.
+                let mut entries: Vec<(Vec<u8>, Option<Value>)> = overlay
+                    .iter()
+                    .filter(|((overlay_bucket, key), _)| {
+                        overlay_bucket == &bucket && range_contains(range, key)
+                    })
+                    .map(|((_, key), write)| {
+                        let value = match write {
+                            OverlayWrite::Put(value) => Some(value.clone()),
+                            OverlayWrite::Delete => None,
+                        };
+                        (key.clone(), value)
+                    })
+                    .collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                sources.push(MergeSource::new(Box::new(entries.into_iter().map(Ok))));
             }
             Backing::Durable(state) => {
-                // Overlay each branch level over the root rows, farthest ancestor
-                // first so the leaf wins (the chain is leaf-first, hence reversed).
-                for layer in state.chain.iter().rev() {
+                for layer in &state.chain {
                     if !layer.written.contains(bucket.as_str()) {
                         continue;
                     }
@@ -399,21 +389,120 @@ impl<'db> Branch<'db> {
                         None => data.range_sync(range)?,
                         Some(at) => data.range_at_sync(at, range)?,
                     };
-                    for row in rows {
-                        let row = row?;
-                        match decode_branch_value(&row.value) {
-                            Some(value) => {
-                                merged.insert(row.key, value);
-                            }
-                            None => {
-                                merged.remove(&row.key);
-                            }
+                    sources.push(MergeSource::new(Box::new(rows.map(|row| {
+                        row.map(|kv| {
+                            let value = decode_branch_value(&kv.value);
+                            (kv.key, value)
+                        })
+                    }))));
+                }
+            }
+        }
+        // The root (lowest precedence): every row is a present value.
+        let root = self
+            .db
+            .bucket_sync(bucket.clone())?
+            .range_at_sync(&self.fork, range)?;
+        sources.push(MergeSource::new(Box::new(
+            root.map(|row| row.map(|kv| (kv.key, Some(kv.value)))),
+        )));
+        Ok(BranchRange { sources })
+    }
+}
+
+/// One row a merge source yields: its key and either a value or a tombstone
+/// (`None`, meaning the level deletes the key).
+type MergeRow = Result<(Vec<u8>, Option<Value>)>;
+
+/// A sorted merge source with one buffered head row, so the merge can compare
+/// keys across sources before consuming them.
+struct MergeSource {
+    iter: Box<dyn Iterator<Item = MergeRow>>,
+    head: Option<MergeRow>,
+}
+
+impl MergeSource {
+    fn new(mut iter: Box<dyn Iterator<Item = MergeRow>>) -> Self {
+        let head = iter.next();
+        Self { iter, head }
+    }
+
+    /// The buffered head key, or `None` when the source is exhausted or its head
+    /// is an error (handled separately).
+    fn key(&self) -> Option<&[u8]> {
+        match &self.head {
+            Some(Ok((key, _))) => Some(key),
+            _ => None,
+        }
+    }
+
+    fn is_err(&self) -> bool {
+        matches!(&self.head, Some(Err(_)))
+    }
+
+    /// Takes the head row and refills from the underlying iterator.
+    fn take(&mut self) -> Option<MergeRow> {
+        let row = self.head.take();
+        self.head = self.iter.next();
+        row
+    }
+}
+
+/// A lazy k-way merge of a branch's read chain — the branch's own writes, each
+/// ancestor branch, and the root — yielding the resolved rows in key order. The
+/// nearest level holding a key wins; a tombstone there hides the key entirely.
+/// Returned by [`Branch::range`].
+pub struct BranchRange {
+    /// Sources in precedence order: index 0 is highest (the branch itself), the
+    /// last is the root.
+    sources: Vec<MergeSource>,
+}
+
+impl Iterator for BranchRange {
+    type Item = Result<KeyValue>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // Surface a pending scan error from any source.
+            for source in &mut self.sources {
+                if source.is_err() {
+                    if let Some(Err(error)) = source.take() {
+                        return Some(Err(error));
+                    }
+                    unreachable!("is_err guarantees an error head");
+                }
+            }
+            // The smallest head key across all sources.
+            let mut smallest: Option<&[u8]> = None;
+            for source in &self.sources {
+                if let Some(key) = source.key() {
+                    let replace = match smallest {
+                        None => true,
+                        Some(current) => key < current,
+                    };
+                    if replace {
+                        smallest = Some(key);
+                    }
+                }
+            }
+            let key = smallest?.to_vec();
+            // Consume that key from every source; the highest-precedence value
+            // (first in source order) wins.
+            let mut chosen: Option<Option<Value>> = None;
+            for source in &mut self.sources {
+                if source.key() == Some(key.as_slice()) {
+                    if let Some(Ok((_, value))) = source.take() {
+                        if chosen.is_none() {
+                            chosen = Some(value);
                         }
                     }
                 }
             }
+            // A present value is emitted; a tombstone (or nothing) skips the key.
+            if let Some(Some(value)) = chosen {
+                return Some(Ok(KeyValue::new(key, value)));
+            }
         }
-        Ok(())
     }
 }
 
@@ -633,27 +722,32 @@ impl Db {
     /// GC that history) and forgets the branch, so it can no longer be opened.
     ///
     /// The branch's data buckets are left in place for now (a bucket-drop
-    /// primitive is a later slice); they become unreachable once the branch is
-    /// gone. Deleting a branch that does not exist, or one that still has child
     /// branches forked from it, is an error (a child depends on this branch's
     /// fork pin staying in place).
+    ///
+    /// The branch's divergent data is reclaimed: each data bucket it wrote is
+    /// cleared, so the space is recovered by compaction and a future branch
+    /// reusing the name starts clean. (The now-empty bucket shells themselves are
+    /// removed only once the KV gains a bucket-drop primitive — a later slice —
+    /// but they are gated by the registry's `written_buckets`, so they are never
+    /// read after the branch is gone.)
     ///
     /// # Errors
     ///
     /// Returns an error if the branch does not exist, still has children, or if
     /// releasing its state fails.
     pub fn delete_branch(&self, name: &str) -> Result<()> {
-        if self.read_registry(name)?.is_none() {
-            return Err(Error::invalid_options("no such branch"));
-        }
+        let entry = self
+            .read_registry(name)?
+            .ok_or_else(|| Error::invalid_options("no such branch"))?;
         // A child branch reads through this branch's history; refuse to drop the
         // pin out from under it.
         for other in self.list_branches()? {
             if other == name {
                 continue;
             }
-            if let Some(entry) = self.read_registry(&other)? {
-                if entry.parent.as_deref() == Some(name) {
+            if let Some(other_entry) = self.read_registry(&other)? {
+                if other_entry.parent.as_deref() == Some(name) {
                     return Err(Error::invalid_options(
                         "cannot delete a branch that still has child branches",
                     ));
@@ -665,6 +759,13 @@ impl Db {
         match self.delete_checkpoint_sync(&fork_checkpoint(name)) {
             Ok(()) | Err(Error::CheckpointNotFound { .. }) => {}
             Err(error) => return Err(error),
+        }
+        // Reclaim the branch's divergent data: clear each data bucket it wrote, so
+        // the space is recovered by compaction and a same-named branch created
+        // later does not inherit stale rows.
+        for user_bucket in &entry.written_buckets {
+            self.bucket_sync(data_bucket(name, user_bucket))?
+                .delete_range_sync(KeyRange::all())?;
         }
         self.bucket_sync(registry_bucket())?
             .delete_sync(name.as_bytes().to_vec())
@@ -765,7 +866,12 @@ mod tests {
         branch.put("data", b"d", b"4".to_vec()).expect("add d");
 
         let rows = branch.range("data", &KeyRange::all()).expect("range");
-        let got: Vec<(Vec<u8>, Vec<u8>)> = rows.into_iter().map(|kv| (kv.key, kv.value)).collect();
+        let got: Vec<(Vec<u8>, Vec<u8>)> = rows
+            .map(|kv| {
+                let kv = kv.expect("row");
+                (kv.key, kv.value)
+            })
+            .collect();
         assert_eq!(
             got,
             vec![
@@ -923,7 +1029,12 @@ mod tests {
         dev.put("data", b"d", b"4".to_vec()).expect("add");
 
         let rows = dev.range("data", &KeyRange::all()).expect("range");
-        let got: Vec<(Vec<u8>, Vec<u8>)> = rows.into_iter().map(|kv| (kv.key, kv.value)).collect();
+        let got: Vec<(Vec<u8>, Vec<u8>)> = rows
+            .map(|kv| {
+                let kv = kv.expect("row");
+                (kv.key, kv.value)
+            })
+            .collect();
         assert_eq!(
             got,
             vec![
@@ -977,7 +1088,12 @@ mod tests {
 
         // The range view merges the whole chain.
         let rows = b.range("data", &KeyRange::all()).expect("range");
-        let got: Vec<(Vec<u8>, Vec<u8>)> = rows.into_iter().map(|kv| (kv.key, kv.value)).collect();
+        let got: Vec<(Vec<u8>, Vec<u8>)> = rows
+            .map(|kv| {
+                let kv = kv.expect("row");
+                (kv.key, kv.value)
+            })
+            .collect();
         assert_eq!(
             got,
             vec![
@@ -1033,5 +1149,37 @@ mod tests {
         db.delete_branch("a")
             .expect("delete parent after child gone");
         assert!(db.list_branches().expect("list").is_empty());
+    }
+
+    #[test]
+    fn recreated_branch_does_not_inherit_deleted_branch_data() {
+        let db = Db::open_sync(DbOptions::memory().with_keep_last_read_versions(64)).expect("open");
+        let bucket = db.bucket_sync("data").expect("bucket");
+        bucket
+            .put_sync(b"k".to_vec(), b"parent".to_vec())
+            .expect("seed");
+
+        db.create_branch("dev", db.latest_read_version())
+            .expect("create");
+        {
+            let mut dev = db.open_branch("dev").expect("open");
+            dev.put("data", b"k", b"old".to_vec()).expect("write");
+            dev.put("data", b"only-old", b"x".to_vec()).expect("write2");
+        }
+        db.delete_branch("dev")
+            .expect("delete (clears the data bucket)");
+
+        // Recreate the same name and write to the same bucket. The branch must
+        // start from the parent, not inherit the deleted branch's rows.
+        db.create_branch("dev", db.latest_read_version())
+            .expect("recreate");
+        let mut dev = db.open_branch("dev").expect("reopen");
+        dev.put("data", b"k", b"new".to_vec()).expect("write");
+        assert_eq!(dev.get("data", b"k").expect("get"), Some(b"new".to_vec()));
+        assert_eq!(
+            dev.get("data", b"only-old").expect("get"),
+            None,
+            "the deleted branch's data was cleared, not inherited"
+        );
     }
 }
