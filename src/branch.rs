@@ -1,63 +1,174 @@
-//! Copy-on-write branches and time travel (slice 1: read-only instant clones
-//! plus an in-memory write overlay), built entirely on the existing MVCC
-//! primitives (`Db::snapshot_at`, `Bucket::get_at_sync`/`range_at_sync`).
+//! Copy-on-write branches and time travel, built over the existing MVCC read
+//! API and named buckets so the LSM read/write hot path is untouched — a
+//! database that never branches pays nothing (see `docs/branching.md`).
 //!
-//! See `docs/branching.md`. The design constraint is that branching must not
-//! cost a database that never branches anything: this module adds a composition
-//! layer *over* the public read API and touches none of the LSM read/write hot
-//! path, so the root (non-branch) lineage is byte-for-byte unchanged.
+//! A [`Branch`] forks from a parent [`ReadVersion`] (a pinned [`crate::Snapshot`]
+//! that also keeps the fork's history retained while the branch lives). It shares
+//! all parent history at or below the fork — O(1) to create, no data copied — and
+//! keeps its own divergent writes separate; reads consult the branch's writes
+//! first and fall through to the pinned parent snapshot. The parent is never
+//! affected.
 //!
-//! A [`Branch`] forks from a parent [`ReadVersion`] (a [`crate::Snapshot`] pinned
-//! at the fork, which also keeps that history retained for the branch's
-//! lifetime). It shares all parent history at or below the fork — creating one
-//! is O(1), no data is copied — and keeps its own divergent writes in an
-//! in-memory overlay. A read consults the overlay first and falls through to the
-//! pinned parent snapshot; the fall-through is the only extra work, and it
-//! happens solely for branch reads.
+//! Two flavors share one API:
 //!
-//! Slice 1 scope: branch-local writes are **ephemeral** (overlay only) — they are
-//! not persisted, compacted, or recovered. Durable, writable branches with their
-//! own layer-set are a later slice (`docs/branching.md`).
+//! * **Ephemeral clone** ([`Db::branch_from_latest`], [`Db::branch_at`]): writes
+//!   live in an in-memory overlay and vanish with the handle — a scratch
+//!   "what-if" clone or a point-in-time (`AS OF`) read view.
+//! * **Durable named branch** ([`Db::create_branch`] + [`Db::open_branch`]): writes
+//!   persist in the branch's own buckets, so they survive reopen and are
+//!   compacted and recovered like any data — a git-style named branch. Because a
+//!   branch's writes live in their **own** buckets (their own layer-set), they
+//!   never enter the parent's trees, so branch activity cannot perturb the
+//!   parent's compaction or read amplification.
+//!
+//! Scope: branches are single-level (forked from the database's own lineage; a
+//! branch of a branch is a later slice). A durable branch pins its fork only
+//! while a handle is open; making the parent's retention floor respect every
+//! branch's fork across restarts (so an idle durable branch cannot lose its base)
+//! is the branch-aware-retention slice (`docs/branching.md`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 
 use crate::bucket::BucketName;
 use crate::db::Db;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::snapshot::Snapshot;
 use crate::types::{KeyRange, KeyValue, ReadVersion, Value};
 
-/// One branch-local write held in the overlay.
+/// Prefix reserving the buckets branching keeps its own state in. Branch names
+/// must not contain the `\u{1}` separator (they are simple identifiers).
+const RESERVED: &str = "\u{1}trine-branch\u{1}";
+const SEP: char = '\u{1}';
+
+/// The bucket holding the branch registry: branch name → [`RegistryEntry`].
+fn registry_bucket() -> String {
+    format!("{RESERVED}registry")
+}
+
+/// The bucket holding a durable branch's divergent writes for one user bucket.
+fn data_bucket(branch: &str, user_bucket: &str) -> String {
+    format!("{RESERVED}{branch}{SEP}{user_bucket}")
+}
+
+/// A durable branch's persisted metadata: where it forked and which user buckets
+/// it has written (so a read need not touch — or create — a data bucket the
+/// branch has never written, and so the parent is consulted directly there).
+struct RegistryEntry {
+    fork: ReadVersion,
+    written_buckets: BTreeSet<String>,
+}
+
+impl RegistryEntry {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.fork.as_u64().to_le_bytes());
+        let count = u32::try_from(self.written_buckets.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&count.to_le_bytes());
+        for bucket in &self.written_buckets {
+            let len = u32::try_from(bucket.len()).unwrap_or(u32::MAX);
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(bucket.as_bytes());
+        }
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        let corrupt = || Error::Corruption {
+            message: "malformed branch registry entry".to_owned(),
+        };
+        let fork_bytes: [u8; 8] = bytes.get(0..8).ok_or_else(corrupt)?.try_into().expect("8");
+        let fork = ReadVersion::from_u64(u64::from_le_bytes(fork_bytes));
+        let mut pos = 8;
+        let count_bytes: [u8; 4] = bytes
+            .get(pos..pos + 4)
+            .ok_or_else(corrupt)?
+            .try_into()
+            .expect("4");
+        let count = u32::from_le_bytes(count_bytes);
+        pos += 4;
+        let mut written_buckets = BTreeSet::new();
+        for _ in 0..count {
+            let len_bytes: [u8; 4] = bytes
+                .get(pos..pos + 4)
+                .ok_or_else(corrupt)?
+                .try_into()
+                .expect("4");
+            let len = u32::from_le_bytes(len_bytes) as usize;
+            pos += 4;
+            let name = bytes.get(pos..pos + len).ok_or_else(corrupt)?;
+            pos += len;
+            written_buckets.insert(String::from_utf8(name.to_vec()).map_err(|_| corrupt())?);
+        }
+        Ok(Self {
+            fork,
+            written_buckets,
+        })
+    }
+}
+
+/// Value tag in a durable branch's data bucket: a present value or a tombstone
+/// (the branch deleted a key the parent still has). Distinguishes "the branch
+/// wrote nothing here, fall through to the parent" (key absent) from "the branch
+/// deleted it" (tombstone).
+const TAG_PRESENT: u8 = 0;
+const TAG_TOMBSTONE: u8 = 1;
+
+fn encode_present(value: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(value.len() + 1);
+    out.push(TAG_PRESENT);
+    out.extend_from_slice(value);
+    out
+}
+
+/// One ephemeral branch-local write held in the in-memory overlay.
 enum OverlayWrite {
-    /// The key is set to this value on the branch (shadows the parent).
     Put(Value),
-    /// The key is deleted on the branch (hides any parent value).
     Delete,
+}
+
+/// How a branch stores its divergent writes.
+enum Backing {
+    /// In-memory, lost with the handle (ephemeral clone / `AS OF` view).
+    Ephemeral(HashMap<(BucketName, Vec<u8>), OverlayWrite>),
+    /// Persisted in the branch's own buckets (durable named branch).
+    Durable {
+        name: String,
+        written_buckets: BTreeSet<String>,
+    },
 }
 
 /// A copy-on-write branch forked from a parent database at a fixed
 /// [`ReadVersion`]. Reads see the parent's state as of the fork with the
 /// branch's own writes layered on top; the parent is unaffected.
-///
-/// Created with [`Db::branch_at`] / [`Db::branch_from_latest`]. The branch
-/// borrows its parent [`Db`] and pins the fork version's history for as long as
-/// it lives.
-///
-/// In slice 1 the branch's writes live only in memory (see the module docs); a
-/// branch is a single-owner handle (its mutating methods take `&mut self`).
 pub struct Branch<'db> {
     db: &'db Db,
     fork: Snapshot,
-    overlay: HashMap<(BucketName, Vec<u8>), OverlayWrite>,
+    backing: Backing,
 }
 
 impl<'db> Branch<'db> {
-    pub(crate) fn new(db: &'db Db, fork: Snapshot) -> Self {
+    fn ephemeral(db: &'db Db, fork: Snapshot) -> Self {
         Self {
             db,
             fork,
-            overlay: HashMap::new(),
+            backing: Backing::Ephemeral(HashMap::new()),
+        }
+    }
+
+    fn durable(
+        db: &'db Db,
+        fork: Snapshot,
+        name: String,
+        written_buckets: BTreeSet<String>,
+    ) -> Self {
+        Self {
+            db,
+            fork,
+            backing: Backing::Durable {
+                name,
+                written_buckets,
+            },
         }
     }
 
@@ -68,60 +179,114 @@ impl<'db> Branch<'db> {
         self.fork.read_version()
     }
 
+    /// Whether this branch's writes are persisted (durable named branch) or live
+    /// only in memory (ephemeral clone).
+    #[must_use]
+    pub const fn is_durable(&self) -> bool {
+        matches!(self.backing, Backing::Durable { .. })
+    }
+
     /// Reads a key on the branch: the branch's own write if it has one, otherwise
     /// the parent's value as of the fork version.
     ///
     /// # Errors
     ///
-    /// Returns an error if the bucket cannot be opened or the parent read fails.
+    /// Returns an error if a bucket cannot be opened or a read fails.
     pub fn get(&self, bucket: impl Into<BucketName>, key: &[u8]) -> Result<Option<Value>> {
         let bucket = bucket.into();
-        match self.overlay.get(&(bucket.clone(), key.to_vec())) {
-            Some(OverlayWrite::Put(value)) => Ok(Some(value.clone())),
-            Some(OverlayWrite::Delete) => Ok(None),
-            None => self.db.bucket_sync(bucket)?.get_at_sync(&self.fork, key),
+        match &self.backing {
+            Backing::Ephemeral(overlay) => match overlay.get(&(bucket.clone(), key.to_vec())) {
+                Some(OverlayWrite::Put(value)) => return Ok(Some(value.clone())),
+                Some(OverlayWrite::Delete) => return Ok(None),
+                None => {}
+            },
+            Backing::Durable {
+                name,
+                written_buckets,
+            } => {
+                if written_buckets.contains(bucket.as_str()) {
+                    let data = self.db.bucket_sync(data_bucket(name, bucket.as_str()))?;
+                    if let Some(raw) = data.get_sync(key)? {
+                        return Ok(decode_branch_value(&raw));
+                    }
+                }
+            }
         }
+        self.parent_get(&bucket, key)
     }
 
-    /// Writes a key on the branch. The write is visible to this branch's reads
-    /// and never touches the parent. Slice 1: in-memory only (not persisted).
+    fn parent_get(&self, bucket: &BucketName, key: &[u8]) -> Result<Option<Value>> {
+        self.db
+            .bucket_sync(bucket.clone())?
+            .get_at_sync(&self.fork, key)
+    }
+
+    /// Writes a key on the branch. The write is visible to this branch's reads and
+    /// never touches the parent. For a durable branch the write is persisted.
     ///
     /// # Errors
     ///
-    /// Slice 1 never fails; the result type is reserved for durable branches.
+    /// Returns an error if persisting a durable write fails (ephemeral never
+    /// fails).
     pub fn put(
         &mut self,
         bucket: impl Into<BucketName>,
         key: impl Into<Vec<u8>>,
         value: impl Into<Value>,
     ) -> Result<()> {
-        self.overlay
-            .insert((bucket.into(), key.into()), OverlayWrite::Put(value.into()));
-        Ok(())
+        self.write(bucket.into(), key.into(), OverlayWrite::Put(value.into()))
     }
 
-    /// Deletes a key on the branch (hiding any parent value). The parent is
-    /// unaffected. Slice 1: in-memory only.
+    /// Deletes a key on the branch (hiding any parent value, via a tombstone for a
+    /// durable branch). The parent is unaffected.
     ///
     /// # Errors
     ///
-    /// Slice 1 never fails; the result type is reserved for durable branches.
+    /// Returns an error if persisting a durable tombstone fails.
     pub fn delete(&mut self, bucket: impl Into<BucketName>, key: impl Into<Vec<u8>>) -> Result<()> {
-        self.overlay
-            .insert((bucket.into(), key.into()), OverlayWrite::Delete);
-        Ok(())
+        self.write(bucket.into(), key.into(), OverlayWrite::Delete)
     }
 
-    /// Scans a key range on the branch, merging its overlay over the parent's
-    /// state as of the fork: branch puts replace and branch deletes remove the
-    /// parent's rows. Returns the merged rows in key order.
-    ///
-    /// Slice 1 returns an eager `Vec` (a clone is an in-memory working set); a
-    /// lazy merging iterator is a later refinement.
+    fn write(&mut self, bucket: BucketName, key: Vec<u8>, write: OverlayWrite) -> Result<()> {
+        match &mut self.backing {
+            Backing::Ephemeral(overlay) => {
+                overlay.insert((bucket, key), write);
+                Ok(())
+            }
+            Backing::Durable {
+                name,
+                written_buckets,
+            } => {
+                let data = self.db.bucket_sync(data_bucket(name, bucket.as_str()))?;
+                match write {
+                    OverlayWrite::Put(value) => data.put_sync(key, encode_present(&value))?,
+                    OverlayWrite::Delete => data.put_sync(key, vec![TAG_TOMBSTONE])?,
+                }
+                // Record the first write to a user bucket so reads consult it (and
+                // so the parent is consulted directly for never-written buckets).
+                if written_buckets.insert(bucket.as_str().to_owned()) {
+                    persist_registry(
+                        self.db,
+                        name,
+                        &RegistryEntry {
+                            fork: self.fork.read_version(),
+                            written_buckets: written_buckets.clone(),
+                        },
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Scans a key range on the branch, merging its writes over the parent's state
+    /// as of the fork: branch puts replace and branch deletes remove the parent's
+    /// rows. Returns the merged rows in key order (eager; a lazy iterator is a
+    /// later refinement).
     ///
     /// # Errors
     ///
-    /// Returns an error if the bucket cannot be opened or the parent scan fails.
+    /// Returns an error if a bucket cannot be opened or a scan fails.
     pub fn range(&self, bucket: impl Into<BucketName>, range: &KeyRange) -> Result<Vec<KeyValue>> {
         let bucket = bucket.into();
         let mut merged: BTreeMap<Vec<u8>, Value> = BTreeMap::new();
@@ -133,24 +298,60 @@ impl<'db> Branch<'db> {
             let row = row?;
             merged.insert(row.key, row.value);
         }
-        // Layer the branch's own writes over the parent rows.
-        for ((overlay_bucket, key), write) in &self.overlay {
-            if *overlay_bucket != bucket || !range_contains(range, key) {
-                continue;
-            }
-            match write {
-                OverlayWrite::Put(value) => {
-                    merged.insert(key.clone(), value.clone());
-                }
-                OverlayWrite::Delete => {
-                    merged.remove(key);
-                }
-            }
-        }
+        self.apply_branch_writes(&bucket, range, &mut merged)?;
         Ok(merged
             .into_iter()
             .map(|(key, value)| KeyValue::new(key, value))
             .collect())
+    }
+
+    /// Layers the branch's own writes for `bucket` within `range` over `merged`.
+    fn apply_branch_writes(
+        &self,
+        bucket: &BucketName,
+        range: &KeyRange,
+        merged: &mut BTreeMap<Vec<u8>, Value>,
+    ) -> Result<()> {
+        match &self.backing {
+            Backing::Ephemeral(overlay) => {
+                for ((overlay_bucket, key), write) in overlay {
+                    if overlay_bucket != bucket || !range_contains(range, key) {
+                        continue;
+                    }
+                    match write {
+                        OverlayWrite::Put(value) => {
+                            merged.insert(key.clone(), value.clone());
+                        }
+                        OverlayWrite::Delete => {
+                            merged.remove(key);
+                        }
+                    }
+                }
+            }
+            Backing::Durable {
+                name,
+                written_buckets,
+            } => {
+                if !written_buckets.contains(bucket.as_str()) {
+                    return Ok(());
+                }
+                // The branch data bucket holds the branch's own writes; read its
+                // own latest state (it is not versioned against the parent fork).
+                let data = self.db.bucket_sync(data_bucket(name, bucket.as_str()))?;
+                for row in data.range_sync(range)? {
+                    let row = row?;
+                    match decode_branch_value(&row.value) {
+                        Some(value) => {
+                            merged.insert(row.key, value);
+                        }
+                        None => {
+                            merged.remove(&row.key);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -169,31 +370,124 @@ fn range_contains(range: &KeyRange, key: &[u8]) -> bool {
     after_start && before_end
 }
 
+/// Decodes a durable branch data value: `Some(value)` for a present write,
+/// `None` for a tombstone (deleted on the branch) or a malformed/empty record.
+fn decode_branch_value(raw: &[u8]) -> Option<Value> {
+    match raw.first() {
+        Some(&TAG_PRESENT) => Some(raw[1..].to_vec()),
+        _ => None,
+    }
+}
+
+fn persist_registry(db: &Db, name: &str, entry: &RegistryEntry) -> Result<()> {
+    db.bucket_sync(registry_bucket())?
+        .put_sync(name.as_bytes().to_vec(), entry.encode())
+}
+
 impl Db {
-    /// Forks a copy-on-write [`Branch`] from a past `version`. Creating a branch
-    /// is O(1) and copies no data; the branch shares the parent's history as of
-    /// `version` and keeps its own writes separate. The parent is unaffected.
+    /// Forks an **ephemeral** copy-on-write [`Branch`] from a past `version` — an
+    /// `AS OF` read view with an in-memory write overlay that vanishes with the
+    /// handle. O(1) and copies no data; the parent is unaffected.
     ///
     /// The fork pins `version`'s history for the branch's lifetime, so it is
-    /// subject to the same retained-history floor as [`Db::snapshot_at`]: a
-    /// `version` older than [`Db::oldest_retained_read_version`] is rejected.
+    /// subject to the same retained-history floor as [`Db::snapshot_at`].
     ///
     /// # Errors
     ///
     /// Returns an error if `version` is newer than the latest committed version
     /// or older than the retained-history floor.
     pub fn branch_at(&self, version: ReadVersion) -> Result<Branch<'_>> {
-        Ok(Branch::new(self, self.snapshot_at(version)?))
+        Ok(Branch::ephemeral(self, self.snapshot_at(version)?))
     }
 
-    /// Forks a branch from the latest committed version — an instant clone of the
-    /// current database state.
+    /// Forks an ephemeral branch from the latest committed version — an instant
+    /// in-memory clone of the current state.
     ///
     /// # Errors
     ///
     /// Returns an error if a snapshot at the latest version cannot be pinned.
     pub fn branch_from_latest(&self) -> Result<Branch<'_>> {
         self.branch_at(self.latest_read_version())
+    }
+
+    /// Creates a **durable** named branch forked at `from`. The name is recorded
+    /// so the branch can be reopened later with [`Db::open_branch`]; its writes
+    /// persist in its own buckets. O(1) and copies no data.
+    ///
+    /// Creating an existing name with the same fork is idempotent; with a
+    /// different fork it is an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `from` is not a readable version, if the name already
+    /// exists with a different fork, or if persisting the registry entry fails.
+    pub fn create_branch(&self, name: &str, from: ReadVersion) -> Result<()> {
+        // Validate the fork is readable (retained and not in the future).
+        let _ = self.snapshot_at(from)?;
+        if let Some(existing) = self.read_registry(name)? {
+            if existing.fork == from {
+                return Ok(());
+            }
+            return Err(Error::invalid_options(
+                "branch already exists with a different fork version",
+            ));
+        }
+        persist_registry(
+            self,
+            name,
+            &RegistryEntry {
+                fork: from,
+                written_buckets: BTreeSet::new(),
+            },
+        )
+    }
+
+    /// Opens a durable named branch created by [`Db::create_branch`], re-pinning
+    /// its fork. The returned handle sees the parent as of the fork with the
+    /// branch's persisted writes on top.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the branch does not exist, or if its fork version is no
+    /// longer retained (see the module docs on retention).
+    pub fn open_branch(&self, name: &str) -> Result<Branch<'_>> {
+        let entry = self
+            .read_registry(name)?
+            .ok_or_else(|| Error::invalid_options("no such branch"))?;
+        let fork = self.snapshot_at(entry.fork)?;
+        Ok(Branch::durable(
+            self,
+            fork,
+            name.to_owned(),
+            entry.written_buckets,
+        ))
+    }
+
+    /// Lists the durable branch names, in name order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the registry cannot be scanned.
+    pub fn list_branches(&self) -> Result<Vec<String>> {
+        let registry = self.bucket_sync(registry_bucket())?;
+        let mut names = Vec::new();
+        for row in registry.range_sync(&KeyRange::all())? {
+            let row = row?;
+            names.push(String::from_utf8(row.key).map_err(|_| Error::Corruption {
+                message: "branch registry holds a non-utf8 name".to_owned(),
+            })?);
+        }
+        Ok(names)
+    }
+
+    fn read_registry(&self, name: &str) -> Result<Option<RegistryEntry>> {
+        match self
+            .bucket_sync(registry_bucket())?
+            .get_sync(name.as_bytes())?
+        {
+            Some(bytes) => Ok(Some(RegistryEntry::decode(&bytes)?)),
+            None => Ok(None),
+        }
     }
 }
 
@@ -213,13 +507,11 @@ mod tests {
         bucket.put_sync(b"k2".to_vec(), b"v2".to_vec()).expect("p2");
 
         let mut branch = db.branch_from_latest().expect("branch");
-        // Reads fall through to the parent.
         assert_eq!(
             branch.get("data", b"k1").expect("get"),
             Some(b"v1".to_vec())
         );
 
-        // A branch write shadows the parent for the branch only.
         branch
             .put("data", b"k1", b"v1-branch".to_vec())
             .expect("put");
@@ -241,10 +533,7 @@ mod tests {
         let bucket = db.bucket_sync("data").expect("bucket");
         bucket.put_sync(b"k".to_vec(), b"v1".to_vec()).expect("p1");
 
-        // Fork now: the branch pins the fork version's history, so it stays valid
-        // even with the default (no extra) retention window.
         let branch = db.branch_from_latest().expect("branch");
-        // The parent moves on.
         bucket.put_sync(b"k".to_vec(), b"v2".to_vec()).expect("p2");
 
         assert_eq!(
@@ -257,7 +546,6 @@ mod tests {
 
     #[test]
     fn branch_at_a_retained_past_version_time_travels() {
-        // Time travel to an arbitrary past version needs that history retained.
         let db = Db::open_sync(DbOptions::memory().with_keep_last_read_versions(8))
             .expect("open with retention");
         let bucket = db.bucket_sync("data").expect("bucket");
@@ -265,7 +553,6 @@ mod tests {
         let v1 = db.latest_read_version();
         bucket.put_sync(b"k".to_vec(), b"v2".to_vec()).expect("p2");
 
-        // AS OF v1 reads the old value; latest reads the new one.
         let old = db.branch_at(v1).expect("branch at v1");
         assert_eq!(old.get("data", b"k").expect("get"), Some(b"v1".to_vec()));
         let now = db.branch_from_latest().expect("branch now");
@@ -273,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn branch_range_merges_overlay_over_parent() {
+    fn ephemeral_branch_range_merges_overlay_over_parent() {
         let db = memory_db();
         let bucket = db.bucket_sync("data").expect("bucket");
         for (k, v) in [(b"a", b"1"), (b"b", b"2"), (b"c", b"3")] {
@@ -295,16 +582,103 @@ mod tests {
                 (b"a".to_vec(), b"1".to_vec()),
                 (b"b".to_vec(), b"2-branch".to_vec()),
                 (b"d".to_vec(), b"4".to_vec()),
-            ],
-            "a stays, b is overridden, c is deleted, d is added; parent order preserved"
+            ]
+        );
+    }
+
+    #[test]
+    fn durable_branch_persists_writes_and_shadows_parent() {
+        let db = Db::open_sync(DbOptions::memory().with_keep_last_read_versions(64)).expect("open");
+        let bucket = db.bucket_sync("data").expect("bucket");
+        bucket
+            .put_sync(b"k1".to_vec(), b"parent".to_vec())
+            .expect("p1");
+        bucket
+            .put_sync(b"k2".to_vec(), b"parent".to_vec())
+            .expect("p2");
+
+        db.create_branch("dev", db.latest_read_version())
+            .expect("create");
+        {
+            let mut dev = db.open_branch("dev").expect("open");
+            dev.put("data", b"k1", b"dev".to_vec()).expect("put");
+            dev.delete("data", b"k2").expect("delete");
+        }
+
+        // A freshly opened handle sees the persisted branch writes; the parent is
+        // untouched.
+        let dev = db.open_branch("dev").expect("reopen");
+        assert_eq!(dev.get("data", b"k1").expect("get"), Some(b"dev".to_vec()));
+        assert_eq!(
+            dev.get("data", b"k2").expect("get"),
+            None,
+            "branch tombstone hides parent"
+        );
+        assert_eq!(dev.get("data", b"k3").expect("get"), None);
+        assert_eq!(
+            bucket.get_sync(b"k1").expect("get"),
+            Some(b"parent".to_vec())
+        );
+        assert_eq!(
+            bucket.get_sync(b"k2").expect("get"),
+            Some(b"parent".to_vec())
         );
 
-        // The parent range is unchanged.
-        let parent: Vec<Vec<u8>> = bucket
-            .range_sync(&KeyRange::all())
-            .expect("parent range")
-            .map(|kv| kv.expect("row").key)
-            .collect();
-        assert_eq!(parent, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+        assert_eq!(db.list_branches().expect("list"), vec!["dev".to_string()]);
+        assert!(dev.is_durable());
+    }
+
+    #[test]
+    fn durable_branch_survives_reopen() {
+        let dir = std::env::temp_dir().join(format!("trine-branch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A durable branch's fork must stay retained across restart for the parent
+        // fall-through to resolve. Until branch-aware retention (slice 3) pins
+        // forks automatically, configure a retention window that covers them.
+        let opts = || crate::DbOptions::new(&dir).with_keep_last_read_versions(64);
+        {
+            let db = Db::open_sync(opts()).expect("open");
+            let bucket = db.bucket_sync("data").expect("bucket");
+            bucket
+                .put_sync(b"k".to_vec(), b"parent".to_vec())
+                .expect("seed");
+            db.create_branch("dev", db.latest_read_version())
+                .expect("create");
+            let mut dev = db.open_branch("dev").expect("open");
+            dev.put("data", b"k", b"dev".to_vec()).expect("put");
+            db.flush_sync().expect("flush");
+        }
+        // Reopen: the durable branch and its writes survive.
+        let db = Db::open_sync(opts()).expect("reopen");
+        assert_eq!(db.list_branches().expect("list"), vec!["dev".to_string()]);
+        let dev = db.open_branch("dev").expect("open after reopen");
+        assert_eq!(dev.get("data", b"k").expect("get"), Some(b"dev".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn durable_branch_range_merges_over_parent() {
+        let db = Db::open_sync(DbOptions::memory().with_keep_last_read_versions(64)).expect("open");
+        let bucket = db.bucket_sync("data").expect("bucket");
+        for (k, v) in [(b"a", b"1"), (b"b", b"2"), (b"c", b"3")] {
+            bucket.put_sync(k.to_vec(), v.to_vec()).expect("seed");
+        }
+        db.create_branch("dev", db.latest_read_version())
+            .expect("create");
+        let mut dev = db.open_branch("dev").expect("open");
+        dev.put("data", b"b", b"2-dev".to_vec()).expect("override");
+        dev.delete("data", b"c").expect("delete");
+        dev.put("data", b"d", b"4".to_vec()).expect("add");
+
+        let rows = dev.range("data", &KeyRange::all()).expect("range");
+        let got: Vec<(Vec<u8>, Vec<u8>)> = rows.into_iter().map(|kv| (kv.key, kv.value)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2-dev".to_vec()),
+                (b"d".to_vec(), b"4".to_vec()),
+            ]
+        );
     }
 }

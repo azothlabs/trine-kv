@@ -1,8 +1,10 @@
 # Branching & Time Travel
 
-Status: **Slice 1 implemented** (read-only instant clones + time travel + an
-in-memory write overlay, behind no feature gate, in `src/branch.rs`); slices 2–4
-designed. This document specifies copy-on-write
+Status: **Slices 1–2 implemented** in `src/branch.rs` (no feature gate):
+ephemeral instant clones + time travel (slice 1) and durable, writable named
+branches whose divergent writes persist in their own buckets (slice 2). Slices
+3–4 (branch-aware retention; branch lifecycle/branch-of-branch) designed. This
+document specifies copy-on-write
 **branches** (Neon-/git-style: an O(1) fork off a version point, history shared
 with the parent, divergent writes isolated) and read-only **time travel** (`AS
 OF` a past version) for trine-kv.
@@ -106,13 +108,32 @@ This proves the fall-through + the zero-root-overhead claim and ships a real,
 useful feature (dev/test clones, point-in-time reads) before the hard durable
 machinery.
 
-### Slice 2 — durable, writable branches
+### Slice 2 — durable, writable branches (done)
 
-Give a branch its own persisted layer-set: a branch-scoped WAL stream, flush, and
-manifest records (`ManifestState` grows a branch registry: `BranchId →
-(ancestor, fork_sequence)` plus per-branch table lists). Recovery reconstructs
-every branch from the manifest + WALs. Root's WAL/flush/manifest entries are a
-branch-registry of one and behave as today.
+A branch's divergent writes need their own persisted, separately-compacted
+layer-set. Rather than grow the manifest with a new branch/WAL schema (a large,
+recovery-sensitive engine change), slice 2 reuses what the KV already does per
+**bucket** — every named bucket is its own `LsmTree` with its own WAL, flush,
+compaction, and recovery. So a durable branch stores its writes in its **own
+reserved buckets**, one per user bucket it diverges in
+(`\u{1}trine-branch\u{1}<branch>\u{1}<user_bucket>`), and its metadata in a
+reserved registry bucket (branch name → `(fork ReadVersion, written buckets)`).
+This is the same composition philosophy as slice 1: **no manifest/WAL/flush/
+recovery/compaction change, no hot-path change** — durability, compaction, and
+recovery come for free, and because a branch's data lives in its own buckets it
+never enters the parent's trees (no compaction/read-amp coupling — perf stays
+isolated). A branch delete value is tombstone-tagged so it hides a parent key
+without a parent write; reads check the branch bucket, decode present/tombstone,
+else fall through to the pinned parent snapshot. `Db::create_branch` /
+`open_branch` / `list_branches` manage them.
+
+Known limit (closed by slice 3): a durable branch pins its fork only while a
+handle is open. Across a restart with no configured retention, the parent's fork
+history may have been GC'd, so the fall-through read fails until the fork is
+re-pinned — today the caller must keep enough retention
+(`with_keep_last_read_versions`) to cover live forks. Deferred to later slices:
+`delete_branch` (needs a bucket-drop primitive) and a branch of a branch (the
+registry already carries the fork; the read path would walk the ancestor chain).
 
 ### Slice 3 — branch-aware retention & compaction
 
