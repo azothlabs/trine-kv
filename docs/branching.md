@@ -1,10 +1,12 @@
 # Branching & Time Travel
 
-Status: **Slices 1–2 implemented** in `src/branch.rs` (no feature gate):
-ephemeral instant clones + time travel (slice 1) and durable, writable named
-branches whose divergent writes persist in their own buckets (slice 2). Slices
-3–4 (branch-aware retention; branch lifecycle/branch-of-branch) designed. This
-document specifies copy-on-write
+Status: **Slices 1–3 implemented** in `src/branch.rs` (no feature gate):
+ephemeral instant clones + time travel (1); durable, writable named branches
+whose divergent writes persist in their own buckets (2); and branch-aware
+retention — a durable branch pins its fork with a checkpoint so the parent keeps
+its fork history across restarts and aggressive GC, with `delete_branch`
+releasing the pin (3). Slice 4 (branch-of-branch; bucket-drop on delete)
+designed. This document specifies copy-on-write
 **branches** (Neon-/git-style: an O(1) fork off a version point, history shared
 with the parent, divergent writes isolated) and read-only **time travel** (`AS
 OF` a past version) for trine-kv.
@@ -135,18 +137,37 @@ re-pinned — today the caller must keep enough retention
 `delete_branch` (needs a bucket-drop primitive) and a branch of a branch (the
 registry already carries the fork; the read path would walk the ancestor chain).
 
-### Slice 3 — branch-aware retention & compaction
+### Slice 3 — branch-aware retention (done)
 
-The retained-history floor becomes the **min over the live set**: `min(PITR
-window, every child branch's fork_sequence)` — a parent cannot GC history any
-child still forks from (Neon's `retain_lsn` set). Compaction runs per layer-set;
-shared ancestor layers compact under the pinned floor.
+The parent must keep the history a branch reads through (everything at or below
+its fork), or a durable branch breaks across a restart or under aggressive GC.
+Again this is achieved by composition rather than a new GC subsystem: the
+retained-history floor already drops to the **oldest checkpoint**
+(`oldest_retained_sequence = min(active snapshots, configured window, oldest
+checkpoint)`), and checkpoints are durable manifest metadata. So a durable
+branch **pins its fork with a checkpoint** at create time; the parent's GC then
+cannot reclaim that history while the branch lives, even across restarts and
+with `keep_last_read_versions = 1`. `delete_branch` deletes the checkpoint,
+releasing the pin so the parent can GC again. The one engine addition is a small
+generic primitive, `Db::create_checkpoint_at_sync(name, version)` — checkpoint a
+specific retained past version, not just the latest (the underlying manifest
+already accepted an arbitrary sequence) — which is useful on its own (anchor any
+PITR point) and keeps branching a composition layer with no hot-path change.
 
-### Slice 4 — branch lifecycle
+This realizes the "min over the live set" retain-set (Neon's `retain_lsn`)
+without a bespoke GC pass: each live branch contributes one checkpoint, and the
+floor is already their minimum. Per-branch compaction is automatic because each
+branch's data is its own buckets (slice 2).
 
-Branch delete (drop a layer-set, release its fork pin so the parent floor can
-advance) and the semantics of merge/reset (likely left to the application layer;
-the KV exposes the version primitives, trinedb decides merge policy).
+### Slice 4 — lifecycle completion & nesting
+
+`delete_branch` already releases the fork pin and forgets the branch (slice 3);
+what remains is **reclaiming its data buckets** (needs a bucket-drop primitive,
+which the KV does not yet expose) so a deleted branch leaves no garbage, and a
+**branch of a branch**: the registry already records the fork, so the read path
+would walk the ancestor chain (child bucket → parent branch bucket → … → root @
+the pinned fork). Merge/reset semantics are left to the application layer
+(trinedb decides merge policy; the KV exposes the version primitives).
 
 ## trinedb projection (out of scope here, for context)
 

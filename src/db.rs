@@ -3511,8 +3511,40 @@ impl Db {
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
-
         let sequence = self.last_committed_sequence();
+        self.record_checkpoint(name, sequence)?;
+        Ok(ReadVersion::from_sequence(sequence))
+    }
+
+    /// Creates a named checkpoint pinning a specific past `version` rather than
+    /// the latest committed one. The version must still be retained; it is pinned
+    /// for the duration of recording the checkpoint so it cannot be reclaimed
+    /// between the check and the write. Use this to anchor an arbitrary
+    /// point-in-time (a database branch pins its fork this way).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`] if the handle is closed, [`Error::ReadOnly`] if
+    /// the handle cannot mutate metadata, [`Error::InvalidOptions`] for an empty
+    /// name, [`Error::CheckpointAlreadyExists`] when `name` already exists, or a
+    /// read-version error if `version` is newer than the latest committed version
+    /// or older than the retained-history floor.
+    pub fn create_checkpoint_at_sync(&self, name: &str, version: ReadVersion) -> Result<()> {
+        self.ensure_open()?;
+        validate_checkpoint_name(name)?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+        // Validate `version` is readable and pin it so it cannot be reclaimed
+        // between the check and recording the checkpoint.
+        let _pin = self.snapshot_at(version)?;
+        self.record_checkpoint(name, version.to_sequence())
+    }
+
+    /// Records a checkpoint pinning `sequence`, in the manifest (persistent) or
+    /// the in-memory registry. Shared by [`Self::create_checkpoint_sync`] and
+    /// [`Self::create_checkpoint_at_sync`].
+    fn record_checkpoint(&self, name: &str, sequence: Sequence) -> Result<()> {
         if let Some(manifest) = &self.inner.manifest {
             manifest
                 .lock()
@@ -3530,8 +3562,7 @@ impl Db {
                 });
             }
         }
-
-        Ok(ReadVersion::from_sequence(sequence))
+        Ok(())
     }
 
     /// Deletes a named checkpoint.

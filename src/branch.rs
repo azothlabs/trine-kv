@@ -21,11 +21,15 @@
 //!   never enter the parent's trees, so branch activity cannot perturb the
 //!   parent's compaction or read amplification.
 //!
+//! A durable branch pins its fork with a durable checkpoint, so the parent keeps
+//! the branch's fork history — and the branch stays openable — across restarts
+//! and aggressive retention, with no manual retention configuration, until
+//! [`Db::delete_branch`] releases the pin.
+//!
 //! Scope: branches are single-level (forked from the database's own lineage; a
-//! branch of a branch is a later slice). A durable branch pins its fork only
-//! while a handle is open; making the parent's retention floor respect every
-//! branch's fork across restarts (so an idle durable branch cannot lose its base)
-//! is the branch-aware-retention slice (`docs/branching.md`).
+//! branch of a branch is a later slice). [`Db::delete_branch`] releases a
+//! branch's fork pin and forgets it, but its data buckets are reclaimed only
+//! once a bucket-drop primitive exists (a later slice).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
@@ -384,6 +388,13 @@ fn persist_registry(db: &Db, name: &str, entry: &RegistryEntry) -> Result<()> {
         .put_sync(name.as_bytes().to_vec(), entry.encode())
 }
 
+/// The checkpoint name pinning a durable branch's fork. A checkpoint is durable
+/// metadata that the retained-history floor and GC respect, so the parent keeps
+/// the branch's fork history across restarts.
+fn fork_checkpoint(branch: &str) -> String {
+    format!("{RESERVED}fork{SEP}{branch}")
+}
+
 impl Db {
     /// Forks an **ephemeral** copy-on-write [`Branch`] from a past `version` — an
     /// `AS OF` read view with an in-memory write overlay that vanishes with the
@@ -417,13 +428,16 @@ impl Db {
     /// Creating an existing name with the same fork is idempotent; with a
     /// different fork it is an error.
     ///
+    /// The fork is pinned with a durable checkpoint, so the parent keeps the
+    /// branch's fork history — and the branch stays openable — across restarts
+    /// and aggressive retention, until the branch is deleted (no manual retention
+    /// configuration needed).
+    ///
     /// # Errors
     ///
     /// Returns an error if `from` is not a readable version, if the name already
-    /// exists with a different fork, or if persisting the registry entry fails.
+    /// exists with a different fork, or if persisting the branch fails.
     pub fn create_branch(&self, name: &str, from: ReadVersion) -> Result<()> {
-        // Validate the fork is readable (retained and not in the future).
-        let _ = self.snapshot_at(from)?;
         if let Some(existing) = self.read_registry(name)? {
             if existing.fork == from {
                 return Ok(());
@@ -431,6 +445,13 @@ impl Db {
             return Err(Error::invalid_options(
                 "branch already exists with a different fork version",
             ));
+        }
+        // Pin the fork durably (this also validates `from` is readable). The
+        // checkpoint lives in the manifest, so the parent's GC cannot reclaim the
+        // history the branch reads through, even after a restart.
+        match self.create_checkpoint_at_sync(&fork_checkpoint(name), from) {
+            Ok(()) | Err(Error::CheckpointAlreadyExists { .. }) => {}
+            Err(error) => return Err(error),
         }
         persist_registry(
             self,
@@ -478,6 +499,31 @@ impl Db {
             })?);
         }
         Ok(names)
+    }
+
+    /// Deletes a durable branch: releases its fork pin (so the parent can again
+    /// GC that history) and forgets the branch, so it can no longer be opened.
+    ///
+    /// The branch's data buckets are left in place for now (a bucket-drop
+    /// primitive is a later slice); they become unreachable once the branch is
+    /// gone. Deleting a branch that does not exist is an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the branch does not exist or if releasing its state
+    /// fails.
+    pub fn delete_branch(&self, name: &str) -> Result<()> {
+        if self.read_registry(name)?.is_none() {
+            return Err(Error::invalid_options("no such branch"));
+        }
+        // Release the fork pin (the checkpoint may be absent if a prior delete was
+        // interrupted after this step — tolerate that).
+        match self.delete_checkpoint_sync(&fork_checkpoint(name)) {
+            Ok(()) | Err(Error::CheckpointNotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        self.bucket_sync(registry_bucket())?
+            .delete_sync(name.as_bytes().to_vec())
     }
 
     fn read_registry(&self, name: &str) -> Result<Option<RegistryEntry>> {
@@ -629,15 +675,14 @@ mod tests {
     }
 
     #[test]
-    fn durable_branch_survives_reopen() {
+    fn durable_branch_survives_reopen_with_default_retention() {
         let dir = std::env::temp_dir().join(format!("trine-branch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        // A durable branch's fork must stay retained across restart for the parent
-        // fall-through to resolve. Until branch-aware retention (slice 3) pins
-        // forks automatically, configure a retention window that covers them.
-        let opts = || crate::DbOptions::new(&dir).with_keep_last_read_versions(64);
+        // Default retention keeps only the latest version, yet the branch's fork
+        // checkpoint pins its fork history durably — so it reopens with no manual
+        // retention configuration (slice 3).
         {
-            let db = Db::open_sync(opts()).expect("open");
+            let db = Db::open_sync(&dir).expect("open");
             let bucket = db.bucket_sync("data").expect("bucket");
             bucket
                 .put_sync(b"k".to_vec(), b"parent".to_vec())
@@ -648,12 +693,75 @@ mod tests {
             dev.put("data", b"k", b"dev".to_vec()).expect("put");
             db.flush_sync().expect("flush");
         }
-        // Reopen: the durable branch and its writes survive.
-        let db = Db::open_sync(opts()).expect("reopen");
+        // Reopen: the durable branch, its fork, and its writes all survive.
+        let db = Db::open_sync(&dir).expect("reopen");
         assert_eq!(db.list_branches().expect("list"), vec!["dev".to_string()]);
         let dev = db.open_branch("dev").expect("open after reopen");
         assert_eq!(dev.get("data", b"k").expect("get"), Some(b"dev".to_vec()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn durable_branch_fork_is_pinned_against_aggressive_gc() {
+        // keep_last_read_versions(1) retains only the latest version, so without a
+        // pin the fork would expire after the next parent write.
+        let db = Db::open_sync(DbOptions::memory().with_keep_last_read_versions(1)).expect("open");
+        let bucket = db.bucket_sync("data").expect("bucket");
+        bucket
+            .put_sync(b"k".to_vec(), b"forked".to_vec())
+            .expect("seed");
+        db.create_branch("dev", db.latest_read_version())
+            .expect("create");
+
+        // Hammer the parent well past the fork; the fork checkpoint keeps that
+        // history retained.
+        for i in 0..50 {
+            bucket
+                .put_sync(b"k".to_vec(), format!("v{i}").into_bytes())
+                .expect("churn");
+        }
+
+        let dev = db.open_branch("dev").expect("fork still openable");
+        assert_eq!(
+            dev.get("data", b"k").expect("get"),
+            Some(b"forked".to_vec()),
+            "the branch still reads its fork value despite aggressive parent GC"
+        );
+    }
+
+    #[test]
+    fn delete_branch_releases_the_fork_pin() {
+        let db = Db::open_sync(DbOptions::memory().with_keep_last_read_versions(1)).expect("open");
+        let bucket = db.bucket_sync("data").expect("bucket");
+        bucket
+            .put_sync(b"k".to_vec(), b"forked".to_vec())
+            .expect("seed");
+        let fork = db.latest_read_version();
+        db.create_branch("dev", fork).expect("create");
+
+        // While the branch lives, the fork stays pinned even past parent writes.
+        bucket
+            .put_sync(b"k".to_vec(), b"after".to_vec())
+            .expect("write");
+        assert!(
+            db.branch_at(fork).is_ok(),
+            "fork pinned while branch exists"
+        );
+
+        db.delete_branch("dev").expect("delete");
+        assert!(
+            db.open_branch("dev").is_err(),
+            "deleted branch cannot be opened"
+        );
+        // The pin is released: with only the latest retained, a further write
+        // pushes the floor past the fork, which is now expired.
+        bucket
+            .put_sync(b"k".to_vec(), b"later".to_vec())
+            .expect("write");
+        assert!(
+            db.branch_at(fork).is_err(),
+            "the fork is no longer pinned after the branch is deleted"
+        );
     }
 
     #[test]
