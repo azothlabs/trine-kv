@@ -29,12 +29,10 @@
 //! Branches nest: [`Db::create_branch_from`] forks a branch off another branch,
 //! and a read walks the whole ancestor chain (branch → parent branch → … → root),
 //! each ancestor seen frozen at the version its child forked it. This is the
-//! git-style DAG. [`Db::delete_branch`] releases a branch's fork pin, clears its
-//! divergent data (so the space is reclaimed and a same-named branch starts
-//! clean), and forgets it; it refuses while the branch still has children (they
-//! read through it). The now-empty data-bucket shells are removed only once the
-//! KV gains a bucket-drop primitive (a later slice), but they hold no data and
-//! are never read after the branch is gone.
+//! git-style DAG. [`Db::delete_branch`] releases a branch's fork pin, drops its
+//! divergent data buckets via [`Db::drop_bucket`] (reclaiming the space; on a
+//! backend without bucket-drop it clears them instead), and forgets it; it
+//! refuses while the branch still has children (they read through it).
 //!
 //! [`Branch::range`] is a lazy [`BranchRange`] iterator: the branch level, each
 //! ancestor, and the root are streamed from their own sorted scans and k-way
@@ -760,12 +758,19 @@ impl Db {
             Ok(()) | Err(Error::CheckpointNotFound { .. }) => {}
             Err(error) => return Err(error),
         }
-        // Reclaim the branch's divergent data: clear each data bucket it wrote, so
-        // the space is recovered by compaction and a same-named branch created
-        // later does not inherit stale rows.
+        // Reclaim the branch's divergent data: drop each data bucket it wrote.
+        // On a backend without bucket-drop, fall back to clearing the contents so
+        // a same-named branch created later does not inherit stale rows (the empty
+        // shell remains there).
         for user_bucket in &entry.written_buckets {
-            self.bucket_sync(data_bucket(name, user_bucket))?
-                .delete_range_sync(KeyRange::all())?;
+            let data = data_bucket(name, user_bucket);
+            match self.drop_bucket_sync(data.clone()) {
+                Ok(()) => {}
+                Err(Error::UnsupportedBackend { .. }) => {
+                    self.bucket_sync(data)?.delete_range_sync(KeyRange::all())?;
+                }
+                Err(error) => return Err(error),
+            }
         }
         self.bucket_sync(registry_bucket())?
             .delete_sync(name.as_bytes().to_vec())
@@ -1181,5 +1186,63 @@ mod tests {
             None,
             "the deleted branch's data was cleared, not inherited"
         );
+    }
+
+    #[test]
+    fn drop_bucket_removes_it_in_memory() {
+        let db = memory_db();
+        let bucket = db.bucket_sync("scratch").expect("bucket");
+        bucket.put_sync(b"k".to_vec(), b"v".to_vec()).expect("put");
+
+        db.drop_bucket_sync("scratch").expect("drop");
+        assert!(
+            db.drop_bucket_sync("scratch").is_err(),
+            "dropping a gone bucket errors"
+        );
+        assert!(
+            db.drop_bucket_sync("default").is_err(),
+            "the default bucket cannot be dropped"
+        );
+
+        // Recreating the name yields a fresh, empty bucket.
+        let fresh = db.bucket_sync("scratch").expect("recreate");
+        assert_eq!(fresh.get_sync(b"k").expect("get"), None);
+    }
+
+    #[test]
+    fn drop_bucket_persists_across_reopen() {
+        let dir = std::env::temp_dir().join(format!("trine-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let db = Db::open_sync(&dir).expect("open");
+            db.bucket_sync("scratch")
+                .expect("scratch")
+                .put_sync(b"k".to_vec(), b"v".to_vec())
+                .expect("put");
+            db.bucket_sync("keep")
+                .expect("keep")
+                .put_sync(b"k".to_vec(), b"keep".to_vec())
+                .expect("put");
+            db.drop_bucket_sync("scratch").expect("drop");
+        }
+        // Reopen: the dropped bucket is gone (recreates empty); the other survives.
+        let db = Db::open_sync(&dir).expect("reopen");
+        assert_eq!(
+            db.bucket_sync("scratch")
+                .expect("scratch")
+                .get_sync(b"k")
+                .expect("get"),
+            None,
+            "dropped bucket did not come back with its data"
+        );
+        assert_eq!(
+            db.bucket_sync("keep")
+                .expect("keep")
+                .get_sync(b"k")
+                .expect("get"),
+            Some(b"keep".to_vec()),
+            "an untouched bucket survives the drop"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

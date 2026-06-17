@@ -601,6 +601,33 @@ impl ManifestStore {
         self.publish_next_state(next_state)?.published_or_err()
     }
 
+    /// Removes a bucket and its table list, marking the bucket's blob files for
+    /// deletion at `pending_deletion_sequence`. The caller retires the bucket's
+    /// table files separately (they are refcount-guarded). Errors if the bucket
+    /// does not exist.
+    pub fn drop_bucket(
+        &mut self,
+        name: &str,
+        pending_blob_deletions: Vec<u64>,
+        pending_deletion_sequence: Sequence,
+    ) -> Result<()> {
+        if !self.state.buckets.contains_key(name) {
+            return Err(Error::invalid_options(
+                "cannot drop a bucket that does not exist",
+            ));
+        }
+        let mut next_state = self.state.clone();
+        next_state.buckets.remove(name);
+        next_state.tables.remove(name);
+        for file_id in pending_blob_deletions {
+            next_state
+                .pending_blob_deletions
+                .entry(file_id)
+                .or_insert(pending_deletion_sequence);
+        }
+        self.publish_next_state(next_state)?.published_or_err()
+    }
+
     #[allow(dead_code)]
     pub(crate) async fn create_bucket_async(
         &mut self,

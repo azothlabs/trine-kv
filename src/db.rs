@@ -1815,6 +1815,88 @@ impl Db {
         Ok(Bucket::new(self.clone(), name, bucket_options, state))
     }
 
+    /// Drops a named bucket, removing it from the database and reclaiming its
+    /// storage. Existing [`Bucket`] handles or snapshots that still reference the
+    /// bucket's tables keep working until dropped (file deletion is deferred while
+    /// any reference remains), but no new handle can open it.
+    ///
+    /// Supported on in-memory and native filesystem databases. Object-store and
+    /// other host backends return [`Error::UnsupportedBackend`] (their remote file
+    /// reclamation is not driven from here).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`] if the handle is closed, [`Error::ReadOnly`] if
+    /// read-only, [`Error::InvalidOptions`] for the default bucket or a bucket
+    /// that does not exist, or [`Error::UnsupportedBackend`] on an unsupported
+    /// backend.
+    pub fn drop_bucket_sync(&self, name: impl Into<BucketName>) -> Result<()> {
+        self.ensure_open()?;
+        let name = name.into();
+        if name.as_str() == DEFAULT_BUCKET_NAME {
+            return Err(Error::invalid_options(
+                "the default bucket cannot be dropped",
+            ));
+        }
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+        match &self.inner.options.storage_mode {
+            StorageMode::InMemory => {
+                let removed = self
+                    .inner
+                    .buckets
+                    .write()
+                    .map_err(|_| lock_poisoned("bucket registry"))?
+                    .remove(name.as_str());
+                if removed.is_none() {
+                    return Err(Error::invalid_options(
+                        "cannot drop a bucket that does not exist",
+                    ));
+                }
+                Ok(())
+            }
+            StorageMode::Persistent { path } => {
+                let path = path.clone();
+                // Flush first so the bucket has no unflushed WAL records that
+                // recovery would replay into a now-missing bucket (this also
+                // advances the WAL replay floor past them).
+                self.flush_sync()?;
+                let removed = self
+                    .inner
+                    .buckets
+                    .write()
+                    .map_err(|_| lock_poisoned("bucket registry"))?
+                    .remove(name.as_str());
+                let Some(tree) = removed else {
+                    return Err(Error::invalid_options(
+                        "cannot drop a bucket that does not exist",
+                    ));
+                };
+                let tables = tree.tables_snapshot()?;
+                let blob_ids: Vec<u64> = tables
+                    .iter()
+                    .flat_map(|table| table.blob_file_ids())
+                    .collect();
+                let sequence = self.last_committed_sequence();
+                if let Some(manifest) = &self.inner.manifest {
+                    manifest
+                        .lock()
+                        .map_err(|_| lock_poisoned("manifest store"))?
+                        .drop_bucket(name.as_str(), blob_ids, sequence)?;
+                }
+                // Retire the bucket's table files (deferred while readers hold a
+                // reference) and its now-orphaned blob files.
+                self.retire_obsolete_table_files(&path, tables)?;
+                self.cleanup_pending_obsolete_blob_files(&path)?;
+                Ok(())
+            }
+            StorageMode::HostPersistent { .. } => Err(Error::unsupported_backend(
+                "dropping a bucket is not supported on this backend",
+            )),
+        }
+    }
+
     async fn bucket_with_options_object_store_async(
         &self,
         name: BucketName,
