@@ -1897,6 +1897,48 @@ impl Db {
         }
     }
 
+    /// Drops a named bucket, reclaiming its storage — the async form that also
+    /// supports object-store databases. In-memory and native databases delegate
+    /// to [`Db::drop_bucket_sync`]; an object-store database removes the bucket
+    /// from the manifest (a CAS publish) so its table and blob objects become
+    /// orphans, then reclaims them with snapshot-safe orphan GC.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Closed`] if the handle is closed, [`Error::ReadOnly`] if
+    /// read-only, [`Error::InvalidOptions`] for the default bucket or a missing
+    /// bucket, or a storage/`ObjectClient` error from the manifest CAS.
+    pub async fn drop_bucket(&self, name: impl Into<BucketName>) -> Result<()> {
+        self.ensure_open()?;
+        let name = name.into();
+        if name.as_str() == DEFAULT_BUCKET_NAME {
+            return Err(Error::invalid_options(
+                "the default bucket cannot be dropped",
+            ));
+        }
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+        if !self.inner.options.storage_mode.is_object_store_persistent() {
+            // In-memory / native: the synchronous path is correct from here.
+            return self.drop_bucket_sync(name);
+        }
+        // Object store: remove the bucket from the manifest via CAS; its table and
+        // blob objects are now unreferenced and reclaimed by orphan GC.
+        let (mut object, _serialize) = self.checkout_object_manifest().await?;
+        object.drop_bucket(name.as_str().to_owned()).await?;
+        self.install_object_manifest(object)?;
+        self.inner
+            .buckets
+            .write()
+            .map_err(|_| lock_poisoned("bucket registry"))?
+            .remove(name.as_str());
+        // Reclaim the now-orphaned objects (best effort: the bucket is already
+        // logically dropped; periodic orphan GC also collects them).
+        let _ = self.cleanup_object_store_orphans_async().await;
+        Ok(())
+    }
+
     async fn bucket_with_options_object_store_async(
         &self,
         name: BucketName,
@@ -9776,6 +9818,66 @@ mod tests {
         assert_eq!(
             db.get_sync(b"k").expect("get after gc").as_deref(),
             Some(b"v".as_slice())
+        );
+    }
+
+    #[test]
+    fn drop_bucket_reclaims_objects_on_object_store() {
+        use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+        let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+        let db = block_on_test_future(Db::open_object_store(
+            Arc::clone(&client),
+            DbOptions::object_store(),
+        ))
+        .expect("open object-store database");
+
+        // A "scratch" bucket with a flushed table object, plus a "keep" bucket.
+        let scratch = block_on_test_future(db.bucket("scratch")).expect("scratch");
+        scratch.put_sync(b"k", b"v").expect("put scratch");
+        let keep = block_on_test_future(db.bucket("keep")).expect("keep");
+        keep.put_sync(b"k", b"keep").expect("put keep");
+        block_on_test_future(db.flush()).expect("flush");
+        drop(scratch);
+        drop(keep);
+
+        block_on_test_future(db.drop_bucket("scratch")).expect("drop scratch");
+
+        // drop_bucket already reclaimed scratch's now-orphaned objects, so a
+        // follow-up orphan GC finds nothing.
+        assert_eq!(
+            block_on_test_future(db.cleanup_object_store_orphans_async()).expect("gc"),
+            0,
+            "drop_bucket collected the dropped bucket's objects"
+        );
+
+        // scratch reopens empty; keep survives, including across a reopen.
+        assert_eq!(
+            block_on_test_future(db.bucket("scratch"))
+                .expect("scratch")
+                .get_sync(b"k")
+                .expect("get"),
+            None
+        );
+        drop(db);
+        let db = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+            .expect("reopen");
+        assert_eq!(
+            block_on_test_future(db.bucket("scratch"))
+                .expect("scratch")
+                .get_sync(b"k")
+                .expect("get"),
+            None,
+            "dropped bucket stays gone across reopen"
+        );
+        assert_eq!(
+            block_on_test_future(db.bucket("keep"))
+                .expect("keep")
+                .get_sync(b"k")
+                .expect("get")
+                .as_deref(),
+            Some(b"keep".as_slice()),
+            "an untouched bucket survives the drop"
         );
     }
 

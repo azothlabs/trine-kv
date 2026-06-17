@@ -308,6 +308,24 @@ impl<C: ObjectClient> ObjectManifestStore<C> {
         .await
     }
 
+    /// Drop a bucket and its table list, CAS-published with rebase-retry. The
+    /// bucket's now-unreferenced table and blob objects are reclaimed by the
+    /// object-store orphan GC (no explicit blob marking needed).
+    pub(crate) async fn drop_bucket(&mut self, name: String) -> Result<()> {
+        self.commit_edit(|state| {
+            if !state.buckets.contains_key(&name) {
+                return Err(Error::invalid_options(
+                    "cannot drop a bucket that does not exist",
+                ));
+            }
+            let mut next_state = state.clone();
+            next_state.buckets.remove(&name);
+            next_state.tables.remove(&name);
+            Ok(Some(next_state))
+        })
+        .await
+    }
+
     /// Create a named checkpoint pin, CAS-published with rebase-retry.
     pub(crate) async fn create_checkpoint(
         &mut self,

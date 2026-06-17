@@ -7,10 +7,10 @@ retention — a durable branch pins its fork with a checkpoint so the parent kee
 its fork history across restarts and aggressive GC, with `delete_branch`
 releasing the pin (3); and branch-of-branch — the git-style DAG, where a branch
 reads through its whole ancestor chain (4). `delete_branch` drops a branch's
-divergent data buckets (via the new `Db::drop_bucket`), `range` is a lazy
-merging iterator, and on in-memory/native databases branching is feature
-complete; the object-store/host backends fall back to clearing branch data
-(their remote bucket-drop is future work). This document specifies copy-on-write
+divergent data buckets (via the new `Db::drop_bucket` / `drop_bucket_sync`,
+which reclaim storage on in-memory, native, and object-store databases), and
+`range` is a lazy merging iterator; only the non-object-store host and browser
+backends still lack bucket-drop. This document specifies copy-on-write
 **branches** (Neon-/git-style: an O(1) fork off a version point, history shared
 with the parent, divergent writes isolated) and read-only **time travel** (`AS
 OF` a past version) for trine-kv.
@@ -175,23 +175,29 @@ merges the chain root-first so the leaf wins. Each level's fork is pinned by its
 own checkpoint, so the whole chain stays readable; `delete_branch` refuses while
 a branch still has children (a child reads through the parent's pinned history).
 
-**Bucket-drop (done):** the KV now exposes `Db::drop_bucket_sync` — it removes a
-bucket from the in-memory registry and (on a native database) from the manifest,
-then retires the bucket's SSTable files and marks its blob files for deletion.
-File deletion is **refcount-guarded** (`Arc::strong_count == 1`), so a reader
-still holding the bucket's tables keeps working and the files are freed only once
-no reference remains; a `flush_sync` first advances the WAL replay floor so
-recovery never replays into a dropped bucket. Object-store/host backends return
-`UnsupportedBackend` (remote reclamation is future work). `delete_branch` uses
-it to drop a deleted branch's data buckets outright (falling back to clearing on
-unsupported backends).
+**Bucket-drop (done):** the KV exposes `Db::drop_bucket_sync` (in-memory and
+native) and `Db::drop_bucket` (async, adds object store). On a **native**
+database it removes the bucket from the registry and the manifest, then retires
+the bucket's SSTable files and marks its blob files for deletion — file deletion
+is **refcount-guarded** (`Arc::strong_count == 1`), so a reader still holding the
+bucket's tables keeps working and the files are freed only once no reference
+remains; a `flush_sync` first advances the WAL replay floor so recovery never
+replays into a dropped bucket. On an **object-store** database it removes the
+bucket from the manifest via a CAS publish, which makes the bucket's table and
+blob objects unreferenced, then reclaims them with the existing snapshot-safe
+**orphan GC** (`cleanup_object_store_orphans_async`) — no manual object deletion.
+Non-object-store host and browser backends return `UnsupportedBackend` (their
+reclamation needs backend-specific work). `delete_branch` uses the sync drop to
+remove a deleted branch's data buckets outright, falling back to clearing on
+backends without a sync drop.
 
 **`range` is lazy (done):** a [`BranchRange`] k-way-merges the chain's sorted
 scans on the fly instead of materializing a map.
 
-**Remaining:** bucket-drop on the object-store/host backends (remote file
-reclamation). Merge/reset semantics stay at the application layer (trinedb
-decides merge policy; the KV exposes the version primitives).
+**Remaining:** bucket-drop on the non-object-store host and browser backends
+(each needs its own file-reclamation path). Merge/reset semantics stay at the
+application layer (trinedb decides merge policy; the KV exposes the version
+primitives).
 
 ## trinedb projection (out of scope here, for context)
 
