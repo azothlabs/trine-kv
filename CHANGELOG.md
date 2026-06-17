@@ -2,6 +2,22 @@
 
 All public crate releases use Semantic Versioning.
 
+## 0.5.2 - 2026-06-17
+
+Additive release for embedders that branch from a higher layer. No hot-path or
+storage-format change; fully compatible with `0.5.0`/`0.5.1`.
+
+### Added
+
+- **`Db::branch_info`** and **`BranchInfo`** (`fork()`, `parent()`): returns a
+  durable branch's fork `ReadVersion` and parent branch without assembling a
+  read chain or opening a data bucket. This lets a higher layer that stores its
+  own divergent data (e.g. an engine whose writes must commit as one atomic
+  multi-bucket batch, which the per-key `Branch` overlay cannot express) reuse
+  the durable branch lifecycle this crate manages — the fork checkpoint that
+  survives restarts and aggressive GC, the registry, and nesting — while doing
+  its own `snapshot_at` fall-through and walking its own ancestry.
+
 ## 0.5.1 - 2026-06-17
 
 Branching release. Adds copy-on-write branches, durable named branches,
