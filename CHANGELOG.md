@@ -2,6 +2,62 @@
 
 All public crate releases use Semantic Versioning.
 
+## 0.5.1 - 2026-06-17
+
+Branching release. Adds copy-on-write branches, durable named branches,
+branch-of-branch nesting, fork-retention pinning, and a bucket-drop primitive
+across all backends. No hot-path or storage-format change; databases written by
+`0.5.0` are fully compatible.
+
+### Added
+
+- **Copy-on-write branches** (`Db::branch_at`, `Db::branch_from_latest`): fork
+  from any pinned snapshot in O(1) (no data copied) with an in-memory overlay
+  for divergent writes. Reads fall through to the frozen parent snapshot; the
+  parent is unaffected. Supports time travel by forking at any retained version.
+- **Durable named branches** (`Db::create_branch`, `open_branch`,
+  `list_branches`): stores divergent writes in per-branch reserved buckets,
+  reusing the existing `LsmTree` machinery for durability, compaction, and
+  recovery with no manifest or WAL change and no hot-path overhead. Deletes are
+  tombstone-tagged so a branch can hide a parent key without a parent write.
+  Branch-level activity cannot affect the parent's compaction or read
+  amplification because branch data lives in its own buckets.
+- **Branch-of-branch nesting** (`Db::create_branch_from`): durable branches can
+  fork from other branches, forming a git-style DAG. The registry records each
+  branch's parent; `open_branch` assembles a leaf-first read chain where each
+  ancestor is frozen at the version its child forked it. `delete_branch` refuses
+  while a branch still has live children.
+- **Fork-retention pinning**: a durable branch creates a checkpoint at fork time,
+  so the parent's GC retains the history the branch reads across restarts and
+  with `keep_last_read_versions = 1`. `delete_branch` removes the checkpoint to
+  release the pin. No new GC subsystem; reuses the existing retained-history
+  floor.
+- **`Branch::range`** is now a lazy k-way merge iterator: streams the branch,
+  each ancestor (frozen at its fork version), and the root in sorted order
+  without materializing an intermediate `BTreeMap`.
+- **`Db::drop_bucket_sync` / `Db::drop_bucket`**: removes a bucket and reclaims
+  its storage. `drop_bucket_sync` covers in-memory and native backends (flushes,
+  advances the WAL replay floor so recovery never replays into a dropped bucket,
+  retires SSTable and blob files, refcount-guarded so active readers keep working
+  until they drop). `drop_bucket` adds object-store support (CAS publish removes
+  the bucket from the manifest; orphan GC reclaims unreferenced objects) and
+  browser/WASI support (WASI routes through the native path; browser publishes
+  the bucket removal to the IndexedDB-backed manifest and retires blob files via
+  async cleanup). Bucket-drop now covers every backend.
+- `delete_branch` drops a deleted branch's data buckets outright (falling back to
+  clearing on unsupported backends), so a deleted branch leaves no garbage and a
+  same-named branch created later starts clean.
+- `Db::create_checkpoint_at_sync(name, version)`: checkpoint a specific retained
+  past version (used internally by branch-fork pinning; `create_checkpoint_sync`
+  is refactored to a special case).
+
+### Fixed
+
+- `delete_branch` previously left stale rows in the branch's data buckets; a
+  same-named branch would inherit them. Now `delete_range` clears each written
+  bucket so space is reclaimed by compaction and correctness is preserved.
+- Dead-code warning for `durability_is_strict` on non-macOS targets.
+
 ## 0.5.0 - 2026-06-15
 
 Performance, durability, and space-reclamation release. It adds guard-aware
