@@ -62,6 +62,37 @@ fn data_bucket(branch: &str, user_bucket: &str) -> String {
     format!("{RESERVED}{branch}{SEP}{user_bucket}")
 }
 
+/// A durable branch's lineage: the global version it forked at and its parent
+/// branch (`None` = forked from the root lineage). Returned by
+/// [`Db::branch_info`] for a higher layer that manages its **own** divergent
+/// storage (e.g. a SQL/document engine whose writes must be one atomic
+/// multi-bucket batch) and only needs the fork point — to read the parent
+/// through [`Db::snapshot_at`] — and the parent link — to walk a nested branch's
+/// ancestry — while still relying on the durable fork pin, registry, and nesting
+/// this crate maintains.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchInfo {
+    fork: ReadVersion,
+    parent: Option<String>,
+}
+
+impl BranchInfo {
+    /// The global version this branch forked at. Read the parent's state as of
+    /// this version (via [`Db::snapshot_at`]) to resolve a branch read that the
+    /// branch's own storage does not hold (the fall-through).
+    #[must_use]
+    pub const fn fork(&self) -> ReadVersion {
+        self.fork
+    }
+
+    /// The parent branch's name, or `None` when this branch forked the root
+    /// lineage. Walk it to assemble a nested branch's ancestor chain.
+    #[must_use]
+    pub fn parent(&self) -> Option<&str> {
+        self.parent.as_deref()
+    }
+}
+
 /// A durable branch's persisted metadata: where it forked, the parent branch it
 /// forked from (`None` = the root lineage), and which user buckets it has written
 /// (so a read need not touch — or create — a data bucket the branch never wrote).
@@ -776,6 +807,28 @@ impl Db {
             .delete_sync(name.as_bytes().to_vec())
     }
 
+    /// Returns a durable branch's lineage (its fork version and parent branch),
+    /// or `None` when no such branch exists — without assembling a read chain or
+    /// opening any data bucket.
+    ///
+    /// This lets a higher layer reuse this crate's durable branch lifecycle (the
+    /// fork pin that survives restarts and aggressive GC, the registry, and
+    /// nesting) while storing its **own** divergent data and doing its own
+    /// fall-through reads against [`Db::snapshot_at`] of the returned
+    /// [`BranchInfo::fork`]. Combine with [`Db::create_branch`] /
+    /// [`Db::create_branch_from`] / [`Db::list_branches`] / [`Db::delete_branch`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the registry cannot be read or a stored entry is
+    /// malformed.
+    pub fn branch_info(&self, name: &str) -> Result<Option<BranchInfo>> {
+        Ok(self.read_registry(name)?.map(|entry| BranchInfo {
+            fork: entry.fork,
+            parent: entry.parent,
+        }))
+    }
+
     fn read_registry(&self, name: &str) -> Result<Option<RegistryEntry>> {
         match self
             .bucket_sync(registry_bucket())?
@@ -1186,6 +1239,26 @@ mod tests {
             None,
             "the deleted branch's data was cleared, not inherited"
         );
+    }
+
+    #[test]
+    fn branch_info_exposes_fork_and_parent_without_opening_data() {
+        let db = Db::open_sync(DbOptions::memory().with_keep_last_read_versions(64)).expect("open");
+        db.bucket_sync("data").expect("bucket");
+        assert!(
+            db.branch_info("missing").expect("info").is_none(),
+            "an unknown branch has no lineage"
+        );
+
+        let fork = db.latest_read_version();
+        db.create_branch("a", fork).expect("create a");
+        let a = db.branch_info("a").expect("info").expect("a present");
+        assert_eq!(a.fork(), fork, "exposes the fork version for fall-through");
+        assert_eq!(a.parent(), None, "a forked the root lineage");
+
+        db.create_branch_from("b", "a").expect("create b");
+        let b = db.branch_info("b").expect("info").expect("b present");
+        assert_eq!(b.parent(), Some("a"), "exposes the parent for nesting");
     }
 
     #[test]
