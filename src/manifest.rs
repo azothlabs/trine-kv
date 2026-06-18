@@ -29,7 +29,7 @@ use crate::storage::BrowserStorageBackend;
 
 pub const MANIFEST_FILE_NAME: &str = "MANIFEST";
 const MANIFEST_MAGIC: u32 = 0x5452_4d46;
-const MANIFEST_VERSION: u16 = 11;
+const MANIFEST_VERSION: u16 = 12;
 // Clean break: only the current manifest format is read. Older on-disk manifests
 // are rejected rather than decoded through version-gated fallbacks.
 const MIN_SUPPORTED_MANIFEST_VERSION: u16 = MANIFEST_VERSION;
@@ -45,6 +45,12 @@ pub struct ManifestState {
     tables: BTreeMap<String, Vec<TableProperties>>,
     pending_blob_deletions: BTreeMap<u64, Sequence>,
     checkpoints: BTreeMap<String, Sequence>,
+    /// The fencing epoch of the writer that last published this manifest. Used
+    /// only by the object-store backend (the filesystem backend uses a `LOCK`
+    /// file for mutual exclusion and always leaves this 0); a publish observing a
+    /// higher epoch than the publisher holds is fenced. See
+    /// [`ObjectManifestStore`].
+    writer_epoch: u64,
 }
 
 impl ManifestState {
@@ -56,6 +62,7 @@ impl ManifestState {
             tables: BTreeMap::new(),
             pending_blob_deletions: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
+            writer_epoch: 0,
         }
     }
 
@@ -195,6 +202,10 @@ pub(crate) struct ObjectManifestStore<C: ObjectClient> {
     /// not exist yet (the first publish creates it with `If-None-Match`).
     etag: Option<ETag>,
     state: ManifestState,
+    /// This writer's fencing epoch (from the writer lease). Stamped into every
+    /// publish; a publish observing a higher epoch in the current manifest is
+    /// fenced.
+    writer_epoch: u64,
 }
 
 impl<C: ObjectClient> std::fmt::Debug for ObjectManifestStore<C> {
@@ -209,8 +220,9 @@ impl<C: ObjectClient> std::fmt::Debug for ObjectManifestStore<C> {
 
 #[allow(dead_code)]
 impl<C: ObjectClient> ObjectManifestStore<C> {
-    /// Open by reading the current manifest object (if any) and its `ETag`.
-    pub(crate) async fn open(client: C, key: impl Into<String>) -> Result<Self> {
+    /// Open by reading the current manifest object (if any) and its `ETag`,
+    /// holding `writer_epoch` (this writer's fencing token) for publishes.
+    pub(crate) async fn open(client: C, key: impl Into<String>, writer_epoch: u64) -> Result<Self> {
         let key = key.into();
         let (state, etag) = Self::read_current(&client, &key).await?;
         Ok(Self {
@@ -218,6 +230,7 @@ impl<C: ObjectClient> ObjectManifestStore<C> {
             key,
             etag,
             state,
+            writer_epoch,
         })
     }
 
@@ -244,7 +257,18 @@ impl<C: ObjectClient> ObjectManifestStore<C> {
     /// [`PublishOutcome::Published`]. On a lost CAS, refresh the cached state +
     /// `ETag` from the store (so the caller sees the winning state) and return
     /// [`PublishOutcome::Conflict`] without advancing past it.
-    pub(crate) async fn try_publish(&mut self, next: ManifestState) -> Result<PublishOutcome> {
+    pub(crate) async fn try_publish(&mut self, mut next: ManifestState) -> Result<PublishOutcome> {
+        // Fencing: if the manifest we are about to overwrite was last published by
+        // a writer holding a higher epoch than ours, a newer owner has taken over
+        // and we must stop — never retry into a clobber.
+        if self.state.writer_epoch > self.writer_epoch {
+            return Err(Error::Fenced {
+                held_epoch: self.writer_epoch,
+                current_epoch: self.state.writer_epoch,
+            });
+        }
+        // Stamp our epoch so a stale prior owner is fenced on its next publish.
+        next.writer_epoch = self.writer_epoch;
         let bytes = encode_manifest_bytes(&next)?;
         let precondition = match &self.etag {
             Some(etag) => Precondition::IfMatch(etag.clone()),
@@ -283,6 +307,14 @@ impl<C: ObjectClient> ObjectManifestStore<C> {
                 PublishOutcome::Conflict { .. } => {}
             }
         }
+    }
+
+    /// Force-publish the current state so this writer's fencing epoch is stamped
+    /// into the manifest immediately — closing the window where a just-displaced
+    /// prior owner could still publish before our first real edit. Fence-checked
+    /// (errors [`Error::Fenced`] if a newer owner already published).
+    pub(crate) async fn claim_writer_epoch(&mut self) -> Result<()> {
+        self.commit_edit(|state| Ok(Some(state.clone()))).await
     }
 
     /// Create a bucket (idempotent), CAS-published with rebase-retry.
@@ -546,8 +578,9 @@ impl ManifestStore {
     pub(crate) async fn open_object_store_async(
         client: Arc<dyn ObjectClient>,
         key: impl Into<String>,
+        writer_epoch: u64,
     ) -> Result<Self> {
-        let object = ObjectManifestStore::open(client, key).await?;
+        let object = ObjectManifestStore::open(client, key, writer_epoch).await?;
         Ok(Self {
             // Unused for the object store (the key lives in `ObjectManifestStore`);
             // publishing never touches `self.path` on this backend.
@@ -574,6 +607,17 @@ impl ManifestStore {
                 "manifest backend is not object storage",
             )),
         }
+    }
+
+    /// Claim this writer's fencing epoch by force-publishing the current
+    /// object-store manifest (stamping the epoch immediately on open, so a
+    /// displaced prior owner is fenced before our first edit). Errors
+    /// [`Error::Fenced`] if a newer owner already exists, or for non-object
+    /// backends.
+    pub(crate) async fn claim_object_epoch_async(&mut self) -> Result<()> {
+        let mut object = self.clone_object_manifest()?;
+        object.claim_writer_epoch().await?;
+        self.install_object_manifest(object)
     }
 
     /// Write back an object-store manifest handle after a CAS publish, syncing
@@ -1338,6 +1382,7 @@ fn encode_state(state: &ManifestState) -> Result<Vec<u8>> {
     put_tables(&mut bytes, &state.tables)?;
     put_pending_blob_deletions(&mut bytes, &state.pending_blob_deletions)?;
     put_checkpoints(&mut bytes, &state.checkpoints)?;
+    put_u64(&mut bytes, state.writer_epoch);
 
     Ok(bytes)
 }
@@ -1394,6 +1439,7 @@ fn decode_state(payload: &[u8]) -> Result<ManifestState> {
     let tables = cursor.read_tables()?;
     let pending_blob_deletions = cursor.read_pending_blob_deletions()?;
     let checkpoints = cursor.read_checkpoints()?;
+    let writer_epoch = cursor.read_u64()?;
 
     if !cursor.is_finished() {
         return Err(invalid_manifest("trailing payload bytes"));
@@ -1405,6 +1451,7 @@ fn decode_state(payload: &[u8]) -> Result<ManifestState> {
         tables,
         pending_blob_deletions,
         checkpoints,
+        writer_epoch,
     })
 }
 
@@ -2074,6 +2121,7 @@ mod tests {
         super::put_u32(&mut payload, 0); // tables
         super::put_u32(&mut payload, 0); // pending blob deletions
         super::put_u32(&mut payload, 0); // checkpoints
+        super::put_u64(&mut payload, 0); // writer_epoch
 
         let state = decode_state(&payload).expect("manifest decodes");
         let options = state.buckets().get("users").expect("bucket options exist");
@@ -2095,6 +2143,7 @@ mod tests {
         super::put_u32(&mut payload, 0); // tables
         super::put_u32(&mut payload, 0); // pending blob deletions
         super::put_u32(&mut payload, 0); // checkpoints
+        super::put_u64(&mut payload, 0); // writer_epoch
 
         let state = decode_state(&payload).expect("manifest decodes");
         let options = state.buckets().get("users").expect("bucket options exist");
@@ -2214,7 +2263,7 @@ mod tests {
 
         let store = std::sync::Arc::new(InMemoryObjectStore::new());
         let mut manifest =
-            poll_ready(super::ObjectManifestStore::open(store, "MANIFEST")).expect("open empty");
+            poll_ready(super::ObjectManifestStore::open(store, "MANIFEST", 1)).expect("open empty");
         assert_eq!(
             manifest.state().wal_replay_floor(),
             crate::types::Sequence::ZERO,
@@ -2251,11 +2300,13 @@ mod tests {
         let mut writer_a = poll_ready(super::ObjectManifestStore::open(
             std::sync::Arc::clone(&store),
             "MANIFEST",
+            1,
         ))
         .expect("open A");
         let mut writer_b = poll_ready(super::ObjectManifestStore::open(
             std::sync::Arc::clone(&store),
             "MANIFEST",
+            1,
         ))
         .expect("open B");
 
@@ -2291,6 +2342,54 @@ mod tests {
     }
 
     #[test]
+    fn object_manifest_fences_a_stale_writer_after_takeover() {
+        use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+        let client: std::sync::Arc<dyn ObjectClient> =
+            std::sync::Arc::new(InMemoryObjectStore::new());
+
+        // Writer A holds epoch 1 and publishes.
+        let mut a = poll_ready(ManifestStore::open_object_store_async(
+            std::sync::Arc::clone(&client),
+            "MANIFEST",
+            1,
+        ))
+        .expect("open A");
+        poll_ready(a.create_bucket_async("alpha".to_owned(), BucketOptions::default()))
+            .expect("A publishes");
+
+        // Writer B takes over with a higher epoch (2) and claims it on open,
+        // stamping the manifest immediately.
+        let mut b = poll_ready(ManifestStore::open_object_store_async(
+            std::sync::Arc::clone(&client),
+            "MANIFEST",
+            2,
+        ))
+        .expect("open B");
+        poll_ready(b.claim_object_epoch_async()).expect("B claims epoch 2");
+
+        // A is still alive (partitioned) and tries to publish again: it loses the
+        // CAS, refreshes onto B's manifest (epoch 2 > 1), and is fenced — it does
+        // NOT retry into a clobber.
+        let fenced = poll_ready(a.create_bucket_async("beta".to_owned(), BucketOptions::default()))
+            .expect_err("A must be fenced after B's takeover");
+        assert!(
+            matches!(
+                fenced,
+                crate::error::Error::Fenced {
+                    held_epoch: 1,
+                    current_epoch: 2
+                }
+            ),
+            "expected Fenced{{1,2}}, got {fenced:?}"
+        );
+
+        // B, the legitimate owner, still publishes.
+        poll_ready(b.create_bucket_async("gamma".to_owned(), BucketOptions::default()))
+            .expect("B still writes");
+    }
+
+    #[test]
     fn object_store_manifest_create_bucket_rebases_on_conflict() {
         use crate::object_store::{InMemoryObjectStore, ObjectClient};
 
@@ -2299,11 +2398,13 @@ mod tests {
         let mut writer_a = poll_ready(ManifestStore::open_object_store_async(
             std::sync::Arc::clone(&client),
             "MANIFEST",
+            1,
         ))
         .expect("open A");
         let mut writer_b = poll_ready(ManifestStore::open_object_store_async(
             std::sync::Arc::clone(&client),
             "MANIFEST",
+            1,
         ))
         .expect("open B");
 
@@ -2324,8 +2425,10 @@ mod tests {
         assert!(writer_b.state().buckets().contains_key("beta"));
 
         // A fresh open sees both — the durable manifest holds the merged result.
-        let reopened =
-            poll_ready(ManifestStore::open_object_store_async(client, "MANIFEST")).expect("reopen");
+        let reopened = poll_ready(ManifestStore::open_object_store_async(
+            client, "MANIFEST", 1,
+        ))
+        .expect("reopen");
         assert!(reopened.state().buckets().contains_key("alpha"));
         assert!(reopened.state().buckets().contains_key("beta"));
     }
@@ -2336,8 +2439,10 @@ mod tests {
 
         let client: std::sync::Arc<dyn ObjectClient> =
             std::sync::Arc::new(InMemoryObjectStore::new());
-        let mut manifest =
-            poll_ready(ManifestStore::open_object_store_async(client, "MANIFEST")).expect("open");
+        let mut manifest = poll_ready(ManifestStore::open_object_store_async(
+            client, "MANIFEST", 1,
+        ))
+        .expect("open");
         poll_ready(manifest.create_bucket_async("alpha".to_owned(), BucketOptions::default()))
             .expect("create");
         // Re-creating with identical options is a no-op (the edit returns None).
@@ -2352,8 +2457,10 @@ mod tests {
 
         let client: std::sync::Arc<dyn ObjectClient> =
             std::sync::Arc::new(InMemoryObjectStore::new());
-        let mut manifest =
-            poll_ready(ManifestStore::open_object_store_async(client, "MANIFEST")).expect("open");
+        let mut manifest = poll_ready(ManifestStore::open_object_store_async(
+            client, "MANIFEST", 1,
+        ))
+        .expect("open");
         // The sync API is unsupported for object storage (it cannot await a CAS).
         let error = manifest
             .create_bucket("alpha".to_owned(), BucketOptions::default())

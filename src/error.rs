@@ -36,6 +36,15 @@ pub enum Error {
         /// Human-readable conflict detail.
         message: String,
     },
+    /// This writer was fenced: another writer holds a newer fencing epoch for the
+    /// same object-store database, so this writer's manifest publish was rejected
+    /// to preserve the single-writer invariant. The holder must stop writing.
+    Fenced {
+        /// The fencing epoch this writer holds.
+        held_epoch: u64,
+        /// The newer epoch already recorded in the published manifest.
+        current_epoch: u64,
+    },
     /// The requested read version is newer than the latest visible database
     /// state.
     ReadVersionTooNew {
@@ -146,6 +155,13 @@ impl fmt::Display for Error {
             }
             Self::CodecUnavailable { codec } => write!(formatter, "codec unavailable: {codec}"),
             Self::Conflict { message } => write!(formatter, "transaction conflict: {message}"),
+            Self::Fenced {
+                held_epoch,
+                current_epoch,
+            } => write!(
+                formatter,
+                "writer fenced: held epoch {held_epoch} but manifest is at epoch {current_epoch}"
+            ),
             Self::ReadVersionTooNew { requested, latest } => write!(
                 formatter,
                 "read version {} is newer than latest read version {}",

@@ -59,6 +59,16 @@ impl DurabilitySubstrate {
         }
     }
 
+    /// This writer's fencing epoch for the object-store backend, stamped into
+    /// manifest publishes so a stale prior owner is fenced. `None` for the
+    /// filesystem backend (mutual exclusion is the `LOCK` file, not an epoch).
+    pub(crate) fn object_fencing_epoch(&self) -> Option<u64> {
+        match self {
+            Self::Filesystem(_) => None,
+            Self::ObjectStore(substrate) => Some(substrate.fencing_epoch()),
+        }
+    }
+
     /// Append a commit's operations to the WAL (no-op when there is no WAL, and
     /// always a no-op for the WAL-less object store — its durability point is the
     /// memtable flush + manifest CAS, not a WAL append).

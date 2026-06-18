@@ -436,6 +436,19 @@ stands as the Band-2 dispatch type for where a single backend value is needed.
       **The object-storage backend (2c) is complete: open / put / get / flush /
       reopen / named buckets / compaction / orphan GC, async-only, Send-safe,
       tested vs `InMemoryObjectStore`. 364 tests green, clippy + wasm clean.**
+    - **2c-4d DONE — writer-lease fencing actually enforced at manifest publish.**
+      2c-3/2c-4c acquired the `ObjectWriterLease` (epoch bump via CAS) and held it,
+      but its epoch was never checked, so a stale/partitioned prior owner was NOT
+      fenced (the lease was a token in name only — the earlier "fenced at
+      manifest-publish time" note was aspirational). Now: `ManifestState` carries
+      `writer_epoch` (manifest format 11→12); `ObjectManifestStore` holds the
+      open-time epoch and, in `try_publish`, stamps `next.writer_epoch = mine` and
+      **rejects with `Error::Fenced` (no retry) when `current.writer_epoch > mine`**.
+      The open path acquires the lease first, opens the manifest with that epoch,
+      and `claim_object_epoch_async()` stamps it immediately on open so a displaced
+      owner is fenced before the new owner's first flush, not only after. Tests:
+      `object_manifest_fences_a_stale_writer_after_takeover` (manifest) and
+      `object_store_fences_a_stale_writer_after_takeover` (`Db` end to end).
   - **2c-5:** orphan-object GC (objects unreferenced by the published manifest).
 
 ## Why this is safe to pursue

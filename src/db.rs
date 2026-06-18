@@ -1247,9 +1247,30 @@ impl Db {
             .to_string_lossy()
             .into_owned();
 
+        // Acquire the writer lease before the manifest, so its fencing epoch is
+        // known and can be stamped into every publish.
+        let substrate = if options.read_only {
+            DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(None, None))
+        } else {
+            let lease_key = db_path
+                .join(recovery::PROCESS_LOCK_FILE_NAME)
+                .to_string_lossy()
+                .into_owned();
+            let lease = ObjectWriterLease::acquire(Arc::clone(&client), lease_key).await?;
+            DurabilitySubstrate::ObjectStore(ObjectStoreSubstrate::new(lease))
+        };
+        let writer_epoch = substrate.object_fencing_epoch().unwrap_or(0);
+
         let mut manifest =
-            ManifestStore::open_object_store_async(Arc::clone(&client), manifest_key).await?;
+            ManifestStore::open_object_store_async(Arc::clone(&client), manifest_key, writer_epoch)
+                .await?;
         ensure_default_bucket_in_manifest_async(&mut manifest, &options).await?;
+        // Stamp our fencing epoch into the manifest now (writable opens), so a
+        // just-displaced prior owner is fenced before we issue our first flush —
+        // not only after it. Fails with `Error::Fenced` if a newer owner exists.
+        if !options.read_only {
+            manifest.claim_object_epoch_async().await?;
+        }
 
         let mut buckets =
             buckets_from_manifest_async(&backend, &db_path, manifest.state(), true).await?;
@@ -1265,17 +1286,6 @@ impl Db {
             .map(|properties| properties.largest_sequence)
             .max()
             .unwrap_or(Sequence::ZERO);
-
-        let substrate = if options.read_only {
-            DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(None, None))
-        } else {
-            let lease_key = db_path
-                .join(recovery::PROCESS_LOCK_FILE_NAME)
-                .to_string_lossy()
-                .into_owned();
-            let lease = ObjectWriterLease::acquire(Arc::clone(&client), lease_key).await?;
-            DurabilitySubstrate::ObjectStore(ObjectStoreSubstrate::new(lease))
-        };
 
         let block_cache_bytes = options.block_cache_bytes;
         let runtime = Runtime::new(options.runtime);
@@ -9787,6 +9797,45 @@ mod tests {
             b.get_sync(b"k").expect("get b").as_deref(),
             Some(b"from-b".as_slice())
         );
+    }
+
+    #[test]
+    fn object_store_fences_a_stale_writer_after_takeover() {
+        use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+        let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+
+        // A opens the prefix (fencing epoch 1) and is the sole writer.
+        let a = block_on_test_future(Db::open_object_store_at(
+            Arc::clone(&client),
+            "db",
+            DbOptions::object_store(),
+        ))
+        .expect("open a");
+        a.put_sync(b"k", b"a1").expect("put a");
+        block_on_test_future(a.flush()).expect("flush a");
+
+        // B takes over the SAME prefix: a higher epoch (2), claimed on open.
+        let b = block_on_test_future(Db::open_object_store_at(
+            Arc::clone(&client),
+            "db",
+            DbOptions::object_store(),
+        ))
+        .expect("open b (takeover)");
+
+        // A is still alive (split brain) and tries to flush again → fenced, so it
+        // cannot clobber B. This is the single-writer guarantee for object storage.
+        a.put_sync(b"k", b"a2").expect("put a again");
+        let fenced = block_on_test_future(a.flush())
+            .expect_err("A's flush must be fenced after B's takeover");
+        assert!(
+            matches!(fenced, Error::Fenced { .. }),
+            "expected Fenced, got {fenced:?}"
+        );
+
+        // B, the legitimate owner, writes and flushes fine.
+        b.put_sync(b"k", b"b1").expect("put b");
+        block_on_test_future(b.flush()).expect("B flushes as the owner");
     }
 
     #[test]
