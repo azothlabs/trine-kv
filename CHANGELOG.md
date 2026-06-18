@@ -2,6 +2,34 @@
 
 All public crate releases use Semantic Versioning.
 
+## 0.5.4 - 2026-06-18
+
+Enforces the object-store single-writer guarantee, and resets the manifest
+format version. The crate has no users yet, so this ships as a patch despite the
+storage-format reset; the public API change is additive (a new variant on the
+`#[non_exhaustive]` `Error` enum).
+
+### Changed
+
+- **Manifest format version reset to 1** (was an accumulated `11`). Only the
+  current format is read; any earlier on-disk manifest is rejected
+  (`UnsupportedFormat`). Create a fresh database — there is no migration. A
+  structured `vX.Y.Z` format-version scheme is preferred going forward.
+
+### Added
+
+- **Writer-lease fencing is now enforced at manifest publish (object-store
+  backend).** Previously the object-store writer lease was acquired but its epoch
+  was never checked, so a stale or partitioned prior owner was not actually
+  fenced and two writers over one key prefix could both publish via
+  compare-and-swap retry (split brain). The manifest now records the publishing
+  writer's fencing epoch; a publish stamps the holder's epoch and is rejected
+  with the new **`Error::Fenced`** — without retrying — when the current manifest
+  carries a higher epoch, so a displaced owner is stopped instead of overwriting
+  the new one. A writable open claims its epoch immediately, fencing a displaced
+  owner before the new owner's first flush. The filesystem backend is unaffected
+  (its single-writer guarantee remains the `LOCK` file).
+
 ## 0.5.3 - 2026-06-18
 
 Additive release: makes the object-store `ObjectClient` a first-class WAL

@@ -29,7 +29,10 @@ use crate::storage::BrowserStorageBackend;
 
 pub const MANIFEST_FILE_NAME: &str = "MANIFEST";
 const MANIFEST_MAGIC: u32 = 0x5452_4d46;
-const MANIFEST_VERSION: u16 = 12;
+// Reset to 1 for the first published storage contract — the crate has no users
+// yet, so the pre-1.0 version churn is collapsed rather than carried. (A
+// structured `vX.Y.Z` scheme is preferred going forward.)
+const MANIFEST_VERSION: u16 = 1;
 // Clean break: only the current manifest format is read. Older on-disk manifests
 // are rejected rather than decoded through version-gated fallbacks.
 const MIN_SUPPORTED_MANIFEST_VERSION: u16 = MANIFEST_VERSION;
