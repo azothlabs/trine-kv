@@ -2,6 +2,23 @@
 
 All public crate releases use Semantic Versioning.
 
+## 0.5.3 - 2026-06-18
+
+Additive release: makes the object-store `ObjectClient` a first-class WAL
+durability sink for a higher layer (e.g. a multi-tenant service). No hot-path or
+storage-format change; fully compatible with `0.5.x`.
+
+### Added
+
+- **`is_wal_object_key(key)`**: classifies an object key as a write-ahead-log
+  object (`trine.wal` / `trine.wal.shard-NNNN`) by its final path segment, so a
+  custom shared `ObjectClient` can route or coalesce the WAL writes (the
+  durability-defining ones) distinctly from bulk data. The `ObjectClient` docs
+  now state the contract: a database writes its WAL through that client and acks
+  a commit only after the WAL `put` is durable, and one `Arc`-shared client
+  across databases is the seam for cross-database group commit — with no engine
+  change.
+
 ## 0.5.2 - 2026-06-17
 
 Additive release for embedders that branch from a higher layer. No hot-path or
