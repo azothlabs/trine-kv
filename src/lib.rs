@@ -165,6 +165,7 @@ pub use stats::{
 };
 pub use transaction::{Transaction, TransactionOptions};
 pub use types::{CommitInfo, KeyRange, KeyValue, ReadVersion, Value};
+pub use wal::is_wal_object_key;
 pub use write_batch::WriteBatch;
 
 #[cfg(test)]

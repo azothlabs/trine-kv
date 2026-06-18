@@ -38,6 +38,25 @@ const HEADER_LEN: usize = 18;
 const WAL_FRONT_DOOR_QUEUE_CAPACITY: usize = 64;
 const WAL_SHARD_FILE_PREFIX: &str = "trine.wal.shard-";
 const WAL_SHARD_FILE_DIGITS: usize = 4;
+
+/// Whether an object-store `key` names a write-ahead-log object — the
+/// `trine.wal` file, a `trine.wal.shard-NNNN` shard, or the rewrite temp — as
+/// opposed to an `SSTable`, blob, manifest, or lease object.
+///
+/// A database opened over object storage writes **all** of these through one
+/// [`ObjectClient`](crate::ObjectClient), and a commit is acknowledged only once
+/// its WAL write is durable — so the WAL writes are the latency-critical,
+/// durability-defining ones. A higher layer that supplies a shared client across
+/// many databases (e.g. a multi-tenant service) uses this to recognize those
+/// writes and route them to a low-latency durable tier, or coalesce them across
+/// databases into one batched durable write (cross-tenant group commit), keeping
+/// them distinct from bulk data writes. Matches the final path segment, so it is
+/// independent of the database's key prefix.
+#[must_use]
+pub fn is_wal_object_key(key: &str) -> bool {
+    let name = key.rsplit('/').next().unwrap_or(key);
+    name.starts_with(WAL_FILE_NAME)
+}
 const OP_INSERT: u8 = 1;
 const OP_REMOVE: u8 = 2;
 const OP_REMOVE_RANGE: u8 = 3;
@@ -1708,6 +1727,20 @@ impl<'payload> Cursor<'payload> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn classifies_wal_objects_by_final_segment() {
+        use super::is_wal_object_key;
+        // WAL objects under any database key prefix.
+        assert!(is_wal_object_key("trine.wal"));
+        assert!(is_wal_object_key("proj/db/trine.wal"));
+        assert!(is_wal_object_key("proj/db/trine.wal.shard-0003"));
+        assert!(is_wal_object_key("proj/db/trine.wal.tmp"));
+        // Non-WAL objects: SSTables, manifest, lease.
+        assert!(!is_wal_object_key("proj/db/000123.sst"));
+        assert!(!is_wal_object_key("proj/db/MANIFEST"));
+        assert!(!is_wal_object_key("proj/db/LEASE"));
+    }
+
     use std::{
         fs,
         future::Future,

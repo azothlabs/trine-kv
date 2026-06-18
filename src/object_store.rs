@@ -122,6 +122,24 @@ pub struct ObjectMeta {
 ///   `None` when the key is absent (like S3 `HEAD`).
 /// - `put_if` applies the write only when the precondition holds, otherwise
 ///   reports [`PutIf::PreconditionFailed`] with the current `ETag`.
+///
+/// # This client is the WAL durability sink (service-layer extension point)
+///
+/// A database opened with [`Db::open_object_store_at`](crate::Db::open_object_store_at)
+/// writes **everything** through this one client — `SSTable` segments, blobs, the
+/// manifest CAS, the writer lease, and the **write-ahead log** — and a commit is
+/// acknowledged only after its WAL `put` is durable. So **this client *is* the
+/// WAL durability sink**: where its WAL writes land defines commit durability and
+/// latency, and the engine needs no other seam for a cloud layer.
+///
+/// Because `Arc<C>` is itself an `ObjectClient`, one client can be **shared
+/// across many open databases**. A higher layer (e.g. a multi-tenant service)
+/// can supply a custom shared client that recognizes WAL writes with
+/// [`is_wal_object_key`](crate::is_wal_object_key) and either routes them to a
+/// low-latency durable tier (while bulk data goes to a cheaper cold tier) or
+/// **coalesces them across databases** into one batched durable write
+/// (cross-tenant group commit), resolving each commit's `put` together. None of
+/// this requires changing the engine.
 pub trait ObjectClient: Send + Sync {
     /// Reads the whole object, or `None` when the key is absent.
     fn get<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<Arc<[u8]>>>;
