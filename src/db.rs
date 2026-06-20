@@ -919,6 +919,7 @@ impl Drop for Db {
                 &self.inner.runtime_shutdown,
                 &self.inner.background_workers,
             );
+            self.inner.substrate.release_writer_lease();
         }
     }
 }
@@ -1335,6 +1336,12 @@ impl Db {
             ));
         }
         validate_common_options(&options)?;
+        if matches!(
+            options.durability,
+            DurabilityMode::SyncData | DurabilityMode::SyncAll | DurabilityMode::SyncAllStrict
+        ) {
+            return Err(Error::unsupported_durability(options.durability));
+        }
 
         let backend = ObjectStoreBackend::new(Arc::clone(&storage_client));
         let wal_backend = ObjectStoreBackend::new(Arc::clone(&wal_client));
@@ -10080,7 +10087,7 @@ mod tests {
     }
 
     #[test]
-    fn object_store_fences_a_stale_writer_after_takeover() {
+    fn object_store_rejects_live_second_writer() {
         use crate::object_store::{InMemoryObjectStore, ObjectClient};
 
         let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
@@ -10095,27 +10102,21 @@ mod tests {
         a.put_sync(b"k", b"a1").expect("put a");
         block_on_test_future(a.flush()).expect("flush a");
 
-        // B takes over the SAME prefix: a higher epoch (2), claimed on open.
-        let b = block_on_test_future(Db::open_object_store_at(
+        // B cannot take over the SAME prefix while A's lease is live.
+        let error = block_on_test_future(Db::open_object_store_at(
             Arc::clone(&client),
             "db",
             DbOptions::object_store(),
         ))
-        .expect("open b (takeover)");
-
-        // A is still alive (split brain), but durable writes are fenced before
-        // they are acknowledged, so A cannot even publish a remote WAL commit.
-        let fenced = a
-            .put_sync(b"k", b"a2")
-            .expect_err("A's write must be fenced after B's takeover");
+        .expect_err("open b while A is live");
         assert!(
-            matches!(fenced, Error::Fenced { .. }),
-            "expected Fenced, got {fenced:?}"
+            matches!(error, Error::RuntimeBusy { .. }),
+            "expected RuntimeBusy, got {error:?}"
         );
 
-        // B, the legitimate owner, writes and flushes fine.
-        b.put_sync(b"k", b"b1").expect("put b");
-        block_on_test_future(b.flush()).expect("B flushes as the owner");
+        // A remains the legitimate owner and can keep writing.
+        a.put_sync(b"k", b"a2").expect("put a again");
+        block_on_test_future(a.flush()).expect("A flushes as the owner");
     }
 
     #[test]
@@ -10165,6 +10166,28 @@ mod tests {
             docs.get_sync(b"title").expect("get docs title").as_deref(),
             Some(b"trine".as_slice())
         );
+    }
+
+    #[test]
+    fn object_store_open_rejects_file_sync_durability() {
+        use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+        for durability in [
+            DurabilityMode::SyncData,
+            DurabilityMode::SyncAll,
+            DurabilityMode::SyncAllStrict,
+        ] {
+            let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+            let error = block_on_test_future(Db::open_object_store(
+                client,
+                DbOptions::object_store().with_durability(durability),
+            ))
+            .expect_err("object-store open rejects file sync durability");
+            assert!(
+                matches!(error, Error::UnsupportedDurability { requested } if requested == durability),
+                "expected UnsupportedDurability({durability:?}), got {error:?}"
+            );
+        }
     }
 
     #[test]

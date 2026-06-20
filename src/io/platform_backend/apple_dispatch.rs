@@ -127,6 +127,9 @@ fn read_dispatch(path: &Path, offset: libc::off_t, len: usize) -> Result<Vec<u8>
     let handler: RcBlock<dyn Fn(u8, *mut DispatchData, libc::c_int)> = RcBlock::new(
         move |done: u8, data: *mut DispatchData, error: libc::c_int| {
             if !data.is_null() {
+                // SAFETY: DispatchIO provides a valid `dispatch_data_t` pointer
+                // only for the duration of this callback. We immediately copy
+                // the bytes into an owned `Vec` and do not retain the pointer.
                 let data = unsafe { &*data };
                 let _ = tx.send(ReadEvent::Chunk(data.to_vec()));
             }
@@ -142,8 +145,9 @@ fn read_dispatch(path: &Path, offset: libc::off_t, len: usize) -> Result<Vec<u8>
     );
 
     let handler_ptr = io_handler_ptr(&handler);
-    // SAFETY: `channel` and `queue` remain alive until the done event arrives.
-    // `handler` is heap-allocated and also kept alive for the same period.
+    // SAFETY: `handler_ptr` is the same block pointer with the DispatchIO
+    // handler ABI shape (see `io_handler_ptr`). `channel`, `queue`, and the
+    // heap-allocated handler remain alive until the done event arrives.
     unsafe {
         channel.read(offset, len, &queue, handler_ptr);
     }
@@ -209,8 +213,9 @@ fn write_dispatch(
     let offset = libc::off_t::try_from(offset)
         .map_err(|_| Error::invalid_options("macOS DispatchIO write offset overflow"))?;
     let handler_ptr = io_handler_ptr(&handler);
-    // SAFETY: `channel`, `queue`, `data`, and `handler` remain alive until the
-    // write completion event arrives.
+    // SAFETY: `handler_ptr` is the same block pointer with the DispatchIO
+    // handler ABI shape (see `io_handler_ptr`). `channel`, `queue`, `data`, and
+    // the heap-allocated handler remain alive until the completion event.
     unsafe {
         channel.write(offset, data, &queue, handler_ptr);
     }
@@ -371,8 +376,8 @@ fn io_handler_ptr(
     // Apple encodes the dispatch `done` flag as a C Boolean. `block2` does not
     // currently provide an ObjC encoding for Rust `bool`, so this mirrors
     // dispatch2's own `DispatchData::to_vec` pattern and uses `u8` at the Rust
-    // closure boundary while passing the expected DispatchIO handler shape to
-    // libdispatch.
+    // closure boundary. The block remains a three-argument DispatchIO handler:
+    // boolean byte, dispatch data pointer, and errno-style integer.
     RcBlock::as_ptr(handler).cast::<DispatchIoHandler>()
 }
 

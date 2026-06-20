@@ -42,6 +42,7 @@ use crate::storage::{
     StorageCapabilities, StorageFuture, StorageObjectDeleteBackend, StorageObjectId,
     StorageObjectListBackend, StorageObjectListRequest, StorageObjectReadBackend,
     StorageObjectWriteBackend, StorageReadBackend, StorageReadFuture, StorageReadObject,
+    ensure_whole_object_read_len,
 };
 
 /// Boxed future returned by [`ObjectClient`] methods. Mirrors the storage
@@ -489,13 +490,15 @@ impl StorageReadBackend for ObjectStoreBackend {
     fn open_read(&self, object: StorageObjectId) -> StorageReadFuture<'_, Self::ReadObject> {
         Box::pin(async move {
             let key = Self::object_key(&object);
-            let bytes = self
+            let meta = self
                 .client
-                .get(&key)
+                .head(&key)
                 .await?
                 .ok_or_else(|| Error::Corruption {
                     message: format!("referenced object {key} cannot be opened"),
                 })?;
+            let bytes =
+                read_object_bytes_by_meta(self.client.as_ref(), &key, &object, &meta).await?;
             Ok(ObjectStoreReadObject { object, bytes })
         })
     }
@@ -503,7 +506,15 @@ impl StorageReadBackend for ObjectStoreBackend {
 
 impl StorageObjectReadBackend for ObjectStoreBackend {
     fn read_object_bytes(&self, object: StorageObjectId) -> StorageFuture<'_, Option<Arc<[u8]>>> {
-        Box::pin(async move { self.client.get(&Self::object_key(&object)).await })
+        Box::pin(async move {
+            let key = Self::object_key(&object);
+            let Some(meta) = self.client.head(&key).await? else {
+                return Ok(None);
+            };
+            read_object_bytes_by_meta(self.client.as_ref(), &key, &object, &meta)
+                .await
+                .map(Some)
+        })
     }
 }
 
@@ -566,9 +577,44 @@ fn path_matches_extension(path: &Path, expected: Option<&str>) -> bool {
     })
 }
 
+fn ensure_object_meta_read_len(object: &StorageObjectId, meta: &ObjectMeta) -> Result<()> {
+    let len = usize::try_from(meta.size).map_err(|_| Error::Corruption {
+        message: format!("object {} length exceeds usize", object.path().display()),
+    })?;
+    ensure_whole_object_read_len(object, len)
+}
+
+async fn read_object_bytes_by_meta(
+    client: &dyn ObjectClient,
+    key: &str,
+    object: &StorageObjectId,
+    meta: &ObjectMeta,
+) -> Result<Arc<[u8]>> {
+    ensure_object_meta_read_len(object, meta)?;
+    let expected_len = usize::try_from(meta.size).map_err(|_| Error::Corruption {
+        message: format!("object {} length exceeds usize", object.path().display()),
+    })?;
+    if expected_len == 0 {
+        return Ok(Arc::from([]));
+    }
+    let bytes = client.get_range(key, 0, meta.size).await?;
+    if bytes.len() != expected_len {
+        return Err(Error::Corruption {
+            message: format!(
+                "object {} range read returned {} bytes for declared length {expected_len}",
+                object.path().display(),
+                bytes.len()
+            ),
+        });
+    }
+    ensure_whole_object_read_len(object, bytes.len())?;
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn bytes(data: &[u8]) -> Arc<[u8]> {
         Arc::from(data)
@@ -590,6 +636,116 @@ mod tests {
         match future.as_mut().poll(&mut context) {
             Poll::Ready(result) => result,
             Poll::Pending => panic!("in-memory object store future should be ready immediately"),
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct OversizedHeadClient {
+        get_calls: AtomicU64,
+    }
+
+    impl ObjectClient for OversizedHeadClient {
+        fn get<'op>(&'op self, _key: &str) -> ObjectFuture<'op, Option<Arc<[u8]>>> {
+            Box::pin(async move {
+                self.get_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(bytes(b"unreachable")))
+            })
+        }
+
+        fn get_range<'op>(
+            &'op self,
+            _key: &str,
+            _offset: u64,
+            _len: u64,
+        ) -> ObjectFuture<'op, Arc<[u8]>> {
+            Box::pin(async move { Err(Error::invalid_options("unexpected range read")) })
+        }
+
+        fn put<'op>(&'op self, _key: &str, _bytes: Arc<[u8]>) -> ObjectFuture<'op, ETag> {
+            Box::pin(async move { Err(Error::invalid_options("unexpected put")) })
+        }
+
+        fn delete<'op>(&'op self, _key: &str) -> ObjectFuture<'op, ()> {
+            Box::pin(async move { Err(Error::invalid_options("unexpected delete")) })
+        }
+
+        fn list<'op>(&'op self, _prefix: &str) -> ObjectFuture<'op, Vec<ObjectMeta>> {
+            Box::pin(async move { Err(Error::invalid_options("unexpected list")) })
+        }
+
+        fn head<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<ObjectMeta>> {
+            let key = key.to_owned();
+            Box::pin(async move {
+                Ok(Some(ObjectMeta {
+                    key,
+                    size: u64::MAX,
+                    etag: ETag::new("oversized"),
+                }))
+            })
+        }
+
+        fn put_if<'op>(
+            &'op self,
+            _key: &str,
+            _bytes: Arc<[u8]>,
+            _precondition: Precondition,
+        ) -> ObjectFuture<'op, PutIf> {
+            Box::pin(async move { Err(Error::invalid_options("unexpected put_if")) })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct ShortRangeClient {
+        get_calls: AtomicU64,
+    }
+
+    impl ObjectClient for ShortRangeClient {
+        fn get<'op>(&'op self, _key: &str) -> ObjectFuture<'op, Option<Arc<[u8]>>> {
+            Box::pin(async move {
+                self.get_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(bytes(b"unreachable")))
+            })
+        }
+
+        fn get_range<'op>(
+            &'op self,
+            _key: &str,
+            _offset: u64,
+            _len: u64,
+        ) -> ObjectFuture<'op, Arc<[u8]>> {
+            Box::pin(async move { Ok(bytes(b"abc")) })
+        }
+
+        fn put<'op>(&'op self, _key: &str, _bytes: Arc<[u8]>) -> ObjectFuture<'op, ETag> {
+            Box::pin(async move { Err(Error::invalid_options("unexpected put")) })
+        }
+
+        fn delete<'op>(&'op self, _key: &str) -> ObjectFuture<'op, ()> {
+            Box::pin(async move { Err(Error::invalid_options("unexpected delete")) })
+        }
+
+        fn list<'op>(&'op self, _prefix: &str) -> ObjectFuture<'op, Vec<ObjectMeta>> {
+            Box::pin(async move { Err(Error::invalid_options("unexpected list")) })
+        }
+
+        fn head<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<ObjectMeta>> {
+            let key = key.to_owned();
+            Box::pin(async move {
+                Ok(Some(ObjectMeta {
+                    key,
+                    size: 5,
+                    etag: ETag::new("short-range"),
+                }))
+            })
+        }
+
+        fn put_if<'op>(
+            &'op self,
+            _key: &str,
+            _bytes: Arc<[u8]>,
+            _precondition: Precondition,
+        ) -> ObjectFuture<'op, PutIf> {
+            Box::pin(async move { Err(Error::invalid_options("unexpected put_if")) })
         }
     }
 
@@ -742,6 +898,49 @@ mod tests {
         // Delete, then it is gone.
         block_on(backend.delete_object(id.clone())).unwrap();
         assert!(block_on(backend.read_object_bytes(id)).unwrap().is_none());
+    }
+
+    #[test]
+    fn object_store_backend_rejects_oversized_head_before_get() {
+        use crate::storage::StorageObjectKind;
+
+        let client = Arc::new(OversizedHeadClient::default());
+        let backend = ObjectStoreBackend::new(client.clone());
+        let id = StorageObjectId::native_file(StorageObjectKind::Table, "/db/huge.trinet");
+
+        let error =
+            block_on(backend.read_object_bytes(id.clone())).expect_err("oversized head fails");
+        assert!(error.to_string().contains("exceeds maximum"));
+        assert_eq!(
+            client.get_calls.load(Ordering::Relaxed),
+            0,
+            "oversized object should fail on HEAD before GET"
+        );
+
+        let error = block_on(backend.open_read(id)).expect_err("oversized head fails");
+        assert!(error.to_string().contains("exceeds maximum"));
+        assert_eq!(
+            client.get_calls.load(Ordering::Relaxed),
+            0,
+            "open_read should also fail on HEAD before GET"
+        );
+    }
+
+    #[test]
+    fn object_store_backend_rejects_short_range_without_whole_get() {
+        use crate::storage::StorageObjectKind;
+
+        let client = Arc::new(ShortRangeClient::default());
+        let backend = ObjectStoreBackend::new(client.clone());
+        let id = StorageObjectId::native_file(StorageObjectKind::Table, "/db/short.trinet");
+
+        let error = block_on(backend.read_object_bytes(id)).expect_err("short range fails");
+        assert!(error.to_string().contains("declared length"));
+        assert_eq!(
+            client.get_calls.load(Ordering::Relaxed),
+            0,
+            "bounded range reads should not fall back to whole-object GET"
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Condvar, Mutex, mpsc},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(not(feature = "s3"))]
@@ -43,6 +43,12 @@ use crate::write_batch::BatchOperation;
 
 const OBJECT_WAL_QUEUE_CAPACITY: usize = 64;
 const OBJECT_WAL_GROUP_COMMIT_DELAY: Duration = Duration::from_millis(5);
+const OBJECT_LEASE_TTL: Duration = Duration::from_secs(30);
+const OBJECT_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(10);
+const OBJECT_LEASE_MAGIC: u32 = 0x5452_4c53;
+const OBJECT_LEASE_VERSION: u16 = 2;
+const OBJECT_LEASE_V2_HEADER_LEN: usize = 34;
+const OBJECT_LEASE_MAX_BYTES: u64 = 64 * 1024;
 
 /// Backend-specific runtime durability operations (WAL lifecycle + writer
 /// lease) that the commit / flush / close paths drive.
@@ -177,7 +183,7 @@ impl DurabilitySubstrate {
     pub(crate) fn release_writer_lease(&self) {
         match self {
             Self::Filesystem(substrate) => substrate.release_writer_lease(),
-            Self::ObjectStore(_) => {}
+            Self::ObjectStore(substrate) => substrate.release_writer_lease(),
         }
     }
 }
@@ -359,6 +365,10 @@ impl ObjectStoreSubstrate {
                 .load(std::sync::atomic::Ordering::Acquire),
         }
     }
+
+    fn release_writer_lease(&self) {
+        let _ = self.wal_lane.release_writer_lease();
+    }
 }
 
 struct ObjectWalLane {
@@ -415,6 +425,14 @@ impl ObjectWalLane {
         completion.wait()
     }
 
+    fn release_writer_lease(&self) -> Result<()> {
+        let completion = Arc::new(ObjectWalCompletion::new());
+        self.send(ObjectWalCommand::Release {
+            completion: Arc::clone(&completion),
+        })?;
+        completion.wait()
+    }
+
     fn send(&self, command: ObjectWalCommand) -> Result<()> {
         let sender = self
             .sender
@@ -447,6 +465,9 @@ enum ObjectWalCommand {
     },
     Rewrite {
         replay_floor: Sequence,
+        completion: Arc<ObjectWalCompletion>,
+    },
+    Release {
         completion: Arc<ObjectWalCompletion>,
     },
 }
@@ -547,9 +568,13 @@ fn run_object_wal_worker(
     loop {
         let command = match deferred.take() {
             Some(command) => command,
-            None => match receiver.recv() {
+            None => match receiver.recv_timeout(OBJECT_LEASE_RENEW_INTERVAL) {
                 Ok(command) => command,
-                Err(_) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = future_driver.block_on(lease.renew());
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
             },
         };
         match command {
@@ -579,7 +604,7 @@ fn run_object_wal_worker(
                 complete_object_wal_accepts(&mut lease, &db_path, &future_driver, accepts);
             }
             ObjectWalCommand::Persist { completion } => {
-                let result = future_driver.block_on(lease.ensure_current());
+                let result = future_driver.block_on(lease.renew());
                 completion.complete(result);
             }
             ObjectWalCommand::Rewrite {
@@ -601,6 +626,11 @@ fn run_object_wal_worker(
                     .await
                 });
                 completion.complete(result);
+            }
+            ObjectWalCommand::Release { completion } => {
+                let result = future_driver.block_on(lease.release());
+                completion.complete(result);
+                return;
             }
         }
     }
@@ -676,14 +706,13 @@ fn complete_object_wal_accepts(
     }
 }
 
-/// A writer lease held against an object store, as a **fencing token**.
+/// A writer lease held against an object store.
 ///
-/// Object stores cannot provide a mutual-exclusion lock, so acquisition does not
-/// "fail if held"; instead the lease object carries a monotonically increasing
-/// epoch, and [`Self::acquire`] takes over by writing `epoch + 1` via a
-/// compare-and-swap. A previous holder is fenced out when its lower epoch is
-/// rejected before publishing a durable WAL commit or manifest edit, and in a
-/// real deployment a TTL bounds how long a crashed holder's epoch stays "live".
+/// The lease object carries both a monotonically increasing fencing epoch and a
+/// wall-clock expiry. A second writer may acquire only after the observed
+/// expiry has passed; while the owner is alive, the WAL worker extends the
+/// expiry with CAS writes. A previous holder is fenced out when its lower epoch
+/// is rejected before publishing a durable WAL commit or manifest edit.
 pub(crate) struct ObjectWriterLease {
     client: Arc<dyn ObjectClient>,
     key: String,
@@ -703,6 +732,7 @@ pub(crate) struct ObjectLeaseState {
     pub(crate) epoch: u64,
     pub(crate) committed_sequence: Sequence,
     pub(crate) current_wal_key: Option<String>,
+    pub(crate) lease_expires_at_ms: u64,
 }
 
 impl ObjectLeaseState {
@@ -711,7 +741,12 @@ impl ObjectLeaseState {
             epoch: 0,
             committed_sequence: Sequence::ZERO,
             current_wal_key: None,
+            lease_expires_at_ms: 0,
         }
+    }
+
+    fn is_expired_at(&self, now_ms: u64) -> bool {
+        self.lease_expires_at_ms <= now_ms
     }
 }
 
@@ -722,30 +757,39 @@ impl std::fmt::Debug for ObjectWriterLease {
             .field("key", &self.key)
             .field("epoch", &self.state.epoch)
             .field("committed_sequence", &self.state.committed_sequence)
+            .field("lease_expires_at_ms", &self.state.lease_expires_at_ms)
             .finish_non_exhaustive()
     }
 }
 
 impl ObjectWriterLease {
-    /// Acquire the lease by bumping its fencing epoch via compare-and-swap. The
-    /// returned lease carries the new epoch; concurrent acquirers retry until
-    /// their CAS lands, so the epoch is strictly monotonic.
+    /// Acquire the lease by creating it or by taking over an expired owner. The
+    /// returned lease carries a higher fencing epoch than the prior owner.
     pub(crate) async fn acquire(
         client: Arc<dyn ObjectClient>,
         key: impl Into<String>,
     ) -> Result<Self> {
         let key = key.into();
         loop {
+            let now_ms = current_epoch_millis()?;
+            let lease_expires_at_ms = object_lease_deadline_ms(now_ms);
             let (next_state, precondition) = match read_lease_state(&client, &key).await? {
                 None => (
                     ObjectLeaseState {
                         epoch: 1,
                         committed_sequence: Sequence::ZERO,
                         current_wal_key: None,
+                        lease_expires_at_ms,
                     },
                     Precondition::IfNoneMatch,
                 ),
                 Some(meta) => {
+                    if !meta.state.is_expired_at(now_ms) {
+                        return Err(Error::runtime_busy(format!(
+                            "object-store writer lease {key} is held until {}",
+                            meta.state.lease_expires_at_ms
+                        )));
+                    }
                     let mut state = meta.state.clone();
                     state.epoch = state
                         .epoch
@@ -753,6 +797,7 @@ impl ObjectWriterLease {
                         .ok_or_else(|| Error::Corruption {
                             message: "object-store writer epoch overflow".to_owned(),
                         })?;
+                    state.lease_expires_at_ms = lease_expires_at_ms;
                     (state, Precondition::IfMatch(meta.etag))
                 }
             };
@@ -869,6 +914,95 @@ impl ObjectWriterLease {
         Ok(())
     }
 
+    async fn renew(&mut self) -> Result<()> {
+        self.ensure_current().await?;
+        let mut next = self.state.clone();
+        next.lease_expires_at_ms = object_lease_deadline_ms(current_epoch_millis()?);
+        match self
+            .client
+            .put_if(
+                &self.key,
+                encode_lease_state(next.clone())?,
+                Precondition::IfMatch(self.etag.clone()),
+            )
+            .await?
+        {
+            PutIf::Stored { etag } => {
+                self.etag = etag;
+                self.state = next;
+                Ok(())
+            }
+            PutIf::PreconditionFailed { .. } => {
+                let Some(current) = read_lease_state(&self.client, &self.key).await? else {
+                    return Err(Error::Fenced {
+                        held_epoch: self.state.epoch,
+                        current_epoch: 0,
+                    });
+                };
+                if current.state.epoch > self.state.epoch {
+                    return Err(Error::Fenced {
+                        held_epoch: self.state.epoch,
+                        current_epoch: current.state.epoch,
+                    });
+                }
+                if current.state.epoch < self.state.epoch {
+                    return Err(Error::Corruption {
+                        message: format!(
+                            "writer lease {} moved backward from epoch {} to {}",
+                            self.key, self.state.epoch, current.state.epoch
+                        ),
+                    });
+                }
+                self.etag = current.etag;
+                self.state = current.state;
+                self.invalidate_wal_cache_if_stale();
+                Ok(())
+            }
+        }
+    }
+
+    async fn release(&mut self) -> Result<()> {
+        loop {
+            let Some(current) = read_lease_state(&self.client, &self.key).await? else {
+                return Ok(());
+            };
+            if current.state.epoch > self.state.epoch {
+                return Err(Error::Fenced {
+                    held_epoch: self.state.epoch,
+                    current_epoch: current.state.epoch,
+                });
+            }
+            if current.state.epoch < self.state.epoch {
+                return Err(Error::Corruption {
+                    message: format!(
+                        "writer lease {} moved backward from epoch {} to {}",
+                        self.key, self.state.epoch, current.state.epoch
+                    ),
+                });
+            }
+            self.etag = current.etag;
+            self.state = current.state;
+            let mut next = self.state.clone();
+            next.lease_expires_at_ms = 0;
+            match self
+                .client
+                .put_if(
+                    &self.key,
+                    encode_lease_state(next.clone())?,
+                    Precondition::IfMatch(self.etag.clone()),
+                )
+                .await?
+            {
+                PutIf::Stored { etag } => {
+                    self.etag = etag;
+                    self.state = next;
+                    return Ok(());
+                }
+                PutIf::PreconditionFailed { .. } => {}
+            }
+        }
+    }
+
     async fn publish_commit_head(
         &mut self,
         sequence: Sequence,
@@ -886,6 +1020,7 @@ impl ObjectWriterLease {
                 next.committed_sequence = sequence;
             }
             next.current_wal_key = Some(wal_key.clone());
+            next.lease_expires_at_ms = object_lease_deadline_ms(current_epoch_millis()?);
             match self
                 .client
                 .put_if(
@@ -984,6 +1119,7 @@ impl ObjectWriterLease {
                 });
                 next.current_wal_key = Some(next_key);
             }
+            next.lease_expires_at_ms = object_lease_deadline_ms(current_epoch_millis()?);
             match self
                 .client
                 .put_if(
@@ -1041,9 +1177,19 @@ async fn read_lease_state(
     let Some(meta) = client.head(key).await? else {
         return Ok(None);
     };
-    let bytes = client.get(key).await?.ok_or_else(|| Error::Corruption {
-        message: format!("writer lease {key} vanished between head and get"),
-    })?;
+    if meta.size > OBJECT_LEASE_MAX_BYTES {
+        return Err(Error::Corruption {
+            message: format!(
+                "writer lease {key} length {} exceeds maximum {OBJECT_LEASE_MAX_BYTES}",
+                meta.size
+            ),
+        });
+    }
+    let bytes = if meta.size == 0 {
+        Arc::from([])
+    } else {
+        client.get_range(key, 0, meta.size).await?
+    };
     Ok(Some(ObservedLeaseState {
         etag: meta.etag,
         state: decode_lease_state(key, &bytes)?,
@@ -1054,9 +1200,12 @@ fn encode_lease_state(state: ObjectLeaseState) -> Result<Arc<[u8]>> {
     let key_len = state.current_wal_key.as_ref().map_or(0, String::len);
     let key_len = u32::try_from(key_len)
         .map_err(|_| Error::invalid_options("object WAL segment key exceeds u32::MAX"))?;
-    let mut bytes = Vec::with_capacity(20 + key_len as usize);
+    let mut bytes = Vec::with_capacity(OBJECT_LEASE_V2_HEADER_LEN + key_len as usize);
+    bytes.extend_from_slice(&OBJECT_LEASE_MAGIC.to_le_bytes());
+    bytes.extend_from_slice(&OBJECT_LEASE_VERSION.to_le_bytes());
     bytes.extend_from_slice(&state.epoch.to_le_bytes());
     bytes.extend_from_slice(&state.committed_sequence.get().to_le_bytes());
+    bytes.extend_from_slice(&state.lease_expires_at_ms.to_le_bytes());
     bytes.extend_from_slice(&key_len.to_le_bytes());
     if let Some(key) = state.current_wal_key {
         bytes.extend_from_slice(key.as_bytes());
@@ -1065,12 +1214,16 @@ fn encode_lease_state(state: ObjectLeaseState) -> Result<Arc<[u8]>> {
 }
 
 fn decode_lease_state(key: &str, bytes: &[u8]) -> Result<ObjectLeaseState> {
+    if bytes.len() >= 4 && read_u32_le(key, &bytes[..4], "magic")? == OBJECT_LEASE_MAGIC {
+        return decode_lease_state_v2(key, bytes);
+    }
     if bytes.len() == 8 {
         let epoch = decode_u64(key, bytes, "epoch")?;
         return Ok(ObjectLeaseState {
             epoch,
             committed_sequence: Sequence::ZERO,
             current_wal_key: None,
+            lease_expires_at_ms: 0,
         });
     }
     if bytes.len() == 16 {
@@ -1080,6 +1233,7 @@ fn decode_lease_state(key: &str, bytes: &[u8]) -> Result<ObjectLeaseState> {
             epoch,
             committed_sequence,
             current_wal_key: None,
+            lease_expires_at_ms: 0,
         });
     }
     if bytes.len() < 20 {
@@ -1089,13 +1243,50 @@ fn decode_lease_state(key: &str, bytes: &[u8]) -> Result<ObjectLeaseState> {
     }
     let epoch = decode_u64(key, &bytes[..8], "epoch")?;
     let committed_sequence = Sequence::new(decode_u64(key, &bytes[8..16], "commit head")?);
-    let key_len = u32::from_le_bytes(bytes[16..20].try_into().map_err(|_| Error::Corruption {
-        message: format!("writer lease {key} has a malformed WAL segment key length"),
-    })?);
+    let key_len = read_u32_le(key, &bytes[16..20], "WAL segment key length")?;
+    decode_lease_state_with_key(key, bytes, 20, key_len, epoch, committed_sequence, 0)
+}
+
+fn decode_lease_state_v2(key: &str, bytes: &[u8]) -> Result<ObjectLeaseState> {
+    if bytes.len() < OBJECT_LEASE_V2_HEADER_LEN {
+        return Err(Error::Corruption {
+            message: format!("writer lease {key} has a malformed v2 state"),
+        });
+    }
+    let version = read_u16_le(key, &bytes[4..6], "version")?;
+    if version != OBJECT_LEASE_VERSION {
+        return Err(Error::Corruption {
+            message: format!("writer lease {key} has unsupported version {version}"),
+        });
+    }
+    let epoch = decode_u64(key, &bytes[6..14], "epoch")?;
+    let committed_sequence = Sequence::new(decode_u64(key, &bytes[14..22], "commit head")?);
+    let lease_expires_at_ms = decode_u64(key, &bytes[22..30], "lease expiry")?;
+    let key_len = read_u32_le(key, &bytes[30..34], "WAL segment key length")?;
+    decode_lease_state_with_key(
+        key,
+        bytes,
+        OBJECT_LEASE_V2_HEADER_LEN,
+        key_len,
+        epoch,
+        committed_sequence,
+        lease_expires_at_ms,
+    )
+}
+
+fn decode_lease_state_with_key(
+    key: &str,
+    bytes: &[u8],
+    key_offset: usize,
+    key_len: u32,
+    epoch: u64,
+    committed_sequence: Sequence,
+    lease_expires_at_ms: u64,
+) -> Result<ObjectLeaseState> {
     let key_len = usize::try_from(key_len).map_err(|_| Error::Corruption {
         message: format!("writer lease {key} WAL segment key length overflow"),
     })?;
-    let key_end = 20_usize
+    let key_end = key_offset
         .checked_add(key_len)
         .ok_or_else(|| Error::Corruption {
             message: format!("writer lease {key} WAL segment key offset overflow"),
@@ -1108,9 +1299,11 @@ fn decode_lease_state(key: &str, bytes: &[u8]) -> Result<ObjectLeaseState> {
     let current_wal_key = if key_len == 0 {
         None
     } else {
-        let key_bytes = bytes.get(20..key_end).ok_or_else(|| Error::Corruption {
-            message: format!("writer lease {key} has a truncated WAL segment key"),
-        })?;
+        let key_bytes = bytes
+            .get(key_offset..key_end)
+            .ok_or_else(|| Error::Corruption {
+                message: format!("writer lease {key} has a truncated WAL segment key"),
+            })?;
         Some(
             std::str::from_utf8(key_bytes)
                 .map_err(|_| Error::Corruption {
@@ -1123,7 +1316,22 @@ fn decode_lease_state(key: &str, bytes: &[u8]) -> Result<ObjectLeaseState> {
         epoch,
         committed_sequence,
         current_wal_key,
+        lease_expires_at_ms,
     })
+}
+
+fn read_u16_le(key: &str, bytes: &[u8], field: &str) -> Result<u16> {
+    let array: [u8; 2] = bytes.try_into().map_err(|_| Error::Corruption {
+        message: format!("writer lease {key} has a malformed {field}"),
+    })?;
+    Ok(u16::from_le_bytes(array))
+}
+
+fn read_u32_le(key: &str, bytes: &[u8], field: &str) -> Result<u32> {
+    let array: [u8; 4] = bytes.try_into().map_err(|_| Error::Corruption {
+        message: format!("writer lease {key} has a malformed {field}"),
+    })?;
+    Ok(u32::from_le_bytes(array))
 }
 
 fn decode_u64(key: &str, bytes: &[u8], field: &str) -> Result<u64> {
@@ -1131,6 +1339,22 @@ fn decode_u64(key: &str, bytes: &[u8], field: &str) -> Result<u64> {
         message: format!("writer lease {key} has a malformed {field}"),
     })?;
     Ok(u64::from_le_bytes(array))
+}
+
+fn current_epoch_millis() -> Result<u64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| Error::Io(io::Error::other(error)))?;
+    u64::try_from(duration.as_millis())
+        .map_err(|_| Error::invalid_options("system time milliseconds exceed u64::MAX"))
+}
+
+fn object_lease_deadline_ms(now_ms: u64) -> u64 {
+    let ttl_ms = match u64::try_from(OBJECT_LEASE_TTL.as_millis()) {
+        Ok(value) => value,
+        Err(_) => u64::MAX,
+    };
+    now_ms.saturating_add(ttl_ms)
 }
 
 fn lock_poisoned_error(lock_name: &'static str) -> Error {
@@ -1434,7 +1658,7 @@ mod tests {
     }
 
     #[test]
-    fn object_writer_lease_bumps_fencing_epoch_on_takeover() {
+    fn object_writer_lease_rejects_live_second_writer_and_takes_expired() {
         use crate::object_store::InMemoryObjectStore;
 
         let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
@@ -1445,12 +1669,34 @@ mod tests {
         assert_eq!(first.epoch(), 1);
         assert_eq!(first.committed_sequence(), Sequence::ZERO);
 
-        // A later acquire takes over with a strictly higher epoch (fencing the
-        // previous holder).
+        let error = poll_ready(ObjectWriterLease::acquire(Arc::clone(&client), "LOCK"))
+            .expect_err("live lease rejects a second writer");
+        assert!(error.to_string().contains("writer lease LOCK is held"));
+
+        let expired = ObjectLeaseState {
+            epoch: first.epoch(),
+            committed_sequence: Sequence::ZERO,
+            current_wal_key: None,
+            lease_expires_at_ms: 0,
+        };
+        match poll_ready(client.put_if(
+            "LOCK",
+            encode_lease_state(expired).expect("encode expired lease"),
+            Precondition::IfMatch(first.etag.clone()),
+        ))
+        .expect("store expired lease")
+        {
+            PutIf::Stored { .. } => {}
+            PutIf::PreconditionFailed { .. } => {
+                panic!("expired lease rewrite should match the observed ETag");
+            }
+        }
+
         let second = poll_ready(ObjectWriterLease::acquire(Arc::clone(&client), "LOCK"))
-            .expect("second acquire");
+            .expect("expired lease can be acquired");
         assert_eq!(second.epoch(), 2);
-        let third = poll_ready(ObjectWriterLease::acquire(client, "LOCK")).expect("third acquire");
-        assert_eq!(third.epoch(), 3);
+        let error = poll_ready(ObjectWriterLease::acquire(client, "LOCK"))
+            .expect_err("new live lease rejects another writer");
+        assert!(error.to_string().contains("writer lease LOCK is held"));
     }
 }

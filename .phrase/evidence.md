@@ -14650,3 +14650,45 @@ Negative check:
 
 - Default persistent durability stays `SyncAll` but is now non-strict (faster);
   power-loss durability is opt-in via `SyncAllStrict`. Documented on the enum.
+
+## 2026-06-20: Object-store production hardening audit fixes
+
+### Observation
+
+- The object-store writer lease behaved as immediate fencing takeover: a second
+  writable opener could bump the epoch while the first writer was still alive.
+- Object-store open accepted file-style sync durability modes and rejected them
+  only when a later write/persist path noticed the backend could not honor them.
+- Object-store read paths used `HEAD` for a size preflight but then fetched whole
+  objects, leaving a large-allocation window if the client lied or the object
+  changed between metadata and bytes.
+- The Apple DispatchIO backend had the right callback lifetime shape, but the
+  raw pointer dereference and block-pointer cast needed tighter local safety
+  notes.
+
+### Interpretation
+
+- Object-store writable open needs live-owner refusal plus crash recovery via
+  expiry, not unconditional takeover. Graceful close should release by expiring
+  the lease while preserving WAL head state.
+- Object-store reads should use bounded range reads based on validated metadata
+  and then verify the returned byte count.
+
+### Verification
+
+- Implemented v2 lease encoding with expiry, worker heartbeat renewal, graceful
+  release-to-expired, and legacy lease decode as immediately expired.
+- Object-store open now rejects `SyncData`, `SyncAll`, and `SyncAllStrict`
+  before any storage I/O. Object-store byte reads now use `get_range(0, size)`
+  after `HEAD` size validation and reject short ranges without falling back to
+  whole-object `get`.
+- Added regressions for live second-writer refusal, expired lease takeover,
+  open-time durability rejection, oversized `HEAD`, and short range reads.
+- `cargo test -q object_store`, `cargo test -q writer_lease`, `cargo check -q`,
+  `cargo check -q --features platform-io-native`, `cargo fmt --check`, and
+  `git diff --check` passed.
+
+### Recommended Next Action
+
+- Keep object-store lease TTL configurable only if production deployment
+  evidence shows the fixed 30s crash-recovery window is too long or too short.
