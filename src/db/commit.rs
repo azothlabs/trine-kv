@@ -1187,45 +1187,59 @@ impl Db {
         batches: Vec<WalBatch>,
         replay_floor: Sequence,
     ) -> Result<()> {
-        let mut last_seen = Sequence::ZERO;
-        let mut last_committed = replay_floor;
-
-        for batch in batches {
-            if batch.sequence <= last_seen {
-                return Err(Error::Corruption {
-                    message: "WAL sequence did not increase".to_owned(),
-                });
-            }
-            last_seen = batch.sequence;
-            validate_batch_len(batch.operations.len())?;
-
-            if batch.sequence <= replay_floor {
-                continue;
-            }
-
-            for (batch_index, operation) in batch.operations.into_iter().enumerate() {
-                let batch_index = u32::try_from(batch_index)
-                    .map_err(|_| Error::invalid_options("WAL operation count exceeds u32::MAX"))?;
-                let state = self.bucket_state(operation.bucket()).map_err(|error| {
-                    if let Error::BucketMissing { name } = error {
-                        Error::Corruption {
-                            message: format!("WAL references bucket missing from manifest: {name}"),
-                        }
-                    } else {
-                        error
-                    }
-                })?;
-                state.apply_operation(operation, batch.sequence, batch_index)?;
-            }
-
-            last_committed = batch.sequence;
-        }
-
+        let buckets = self
+            .inner
+            .buckets
+            .read()
+            .map_err(|_| lock_poisoned("bucket registry"))?;
+        let last_committed = replay_wal_batches_into_buckets(&buckets, batches, replay_floor)?;
+        drop(buckets);
         self.inner
             .commit_tracker
             .reset_visible_boundary(last_committed)?;
         Ok(())
     }
+}
+
+pub(super) fn replay_wal_batches_into_buckets(
+    buckets: &std::collections::BTreeMap<String, Arc<LsmTree>>,
+    batches: Vec<WalBatch>,
+    replay_floor: Sequence,
+) -> Result<Sequence> {
+    let mut last_seen = Sequence::ZERO;
+    let mut last_committed = replay_floor;
+
+    for batch in batches {
+        if batch.sequence <= last_seen {
+            return Err(Error::Corruption {
+                message: "WAL sequence did not increase".to_owned(),
+            });
+        }
+        last_seen = batch.sequence;
+        validate_batch_len(batch.operations.len())?;
+
+        if batch.sequence <= replay_floor {
+            continue;
+        }
+
+        for (batch_index, operation) in batch.operations.into_iter().enumerate() {
+            let batch_index = u32::try_from(batch_index)
+                .map_err(|_| Error::invalid_options("WAL operation count exceeds u32::MAX"))?;
+            let state = buckets
+                .get(operation.bucket())
+                .ok_or_else(|| Error::Corruption {
+                    message: format!(
+                        "WAL references bucket missing from manifest: {}",
+                        operation.bucket()
+                    ),
+                })?;
+            state.apply_operation(operation, batch.sequence, batch_index)?;
+        }
+
+        last_committed = batch.sequence;
+    }
+
+    Ok(last_committed)
 }
 
 fn include_min_key(slot: &mut Option<Vec<u8>>, key: &[u8]) {

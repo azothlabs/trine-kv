@@ -2,50 +2,89 @@
 
 ## Status
 
-Durability tiering done. Also this session: snapshot-version-pin Phase 1 (merged;
-2-3 deferred), delete-gc 4b (source-level GC), layered-filter Phase 5 D1 (opt-in
-curve), manifest clean break (v11, no back-compat).
+Object-store compute/storage split hardening completed for the current
+correctness phase. Previous durability tiering is complete.
 
 ## Goal
 
-Stop paying macOS `F_FULLFSYNC` on every durable commit. Expose a strict vs
-non-strict durability tier (default non-strict for throughput; strict opt-in for
-power-loss durability), routed through a single fsync abstraction.
+Make object-store persistence a real shared storage backend for separated
+compute and storage: confirmed durable writes must be recoverable after process
+loss and writer takeover, while explicitly buffered writes remain opt-in.
 
-## Design Assessment
+## Backend Boundary Receipt
 
-macOS std `sync_all`/`sync_data` always issue `F_FULLFSYNC` — the only call that
-flushes the drive's volatile cache (plain `fsync` does not; Apple `fsync(2)`,
-per https://bonsaidb.io/blog/acid-on-apple/). That was the ~500 ops/s floor. Make
-the strength a tier and centralize the platform decision in one place rather than
-editing every sync site (per the user's direction).
+- Trine operation names: open object-store database, accept write commit, publish
+  table flush, publish manifest, recover from manifest plus remote commit log,
+  advance replay floor, fence stale writer, clean orphan objects.
+- Owned interface: Trine's `ObjectClient`, storage substrate, manifest store,
+  write pipeline, and recovery path. External object-storage crates are adapters
+  behind that boundary.
+- Chosen backend: S3-compatible object storage through the existing object-store
+  client contract, with the in-memory object client as deterministic test
+  backend.
+- Known backend limits: no append primitive, higher latency than local files,
+  conditional writes required for manifest/lease/head ownership, listing may be
+  weaker than point reads on some providers, deletes are cleanup only.
+- Leak-check scope: public API names, error variants, stats, and docs must speak
+  in Trine database operations rather than naming a provider as the architecture.
+- Verification gate: crash/reopen recovery for confirmed object-store writes,
+  stale-writer fencing, manifest CAS conflict behavior, WAL replay floor
+  advancement, orphan cleanup safety, `cargo fmt --check`, targeted tests, and
+  rustdoc/doc tests if public API docs change.
 
-## Scope (done)
+## Completed Task Slice
 
-- `src/durability.rs`: single abstraction `sync_file_for_durability(&File, mode)`
-  (+ `sync_fd_for_durability` for the macOS DispatchIO backend,
-  `requires_file_sync`, `durability_is_strict`). macOS: strict → `F_FULLFSYNC`
-  (fallback `fsync` on ENOTSUP), non-strict → `fsync`. Non-macOS → std sync
-  (already durable; strict == non-strict).
-- `DurabilityMode::SyncAllStrict` + `WriteOptions::sync_all_strict()`; docs on the
-  enum spell out the power-loss caveat.
-- All sync sites (storage.rs, io/platform_threadpool.rs, io/platform_backend.rs,
-  apple_dispatch.rs) route through the abstraction. `libc` is a non-optional macOS
-  dependency.
-- Default persistent durability stays `SyncAll`, now non-strict (faster).
+- Define explicit object-store commit modes so the current buffered behavior
+  cannot masquerade as confirmed remote durability.
+- Add a remote commit log path for durable object-store writes.
+- Replay that log on open before serving reads.
+- Advance and clean the log after table flush publishes a manifest that covers
+  the replay floor.
+- Fence stale writers before they can acknowledge new writes.
+- Keep remote WAL metadata bounded by segmenting commit records instead of
+  growing the lease/head object per commit.
+- Define read-only compute refresh semantics for observing newer shared state.
+- Record provider assumptions that correctness depends on: conditional writes,
+  point-read visibility, listing use, idempotent delete, and retry boundaries.
+
+## Out Of Scope
+
+- Provider-specific S3 tuning beyond the current adapter contract.
+- Performance tuning beyond the first grouped/segmented WAL correctness model.
 
 ## Acceptance Gate
 
-- Measured (macOS, 200 single-key sync writes): non-strict ~8,234 ops/s vs strict
-  ~386 ops/s (~21x). Met.
-- Strict write persists across reopen (`strict_durability_write_persists_and_reopens`);
-  durability unit tests classify modes and sync every mode. Met.
-- Full gate: fmt + clippy (default and `--features platform-io-native`) clean;
-  `--lib` 373, `--all-features` 377 / 1 ignored, native `--lib` 374; benches ok.
+- A confirmed durable object-store write survives closing without flush and
+  reopening from the shared backend. Met.
+- A stale writer cannot acknowledge a durable write after another writer takes
+  ownership. Met.
+- Flush publication advances the remote replay floor and does not lose writes
+  across reopen. Met.
+- Existing native persistent and in-memory behavior stays compatible. Met.
+- Remote WAL metadata does not grow one lease/head entry per durable commit.
+  Met.
+- Durable write confirmation can batch more than one commit into one remote WAL
+  segment. Met.
+- Read-only compute handles can refresh to a newer manifest/replay boundary
+  without reopening. Met.
+- Provider correctness assumptions are captured in code-facing docs and covered
+  by deterministic object-client tests where possible. Met.
+
+## Verification
+
+- `cargo check -q`
+- `cargo test -q object_store`
+- `cargo test -q --lib`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo clippy -q --lib`
+- `cargo test -q --doc --all-features`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test -q --all-features`
 
 ## Next Recommendation
 
-- Deferred/measure-gated as before: snapshot-version-pin Phases 2-3; layered-filter
-  Phase 5 D1 default-flip + D2 (need s3 benchmark / static-headroom evidence). A
-  future polish: surface a database-default `SyncAllStrict` option for users who
-  want power-loss durability by default.
+- Next phase should measure remote-provider workloads and tune batching/cost
+  behavior if measurements show the correctness-first segment model is too
+  expensive. No correctness blocker remains in the deterministic object-client
+  gate.

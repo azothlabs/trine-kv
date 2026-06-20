@@ -49,7 +49,8 @@ use crate::{
         StorageObjectReadBackend, StorageReadBackend,
     },
     substrate::{
-        DurabilitySubstrate, FilesystemSubstrate, ObjectStoreSubstrate, ObjectWriterLease,
+        DurabilitySubstrate, FilesystemSubstrate, ObjectLeaseState, ObjectStoreSubstrate,
+        ObjectWriterLease,
     },
     table::{self, Table},
     transaction::{Transaction, TransactionOptions},
@@ -1214,11 +1215,11 @@ impl Db {
     /// several databases can share one bucket. An empty `prefix` uses the bucket
     /// root.
     ///
-    /// The byte IO, the manifest (conditional-PUT CAS), and the writer lease all
-    /// ride `client`. There is no WAL — a commit is durable once its memtable is
-    /// flushed to objects and the manifest CAS publishes them — so the recovered
-    /// visible sequence is the maximum `largest_sequence` across the manifest's
-    /// tables.
+    /// The byte IO, the manifest (conditional-PUT CAS), the writer lease, and
+    /// the remote WAL all ride `client`. Durable writes publish WAL frames into
+    /// the current remote segment before they become visible; flush later
+    /// converts covered memtables into table objects, advances the manifest
+    /// replay floor, and cleans old WAL objects.
     ///
     /// # Errors
     ///
@@ -1229,6 +1230,7 @@ impl Db {
         all(target_arch = "wasm32", target_os = "unknown"),
         allow(clippy::arc_with_non_send_sync)
     )]
+    #[allow(clippy::too_many_lines)]
     pub async fn open_object_store_at(
         client: Arc<dyn ObjectClient>,
         prefix: impl Into<String>,
@@ -1249,15 +1251,25 @@ impl Db {
 
         // Acquire the writer lease before the manifest, so its fencing epoch is
         // known and can be stamped into every publish.
-        let substrate = if options.read_only {
-            DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(None, None))
+        let lease_key = db_path
+            .join(recovery::PROCESS_LOCK_FILE_NAME)
+            .to_string_lossy()
+            .into_owned();
+        let (substrate, remote_wal_state) = if options.read_only {
+            let remote_wal_state = ObjectWriterLease::read_current(Arc::clone(&client), lease_key)
+                .await?
+                .unwrap_or_else(ObjectLeaseState::empty);
+            (
+                DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(None, None)),
+                remote_wal_state,
+            )
         } else {
-            let lease_key = db_path
-                .join(recovery::PROCESS_LOCK_FILE_NAME)
-                .to_string_lossy()
-                .into_owned();
             let lease = ObjectWriterLease::acquire(Arc::clone(&client), lease_key).await?;
-            DurabilitySubstrate::ObjectStore(ObjectStoreSubstrate::new(lease))
+            let remote_wal_state = lease.lease_state();
+            (
+                DurabilitySubstrate::ObjectStore(ObjectStoreSubstrate::new(lease, db_path.clone())),
+                remote_wal_state,
+            )
         };
         let writer_epoch = substrate.object_fencing_epoch().unwrap_or(0);
 
@@ -1275,25 +1287,23 @@ impl Db {
         let mut buckets =
             buckets_from_manifest_async(&backend, &db_path, manifest.state(), true).await?;
         ensure_default_bucket_loaded(&mut buckets, &options)?;
-
-        // No WAL: the durable visible boundary is the newest sequence already
-        // flushed into the manifest's tables.
-        let visible_sequence = manifest
-            .state()
-            .tables()
-            .values()
-            .flatten()
-            .map(|properties| properties.largest_sequence)
-            .max()
-            .unwrap_or(Sequence::ZERO);
+        let replay_floor = manifest.state().wal_replay_floor();
+        let wal_paths = object_store_wal_paths_after_replay_floor(&remote_wal_state, replay_floor)?;
+        let wal_streams = wal::read_recovery_streams_after_paths_with_backend_async(
+            &backend,
+            &wal_paths,
+            replay_floor,
+        )
+        .await?;
+        let batches = wal::merge_batch_streams_by_sequence(wal_streams)?;
 
         let block_cache_bytes = options.block_cache_bytes;
         let runtime = Runtime::new(options.runtime);
-        Ok(Self {
+        let db = Self {
             inner: Arc::new(DbInner {
                 options,
                 user_handles: AtomicUsize::new(1),
-                commit_tracker: CommitTracker::new(visible_sequence),
+                commit_tracker: CommitTracker::new(Sequence::ZERO),
                 closed: AtomicBool::new(false),
                 publish_barrier: PublishBarrier::new(),
                 memtable_publish_lock: Mutex::new(()),
@@ -1338,7 +1348,9 @@ impl Db {
                 background_workers: Mutex::new(Vec::new()),
             }),
             counts_as_user_handle: true,
-        })
+        };
+        db.replay_wal_batches(batches, replay_floor)?;
+        Ok(db)
     }
 
     #[cfg_attr(
@@ -2620,12 +2632,10 @@ impl Db {
         }
 
         match &self.inner.options.storage_mode {
-            // In-memory has no durable layer; object storage is WAL-less (each PUT
-            // is durable on ack, so there is nothing to persist short of a flush).
-            StorageMode::InMemory
-            | StorageMode::HostPersistent {
+            StorageMode::InMemory => Ok(()),
+            StorageMode::HostPersistent {
                 backend: HostStorageBackend::ObjectStore,
-            } => Ok(()),
+            } => self.inner.substrate.persist_wal(mode),
             StorageMode::Persistent { .. }
             | StorageMode::HostPersistent {
                 backend: HostStorageBackend::Wasi { .. },
@@ -2664,8 +2674,8 @@ impl Db {
         &self.inner.object_storage_prefix
     }
 
-    /// Flush all immutable memtables to objects and publish them via the manifest
-    /// CAS (the WAL-less durability point for object storage).
+    /// Flush all immutable memtables to objects, publish them via the manifest
+    /// CAS, then clean remote WAL objects covered by the new replay floor.
     ///
     /// NOTE: this holds the manifest mutex across the async CAS publish, so the
     /// returned future is not `Send` (fine for the current async-only,
@@ -2734,7 +2744,10 @@ impl Db {
         self.publish_flushed_tables_object_store_async(&written_tables, flush_sequence)
             .await?;
         Self::install_flushed_tables(flush_inputs, written_tables)?;
-        // No WAL to rewrite: object-store databases are WAL-less.
+        self.inner
+            .substrate
+            .rewrite_wal_after_replay_floor_async(flush_sequence)
+            .await?;
         Ok(())
     }
 
@@ -3152,13 +3165,10 @@ impl Db {
         }
 
         match &self.inner.options.storage_mode {
-            StorageMode::InMemory
-            | StorageMode::HostPersistent {
-                backend: HostStorageBackend::ObjectStore,
-            } => Ok(()),
+            StorageMode::InMemory => Ok(()),
             StorageMode::Persistent { .. }
             | StorageMode::HostPersistent {
-                backend: HostStorageBackend::Wasi { .. },
+                backend: HostStorageBackend::Wasi { .. } | HostStorageBackend::ObjectStore,
             } => self.inner.substrate.persist_wal_async(mode).await,
             StorageMode::HostPersistent { backend } => {
                 Err(Error::unsupported_backend(backend.as_str()))
@@ -7971,6 +7981,117 @@ impl Db {
         }
     }
 
+    /// Refreshes a read-only object-store handle to the newest shared state.
+    ///
+    /// Object-store databases support a compute/storage split: one writer owns
+    /// the fencing lease while any number of read-only handles can serve reads
+    /// from the shared object store. A read-only handle is a point-in-time view
+    /// until this method is called. Refresh re-reads the manifest, rebuilds the
+    /// bucket state from the tables it names, then replays the current remote
+    /// WAL segment when the writer has acknowledged commits newer than the
+    /// manifest replay floor. The returned [`ReadVersion`] is the newest version
+    /// visible to reads after the refresh completes.
+    ///
+    /// `refresh_object_store` never takes the writer lease and never publishes
+    /// metadata. It requires the object-store client to make a successful
+    /// conditional lease/head write visible to later `get`/`head` reads of that
+    /// same key; object listing is used only for cleanup paths, not as the
+    /// source of committed WAL state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidOptions`] if the handle is not a read-only
+    /// object-store database, [`Error::Closed`] if the handle is closed, or a
+    /// storage/corruption error if the manifest, table objects, or referenced
+    /// WAL segment cannot be read.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::sync::Arc;
+    ///
+    /// use trine_kv::{Db, DbOptions, InMemoryObjectStore};
+    ///
+    /// async fn example() -> trine_kv::Result<()> {
+    ///     let client = Arc::new(InMemoryObjectStore::new());
+    ///     let writer = Db::open_object_store(client.clone(), DbOptions::object_store()).await?;
+    ///     let reader = Db::open_object_store(client, DbOptions::object_store().read_only()).await?;
+    ///
+    ///     writer.put(b"k", b"v").await?;
+    ///     assert_eq!(reader.get(b"k").await?, None);
+    ///
+    ///     let refreshed = reader.refresh_object_store().await?;
+    ///     assert_eq!(reader.get(b"k").await?, Some(b"v".to_vec()));
+    ///     assert_eq!(refreshed, reader.latest_read_version());
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn refresh_object_store(&self) -> Result<ReadVersion> {
+        self.ensure_open()?;
+        if !self.inner.options.storage_mode.is_object_store_persistent()
+            || !self.inner.options.read_only
+        {
+            return Err(Error::invalid_options(
+                "refresh_object_store requires a read-only object-store database",
+            ));
+        }
+
+        let _refresh = self.inner.object_manifest_async_lock.lock().await;
+        let backend = self.object_storage()?;
+        let client = backend.client();
+        let db_path = self.object_store_db_path().to_path_buf();
+        let manifest_key = manifest::manifest_path(&db_path)
+            .to_string_lossy()
+            .into_owned();
+        let lease_key = db_path
+            .join(recovery::PROCESS_LOCK_FILE_NAME)
+            .to_string_lossy()
+            .into_owned();
+
+        let remote_wal_state = ObjectWriterLease::read_current(Arc::clone(&client), lease_key)
+            .await?
+            .unwrap_or_else(ObjectLeaseState::empty);
+        let manifest = ManifestStore::open_object_store_async(client, manifest_key, 0).await?;
+        let mut buckets =
+            buckets_from_manifest_async(&backend, &db_path, manifest.state(), true).await?;
+        ensure_default_bucket_loaded(&mut buckets, &self.inner.options)?;
+
+        let replay_floor = manifest.state().wal_replay_floor();
+        let wal_paths = object_store_wal_paths_after_replay_floor(&remote_wal_state, replay_floor)?;
+        let wal_streams = wal::read_recovery_streams_after_paths_with_backend_async(
+            &backend,
+            &wal_paths,
+            replay_floor,
+        )
+        .await?;
+        let batches = wal::merge_batch_streams_by_sequence(wal_streams)?;
+        let last_committed =
+            commit::replay_wal_batches_into_buckets(&buckets, batches, replay_floor)?;
+
+        {
+            let mut installed = self
+                .inner
+                .buckets
+                .write()
+                .map_err(|_| lock_poisoned("bucket registry"))?;
+            *installed = buckets;
+        }
+        self.inner
+            .manifest
+            .as_ref()
+            .ok_or_else(|| Error::Corruption {
+                message: "object-store database is missing manifest store".to_owned(),
+            })?
+            .lock()
+            .map_err(|_| lock_poisoned("manifest store"))?
+            .install_object_manifest(manifest.clone_object_manifest()?)?;
+        self.inner
+            .commit_tracker
+            .reset_visible_boundary(last_committed)?;
+
+        Ok(ReadVersion::from_sequence(last_committed))
+    }
+
     /// Returns a handle for the built-in default bucket.
     ///
     /// Direct `Db` methods such as [`Db::put`] and [`Db::get`] use this bucket
@@ -8459,6 +8580,10 @@ impl Db {
     ///
     /// - `mode`: durability level to request for pending WAL bytes.
     pub async fn persist(&self, mode: DurabilityMode) -> Result<()> {
+        if self.inner.options.storage_mode.is_object_store_persistent() {
+            return self.inner.substrate.persist_wal_async(mode).await;
+        }
+
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         if matches!(
             self.inner.options.storage_mode,
@@ -8712,6 +8837,27 @@ fn validate_options(options: &DbOptions) -> Result<()> {
         ));
     }
     validate_common_options(options)
+}
+
+fn object_store_wal_paths_after_replay_floor(
+    state: &ObjectLeaseState,
+    replay_floor: Sequence,
+) -> Result<Vec<PathBuf>> {
+    if state.committed_sequence <= replay_floor {
+        return Ok(Vec::new());
+    }
+
+    state
+        .current_wal_key
+        .as_ref()
+        .map(|key| vec![PathBuf::from(key)])
+        .ok_or_else(|| Error::Corruption {
+            message: format!(
+                "object-store WAL head reached sequence {} beyond replay floor {} without a WAL segment",
+                state.committed_sequence.get(),
+                replay_floor.get()
+            ),
+        })
 }
 
 fn validate_common_options(options: &DbOptions) -> Result<()> {
@@ -9713,10 +9859,11 @@ mod tests {
     };
     use crate::{
         bucket::DEFAULT_BUCKET_NAME,
-        options::{BucketOptions, DbOptions},
+        options::{BucketOptions, DbOptions, DurabilityMode},
         runtime::CancellationToken,
         storage::{StorageCapability, StorageReadBackend},
-        types::KeyRange,
+        substrate::ObjectWriterLease,
+        types::{KeyRange, ReadVersion, Sequence},
     };
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -9823,11 +9970,11 @@ mod tests {
         ))
         .expect("open b (takeover)");
 
-        // A is still alive (split brain) and tries to flush again → fenced, so it
-        // cannot clobber B. This is the single-writer guarantee for object storage.
-        a.put_sync(b"k", b"a2").expect("put a again");
-        let fenced = block_on_test_future(a.flush())
-            .expect_err("A's flush must be fenced after B's takeover");
+        // A is still alive (split brain), but durable writes are fenced before
+        // they are acknowledged, so A cannot even publish a remote WAL commit.
+        let fenced = a
+            .put_sync(b"k", b"a2")
+            .expect_err("A's write must be fenced after B's takeover");
         assert!(
             matches!(fenced, Error::Fenced { .. }),
             "expected Fenced, got {fenced:?}"
@@ -9861,12 +10008,10 @@ mod tests {
                 block_on_test_future(db.bucket_with_options("docs", BucketOptions::default()))
                     .expect("create docs bucket");
             docs.put_sync(b"title", b"trine").expect("put into docs");
-            // Durable flush: memtables -> SSTable objects + manifest CAS publish.
-            block_on_test_future(db.flush()).expect("flush to object storage");
         }
 
-        // Reopen from the same object store. There is no WAL: recovery comes from
-        // the manifest (read via CAS store) + the flushed SSTable objects.
+        // Reopen from the same object store. Durable writes recover from the
+        // manifest plus the remote WAL head even without a flush.
         let db = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
             .expect("reopen object-store database");
         assert_eq!(
@@ -9887,6 +10032,140 @@ mod tests {
             docs.get_sync(b"title").expect("get docs title").as_deref(),
             Some(b"trine".as_slice())
         );
+    }
+
+    #[test]
+    fn object_store_buffered_write_requires_flush_to_recover() {
+        use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+        let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+
+        {
+            let db = block_on_test_future(Db::open_object_store(
+                Arc::clone(&client),
+                DbOptions::object_store().with_durability(DurabilityMode::Buffered),
+            ))
+            .expect("open object-store database");
+            db.put_sync(b"k", b"buffered").expect("buffered put");
+            assert_eq!(
+                db.get_sync(b"k").expect("in-process read").as_deref(),
+                Some(b"buffered".as_slice())
+            );
+        }
+
+        let db = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+            .expect("reopen object-store database");
+        assert_eq!(db.get_sync(b"k").expect("reopen read"), None);
+    }
+
+    #[test]
+    fn object_store_wal_head_points_to_segment_not_per_commit_index() {
+        use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+        let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+        let db = block_on_test_future(Db::open_object_store(
+            Arc::clone(&client),
+            DbOptions::object_store(),
+        ))
+        .expect("open object-store database");
+        db.put_sync(b"a", b"one").expect("put a");
+        db.put_sync(b"b", b"two").expect("put b");
+        db.put_sync(b"c", b"three").expect("put c");
+
+        let state =
+            block_on_test_future(ObjectWriterLease::read_current(Arc::clone(&client), "LOCK"))
+                .expect("read WAL head")
+                .expect("WAL head exists");
+        let segment_key = state.current_wal_key.expect("segment key");
+        let segment = block_on_test_future(client.get(&segment_key))
+            .expect("read WAL segment")
+            .expect("segment exists");
+        let batches =
+            crate::wal::decode_frames_after(segment.as_ref(), Sequence::ZERO).expect("decode WAL");
+        assert_eq!(batches.len(), 3);
+        assert_eq!(state.committed_sequence, Sequence::new(3));
+
+        block_on_test_future(db.flush()).expect("flush");
+        let state = block_on_test_future(ObjectWriterLease::read_current(client, "LOCK"))
+            .expect("read WAL head after flush")
+            .expect("WAL head exists after flush");
+        assert_eq!(state.current_wal_key, None);
+        assert_eq!(state.committed_sequence, Sequence::new(3));
+    }
+
+    #[test]
+    fn object_store_read_only_refresh_replays_remote_wal_segment() {
+        use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+        let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+        let writer = block_on_test_future(Db::open_object_store(
+            Arc::clone(&client),
+            DbOptions::object_store(),
+        ))
+        .expect("open writer");
+        let reader = block_on_test_future(Db::open_object_store(
+            Arc::clone(&client),
+            DbOptions::object_store().read_only(),
+        ))
+        .expect("open reader");
+
+        writer.put_sync(b"k", b"wal").expect("writer put");
+        assert_eq!(reader.get_sync(b"k").expect("stale reader"), None);
+
+        let refreshed = block_on_test_future(reader.refresh_object_store()).expect("refresh");
+        assert_eq!(refreshed, ReadVersion::from_sequence(Sequence::new(1)));
+        assert_eq!(
+            reader.get_sync(b"k").expect("refreshed reader").as_deref(),
+            Some(b"wal".as_slice())
+        );
+    }
+
+    #[test]
+    fn object_store_read_only_refresh_reloads_manifest_after_flush() {
+        use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+        let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+        let writer = block_on_test_future(Db::open_object_store(
+            Arc::clone(&client),
+            DbOptions::object_store(),
+        ))
+        .expect("open writer");
+        let reader = block_on_test_future(Db::open_object_store(
+            Arc::clone(&client),
+            DbOptions::object_store().read_only(),
+        ))
+        .expect("open reader");
+
+        writer.put_sync(b"k", b"table").expect("writer put");
+        block_on_test_future(writer.flush()).expect("writer flush");
+
+        let refreshed = block_on_test_future(reader.refresh_object_store()).expect("refresh");
+        assert_eq!(refreshed, ReadVersion::from_sequence(Sequence::new(1)));
+        assert_eq!(
+            block_on_test_future(reader.get(b"k"))
+                .expect("refreshed async read")
+                .as_deref(),
+            Some(b"table".as_slice())
+        );
+    }
+
+    #[test]
+    fn object_store_refresh_requires_read_only_object_store_handle() {
+        use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+        let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+        let writer = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+            .expect("open writer");
+
+        assert!(matches!(
+            block_on_test_future(writer.refresh_object_store()),
+            Err(Error::InvalidOptions { .. })
+        ));
+        let memory = Db::open_sync(DbOptions::memory()).expect("open memory");
+        assert!(matches!(
+            block_on_test_future(memory.refresh_object_store()),
+            Err(Error::InvalidOptions { .. })
+        ));
     }
 
     #[test]

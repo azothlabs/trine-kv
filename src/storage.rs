@@ -376,8 +376,8 @@ impl StorageCapabilities {
     /// Byte-level capabilities of an object-storage backend: whole-object
     /// get/put/delete + prefix listing. Append, atomic rename/WAL-rewrite, and
     /// filesystem locking are deliberately absent — those diverge and are handled
-    /// by the object-storage durability substrate (segmented/WAL-less + manifest
-    /// CAS + lease object), not this byte backend.
+    /// by the object-storage durability substrate (immutable WAL segments +
+    /// manifest CAS + lease/head object), not this byte backend.
     pub(crate) const fn object_store() -> Self {
         Self::empty()
             .with(StorageCapability::Persistent)
@@ -3787,9 +3787,9 @@ pub(crate) enum StorageBackend {
     Native(NativeFileBackend),
     /// Object storage (async-only). Only the byte ops (read/write/delete/list)
     /// are supported; append, WAL rewrite, writer lease, directory ops, and
-    /// manifest publish return `unsupported` — object-store databases are
-    /// WAL-less and publish the manifest via `ObjectManifestStore`, so they never
-    /// drive those through this enum.
+    /// manifest publish return `unsupported` because object-store databases
+    /// drive remote WAL and manifest ownership through the durability substrate
+    /// and `ObjectManifestStore`, not this byte backend.
     ObjectStore(ObjectStoreBackend),
 }
 
@@ -3913,7 +3913,7 @@ impl StorageWalRewriteBackend for StorageBackend {
             }
             StorageBackend::ObjectStore(_) => Box::pin(async move {
                 Err(Error::unsupported_backend(
-                    "object-store backend is WAL-less",
+                    "object-store WAL rewrite is managed by the durability substrate",
                 ))
             }),
         }
@@ -4193,8 +4193,8 @@ mod storage_backend_tests {
         );
         assert!(!backend.capabilities().supports(StorageCapability::Append));
 
-        // Non-byte ops are unsupported (object-store DBs are WAL-less, async-only,
-        // and publish the manifest via ObjectManifestStore).
+        // Non-byte ops are unsupported here: object-store DBs are async-only and
+        // drive WAL/manifest ownership outside this byte backend.
         assert!(
             poll_ready_storage_future(
                 backend.create_directory_all(StorageDirectoryId::native_file("/db"))

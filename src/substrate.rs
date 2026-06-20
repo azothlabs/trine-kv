@@ -4,7 +4,8 @@
 //! diverge between storage backends:
 //!
 //! - the **write-ahead log** lifecycle (filesystem appends to one growing file
-//!   per shard; object storage has no append and must segment or go WAL-less),
+//!   per shard; object storage appends frames into immutable WAL segments and
+//!   advances a CAS-protected remote WAL head),
 //!   and
 //! - the **single-writer lease** (filesystem holds a `LOCK` file via a writer
 //!   lease; object storage needs a lease object + TTL + fencing token).
@@ -15,20 +16,25 @@
 //! slice 2b ① ([`crate::manifest::PublishOutcome`]).
 //!
 //! `DbInner` holds a `DurabilitySubstrate` and the commit / flush / close paths
-//! drive it (slice 2b ③). The `Filesystem` variant wraps the real
-//! `WalFrontDoor` + `ProcessLock`; the `ObjectStore` variant (slice 2c) is
-//! WAL-less with a fencing-epoch lease and is constructed once the object-store
-//! open path is wired (2c-4) — until then its arms + lease primitive are
-//! exercised by unit tests.
+//! drive it. The `Filesystem` variant wraps the real `WalFrontDoor` +
+//! `ProcessLock`; the `ObjectStore` variant publishes immutable remote WAL
+//! segments and uses the writer lease object as the CAS-protected WAL head and
+//! fencing token.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    future::Future,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    task::{Context, Poll, Wake, Waker},
+    thread,
+};
 
 use crate::error::{Error, Result};
-use crate::object_store::{ObjectClient, Precondition, PutIf};
+use crate::object_store::{ETag, ObjectClient, Precondition, PutIf};
 use crate::options::DurabilityMode;
 use crate::recovery::ProcessLock;
 use crate::types::Sequence;
-use crate::wal::{WalFrontDoor, WalFrontDoorStats};
+use crate::wal::{self, WalFrontDoor, WalFrontDoorStats};
 use crate::write_batch::BatchOperation;
 
 /// Backend-specific runtime durability operations (WAL lifecycle + writer
@@ -41,21 +47,17 @@ use crate::write_batch::BatchOperation;
 pub(crate) enum DurabilitySubstrate {
     /// Native filesystem: appendable WAL files + a `LOCK` writer lease.
     Filesystem(FilesystemSubstrate),
-    /// Object storage: WAL-less (durability is flush-to-object + manifest CAS)
-    /// with a fencing-epoch writer lease.
-    // Constructed once the object-store open path is wired (2c-4); the enum arms
-    // and lease primitive below are exercised by unit tests until then.
-    #[allow(dead_code)]
+    /// Object storage: immutable remote WAL segments + a fencing-epoch writer
+    /// lease that also stores the remote WAL head.
     ObjectStore(ObjectStoreSubstrate),
 }
 
 impl DurabilitySubstrate {
-    /// Whether a write-ahead log is present. A read-only open has none; the
-    /// object store is WAL-less and always reports `false`.
+    /// Whether a write-ahead log is present. A read-only open has none.
     pub(crate) fn wal_is_present(&self) -> bool {
         match self {
             Self::Filesystem(substrate) => substrate.wal_is_present(),
-            Self::ObjectStore(_) => false,
+            Self::ObjectStore(_) => true,
         }
     }
 
@@ -69,9 +71,7 @@ impl DurabilitySubstrate {
         }
     }
 
-    /// Append a commit's operations to the WAL (no-op when there is no WAL, and
-    /// always a no-op for the WAL-less object store — its durability point is the
-    /// memtable flush + manifest CAS, not a WAL append).
+    /// Append a commit's operations to the WAL (no-op when there is no WAL).
     pub(crate) fn accept_commit(
         &self,
         sequence: Sequence,
@@ -82,7 +82,9 @@ impl DurabilitySubstrate {
             Self::Filesystem(substrate) => {
                 substrate.accept_commit(sequence, operations, durability)
             }
-            Self::ObjectStore(_) => Ok(()),
+            Self::ObjectStore(substrate) => {
+                block_on_substrate_future(substrate.accept_commit(sequence, operations, durability))
+            }
         }
     }
 
@@ -101,16 +103,21 @@ impl DurabilitySubstrate {
                     .accept_commit_async(sequence, operations, durability)
                     .await
             }
-            Self::ObjectStore(_) => Ok(()),
+            Self::ObjectStore(substrate) => {
+                substrate
+                    .accept_commit(sequence, operations, durability)
+                    .await
+            }
         }
     }
 
-    /// Flush WAL durability to the requested level (no-op when there is no WAL;
-    /// no-op for the WAL-less object store).
+    /// Flush WAL durability to the requested level (no-op when there is no WAL).
     pub(crate) fn persist_wal(&self, durability: DurabilityMode) -> Result<()> {
         match self {
             Self::Filesystem(substrate) => substrate.persist_wal(durability),
-            Self::ObjectStore(_) => Ok(()),
+            Self::ObjectStore(substrate) => {
+                block_on_substrate_future(substrate.persist_wal(durability))
+            }
         }
     }
 
@@ -120,25 +127,26 @@ impl DurabilitySubstrate {
     pub(crate) async fn persist_wal_async(&self, durability: DurabilityMode) -> Result<()> {
         match self {
             Self::Filesystem(substrate) => substrate.persist_wal_async(durability).await,
-            Self::ObjectStore(_) => Ok(()),
+            Self::ObjectStore(substrate) => substrate.persist_wal(durability).await,
         }
     }
 
-    /// WAL statistics, or `None` when there is no WAL (always `None` for the
-    /// object store).
+    /// WAL statistics, or `None` when there is no WAL.
     pub(crate) fn wal_stats(&self) -> Option<WalFrontDoorStats> {
         match self {
             Self::Filesystem(substrate) => substrate.wal_stats(),
-            Self::ObjectStore(_) => None,
+            Self::ObjectStore(substrate) => Some(substrate.wal_stats()),
         }
     }
 
     /// Truncate the WAL below a checkpoint after a memtable flush advances the
-    /// replay floor (no-op when there is no WAL; no-op for the object store).
+    /// replay floor (no-op when there is no WAL).
     pub(crate) fn rewrite_wal_after_replay_floor(&self, replay_floor: Sequence) -> Result<()> {
         match self {
             Self::Filesystem(substrate) => substrate.rewrite_wal_after_replay_floor(replay_floor),
-            Self::ObjectStore(_) => Ok(()),
+            Self::ObjectStore(substrate) => {
+                block_on_substrate_future(substrate.rewrite_wal_after_replay_floor(replay_floor))
+            }
         }
     }
 
@@ -155,7 +163,9 @@ impl DurabilitySubstrate {
                     .rewrite_wal_after_replay_floor_async(replay_floor)
                     .await
             }
-            Self::ObjectStore(_) => Ok(()),
+            Self::ObjectStore(substrate) => {
+                substrate.rewrite_wal_after_replay_floor(replay_floor).await
+            }
         }
     }
 
@@ -272,33 +282,100 @@ impl FilesystemSubstrate {
     }
 }
 
-/// Object-storage durability: **WAL-less** (a commit is durable once its
-/// memtable is flushed to `SSTable` objects and the manifest CAS publishes
-/// them), holding only a fencing-epoch writer lease.
+/// Object-storage durability: immutable WAL segments plus a lease object that
+/// doubles as a fencing token and the published remote WAL head.
 pub(crate) struct ObjectStoreSubstrate {
-    #[allow(dead_code)] // held for the fencing epoch; wired into manifest-publish fencing in 2c-4.
-    lease: ObjectWriterLease,
+    lease: futures::lock::Mutex<ObjectWriterLease>,
+    db_path: PathBuf,
+    records_accepted: std::sync::atomic::AtomicU64,
+    bytes_accepted: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for ObjectStoreSubstrate {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ObjectStoreSubstrate")
-            .field("epoch", &self.lease.epoch)
+            .field("db_path", &self.db_path)
             .finish_non_exhaustive()
     }
 }
 
-#[allow(dead_code)] // wired into the object-store open path in 2c-4
 impl ObjectStoreSubstrate {
-    pub(crate) fn new(lease: ObjectWriterLease) -> Self {
-        Self { lease }
+    pub(crate) fn new(lease: ObjectWriterLease, db_path: PathBuf) -> Self {
+        Self {
+            lease: futures::lock::Mutex::new(lease),
+            db_path,
+            records_accepted: std::sync::atomic::AtomicU64::new(0),
+            bytes_accepted: std::sync::atomic::AtomicU64::new(0),
+        }
     }
 
     /// The fencing epoch of the held lease (stamped into manifest publishes so a
     /// stale writer is fenced out).
     pub(crate) fn fencing_epoch(&self) -> u64 {
-        self.lease.epoch
+        self.lease.try_lock().map_or(0, |lease| lease.state.epoch)
+    }
+
+    async fn accept_commit(
+        &self,
+        sequence: Sequence,
+        operations: &[BatchOperation],
+        durability: DurabilityMode,
+    ) -> Result<()> {
+        if durability == DurabilityMode::Buffered {
+            return Ok(());
+        }
+        let frame = wal::encode_batch_frame(sequence, operations)?;
+        let bytes_accepted = frame.len() as u64;
+        let mut lease = self.lease.lock().await;
+        lease
+            .publish_commit_object(&self.db_path, sequence, frame.into())
+            .await?;
+        self.records_accepted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.bytes_accepted
+            .fetch_add(bytes_accepted, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn persist_wal(&self, durability: DurabilityMode) -> Result<()> {
+        if durability == DurabilityMode::Buffered {
+            return Ok(());
+        }
+        let lease = self.lease.lock().await;
+        lease.ensure_current().await
+    }
+
+    async fn rewrite_wal_after_replay_floor(&self, replay_floor: Sequence) -> Result<()> {
+        let mut lease = self.lease.lock().await;
+        let deleted = lease
+            .rewrite_segment_after_replay_floor(&self.db_path, replay_floor)
+            .await?;
+        for key in deleted {
+            lease.client.delete(&key).await?;
+        }
+        // Also sweep old unindexed WAL objects left by failed commits. These are
+        // never part of recovery because recovery reads the lease WAL head.
+        wal::delete_object_wal_at_or_below_with_backend_async(
+            &crate::object_store::ObjectStoreBackend::new(Arc::clone(&lease.client)),
+            &self.db_path,
+            replay_floor,
+        )
+        .await
+    }
+
+    fn wal_stats(&self) -> WalFrontDoorStats {
+        WalFrontDoorStats {
+            shards: 1,
+            open_shards: 1,
+            queue_capacity: 0,
+            records_accepted: self
+                .records_accepted
+                .load(std::sync::atomic::Ordering::Acquire),
+            bytes_accepted: self
+                .bytes_accepted
+                .load(std::sync::atomic::Ordering::Acquire),
+        }
     }
 }
 
@@ -308,15 +385,30 @@ impl ObjectStoreSubstrate {
 /// "fail if held"; instead the lease object carries a monotonically increasing
 /// epoch, and [`Self::acquire`] takes over by writing `epoch + 1` via a
 /// compare-and-swap. A previous holder is fenced out when its lower epoch is
-/// rejected at manifest-publish time (wired in a later slice), and in a real
-/// deployment a TTL bounds how long a crashed holder's epoch stays "live".
+/// rejected before publishing a durable WAL commit or manifest edit, and in a
+/// real deployment a TTL bounds how long a crashed holder's epoch stays "live".
 pub(crate) struct ObjectWriterLease {
-    // Read when lease release / fencing writes are wired (2c-4); the lease is
-    // acquired against it here.
-    #[allow(dead_code)]
     client: Arc<dyn ObjectClient>,
     key: String,
-    epoch: u64,
+    etag: ETag,
+    state: ObjectLeaseState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObjectLeaseState {
+    pub(crate) epoch: u64,
+    pub(crate) committed_sequence: Sequence,
+    pub(crate) current_wal_key: Option<String>,
+}
+
+impl ObjectLeaseState {
+    pub(crate) fn empty() -> Self {
+        Self {
+            epoch: 0,
+            committed_sequence: Sequence::ZERO,
+            current_wal_key: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for ObjectWriterLease {
@@ -324,12 +416,12 @@ impl std::fmt::Debug for ObjectWriterLease {
         formatter
             .debug_struct("ObjectWriterLease")
             .field("key", &self.key)
-            .field("epoch", &self.epoch)
+            .field("epoch", &self.state.epoch)
+            .field("committed_sequence", &self.state.committed_sequence)
             .finish_non_exhaustive()
     }
 }
 
-#[allow(dead_code)] // wired into the object-store open path in 2c-4
 impl ObjectWriterLease {
     /// Acquire the lease by bumping its fencing epoch via compare-and-swap. The
     /// returned lease carries the new epoch; concurrent acquirers retry until
@@ -340,27 +432,36 @@ impl ObjectWriterLease {
     ) -> Result<Self> {
         let key = key.into();
         loop {
-            let (next_epoch, precondition) = match client.head(&key).await? {
-                None => (1, Precondition::IfNoneMatch),
+            let (next_state, precondition) = match read_lease_state(&client, &key).await? {
+                None => (
+                    ObjectLeaseState {
+                        epoch: 1,
+                        committed_sequence: Sequence::ZERO,
+                        current_wal_key: None,
+                    },
+                    Precondition::IfNoneMatch,
+                ),
                 Some(meta) => {
-                    let bytes = client.get(&key).await?.ok_or_else(|| Error::Corruption {
-                        message: format!("writer lease {key} vanished between head and get"),
-                    })?;
-                    (
-                        decode_epoch(&key, &bytes)? + 1,
-                        Precondition::IfMatch(meta.etag),
-                    )
+                    let mut state = meta.state.clone();
+                    state.epoch = state
+                        .epoch
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Corruption {
+                            message: "object-store writer epoch overflow".to_owned(),
+                        })?;
+                    (state, Precondition::IfMatch(meta.etag))
                 }
             };
             match client
-                .put_if(&key, encode_epoch(next_epoch), precondition)
+                .put_if(&key, encode_lease_state(next_state.clone())?, precondition)
                 .await?
             {
-                PutIf::Stored { .. } => {
+                PutIf::Stored { etag } => {
                     return Ok(Self {
                         client,
                         key,
-                        epoch: next_epoch,
+                        etag,
+                        state: next_state,
                     });
                 }
                 // Lost the CAS to a concurrent acquirer; re-read and try again.
@@ -370,27 +471,344 @@ impl ObjectWriterLease {
     }
 
     /// The fencing epoch this lease acquired.
+    #[cfg(test)]
     pub(crate) fn epoch(&self) -> u64 {
-        self.epoch
+        self.state.epoch
+    }
+
+    #[cfg(test)]
+    pub(crate) fn committed_sequence(&self) -> Sequence {
+        self.state.committed_sequence
+    }
+
+    pub(crate) fn lease_state(&self) -> ObjectLeaseState {
+        self.state.clone()
+    }
+
+    pub(crate) async fn read_current(
+        client: Arc<dyn ObjectClient>,
+        key: impl Into<String>,
+    ) -> Result<Option<ObjectLeaseState>> {
+        read_lease_state(&client, &key.into())
+            .await
+            .map(|state| state.map(|state| state.state))
+    }
+
+    async fn publish_commit_object(
+        &mut self,
+        db_path: &std::path::Path,
+        sequence: Sequence,
+        frame: Arc<[u8]>,
+    ) -> Result<()> {
+        self.ensure_current().await?;
+        let wal_key = wal::object_wal_commit_path(db_path, self.state.epoch, sequence)
+            .to_string_lossy()
+            .into_owned();
+        let mut segment = match &self.state.current_wal_key {
+            Some(key) => self
+                .client
+                .get(key)
+                .await?
+                .ok_or_else(|| Error::Corruption {
+                    message: format!("object WAL segment {key} is missing"),
+                })?,
+            None => Arc::from([]),
+        }
+        .to_vec();
+        segment.extend_from_slice(&frame);
+        self.client.put(&wal_key, segment.into()).await?;
+        self.publish_commit_head(sequence, wal_key).await
+    }
+
+    async fn ensure_current(&self) -> Result<()> {
+        let Some(current) = read_lease_state(&self.client, &self.key).await? else {
+            return Err(Error::Fenced {
+                held_epoch: self.state.epoch,
+                current_epoch: 0,
+            });
+        };
+        if current.state.epoch > self.state.epoch {
+            return Err(Error::Fenced {
+                held_epoch: self.state.epoch,
+                current_epoch: current.state.epoch,
+            });
+        }
+        if current.state.epoch < self.state.epoch {
+            return Err(Error::Corruption {
+                message: format!(
+                    "writer lease {} moved backward from epoch {} to {}",
+                    self.key, self.state.epoch, current.state.epoch
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    async fn publish_commit_head(&mut self, sequence: Sequence, wal_key: String) -> Result<()> {
+        loop {
+            if self.state.committed_sequence >= sequence
+                && self.state.current_wal_key.as_deref() == Some(wal_key.as_str())
+            {
+                return Ok(());
+            }
+            let mut next = self.state.clone();
+            if next.committed_sequence < sequence {
+                next.committed_sequence = sequence;
+            }
+            next.current_wal_key = Some(wal_key.clone());
+            match self
+                .client
+                .put_if(
+                    &self.key,
+                    encode_lease_state(next.clone())?,
+                    Precondition::IfMatch(self.etag.clone()),
+                )
+                .await?
+            {
+                PutIf::Stored { etag } => {
+                    self.etag = etag;
+                    self.state = next;
+                    return Ok(());
+                }
+                PutIf::PreconditionFailed { .. } => {
+                    let Some(current) = read_lease_state(&self.client, &self.key).await? else {
+                        return Err(Error::Fenced {
+                            held_epoch: self.state.epoch,
+                            current_epoch: 0,
+                        });
+                    };
+                    if current.state.epoch > self.state.epoch {
+                        return Err(Error::Fenced {
+                            held_epoch: self.state.epoch,
+                            current_epoch: current.state.epoch,
+                        });
+                    }
+                    if current.state.epoch < self.state.epoch {
+                        return Err(Error::Corruption {
+                            message: format!(
+                                "writer lease {} moved backward from epoch {} to {}",
+                                self.key, self.state.epoch, current.state.epoch
+                            ),
+                        });
+                    }
+                    self.etag = current.etag;
+                    self.state = current.state;
+                }
+            }
+        }
+    }
+
+    async fn rewrite_segment_after_replay_floor(
+        &mut self,
+        db_path: &std::path::Path,
+        replay_floor: Sequence,
+    ) -> Result<Vec<String>> {
+        self.ensure_current().await?;
+        loop {
+            let Some(current_key) = self.state.current_wal_key.clone() else {
+                return Ok(Vec::new());
+            };
+            let bytes = self
+                .client
+                .get(&current_key)
+                .await?
+                .ok_or_else(|| Error::Corruption {
+                    message: format!("object WAL segment {current_key} is missing"),
+                })?;
+            let batches = wal::decode_frames_after(bytes.as_ref(), replay_floor)?;
+            let mut next = self.state.clone();
+            let delete_keys = vec![current_key.clone()];
+            if batches.is_empty() {
+                next.current_wal_key = None;
+            } else {
+                let rewritten = wal::encode_batches_after(&batches, replay_floor)?;
+                let last_sequence = batches.last().map_or(replay_floor, |batch| batch.sequence);
+                let next_key =
+                    wal::object_wal_rewrite_path(db_path, self.state.epoch, last_sequence)
+                        .to_string_lossy()
+                        .into_owned();
+                self.client.put(&next_key, rewritten.into()).await?;
+                next.current_wal_key = Some(next_key);
+            }
+            match self
+                .client
+                .put_if(
+                    &self.key,
+                    encode_lease_state(next.clone())?,
+                    Precondition::IfMatch(self.etag.clone()),
+                )
+                .await?
+            {
+                PutIf::Stored { etag } => {
+                    self.etag = etag;
+                    self.state = next;
+                    return Ok(delete_keys);
+                }
+                PutIf::PreconditionFailed { .. } => {
+                    let Some(current) = read_lease_state(&self.client, &self.key).await? else {
+                        return Err(Error::Fenced {
+                            held_epoch: self.state.epoch,
+                            current_epoch: 0,
+                        });
+                    };
+                    if current.state.epoch > self.state.epoch {
+                        return Err(Error::Fenced {
+                            held_epoch: self.state.epoch,
+                            current_epoch: current.state.epoch,
+                        });
+                    }
+                    if current.state.epoch < self.state.epoch {
+                        return Err(Error::Corruption {
+                            message: format!(
+                                "writer lease {} moved backward from epoch {} to {}",
+                                self.key, self.state.epoch, current.state.epoch
+                            ),
+                        });
+                    }
+                    self.etag = current.etag;
+                    self.state = current.state;
+                }
+            }
+        }
     }
 }
 
-#[allow(dead_code)] // used by ObjectWriterLease::acquire, wired in 2c-4
-fn encode_epoch(epoch: u64) -> Arc<[u8]> {
-    Arc::from(epoch.to_le_bytes().as_slice())
+struct ObservedLeaseState {
+    etag: ETag,
+    state: ObjectLeaseState,
 }
 
-#[allow(dead_code)] // used by ObjectWriterLease::acquire, wired in 2c-4
-fn decode_epoch(key: &str, bytes: &[u8]) -> Result<u64> {
+async fn read_lease_state(
+    client: &Arc<dyn ObjectClient>,
+    key: &str,
+) -> Result<Option<ObservedLeaseState>> {
+    let Some(meta) = client.head(key).await? else {
+        return Ok(None);
+    };
+    let bytes = client.get(key).await?.ok_or_else(|| Error::Corruption {
+        message: format!("writer lease {key} vanished between head and get"),
+    })?;
+    Ok(Some(ObservedLeaseState {
+        etag: meta.etag,
+        state: decode_lease_state(key, &bytes)?,
+    }))
+}
+
+fn encode_lease_state(state: ObjectLeaseState) -> Result<Arc<[u8]>> {
+    let key_len = state.current_wal_key.as_ref().map_or(0, String::len);
+    let key_len = u32::try_from(key_len)
+        .map_err(|_| Error::invalid_options("object WAL segment key exceeds u32::MAX"))?;
+    let mut bytes = Vec::with_capacity(20 + key_len as usize);
+    bytes.extend_from_slice(&state.epoch.to_le_bytes());
+    bytes.extend_from_slice(&state.committed_sequence.get().to_le_bytes());
+    bytes.extend_from_slice(&key_len.to_le_bytes());
+    if let Some(key) = state.current_wal_key {
+        bytes.extend_from_slice(key.as_bytes());
+    }
+    Ok(Arc::from(bytes))
+}
+
+fn decode_lease_state(key: &str, bytes: &[u8]) -> Result<ObjectLeaseState> {
+    if bytes.len() == 8 {
+        let epoch = decode_u64(key, bytes, "epoch")?;
+        return Ok(ObjectLeaseState {
+            epoch,
+            committed_sequence: Sequence::ZERO,
+            current_wal_key: None,
+        });
+    }
+    if bytes.len() == 16 {
+        let epoch = decode_u64(key, &bytes[..8], "epoch")?;
+        let committed_sequence = Sequence::new(decode_u64(key, &bytes[8..], "commit head")?);
+        return Ok(ObjectLeaseState {
+            epoch,
+            committed_sequence,
+            current_wal_key: None,
+        });
+    }
+    if bytes.len() < 20 {
+        return Err(Error::Corruption {
+            message: format!("writer lease {key} has a malformed state"),
+        });
+    }
+    let epoch = decode_u64(key, &bytes[..8], "epoch")?;
+    let committed_sequence = Sequence::new(decode_u64(key, &bytes[8..16], "commit head")?);
+    let key_len = u32::from_le_bytes(bytes[16..20].try_into().map_err(|_| Error::Corruption {
+        message: format!("writer lease {key} has a malformed WAL segment key length"),
+    })?);
+    let key_len = usize::try_from(key_len).map_err(|_| Error::Corruption {
+        message: format!("writer lease {key} WAL segment key length overflow"),
+    })?;
+    let key_end = 20_usize
+        .checked_add(key_len)
+        .ok_or_else(|| Error::Corruption {
+            message: format!("writer lease {key} WAL segment key offset overflow"),
+        })?;
+    if key_end != bytes.len() {
+        return Err(Error::Corruption {
+            message: format!("writer lease {key} has malformed WAL segment key bytes"),
+        });
+    }
+    let current_wal_key = if key_len == 0 {
+        None
+    } else {
+        let key_bytes = bytes.get(20..key_end).ok_or_else(|| Error::Corruption {
+            message: format!("writer lease {key} has a truncated WAL segment key"),
+        })?;
+        Some(
+            std::str::from_utf8(key_bytes)
+                .map_err(|_| Error::Corruption {
+                    message: format!("writer lease {key} WAL segment key is not valid UTF-8"),
+                })?
+                .to_owned(),
+        )
+    };
+    Ok(ObjectLeaseState {
+        epoch,
+        committed_sequence,
+        current_wal_key,
+    })
+}
+
+fn decode_u64(key: &str, bytes: &[u8], field: &str) -> Result<u64> {
     let array: [u8; 8] = bytes.try_into().map_err(|_| Error::Corruption {
-        message: format!("writer lease {key} has a malformed epoch"),
+        message: format!("writer lease {key} has a malformed {field}"),
     })?;
     Ok(u64::from_le_bytes(array))
+}
+
+struct SubstrateThreadWake {
+    thread: thread::Thread,
+}
+
+impl Wake for SubstrateThreadWake {
+    fn wake(self: Arc<Self>) {
+        self.thread.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.thread.unpark();
+    }
+}
+
+fn block_on_substrate_future<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
+    let waker = Waker::from(Arc::new(SubstrateThreadWake {
+        thread: thread::current(),
+    }));
+    let mut context = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(result) => return result,
+            Poll::Pending => thread::park(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -479,25 +897,36 @@ mod tests {
     }
 
     #[test]
-    fn object_store_substrate_is_wal_less_and_inert() {
+    fn object_store_substrate_publishes_remote_wal_head() {
         use crate::object_store::InMemoryObjectStore;
 
         let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
-        let lease = poll_ready(ObjectWriterLease::acquire(client, "LOCK")).expect("acquire lease");
-        let substrate = DurabilitySubstrate::ObjectStore(ObjectStoreSubstrate::new(lease));
+        let lease = poll_ready(ObjectWriterLease::acquire(Arc::clone(&client), "LOCK"))
+            .expect("acquire lease");
+        let substrate =
+            DurabilitySubstrate::ObjectStore(ObjectStoreSubstrate::new(lease, PathBuf::from("db")));
 
-        // WAL-less: every WAL operation is an inert success.
-        assert!(!substrate.wal_is_present());
+        assert!(substrate.wal_is_present());
         substrate
             .accept_commit(Sequence::new(1), &[put("k", "v")], DurabilityMode::Flush)
-            .expect("WAL-less accept is a no-op");
+            .expect("accept commit");
         substrate
             .persist_wal(DurabilityMode::Flush)
-            .expect("WAL-less persist is a no-op");
-        assert!(substrate.wal_stats().is_none());
+            .expect("persist WAL");
+        assert_eq!(
+            substrate
+                .wal_stats()
+                .expect("object WAL stats")
+                .records_accepted,
+            1
+        );
         substrate
             .rewrite_wal_after_replay_floor(Sequence::new(1))
-            .expect("WAL-less rewrite is a no-op");
+            .expect("rewrite WAL after replay floor");
+        let head = poll_ready(ObjectWriterLease::read_current(client, "LOCK"))
+            .expect("read lease")
+            .expect("lease exists");
+        assert_eq!(head.committed_sequence, Sequence::new(1));
         substrate.release_writer_lease(); // no-op; idempotent
     }
 
@@ -511,6 +940,7 @@ mod tests {
         let first = poll_ready(ObjectWriterLease::acquire(Arc::clone(&client), "LOCK"))
             .expect("first acquire");
         assert_eq!(first.epoch(), 1);
+        assert_eq!(first.committed_sequence(), Sequence::ZERO);
 
         // A later acquire takes over with a strictly higher epoch (fencing the
         // previous holder).

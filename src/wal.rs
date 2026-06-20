@@ -21,7 +21,8 @@ use crate::{
         BlockingStorageObjectReadBackend, BlockingStorageReadBackend, BlockingStorageReadObject,
         BlockingStorageWalRewriteBackend, NativeFileAppendObject, NativeFileBackend,
         StorageAppendBackend, StorageAppendObject, StorageCapability, StorageDirectoryFile,
-        StorageDirectoryId, StorageDirectoryListBackend, StorageObjectId, StorageObjectKind,
+        StorageDirectoryId, StorageDirectoryListBackend, StorageObjectDeleteBackend,
+        StorageObjectId, StorageObjectKind, StorageObjectListBackend, StorageObjectListRequest,
         StorageObjectReadBackend, StorageReadBackend, StorageReadObject, StorageWalRewriteBackend,
     },
     types::{KeyRange, Sequence},
@@ -38,6 +39,12 @@ const HEADER_LEN: usize = 18;
 const WAL_FRONT_DOOR_QUEUE_CAPACITY: usize = 64;
 const WAL_SHARD_FILE_PREFIX: &str = "trine.wal.shard-";
 const WAL_SHARD_FILE_DIGITS: usize = 4;
+const OBJECT_WAL_FILE_PREFIX: &str = "trine.wal.epoch-";
+const OBJECT_WAL_COMMIT_MARKER: &str = ".commit-";
+const OBJECT_WAL_REWRITE_PREFIX: &str = "trine.wal.rewrite-epoch-";
+const OBJECT_WAL_REWRITE_MARKER: &str = ".after-";
+const OBJECT_WAL_FILE_SUFFIX: &str = ".trinewal";
+const OBJECT_WAL_SEQUENCE_DIGITS: usize = 20;
 
 /// Whether an object-store `key` names a write-ahead-log object — the
 /// `trine.wal` file, a `trine.wal.shard-NNNN` shard, or the rewrite temp — as
@@ -711,6 +718,24 @@ pub fn wal_shard_path(db_path: &Path, shard_index: usize) -> PathBuf {
     db_path.join(format!("{WAL_SHARD_FILE_PREFIX}{shard_index:0width$}"))
 }
 
+#[must_use]
+pub(crate) fn object_wal_commit_path(db_path: &Path, epoch: u64, sequence: Sequence) -> PathBuf {
+    let width = OBJECT_WAL_SEQUENCE_DIGITS;
+    db_path.join(format!(
+        "{OBJECT_WAL_FILE_PREFIX}{epoch:0width$}{OBJECT_WAL_COMMIT_MARKER}{:0width$}{OBJECT_WAL_FILE_SUFFIX}",
+        sequence.get()
+    ))
+}
+
+#[must_use]
+pub(crate) fn object_wal_rewrite_path(db_path: &Path, epoch: u64, sequence: Sequence) -> PathBuf {
+    let width = OBJECT_WAL_SEQUENCE_DIGITS;
+    db_path.join(format!(
+        "{OBJECT_WAL_REWRITE_PREFIX}{epoch:0width$}{OBJECT_WAL_REWRITE_MARKER}{:0width$}{OBJECT_WAL_FILE_SUFFIX}",
+        sequence.get()
+    ))
+}
+
 #[cfg(test)]
 pub(crate) fn read_all_batches(db_path: &Path) -> Result<Vec<WalBatch>> {
     read_all_batches_after(db_path, Sequence::ZERO)
@@ -847,6 +872,81 @@ where
 {
     let paths = discover_wal_paths_with_backend_async(backend, db_path).await?;
     read_recovery_streams_after_paths_with_backend_async(backend, &paths, replay_floor).await
+}
+
+#[allow(dead_code)]
+pub(crate) async fn read_object_wal_batches_after_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+    replay_floor: Sequence,
+) -> Result<Vec<WalBatch>>
+where
+    B: StorageObjectListBackend + StorageObjectReadBackend,
+{
+    let mut batches = Vec::new();
+    for path in discover_object_wal_paths_with_backend_async(backend, db_path).await? {
+        let Some(sequence) = object_wal_sequence_from_path(&path)? else {
+            continue;
+        };
+        if sequence <= replay_floor {
+            continue;
+        }
+        let object_batches =
+            read_batches_after_with_backend_async(backend, &path, replay_floor).await?;
+        for batch in object_batches {
+            if batch.sequence != sequence {
+                return Err(Error::Corruption {
+                    message: format!(
+                        "object WAL path {} contains commit sequence {}",
+                        path.display(),
+                        batch.sequence.get()
+                    ),
+                });
+            }
+            batches.push(batch);
+        }
+    }
+    validate_wal_stream_order(&batches)?;
+    Ok(batches)
+}
+
+pub(crate) async fn delete_object_wal_at_or_below_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+    replay_floor: Sequence,
+) -> Result<()>
+where
+    B: StorageObjectDeleteBackend + StorageObjectListBackend,
+{
+    for path in discover_object_wal_paths_with_backend_async(backend, db_path).await? {
+        let Some(sequence) = object_wal_sequence_from_path(&path)? else {
+            continue;
+        };
+        if sequence <= replay_floor {
+            backend.delete_object(wal_storage_object(&path)).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn discover_object_wal_paths_with_backend_async<B>(
+    backend: &B,
+    db_path: &Path,
+) -> Result<Vec<PathBuf>>
+where
+    B: StorageObjectListBackend,
+{
+    let request = StorageObjectListRequest::native_file(StorageObjectKind::Wal, db_path)
+        .with_file_extension("trinewal");
+    let mut paths = Vec::new();
+    for object in backend.list_objects(request).await? {
+        let path = object.path().to_path_buf();
+        if object_wal_sequence_from_path(&path)?.is_some() {
+            paths.push(path);
+        }
+    }
+    paths.sort_unstable();
+    Ok(paths)
 }
 
 #[allow(dead_code)]
@@ -1408,7 +1508,10 @@ fn wal_shard_index_from_final_file_name(file_name: &str) -> Result<Option<usize>
     Ok(Some(shard_index))
 }
 
-fn encode_batches_after(batches: &[WalBatch], replay_floor: Sequence) -> Result<Vec<u8>> {
+pub(crate) fn encode_batches_after(
+    batches: &[WalBatch],
+    replay_floor: Sequence,
+) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     for batch in batches.iter().filter(|batch| batch.sequence > replay_floor) {
         bytes.extend_from_slice(&encode_batch_frame(batch.sequence, &batch.operations)?);
@@ -1416,7 +1519,10 @@ fn encode_batches_after(batches: &[WalBatch], replay_floor: Sequence) -> Result<
     Ok(bytes)
 }
 
-fn encode_batch_frame(sequence: Sequence, operations: &[BatchOperation]) -> Result<Vec<u8>> {
+pub(crate) fn encode_batch_frame(
+    sequence: Sequence,
+    operations: &[BatchOperation],
+) -> Result<Vec<u8>> {
     let payload = encode_payload(sequence, operations)?;
     let payload_checksum = checksum(&payload);
     let payload_len = u32::try_from(payload.len())
@@ -1432,6 +1538,44 @@ fn encode_batch_frame(sequence: Sequence, operations: &[BatchOperation]) -> Resu
     frame.extend_from_slice(&payload);
 
     Ok(frame)
+}
+
+fn object_wal_sequence_from_path(path: &Path) -> Result<Option<Sequence>> {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(Error::Corruption {
+            message: format!(
+                "object WAL file name is not valid UTF-8: {}",
+                path.display()
+            ),
+        });
+    };
+    let sequence = if let Some(rest) = file_name.strip_prefix(OBJECT_WAL_FILE_PREFIX) {
+        let Some((_, sequence)) = rest.split_once(OBJECT_WAL_COMMIT_MARKER) else {
+            return Ok(None);
+        };
+        sequence
+    } else if let Some(rest) = file_name.strip_prefix(OBJECT_WAL_REWRITE_PREFIX) {
+        let Some((_, sequence)) = rest.split_once(OBJECT_WAL_REWRITE_MARKER) else {
+            return Ok(None);
+        };
+        sequence
+    } else {
+        return Ok(None);
+    };
+    let Some(sequence) = sequence.strip_suffix(OBJECT_WAL_FILE_SUFFIX) else {
+        return Ok(None);
+    };
+    if sequence.len() != OBJECT_WAL_SEQUENCE_DIGITS
+        || !sequence.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(Error::Corruption {
+            message: format!("malformed object WAL file name: {file_name}"),
+        });
+    }
+    let sequence = sequence.parse::<u64>().map_err(|error| Error::Corruption {
+        message: format!("malformed object WAL file name {file_name}: {error}"),
+    })?;
+    Ok(Some(Sequence::new(sequence)))
 }
 
 fn encode_payload(sequence: Sequence, operations: &[BatchOperation]) -> Result<Vec<u8>> {
@@ -1466,7 +1610,7 @@ fn encode_payload(sequence: Sequence, operations: &[BatchOperation]) -> Result<V
     Ok(bytes)
 }
 
-fn decode_frames_after(bytes: &[u8], replay_floor: Sequence) -> Result<Vec<WalBatch>> {
+pub(crate) fn decode_frames_after(bytes: &[u8], replay_floor: Sequence) -> Result<Vec<WalBatch>> {
     let mut batches = Vec::new();
     let mut offset = 0;
 

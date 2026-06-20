@@ -26,6 +26,61 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-06-20: Object-Store Compute/Storage Split Completion
+
+### Observation
+
+- Object-store durable writes now store WAL frames in a remote segment before
+  publishing the write to memtables.
+- The object-store writer lease object now carries both the fencing epoch and a
+  CAS-published head: committed sequence plus the current WAL segment key.
+  Recovery and read-only refresh follow only this head, so failed or stale WAL
+  segment PUTs are ignored.
+- Writer takeover preserves the prior committed remote WAL head while bumping
+  the epoch. A stale writer is fenced before a new durable write is
+  acknowledged.
+- Object-store flush publishes table objects through the manifest CAS, advances
+  the replay floor, rewrites or clears the current WAL segment, and deletes
+  covered WAL objects best-effort.
+- Read-only object-store handles now have `refresh_object_store`, which reloads
+  the manifest, rebuilds bucket state, replays the current WAL segment, and
+  returns the refreshed read version without acquiring the writer lease.
+- `ObjectClient` docs now state the correctness assumptions for conditional
+  writes, same-key point-read visibility, idempotent delete, and listing being
+  cleanup-only.
+- `Buffered` object-store durability remains explicit and is not recoverable
+  before flush.
+
+### Interpretation
+
+- Object-store mode now has a real confirmed-write recovery boundary for the
+  separated compute/storage use case. The segment/head model bounds lease/head
+  metadata while allowing multiple commits in one remote WAL segment. Provider
+  tuning is now performance work rather than a correctness blocker.
+
+### Verification
+
+- `cargo check -q`
+- `cargo test -q object_store`
+- `cargo test -q --lib`
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo clippy -q --lib`
+- `cargo test -q --doc --all-features`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test -q --all-features`
+
+### Remaining Blockers
+
+- No correctness blocker remains for confirmed object-store writes in the
+  in-memory object-client gate. Provider-specific latency/cost tuning remains a
+  future phase.
+
+### Recommended Next Action
+
+- Measure remote-provider workloads before changing the segment-write strategy
+  or adding provider-specific batching.
+
 ## 2026-06-14: Guard-Aware Compaction Picker Completion
 
 ### Observation

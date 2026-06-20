@@ -15,9 +15,15 @@
 //!
 //! This trait is the public "bring your own object store" seam: implement
 //! [`ObjectClient`] for your provider (S3 and compatible) and open a database
-//! with [`crate::Db::open_object_store`]. The crate's manifest commit relies on
-//! `put_if` providing a real conditional write (compare-and-swap); a backend that
-//! cannot honor `If-None-Match` / `If-Match` is unsafe for concurrent writers.
+//! with [`crate::Db::open_object_store`]. The crate's manifest commit and remote
+//! WAL head rely on `put_if` providing a real conditional write
+//! (compare-and-swap); a backend that cannot honor `If-None-Match` /
+//! `If-Match` is unsafe for concurrent writers. After a successful conditional
+//! write, later `get`/`head` calls for that same key must observe that version
+//! or a newer one. Recovery and read-only refresh follow the lease/head and
+//! manifest keys directly; object listing is used for cleanup, so eventually
+//! consistent listings may delay garbage collection but must not define
+//! committed state.
 
 use std::{
     collections::BTreeMap,
@@ -116,8 +122,12 @@ pub struct ObjectMeta {
 /// - `put` always stores and returns a fresh `ETag` (overwrites bump the `ETag`).
 /// - `get` returns `None` for an absent key; `get_range` errors for an absent
 ///   key or an out-of-bounds range.
+/// - After `put`, or after a `put_if` returns [`PutIf::Stored`], later `get` and
+///   `head` calls for the same key observe that object version or a newer one.
 /// - `delete` is idempotent (deleting an absent key succeeds).
 /// - `list` returns objects whose key starts with the prefix, in key order.
+///   Listing drives orphan cleanup only; recovery and read-only refresh do not
+///   infer committed state from a listing result.
 /// - `head` returns an object's metadata (size + `ETag`) without its bytes, or
 ///   `None` when the key is absent (like S3 `HEAD`).
 /// - `put_if` applies the write only when the precondition holds, otherwise
@@ -408,6 +418,10 @@ impl std::fmt::Debug for ObjectStoreBackend {
 impl ObjectStoreBackend {
     pub(crate) fn new(client: Arc<dyn ObjectClient>) -> Self {
         Self { client }
+    }
+
+    pub(crate) fn client(&self) -> Arc<dyn ObjectClient> {
+        Arc::clone(&self.client)
     }
 
     fn object_key(object: &StorageObjectId) -> String {
