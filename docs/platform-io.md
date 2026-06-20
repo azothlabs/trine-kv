@@ -99,7 +99,7 @@ delete                        TruePlatformAsync ThreadPool       ThreadPool     
 directory create              TruePlatformAsync ThreadPool       ThreadPool       ThreadPool       ThreadPool
 directory sync                TruePlatformAsync ThreadPool       Partial          Partial          ThreadPool
 directory listing             ThreadPool        ThreadPool       ThreadPool       ThreadPool       ThreadPool
-writer lease                  TruePlatformAsync Partial          Partial          Partial          ThreadPool/Unsupported
+writer lease                  ThreadPool        ThreadPool       ThreadPool       ThreadPool       ThreadPool/Unsupported
 ```
 
 Legend: `Partial` means `PlatformNativeAsyncButPartial`, and `ThreadPool` means

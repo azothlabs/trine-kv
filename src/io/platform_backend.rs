@@ -1,4 +1,5 @@
 use std::{
+    fs::File,
     io,
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
@@ -126,10 +127,11 @@ pub(super) async fn read_exact_at_owned(
 }
 
 #[allow(clippy::unused_async)]
-pub(super) async fn read_optional(path: PathBuf) -> Result<Option<Arc<[u8]>>> {
+pub(super) async fn read_optional(path: PathBuf, max_bytes: usize) -> Result<Option<Arc<[u8]>>> {
+    ensure_optional_read_len(&path, max_bytes)?;
     #[cfg(target_os = "macos")]
     {
-        apple_dispatch::read_optional(&path)
+        apple_dispatch::read_optional(&path, max_bytes)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -140,6 +142,26 @@ pub(super) async fn read_optional(path: PathBuf) -> Result<Option<Arc<[u8]>>> {
             Err(error) => Err(Error::Io(error)),
         }
     }
+}
+
+fn ensure_optional_read_len(path: &Path, max_bytes: usize) -> Result<()> {
+    let len = match std::fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(Error::Io(error)),
+    };
+    let len = usize::try_from(len).map_err(|_| Error::Corruption {
+        message: format!("object {} length exceeds usize", path.display()),
+    })?;
+    if len > max_bytes {
+        return Err(Error::Corruption {
+            message: format!(
+                "object {} length {len} exceeds maximum {max_bytes}",
+                path.display()
+            ),
+        });
+    }
+    Ok(())
 }
 
 pub(super) async fn write_temp_rename(
@@ -306,62 +328,8 @@ fn list_file_paths_blocking(path: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-pub(super) async fn acquire_writer_lease(path: PathBuf, owner: Arc<[u8]>) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(parent) = path.parent() {
-            compio::fs::create_dir_all(parent)
-                .await
-                .map_err(Error::Io)?;
-        }
-
-        match apple_dispatch::write_create_new(&path, &owner, DurabilityMode::Buffered) {
-            Ok(()) => Ok(()),
-            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                Err(Error::Corruption {
-                    message: format!("database lock is already held: {}", path.display()),
-                })
-            }
-            Err(error) => {
-                let _ = compio::fs::remove_file(&path).await;
-                Err(error)
-            }
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        use compio::io::AsyncWriteAtExt;
-
-        if let Some(parent) = path.parent() {
-            compio::fs::create_dir_all(parent)
-                .await
-                .map_err(Error::Io)?;
-        }
-
-        let mut options = compio::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        let mut file = match options.open(&path).await {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(Error::Corruption {
-                    message: format!("database lock is already held: {}", path.display()),
-                });
-            }
-            Err(error) => return Err(Error::Io(error)),
-        };
-
-        let compio::buf::BufResult(result, _buffer) = file.write_all_at(owner.to_vec(), 0).await;
-        if let Err(error) = result {
-            let _ = compio::fs::remove_file(&path).await;
-            return Err(Error::Io(error));
-        }
-        if let Err(error) = file.close().await {
-            let _ = compio::fs::remove_file(&path).await;
-            return Err(Error::Io(error));
-        }
-        Ok(())
-    }
+pub(super) fn acquire_writer_lease(path: &Path, owner: &[u8]) -> Result<File> {
+    super::platform_threadpool::acquire_writer_lease(path, owner)
 }
 
 #[cfg(not(target_os = "macos"))]

@@ -97,9 +97,17 @@ Rules:
 
 - only one writer may open the same persistent database scope for writing;
 - startup must acquire an exclusive writer lease unless opened read-only;
+- native-file writer leases are OS file locks on `LOCK`; the `LOCK` bytes are
+  owner diagnostics, so a crash-left marker without a live OS lock must not
+  block the next writable open;
 - all files include format version and CRC-32C checksum coverage;
 - manifest publish is atomic;
 - crash recovery must replay committed WAL records after the manifest snapshot.
+- storage decoders must bound untrusted file, object, frame, block, record,
+  and property lengths before allocating buffers from those fields. Native
+  whole-object reads enforce kind-specific object-size caps before allocation;
+  object-store whole-object reads must preflight with `head`, reject over-limit
+  metadata before `get`, and recheck returned bytes before decoding.
 - the engine core must not call platform filesystem APIs directly;
 - backend capability checks must reject unsupported durability or lease modes.
 
@@ -687,6 +695,9 @@ Required behavior:
 - `none` codec is always available;
 - compressed blocks store codec id and uncompressed length;
 - checksum is checked before trusting decoded records;
+- decoded block length from the block header must be checked against the
+  implementation's maximum decoded block size before decompression allocates
+  output bytes;
 - a database must refuse to open if it needs a codec that is not available;
 - compression can be configured per bucket; option changes affect newly
   written tables and do not rewrite existing tables by themselves.

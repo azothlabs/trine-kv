@@ -20,6 +20,6 @@ pub(super) const fn matrix() -> PlatformIoBackendMatrix {
         // selected UAPI/crate stack, so platform-io completes listing through
         // its managed blocking lane rather than a native completion.
         directory_listing: ThreadPoolManagedAsync,
-        writer_lease_acquire: TruePlatformAsync,
+        writer_lease_acquire: ThreadPoolManagedAsync,
     }
 }

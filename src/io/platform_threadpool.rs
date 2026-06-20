@@ -82,7 +82,23 @@ pub(super) fn read_exact_at_owned(
     Ok(StorageReadBuffer::from_vec(offset, buffer))
 }
 
-pub(super) fn read_optional(path: PathBuf) -> Result<Option<Arc<[u8]>>> {
+pub(super) fn read_optional(path: PathBuf, max_bytes: usize) -> Result<Option<Arc<[u8]>>> {
+    let len = match fs::metadata(&path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(Error::Io(error)),
+    };
+    let len = usize::try_from(len).map_err(|_| Error::Corruption {
+        message: format!("object {} length exceeds usize", path.display()),
+    })?;
+    if len > max_bytes {
+        return Err(Error::Corruption {
+            message: format!(
+                "object {} length {len} exceeds maximum {max_bytes}",
+                path.display()
+            ),
+        });
+    }
     match fs::read(path) {
         Ok(bytes) => Ok(Some(Arc::from(bytes))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -171,30 +187,33 @@ pub(super) fn list_file_paths(path: PathBuf) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-pub(super) fn acquire_writer_lease(path: &Path, owner: &[u8]) -> Result<()> {
+pub(super) fn acquire_writer_lease(path: &Path, owner: &[u8]) -> Result<File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let mut file = match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            return Err(Error::Corruption {
-                message: format!("database lock is already held: {}", path.display()),
-            });
-        }
-        Err(error) => return Err(Error::Io(error)),
-    };
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(Error::Io)?;
+    if !fs4::fs_std::FileExt::try_lock_exclusive(&file).map_err(Error::Io)? {
+        return Err(Error::Corruption {
+            message: format!("database lock is already held: {}", path.display()),
+        });
+    }
 
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
     if let Err(error) = file.write_all(owner) {
-        let _ = fs::remove_file(path);
         return Err(Error::Io(error));
     }
     if let Err(error) = file.flush() {
-        let _ = fs::remove_file(path);
         return Err(Error::Io(error));
     }
-    Ok(())
+    Ok(file)
 }
 
 fn persist_file(file: &File, durability: DurabilityMode) -> Result<()> {

@@ -21,6 +21,7 @@ use crate::{
         BlockingAdapterIoDriver, InlineIoDriver, IoAppendObject, IoCompletion, IoDriver,
         IoDriverInfo, IoReadObject,
     },
+    limits,
     object_store::{ObjectStoreBackend, ObjectStoreReadObject},
     options::DurabilityMode,
     runtime::Runtime,
@@ -56,6 +57,33 @@ impl StorageObjectKind {
             Self::WriterLease => "writer lease",
         }
     }
+}
+
+pub(crate) fn max_whole_object_read_bytes(kind: StorageObjectKind) -> usize {
+    match kind {
+        StorageObjectKind::Blob => limits::MAX_WHOLE_BLOB_DECODE_BYTES,
+        StorageObjectKind::Manifest => limits::MAX_MANIFEST_PAYLOAD_BYTES + 14,
+        StorageObjectKind::RecoveryReport => limits::MAX_MANIFEST_PAYLOAD_BYTES,
+        StorageObjectKind::Table => 14 + limits::MAX_WHOLE_TABLE_DECODE_BYTES,
+        StorageObjectKind::Temporary => limits::MAX_WHOLE_TABLE_DECODE_BYTES,
+        StorageObjectKind::Wal => limits::MAX_WAL_FRAME_PAYLOAD_BYTES * 16,
+        StorageObjectKind::WriterLease => 64 * 1024,
+    }
+}
+
+pub(crate) fn ensure_whole_object_read_len(object: &StorageObjectId, len: usize) -> Result<()> {
+    let max = max_whole_object_read_bytes(object.kind());
+    if len <= max {
+        return Ok(());
+    }
+
+    Err(Error::Corruption {
+        message: format!(
+            "{} object {} length {len} exceeds maximum {max}",
+            object.kind().as_str(),
+            object.path().display()
+        ),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1399,8 +1427,9 @@ impl StorageObjectReadBackend for NativeFileBackend {
                 StorageOperation::ReadObjectBytes,
                 Box::pin(async move {
                     require_native_file_object_read()?;
+                    let max_bytes = max_whole_object_read_bytes(object.kind());
                     let completion =
-                        driver.submit_read_optional_path(object.path().to_path_buf())?;
+                        driver.submit_read_optional_path(object.path().to_path_buf(), max_bytes)?;
                     record_platform_io_task(
                         task_metrics.as_ref(),
                         &driver,
@@ -1564,8 +1593,8 @@ impl StorageWriterLeaseBackend for NativeFileBackend {
                         &driver,
                         PlatformIoOperation::WriterLeaseAcquire,
                     );
-                    completion.await?;
-                    Ok(NativeFileWriterLease::from_platform(object, owner, driver))
+                    let file = completion.await?;
+                    Ok(NativeFileWriterLease::from_locked_file(object, owner, file))
                 }),
             );
         }
@@ -1595,8 +1624,8 @@ impl BlockingStorageWriterLeaseBackend for NativeFileBackend {
                         &driver,
                         PlatformIoOperation::WriterLeaseAcquire,
                     );
-                    wait_for_platform_io(completion)?;
-                    Ok(NativeFileWriterLease::from_platform(object, owner, driver))
+                    let file = wait_for_platform_io(completion)?;
+                    Ok(NativeFileWriterLease::from_locked_file(object, owner, file))
                 },
             );
         }
@@ -1772,8 +1801,9 @@ impl StorageManifestReadBackend for NativeFileBackend {
                 StorageOperation::ReadCurrentManifest,
                 Box::pin(async move {
                     require_native_file_manifest_read(&object)?;
+                    let max_bytes = max_whole_object_read_bytes(object.kind());
                     let completion =
-                        driver.submit_read_optional_path(object.path().to_path_buf())?;
+                        driver.submit_read_optional_path(object.path().to_path_buf(), max_bytes)?;
                     record_platform_io_task(
                         task_metrics.as_ref(),
                         &driver,
@@ -3115,76 +3145,45 @@ pub(crate) struct NativeFileWriterLease {
     object: StorageObjectId,
     owner: String,
     file: Option<File>,
-    #[cfg(feature = "platform-io")]
-    platform_io: Option<PlatformIoDriver>,
 }
 
 impl NativeFileWriterLease {
     fn acquire(object: StorageObjectId) -> Result<Self> {
-        let mut file = acquire_native_file_writer_lease(&object)?;
         let owner = writer_lease_owner_text();
-        if let Err(error) = write_native_file_writer_lease_owner(&mut file, &owner) {
-            let _ = fs::remove_file(object.path());
-            return Err(error);
-        }
+        let mut file = acquire_native_file_writer_lease(&object)?;
+        write_native_file_writer_lease_owner(&mut file, &owner)?;
 
         Ok(Self {
             object,
             owner,
             file: Some(file),
-            #[cfg(feature = "platform-io")]
-            platform_io: None,
         })
     }
 
     #[cfg(feature = "platform-io")]
-    fn from_platform(
-        object: StorageObjectId,
-        owner: String,
-        platform_io: PlatformIoDriver,
-    ) -> Self {
+    fn from_locked_file(object: StorageObjectId, owner: String, file: File) -> Self {
         Self {
             object,
             owner,
-            file: None,
-            platform_io: Some(platform_io),
+            file: Some(file),
         }
     }
 }
 
 impl Drop for NativeFileWriterLease {
     fn drop(&mut self) {
-        let _ = self.file.take();
-
-        #[cfg(feature = "platform-io")]
-        if let Some(driver) = self.platform_io.as_ref() {
-            let cleaned =
-                cleanup_native_file_writer_lease_platform(driver, &self.object, &self.owner);
-            if cleaned.is_ok() {
-                return;
+        let should_clear = fs::read_to_string(self.object.path())
+            .is_ok_and(|contents| contents.as_str() == self.owner.as_str());
+        if should_clear {
+            if let Some(file) = self.file.as_mut() {
+                let _ = clear_native_file_writer_lease_owner(file);
             }
         }
-
-        let should_remove = fs::read_to_string(self.object.path())
-            .is_ok_and(|contents| contents.as_str() == self.owner.as_str());
-        if should_remove {
-            let _ = fs::remove_file(self.object.path());
+        if let Some(file) = self.file.as_ref() {
+            let _ = fs4::fs_std::FileExt::unlock(file);
         }
+        let _ = self.file.take();
     }
-}
-
-#[cfg(feature = "platform-io")]
-fn cleanup_native_file_writer_lease_platform(
-    driver: &PlatformIoDriver,
-    object: &StorageObjectId,
-    owner: &str,
-) -> Result<()> {
-    let bytes =
-        wait_for_platform_io(driver.submit_read_optional_path(object.path().to_path_buf())?)?;
-    if bytes.is_some_and(|bytes| bytes.as_ref() == owner.as_bytes()) {
-        wait_for_platform_io(driver.submit_delete_path(object.path().to_path_buf())?)?;
-    }
-    Ok(())
 }
 
 #[cfg(feature = "platform-io")]
@@ -3499,6 +3498,7 @@ fn read_native_file_object_bytes(object: &StorageObjectId) -> Result<Option<Arc<
         metrics: Arc::new(NativeFileStorageMetrics::default()),
     };
     let len = u64_to_usize(object.len_blocking()?, "storage object length")?;
+    ensure_whole_object_read_len(&object.object, len)?;
     let buffer = object.read_exact_at_owned_blocking(0, len)?;
     debug_assert_eq!(buffer.offset(), 0);
     debug_assert_eq!(buffer.len(), len);
@@ -3593,16 +3593,19 @@ fn acquire_native_file_writer_lease(object: &StorageObjectId) -> Result<File> {
         fs::create_dir_all(parent)?;
     }
 
-    match OpenOptions::new()
+    let file = OpenOptions::new()
+        .read(true)
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(false)
         .open(object.path())
-    {
-        Ok(file) => Ok(file),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(Error::Corruption {
+        .map_err(Error::Io)?;
+    if fs4::fs_std::FileExt::try_lock_exclusive(&file).map_err(Error::Io)? {
+        Ok(file)
+    } else {
+        Err(Error::Corruption {
             message: format!("database lock is already held: {}", object.path().display()),
-        }),
-        Err(error) => Err(Error::Io(error)),
+        })
     }
 }
 
@@ -3614,9 +3617,19 @@ fn writer_lease_owner_text() -> String {
 }
 
 fn write_native_file_writer_lease_owner(file: &mut File, owner: &str) -> Result<()> {
-    // The exclusive lease is the create-new LOCK file. The owner text is only a
-    // drop-time guard and diagnostic aid, so it does not need a storage sync.
+    // The exclusive lease is the OS file lock held by this open handle. The
+    // owner text is only a release-time guard and diagnostic aid, so it does not
+    // need a storage sync.
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
     file.write_all(owner.as_bytes())?;
+    file.flush()?;
+    Ok(())
+}
+
+fn clear_native_file_writer_lease_owner(file: &mut File) -> Result<()> {
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
     file.flush()?;
     Ok(())
 }
@@ -4577,8 +4590,14 @@ mod tests {
         );
         drop(lease);
         assert!(
-            !lease_object.path().exists(),
-            "dropping runtime writer lease should remove marker"
+            lease_object.path().exists(),
+            "dropping runtime writer lease should keep the lock file inode"
+        );
+        assert!(
+            std::fs::read(lease_object.path())
+                .expect("runtime writer lease marker reads")
+                .is_empty(),
+            "dropping runtime writer lease should clear owner text"
         );
 
         let listed_path = root.join("directory-file.tmp");
@@ -4956,8 +4975,14 @@ mod tests {
         );
         drop(lease);
         assert!(
-            !lease_object.path().exists(),
-            "dropping writer lease should remove marker"
+            lease_object.path().exists(),
+            "dropping writer lease should keep the lock file inode"
+        );
+        assert!(
+            std::fs::read(lease_object.path())
+                .expect("platform writer lease marker reads")
+                .is_empty(),
+            "dropping writer lease should clear owner text"
         );
 
         assert_platform_io_listing_managed_async(&backend, directory.clone(), &table);
@@ -5879,8 +5904,59 @@ mod tests {
 
         drop(lease);
         assert!(
-            !object.path().exists(),
-            "dropping owned writer lease should remove marker"
+            object.path().exists(),
+            "dropping owned writer lease should keep the lock file inode"
+        );
+        assert!(
+            std::fs::read(object.path())
+                .expect("writer lease marker reads")
+                .is_empty(),
+            "dropping owned writer lease should clear owner text"
+        );
+
+        std::fs::remove_dir_all(root).expect("test dir removes");
+    }
+
+    #[test]
+    fn native_file_backend_recovers_stale_writer_lease_marker() {
+        let root = std::env::temp_dir().join(format!(
+            "trine-kv-storage-writer-lease-stale-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("test dir creates");
+        let object =
+            StorageObjectId::native_file(StorageObjectKind::WriterLease, root.join("LOCK"));
+        std::fs::write(object.path(), b"pid=stale\nnonce=stale\n")
+            .expect("stale writer lease marker writes");
+
+        let lease = NativeFileBackend::new()
+            .acquire_writer_lease_blocking(object.clone())
+            .expect("stale writer lease marker does not block OS lock acquire");
+        let marker = std::fs::read_to_string(object.path()).expect("lease marker reads");
+        assert_ne!(
+            marker, "pid=stale\nnonce=stale\n",
+            "acquiring over a stale marker should publish the new owner"
+        );
+
+        let error = NativeFileBackend::new()
+            .acquire_writer_lease_blocking(object.clone())
+            .expect_err("live OS writer lease still blocks a second writer");
+        assert!(error.to_string().contains("database lock is already held"));
+
+        drop(lease);
+        assert!(
+            object.path().exists(),
+            "dropping recovered writer lease should keep the lock file inode"
+        );
+        assert!(
+            std::fs::read(object.path())
+                .expect("recovered writer lease marker reads")
+                .is_empty(),
+            "dropping recovered writer lease should clear owner text"
         );
 
         std::fs::remove_dir_all(root).expect("test dir removes");
@@ -5898,10 +5974,18 @@ mod tests {
         ));
         let object =
             StorageObjectId::native_file(StorageObjectKind::WriterLease, root.join("LOCK"));
-        let lease = NativeFileBackend::new()
+        let mut lease = NativeFileBackend::new()
             .acquire_writer_lease_blocking(object.clone())
             .expect("writer lease acquires");
-        std::fs::write(object.path(), b"pid=other\nnonce=other\n").expect("lease marker changes");
+        let file = lease
+            .file
+            .as_mut()
+            .expect("native writer lease owns a file");
+        file.set_len(0).expect("lease marker truncates");
+        file.seek(SeekFrom::Start(0)).expect("lease marker seeks");
+        file.write_all(b"pid=other\nnonce=other\n")
+            .expect("lease marker changes");
+        file.flush().expect("lease marker flushes");
 
         drop(lease);
 

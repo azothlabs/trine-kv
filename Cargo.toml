@@ -34,6 +34,9 @@ crossbeam-channel = { version = "0.5.15", optional = true }
 # Async primitives (e.g. `futures::lock::Mutex` for serializing object-store
 # manifest publishes Send-safely). Available on every target.
 futures = "0.3.32"
+# Cross-platform advisory file locks for native writer leases. The lock is bound
+# to the open LOCK file handle so crash recovery is handled by the OS.
+fs4 = { version = "0.13.1", default-features = false, features = ["sync"] }
 # Trine uses only lz4_flex block compression. Keep checked decode enabled, but
 # avoid the default `safe-decode` zero-fill path on the table block read path.
 lz4_flex = { version = "0.13.1", default-features = false, features = [

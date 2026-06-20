@@ -48,8 +48,8 @@ pub(super) fn read_exact_at_owned(
     Ok(StorageReadBuffer::from_vec(offset, bytes))
 }
 
-pub(super) fn read_optional(path: &Path) -> Result<Option<Arc<[u8]>>> {
-    match read_dispatch(path, 0, usize::MAX) {
+pub(super) fn read_optional(path: &Path, max_bytes: usize) -> Result<Option<Arc<[u8]>>> {
+    match read_dispatch(path, 0, max_bytes) {
         Ok(bytes) => Ok(Some(Arc::from(bytes))),
         Err(Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
@@ -77,20 +77,6 @@ pub(super) fn write_existing_or_create(
         bytes,
         offset,
         libc::O_WRONLY | libc::O_CREAT,
-        durability,
-    )
-}
-
-pub(super) fn write_create_new(
-    path: &Path,
-    bytes: &[u8],
-    durability: DurabilityMode,
-) -> Result<()> {
-    write_dispatch(
-        path,
-        bytes,
-        0,
-        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
         durability,
     )
 }

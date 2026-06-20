@@ -13,7 +13,7 @@ use std::{
 ))]
 use std::sync::mpsc;
 #[cfg(feature = "platform-io")]
-use std::{path::PathBuf, thread};
+use std::{fs::File, path::PathBuf, thread};
 
 use crate::{
     error::{Error, Result},
@@ -431,6 +431,7 @@ enum PlatformIoTask {
     },
     ReadOptional {
         path: PathBuf,
+        max_bytes: usize,
         completion: IoCompletion<Option<Arc<[u8]>>>,
     },
     WriteTempRename {
@@ -476,7 +477,7 @@ enum PlatformIoTask {
     AcquireWriterLease {
         path: PathBuf,
         owner: Arc<[u8]>,
-        completion: IoCompletion<()>,
+        completion: IoCompletion<File>,
     },
 }
 
@@ -532,10 +533,15 @@ impl PlatformIoDriver {
     pub(crate) fn submit_read_optional_path(
         &self,
         path: PathBuf,
+        max_bytes: usize,
     ) -> Result<IoCompletion<Option<Arc<[u8]>>>> {
         let completion = IoCompletion::new();
         let waiter = completion.clone();
-        self.submit_task(PlatformIoTask::ReadOptional { path, completion })?;
+        self.submit_task(PlatformIoTask::ReadOptional {
+            path,
+            max_bytes,
+            completion,
+        })?;
         Ok(waiter)
     }
 
@@ -636,7 +642,7 @@ impl PlatformIoDriver {
         &self,
         path: PathBuf,
         owner: Arc<[u8]>,
-    ) -> Result<IoCompletion<()>> {
+    ) -> Result<IoCompletion<File>> {
         let completion = IoCompletion::new();
         let waiter = completion.clone();
         self.submit_task(PlatformIoTask::AcquireWriterLease {
@@ -669,6 +675,7 @@ impl PlatformIoDriver {
     }
 
     #[cfg(not(all(feature = "platform-io-native", any(unix, windows))))]
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
     fn submit_native_task(&self, task: PlatformIoTask) -> Result<()> {
         task.complete_start_error("native platform I/O feature is not enabled");
         Ok(())
@@ -762,8 +769,15 @@ impl PlatformIoTask {
                     platform_threadpool::read_exact_at_owned(path, offset, len),
                 );
             }
-            Self::ReadOptional { path, completion } => {
-                complete_platform_io(&completion, platform_threadpool::read_optional(path));
+            Self::ReadOptional {
+                path,
+                max_bytes,
+                completion,
+            } => {
+                complete_platform_io(
+                    &completion,
+                    platform_threadpool::read_optional(path, max_bytes),
+                );
             }
             Self::WriteTempRename {
                 path,
@@ -852,8 +866,15 @@ impl PlatformIoTask {
                     platform_backend::read_exact_at_owned(path, offset, len).await,
                 );
             }
-            Self::ReadOptional { path, completion } => {
-                complete_platform_io(&completion, platform_backend::read_optional(path).await);
+            Self::ReadOptional {
+                path,
+                max_bytes,
+                completion,
+            } => {
+                complete_platform_io(
+                    &completion,
+                    platform_backend::read_optional(path, max_bytes).await,
+                );
             }
             Self::WriteTempRename {
                 path,
@@ -920,7 +941,7 @@ impl PlatformIoTask {
             } => {
                 complete_platform_io(
                     &completion,
-                    platform_backend::acquire_writer_lease(path, owner).await,
+                    platform_backend::acquire_writer_lease(&path, &owner),
                 );
             }
         }
@@ -945,8 +966,10 @@ impl PlatformIoTask {
             | Self::WriteTempRename { completion, .. }
             | Self::Delete { completion, .. }
             | Self::CreateDirAll { completion, .. }
-            | Self::SyncDir { completion, .. }
-            | Self::AcquireWriterLease { completion, .. } => {
+            | Self::SyncDir { completion, .. } => {
+                complete_platform_io(&completion, Err(error()));
+            }
+            Self::AcquireWriterLease { completion, .. } => {
                 complete_platform_io(&completion, Err(error()));
             }
         }
@@ -1175,7 +1198,7 @@ mod tests {
 
         assert_eq!(matrix.kind, PlatformIoBackendKind::LinuxNative);
         for operation in ALL_PLATFORM_OPERATIONS {
-            let expected = if operation == Op::DirectoryListing {
+            let expected = if matches!(operation, Op::DirectoryListing | Op::WriterLeaseAcquire) {
                 ThreadPoolManagedAsync
             } else {
                 TruePlatformAsync
@@ -1256,7 +1279,7 @@ mod tests {
                 (Op::DirectoryCreate, rows.directory_create),
                 (Op::DirectorySync, rows.directory_sync),
                 (Op::DirectoryListing, ThreadPool),
-                (Op::WriterLeaseAcquire, Partial),
+                (Op::WriterLeaseAcquire, ThreadPool),
             ],
         );
     }

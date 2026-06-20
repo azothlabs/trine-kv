@@ -532,36 +532,57 @@ fn persistent_writer_open_fails_when_directory_lock_is_held() {
 
     db.close_sync();
     assert!(
-        !lock_path.exists(),
-        "close should release the writer directory lock"
+        lock_path.exists(),
+        "close should keep the lock file inode for the next writer"
+    );
+    assert!(
+        fs::read(&lock_path)
+            .expect("lock marker reads after close")
+            .is_empty(),
+        "close should clear the writer lock owner text"
     );
 
     let reopened = Db::open_sync(options).expect("writer reopens after close");
     drop(reopened);
     assert!(
-        !lock_path.exists(),
-        "dropping the final writer handle should release the directory lock"
+        lock_path.exists(),
+        "dropping the final writer handle should keep the lock file inode"
+    );
+    assert!(
+        fs::read(&lock_path)
+            .expect("lock marker reads after drop")
+            .is_empty(),
+        "dropping the final writer handle should clear owner text"
     );
 
     fs::remove_dir_all(path).expect("cleanup test db");
 }
 
 #[test]
-fn persistent_writer_open_fails_closed_on_existing_lock_file() {
+fn persistent_writer_open_recovers_stale_lock_marker() {
     let path = temp_db_path("writer-lock-stale");
     let options = DbOptions::persistent(&path);
     let lock_path = path.join("LOCK");
     write_file(&lock_path, b"pid=stale\n");
 
-    let message = corruption_message(
-        Db::open_sync(options).expect_err("existing lock file must fail closed"),
-    );
-    assert!(message.contains("database lock is already held"));
-    assert_eq!(
-        fs::read(&lock_path).expect("stale lock remains readable"),
-        b"pid=stale\n"
+    let db = Db::open_sync(options).expect("stale lock marker does not block open");
+    assert_ne!(
+        fs::read(&lock_path).expect("new lock marker remains readable"),
+        b"pid=stale\n",
+        "open should overwrite a stale marker with the new owner"
     );
     assert!(!recovery::recovery_report_path(&path).exists());
+    db.close_sync();
+    assert!(
+        lock_path.exists(),
+        "close should keep the recovered writer lock file inode"
+    );
+    assert!(
+        fs::read(&lock_path)
+            .expect("recovered lock marker reads after close")
+            .is_empty(),
+        "close should clear the recovered writer lock owner text"
+    );
 
     fs::remove_dir_all(path).expect("cleanup test db");
 }
@@ -583,8 +604,10 @@ fn persistent_read_only_open_does_not_take_writer_lock() {
     read_only_options.create_if_missing = false;
     let read_only_db = Db::open_sync(read_only_options).expect("read-only open succeeds");
     assert!(
-        !lock_path.exists(),
-        "read-only open should not take the writer directory lock"
+        fs::read(&lock_path)
+            .expect("lock marker remains readable")
+            .is_empty(),
+        "read-only open should not write writer lock owner text"
     );
 
     let writer = Db::open_sync(options).expect("writer opens while read-only handle exists");

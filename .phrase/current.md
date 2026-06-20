@@ -8,6 +8,25 @@ storage/manifest and a separate object client for writer lease plus remote WAL.
 Billing-aware R2 measurement now has per-scenario request-class output and
 regression budgets for the expensive WAL publish path.
 
+Post-phase native async close/lease correctness audit found and fixed a race:
+close now rejects new publish activity, waits for already admitted commit,
+flush, or compaction publish activity to finish, and only then releases the
+writer lease.
+
+Post-phase native writer lease availability audit found and fixed the stale
+`LOCK` marker trap: native-file writer leases are now OS file locks held on the
+open `LOCK` handle, while the file contents remain owner diagnostics and
+release-time cleanup guards.
+
+Post-phase table block decode hardening found and fixed a memory DoS risk:
+decoded block lengths from SSTable block headers are now bounded before LZ4
+decode can allocate output bytes. Table writes also cap the effective inline
+value threshold so oversized values are sent to blob storage instead of creating
+blocks the decoder would later reject. The same resource-bound pass now covers
+whole-object reads, manifest/WAL payload lengths, blob file/property/record
+lengths, direct blob references, cursor byte-field overflow checks, and
+object-store `head` preflight before whole-object `get`.
+
 ## Goal
 
 Reduce confirmed object-store write latency and allow deployments to place the
@@ -93,16 +112,36 @@ recoverable after process loss and writer takeover.
 - Real R2 live run reports request classes per scenario and enforces the group
   commit Class A budget. Met.
 - Existing native persistent and in-memory behavior stays compatible. Met.
+- Native async close waits for admitted publish activity before releasing the
+  writer lease. Met.
+- Native writable open recovers from a crash-left `LOCK` marker when no process
+  still holds the OS file lock, while live second writers still fail. Met.
+- Malicious or corrupt SSTable block headers cannot force oversized LZ4 output
+  allocation before decode validation. Met.
+- Malicious or corrupt manifest, WAL, table, or blob length fields cannot force
+  unbounded buffer allocation before validation. Met.
 
 ## Verification
 
+- `cargo test -q oversized_uncompressed_len`
+- `cargo test -q lz4_decode_rejects_oversized_output_before_allocation`
+- `cargo test -q blob_threshold_is_capped_to_keep_inline_values_decodable`
+- `cargo test -q large_allocation`
+- `cargo test -q oversized`
+- `cargo test -q native_async_close_waits_for_active_publish_before_releasing_lease`
+- `cargo test -q writer_lease`
+- `cargo test -q writer_lease --features platform-io`
 - `cargo fmt --check`
 - `git diff --check`
+- `cargo check -q`
+- `cargo check -q --features platform-io`
+- `cargo check -q --all-features`
 - `cargo check -q --features s3`
 - `cargo test -q object_wal_lane_group_commits_queued_accepts`
 - `cargo test -q object_store`
 - `cargo test -q --lib`
 - `cargo clippy -q --lib`
+- `cargo clippy -q --all-features --lib`
 - `cargo clippy -q --features s3 --lib`
 - `cargo test -q object_store_split_wal_tier`
 - `cargo test -q --features s3 s3_live_measurement_and_fault_suite`

@@ -98,6 +98,7 @@ mod internal_key;
 mod io;
 /// Forward and reverse iterators over committed rows.
 pub mod iterator;
+mod limits;
 mod lsm;
 mod manifest;
 #[allow(dead_code)]

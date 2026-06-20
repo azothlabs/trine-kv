@@ -51,17 +51,21 @@ write/flush:
 ## Interpretation
 
 The slowdown was not WAL replay. It was the writer-lease owner text being
-`sync_all`ed on every writable open. The single-writer guarantee comes from
-exclusive `create_new` creation of the `LOCK` file and the file's existence
-while the database is open. The owner text is a drop-time guard and diagnostic
-aid; syncing it to storage does not provide the parent-directory durability
-needed for a crash-proof lease protocol, and it was much more expensive than
-the WAL read/replay work.
+`sync_all`ed on every writable open. At the time of this benchmark, the
+single-writer guarantee came from exclusive `create_new` creation of the `LOCK`
+file and the file's existence while the database was open. A later hardening
+change moved the native-file writer lease to an OS file lock held on the open
+`LOCK` handle, while keeping the owner text as a release-time guard and
+diagnostic aid. Normal close/drop clears matching owner text and keeps the
+`LOCK` file inode in place, so crash-left `LOCK` owner bytes no longer block a
+writable open when no process still holds the OS lock.
 
-The fix keeps the safety boundary intact:
+The owner-text persistence fix kept the safety boundary intact:
 
-- `create_new` still fails closed when a lock file already exists.
-- The owner text is still written so `Drop` removes only the lock file created
+- a second writer still fails while the OS file lock is held;
+- a stale marker without a live OS file lock can be overwritten by the next
+  writer;
+- The owner text is still written so `Drop` clears only the owner text created
   by this handle.
 - The default native path, platform-io thread-pool path, and native platform I/O
   path now share the same cheaper owner-text semantics.

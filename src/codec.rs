@@ -1,4 +1,10 @@
-use crate::{Error, error::Result};
+use crate::{Error, error::Result, limits};
+
+// Normal data blocks target 16 KiB and large values use blob storage. This
+// keeps corrupt headers from turning a tiny compressed payload into an
+// unbounded decoder allocation while leaving wide headroom for large records and
+// metadata blocks.
+pub(crate) const MAX_DECODED_BLOCK_BYTES: usize = limits::MAX_DECODED_BLOCK_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CodecId {
@@ -48,6 +54,7 @@ impl BlockCodec for NoneCodec {
     }
 
     fn decode(&self, input: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
+        ensure_decoded_block_len(uncompressed_len)?;
         if input.len() == uncompressed_len {
             Ok(input.to_vec())
         } else {
@@ -67,6 +74,7 @@ impl BlockCodec for FastLz4BlockCodec {
     }
 
     fn decode(&self, input: &[u8], uncompressed_len: usize) -> Result<Vec<u8>> {
+        ensure_decoded_block_len(uncompressed_len)?;
         let decoded = lz4_flex::block::decompress(input, uncompressed_len).map_err(|error| {
             Error::InvalidFormat {
                 message: format!("invalid lz4 block: {error}"),
@@ -97,5 +105,33 @@ pub(crate) fn decode_block(
     match codec {
         CodecId::None => NoneCodec.decode(input, uncompressed_len),
         CodecId::FastLz4Block => FastLz4BlockCodec.decode(input, uncompressed_len),
+    }
+}
+
+pub(crate) fn ensure_decoded_block_len(uncompressed_len: usize) -> Result<()> {
+    limits::ensure_invalid_format_len(
+        uncompressed_len,
+        MAX_DECODED_BLOCK_BYTES,
+        "decoded block length",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lz4_decode_rejects_oversized_output_before_allocation() {
+        let error = decode_block(CodecId::FastLz4Block, &[0], u32::MAX as usize)
+            .expect_err("oversized decoded block should fail before lz4 allocation");
+
+        assert!(
+            matches!(error, Error::InvalidFormat { .. }),
+            "unexpected error kind: {error}"
+        );
+        assert!(
+            error.to_string().contains("decoded block length"),
+            "unexpected error: {error}"
+        );
     }
 }

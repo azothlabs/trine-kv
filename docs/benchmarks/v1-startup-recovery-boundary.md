@@ -58,14 +58,15 @@ Selected storage-operation medians for 32 cold writable opens:
 ## Rejected Optimization
 
 The writable close/drop path still has visible cost because the writer lease
-drop path reads the `LOCK` owner text before removing the file. A Unix-only
+drop path reads the `LOCK` owner text before clearing that text. A Unix-only
 unlink-while-open fast path was tested, but the existing
 `native_file_writer_lease_does_not_remove_changed_marker` regression test
 correctly rejected it: if another actor changes the marker, Trine must not
-remove it on drop.
+clear it on drop.
 
-That safety rule is more important than this close-path micro-optimization, so
-no writer-lease behavior change was retained.
+That safety rule is more important than this close-path micro-optimization. The
+current writer-lease release path keeps the same `LOCK` file inode in place,
+clears only matching owner text, and then releases the OS file lock.
 
 ## Interpretation
 

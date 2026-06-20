@@ -318,12 +318,31 @@ pub(super) struct CommitSlot {
 
 #[derive(Debug)]
 pub(super) struct PublishBarrier {
-    lock: Mutex<()>,
+    sequence_lock: Mutex<()>,
+    activity: Mutex<PublishBarrierActivity>,
+    idle: Condvar,
 }
 
 #[derive(Debug)]
 pub(super) struct PublishBarrierGuard<'barrier> {
+    _activity: PublishActivityGuard<'barrier>,
+    _sequence: PublishSequenceGuard<'barrier>,
+}
+
+#[derive(Debug)]
+pub(super) struct PublishActivityGuard<'barrier> {
+    barrier: &'barrier PublishBarrier,
+}
+
+#[derive(Debug)]
+pub(super) struct PublishSequenceGuard<'barrier> {
     _guard: MutexGuard<'barrier, ()>,
+}
+
+#[derive(Debug, Default)]
+struct PublishBarrierActivity {
+    active: usize,
+    closing: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -460,15 +479,74 @@ impl CommitTracker {
 impl PublishBarrier {
     fn new() -> Self {
         Self {
-            lock: Mutex::new(()),
+            sequence_lock: Mutex::new(()),
+            activity: Mutex::new(PublishBarrierActivity::default()),
+            idle: Condvar::new(),
         }
     }
 
     pub(super) fn enter(&self) -> Result<PublishBarrierGuard<'_>> {
-        self.lock
+        let activity = self.begin_activity()?;
+        match self.enter_sequence() {
+            Ok(sequence) => Ok(PublishBarrierGuard {
+                _activity: activity,
+                _sequence: sequence,
+            }),
+            Err(error) => {
+                drop(activity);
+                Err(error)
+            }
+        }
+    }
+
+    pub(super) fn begin_activity(&self) -> Result<PublishActivityGuard<'_>> {
+        let mut activity = self
+            .activity
             .lock()
-            .map(|guard| PublishBarrierGuard { _guard: guard })
-            .map_err(|_| lock_poisoned("publish barrier"))
+            .map_err(|_| lock_poisoned("publish activity"))?;
+        if activity.closing {
+            return Err(Error::Closed);
+        }
+        activity.active = activity
+            .active
+            .checked_add(1)
+            .ok_or_else(|| Error::Corruption {
+                message: "publish activity counter overflow".to_owned(),
+            })?;
+        Ok(PublishActivityGuard { barrier: self })
+    }
+
+    pub(super) fn enter_sequence(&self) -> Result<PublishSequenceGuard<'_>> {
+        self.sequence_lock
+            .lock()
+            .map(|guard| PublishSequenceGuard { _guard: guard })
+            .map_err(|_| lock_poisoned("publish sequence barrier"))
+    }
+
+    fn close(&self) -> Result<()> {
+        let mut activity = self
+            .activity
+            .lock()
+            .map_err(|_| lock_poisoned("publish activity"))?;
+        activity.closing = true;
+        while activity.active != 0 {
+            activity = self
+                .idle
+                .wait(activity)
+                .map_err(|_| lock_poisoned("publish activity"))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PublishActivityGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut activity) = self.barrier.activity.lock() {
+            activity.active = activity.active.saturating_sub(1);
+            if activity.active == 0 {
+                self.barrier.idle.notify_all();
+            }
+        }
     }
 }
 
@@ -919,6 +997,7 @@ impl Drop for Db {
                 &self.inner.runtime_shutdown,
                 &self.inner.background_workers,
             );
+            let _ = self.inner.publish_barrier.close();
             self.inner.substrate.release_writer_lease();
         }
     }
@@ -3428,13 +3507,13 @@ impl Db {
             &self.inner.runtime_shutdown,
             &self.inner.background_workers,
         );
+        self.inner.publish_barrier.close()?;
         if let Some(db_path) = self.persistent_path().map(Path::to_path_buf) {
             self.cleanup_pending_obsolete_table_files_native_async(&db_path)
                 .await?;
             self.cleanup_pending_obsolete_blob_files_native_async(&db_path)
                 .await?;
         }
-        let _publish = self.inner.publish_barrier.enter()?;
         self.inner.substrate.release_writer_lease();
         Ok(())
     }
@@ -4285,10 +4364,10 @@ impl Db {
             &self.inner.runtime_shutdown,
             &self.inner.background_workers,
         );
-        // The directory lock is released only after the publish barrier is
-        // idle. Otherwise a second process could open while this one is still
-        // publishing files for a commit, flush, or compaction.
-        let Ok(_publish) = self.inner.publish_barrier.enter() else {
+        // The writer lease is released only after all admitted publish
+        // activities finish. Otherwise a second process could open while this
+        // one is still publishing files or making a commit visible.
+        let Ok(()) = self.inner.publish_barrier.close() else {
             return;
         };
         if let Some(db_path) = self.persistent_path().map(Path::to_path_buf) {
@@ -5450,6 +5529,14 @@ impl Db {
             return Err(error);
         }
 
+        let _publish_activity = match self.inner.publish_barrier.begin_activity() {
+            Ok(activity) => activity,
+            Err(error) => {
+                let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+                return Err(error);
+            }
+        };
+
         if let Err(error) = self
             .publish_flushed_tables_native_async(&written_tables, flush_sequence)
             .await
@@ -6027,6 +6114,14 @@ impl Db {
             }
             return Err(error);
         }
+        let _publish_activity = match self.inner.publish_barrier.begin_activity() {
+            Ok(activity) => activity,
+            Err(error) => {
+                let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+                return Err(error);
+            }
+        };
+
         if let Err(error) = self
             .publish_compacted_tables_native_async(&written_tables, &obsolete_blob_ids)
             .await
@@ -11211,6 +11306,47 @@ mod tests {
             )])
             .expect("released range can reserve again");
         assert!(third.contains("default", &KeyRange::half_open(b"b", b"d")));
+    }
+
+    #[test]
+    fn native_async_close_waits_for_active_publish_before_releasing_lease() {
+        let path = temp_db_path("native-close-waits-for-publish");
+        let mut options = DbOptions::persistent(&path);
+        options.background_worker_count = 0;
+        let db = Db::open_sync(options).expect("open db");
+        db.put_sync(b"key", b"value").expect("write");
+
+        let activity = db
+            .inner
+            .publish_barrier
+            .begin_activity()
+            .expect("test holds active publish");
+        let thread_db = db.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            started_tx.send(()).expect("report close thread start");
+            let result = block_on_test_future(thread_db.close());
+            done_tx.send(result).expect("send close result");
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("close thread starts");
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "native async close must wait for active publish before releasing the writer lease"
+        );
+
+        drop(activity);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("close finishes after active publish exits")
+            .expect("close succeeds");
+        handle.join().expect("close thread joins");
+
+        drop(db);
+        fs::remove_dir_all(path).expect("cleanup test db");
     }
 
     #[test]

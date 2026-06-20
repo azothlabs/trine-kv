@@ -12,6 +12,7 @@ use std::{pin::Pin, thread};
 
 use crate::{
     error::{Error, Result},
+    limits,
     lsm::LsmTree,
     options::{DurabilityMode, StorageMode, WriteOptions},
     transaction::TransactionReadSet,
@@ -21,7 +22,8 @@ use crate::{
 };
 
 use super::{
-    CommitSlot, Db, PublishBarrierGuard, lock_poisoned, usize_to_u64_saturating, validate_batch_len,
+    CommitSlot, Db, PublishSequenceGuard, lock_poisoned, usize_to_u64_saturating,
+    validate_batch_len,
 };
 
 #[derive(Debug)]
@@ -665,12 +667,14 @@ impl Db {
     }
 
     fn commit_write_request(&self, request: WriteRequest) -> Result<CommitInfo> {
+        let _publish_activity = self.inner.publish_barrier.begin_activity()?;
         let accepted_state = self.accept_write_request(request)?;
         self.publish_accepted_write_state(accepted_state)
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     async fn commit_write_request_async(&self, request: WriteRequest) -> Result<CommitInfo> {
+        let _publish_activity = self.inner.publish_barrier.begin_activity()?;
         let accepted_state = self.accept_write_request_with_wal_preaccept(request, false)?;
         self.publish_accepted_write_state_async(accepted_state)
             .await
@@ -736,6 +740,7 @@ impl Db {
         // barrier or touching memtables, so a rejected batch cannot leave
         // partial state.
         validate_batch_len(operations.len())?;
+        validate_operation_resource_bounds(&operations)?;
         if !operations.is_empty() {
             self.apply_write_backpressure()?;
         }
@@ -760,7 +765,7 @@ impl Db {
             AcceptedWriteState::Noop(commit_info) => Ok(commit_info),
             AcceptedWriteState::Pending(writer_state) => {
                 let sequenced = {
-                    let publish = self.inner.publish_barrier.enter()?;
+                    let publish = self.inner.publish_barrier.enter_sequence()?;
                     self.sequence_writer_local_state_under_barrier(writer_state, &publish)?
                 };
                 let sequenced = match sequenced {
@@ -792,7 +797,7 @@ impl Db {
     fn sequence_writer_local_state_under_barrier(
         &self,
         writer_state: WriterLocalWriteState,
-        _publish: &PublishBarrierGuard<'_>,
+        _publish: &PublishSequenceGuard<'_>,
     ) -> Result<SequencedWriteState> {
         let WriterLocalWriteState {
             prepared,
@@ -869,7 +874,7 @@ impl Db {
             AcceptedWriteState::Noop(commit_info) => Ok(commit_info),
             AcceptedWriteState::Pending(writer_state) => {
                 let sequenced = {
-                    let publish = self.inner.publish_barrier.enter()?;
+                    let publish = self.inner.publish_barrier.enter_sequence()?;
                     self.sequence_writer_local_state_under_barrier(writer_state, &publish)?
                 };
                 let sequenced = match sequenced {
@@ -1317,6 +1322,45 @@ const fn durability_rank(mode: DurabilityMode) -> u8 {
     }
 }
 
+fn validate_operation_resource_bounds(operations: &[BatchOperation]) -> Result<()> {
+    for operation in operations {
+        match operation {
+            BatchOperation::Put { key, value, .. } => {
+                validate_write_byte_field(key.len(), "write key length")?;
+                validate_write_byte_field(value.len(), "write value length")?;
+            }
+            BatchOperation::Delete { key, .. } => {
+                validate_write_byte_field(key.len(), "write key length")?;
+            }
+            BatchOperation::DeleteRange { range, .. } => {
+                validate_bound_len(&range.start)?;
+                validate_bound_len(&range.end)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_bound_len(bound: &Bound<Vec<u8>>) -> Result<()> {
+    match bound {
+        Bound::Included(bytes) | Bound::Excluded(bytes) => {
+            validate_write_byte_field(bytes.len(), "write range bound length")
+        }
+        Bound::Unbounded => Ok(()),
+    }
+}
+
+fn validate_write_byte_field(len: usize, field: &'static str) -> Result<()> {
+    if len <= limits::MAX_DECODED_BLOCK_BYTES {
+        return Ok(());
+    }
+
+    Err(Error::invalid_options(format!(
+        "{field} {len} exceeds maximum {}",
+        limits::MAX_DECODED_BLOCK_BYTES
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1347,7 +1391,7 @@ mod tests {
     fn publish_writer_state_for_test(
         db: &Db,
         writer_state: super::WriterLocalWriteState,
-        publish: &super::PublishBarrierGuard<'_>,
+        publish: &super::PublishSequenceGuard<'_>,
     ) -> super::PublishedWrite {
         let sequenced = db
             .sequence_writer_local_state_under_barrier(writer_state, publish)
@@ -1626,7 +1670,7 @@ mod tests {
         let blocked_publish = db
             .inner
             .publish_barrier
-            .enter()
+            .enter_sequence()
             .expect("enter publish barrier");
         let accepted_state = db
             .accept_write_request(request)
@@ -1652,7 +1696,7 @@ mod tests {
         let publish = db
             .inner
             .publish_barrier
-            .enter()
+            .enter_sequence()
             .expect("enter publish barrier");
         let published = publish_writer_state_for_test(&db, writer_state, &publish);
         assert_eq!(published.commit_info.sequence(), Sequence::new(1));
@@ -1707,7 +1751,7 @@ mod tests {
         let publish = db
             .inner
             .publish_barrier
-            .enter()
+            .enter_sequence()
             .expect("enter publish barrier");
         let sequenced = db
             .sequence_writer_local_state_under_barrier(writer_state, &publish)
@@ -1775,7 +1819,7 @@ mod tests {
         let publish = db
             .inner
             .publish_barrier
-            .enter()
+            .enter_sequence()
             .expect("enter publish barrier");
         let published = publish_writer_state_for_test(&db, writer_state, &publish);
 
@@ -1839,7 +1883,7 @@ mod tests {
         let publish = db
             .inner
             .publish_barrier
-            .enter()
+            .enter_sequence()
             .expect("enter publish barrier");
         let first_published = publish_writer_state_for_test(&db, first_state, &publish);
         let second_published = publish_writer_state_for_test(&db, second_state, &publish);

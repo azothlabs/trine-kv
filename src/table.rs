@@ -22,6 +22,7 @@ use crate::{
         Direction, ForwardKeyState, RecordGroup, ReverseKeyState, ScanRecord, ScanSelector,
         prefix_successor, sort_group_records,
     },
+    limits,
     options::{
         DurabilityMode, FilterDepthCurve, FilterPolicy, IndexSearchPolicy, PrefixFilterPolicy,
     },
@@ -95,6 +96,7 @@ const MIN_INDEX_ENTRY_BYTES: usize = MIN_INTERNAL_KEY_BYTES * 2 + 16 + 1 + 1;
 const MIN_INDEX_PARTITION_ENTRY_BYTES: usize = MIN_INTERNAL_KEY_BYTES * 2 + 16 + 8;
 const MIN_RANGE_TOMBSTONE_BYTES: usize = 14;
 const RESTART_POINT_BYTES: usize = 4;
+const INLINE_VALUE_HEADER_BYTES: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TableId(pub u64);
@@ -3719,7 +3721,7 @@ pub(crate) fn write_table_with_backend(
         backend,
         db_path,
         table_id.get(),
-        options.blob_threshold_bytes,
+        effective_blob_threshold_bytes(options.blob_threshold_bytes),
         CodecId::None,
         &point_records,
     )?
@@ -3853,7 +3855,7 @@ where
         backend,
         db_path,
         table_id.get(),
-        options.blob_threshold_bytes,
+        effective_blob_threshold_bytes(options.blob_threshold_bytes),
         CodecId::None,
         &point_records,
         durability,
@@ -4067,6 +4069,11 @@ where
         })?;
     let file_len = usize::try_from(file_len)
         .map_err(|_| Error::invalid_options("table file length exceeds usize"))?;
+    limits::ensure_corruption_len(
+        file_len,
+        HEADER_LEN + limits::MAX_WHOLE_TABLE_DECODE_BYTES,
+        "table file length",
+    )?;
     let bytes = table_object
         .read_exact_at_owned(0, file_len)
         .await
@@ -4506,6 +4513,15 @@ fn build_data_blocks(
     Ok(data_blocks)
 }
 
+fn effective_blob_threshold_bytes(configured_threshold: usize) -> usize {
+    configured_threshold.min(max_inline_value_bytes())
+}
+
+fn max_inline_value_bytes() -> usize {
+    limits::MAX_DECODED_BLOCK_BYTES
+        .saturating_sub(MIN_INTERNAL_KEY_BYTES + INLINE_VALUE_HEADER_BYTES)
+}
+
 fn index_partitions_for_loaded_blocks(data_blocks: &[TableDataBlock]) -> Vec<IndexPartitionEntry> {
     data_blocks
         .chunks(INDEX_PARTITION_TARGET_ENTRIES)
@@ -4604,6 +4620,11 @@ fn decode_table_from_storage_object(
     let magic = read_u32_at(&header, 0)?;
     let version = read_u16_at(&header, 4)?;
     let payload_len = read_u32_at(&header, 6)? as usize;
+    limits::ensure_invalid_format_len(
+        payload_len,
+        limits::MAX_WHOLE_TABLE_DECODE_BYTES,
+        "table payload length",
+    )?;
     let payload_checksum = read_u32_at(&header, 10)?;
     if magic != TABLE_MAGIC {
         return Err(Error::Corruption {
@@ -4616,9 +4637,7 @@ fn decode_table_from_storage_object(
         });
     }
     let expected_len = usize_to_u64(
-        HEADER_LEN
-            .checked_add(payload_len)
-            .ok_or_else(|| invalid_table("table length overflow"))?,
+        limits::checked_add_invalid_format(HEADER_LEN, payload_len, "table length")?,
         "table file length",
     )?;
     if file_len != expected_len {
@@ -6304,15 +6323,17 @@ fn u32_to_usize(value: u32) -> usize {
 }
 
 fn read_u16_at(bytes: &[u8], offset: usize) -> Result<u16> {
+    let end = limits::checked_add_invalid_format(offset, 2, "u16 offset")?;
     let value = bytes
-        .get(offset..offset + 2)
+        .get(offset..end)
         .ok_or_else(|| invalid_table("short u16"))?;
     Ok(u16::from_le_bytes([value[0], value[1]]))
 }
 
 fn read_u32_at(bytes: &[u8], offset: usize) -> Result<u32> {
+    let end = limits::checked_add_invalid_format(offset, 4, "u32 offset")?;
     let value = bytes
-        .get(offset..offset + 4)
+        .get(offset..end)
         .ok_or_else(|| invalid_table("short u32"))?;
     Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
 }
@@ -6377,11 +6398,12 @@ impl<'payload> Cursor<'payload> {
     }
 
     fn read_u64(&mut self) -> Result<u64> {
+        let end = limits::checked_add_invalid_format(self.offset, 8, "u64 offset")?;
         let value = self
             .payload
-            .get(self.offset..self.offset + 8)
+            .get(self.offset..end)
             .ok_or_else(|| invalid_table("short u64"))?;
-        self.offset += 8;
+        self.offset = end;
         Ok(u64::from_le_bytes([
             value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
         ]))
@@ -6389,11 +6411,12 @@ impl<'payload> Cursor<'payload> {
 
     fn read_bytes(&mut self) -> Result<&'payload [u8]> {
         let len = self.read_u32()? as usize;
+        let end = limits::checked_add_invalid_format(self.offset, len, "byte field length")?;
         let value = self
             .payload
-            .get(self.offset..self.offset + len)
+            .get(self.offset..end)
             .ok_or_else(|| invalid_table("short bytes"))?;
-        self.offset += len;
+        self.offset = end;
         Ok(value)
     }
 
@@ -6572,9 +6595,10 @@ mod tests {
         }
 
         fn read_exact_at_owned(&self, offset: usize, len: usize) -> Result<StorageReadBuffer> {
+            let end = limits::checked_add_invalid_format(offset, len, "test read offset")?;
             let bytes = self
                 .bytes
-                .get(offset..offset + len)
+                .get(offset..end)
                 .ok_or_else(|| invalid_table("owned read outside source"))?
                 .to_vec();
             Ok(StorageReadBuffer::from_vec(offset, bytes))
@@ -7455,6 +7479,14 @@ mod tests {
     }
 
     #[test]
+    fn blob_threshold_is_capped_to_keep_inline_values_decodable() {
+        let capped = effective_blob_threshold_bytes(usize::MAX);
+
+        assert_eq!(capped, max_inline_value_bytes());
+        assert!(capped < limits::MAX_DECODED_BLOCK_BYTES);
+    }
+
+    #[test]
     fn partitioned_filters_round_trip_through_index_entries() {
         let table = table_with_filters(160, CodecId::None);
         let payload = encode_table(&table).expect("table encodes");
@@ -7576,6 +7608,21 @@ mod tests {
         let error =
             decode_table(&table_file_bytes(&payload)).expect_err("unknown block codec fails");
         assert!(matches!(error, Error::UnsupportedFormat { .. }));
+    }
+
+    #[test]
+    fn table_decode_rejects_payload_len_before_large_allocation() {
+        let payload_len = u32::try_from(limits::MAX_WHOLE_TABLE_DECODE_BYTES + 1)
+            .expect("test payload length fits u32");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&TABLE_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&TABLE_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&payload_len.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+
+        let error = decode_table(&bytes).expect_err("oversized payload length should fail");
+
+        assert_invalid_table_message(&error, "table payload length");
     }
 
     #[test]

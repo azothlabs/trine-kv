@@ -15,6 +15,7 @@ use std::{
 
 use crate::{
     error::{Error, Result},
+    limits,
     options::DurabilityMode,
     storage::{
         BlockingStorageAppendBackend, BlockingStorageDirectoryListBackend,
@@ -1524,6 +1525,13 @@ pub(crate) fn encode_batch_frame(
     operations: &[BatchOperation],
 ) -> Result<Vec<u8>> {
     let payload = encode_payload(sequence, operations)?;
+    if payload.len() > limits::MAX_WAL_FRAME_PAYLOAD_BYTES {
+        return Err(Error::invalid_options(format!(
+            "WAL payload length {} exceeds maximum {}",
+            payload.len(),
+            limits::MAX_WAL_FRAME_PAYLOAD_BYTES
+        )));
+    }
     let payload_checksum = checksum(&payload);
     let payload_len = u32::try_from(payload.len())
         .map_err(|_| Error::invalid_options("WAL payload exceeds u32::MAX bytes"))?;
@@ -1643,8 +1651,15 @@ pub(crate) fn decode_frames_after(bytes: &[u8], replay_floor: Sequence) -> Resul
         }
 
         let payload_len = payload_len as usize;
-        let payload_start = offset + HEADER_LEN;
-        let payload_end = payload_start + payload_len;
+        limits::ensure_invalid_format_len(
+            payload_len,
+            limits::MAX_WAL_FRAME_PAYLOAD_BYTES,
+            "WAL payload length",
+        )?;
+        let payload_start =
+            limits::checked_add_invalid_format(offset, HEADER_LEN, "WAL payload start")?;
+        let payload_end =
+            limits::checked_add_invalid_format(payload_start, payload_len, "WAL payload end")?;
         if payload_end > bytes.len() {
             break;
         }
@@ -1763,22 +1778,25 @@ fn put_bound(bytes: &mut Vec<u8>, bound: &Bound<Vec<u8>>) -> Result<()> {
 }
 
 fn read_u16_at(bytes: &[u8], offset: usize) -> Result<u16> {
+    let end = limits::checked_add_invalid_format(offset, 2, "u16 offset")?;
     let value = bytes
-        .get(offset..offset + 2)
+        .get(offset..end)
         .ok_or_else(|| invalid_wal("short u16"))?;
     Ok(u16::from_le_bytes([value[0], value[1]]))
 }
 
 fn read_u32_at(bytes: &[u8], offset: usize) -> Result<u32> {
+    let end = limits::checked_add_invalid_format(offset, 4, "u32 offset")?;
     let value = bytes
-        .get(offset..offset + 4)
+        .get(offset..end)
         .ok_or_else(|| invalid_wal("short u32"))?;
     Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
 }
 
 fn read_u64_at(bytes: &[u8], offset: usize) -> Result<u64> {
+    let end = limits::checked_add_invalid_format(offset, 8, "u64 offset")?;
     let value = bytes
-        .get(offset..offset + 8)
+        .get(offset..end)
         .ok_or_else(|| invalid_wal("short u64"))?;
     Ok(u64::from_le_bytes([
         value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
@@ -1841,11 +1859,12 @@ impl<'payload> Cursor<'payload> {
 
     fn read_bytes(&mut self) -> Result<&'payload [u8]> {
         let len = self.read_u32()? as usize;
+        let end = limits::checked_add_invalid_format(self.offset, len, "WAL byte field length")?;
         let value = self
             .payload
-            .get(self.offset..self.offset + len)
+            .get(self.offset..end)
             .ok_or_else(|| invalid_wal("short bytes"))?;
-        self.offset += len;
+        self.offset = end;
         Ok(value)
     }
 
@@ -1893,7 +1912,7 @@ mod tests {
     };
 
     use crate::{
-        options::DurabilityMode, storage::NativeFileBackend, types::Sequence,
+        limits, options::DurabilityMode, storage::NativeFileBackend, types::Sequence,
         write_batch::BatchOperation,
     };
 
@@ -2362,6 +2381,25 @@ mod tests {
                 .contains("operation count exceeds payload bytes"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn wal_decode_rejects_frame_payload_len_before_large_allocation() {
+        let payload_len = u32::try_from(limits::MAX_WAL_FRAME_PAYLOAD_BYTES + 1)
+            .expect("test payload length fits u32");
+        let payload_checksum = 0_u32;
+        let header_checksum = super::header_checksum(payload_len, payload_checksum);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&WAL_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&WAL_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&payload_len.to_le_bytes());
+        bytes.extend_from_slice(&header_checksum.to_le_bytes());
+        bytes.extend_from_slice(&payload_checksum.to_le_bytes());
+
+        let error = decode_frames_after(&bytes, Sequence::ZERO)
+            .expect_err("oversized frame payload should fail before allocation");
+
+        assert!(error.to_string().contains("WAL payload length"));
     }
 
     #[test]

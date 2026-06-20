@@ -8,6 +8,7 @@ use crate::{
     codec::{self, CodecId},
     error::{Error, Result},
     internal_key::{InternalKey, ValueKind},
+    limits,
     options::DurabilityMode,
     storage::{
         BlockingStorageObjectListBackend, BlockingStorageObjectWriteBackend,
@@ -415,9 +416,7 @@ fn read_value_for_internal_key_cached(
             len,
             checksum: expected_checksum,
         } => {
-            let len = usize::try_from(*len).map_err(|_| Error::Corruption {
-                message: "blob length exceeds usize".to_owned(),
-            })?;
+            let len = checked_blob_read_len(*len)?;
             let blob_file = cached_blob_file(backend, db_path, *file_id, blob_files)?;
             let mut bytes = vec![0_u8; len];
             read_blob_exact_at(
@@ -510,9 +509,7 @@ pub(crate) fn read_value_for_internal_key_with_backend(
             len,
             checksum: expected_checksum,
         } => {
-            let len = usize::try_from(*len).map_err(|_| Error::Corruption {
-                message: "blob length exceeds usize".to_owned(),
-            })?;
+            let len = checked_blob_read_len(*len)?;
             let mut bytes = vec![0_u8; len];
             let object = open_blob_read_object_with_backend(backend, db_path, *file_id)?;
             read_blob_exact_at(
@@ -555,9 +552,7 @@ where
         } => {
             let object =
                 open_blob_read_object_with_backend_async(backend, db_path, *file_id).await?;
-            let len = usize::try_from(*len).map_err(|_| Error::Corruption {
-                message: "blob length exceeds usize".to_owned(),
-            })?;
+            let len = checked_blob_read_len(*len)?;
             let mut bytes = vec![0_u8; len];
             read_blob_exact_at_async(
                 &object,
@@ -623,6 +618,7 @@ pub(crate) fn read_blob_file_properties_with_backend(
         "referenced blob footer cannot be read",
     )?;
     let (properties_offset, properties_len) = decode_footer(&footer)?;
+    let properties_len = checked_blob_properties_len(properties_len)?;
     let properties_end =
         checked_blob_offset_add(properties_offset, properties_len, "blob properties bounds")?;
     if properties_offset < BLOB_HEADER_LEN as u64 || properties_end > footer_start {
@@ -664,6 +660,7 @@ pub(crate) fn read_blob_file_with_backend(
 ) -> Result<BlobFile> {
     let object = open_blob_read_object_with_backend(backend, db_path, file_id)?;
     let file_len = blob_object_len(&object, "referenced blob file metadata cannot be read")?;
+    let file_len = checked_whole_blob_file_len(file_len)?;
     let mut bytes = vec![0_u8; u64_to_usize(file_len, "blob file length")?];
     read_blob_exact_at(
         &object,
@@ -815,6 +812,7 @@ where
     let object = open_blob_read_object_with_backend_async(backend, db_path, file_id).await?;
     let file_len =
         blob_object_len_async(&object, "referenced blob file metadata cannot be read").await?;
+    let file_len = checked_whole_blob_file_len(file_len)?;
     let file_len = u64_to_usize(file_len, "blob file length")?;
     let bytes = object
         .read_exact_at_owned(0, file_len)
@@ -893,6 +891,7 @@ pub fn encode_blob_file(
                 "blob records can only store put values",
             ));
         }
+        ensure_blob_value_len(record.value.len())?;
         let offset = usize_to_u64(bytes.len(), "blob record offset")?;
         let encoded_value = codec::encode_block(record.compression, &record.value)?;
         let value_len = usize_to_u64(record.value.len(), "blob value length")?;
@@ -932,6 +931,7 @@ pub fn encode_blob_file(
     let properties_len = usize_to_u64(properties_bytes.len(), "blob properties length")?;
     bytes.extend_from_slice(&properties_bytes);
     put_footer(&mut bytes, properties_offset, properties_len);
+    ensure_blob_file_len(bytes.len())?;
 
     let indexes = indexed_records
         .into_iter()
@@ -944,12 +944,20 @@ pub fn decode_blob_file(bytes: &[u8]) -> Result<BlobFile> {
     if bytes.len() < BLOB_HEADER_LEN + BLOB_FOOTER_LEN {
         return Err(invalid_blob("file is too short"));
     }
+    limits::ensure_invalid_format_len(
+        bytes.len(),
+        limits::MAX_WHOLE_BLOB_DECODE_BYTES,
+        "blob file length",
+    )?;
 
     let header = decode_header(bytes)?;
     let footer_start = bytes.len() - BLOB_FOOTER_LEN;
     let (properties_offset, properties_len) = decode_footer(&bytes[footer_start..])?;
     let properties_start = u64_to_usize(properties_offset, "blob properties offset")?;
-    let properties_len = u64_to_usize(properties_len, "blob properties length")?;
+    let properties_len = u64_to_usize(
+        checked_blob_properties_len(properties_len)?,
+        "blob properties length",
+    )?;
     let properties_end = properties_start
         .checked_add(properties_len)
         .ok_or_else(|| invalid_blob("properties bounds overflow"))?;
@@ -1123,6 +1131,7 @@ fn read_indexed_blob_record(
         "referenced blob record frame cannot be read",
     )?;
     let body_len = read_u64_at(&frame, 0)?;
+    let body_len = checked_blob_record_body_len(body_len)?;
     let record_checksum = read_u32_at(&frame, 8)?;
     let body_end = checked_blob_offset_add(frame_end, body_len, "blob record body bounds")?;
     if body_end > file_len {
@@ -1166,7 +1175,8 @@ fn decode_records(file_id: u64, bytes: &[u8]) -> Result<Vec<BlobFileRecord>> {
         let offset = usize_to_u64(cursor.offset, "blob record offset")?
             .checked_add(BLOB_HEADER_LEN as u64)
             .ok_or_else(|| invalid_blob("blob record offset overflow"))?;
-        let body_len = u64_to_usize(cursor.read_u64()?, "blob record length")?;
+        let body_len = checked_blob_record_body_len(cursor.read_u64()?)?;
+        let body_len = u64_to_usize(body_len, "blob record length")?;
         let record_checksum = cursor.read_u32()?;
         let body = cursor.read_exact(body_len)?;
         if checksum(body) != record_checksum {
@@ -1210,7 +1220,7 @@ fn decode_record_body(
     let value = codec::decode_block(
         compression,
         encoded_value,
-        u64_to_usize(value_len, "blob value length")?,
+        checked_blob_read_len(value_len)?,
     )
     .map_err(|error| Error::Corruption {
         message: format!("blob value cannot be decoded: {error}"),
@@ -1464,15 +1474,17 @@ fn put_bytes(bytes: &mut Vec<u8>, value: &[u8]) -> Result<()> {
 }
 
 fn read_u32_at(bytes: &[u8], offset: usize) -> Result<u32> {
+    let end = limits::checked_add_invalid_format(offset, 4, "u32 offset")?;
     let value = bytes
-        .get(offset..offset + 4)
+        .get(offset..end)
         .ok_or_else(|| invalid_blob("short u32"))?;
     Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
 }
 
 fn read_u64_at(bytes: &[u8], offset: usize) -> Result<u64> {
+    let end = limits::checked_add_invalid_format(offset, 8, "u64 offset")?;
     let value = bytes
-        .get(offset..offset + 8)
+        .get(offset..end)
         .ok_or_else(|| invalid_blob("short u64"))?;
     Ok(u64::from_le_bytes([
         value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
@@ -1493,6 +1505,64 @@ fn u64_to_usize(value: u64, field: &'static str) -> Result<usize> {
     usize::try_from(value).map_err(|_| Error::Corruption {
         message: format!("{field} exceeds usize"),
     })
+}
+
+fn checked_blob_read_len(len: u64) -> Result<usize> {
+    let len = u64_to_usize(len, "blob length")?;
+    limits::ensure_corruption_len(len, limits::MAX_DECODED_BLOCK_BYTES, "blob length")?;
+    Ok(len)
+}
+
+fn checked_whole_blob_file_len(len: u64) -> Result<u64> {
+    let usize_len = u64_to_usize(len, "blob file length")?;
+    limits::ensure_corruption_len(
+        usize_len,
+        limits::MAX_WHOLE_BLOB_DECODE_BYTES,
+        "blob file length",
+    )?;
+    Ok(len)
+}
+
+fn checked_blob_record_body_len(len: u64) -> Result<u64> {
+    let usize_len = u64_to_usize(len, "blob record length")?;
+    limits::ensure_invalid_format_len(
+        usize_len,
+        limits::MAX_BLOB_RECORD_BODY_BYTES,
+        "blob record length",
+    )?;
+    Ok(len)
+}
+
+fn checked_blob_properties_len(len: u64) -> Result<u64> {
+    let usize_len = u64_to_usize(len, "blob properties length")?;
+    limits::ensure_invalid_format_len(
+        usize_len,
+        limits::MAX_BLOB_PROPERTIES_BYTES,
+        "blob properties length",
+    )?;
+    Ok(len)
+}
+
+fn ensure_blob_value_len(len: usize) -> Result<()> {
+    if len <= limits::MAX_DECODED_BLOCK_BYTES {
+        return Ok(());
+    }
+
+    Err(Error::invalid_options(format!(
+        "blob value length {len} exceeds maximum {}",
+        limits::MAX_DECODED_BLOCK_BYTES
+    )))
+}
+
+fn ensure_blob_file_len(len: usize) -> Result<()> {
+    if len <= limits::MAX_WHOLE_BLOB_DECODE_BYTES {
+        return Ok(());
+    }
+
+    Err(Error::invalid_options(format!(
+        "blob file length {len} exceeds maximum {}",
+        limits::MAX_WHOLE_BLOB_DECODE_BYTES
+    )))
 }
 
 fn invalid_blob(message: &'static str) -> Error {
@@ -1520,11 +1590,12 @@ impl<'payload> Cursor<'payload> {
     }
 
     fn read_exact(&mut self, len: usize) -> Result<&'payload [u8]> {
+        let end = limits::checked_add_invalid_format(self.offset, len, "byte field length")?;
         let value = self
             .payload
-            .get(self.offset..self.offset + len)
+            .get(self.offset..end)
             .ok_or_else(|| invalid_blob("short byte field"))?;
-        self.offset += len;
+        self.offset = end;
         Ok(value)
     }
 
@@ -1715,6 +1786,73 @@ mod tests {
 
         let error = decode_blob_file(&bytes).expect_err("corrupt footer fails");
         assert!(error.to_string().contains("footer magic mismatch"));
+    }
+
+    #[test]
+    fn blob_decode_rejects_properties_len_before_large_allocation() {
+        let header = BlobFileHeader::new(7, Sequence::new(42), 64 * 1024, CodecId::None);
+        let mut bytes = Vec::new();
+        super::put_header(&mut bytes, header);
+        super::put_footer(
+            &mut bytes,
+            super::BLOB_HEADER_LEN as u64,
+            (super::limits::MAX_BLOB_PROPERTIES_BYTES as u64) + 1,
+        );
+
+        let error = decode_blob_file(&bytes)
+            .expect_err("oversized properties length should fail before allocation");
+
+        assert!(error.to_string().contains("blob properties length"));
+    }
+
+    #[test]
+    fn indexed_blob_read_rejects_record_body_len_before_large_allocation() {
+        let temp = temp_blob_dir("oversized-record-body");
+        let path = super::blob_path(&temp, 22);
+        let mut bytes = vec![0_u8; super::BLOB_HEADER_LEN];
+        bytes.extend_from_slice(
+            &((super::limits::MAX_BLOB_RECORD_BODY_BYTES as u64) + 1).to_le_bytes(),
+        );
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        std::fs::write(&path, bytes).expect("blob bytes write");
+
+        let backend = NativeFileBackend::new();
+        let object = super::open_blob_read_object_with_backend(&backend, &temp, 22)
+            .expect("blob object opens");
+        let index = super::BlobIndex {
+            file_id: 22,
+            offset: super::BLOB_HEADER_LEN as u64,
+            encoded_len: 0,
+            value_len: 0,
+            value_checksum: 0,
+            record_checksum: 0,
+            compression: CodecId::None,
+        };
+
+        let error =
+            super::read_indexed_blob_record(&object, super::BLOB_HEADER_LEN as u64 + 12, &index)
+                .expect_err("oversized record body should fail before allocation");
+
+        assert!(error.to_string().contains("blob record length"));
+        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn direct_blob_ref_rejects_len_before_large_allocation() {
+        let temp = temp_blob_dir("oversized-direct-ref");
+        let value = ValueRef::Blob {
+            file_id: 99,
+            offset: 0,
+            len: (super::limits::MAX_DECODED_BLOCK_BYTES as u64) + 1,
+            checksum: 0,
+        };
+        let backend = NativeFileBackend::new();
+
+        let error = super::read_value_for_internal_key_with_backend(&backend, &temp, &value, None)
+            .expect_err("oversized direct blob reference should fail before opening blob");
+
+        assert!(error.to_string().contains("blob length"));
+        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
 
     #[test]

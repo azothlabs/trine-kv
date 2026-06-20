@@ -72,6 +72,7 @@ impl BlockManager {
     }
 
     pub(crate) fn encode_checked(codec: CodecId, block_payload: &[u8]) -> Result<Vec<u8>> {
+        ensure_writable_block_len(block_payload.len())?;
         let encoded = codec::encode_block(codec, block_payload)?;
         let mut bytes = Vec::with_capacity(BLOCK_HEADER_LEN + encoded.len());
         bytes.push(codec.tag());
@@ -238,6 +239,7 @@ impl BlockManager {
 
         let codec = CodecId::from_tag(block_bytes[0])?;
         let uncompressed_len = read_u32_at(block_bytes, 1)? as usize;
+        codec::ensure_decoded_block_len(uncompressed_len)?;
         let encoded_len = read_u32_at(block_bytes, 5)? as usize;
         let expected_checksum = read_u32_at(block_bytes, 9)?;
         if block_bytes.len() != BLOCK_HEADER_LEN + encoded_len {
@@ -318,6 +320,8 @@ pub(crate) fn checksum(bytes: &[u8]) -> u32 {
 }
 
 fn checked_block_len(header: &[u8]) -> Result<usize> {
+    let uncompressed_len = read_u32_at(header, 1)? as usize;
+    codec::ensure_decoded_block_len(uncompressed_len)?;
     let encoded_len = read_u32_at(header, 5)? as usize;
     BLOCK_HEADER_LEN
         .checked_add(encoded_len)
@@ -331,6 +335,7 @@ fn decoded_block_header(block_bytes: &[u8]) -> Result<DecodedBlockHeader> {
 
     let codec = CodecId::from_tag(block_bytes[0])?;
     let uncompressed_len = read_u32_at(block_bytes, 1)? as usize;
+    codec::ensure_decoded_block_len(uncompressed_len)?;
     let encoded_len = read_u32_at(block_bytes, 5)? as usize;
     let expected_checksum = read_u32_at(block_bytes, 9)?;
     if block_bytes.len() != BLOCK_HEADER_LEN + encoded_len {
@@ -364,6 +369,17 @@ fn usize_to_u32(value: usize, field: &'static str) -> Result<u32> {
 
 fn usize_to_u64(value: usize, field: &'static str) -> Result<u64> {
     u64::try_from(value).map_err(|_| Error::invalid_options(format!("{field} exceeds u64::MAX")))
+}
+
+fn ensure_writable_block_len(len: usize) -> Result<()> {
+    if len <= codec::MAX_DECODED_BLOCK_BYTES {
+        return Ok(());
+    }
+
+    Err(Error::invalid_options(format!(
+        "block payload length {len} exceeds maximum {}",
+        codec::MAX_DECODED_BLOCK_BYTES
+    )))
 }
 
 fn invalid_table(message: &'static str) -> Error {
@@ -433,6 +449,30 @@ mod tests {
         }
     }
 
+    fn block_bytes_with_header(codec: CodecId, uncompressed_len: u32, encoded: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(codec.tag());
+        put_u32(&mut bytes, uncompressed_len);
+        put_u32(
+            &mut bytes,
+            u32::try_from(encoded.len()).expect("test encoded length fits"),
+        );
+        put_u32(&mut bytes, checksum(encoded));
+        bytes.extend_from_slice(encoded);
+        bytes
+    }
+
+    fn assert_oversized_decoded_block(error: &Error) {
+        assert!(
+            matches!(error, Error::InvalidFormat { .. }),
+            "unexpected error kind: {error}"
+        );
+        assert!(
+            error.to_string().contains("decoded block length"),
+            "unexpected error: {error}"
+        );
+    }
+
     #[test]
     fn owned_default_fallback_matches_borrowed_read() {
         let payload = b"trine block decode owned seam".to_vec();
@@ -471,6 +511,38 @@ mod tests {
         assert_eq!(decoded.codec(), CodecId::None);
         assert_eq!(decoded.payload(), block_payload);
         assert_eq!(decoded.payload().as_ptr(), expected_payload_ptr);
+    }
+
+    #[test]
+    fn borrowed_decode_rejects_oversized_uncompressed_len_before_lz4_allocation() {
+        let block = block_bytes_with_header(CodecId::FastLz4Block, u32::MAX, &[0]);
+
+        let error = BlockManager::decode_checked(&block)
+            .expect_err("oversized decoded block should fail before lz4 decode");
+
+        assert_oversized_decoded_block(&error);
+    }
+
+    #[test]
+    fn owned_decode_rejects_oversized_uncompressed_len_before_lz4_allocation() {
+        let block = block_bytes_with_header(CodecId::FastLz4Block, u32::MAX, &[0]);
+        let buffer = StorageReadBuffer::from_vec(0, block);
+
+        let error = BlockManager::decode_checked_owned(buffer)
+            .expect_err("oversized decoded block should fail before lz4 decode");
+
+        assert_oversized_decoded_block(&error);
+    }
+
+    #[test]
+    fn offset_decode_rejects_oversized_uncompressed_len_before_payload_read() {
+        let block = block_bytes_with_header(CodecId::FastLz4Block, u32::MAX, &[0]);
+        let source = SliceSource { bytes: &block };
+
+        let error = BlockManager::read_checked_at_source_offset(block.len(), 0, 0, &source)
+            .expect_err("oversized decoded block should fail from header");
+
+        assert_oversized_decoded_block(&error);
     }
 
     #[test]

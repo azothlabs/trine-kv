@@ -23,6 +23,6 @@ pub(super) const fn matrix() -> PlatformIoBackendMatrix {
         directory_create: ThreadPoolManagedAsync,
         directory_sync: ThreadPoolManagedAsync,
         directory_listing: ThreadPoolManagedAsync,
-        writer_lease_acquire: PlatformNativeAsyncButPartial,
+        writer_lease_acquire: ThreadPoolManagedAsync,
     }
 }

@@ -278,6 +278,14 @@ writer fails while the lock is held. The lock is released after the writer
 coordinator is idle during close/drop, so another process cannot open while the
 current process is still publishing files.
 
+On the native-file backend, the `LOCK` file contains owner text for diagnostics
+and release-time cleanup, but the live writer lease is the OS file lock held by
+the open handle. Normal close/drop clears matching owner text while keeping the
+`LOCK` file inode in place. If a process crashes and leaves owner text behind,
+the next writable open can acquire the OS lock, overwrite the stale owner text,
+and continue recovery. A still-running writer remains protected because its OS
+lock prevents another writable open.
+
 Read-only opens do not take the writer lock and do not create a WAL writer. They
 still load the manifest, validate referenced files, and replay WAL records into
 memory. Use read-only opens for inspection of a stable directory state; v1 does

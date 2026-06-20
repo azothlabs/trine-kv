@@ -26,6 +26,190 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-06-20: Persistent Decode Resource Bounds
+
+### Observation
+
+- Added a shared internal resource-limit module for untrusted persistent input:
+  table block output, whole-table decode, whole-blob decode, blob record bodies,
+  blob properties, WAL frame payloads, and manifest payloads.
+- SSTable block headers store an uncompressed block length read from disk. The
+  block parser now rejects oversized decoded lengths before checksum validation
+  or codec decode, and the codec layer repeats the same bound before LZ4 output
+  allocation.
+- Table full-decode paths now cap declared payload length before allocating the
+  table object buffer. Table writes also cap the effective inline-value
+  threshold so oversized values are sent to blob storage instead of creating
+  blocks the decoder later refuses.
+- Blob decode now validates whole-file size, properties length, indexed record
+  body length, and direct blob reference value length before allocating buffers
+  or decoding compressed data.
+- WAL and manifest decoders now bound payload lengths and use checked offset
+  arithmetic before slicing or allocating. Their encoders reject payloads above
+  the same persistent-read limits.
+- Native whole-object read paths now preflight file metadata with object-kind
+  limits before reading the entire file into memory. Object-store whole-object
+  reads preflight `head` metadata with the same kind-specific limits before
+  `get`, and recheck returned bytes before Trine decodes them.
+- Commit admission now rejects oversized write operation byte fields before WAL
+  acceptance, preventing acknowledged writes that later fail flush-time
+  persistent encoding.
+- The v1 protocol now records that persistent decoders must bound untrusted
+  file, object, frame, block, record, and property lengths before buffer
+  allocation or codec output allocation.
+
+### Interpretation
+
+- Malicious or corrupt table, blob, WAL, manifest, and native whole-object
+  inputs can no longer use forged length fields to force unbounded allocation in
+  Trine-owned decode paths.
+- This does not change persistent format versions; it narrows the accepted input
+  space for resource-exhaustion safety.
+- Object-store clients already expose `head`, so the backend now avoids calling
+  `get` for known-over-limit objects and still protects against size changes by
+  rechecking returned bytes.
+
+### Verification
+
+- `cargo test -q large_allocation`
+- `cargo test -q object_store_backend_rejects_oversized_head_before_get`
+- `cargo test -q oversized_uncompressed_len`
+- `cargo test -q lz4_decode_rejects_oversized_output_before_allocation`
+- `cargo test -q blob_threshold_is_capped_to_keep_inline_values_decodable`
+- `cargo test -q oversized`
+- `cargo test -q --lib`
+- `cargo check -q --all-features`
+- `cargo clippy -q --lib`
+- `cargo clippy -q --all-features --lib`
+- `cargo test -q --all-features`
+- `cargo fmt --check`
+- `git diff --check`
+
+### Remaining Blockers
+
+- No known untrusted persistent length-field allocation blocker remains in
+  Trine-owned table, blob, WAL, manifest, native whole-object, object-store
+  whole-object, or commit admission paths.
+
+### Recommended Next Action
+
+- Keep future persistent decoders behind shared resource limits and add a
+  malformed-input regression before enabling a new length-bearing format field
+  or codec id.
+
+## 2026-06-20: Native Writer Lease Stale LOCK Recovery
+
+### Observation
+
+- Native writer leases previously used exclusive `create_new` creation of the
+  `LOCK` file. If the process crashed, `Drop` never removed the file and the
+  next writable open failed even though no writer was alive.
+- Replaced create-new-as-lease with an OS file lock held by the open `LOCK`
+  handle. The `LOCK` bytes are now owner diagnostics and a release-time cleanup
+  guard, not the authority for liveness.
+- The default native path, runtime blocking-adapter path, platform-io
+  thread-pool path, and native platform-io path all return the held `File` to
+  `NativeFileWriterLease`, so the OS lock remains held for the lease lifetime.
+- Stale marker recovery overwrites old owner text after acquiring the OS lock.
+  A live second writer still fails because `try_lock_exclusive` returns
+  contended before the marker is changed.
+- Normal close/drop now clears matching owner text while still holding the OS
+  lock and keeps the `LOCK` file inode in place, so a new writer cannot create
+  a separate lock file before the old lock handle is released.
+
+### Interpretation
+
+- Crash-left `LOCK` files no longer create an availability dead end for native
+  persistent databases.
+- The single-writer invariant remains conservative: liveness is based on the OS
+  lock, not pid guessing or deleting a marker file that might belong to a live
+  process.
+- This changes the native-file storage contract, so the v1 protocol and
+  durability docs now say that `LOCK` contents are diagnostics while the OS file
+  lock is the lease.
+
+### Verification
+
+- `cargo fmt`
+- `cargo test -q writer_lease`
+- `cargo test -q persistent_writer_open`
+- `cargo test -q persistent_read_only_open_does_not_take_writer_lock`
+- `cargo check -q`
+- `cargo check -q --features platform-io`
+- `cargo check -q --all-features`
+- `cargo test -q --lib`
+- `cargo test -q writer_lease --features platform-io`
+- `cargo clippy -q --lib`
+- `cargo clippy -q --features platform-io --lib`
+- `cargo clippy -q --all-features --lib`
+- `cargo test -q --all-features`
+
+### Remaining Blockers
+
+- No known stale native `LOCK` marker blocker remains.
+- Network filesystems with weak or non-standard advisory lock semantics remain
+  a deployment risk; Trine now relies on the host OS/file-system lock behavior
+  for native single-writer exclusion.
+
+### Recommended Next Action
+
+- Keep future native writer lease work tied to OS/file-system lock semantics,
+  not pid-based stale deletion. If network-filesystem deployments become a
+  target, add a dedicated compatibility phase with real backend evidence.
+
+## 2026-06-20: Native Async Close/Lease Publish Race
+
+### Observation
+
+- Native async commit previously entered the publish barrier only around the
+  short sequence/publish block. The write could await WAL acceptance after
+  close had already stopped background workers and before close released the
+  writer lease.
+- Native async flush and compaction also awaited manifest publish before the
+  in-memory install, so close could release the writer lease while an admitted
+  publish was still incomplete.
+- Reworked `PublishBarrier` into two boundaries:
+  - a close-aware activity latch that rejects new publish activity after close
+    starts and lets close wait for all admitted activity to leave;
+  - a short sequence lock for ordering sequence assignment and local publish
+    critical sections.
+- Commit begins activity before accepting a write request and keeps it through
+  WAL acceptance and memtable publish.
+- Native async flush/compaction begin activity before manifest publish and keep
+  it through local install and cleanup steps. If close already started, they
+  return `Closed` and remove newly written table files.
+
+### Interpretation
+
+- The writer lease is no longer released while an admitted commit, flush, or
+  compaction publish can still make database state visible. That closes the
+  split-brain window where a second process could take ownership while the old
+  process was still completing publication.
+- The sequence lock remains short-lived and is not held across await points.
+  Async paths hold only the activity token across await, so the fix avoids
+  blocking unrelated threads on a standard mutex while storage I/O is pending.
+
+### Verification
+
+- `cargo fmt`
+- `cargo test -q native_async_close_waits_for_active_publish_before_releasing_lease`
+- `cargo check -q`
+- `cargo test -q --lib`
+- `cargo clippy -q --lib`
+- `cargo test -q object_store`
+- `cargo test -q --all-features`
+
+### Remaining Blockers
+
+- No known close/lease correctness blocker remains for the fixed native async
+  publish paths.
+
+### Recommended Next Action
+
+- Keep any future async publish path behind the same activity latch before it
+  can make persistent state visible, and add a close interleaving regression
+  when adding such a path.
+
 ## 2026-06-20: Billing-Aware R2 Object-Store Guard
 
 ### Observation
