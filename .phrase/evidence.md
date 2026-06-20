@@ -26,6 +26,405 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-06-20: Billing-Aware R2 Object-Store Guard
+
+### Observation
+
+- Extended the R2 live measurement suite with per-scenario request-class output:
+  Class A, Class B, free deletes, raw `put`/`put_if`/`list`/`get`/`head` counts,
+  and R2 Standard request-cost estimates before free tier.
+- Added live budget guards:
+  - sequential durable writes must not exceed one WAL segment `put` plus one WAL
+    head `put_if` per write;
+  - the measured concurrent group-commit batch must use exactly one WAL segment
+    `put` and one WAL head `put_if`.
+- Latest R2 live billing run passed. Selected scenario counts:
+  - `sequential_writes`: 12 writes, Class A 24, Class B 0, `put=12`,
+    `put_if=12`, estimated Standard request cost `$0.00010800`.
+  - `group_commit_writes`: 12 concurrent writes, Class A 2, Class B 0,
+    `put=1`, `put_if=1`, estimated Standard request cost `$0.00000900`.
+  - `refresh`: Class B 5, estimated Standard request cost `$0.00000180`.
+  - `flush`: Class A 4, Class B 3, 1 free delete, estimated Standard request
+    cost `$0.00001908`.
+  - `manual_cleanup`: Class A 7, 5 free deletes, estimated Standard request
+    cost `$0.00003150`.
+  - Total suite estimate: Class A 58, Class B 33, free deletes 16, estimated
+    Standard request cost `$0.00027288`.
+- WAL object count stayed bounded: 12 sequential writes left 1 WAL object before
+  flush; 12 concurrent group-commit writes also left 1 WAL object.
+
+### Interpretation
+
+- The current object-store path is materially better for R2/S3-style request
+  billing than the original per-commit-object path. The measured group-commit
+  batch reduced WAL publish Class A requests from 24 to 2 for 12 writes.
+- The largest billable lever is still batching confirmed writes. Split WAL tier
+  creates the boundary for a different provider, but R2-only split smoke does
+  not lower the request class cost by itself.
+- Read-only refresh is mostly Class B and cheap in request-cost terms; its
+  problem is latency/cadence, not request bill.
+- Cleanup deletes are free on R2, but the list polls used to verify cleanup are
+  Class A. Keeping WAL object count at 1 is still valuable because it limits how
+  often cleanup/list work has to scale with writes.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo check -q --features s3`
+- `cargo clippy -q --features s3 --lib`
+- `cargo test -q --lib`
+- `infisical run --silent --env=dev --path=/ --recursive -- cargo test -q --features s3 s3_live_measurement_and_fault_suite -- --ignored --nocapture`
+- Live result: 1 passed; finished in 66.36s.
+
+### Remaining Blockers
+
+- No billing-regression blocker remains for the measured R2 path.
+- A concrete external low-latency WAL provider could change both latency and
+  request economics; it needs its own provider-specific measurement.
+
+### Recommended Next Action
+
+- Keep the billing guard in the live suite. If object-store costs become a
+  release gate, promote the scenario budgets into a separate ignored
+  cost-regression test with explicit threshold configuration.
+
+## 2026-06-20: Explicit Split WAL Tier API
+
+### Observation
+
+- Added explicit split-tier object-store open APIs:
+  - `Db::open_object_store_with_wal(storage_client, wal_client, options)`
+  - `Db::open_object_store_with_wal_at(storage_client, wal_client, prefix, options)`
+- The storage client now owns table/blob objects and the manifest CAS.
+- The WAL client now owns the writer lease, remote WAL head, WAL segment bytes,
+  WAL replay during open, WAL replay during read-only refresh, and WAL cleanup
+  after flush.
+- Existing `Db::open_object_store(_at)` remains compatible by passing the same
+  client as both storage and WAL client.
+- Added deterministic regressions:
+  - split WAL tier recovers an unflushed confirmed write when storage and WAL
+    are separate in-memory clients;
+  - split WAL tier read-only refresh replays remote WAL from the WAL client
+    while reading manifest/table state from the storage client.
+- Updated `ObjectClient` docs to describe explicit split WAL tiers instead of
+  implying callers must infer and route WAL keys inside one client.
+- R2 live suite now exercises the split-tier API path with both clients pointing
+  at R2. The run passed and reported:
+  - 12 sequential durable writes: total 23,088.22 ms; p50 1,678.14 ms; p95
+    2,436.94 ms.
+  - 12 concurrent durable writes through group commit: total 2,805.85 ms, 1 WAL
+    PUT, 1 head `put_if`.
+  - split-tier reopen after unflushed confirmed write: 9,131.78 ms.
+  - WAL cleanup after flush remained visible on attempt 1.
+
+### Interpretation
+
+- Trine now has a real database-level WAL tier boundary. Deployments can place
+  confirmed-write WAL traffic on a lower-latency durable `ObjectClient` while
+  keeping bulk tables and manifest on object storage.
+- The R2 split-tier smoke proves the API and recovery path against a real
+  S3-compatible client, but it does not prove low single-commit latency because
+  both clients in that live run still point at R2. A real latency win for
+  isolated commits requires a concrete lower-latency WAL provider behind
+  `ObjectClient`.
+- The prior group-commit result remains valid: burst/concurrent writes reduce
+  remote publish count even when using the same R2 client.
+
+### Verification
+
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check -q`
+- `cargo check -q --features s3`
+- `cargo test -q object_store_split_wal_tier`
+- `cargo test -q object_store`
+- `cargo test -q --lib`
+- `cargo clippy -q --lib`
+- `cargo clippy -q --features s3 --lib`
+- `cargo test -q --features s3 s3_live_measurement_and_fault_suite`
+- `cargo test -q --doc --all-features`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test -q --all-features`
+- `infisical run --silent --env=dev --path=/ --recursive -- cargo test -q --features s3 s3_live_measurement_and_fault_suite -- --ignored --nocapture`
+- Live result: 1 passed; finished in 70.13s.
+
+### Remaining Blockers
+
+- No Trine-core blocker remains for split WAL tier support.
+- A concrete external low-latency WAL service/provider adapter is not included.
+  That belongs to a separate provider phase behind `ObjectClient`.
+
+### Recommended Next Action
+
+- Commit this phase. If lower isolated-write latency is still required, choose
+  and implement a specific WAL provider adapter, then measure R2 storage plus
+  that WAL provider against the existing R2-only baseline.
+
+## 2026-06-20: Object-Store Group Commit Scheduling And WAL Lane
+
+### Observation
+
+- Added an internal object WAL lane for object-store writes. The lane owns the
+  writer lease, receives bounded commit-accept commands, and groups queued
+  accepts before rewriting the stable remote WAL segment and publishing the
+  remote WAL head.
+- Added a sequence-contiguity guard before head publish, so a grouped remote WAL
+  head cannot skip a missing commit frame.
+- Added worker startup error propagation instead of panicking if the object WAL
+  thread cannot start.
+- Fixed real-provider execution by giving the WAL worker a Tokio-capable future
+  driver under the `s3` feature. The first R2 run exposed the bug: the worker
+  panicked because the S3 adapter had no Tokio reactor. The fixed run completed.
+- Deterministic local test `object_wal_lane_group_commits_queued_accepts`
+  showed 8 queued accepts sharing 1 segment PUT and 1 grouped head publish,
+  plus the initial lease-acquire CAS.
+- R2 live measurement after this phase:
+  - 12 sequential durable writes: total 25,471.95 ms; min 1,491.19 ms; p50
+    2,087.12 ms; p95 2,715.70 ms; max 2,808.46 ms.
+  - Sequential WAL before flush: 1 WAL object, 768 bytes; listing saw it on
+    attempt 1 in 305.07 ms.
+  - Read-only refresh to `ReadVersion(12)`: 2,007.91 ms.
+  - Flush: 4,587.62 ms.
+  - WAL cleanup after flush: 0 WAL objects; listing saw cleanup on attempt 1 in
+    330.93 ms.
+  - 12 concurrent durable writes through group commit: total 2,775.09 ms, 1 WAL
+    PUT, 1 head `put_if`, 1 WAL object, 840 bytes; listing saw it on attempt 1
+    in 328.41 ms.
+  - Conditional-write behavior remained correct: create 714.29 ms, create
+    conflict 639.30 ms, stale ETag conflict 584.63 ms.
+  - Manual cleanup/list/delete still showed immediate visibility in this run:
+    5 temporary objects wrote in 4,935.11 ms, list saw them on attempt 1 in
+    294.28 ms, delete took 1,644.82 ms, deletion visible on attempt 1 in
+    306.04 ms.
+  - Trine `ObjectClient` operation counts from the run: `put` 19, `put_if` 25,
+    `list` 7, `get` 13, `head` 13, `delete` 13. Estimated Standard R2 request
+    cost before free tier: $0.00023886.
+
+### Interpretation
+
+- Group commit works on the real R2 path: concurrent confirmed writes avoided
+  one remote segment PUT plus one remote head CAS per write. In the measured
+  run, 12 concurrent writes completed in roughly the latency of one remote
+  publish pair rather than 12 sequential publish pairs.
+- Sequential single-write latency is still bounded by R2 round trips. This phase
+  intentionally improves bursts/concurrency; it does not make isolated
+  single-commit writes sub-second.
+- The independent low-latency WAL layer should now be treated as a separate
+  architecture phase only if product requirements need lower single-commit
+  latency than R2 can provide. The internal WAL lane is the Trine-side boundary
+  that such a tier would replace or implement.
+- The Tokio-reactor failure was a real production risk for S3-compatible object
+  storage, not only a test issue. Making `tokio` part of the `s3` feature closes
+  that runtime hole.
+
+### Verification
+
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check -q --features s3`
+- `cargo test -q object_wal_lane_group_commits_queued_accepts`
+- `cargo test -q object_store`
+- `cargo test -q --lib`
+- `cargo clippy -q --lib`
+- `cargo clippy -q --features s3 --lib`
+- `cargo test -q --features s3 s3_live_measurement_and_fault_suite`
+- `cargo test -q --all-features`
+- `infisical run --silent --env=dev --path=/ --recursive -- cargo test -q --features s3 s3_live_measurement_and_fault_suite -- --ignored --nocapture`
+- Live result: 1 passed; finished in 64.00s.
+
+### Remaining Blockers
+
+- No correctness blocker remains for the internal group-commit lane in the
+  object-store path.
+- A separate external low-latency WAL tier is not implemented. It remains a
+  future phase requiring an explicit contract for durability, fencing, replay
+  retention, and handoff into object storage.
+
+### Recommended Next Action
+
+- Stop optimizing the R2 single-commit path without a new product requirement.
+  If sub-second isolated durable writes are required, start a new phase for an
+  external low-latency WAL tier and keep this group-commit lane as the Trine
+  commit semantics boundary.
+
+## 2026-06-20: R2 Live Object-Store Smoke
+
+### Observation
+
+- Infisical workspace binding exists in `.infisical.json`; `dev` injects the R2
+  secret set needed for live object-store testing.
+- `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, and `R2_ENDPOINT`
+  were mapped only inside the child process to the S3-compatible environment
+  variables expected by the existing live test.
+- The ignored live test `s3_live_database_round_trip` passed against Cloudflare
+  R2 through the `object_store` adapter.
+
+### Interpretation
+
+- Real R2 accepts the adapter's conditional write configuration well enough for
+  the existing open/write/flush/reopen round trip. This reduces provider
+  correctness risk for the manifest CAS path, though it is still a smoke test,
+  not a latency/cost or fault-matrix measurement.
+
+### Verification
+
+- `infisical run --silent --env=dev --path=/ --recursive -- cargo test -q --features s3 s3_live_database_round_trip -- --ignored`
+- Result: 1 live test passed in 23.22s.
+
+### Remaining Blockers
+
+- No R2 smoke-test blocker remains.
+- Still need real-provider latency/cost measurement and targeted failure-mode
+  checks before tuning the segment-write strategy.
+
+### Recommended Next Action
+
+- Add or run a small R2 measurement/fault suite covering write latency, segment
+  growth, refresh latency, conditional-write conflict, and cleanup behavior.
+
+## 2026-06-20: R2 Live Measurement And Fault Suite
+
+### Observation
+
+- Added ignored live test `s3_live_measurement_and_fault_suite` for real R2.
+  The suite wraps Trine's `ObjectClient` to count operations and latency without
+  printing secret values.
+- The suite covers:
+  - durable write latency and request counts,
+  - WAL segment object growth before flush and cleanup after flush,
+  - read-only `refresh_object_store` latency,
+  - conditional-write create/conflict/stale-ETag behavior,
+  - manual list/delete visibility for cleanup-style operations.
+- One R2 run through Infisical `dev` completed successfully.
+- Measured write path:
+  - 12 durable writes: total 36,810.19 ms; min 2,325.57 ms; p50 3,082.28 ms;
+    p95 3,470.81 ms; max 3,788.98 ms.
+  - WAL before flush: 12 WAL objects, 4,992 bytes total, largest object 768
+    bytes. Listing saw the expected state on attempt 1 in 317.82 ms.
+  - Read-only refresh to `ReadVersion(12)`: 2,268.62 ms.
+  - Flush: 8,165.15 ms.
+  - WAL after flush: 0 WAL objects; listing saw cleanup on attempt 1 in
+    308.54 ms.
+- Conditional-write behavior:
+  - create: 796.54 ms.
+  - create conflict: 670.18 ms and returned current ETag.
+  - stale ETag conflict: 711.70 ms and returned current ETag.
+- Manual cleanup/list/delete:
+  - 5 temporary objects wrote in 5,330.54 ms.
+  - list saw all 5 objects on attempt 1 in 411.54 ms.
+  - delete total was 1,942.45 ms.
+  - list saw deletion on attempt 1 in 300.02 ms.
+- Trine `ObjectClient` operation counts from the run:
+  - Class-A-shaped calls: `put` 18, `put_if` 21, `list` 6.
+  - Class-B-shaped calls: `get` 30, `head` 19.
+  - Free-delete-shaped calls: `delete` 21.
+  - Estimated Standard R2 request cost before free tier: $0.00022014, using
+    Cloudflare's current Class A/B per-million request pricing. This estimate is
+    at Trine `ObjectClient` call granularity; adapter internals may add provider
+    requests on some branches.
+
+### Interpretation
+
+- Real R2 honors the conditional-write behavior needed by the manifest/lease
+  path.
+- The current correctness-first WAL segment strategy is safe but expensive on
+  R2 latency: each confirmed write is dominated by remote read/conditional-write
+  work and leaves one old WAL segment object until flush. Flush cleanup worked
+  immediately in this run, but object count grows linearly between flushes.
+- Read-only refresh works on R2, but a ~2.27s refresh for this tiny data set is
+  high enough that refresh cadence and batching need product-level decisions.
+- R2 list/delete visibility showed no delay in this run, but this is a smoke
+  measurement, not a proof across regions, load, or provider incidents.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q --features s3 s3_live_measurement_and_fault_suite`
+- `cargo test -q --features s3 s3_live_database_round_trip`
+- `cargo clippy -q --features s3 --lib`
+- `cargo test -q --features s3 --lib`
+- `infisical run --silent --env=dev --path=/ --recursive -- cargo test -q --features s3 s3_live_measurement_and_fault_suite -- --ignored --nocapture`
+- Live result: 1 passed; finished in 66.59s.
+
+### Remaining Blockers
+
+- No correctness blocker surfaced in the R2 live suite.
+- Performance blocker: per-write latency is seconds on this path, and WAL object
+  count grows by confirmed write until flush. This is likely too expensive for
+  frequent single-key confirmed writes without batching or a different remote
+  WAL write strategy.
+
+### Recommended Next Action
+
+- Start an object-store write-strategy phase focused on reducing confirmed-write
+  latency and WAL object churn, using this R2 run as the baseline. Candidate
+  directions: batch multiple user commits before remote head publish, separate a
+  low-latency WAL service/client layer from bulk object storage, or make
+  flush/refresh cadence explicit for read-only compute nodes.
+
+## 2026-06-20: Object-Store Stable WAL Segment Optimization
+
+### Observation
+
+- Changed object-store confirmed writes from "read current segment, write a new
+  per-commit segment key, CAS head" to a stable per-writer-epoch WAL segment key
+  with local segment bytes cached in the held writer lease.
+- Recovery and read-only refresh now cap replay at the lease head's committed
+  sequence. This keeps a crash between stable-segment PUT and lease/head CAS
+  from making the extra frame visible.
+- Added deterministic regressions:
+  - multiple confirmed writes before flush leave one WAL object, not one object
+    per write;
+  - recovery ignores WAL frames beyond the remote WAL head.
+- R2 before/after comparison against the previous live baseline:
+  - 12 sequential durable writes: 36,810.19 ms -> 22,084.28 ms (~40.0% lower).
+  - write p50: 3,082.28 ms -> 1,656.60 ms (~46.3% lower).
+  - write p95: 3,470.81 ms -> 2,322.10 ms (~33.1% lower).
+  - WAL objects before flush: 12 -> 1.
+  - WAL bytes before flush: 4,992 -> 768.
+  - read-only refresh: 2,268.62 ms -> 1,992.46 ms (~12.2% lower).
+  - flush: 8,165.15 ms -> 4,414.46 ms (~45.9% lower).
+  - Trine `ObjectClient` Class-B-shaped calls: 49 -> 14.
+  - estimated Standard R2 request cost before free tier:
+    $0.00022014 -> $0.00020754.
+- The optimized R2 live suite passed in 47.27s.
+
+### Interpretation
+
+- The stable segment strategy removed avoidable readback and object churn while
+  preserving confirmed-write recovery semantics.
+- Remaining single-write latency is now dominated by R2 `put` plus conditional
+  `put_if` round trips. Further large gains require a true group-commit path
+  that confirms several user commits with one remote head publish, or a separate
+  low-latency WAL layer/service. That is a distinct design phase because it
+  changes scheduling and user-visible commit latency tradeoffs.
+- Refresh cadence remains a product/workload choice: refresh is correct on R2,
+  but still roughly 2s for this small workload.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo test -q object_store`
+- `cargo test -q --lib`
+- `cargo clippy -q --lib`
+- `cargo test -q --features s3 s3_live_measurement_and_fault_suite`
+- `infisical run --silent --env=dev --path=/ --recursive -- cargo test -q --features s3 s3_live_measurement_and_fault_suite -- --ignored --nocapture`
+- Live result: 1 passed; finished in 47.27s.
+
+### Remaining Blockers
+
+- No correctness blocker remains for the stable segment strategy.
+- Performance blocker remains for low-latency single confirmed writes on R2:
+  without group commit or a separate WAL layer, each confirmed commit still pays
+  at least one object PUT and one conditional head publish.
+
+### Recommended Next Action
+
+- Only start another write-path phase if the product needs sub-second confirmed
+  object-store writes. That phase should choose between explicit group-commit
+  scheduling and a separate low-latency WAL layer; do not keep shaving the
+  current single-commit path without a new measured bottleneck.
+
 ## 2026-06-20: Object-Store Compute/Storage Split Completion
 
 ### Observation

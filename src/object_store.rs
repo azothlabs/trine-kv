@@ -133,23 +133,27 @@ pub struct ObjectMeta {
 /// - `put_if` applies the write only when the precondition holds, otherwise
 ///   reports [`PutIf::PreconditionFailed`] with the current `ETag`.
 ///
-/// # This client is the WAL durability sink (service-layer extension point)
+/// # WAL durability sink and split tiers
 ///
 /// A database opened with [`Db::open_object_store_at`](crate::Db::open_object_store_at)
-/// writes **everything** through this one client — `SSTable` segments, blobs, the
+/// writes everything through one client — `SSTable` segments, blobs, the
 /// manifest CAS, the writer lease, and the **write-ahead log** — and a commit is
-/// acknowledged only after its WAL `put` is durable. So **this client *is* the
-/// WAL durability sink**: where its WAL writes land defines commit durability and
-/// latency, and the engine needs no other seam for a cloud layer.
+/// acknowledged only after its WAL bytes and WAL head are durable.
+///
+/// A database opened with
+/// [`Db::open_object_store_with_wal_at`](crate::Db::open_object_store_with_wal_at)
+/// splits that responsibility: the storage client stores bulk objects and the
+/// manifest, while the WAL client stores the writer lease, remote WAL head, and
+/// WAL segments. The WAL client is then the commit-latency and commit-durability
+/// sink; the storage client remains the long-term table/blob tier.
 ///
 /// Because `Arc<C>` is itself an `ObjectClient`, one client can be **shared
 /// across many open databases**. A higher layer (e.g. a multi-tenant service)
-/// can supply a custom shared client that recognizes WAL writes with
-/// [`is_wal_object_key`](crate::is_wal_object_key) and either routes them to a
-/// low-latency durable tier (while bulk data goes to a cheaper cold tier) or
-/// **coalesces them across databases** into one batched durable write
-/// (cross-tenant group commit), resolving each commit's `put` together. None of
-/// this requires changing the engine.
+/// can either provide an explicit WAL client through the split-tier open API or
+/// supply a custom shared client that recognizes WAL writes with
+/// [`is_wal_object_key`](crate::is_wal_object_key) and coalesces them across
+/// databases. In both forms, the client handling WAL keys must provide the
+/// conditional-write and same-key visibility guarantees described above.
 pub trait ObjectClient: Send + Sync {
     /// Reads the whole object, or `None` when the key is absent.
     fn get<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<Arc<[u8]>>>;

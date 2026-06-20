@@ -45,11 +45,9 @@ lz4_flex = { version = "0.13.1", default-features = false, features = [
 # `aws` feature provides the S3 client builder; the core gives the in-memory
 # store used to test the ObjectClient adapter without a network.
 object_store = { version = "0.12", default-features = false, features = ["aws"], optional = true }
-
-[dev-dependencies]
-# Runtime for the ignored live S3/R2 integration test (object_store's S3 client
-# is reqwest/tokio-based, so its futures need a tokio reactor to drive network IO).
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+# Runtime for real S3-compatible object storage. The `object_store` S3 client is
+# reqwest/tokio-based, so its futures need a Tokio reactor in production too.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"], optional = true }
 
 [[bench]]
 name = "v1_bench"
@@ -75,7 +73,7 @@ platform-io-native = [
     "dep:dispatch2",
 ]
 # Real object-storage `ObjectClient` (S3 and compatible) via the `object_store` crate.
-s3 = ["dep:object_store"]
+s3 = ["dep:object_store", "dep:tokio"]
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 js-sys = "0.3.99"
