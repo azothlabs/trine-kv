@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::{codec::CodecId, prefix::PrefixExtractor, runtime::RuntimeOptions};
+use crate::{codec::CodecId, limits, prefix::PrefixExtractor, runtime::RuntimeOptions};
 
 /// Storage location and host backend selected for a database.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,6 +264,20 @@ pub struct DbOptions {
     pub level_size_multiplier: usize,
     /// Maximum L0 table count before compaction is requested.
     pub max_l0_files: usize,
+    /// Maximum user key length accepted by write APIs, in bytes.
+    ///
+    /// The same limit applies to delete keys and range-delete bounds. The value
+    /// must be non-zero and may not exceed [`DbOptions::MAX_WRITE_FIELD_BYTES`].
+    /// Lower this limit for multi-tenant or untrusted workloads to cap WAL,
+    /// memtable, table-index, and comparison work caused by oversized keys.
+    pub max_key_bytes: usize,
+    /// Maximum user value length accepted by write APIs, in bytes.
+    ///
+    /// The value must be non-zero and may not exceed
+    /// [`DbOptions::MAX_WRITE_FIELD_BYTES`]. This limit is checked before WAL
+    /// acceptance or memtable publication; larger payloads should be stored
+    /// outside the ordinary value path and referenced from Trine records.
+    pub max_value_bytes: usize,
     /// Approximate bytes reserved for cached table blocks.
     pub block_cache_bytes: usize,
     /// Number of background workers used by maintenance-capable runtimes.
@@ -296,6 +310,17 @@ impl DbOptions {
     pub const DEFAULT_WRITE_BUFFER_BYTES: usize = 64 * 1024 * 1024;
     /// Default target size for table files.
     pub const DEFAULT_TARGET_TABLE_BYTES: usize = 64 * 1024 * 1024;
+    /// Default maximum user key length accepted by write APIs.
+    pub const DEFAULT_MAX_KEY_BYTES: usize = limits::MAX_DECODED_BLOCK_BYTES;
+    /// Default maximum user value length accepted by write APIs.
+    pub const DEFAULT_MAX_VALUE_BYTES: usize = limits::MAX_DECODED_BLOCK_BYTES;
+    /// Maximum configurable limit for a single write byte field.
+    ///
+    /// This is tied to Trine's internal decoded-block safety bound. Keeping
+    /// public write limits at or below this value prevents accepted records from
+    /// later creating table, WAL, or blob decode paths that exceed the engine's
+    /// allocation guardrails.
+    pub const MAX_WRITE_FIELD_BYTES: usize = limits::MAX_DECODED_BLOCK_BYTES;
     /// Default block-cache byte budget.
     pub const DEFAULT_BLOCK_CACHE_BYTES: usize = 256 * 1024 * 1024;
     /// Default minimum blob file size for garbage collection.
@@ -470,6 +495,30 @@ impl DbOptions {
         self.wal_shards = WalShardPolicy::Fixed(count);
         self
     }
+
+    /// Sets the maximum user key length accepted by write APIs.
+    ///
+    /// This applies to put keys, delete keys, and both bounds of range deletes.
+    /// The unit is bytes after the caller has encoded the key. `0` is invalid,
+    /// and values above [`DbOptions::MAX_WRITE_FIELD_BYTES`] are rejected when
+    /// the database opens.
+    #[must_use]
+    pub const fn with_max_key_bytes(mut self, max_key_bytes: usize) -> Self {
+        self.max_key_bytes = max_key_bytes;
+        self
+    }
+
+    /// Sets the maximum user value length accepted by write APIs.
+    ///
+    /// The unit is bytes after the caller has encoded the value. `0` is invalid,
+    /// and values above [`DbOptions::MAX_WRITE_FIELD_BYTES`] are rejected when
+    /// the database opens. Writes whose value exceeds this limit fail before
+    /// they enter WAL acceptance or memtable publication.
+    #[must_use]
+    pub const fn with_max_value_bytes(mut self, max_value_bytes: usize) -> Self {
+        self.max_value_bytes = max_value_bytes;
+        self
+    }
 }
 
 impl Default for DbOptions {
@@ -485,6 +534,8 @@ impl Default for DbOptions {
             target_table_bytes: Self::DEFAULT_TARGET_TABLE_BYTES,
             level_size_multiplier: 10,
             max_l0_files: 8,
+            max_key_bytes: Self::DEFAULT_MAX_KEY_BYTES,
+            max_value_bytes: Self::DEFAULT_MAX_VALUE_BYTES,
             block_cache_bytes: Self::DEFAULT_BLOCK_CACHE_BYTES,
             background_worker_count: 1,
             wal_shards: WalShardPolicy::Auto,

@@ -12,9 +12,8 @@ use std::{pin::Pin, thread};
 
 use crate::{
     error::{Error, Result},
-    limits,
     lsm::LsmTree,
-    options::{DurabilityMode, StorageMode, WriteOptions},
+    options::{DbOptions, DurabilityMode, StorageMode, WriteOptions},
     transaction::TransactionReadSet,
     types::{CommitInfo, Sequence},
     wal::WalBatch,
@@ -740,7 +739,11 @@ impl Db {
         // barrier or touching memtables, so a rejected batch cannot leave
         // partial state.
         validate_batch_len(operations.len())?;
-        validate_operation_resource_bounds(&operations)?;
+        validate_operation_resource_bounds(
+            &operations,
+            self.inner.options.max_key_bytes,
+            self.inner.options.max_value_bytes,
+        )?;
         if !operations.is_empty() {
             self.apply_write_backpressure()?;
         }
@@ -1322,42 +1325,46 @@ const fn durability_rank(mode: DurabilityMode) -> u8 {
     }
 }
 
-fn validate_operation_resource_bounds(operations: &[BatchOperation]) -> Result<()> {
+fn validate_operation_resource_bounds(
+    operations: &[BatchOperation],
+    max_key_bytes: usize,
+    max_value_bytes: usize,
+) -> Result<()> {
     for operation in operations {
         match operation {
             BatchOperation::Put { key, value, .. } => {
-                validate_write_byte_field(key.len(), "write key length")?;
-                validate_write_byte_field(value.len(), "write value length")?;
+                validate_write_byte_field(key.len(), max_key_bytes, "write key length")?;
+                validate_write_byte_field(value.len(), max_value_bytes, "write value length")?;
             }
             BatchOperation::Delete { key, .. } => {
-                validate_write_byte_field(key.len(), "write key length")?;
+                validate_write_byte_field(key.len(), max_key_bytes, "write key length")?;
             }
             BatchOperation::DeleteRange { range, .. } => {
-                validate_bound_len(&range.start)?;
-                validate_bound_len(&range.end)?;
+                validate_bound_len(&range.start, max_key_bytes)?;
+                validate_bound_len(&range.end, max_key_bytes)?;
             }
         }
     }
     Ok(())
 }
 
-fn validate_bound_len(bound: &Bound<Vec<u8>>) -> Result<()> {
+fn validate_bound_len(bound: &Bound<Vec<u8>>, max_key_bytes: usize) -> Result<()> {
     match bound {
         Bound::Included(bytes) | Bound::Excluded(bytes) => {
-            validate_write_byte_field(bytes.len(), "write range bound length")
+            validate_write_byte_field(bytes.len(), max_key_bytes, "write range bound length")
         }
         Bound::Unbounded => Ok(()),
     }
 }
 
-fn validate_write_byte_field(len: usize, field: &'static str) -> Result<()> {
-    if len <= limits::MAX_DECODED_BLOCK_BYTES {
+fn validate_write_byte_field(len: usize, max_bytes: usize, field: &'static str) -> Result<()> {
+    let max_bytes = max_bytes.min(DbOptions::MAX_WRITE_FIELD_BYTES);
+    if len <= max_bytes {
         return Ok(());
     }
 
     Err(Error::invalid_options(format!(
-        "{field} {len} exceeds maximum {}",
-        limits::MAX_DECODED_BLOCK_BYTES
+        "{field} {len} exceeds maximum {max_bytes}"
     )))
 }
 
@@ -1372,7 +1379,7 @@ mod tests {
     };
 
     use crate::{
-        Db, WriteBatch,
+        Db, KeyRange, WriteBatch,
         db::CommitTracker,
         error::Error,
         lsm::LsmTree,
@@ -1501,6 +1508,72 @@ mod tests {
 
         assert!(matches!(error, Error::ReadOnly));
         assert_eq!(db.get_sync(b"k").expect("read missing key"), None);
+    }
+
+    #[test]
+    fn write_rejects_key_over_configured_limit() {
+        let options = DbOptions::memory().with_max_key_bytes(3);
+        let db = Db::open_sync(options).expect("memory db opens");
+
+        let error = db
+            .put_sync(b"long", b"value")
+            .expect_err("oversized key is rejected");
+
+        assert!(
+            matches!(error, Error::InvalidOptions { ref message } if message.contains("write key length 4 exceeds maximum 3")),
+            "expected configured key limit error, got {error:?}"
+        );
+        assert_eq!(db.get_sync(b"long").expect("read missing key"), None);
+    }
+
+    #[test]
+    fn write_rejects_value_over_configured_limit() {
+        let options = DbOptions::memory().with_max_value_bytes(3);
+        let db = Db::open_sync(options).expect("memory db opens");
+
+        let error = db
+            .put_sync(b"key", b"value")
+            .expect_err("oversized value is rejected");
+
+        assert!(
+            matches!(error, Error::InvalidOptions { ref message } if message.contains("write value length 5 exceeds maximum 3")),
+            "expected configured value limit error, got {error:?}"
+        );
+        assert_eq!(db.get_sync(b"key").expect("read missing value"), None);
+    }
+
+    #[test]
+    fn range_delete_rejects_bound_over_configured_key_limit() {
+        let options = DbOptions::memory().with_max_key_bytes(3);
+        let db = Db::open_sync(options).expect("memory db opens");
+
+        let error = db
+            .delete_range_sync(KeyRange::half_open(b"a".to_vec(), b"long".to_vec()))
+            .expect_err("oversized range bound is rejected");
+
+        assert!(
+            matches!(error, Error::InvalidOptions { ref message } if message.contains("write range bound length 4 exceeds maximum 3")),
+            "expected configured range-bound limit error, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn open_rejects_invalid_write_byte_limits() {
+        let error = Db::open_sync(DbOptions::memory().with_max_key_bytes(0))
+            .expect_err("zero key limit is rejected");
+        assert!(
+            matches!(error, Error::InvalidOptions { ref message } if message.contains("max key size must be non-zero")),
+            "expected zero key limit error, got {error:?}"
+        );
+
+        let error = Db::open_sync(
+            DbOptions::memory().with_max_value_bytes(DbOptions::MAX_WRITE_FIELD_BYTES + 1),
+        )
+        .expect_err("oversized value limit is rejected");
+        assert!(
+            matches!(error, Error::InvalidOptions { ref message } if message.contains("max value size")),
+            "expected value limit ceiling error, got {error:?}"
+        );
     }
 
     #[test]

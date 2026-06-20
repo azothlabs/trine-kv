@@ -34,6 +34,7 @@ use std::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::error::{Error, Result};
@@ -134,6 +135,12 @@ pub struct ObjectMeta {
 /// - `put_if` applies the write only when the precondition holds, otherwise
 ///   reports [`PutIf::PreconditionFailed`] with the current `ETag`.
 ///
+/// Writable object-store opens run a small same-key contract probe against the
+/// storage and WAL clients before taking ownership. The probe catches common
+/// unsafe adapters early, such as unconditional `put_if`, stale `head`, or stale
+/// `get` after a successful conditional write. It is still the implementor's
+/// responsibility to provide these semantics for all keys after open.
+///
 /// # WAL durability sink and split tiers
 ///
 /// A database opened with [`Db::open_object_store_at`](crate::Db::open_object_store_at)
@@ -185,6 +192,142 @@ pub trait ObjectClient: Send + Sync {
         bytes: Arc<[u8]>,
         precondition: Precondition,
     ) -> ObjectFuture<'op, PutIf>;
+}
+
+static OBJECT_CLIENT_CONTRACT_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) async fn verify_object_client_contract(
+    client: &Arc<dyn ObjectClient>,
+    db_path: &Path,
+    role: &str,
+) -> Result<()> {
+    let key = object_client_contract_probe_key(db_path, role)?;
+    let result = verify_object_client_contract_at_key(client, &key).await;
+    let cleanup = client.delete(&key).await;
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+    }
+}
+
+async fn verify_object_client_contract_at_key(
+    client: &Arc<dyn ObjectClient>,
+    key: &str,
+) -> Result<()> {
+    client.delete(key).await?;
+
+    let first = Arc::<[u8]>::from(b"trine-object-client-contract:first".as_slice());
+    let second = Arc::<[u8]>::from(b"trine-object-client-contract:second".as_slice());
+    let first_etag = client.put(key, Arc::clone(&first)).await?;
+    verify_object_client_observed_bytes(client, key, &first, &first_etag, "put").await?;
+
+    match client
+        .put_if(key, Arc::clone(&second), Precondition::IfNoneMatch)
+        .await?
+    {
+        PutIf::PreconditionFailed { current } if current.as_ref() == Some(&first_etag) => {}
+        PutIf::PreconditionFailed { current } => {
+            return Err(Error::Corruption {
+                message: format!(
+                    "object client contract probe for {key} returned wrong IfNoneMatch ETag: {current:?}"
+                ),
+            });
+        }
+        PutIf::Stored { .. } => {
+            return Err(Error::Corruption {
+                message: format!(
+                    "object client contract probe for {key} stored despite IfNoneMatch on an existing object"
+                ),
+            });
+        }
+    }
+
+    let mismatched = ETag::new("trine-object-client-contract-mismatch");
+    match client
+        .put_if(key, Arc::clone(&second), Precondition::IfMatch(mismatched))
+        .await?
+    {
+        PutIf::PreconditionFailed { .. } => {}
+        PutIf::Stored { .. } => {
+            return Err(Error::Corruption {
+                message: format!(
+                    "object client contract probe for {key} stored despite a mismatched IfMatch ETag"
+                ),
+            });
+        }
+    }
+
+    let second_etag = match client
+        .put_if(
+            key,
+            Arc::clone(&second),
+            Precondition::IfMatch(first_etag.clone()),
+        )
+        .await?
+    {
+        PutIf::Stored { etag } => etag,
+        PutIf::PreconditionFailed { current } => {
+            return Err(Error::Corruption {
+                message: format!(
+                    "object client contract probe for {key} rejected a matching IfMatch ETag: {current:?}"
+                ),
+            });
+        }
+    };
+    if second_etag == first_etag {
+        return Err(Error::Corruption {
+            message: format!(
+                "object client contract probe for {key} reused an ETag after overwriting bytes"
+            ),
+        });
+    }
+    verify_object_client_observed_bytes(client, key, &second, &second_etag, "put_if").await
+}
+
+async fn verify_object_client_observed_bytes(
+    client: &Arc<dyn ObjectClient>,
+    key: &str,
+    expected: &Arc<[u8]>,
+    expected_etag: &ETag,
+    operation: &str,
+) -> Result<()> {
+    let head = client.head(key).await?.ok_or_else(|| Error::Corruption {
+        message: format!("object client contract probe for {key} lost head after {operation}"),
+    })?;
+    if &head.etag != expected_etag || head.size != expected.len() as u64 {
+        return Err(Error::Corruption {
+            message: format!(
+                "object client contract probe for {key} observed stale head after {operation}"
+            ),
+        });
+    }
+    let bytes = client.get(key).await?.ok_or_else(|| Error::Corruption {
+        message: format!("object client contract probe for {key} lost bytes after {operation}"),
+    })?;
+    if bytes.as_ref() != expected.as_ref() {
+        return Err(Error::Corruption {
+            message: format!(
+                "object client contract probe for {key} observed stale bytes after {operation}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn object_client_contract_probe_key(db_path: &Path, role: &str) -> Result<String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| Error::Corruption {
+            message: format!("system clock is before UNIX_EPOCH: {error}"),
+        })?;
+    let counter = OBJECT_CLIENT_CONTRACT_PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    Ok(db_path
+        .join(format!(
+            ".trine-object-client-contract-{role}-{}-{counter}",
+            now.as_nanos()
+        ))
+        .to_string_lossy()
+        .into_owned())
 }
 
 /// One stored object: its bytes and current `ETag`.

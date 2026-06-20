@@ -25,7 +25,7 @@ use crate::{
         LsmPointReadSnapshot, LsmTree,
     },
     manifest::{self, ManifestState, ManifestStore},
-    object_store::{ObjectClient, ObjectStoreBackend},
+    object_store::{ObjectClient, ObjectStoreBackend, verify_object_client_contract},
     options::{
         BlobLevelMergePolicy, BucketOptions, DbOptions, DurabilityMode, FailOnCorruptionPolicy,
         FilterPolicy, HostStorageBackend, PrefixFilterPolicy, StorageMode, WriteOptions,
@@ -1425,6 +1425,10 @@ impl Db {
         let backend = ObjectStoreBackend::new(Arc::clone(&storage_client));
         let wal_backend = ObjectStoreBackend::new(Arc::clone(&wal_client));
         let db_path = PathBuf::from(prefix.into());
+        if !options.read_only {
+            verify_object_client_contract(&storage_client, &db_path, "storage").await?;
+            verify_object_client_contract(&wal_client, &db_path, "wal").await?;
+        }
         let manifest_key = manifest::manifest_path(&db_path)
             .to_string_lossy()
             .into_owned();
@@ -1484,8 +1488,9 @@ impl Db {
         .await?;
         let batches = object_store_committed_wal_batches(
             wal::merge_batch_streams_by_sequence(wal_streams)?,
+            replay_floor,
             remote_wal_state.committed_sequence,
-        );
+        )?;
 
         let block_cache_bytes = options.block_cache_bytes;
         let runtime = Runtime::new(options.runtime);
@@ -8287,8 +8292,9 @@ impl Db {
         .await?;
         let batches = object_store_committed_wal_batches(
             wal::merge_batch_streams_by_sequence(wal_streams)?,
+            replay_floor,
             remote_wal_state.committed_sequence,
-        );
+        )?;
         let last_committed =
             commit::replay_wal_batches_into_buckets(&buckets, batches, replay_floor)?;
 
@@ -9086,12 +9092,62 @@ fn object_store_wal_paths_after_replay_floor(
 
 fn object_store_committed_wal_batches(
     batches: Vec<WalBatch>,
+    replay_floor: Sequence,
     committed_sequence: Sequence,
-) -> Vec<WalBatch> {
-    batches
+) -> Result<Vec<WalBatch>> {
+    let batches = batches
         .into_iter()
         .filter(|batch| batch.sequence <= committed_sequence)
-        .collect()
+        .collect::<Vec<_>>();
+    validate_object_store_committed_wal_coverage(&batches, replay_floor, committed_sequence)?;
+    Ok(batches)
+}
+
+fn validate_object_store_committed_wal_coverage(
+    batches: &[WalBatch],
+    replay_floor: Sequence,
+    committed_sequence: Sequence,
+) -> Result<()> {
+    if committed_sequence <= replay_floor {
+        return Ok(());
+    }
+
+    let mut expected = replay_floor
+        .get()
+        .checked_add(1)
+        .map(Sequence::new)
+        .ok_or_else(|| Error::Corruption {
+            message: "object-store WAL replay floor cannot advance past u64::MAX".to_owned(),
+        })?;
+    for batch in batches {
+        if batch.sequence != expected {
+            return Err(Error::Corruption {
+                message: format!(
+                    "object-store WAL is missing confirmed commit sequence {} before head {}",
+                    expected.get(),
+                    committed_sequence.get()
+                ),
+            });
+        }
+        if batch.sequence == committed_sequence {
+            return Ok(());
+        }
+        expected = expected
+            .get()
+            .checked_add(1)
+            .map(Sequence::new)
+            .ok_or_else(|| Error::Corruption {
+                message: "object-store WAL committed sequence cannot advance past u64::MAX"
+                    .to_owned(),
+            })?;
+    }
+
+    Err(Error::Corruption {
+        message: format!(
+            "object-store WAL ended before confirmed head {}",
+            committed_sequence.get()
+        ),
+    })
 }
 
 fn validate_common_options(options: &DbOptions) -> Result<()> {
@@ -9118,6 +9174,26 @@ fn validate_common_options(options: &DbOptions) -> Result<()> {
     }
     if options.max_l0_files == 0 {
         return Err(Error::invalid_options("max L0 files must be non-zero"));
+    }
+    if options.max_key_bytes == 0 {
+        return Err(Error::invalid_options("max key size must be non-zero"));
+    }
+    if options.max_key_bytes > DbOptions::MAX_WRITE_FIELD_BYTES {
+        return Err(Error::invalid_options(format!(
+            "max key size {} exceeds maximum {}",
+            options.max_key_bytes,
+            DbOptions::MAX_WRITE_FIELD_BYTES
+        )));
+    }
+    if options.max_value_bytes == 0 {
+        return Err(Error::invalid_options("max value size must be non-zero"));
+    }
+    if options.max_value_bytes > DbOptions::MAX_WRITE_FIELD_BYTES {
+        return Err(Error::invalid_options(format!(
+            "max value size {} exceeds maximum {}",
+            options.max_value_bytes,
+            DbOptions::MAX_WRITE_FIELD_BYTES
+        )));
     }
     if options.keep_last_read_versions == 0 {
         return Err(Error::invalid_options(
@@ -10093,6 +10169,7 @@ mod tests {
     };
     use crate::{
         bucket::DEFAULT_BUCKET_NAME,
+        object_store::{ETag, ObjectClient, ObjectFuture, ObjectMeta, Precondition, PutIf},
         options::{BucketOptions, DbOptions, DurabilityMode},
         runtime::CancellationToken,
         storage::{StorageCapability, StorageReadBackend},
@@ -10129,6 +10206,55 @@ mod tests {
                 Poll::Ready(result) => return result,
                 Poll::Pending => thread::park_timeout(Duration::from_secs(1)),
             }
+        }
+    }
+
+    struct UnsafePutIfObjectStore {
+        inner: Arc<dyn ObjectClient>,
+    }
+
+    impl ObjectClient for UnsafePutIfObjectStore {
+        fn get<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<Arc<[u8]>>> {
+            self.inner.get(key)
+        }
+
+        fn get_range<'op>(
+            &'op self,
+            key: &str,
+            offset: u64,
+            len: u64,
+        ) -> ObjectFuture<'op, Arc<[u8]>> {
+            self.inner.get_range(key, offset, len)
+        }
+
+        fn put<'op>(&'op self, key: &str, bytes: Arc<[u8]>) -> ObjectFuture<'op, ETag> {
+            self.inner.put(key, bytes)
+        }
+
+        fn delete<'op>(&'op self, key: &str) -> ObjectFuture<'op, ()> {
+            self.inner.delete(key)
+        }
+
+        fn list<'op>(&'op self, prefix: &str) -> ObjectFuture<'op, Vec<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn head<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<ObjectMeta>> {
+            self.inner.head(key)
+        }
+
+        fn put_if<'op>(
+            &'op self,
+            key: &str,
+            bytes: Arc<[u8]>,
+            _precondition: Precondition,
+        ) -> ObjectFuture<'op, PutIf> {
+            let inner = Arc::clone(&self.inner);
+            let key = key.to_owned();
+            Box::pin(async move {
+                let etag = inner.put(&key, bytes).await?;
+                Ok(PutIf::Stored { etag })
+            })
         }
     }
 
@@ -10286,6 +10412,21 @@ mod tests {
     }
 
     #[test]
+    fn object_store_open_rejects_unsafe_put_if_client() {
+        use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+        let inner: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+        let client: Arc<dyn ObjectClient> = Arc::new(UnsafePutIfObjectStore { inner });
+        let error = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+            .expect_err("unsafe object client must be rejected");
+
+        assert!(
+            matches!(error, Error::Corruption { ref message } if message.contains("contract probe")),
+            "expected contract probe corruption, got {error:?}"
+        );
+    }
+
+    #[test]
     fn object_store_buffered_write_requires_flush_to_recover() {
         use crate::object_store::{InMemoryObjectStore, ObjectClient};
 
@@ -10399,6 +10540,43 @@ mod tests {
         assert_eq!(
             db.latest_read_version(),
             ReadVersion::from_sequence(Sequence::new(1))
+        );
+    }
+
+    #[test]
+    fn object_store_recovery_rejects_truncated_confirmed_wal_segment() {
+        use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+        let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+        {
+            let db = block_on_test_future(Db::open_object_store(
+                Arc::clone(&client),
+                DbOptions::object_store(),
+            ))
+            .expect("open object-store database");
+            db.put_sync(b"a", b"one").expect("put a");
+            db.put_sync(b"b", b"two").expect("put b");
+
+            let state =
+                block_on_test_future(ObjectWriterLease::read_current(Arc::clone(&client), "LOCK"))
+                    .expect("read WAL head")
+                    .expect("WAL head exists");
+            assert_eq!(state.committed_sequence, Sequence::new(2));
+            let segment_key = state.current_wal_key.expect("segment key");
+            let mut segment = block_on_test_future(client.get(&segment_key))
+                .expect("read WAL segment")
+                .expect("segment exists")
+                .to_vec();
+            segment.pop();
+            block_on_test_future(client.put(&segment_key, Arc::from(segment.as_slice())))
+                .expect("truncate confirmed WAL segment");
+        }
+
+        let error = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+            .expect_err("truncated confirmed WAL segment must fail closed");
+        assert!(
+            matches!(error, Error::Corruption { ref message } if message.contains("ended before confirmed head")),
+            "expected missing confirmed WAL corruption, got {error:?}"
         );
     }
 

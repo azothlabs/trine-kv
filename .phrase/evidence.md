@@ -14876,3 +14876,81 @@ Negative check:
 
 - Keep object-store lease TTL configurable only if production deployment
   evidence shows the fixed 30s crash-recovery window is too long or too short.
+
+## 2026-06-20: Object-store confirmed WAL recovery coverage
+
+### Observation
+
+- Object-store recovery trusted the remote WAL head sequence after filtering
+  frames at or below it, but did not prove that replay covered every confirmed
+  sequence from the manifest replay floor through that head.
+- The `ObjectClient` contract documented conditional-write and same-key
+  read-after-write requirements, but unsafe adapters could reach writer lease or
+  manifest ownership before any runtime semantic check.
+
+### Interpretation
+
+- A confirmed object-store WAL head must be treated as a coverage claim:
+  missing, truncated, or non-contiguous WAL frames are corruption, not a
+  recoverable short read.
+- Writable object-store open should reject common unsafe client implementations
+  before acquiring ownership.
+
+### Verification
+
+- Added contiguous confirmed-WAL coverage validation for object-store open and
+  read-only refresh.
+- Added a writable-open `ObjectClient` contract probe for storage and WAL
+  clients covering `put`, `head`, `get`, `IfNoneMatch`, mismatched `IfMatch`,
+  matching `IfMatch`, and ETag advancement.
+- Regression coverage:
+  `cargo test -q object_store_recovery_rejects_truncated_confirmed_wal_segment`
+  and `cargo test -q object_store_open_rejects_unsafe_put_if_client`.
+- Broader checks passed: `cargo test -q object_store`, `cargo fmt --check`,
+  `git diff --check`, `cargo check -q`, `cargo check -q --features s3`,
+  `cargo rustdoc --all-features -- -D warnings`, and `cargo clippy -q --lib`.
+
+### Recommended Next Action
+
+- For a future external WAL-service adapter, keep this probe as the minimum
+  local gate and add provider-specific failure injection around stale head/get
+  behavior.
+
+## 2026-06-20: Configurable write key/value byte limits
+
+### Observation
+
+- Write preflight previously used the internal decoded-block safety bound as
+  the only user key, delete bound, and value byte limit.
+- That kept allocation guardrails intact but gave deployments no way to lower
+  the accepted payload size for multi-tenant, untrusted, or latency-sensitive
+  workloads.
+
+### Interpretation
+
+- User-facing write limits should be explicit database options with compatible
+  defaults, while still capped by the internal engine safety bound.
+- Range-delete bounds should share the key limit because they participate in the
+  same comparison, WAL, and table-bound paths as ordinary keys.
+
+### Verification
+
+- Added `DbOptions::max_key_bytes` and `DbOptions::max_value_bytes`, with
+  builder methods and defaults equal to the existing 64MiB internal limit.
+- Open now rejects zero limits and limits above Trine's internal write-field
+  ceiling. Write preflight rejects oversized put keys, delete keys,
+  range-delete bounds, and values before WAL acceptance or memtable publication.
+- Regression coverage passed:
+  `cargo test -q configured_limit`,
+  `cargo test -q range_delete_rejects_bound_over_configured_key_limit`, and
+  `cargo test -q open_rejects_invalid_write_byte_limits`.
+- Broader checks passed: `cargo fmt --check`, `git diff --check`,
+  `cargo check -q`, `cargo check -q --all-features`,
+  `cargo rustdoc --all-features -- -D warnings`,
+  `cargo test -q --doc --all-features`, and `cargo clippy -q --lib`.
+
+### Recommended Next Action
+
+- If production users need larger ordinary values, first define a dedicated
+  large-object/chunk reference path instead of raising the default ordinary
+  value limit.
