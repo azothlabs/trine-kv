@@ -388,6 +388,7 @@ mod tests {
             }
         }
 
+        #[allow(clippy::cast_precision_loss)]
         fn standard_usd_before_free_tier(&self) -> f64 {
             let class_a = self.class_a as f64 * 4.50 / 1_000_000.0;
             let class_b = self.class_b as f64 * 0.36 / 1_000_000.0;
@@ -835,6 +836,7 @@ mod tests {
         result.expect("R2 measurement/fault suite");
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run_live_measurement_and_fault_suite(
         client: Arc<dyn ObjectClient>,
         prefix: &str,
@@ -912,8 +914,7 @@ mod tests {
         )
         .await?;
         let group_counts_before = metrics.snapshot();
-        let group_latency =
-            run_concurrent_puts(&group_writer, GROUP_WRITE_COUNT, "group-key").await?;
+        let group_latency = run_concurrent_puts(&group_writer, GROUP_WRITE_COUNT, "group-key")?;
         let group_counts = metrics.snapshot().delta_since(group_counts_before);
         if group_counts.put != 1 || group_counts.put_if != 1 {
             return Err(Error::Corruption {
@@ -1049,7 +1050,7 @@ mod tests {
         }
         let cleanup_delete_latency = delete_started.elapsed();
         let (_cleanup_after_delete, cleanup_delete_attempts, cleanup_delete_visible_latency) =
-            wait_for_list_condition(&client, &cleanup_prefix, |objects| objects.is_empty()).await?;
+            wait_for_list_condition(&client, &cleanup_prefix, <[ObjectMeta]>::is_empty).await?;
         let manual_cleanup_counts = metrics.snapshot().delta_since(manual_cleanup_counts_before);
 
         eprintln!(
@@ -1139,7 +1140,7 @@ mod tests {
         Ok(())
     }
 
-    async fn run_concurrent_puts(db: &Db, count: usize, key_prefix: &str) -> Result<Duration> {
+    fn run_concurrent_puts(db: &Db, count: usize, key_prefix: &str) -> Result<Duration> {
         tokio::task::block_in_place(|| {
             let barrier = Arc::new(Barrier::new(count + 1));
             let mut handles = Vec::with_capacity(count);

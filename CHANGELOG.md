@@ -2,6 +2,57 @@
 
 All public crate releases use Semantic Versioning.
 
+## 0.5.5 - 2026-06-20
+
+Object-store production hardening release. This patch keeps the `0.5.x`
+storage format compatible while tightening confirmed-write recovery, object
+client assumptions, resource bounds, and the object-store WAL path.
+
+### Added
+
+- **Split object-store WAL tier open APIs**:
+  `Db::open_object_store_with_wal` and `Db::open_object_store_with_wal_at` let a
+  deployment use one `ObjectClient` for manifest/table/blob storage and another
+  for the confirmed-write WAL, writer lease, and WAL head. This supports
+  placing the write durability sink on a lower-latency tier without changing
+  the table storage tier.
+- **Object-store WAL group commit scheduling**: queued durable object-store
+  commits can share one WAL segment publish and one WAL-head conditional write.
+  The writer only advances the remote head after contiguous commit frames are
+  present in the segment.
+- **Writable object-store `ObjectClient` contract probe**: writable open now
+  checks same-key `put`, `head`, `get`, `IfNoneMatch`, `IfMatch`, and ETag
+  advancement before taking ownership, so unsafe adapters fail at open instead
+  of creating latent durability risk.
+- **Configurable write byte limits**:
+  `DbOptions::max_key_bytes` / `with_max_key_bytes` and
+  `DbOptions::max_value_bytes` / `with_max_value_bytes` bound accepted user
+  keys, range-delete bounds, and values. Defaults remain compatible with the
+  previous 64MiB internal safety ceiling.
+- **Real S3-compatible object-store runtime support** under the `s3` feature:
+  the object WAL worker can drive Tokio-backed S3 futures instead of requiring
+  the caller thread to provide a reactor.
+
+### Fixed
+
+- Object-store recovery and read-only refresh now reject missing, truncated, or
+  non-contiguous confirmed WAL frames instead of trusting a higher remote WAL
+  head after a short or corrupt segment read.
+- Object-store writer leases now refuse a live second writer and allow takeover
+  only after expiry; graceful close releases the lease by expiring it while
+  preserving the WAL head.
+- Object-store open now rejects file-style sync durability modes that the
+  backend cannot honor.
+- Object-store reads use bounded range reads after `HEAD` size validation and
+  reject short range reads, avoiding whole-object allocation after a misleading
+  or stale metadata response.
+- Native async close now waits for admitted commit, flush, or compaction publish
+  activity before releasing the writer lease.
+- Native-file writer leases are held by OS file locks on the open `LOCK` handle,
+  preventing stale diagnostic `LOCK` contents from blocking crash recovery.
+- Manifest, WAL, SSTable, blob, cursor, and object read paths now reject
+  oversized lengths before unbounded buffer allocation or LZ4 decode.
+
 ## 0.5.4 - 2026-06-18
 
 Enforces the object-store single-writer guarantee, and resets the manifest

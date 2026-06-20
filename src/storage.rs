@@ -3179,8 +3179,11 @@ impl Drop for NativeFileWriterLease {
                 let _ = clear_native_file_writer_lease_owner(file);
             }
         }
-        if let Some(file) = self.file.as_ref() {
-            let _ = fs4::fs_std::FileExt::unlock(file);
+        #[cfg(any(unix, windows))]
+        {
+            if let Some(file) = self.file.as_ref() {
+                let _ = fs4::fs_std::FileExt::unlock(file);
+            }
         }
         let _ = self.file.take();
     }
@@ -3459,6 +3462,7 @@ fn prepare_native_file_wal_rewrite(
     Ok((path, tmp_path))
 }
 
+#[cfg(any(unix, windows))]
 fn require_native_file_writer_lease(object: &StorageObjectId) -> Result<()> {
     if object.kind() != StorageObjectKind::WriterLease {
         return Err(Error::invalid_options(
@@ -3586,6 +3590,7 @@ fn rewrite_native_file_wal(
     Ok(())
 }
 
+#[cfg(any(unix, windows))]
 fn acquire_native_file_writer_lease(object: &StorageObjectId) -> Result<File> {
     require_native_file_writer_lease(object)?;
 
@@ -3607,6 +3612,11 @@ fn acquire_native_file_writer_lease(object: &StorageObjectId) -> Result<File> {
             message: format!("database lock is already held: {}", object.path().display()),
         })
     }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn acquire_native_file_writer_lease(_object: &StorageObjectId) -> Result<File> {
+    Err(Error::unsupported_backend("native file writer lease"))
 }
 
 fn writer_lease_owner_text() -> String {

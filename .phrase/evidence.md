@@ -14954,3 +14954,47 @@ Negative check:
 - If production users need larger ordinary values, first define a dedicated
   large-object/chunk reference path instead of raising the default ordinary
   value limit.
+
+## 2026-06-20: 0.5.5 release gate
+
+### Observation
+
+- Preparing `0.5.5` required packaging the object-store hardening work after
+  `v0.5.4`: split WAL tier APIs, WAL coverage validation, object-client probe,
+  object-store lease/read hardening, persistent decode allocation guards, and
+  configurable write byte limits.
+- The release gate exposed that the native `fs4` file-lock dependency was still
+  unconditional, so wasm targets pulled in unsupported `errno`/`fs4` code.
+- Full clippy also caught a few S3 live-suite test-helper issues under
+  `--all-targets --all-features`.
+
+### Interpretation
+
+- `fs4` is a native writer-lease implementation detail and should be scoped to
+  Unix/Windows targets. Non-native targets should not compile that dependency
+  and should fail if a native file lease path is selected.
+- The S3 live-suite fixes are release-gate hygiene and do not change public
+  behavior.
+
+### Verification
+
+- Updated `Cargo.toml`/`Cargo.lock` to `0.5.5` and added the `CHANGELOG.md`
+  entry.
+- Scoped `fs4` to `cfg(any(unix, windows))`, guarded native file-lock helpers,
+  and cleaned S3 live-suite clippy findings.
+- Checks passed: `cargo fmt --check`, `git diff --check`,
+  `cargo check -q --all-features`,
+  `cargo clippy -q --all-targets --all-features -- -D warnings`,
+  `cargo test -q --all-targets --all-features`,
+  `cargo check -q --target wasm32-unknown-unknown --lib`,
+  `cargo check -q --target wasm32-wasip1 --lib`,
+  `cargo clippy -q --target wasm32-unknown-unknown --lib -- -D warnings`,
+  `cargo rustdoc --all-features -- -D warnings`,
+  `cargo test -q --doc --all-features`, and the five release examples.
+- Package/publish checks passed: `cargo package --list`,
+  `cargo package --locked`, and `cargo publish --dry-run --locked`. The package
+  contains 118 files, 2.7MiB unpacked and about 490KiB compressed.
+
+### Recommended Next Action
+
+- Tag and push `v0.5.5`, then publish the crate with `cargo publish --locked`.

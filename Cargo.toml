@@ -1,6 +1,6 @@
 [package]
 name = "trine-kv"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -34,9 +34,6 @@ crossbeam-channel = { version = "0.5.15", optional = true }
 # Async primitives (e.g. `futures::lock::Mutex` for serializing object-store
 # manifest publishes Send-safely). Available on every target.
 futures = "0.3.32"
-# Cross-platform advisory file locks for native writer leases. The lock is bound
-# to the open LOCK file handle so crash recovery is handled by the OS.
-fs4 = { version = "0.13.1", default-features = false, features = ["sync"] }
 # Trine uses only lz4_flex block compression. Keep checked decode enabled, but
 # avoid the default `safe-decode` zero-fill path on the table block read path.
 lz4_flex = { version = "0.13.1", default-features = false, features = [
@@ -85,6 +82,9 @@ wasm-bindgen = "0.2.122"
 wasm-bindgen-futures = "0.4.72"
 
 [target.'cfg(any(unix, windows))'.dependencies]
+# Cross-platform advisory file locks for native writer leases. The lock is bound
+# to the open LOCK file handle so crash recovery is handled by the OS.
+fs4 = { version = "0.13.1", default-features = false, features = ["sync"] }
 compio = { version = "0.14.0", default-features = false, features = ["runtime"], optional = true }
 compio-driver = { version = "0.7.1", default-features = false, features = ["io-uring"], optional = true }
 compio-fs = { version = "0.7.0", default-features = false, features = ["io-uring"], optional = true }
