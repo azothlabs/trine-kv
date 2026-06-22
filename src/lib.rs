@@ -149,11 +149,13 @@ pub use error::{Error, Result};
 pub use iterator::{Direction, Iter, LazyIter, LazyKeyValue, LazyValue};
 pub use object_store::{
     ETag, InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta, Precondition, PutIf,
+    verify_object_client_contract,
 };
 pub use options::{
     BlobGcRatio, BlobLevelMergePolicy, BucketOptions, CompressionProfile, DbOptions,
     DurabilityMode, FailOnCorruptionPolicy, FilterDepthCurve, FilterPolicy, HostStorageBackend,
-    IndexSearchPolicy, PrefixFilterPolicy, StorageMode, WalShardPolicy, WriteOptions,
+    IndexSearchPolicy, ObjectClientTrustMode, PrefixFilterPolicy, StorageMode, WalShardPolicy,
+    WriteOptions,
 };
 pub use point_value::PointValue;
 pub use prefix::PrefixExtractor;

@@ -264,6 +264,18 @@ pub struct DbOptions {
     pub level_size_multiplier: usize,
     /// Maximum L0 table count before compaction is requested.
     pub max_l0_files: usize,
+    /// How object-store opens treat the supplied [`crate::ObjectClient`].
+    ///
+    /// The default is [`ObjectClientTrustMode::Trusted`]: `Db::open_object_store*`
+    /// assumes the client already satisfies Trine's conditional-write and
+    /// same-key visibility contract. Prefer that default for production opens
+    /// after validating the adapter in CI, at process startup, or in a deploy
+    /// health check with [`crate::verify_object_client_contract`].
+    ///
+    /// [`ObjectClientTrustMode::VerifyOnOpen`] is available as a fail-closed
+    /// diagnostic mode. It adds object-store requests and latency to each
+    /// writable object-store open, so it is not the default.
+    pub object_client_trust: ObjectClientTrustMode,
     /// Maximum user key length accepted by write APIs, in bytes.
     ///
     /// The same limit applies to delete keys and range-delete bounds. The value
@@ -496,6 +508,20 @@ impl DbOptions {
         self
     }
 
+    /// Sets how object-store opens treat the supplied object client.
+    ///
+    /// The default is [`ObjectClientTrustMode::Trusted`], which does not run a
+    /// contract probe during open. Use [`ObjectClientTrustMode::VerifyOnOpen`]
+    /// only when the extra object-store requests are acceptable, such as adapter
+    /// development or a temporary diagnostic rollout. For normal production
+    /// deployments, prefer running [`crate::verify_object_client_contract`] from
+    /// CI, startup, or a deployment health check.
+    #[must_use]
+    pub const fn with_object_client_trust(mut self, trust: ObjectClientTrustMode) -> Self {
+        self.object_client_trust = trust;
+        self
+    }
+
     /// Sets the maximum user key length accepted by write APIs.
     ///
     /// This applies to put keys, delete keys, and both bounds of range deletes.
@@ -534,6 +560,7 @@ impl Default for DbOptions {
             target_table_bytes: Self::DEFAULT_TARGET_TABLE_BYTES,
             level_size_multiplier: 10,
             max_l0_files: 8,
+            object_client_trust: ObjectClientTrustMode::default(),
             max_key_bytes: Self::DEFAULT_MAX_KEY_BYTES,
             max_value_bytes: Self::DEFAULT_MAX_VALUE_BYTES,
             block_cache_bytes: Self::DEFAULT_BLOCK_CACHE_BYTES,
@@ -547,6 +574,35 @@ impl Default for DbOptions {
             blob_gc_min_file_bytes: Self::DEFAULT_BLOB_GC_MIN_FILE_BYTES,
         }
     }
+}
+
+/// Policy for trusting or probing an object-store client during open.
+///
+/// This only affects object-store database opens. It does not change the
+/// database file format, WAL format, or recovery rules.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ObjectClientTrustMode {
+    /// Trust that the supplied [`crate::ObjectClient`] satisfies Trine's object
+    /// contract.
+    ///
+    /// This is the default because open should be cheap and predictable in
+    /// production. Use [`crate::verify_object_client_contract`] in CI, process
+    /// startup, or deployment health checks to validate a custom adapter before
+    /// relying on this mode. If the adapter violates conditional-write or
+    /// same-key read-after-write semantics, `Trusted` open will not detect that
+    /// at open time; later WAL, lease, manifest, and recovery checks still fail
+    /// closed when they can observe corruption or fencing conflicts.
+    #[default]
+    Trusted,
+    /// Run the object-client contract probe during each writable object-store
+    /// open.
+    ///
+    /// This mode is useful while developing a new adapter or diagnosing a
+    /// provider. It writes and deletes a small temporary probe object before
+    /// writer ownership is taken. That adds latency, request cost, and a
+    /// permission requirement to open, and proves only the probed key at that
+    /// moment. Read-only opens never run this probe.
+    VerifyOnOpen,
 }
 
 /// Policy for choosing the number of WAL shards (independent append lanes).

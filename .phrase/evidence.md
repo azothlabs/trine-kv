@@ -14998,3 +14998,47 @@ Negative check:
 ### Recommended Next Action
 
 - Tag and push `v0.5.5`, then publish the crate with `cargo publish --locked`.
+
+## 2026-06-22: ObjectClient contract probe moved out of default open path
+
+### Observation
+
+- The writable object-store open path ran the full object-client contract probe
+  by default. That caught unsafe adapters early, but charged every open with
+  extra object-store requests, latency, cleanup risk, and permission
+  requirements.
+- The probe only validates one temporary key at one moment, so it is better
+  suited to adapter conformance checks, CI, process startup, or deployment
+  health checks than to every production open.
+
+### Interpretation
+
+- Object-store opens should trust a configured adapter by default and let the
+  caller decide when to run the health check.
+- The fail-closed open behavior remains useful for adapter development and
+  diagnostics, but it should be explicit.
+
+### Verification
+
+- Added public `verify_object_client_contract` as the object-store adapter
+  health check.
+- Added `ObjectClientTrustMode` with default `Trusted` and opt-in
+  `VerifyOnOpen`, plus `DbOptions::with_object_client_trust`.
+- Writable object-store open now runs the probe only in `VerifyOnOpen`, and
+  avoids probing the same shared storage/WAL client twice.
+- Regression coverage passed:
+  `cargo test -q object_client_health_check_rejects_unsafe_put_if_client`,
+  `cargo test -q object_store_open_trusts_object_client_by_default`,
+  `cargo test -q object_store_verify_on_open_rejects_unsafe_put_if_client`,
+  and `cargo test -q object_store`.
+- Public API/doc checks passed: `cargo rustdoc --all-features -- -D warnings`
+  and `cargo test -q --doc --all-features`.
+- Additional checks passed: `cargo fmt --check`, `git diff --check`,
+  `cargo check -q`, `cargo check -q --all-features`, and
+  `cargo clippy -q --lib`.
+
+### Recommended Next Action
+
+- Keep adapter conformance in deployment automation rather than normal open.
+  Only enable `VerifyOnOpen` for new adapters, temporary diagnostics, or
+  high-risk rollouts where open latency and request cost are acceptable.

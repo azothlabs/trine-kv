@@ -25,10 +25,11 @@ use crate::{
         LsmPointReadSnapshot, LsmTree,
     },
     manifest::{self, ManifestState, ManifestStore},
-    object_store::{ObjectClient, ObjectStoreBackend, verify_object_client_contract},
+    object_store::{ObjectClient, ObjectStoreBackend, verify_object_client_contract_for_open},
     options::{
         BlobLevelMergePolicy, BucketOptions, DbOptions, DurabilityMode, FailOnCorruptionPolicy,
-        FilterPolicy, HostStorageBackend, PrefixFilterPolicy, StorageMode, WriteOptions,
+        FilterPolicy, HostStorageBackend, ObjectClientTrustMode, PrefixFilterPolicy, StorageMode,
+        WriteOptions,
     },
     point_value::PointValue,
     recovery,
@@ -1425,9 +1426,16 @@ impl Db {
         let backend = ObjectStoreBackend::new(Arc::clone(&storage_client));
         let wal_backend = ObjectStoreBackend::new(Arc::clone(&wal_client));
         let db_path = PathBuf::from(prefix.into());
-        if !options.read_only {
-            verify_object_client_contract(&storage_client, &db_path, "storage").await?;
-            verify_object_client_contract(&wal_client, &db_path, "wal").await?;
+        if !options.read_only
+            && matches!(
+                options.object_client_trust,
+                ObjectClientTrustMode::VerifyOnOpen
+            )
+        {
+            verify_object_client_contract_for_open(&storage_client, &db_path, "storage").await?;
+            if !Arc::ptr_eq(&storage_client, &wal_client) {
+                verify_object_client_contract_for_open(&wal_client, &db_path, "wal").await?;
+            }
         }
         let manifest_key = manifest::manifest_path(&db_path)
             .to_string_lossy()
@@ -10169,8 +10177,11 @@ mod tests {
     };
     use crate::{
         bucket::DEFAULT_BUCKET_NAME,
-        object_store::{ETag, ObjectClient, ObjectFuture, ObjectMeta, Precondition, PutIf},
-        options::{BucketOptions, DbOptions, DurabilityMode},
+        object_store::{
+            ETag, ObjectClient, ObjectFuture, ObjectMeta, Precondition, PutIf,
+            verify_object_client_contract,
+        },
+        options::{BucketOptions, DbOptions, DurabilityMode, ObjectClientTrustMode},
         runtime::CancellationToken,
         storage::{StorageCapability, StorageReadBackend},
         substrate::ObjectWriterLease,
@@ -10412,13 +10423,46 @@ mod tests {
     }
 
     #[test]
-    fn object_store_open_rejects_unsafe_put_if_client() {
+    fn object_client_health_check_rejects_unsafe_put_if_client() {
         use crate::object_store::{InMemoryObjectStore, ObjectClient};
 
         let inner: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
         let client: Arc<dyn ObjectClient> = Arc::new(UnsafePutIfObjectStore { inner });
-        let error = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
-            .expect_err("unsafe object client must be rejected");
+        let error = block_on_test_future(verify_object_client_contract(client, "health"))
+            .expect_err("unsafe object client must be rejected by health check");
+
+        assert!(
+            matches!(error, Error::Corruption { ref message } if message.contains("contract probe")),
+            "expected contract probe corruption, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn object_store_open_trusts_object_client_by_default() {
+        use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+        let inner: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+        let client: Arc<dyn ObjectClient> = Arc::new(UnsafePutIfObjectStore { inner });
+        let db = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+            .expect("trusted open does not run the object-client health check");
+
+        assert_eq!(
+            db.options().object_client_trust,
+            ObjectClientTrustMode::Trusted
+        );
+    }
+
+    #[test]
+    fn object_store_verify_on_open_rejects_unsafe_put_if_client() {
+        use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+        let inner: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+        let client: Arc<dyn ObjectClient> = Arc::new(UnsafePutIfObjectStore { inner });
+        let error = block_on_test_future(Db::open_object_store(
+            client,
+            DbOptions::object_store().with_object_client_trust(ObjectClientTrustMode::VerifyOnOpen),
+        ))
+        .expect_err("verify-on-open must reject unsafe object clients");
 
         assert!(
             matches!(error, Error::Corruption { ref message } if message.contains("contract probe")),

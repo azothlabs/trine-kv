@@ -135,11 +135,13 @@ pub struct ObjectMeta {
 /// - `put_if` applies the write only when the precondition holds, otherwise
 ///   reports [`PutIf::PreconditionFailed`] with the current `ETag`.
 ///
-/// Writable object-store opens run a small same-key contract probe against the
-/// storage and WAL clients before taking ownership. The probe catches common
-/// unsafe adapters early, such as unconditional `put_if`, stale `head`, or stale
-/// `get` after a successful conditional write. It is still the implementor's
-/// responsibility to provide these semantics for all keys after open.
+/// Object-store opens trust this contract by default. That keeps open cheap and
+/// predictable, but it also means a faulty adapter can pass open and fail only
+/// later when WAL, lease, manifest, or recovery checks observe the bad behavior.
+/// Run [`verify_object_client_contract`] in CI, process startup, or a deployment
+/// health check before trusting a custom adapter in production. If you need open
+/// itself to fail closed while developing or diagnosing an adapter, configure
+/// [`ObjectClientTrustMode::VerifyOnOpen`](crate::ObjectClientTrustMode).
 ///
 /// # WAL durability sink and split tiers
 ///
@@ -196,12 +198,63 @@ pub trait ObjectClient: Send + Sync {
 
 static OBJECT_CLIENT_CONTRACT_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) async fn verify_object_client_contract(
+/// Verifies the same-key semantics Trine requires from an [`ObjectClient`].
+///
+/// This is a health-check helper for object-store adapters. It writes, reads,
+/// conditionally overwrites, and deletes one temporary probe object under
+/// `prefix`, then returns [`Ok(())`](std::result::Result::Ok) only if the client
+/// behaves like a real compare-and-swap object store for that key.
+///
+/// # What This Checks
+///
+/// The probe verifies:
+///
+/// - `put` stores bytes and returns an `ETag` visible through `head` and `get`;
+/// - `put_if(..., IfNoneMatch)` refuses to overwrite an existing object;
+/// - `put_if(..., IfMatch(wrong_etag))` refuses to overwrite;
+/// - `put_if(..., IfMatch(current_etag))` stores and returns a new `ETag`;
+/// - same-key `head` and `get` observe the bytes from the successful write.
+///
+/// # Limits
+///
+/// This is not a proof that every future request will be correct. It validates
+/// one temporary key at one moment. Use it before deployment, during process
+/// startup, or as a service health check; Trine's open path defaults to trusting
+/// the client so normal opens do not pay these extra object-store requests.
+///
+/// # Parameters
+///
+/// - `client`: object-store adapter to validate.
+/// - `prefix`: object-key prefix where the temporary probe object may be
+///   created. The function appends a unique hidden key and deletes it before
+///   returning. The caller must grant read, write, conditional-write, metadata,
+///   and delete permissions for this prefix.
+///
+/// # Errors
+///
+/// Returns any error from the client. Returns [`Error::Corruption`] when the
+/// observed behavior violates Trine's required object-store semantics. If the
+/// final cleanup delete fails after a successful probe, that cleanup error is
+/// returned so the caller can treat the health check as failed.
+pub async fn verify_object_client_contract(
+    client: Arc<dyn ObjectClient>,
+    prefix: impl Into<String>,
+) -> Result<()> {
+    let key = object_client_contract_probe_key(Path::new(&prefix.into()))?;
+    let result = verify_object_client_contract_at_key(&client, &key).await;
+    let cleanup = client.delete(&key).await;
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+    }
+}
+
+pub(crate) async fn verify_object_client_contract_for_open(
     client: &Arc<dyn ObjectClient>,
     db_path: &Path,
     role: &str,
 ) -> Result<()> {
-    let key = object_client_contract_probe_key(db_path, role)?;
+    let key = object_client_contract_probe_key_for_role(db_path, role)?;
     let result = verify_object_client_contract_at_key(client, &key).await;
     let cleanup = client.delete(&key).await;
     match (result, cleanup) {
@@ -314,7 +367,11 @@ async fn verify_object_client_observed_bytes(
     Ok(())
 }
 
-fn object_client_contract_probe_key(db_path: &Path, role: &str) -> Result<String> {
+fn object_client_contract_probe_key(prefix: &Path) -> Result<String> {
+    object_client_contract_probe_key_for_role(prefix, "health")
+}
+
+fn object_client_contract_probe_key_for_role(db_path: &Path, role: &str) -> Result<String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| Error::Corruption {
