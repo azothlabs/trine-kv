@@ -2,6 +2,37 @@
 
 All public crate releases use Semantic Versioning.
 
+## 0.5.6 - 2026-06-22
+
+Object-store adapter health-check release. This patch moves the object-client
+contract probe out of the default object-store open path, so production opens
+stay cheap while deployments still have an explicit way to validate custom
+adapters before trusting them.
+
+### Changed
+
+- **Object-store opens now trust the supplied `ObjectClient` by default.**
+  `DbOptions::object_client_trust` defaults to
+  `ObjectClientTrustMode::Trusted`, so `Db::open_object_store*` no longer writes
+  temporary probe objects during normal writable opens. This avoids extra
+  object-store requests, latency, cleanup risk, and permission requirements on
+  every open.
+- **Open-time probing is now opt-in.**
+  `ObjectClientTrustMode::VerifyOnOpen` preserves the previous fail-closed
+  behavior for adapter development, temporary diagnostics, or high-risk
+  rollouts. When storage and WAL clients are the same shared `Arc`, the probe is
+  run only once.
+
+### Added
+
+- **`verify_object_client_contract(client, prefix)`**: a public health-check
+  helper for CI, process startup, and deployment checks. It validates same-key
+  `put`, `head`, `get`, `IfNoneMatch`, `IfMatch`, and ETag advancement using a
+  temporary object under the supplied prefix, then deletes the probe key.
+- **`DbOptions::with_object_client_trust`** and
+  **`ObjectClientTrustMode`**: explicit configuration for whether object-store
+  open should trust the client or run the contract probe during writable open.
+
 ## 0.5.5 - 2026-06-20
 
 Object-store production hardening release. This patch keeps the `0.5.x`

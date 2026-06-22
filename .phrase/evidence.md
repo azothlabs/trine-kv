@@ -15042,3 +15042,38 @@ Negative check:
 - Keep adapter conformance in deployment automation rather than normal open.
   Only enable `VerifyOnOpen` for new adapters, temporary diagnostics, or
   high-risk rollouts where open latency and request cost are acceptable.
+
+## 2026-06-22: 0.5.6 release gate
+
+### Observation
+
+- Preparing `0.5.6` packages the object-client probing policy adjustment after
+  `v0.5.5`: default object-store opens trust the configured client, the probe is
+  exposed as a public health-check helper, and `VerifyOnOpen` remains opt-in.
+
+### Interpretation
+
+- This is a patch release: storage format and WAL/recovery semantics are
+  unchanged, while object-store open no longer pays the conformance-probe cost
+  by default.
+
+### Verification
+
+- Updated `Cargo.toml`/`Cargo.lock` to `0.5.6` and added the `CHANGELOG.md`
+  entry.
+- Checks passed: `cargo fmt --check`, `git diff --check`,
+  `cargo check -q --all-features`,
+  `cargo clippy -q --all-targets --all-features -- -D warnings`,
+  `cargo test -q --all-targets --all-features`,
+  `cargo check -q --target wasm32-unknown-unknown --lib`,
+  `cargo check -q --target wasm32-wasip1 --lib`,
+  `cargo clippy -q --target wasm32-unknown-unknown --lib -- -D warnings`,
+  `cargo rustdoc --all-features -- -D warnings`,
+  `cargo test -q --doc --all-features`, and the five release examples.
+- Package/publish checks passed: `cargo package --list`,
+  `cargo package --locked`, and `cargo publish --dry-run --locked`. The package
+  contains 118 files, 2.7MiB unpacked and about 492.5KiB compressed.
+
+### Recommended Next Action
+
+- Tag and push `v0.5.6`, then publish the crate with `cargo publish --locked`.
