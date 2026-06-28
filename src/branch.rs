@@ -36,7 +36,7 @@
 //!
 //! [`Branch::range`] is a lazy [`BranchRange`] iterator: the branch level, each
 //! ancestor, and the root are streamed from their own sorted scans and k-way
-//! merged on the fly (no full materialization).
+//! merged on the fly (no full copy).
 
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Bound;
@@ -375,7 +375,7 @@ impl<'db> Branch<'db> {
     /// parent's state as of the fork (and over each ancestor branch, for a nested
     /// branch): branch puts replace and branch deletes hide the parent's rows.
     /// Returns a [`BranchRange`] iterator yielding the merged rows in key order
-    /// without materializing them — each branch level and the root are streamed
+    /// without building a full copy — each branch level and the root are streamed
     /// from their own sorted scans and k-way merged on the fly.
     ///
     /// # Errors
@@ -564,6 +564,25 @@ fn persist_registry(db: &Db, name: &str, entry: &RegistryEntry) -> Result<()> {
         .put_sync(name.as_bytes().to_vec(), entry.encode())
 }
 
+async fn persist_registry_async(db: &Db, name: &str, entry: &RegistryEntry) -> Result<()> {
+    db.bucket(registry_bucket())
+        .await?
+        .put(name.as_bytes().to_vec(), entry.encode())
+        .await
+}
+
+async fn list_branches_async(db: &Db) -> Result<Vec<String>> {
+    let registry = db.bucket(registry_bucket()).await?;
+    let mut names = Vec::new();
+    for row in registry.range(&KeyRange::all()).await? {
+        let row = row?;
+        names.push(String::from_utf8(row.key).map_err(|_| Error::Corruption {
+            message: "branch registry holds a non-utf8 name".to_owned(),
+        })?);
+    }
+    Ok(names)
+}
+
 /// The checkpoint name pinning a durable branch's fork. A checkpoint is durable
 /// metadata that the retained-history floor and GC respect, so the parent keeps
 /// the branch's fork history across restarts.
@@ -638,6 +657,41 @@ impl Db {
                 written_buckets: BTreeSet::new(),
             },
         )
+    }
+
+    /// Async-first form of [`Db::create_branch`]. Required for object-store
+    /// backends because both the fork checkpoint and the branch registry are
+    /// durable metadata writes.
+    ///
+    /// # Errors
+    ///
+    /// Same validation and persistence errors as [`Db::create_branch`].
+    pub async fn create_branch_at(&self, name: &str, from: ReadVersion) -> Result<()> {
+        if let Some(existing) = self.read_registry_async(name).await? {
+            if existing.fork == from {
+                return Ok(());
+            }
+            return Err(Error::invalid_options(
+                "branch already exists with a different fork version",
+            ));
+        }
+        match self
+            .create_checkpoint_at(&fork_checkpoint(name), from)
+            .await
+        {
+            Ok(()) | Err(Error::CheckpointAlreadyExists { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        persist_registry_async(
+            self,
+            name,
+            &RegistryEntry {
+                fork: from,
+                parent: None,
+                written_buckets: BTreeSet::new(),
+            },
+        )
+        .await
     }
 
     /// Creates a **durable** named branch forked from another branch `parent` at
@@ -807,6 +861,53 @@ impl Db {
             .delete_sync(name.as_bytes().to_vec())
     }
 
+    /// Async-first form of [`Db::delete_branch`]. Required for object-store
+    /// backends because branch metadata and bucket deletion publish durable
+    /// metadata through async compare-and-swap calls.
+    ///
+    /// # Errors
+    ///
+    /// Same validation and persistence errors as [`Db::delete_branch`].
+    pub async fn delete_branch_async(&self, name: &str) -> Result<()> {
+        let entry = self
+            .read_registry_async(name)
+            .await?
+            .ok_or_else(|| Error::invalid_options("no such branch"))?;
+        for other in list_branches_async(self).await? {
+            if other == name {
+                continue;
+            }
+            if let Some(other_entry) = self.read_registry_async(&other).await? {
+                if other_entry.parent.as_deref() == Some(name) {
+                    return Err(Error::invalid_options(
+                        "cannot delete a branch that still has child branches",
+                    ));
+                }
+            }
+        }
+        match self.delete_checkpoint(&fork_checkpoint(name)).await {
+            Ok(()) | Err(Error::CheckpointNotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        for user_bucket in &entry.written_buckets {
+            let data = data_bucket(name, user_bucket);
+            match self.drop_bucket(data.clone()).await {
+                Ok(()) => {}
+                Err(Error::UnsupportedBackend { .. }) => {
+                    self.bucket(data)
+                        .await?
+                        .delete_range(KeyRange::all())
+                        .await?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.bucket(registry_bucket())
+            .await?
+            .delete(name.as_bytes().to_vec())
+            .await
+    }
+
     /// Returns a durable branch's lineage (its fork version and parent branch),
     /// or `None` when no such branch exists — without assembling a read chain or
     /// opening any data bucket.
@@ -833,6 +934,18 @@ impl Db {
         match self
             .bucket_sync(registry_bucket())?
             .get_sync(name.as_bytes())?
+        {
+            Some(bytes) => Ok(Some(RegistryEntry::decode(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn read_registry_async(&self, name: &str) -> Result<Option<RegistryEntry>> {
+        match self
+            .bucket(registry_bucket())
+            .await?
+            .get(name.as_bytes())
+            .await?
         {
             Some(bytes) => Ok(Some(RegistryEntry::decode(&bytes)?)),
             None => Ok(None),

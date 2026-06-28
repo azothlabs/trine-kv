@@ -2,6 +2,22 @@
 
 All public crate releases use Semantic Versioning.
 
+## 0.5.7 - 2026-06-28
+
+Object-store branch metadata release. This patch keeps the `0.5.x` storage
+format compatible while making durable branch creation and deletion usable on
+object-store backends.
+
+### Added
+
+- **`Db::create_checkpoint_at`**: async checkpoint creation for an exact retained
+  read version, including object-store manifest CAS support.
+- **`Db::create_branch_at`**: async durable branch creation from an exact
+  retained read version.
+- **`Db::delete_branch_async`**: async durable branch deletion for object-store
+  backends, including checkpoint release, branch data bucket cleanup, and branch
+  registry updates.
+
 ## 0.5.6 - 2026-06-22
 
 Object-store adapter health-check release. This patch moves the object-client

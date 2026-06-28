@@ -3965,6 +3965,38 @@ impl Db {
         self.record_checkpoint(name, version.to_sequence())
     }
 
+    /// Async-first form of [`Db::create_checkpoint_at_sync`]. Object-store
+    /// backends must publish manifest metadata through this path.
+    ///
+    /// # Errors
+    ///
+    /// Same validation and persistence errors as
+    /// [`Db::create_checkpoint_at_sync`].
+    pub async fn create_checkpoint_at(&self, name: &str, version: ReadVersion) -> Result<()> {
+        self.ensure_open()?;
+        validate_checkpoint_name(name)?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+        let _pin = self.snapshot_at(version)?;
+
+        if self.inner.options.storage_mode.is_object_store_persistent() {
+            let (mut object, _serialize) = self.checkout_object_manifest().await?;
+            object
+                .create_checkpoint(name.to_owned(), version.to_sequence())
+                .await?;
+            self.install_object_manifest(object)?;
+            return Ok(());
+        }
+
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        if self.inner.options.storage_mode.is_browser_persistent() {
+            return self.create_checkpoint_at_sync(name, version);
+        }
+
+        self.create_checkpoint_at_sync(name, version)
+    }
+
     /// Records a checkpoint pinning `sequence`, in the manifest (persistent) or
     /// the in-memory registry. Shared by [`Self::create_checkpoint_sync`] and
     /// [`Self::create_checkpoint_at_sync`].
