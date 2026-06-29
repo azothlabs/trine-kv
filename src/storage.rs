@@ -15,7 +15,9 @@ use std::{
 
 use crate::{
     block::BlockReadSource,
-    durability::{sync_dir_after_renames, sync_parent_dir_after_rename},
+    durability::{
+        requires_parent_dir_sync_after_rename, sync_dir_after_renames, sync_parent_dir_after_rename,
+    },
     error::{Error, Result},
     io::{
         BlockingAdapterIoDriver, InlineIoDriver, IoAppendObject, IoCompletion, IoDriver,
@@ -1898,7 +1900,7 @@ impl StorageObjectWriteBackend for NativeFileBackend {
                 Box::pin(async move {
                     let (path, tmp_path) = prepare_native_file_object_write(&object, durability)?;
                     let completion = driver.submit_write_temp_rename_path(
-                        path, tmp_path, bytes, durability, true, false,
+                        path, tmp_path, bytes, durability, true, true,
                     )?;
                     record_platform_io_task(
                         task_metrics.as_ref(),
@@ -3583,7 +3585,7 @@ fn rewrite_native_file_wal(
         sync_native_file_for_durability(&file, durability)?;
     }
     fs::rename(&tmp_path, &path)?;
-    if durability == DurabilityMode::SyncAll {
+    if requires_parent_dir_sync_after_rename(durability) {
         sync_native_file_parent_directory_after_rename(&path)?;
     }
 
@@ -3746,6 +3748,9 @@ fn write_native_file_object(
         sync_native_file_for_durability(&file, durability)?;
     }
     fs::rename(&tmp_path, &path)?;
+    if requires_parent_dir_sync_after_rename(durability) {
+        sync_native_file_parent_directory_after_rename(&path)?;
+    }
 
     Ok(())
 }
@@ -3772,7 +3777,7 @@ fn publish_manifest_to_native_file(
         sync_native_file_for_durability(&file, durability)?;
     }
     fs::rename(&tmp_path, &path)?;
-    if durability == DurabilityMode::SyncAll {
+    if requires_parent_dir_sync_after_rename(durability) {
         sync_native_file_parent_directory_after_rename(&path)?;
     }
 

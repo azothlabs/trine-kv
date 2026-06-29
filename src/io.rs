@@ -440,7 +440,7 @@ enum PlatformIoTask {
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
         create_parent: bool,
-        sync_parent_on_sync_all: bool,
+        sync_parent_after_rename: bool,
         completion: IoCompletion<()>,
     },
     Append {
@@ -552,7 +552,7 @@ impl PlatformIoDriver {
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
         create_parent: bool,
-        sync_parent_on_sync_all: bool,
+        sync_parent_after_rename: bool,
     ) -> Result<IoCompletion<()>> {
         let completion = IoCompletion::new();
         let waiter = completion.clone();
@@ -562,7 +562,7 @@ impl PlatformIoDriver {
             bytes,
             durability,
             create_parent,
-            sync_parent_on_sync_all,
+            sync_parent_after_rename,
             completion,
         })?;
         Ok(waiter)
@@ -785,7 +785,7 @@ impl PlatformIoTask {
                 bytes,
                 durability,
                 create_parent,
-                sync_parent_on_sync_all,
+                sync_parent_after_rename,
                 completion,
             } => {
                 complete_platform_io(
@@ -796,7 +796,7 @@ impl PlatformIoTask {
                         &bytes,
                         durability,
                         create_parent,
-                        sync_parent_on_sync_all,
+                        sync_parent_after_rename,
                     ),
                 );
             }
@@ -882,7 +882,7 @@ impl PlatformIoTask {
                 bytes,
                 durability,
                 create_parent,
-                sync_parent_on_sync_all,
+                sync_parent_after_rename,
                 completion,
             } => {
                 complete_platform_io(
@@ -893,7 +893,7 @@ impl PlatformIoTask {
                         bytes,
                         durability,
                         create_parent,
-                        sync_parent_on_sync_all,
+                        sync_parent_after_rename,
                     )
                     .await,
                 );

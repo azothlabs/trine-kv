@@ -585,13 +585,16 @@ pub enum ObjectClientTrustMode {
     /// Trust that the supplied [`crate::ObjectClient`] satisfies Trine's object
     /// contract.
     ///
-    /// This is the default because open should be cheap and predictable in
-    /// production. Use [`crate::verify_object_client_contract`] in CI, process
-    /// startup, or deployment health checks to validate a custom adapter before
-    /// relying on this mode. If the adapter violates conditional-write or
-    /// same-key read-after-write semantics, `Trusted` open will not detect that
-    /// at open time; later WAL, lease, manifest, and recovery checks still fail
-    /// closed when they can observe corruption or fencing conflicts.
+    /// This is the default because normal opens should be cheap and predictable
+    /// after an adapter has already been qualified. It is not a safety proof and
+    /// it does not probe the backend during open. Use
+    /// [`crate::verify_object_client_contract`] in CI, process startup, or a
+    /// deployment health check before relying on a custom adapter in this mode.
+    ///
+    /// If the adapter violates conditional-write or same-key read-after-write
+    /// semantics, `Trusted` open will not detect that at open time; later WAL,
+    /// lease, manifest, and recovery checks still fail closed when they can
+    /// observe corruption or fencing conflicts.
     #[default]
     Trusted,
     /// Run the object-client contract probe during each writable object-store

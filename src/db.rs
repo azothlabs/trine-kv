@@ -1426,6 +1426,9 @@ impl Db {
         let backend = ObjectStoreBackend::new(Arc::clone(&storage_client));
         let wal_backend = ObjectStoreBackend::new(Arc::clone(&wal_client));
         let db_path = PathBuf::from(prefix.into());
+        // The default trust mode assumes adapter qualification happened outside
+        // open (CI/startup/health check). VerifyOnOpen is the explicit
+        // fail-closed mode for deployments that want this open call to probe.
         if !options.read_only
             && matches!(
                 options.object_client_trust,

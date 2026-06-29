@@ -656,50 +656,6 @@ impl LsmTree {
         Ok(batch.scatter(&unique_values))
     }
 
-    pub(crate) fn memtable_range_tombstones_for_read_sequence(
-        &self,
-        read_sequence: Sequence,
-    ) -> Result<RangeTombstoneIndex<RangeTombstone>> {
-        self.memtable_range_tombstones_with_deltas(!self.delta_mirror_covers(read_sequence))
-    }
-
-    fn memtable_range_tombstones_with_deltas(
-        &self,
-        include_deltas: bool,
-    ) -> Result<RangeTombstoneIndex<RangeTombstone>> {
-        let mut tombstones = Vec::new();
-
-        if include_deltas {
-            let delta_snapshot = self.delta_snapshot()?;
-            for delta in delta_snapshot.deltas() {
-                tombstones.extend(delta.range_tombstones.iter().cloned());
-            }
-        }
-
-        if self.range_tombstone_bytes.load(Ordering::Acquire) != 0 {
-            let active_tombstones = self
-                .range_tombstones
-                .read()
-                .map_err(|_| lock_poisoned("range tombstones"))?;
-            tombstones.extend(active_tombstones.iter().cloned());
-        }
-
-        if !self.has_immutable_memtable_fast() {
-            return Ok(RangeTombstoneIndex::new(tombstones));
-        }
-
-        let immutable_memtables = self
-            .immutable_memtables
-            .read()
-            .map_err(|_| lock_poisoned("immutable memtable queue"))?
-            .clone();
-        for immutable in immutable_memtables {
-            tombstones.extend(immutable.range_tombstones.iter().cloned());
-        }
-
-        Ok(RangeTombstoneIndex::new(tombstones))
-    }
-
     fn newest_visible_memtable_point_candidate_in_snapshot(
         snapshot: &LsmPointReadSnapshot,
         key: &[u8],

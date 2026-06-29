@@ -19,6 +19,19 @@ pub(crate) fn requires_file_sync(durability: DurabilityMode) -> bool {
     )
 }
 
+/// Whether a temp-file + rename publish must also sync the parent directory.
+///
+/// The file sync makes the bytes durable; the directory sync makes the new name
+/// durable. `SyncAllStrict` is stronger than `SyncAll`, so it must include this
+/// metadata step too.
+#[must_use]
+pub(crate) const fn requires_parent_dir_sync_after_rename(durability: DurabilityMode) -> bool {
+    matches!(
+        durability,
+        DurabilityMode::SyncAll | DurabilityMode::SyncAllStrict
+    )
+}
+
 /// Whether `durability` is the strict tier that must survive sudden power loss.
 // Only the macOS sync path branches on strictness (it picks F_FULLFSYNC vs
 // plain fsync); every other target's real sync already flushes durably, so this
@@ -211,8 +224,8 @@ mod tests {
     };
 
     use super::{
-        durability_is_strict, requires_file_sync, sync_dir_after_renames, sync_file_for_durability,
-        sync_parent_dir_after_rename,
+        durability_is_strict, requires_file_sync, requires_parent_dir_sync_after_rename,
+        sync_dir_after_renames, sync_file_for_durability, sync_parent_dir_after_rename,
     };
     use crate::options::DurabilityMode;
 
@@ -223,6 +236,22 @@ mod tests {
         assert!(requires_file_sync(DurabilityMode::SyncData));
         assert!(requires_file_sync(DurabilityMode::SyncAll));
         assert!(requires_file_sync(DurabilityMode::SyncAllStrict));
+
+        assert!(!requires_parent_dir_sync_after_rename(
+            DurabilityMode::Buffered
+        ));
+        assert!(!requires_parent_dir_sync_after_rename(
+            DurabilityMode::Flush
+        ));
+        assert!(!requires_parent_dir_sync_after_rename(
+            DurabilityMode::SyncData
+        ));
+        assert!(requires_parent_dir_sync_after_rename(
+            DurabilityMode::SyncAll
+        ));
+        assert!(requires_parent_dir_sync_after_rename(
+            DurabilityMode::SyncAllStrict
+        ));
 
         assert!(!durability_is_strict(DurabilityMode::SyncAll));
         assert!(durability_is_strict(DurabilityMode::SyncAllStrict));

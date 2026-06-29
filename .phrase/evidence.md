@@ -15077,3 +15077,59 @@ Negative check:
 ### Recommended Next Action
 
 - Tag and push `v0.5.6`, then publish the crate with `cargo publish --locked`.
+
+## 2026-06-29: Transaction conflict and strict rename durability hardening
+
+### Observation
+
+- Transaction conflict checks captured the table version before active and
+  immutable memtable sources. Ordinary read and scan paths captured memtable
+  sources before the table version because flush publishes the L0 table before
+  removing the immutable memtable.
+- Rename-backed native file publishes synced the parent directory only for
+  `SyncAll`, leaving `SyncAllStrict` without the directory-entry durability step.
+  Ordinary object writes also used temp-file rename without a parent-directory
+  sync at the strong durability tiers.
+- Object-store open still intentionally defaults to trusting an already
+  qualified `ObjectClient`.
+
+### Interpretation
+
+- Transaction validation must use the same source-capture ordering as reads:
+  seeing both a flushed immutable memtable and its table copy is safe, but
+  missing both can let a stale transaction commit.
+- `SyncAllStrict` is stronger than `SyncAll`; every rename publish that asks for
+  the strong metadata boundary must sync the parent directory for both modes.
+- The object-client trust default does not need a behavior change, but code
+  comments should make clear that the conformance probe belongs in CI, startup,
+  health checks, or explicit `VerifyOnOpen`.
+
+### Verification
+
+- Added conflict-source snapshots for transaction validation. The snapshot
+  captures active memtable, active range tombstones, immutable memtables, and
+  then the table version, matching read/scan ordering.
+- Removed the stale conflict-only memtable tombstone helper from the read module.
+- Added focused regressions for point conflicts, range point conflicts, and
+  range-tombstone conflicts after the immutable queue is cleared from under a
+  captured conflict snapshot.
+- Added `requires_parent_dir_sync_after_rename` and routed native, platform
+  thread-pool, and native platform temp-rename paths through it. Ordinary
+  object writes now request parent-directory sync at `SyncAll` and
+  `SyncAllStrict` too.
+- Clarified object-store trusted-open comments without changing behavior.
+- Checks passed: `cargo test -q conflict_snapshot`,
+  `cargo test -q requires_file_sync_and_strictness_classify_modes`,
+  `cargo check -q`, `cargo check -q --features platform-io`,
+  `cargo check -q --features platform-io-native`,
+  `cargo check -q --all-features`, `cargo test -q --lib`,
+  `cargo test -q --all-features --lib`, `cargo clippy -q --lib`,
+  `cargo clippy -q --all-features --lib`, `cargo fmt --check`, and
+  `git diff --check`.
+
+### Recommended Next Action
+
+- Treat the transaction conflict and strict rename durability blockers as fixed.
+  The remaining object-store trust policy is an operational deployment choice:
+  keep `Trusted` for qualified adapters and use `VerifyOnOpen` only when open
+  should perform the probe.

@@ -6,6 +6,7 @@ use std::{
 };
 
 use crate::{
+    durability::requires_parent_dir_sync_after_rename,
     error::{Error, Result},
     options::DurabilityMode,
     storage::StorageReadBuffer,
@@ -112,7 +113,7 @@ pub(super) fn write_temp_rename(
     bytes: &[u8],
     durability: DurabilityMode,
     create_parent: bool,
-    sync_parent_on_sync_all: bool,
+    sync_parent_after_rename: bool,
 ) -> Result<()> {
     if create_parent {
         if let Some(parent) = tmp_path.parent() {
@@ -127,7 +128,7 @@ pub(super) fn write_temp_rename(
     }
 
     fs::rename(tmp_path, path)?;
-    if sync_parent_on_sync_all && durability == DurabilityMode::SyncAll {
+    if sync_parent_after_rename && requires_parent_dir_sync_after_rename(durability) {
         sync_parent_directory(path)?;
     }
     Ok(())

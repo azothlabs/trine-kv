@@ -6,6 +6,7 @@ use std::{
 };
 
 use crate::{
+    durability::requires_parent_dir_sync_after_rename,
     error::{Error, Result},
     options::DurabilityMode,
     storage::StorageReadBuffer,
@@ -170,7 +171,7 @@ pub(super) async fn write_temp_rename(
     bytes: Arc<[u8]>,
     durability: DurabilityMode,
     create_parent: bool,
-    sync_parent_on_sync_all: bool,
+    sync_parent_after_rename: bool,
 ) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -186,7 +187,7 @@ pub(super) async fn write_temp_rename(
         compio::fs::rename(&tmp_path, &path)
             .await
             .map_err(|error| rename_error(&tmp_path, &path, &error))?;
-        if sync_parent_on_sync_all && durability == DurabilityMode::SyncAll {
+        if sync_parent_after_rename && requires_parent_dir_sync_after_rename(durability) {
             sync_parent_directory(&path).await?;
         }
         Ok(())
@@ -214,7 +215,7 @@ pub(super) async fn write_temp_rename(
         compio::fs::rename(&tmp_path, &path)
             .await
             .map_err(|error| rename_error(&tmp_path, &path, &error))?;
-        if sync_parent_on_sync_all && durability == DurabilityMode::SyncAll {
+        if sync_parent_after_rename && requires_parent_dir_sync_after_rename(durability) {
             sync_parent_directory(&path).await?;
         }
         Ok(())
