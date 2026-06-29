@@ -26,6 +26,39 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-06-29: 0.5.8 Local Release Prep
+
+### Observation
+
+- `v0.5.7` already points at the prior object-store branch metadata release.
+- The post-`0.5.7` hardening commit closes the transaction conflict snapshot
+  flush window and strengthens native parent-directory sync after rename.
+- Release metadata was prepared locally as `0.5.8`; network publishing and
+  remote push remain intentionally out of scope for this agent run.
+
+### Interpretation
+
+- The fixes are patch-compatible with the `0.5.x` storage format and should be
+  released as `0.5.8`, not as a replacement for the existing `0.5.7` tag.
+
+### Verification
+
+- `cargo check -q --all-features`
+- `cargo test -q conflict_snapshot`
+- `cargo test -q requires_file_sync_and_strictness_classify_modes`
+- `cargo fmt --check`
+- `git diff --check`
+
+### Remaining Blockers
+
+- crates.io publish and remote git push still need the user's network-enabled
+  environment.
+
+### Recommended Next Action
+
+- After the local gate passes and the tag is created, publish with the standard
+  release workflow from a network-enabled shell.
+
 ## 2026-06-20: Persistent Decode Resource Bounds
 
 ### Observation

@@ -2,6 +2,28 @@
 
 All public crate releases use Semantic Versioning.
 
+## 0.5.8 - 2026-06-29
+
+Transaction and native durability hardening release. This patch keeps the
+`0.5.x` storage format compatible while closing a flush race in serializable
+transaction conflict checks and strengthening local rename publish durability.
+
+### Fixed
+
+- Transaction conflict validation now captures the relevant memtable sources
+  before reading the table version, matching the engine's read ordering and
+  preventing a flush handoff from hiding a committed write from conflict checks.
+- Native file publishes now request a parent-directory sync after rename when
+  strict durability requires the directory entry to be stable.
+- Ordinary native object writes now use the same parent-directory sync boundary
+  for `SyncAll` and `SyncAllStrict` durability modes.
+
+### Changed
+
+- Clarified object-store trust-mode comments so callers can distinguish
+  production health checks from the trusted-client fast path without changing
+  runtime behavior.
+
 ## 0.5.7 - 2026-06-28
 
 Object-store branch metadata release. This patch keeps the `0.5.x` storage
