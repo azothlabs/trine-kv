@@ -2,6 +2,43 @@
 
 All public crate releases use Semantic Versioning.
 
+## 0.5.9 - 2026-07-06
+
+Maintenance hardening release. This patch keeps the `0.5.x` storage format
+compatible while tightening recovery, background maintenance, native WAL
+durability, and platform-specific build coverage.
+
+### Added
+
+- **`S3ClientOptions` and `ObjectStoreClient::s3_with_options`**: S3-compatible
+  endpoints can now opt in to plain HTTP explicitly for local or otherwise
+  trusted deployments.
+
+### Fixed
+
+- Multi-shard native group commit now writes confirmed WAL marker temporary
+  files with shard-distinct names, avoiding a race where concurrent marker
+  publishes could share `trine.wal.tmp` and fail with `NotFound`.
+- SSTable reads and WAL recovery now reject additional short, malformed, or
+  inconsistent inputs before they can be treated as durable state.
+- Object-store maintenance and blob cleanup paths now preserve the relevant
+  state and error category instead of collapsing background failures into a
+  generic corruption report.
+- The wasm background-worker unsupported-backend path now resolves the crate
+  error type under wasm checks.
+- Platform I/O tests now cover the native read-append path and align writer
+  lease expectations with each platform driver.
+
+### Changed
+
+- Large database, storage, table, WAL, blob, manifest, and benchmark modules
+  were split into focused submodules without changing the public storage format.
+- Native open, iterator scan grouping, and maintenance internals were refactored
+  to reduce duplicated state assembly and hidden invariants.
+- `ObjectStoreClient::s3` keeps HTTP disabled even for custom endpoints; use
+  `s3_with_options` with `S3ClientOptions::allow_http` for local MinIO-style
+  endpoints.
+
 ## 0.5.8 - 2026-06-29
 
 Transaction and native durability hardening release. This patch keeps the
