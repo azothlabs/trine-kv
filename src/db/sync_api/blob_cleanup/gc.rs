@@ -88,7 +88,9 @@ impl Db {
             return Err(error);
         }
 
-        let obsolete_tables = self.install_compacted_tables(outputs)?;
+        let obsolete_tables = self
+            .install_compacted_tables(outputs)
+            .map_err(|error| self.close_after_durable_publish_error("blob GC", &error))?;
         self.retire_obsolete_table_files(db_path, obsolete_tables)?;
         self.inner.blob_gc_runs.fetch_add(1, Ordering::AcqRel);
         self.inner
@@ -183,11 +185,15 @@ impl Db {
             .publish_compacted_tables_native_async(&outputs, &obsolete_blob_ids)
             .await
         {
-            let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+            if !self.closed_after_durable_publish_error() {
+                let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+            }
             return Err(error);
         }
 
-        let obsolete_tables = self.install_compacted_tables(outputs)?;
+        let obsolete_tables = self
+            .install_compacted_tables(outputs)
+            .map_err(|error| self.close_after_durable_publish_error("blob GC", &error))?;
         self.retire_obsolete_table_files_native_async(db_path, obsolete_tables)
             .await?;
         self.inner.blob_gc_runs.fetch_add(1, Ordering::AcqRel);
@@ -287,13 +293,17 @@ impl Db {
             .publish_compacted_tables_browser_async(&outputs, &obsolete_blob_ids)
             .await
         {
-            let _ = self
-                .remove_storage_files_browser_async(db_path, &written_table_ids)
-                .await;
+            if !self.closed_after_durable_publish_error() {
+                let _ = self
+                    .remove_storage_files_browser_async(db_path, &written_table_ids)
+                    .await;
+            }
             return Err(error);
         }
 
-        let obsolete_tables = self.install_compacted_tables(outputs)?;
+        let obsolete_tables = self
+            .install_compacted_tables(outputs)
+            .map_err(|error| self.close_after_durable_publish_error("blob GC", &error))?;
         self.retire_obsolete_table_files_browser_async(db_path, obsolete_tables)
             .await?;
         self.inner.blob_gc_runs.fetch_add(1, Ordering::AcqRel);

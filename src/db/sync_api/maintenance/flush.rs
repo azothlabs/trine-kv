@@ -391,7 +391,8 @@ impl Db {
                     remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
                 return Err(error);
             }
-            Self::install_flushed_tables(flush_inputs, written_tables)?;
+            Self::install_flushed_tables(flush_inputs, written_tables)
+                .map_err(|error| self.close_after_durable_publish_error("flush", &error))?;
             self.rewrite_wal_after_replay_floor(flush_sequence)?;
         }
         self.l0_pressure_exceeded()
@@ -494,11 +495,14 @@ impl Db {
             .publish_flushed_tables_native_async(&written_tables, flush_sequence)
             .await
         {
-            let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+            if !self.closed_after_durable_publish_error() {
+                let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+            }
             return Err(error);
         }
 
-        Self::install_flushed_tables(flush_inputs, written_tables)?;
+        Self::install_flushed_tables(flush_inputs, written_tables)
+            .map_err(|error| self.close_after_durable_publish_error("flush", &error))?;
         self.rewrite_wal_after_replay_floor_async(flush_sequence)
             .await?;
         self.l0_pressure_exceeded()
@@ -532,6 +536,7 @@ impl Db {
             .lock()
             .map_err(|_| lock_poisoned("manifest store"))?
             .install_prepared_publish(prepared)
+            .map_err(|error| self.close_after_durable_publish_error("flush", &error))
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -577,6 +582,7 @@ impl Db {
             .lock()
             .map_err(|_| lock_poisoned("manifest store"))?
             .install_prepared_publish(prepared)
+            .map_err(|error| self.close_after_durable_publish_error("compaction", &error))
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -665,12 +671,15 @@ impl Db {
             .publish_flushed_tables_browser_async(&written_tables, flush_sequence)
             .await
         {
-            let _ = self
-                .remove_storage_files_browser_async(db_path, &written_table_ids)
-                .await;
+            if !self.closed_after_durable_publish_error() {
+                let _ = self
+                    .remove_storage_files_browser_async(db_path, &written_table_ids)
+                    .await;
+            }
             return Err(error);
         }
-        Self::install_flushed_tables(flush_inputs, written_tables)?;
+        Self::install_flushed_tables(flush_inputs, written_tables)
+            .map_err(|error| self.close_after_durable_publish_error("flush", &error))?;
         self.rewrite_wal_after_replay_floor_browser_async(db_path, flush_sequence)
             .await?;
         self.l0_pressure_exceeded()
@@ -705,6 +714,7 @@ impl Db {
             .lock()
             .map_err(|_| lock_poisoned("manifest store"))?
             .install_prepared_publish(prepared)
+            .map_err(|error| self.close_after_durable_publish_error("flush", &error))
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]

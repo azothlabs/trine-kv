@@ -149,7 +149,9 @@ impl Db {
             return Err(error);
         }
 
-        let obsolete_tables = self.install_compacted_tables(written_tables)?;
+        let obsolete_tables = self
+            .install_compacted_tables(written_tables)
+            .map_err(|error| self.close_after_durable_publish_error("compaction", &error))?;
         self.record_compaction_stats_from_tables(
             compaction_inputs.len(),
             &input_tables_for_stats,
@@ -296,11 +298,15 @@ impl Db {
             .publish_compacted_tables_native_async(&written_tables, &obsolete_blob_ids)
             .await
         {
-            let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+            if !self.closed_after_durable_publish_error() {
+                let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+            }
             return Err(error);
         }
 
-        let obsolete_tables = self.install_compacted_tables(written_tables)?;
+        let obsolete_tables = self
+            .install_compacted_tables(written_tables)
+            .map_err(|error| self.close_after_durable_publish_error("compaction", &error))?;
         self.record_compaction_stats_from_tables(
             compaction_inputs.len(),
             &input_tables,
@@ -403,13 +409,17 @@ impl Db {
             .publish_compacted_tables_browser_async(&written_tables, &obsolete_blob_ids)
             .await
         {
-            let _ = self
-                .remove_storage_files_browser_async(db_path, &written_table_ids)
-                .await;
+            if !self.closed_after_durable_publish_error() {
+                let _ = self
+                    .remove_storage_files_browser_async(db_path, &written_table_ids)
+                    .await;
+            }
             return Err(error);
         }
 
-        let obsolete_tables = self.install_compacted_tables(written_tables)?;
+        let obsolete_tables = self
+            .install_compacted_tables(written_tables)
+            .map_err(|error| self.close_after_durable_publish_error("compaction", &error))?;
         self.record_compaction_stats_from_tables(
             compaction_inputs.len(),
             &input_tables,

@@ -143,7 +143,9 @@ impl Db {
             object
                 .create_checkpoint(name.to_owned(), version.to_sequence())
                 .await?;
-            self.install_object_manifest(object)?;
+            self.install_object_manifest(object).map_err(|error| {
+                self.close_after_durable_publish_error("checkpoint creation", &error)
+            })?;
             return Ok(());
         }
 

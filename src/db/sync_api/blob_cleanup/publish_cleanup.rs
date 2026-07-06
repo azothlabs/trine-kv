@@ -12,6 +12,27 @@ use super::{
 use crate::storage::{StorageObjectDeleteBackend, StorageObjectId};
 
 impl Db {
+    pub(in crate::db) fn close_after_durable_publish_error(
+        &self,
+        operation: &'static str,
+        error: &Error,
+    ) -> Error {
+        let error = Error::Corruption {
+            message: format!(
+                "{operation} published durable state but failed to update local state: {error}; \
+                 database handle closed; reopen persistent databases to recover"
+            ),
+        };
+        self.inner.closed.store(true, Ordering::Release);
+        self.inner.maintenance.record_error(&error);
+        self.inner.maintenance.shutdown();
+        error
+    }
+
+    pub(in crate::db) fn closed_after_durable_publish_error(&self) -> bool {
+        self.inner.closed.load(Ordering::Acquire)
+    }
+
     pub(in crate::db) fn next_table_id(&self) -> Result<table::TableId> {
         self.inner
             .manifest
@@ -123,6 +144,7 @@ impl Db {
             .lock()
             .map_err(|_| lock_poisoned("manifest store"))?
             .install_prepared_publish(prepared)
+            .map_err(|error| self.close_after_durable_publish_error("compaction", &error))
     }
 
     pub(in crate::db) fn rewrite_wal_after_replay_floor(
@@ -256,6 +278,9 @@ impl Db {
             .lock()
             .map_err(|_| lock_poisoned("manifest store"))?
             .install_prepared_publish(prepared)
+            .map_err(|error| {
+                self.close_after_durable_publish_error("obsolete blob cleanup", &error)
+            })
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -339,6 +364,9 @@ impl Db {
             .lock()
             .map_err(|_| lock_poisoned("manifest store"))?
             .install_prepared_publish(prepared)
+            .map_err(|error| {
+                self.close_after_durable_publish_error("obsolete blob cleanup", &error)
+            })
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]

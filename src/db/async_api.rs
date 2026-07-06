@@ -261,7 +261,9 @@ impl Db {
             let sequence = self.last_committed_sequence();
             let (mut object, _serialize) = self.checkout_object_manifest().await?;
             object.create_checkpoint(name.to_owned(), sequence).await?;
-            self.install_object_manifest(object)?;
+            self.install_object_manifest(object).map_err(|error| {
+                self.close_after_durable_publish_error("checkpoint creation", &error)
+            })?;
             return Ok(ReadVersion::from_sequence(sequence));
         }
 
@@ -296,7 +298,9 @@ impl Db {
         if self.inner.options.storage_mode.is_object_store_persistent() {
             let (mut object, _serialize) = self.checkout_object_manifest().await?;
             object.delete_checkpoint(name.to_owned()).await?;
-            self.install_object_manifest(object)?;
+            self.install_object_manifest(object).map_err(|error| {
+                self.close_after_durable_publish_error("checkpoint deletion", &error)
+            })?;
             return Ok(());
         }
 
@@ -723,13 +727,19 @@ impl Db {
             if self.inner.options.read_only {
                 return Err(Error::ReadOnly);
             }
-            self.run_compaction_once_object_store_async(
-                self.object_store_db_path(),
-                &range,
-                false,
-                MaintenanceBudget::unbounded(),
-            )
-            .await?;
+            let outcome = self
+                .run_compaction_once_object_store_async(
+                    self.object_store_db_path(),
+                    &range,
+                    false,
+                    MaintenanceBudget::unbounded(),
+                )
+                .await?;
+            if outcome.busy {
+                return Err(Error::runtime_busy(
+                    "object-store compaction is already active",
+                ));
+            }
             return Ok(());
         }
 
@@ -825,22 +835,27 @@ impl Db {
             if self.inner.options.read_only {
                 return Err(Error::ReadOnly);
             }
-            // Object-store maintenance: flush immutable memtables, compact, then
-            // reclaim orphaned/obsolete objects (snapshot-safe GC).
             let mut outcome = MaintenanceOutcome::default();
+            let mut run_compaction = true;
             if self.has_immutable_memtables()? {
-                self.flush_object_store_async().await?;
+                let flush = self.flush_object_store_with_budget_async(budget).await?;
+                run_compaction = !flush.busy && !flush.budget_exhausted;
+                outcome.add_assign(flush);
             }
-            let compaction = self
-                .run_compaction_once_object_store_async(
-                    self.object_store_db_path(),
-                    &KeyRange::all(),
-                    false,
-                    budget,
-                )
-                .await?;
-            outcome.add_assign(compaction);
-            self.cleanup_object_store_orphans_async().await?;
+            if run_compaction {
+                let compaction = self
+                    .run_compaction_once_object_store_async(
+                        self.object_store_db_path(),
+                        &KeyRange::all(),
+                        false,
+                        budget,
+                    )
+                    .await?;
+                outcome.add_assign(compaction);
+            }
+            if !outcome.busy && !outcome.budget_exhausted {
+                self.cleanup_object_store_orphans_async().await?;
+            }
             return Ok(outcome);
         }
 

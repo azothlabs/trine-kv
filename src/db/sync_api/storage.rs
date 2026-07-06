@@ -114,18 +114,60 @@ impl Db {
         let db_path = self.object_store_db_path();
         let target_sequence = self.freeze_public_flush_target()?;
         while self.has_immutable_memtables_at_or_below(target_sequence)? {
-            let Some(_flush_guard) = self.inner.maintenance.try_start_flush() else {
+            let outcome = self
+                .run_flush_once_with_budget_object_store_async(
+                    db_path,
+                    MaintenanceBudget::unbounded(),
+                )
+                .await?;
+            if outcome.busy {
                 return Err(Error::runtime_busy("object-store flush is already active"));
-            };
-            let (flush_inputs, _budget_exhausted) =
-                self.collect_flush_inputs_with_budget(MaintenanceBudget::unbounded())?;
-            if flush_inputs.is_empty() {
+            }
+            if outcome.flushes == 0 {
                 break;
             }
-            self.write_flush_inputs_object_store_async(db_path, &flush_inputs)
-                .await?;
         }
         Ok(())
+    }
+
+    pub(in crate::db) async fn flush_object_store_with_budget_async(
+        &self,
+        budget: MaintenanceBudget,
+    ) -> Result<MaintenanceOutcome> {
+        self.ensure_open()?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+        let db_path = self.object_store_db_path();
+        if !self.has_immutable_memtables()? {
+            return Ok(MaintenanceOutcome::default());
+        }
+        self.run_flush_once_with_budget_object_store_async(db_path, budget)
+            .await
+    }
+
+    pub(in crate::db) async fn run_flush_once_with_budget_object_store_async(
+        &self,
+        db_path: &Path,
+        budget: MaintenanceBudget,
+    ) -> Result<MaintenanceOutcome> {
+        let Some(_flush_guard) = self.inner.maintenance.try_start_flush() else {
+            return Ok(MaintenanceOutcome::busy_outcome());
+        };
+
+        let (flush_inputs, budget_exhausted) = self.collect_flush_inputs_with_budget(budget)?;
+        let flush_count = flush_inputs.len();
+        self.write_flush_inputs_object_store_async(db_path, &flush_inputs)
+            .await?;
+        let outcome = MaintenanceOutcome {
+            flushes: flush_count,
+            budget_exhausted: budget_exhausted && flush_count != 0,
+            ..MaintenanceOutcome::default()
+        };
+        if outcome.budget_exhausted {
+            self.record_maintenance_budget_exhaustion();
+        }
+        Ok(outcome)
     }
 
     pub(in crate::db) async fn write_flush_inputs_object_store_async(
@@ -168,7 +210,8 @@ impl Db {
         // make this future `!Send`.
         self.publish_flushed_tables_object_store_async(&written_tables, flush_sequence)
             .await?;
-        Self::install_flushed_tables(flush_inputs, written_tables)?;
+        Self::install_flushed_tables(flush_inputs, written_tables)
+            .map_err(|error| self.close_after_durable_publish_error("flush", &error))?;
         self.inner
             .substrate
             .rewrite_wal_after_replay_floor_async(flush_sequence)
@@ -188,6 +231,7 @@ impl Db {
         let (mut object, _serialize) = self.checkout_object_manifest().await?;
         object.add_tables(edits, flush_sequence).await?;
         self.install_object_manifest(object)
+            .map_err(|error| self.close_after_durable_publish_error("flush", &error))
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -214,7 +258,10 @@ impl Db {
         manifest
             .lock()
             .map_err(|_| lock_poisoned("manifest store"))?
-            .install_prepared_publish(prepared_publish)?;
+            .install_prepared_publish(prepared_publish)
+            .map_err(|error| {
+                self.close_after_durable_publish_error("checkpoint creation", &error)
+            })?;
         Ok(ReadVersion::from_sequence(sequence))
     }
 
@@ -239,6 +286,7 @@ impl Db {
             .lock()
             .map_err(|_| lock_poisoned("manifest store"))?
             .install_prepared_publish(prepared_publish)
+            .map_err(|error| self.close_after_durable_publish_error("checkpoint deletion", &error))
     }
 
     /// Object-store manifest publishes run Send-safely as a checkout / mutate /
@@ -447,10 +495,12 @@ impl Db {
                     pending_deletion_sequence,
                 )
                 .await?;
-            self.install_object_manifest(object)?;
+            self.install_object_manifest(object)
+                .map_err(|error| self.close_after_durable_publish_error("compaction", &error))?;
         }
 
-        self.install_compacted_tables(written_tables)?;
+        self.install_compacted_tables(written_tables)
+            .map_err(|error| self.close_after_durable_publish_error("compaction", &error))?;
         self.record_compaction_stats_from_tables(
             compaction_inputs.len(),
             &input_tables,

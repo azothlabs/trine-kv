@@ -80,7 +80,8 @@ impl Db {
 
         self.persist_bucket_creation(name.as_str(), &options)?;
 
-        let (bucket_options, state) = {
+        let durable_bucket_creation = self.inner.manifest.is_some();
+        let installed_bucket = (|| -> Result<_> {
             let mut buckets = self
                 .inner
                 .buckets
@@ -93,13 +94,20 @@ impl Db {
                         "existing bucket options do not match requested options",
                     ));
                 }
-                (state.options.clone(), Arc::clone(state))
+                Ok((state.options.clone(), Arc::clone(state)))
             } else {
                 let bucket_options = options.clone();
                 let state = Arc::new(LsmTree::new(options, Vec::new())?);
                 buckets.insert(name.as_str().to_owned(), Arc::clone(&state));
-                (bucket_options, state)
+                Ok((bucket_options, state))
             }
+        })();
+        let (bucket_options, state) = if durable_bucket_creation {
+            installed_bucket.map_err(|error| {
+                self.close_after_durable_publish_error("bucket creation", &error)
+            })?
+        } else {
+            installed_bucket?
         };
 
         Ok(Bucket::new(self.clone(), name, bucket_options, state))
@@ -223,7 +231,8 @@ impl Db {
             // and blob objects are now unreferenced and reclaimed by orphan GC.
             let (mut object, _serialize) = self.checkout_object_manifest().await?;
             object.drop_bucket(name.as_str().to_owned()).await?;
-            self.install_object_manifest(object)?;
+            self.install_object_manifest(object)
+                .map_err(|error| self.close_after_durable_publish_error("bucket drop", &error))?;
             self.inner
                 .buckets
                 .write()
@@ -276,7 +285,10 @@ impl Db {
                 manifest
                     .lock()
                     .map_err(|_| lock_poisoned("manifest store"))?
-                    .install_prepared_publish(prepared)?;
+                    .install_prepared_publish(prepared)
+                    .map_err(|error| {
+                        self.close_after_durable_publish_error("bucket drop", &error)
+                    })?;
             }
             self.inner
                 .buckets
@@ -332,9 +344,10 @@ impl Db {
         object
             .create_bucket(name.as_str().to_owned(), options.clone())
             .await?;
-        self.install_object_manifest(object)?;
+        self.install_object_manifest(object)
+            .map_err(|error| self.close_after_durable_publish_error("bucket creation", &error))?;
 
-        let (bucket_options, state) = {
+        let (bucket_options, state) = (|| -> Result<_> {
             let mut buckets = self
                 .inner
                 .buckets
@@ -346,14 +359,15 @@ impl Db {
                         "existing bucket options do not match requested options",
                     ));
                 }
-                (state.options.clone(), Arc::clone(state))
+                Ok((state.options.clone(), Arc::clone(state)))
             } else {
                 let bucket_options = options.clone();
                 let state = Arc::new(LsmTree::new(options, Vec::new())?);
                 buckets.insert(name.as_str().to_owned(), Arc::clone(&state));
-                (bucket_options, state)
+                Ok((bucket_options, state))
             }
-        };
+        })()
+        .map_err(|error| self.close_after_durable_publish_error("bucket creation", &error))?;
         Ok(Bucket::new(self.clone(), name, bucket_options, state))
     }
 
@@ -429,10 +443,13 @@ impl Db {
             manifest
                 .lock()
                 .map_err(|_| lock_poisoned("manifest store"))?
-                .install_prepared_publish(prepared_publish)?;
+                .install_prepared_publish(prepared_publish)
+                .map_err(|error| {
+                    self.close_after_durable_publish_error("bucket creation", &error)
+                })?;
         }
 
-        let (bucket_options, state) = {
+        let (bucket_options, state) = (|| -> Result<_> {
             let mut buckets = self
                 .inner
                 .buckets
@@ -445,14 +462,15 @@ impl Db {
                         "existing bucket options do not match requested options",
                     ));
                 }
-                (state.options.clone(), Arc::clone(state))
+                Ok((state.options.clone(), Arc::clone(state)))
             } else {
                 let bucket_options = options.clone();
                 let state = Arc::new(LsmTree::new(options, Vec::new())?);
                 buckets.insert(name.as_str().to_owned(), Arc::clone(&state));
-                (bucket_options, state)
+                Ok((bucket_options, state))
             }
-        };
+        })()
+        .map_err(|error| self.close_after_durable_publish_error("bucket creation", &error))?;
 
         Ok(Bucket::new(self.clone(), name, bucket_options, state))
     }
