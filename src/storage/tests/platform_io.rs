@@ -297,9 +297,9 @@ fn assert_linux_platform_management_counters(stats: &NativeFileStorageStats) {
         stats
             .platform_io_operations
             .writer_lease
-            .true_platform_async
+            .thread_pool_managed_async
             > 0,
-        "Linux platform writer lease should report true platform async"
+        "Linux platform writer lease should report thread-pool managed async"
     );
     assert!(
         stats
