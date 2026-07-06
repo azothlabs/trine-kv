@@ -176,8 +176,25 @@ pub(in crate::storage) fn prepare_native_file_object_write(
     capabilities.require_durability(durability)?;
 
     let path = object.path().to_path_buf();
-    let tmp_path = path.with_extension("tmp");
+    let tmp_path = if object.kind() == StorageObjectKind::Wal {
+        native_file_tmp_path_by_appending_suffix(&path)?
+    } else {
+        path.with_extension("tmp")
+    };
     Ok((path, tmp_path))
+}
+
+fn native_file_tmp_path_by_appending_suffix(path: &Path) -> Result<PathBuf> {
+    let Some(file_name) = path.file_name() else {
+        return Err(Error::invalid_options(format!(
+            "native file object path has no file name: {}",
+            path.display()
+        )));
+    };
+
+    let mut tmp_name = file_name.to_os_string();
+    tmp_name.push(".tmp");
+    Ok(path.with_file_name(tmp_name))
 }
 
 pub(in crate::storage) fn require_native_file_object_delete(

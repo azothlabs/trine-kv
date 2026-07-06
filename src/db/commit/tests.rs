@@ -2,7 +2,8 @@ use std::{
     fs,
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Barrier},
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -11,7 +12,7 @@ use crate::{
     db::CommitTracker,
     error::Error,
     lsm::LsmTree,
-    options::{DbOptions, WriteOptions},
+    options::{DbOptions, WalShardPolicy, WriteOptions},
     transaction::{ReadKey, TransactionReadSet},
     types::Sequence,
     wal,
@@ -413,6 +414,47 @@ fn persistent_blind_write_accepts_wal_before_publish_barrier() {
     );
 
     drop(publish);
+    drop(db);
+    cleanup_dir(&path);
+}
+
+#[test]
+fn sync_data_group_commit_writers_use_distinct_confirmed_marker_temps() {
+    let path = temp_db_path("sync-data-group-commit");
+    let mut options = DbOptions::persistent(&path).with_durability(DurabilityMode::SyncData);
+    options.background_worker_count = 0;
+    options.wal_shards = WalShardPolicy::Fixed(4);
+    let db = Arc::new(Db::open_sync(options).expect("persistent db opens"));
+    let concurrency = 8_usize;
+    let writes_per_thread = 16_usize;
+    let barrier = Arc::new(Barrier::new(concurrency));
+    let mut handles = Vec::with_capacity(concurrency);
+
+    for thread_index in 0..concurrency {
+        let db = Arc::clone(&db);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            let bucket = db.default_bucket_sync().expect("default bucket opens");
+            barrier.wait();
+            for write_index in 0..writes_per_thread {
+                let row = thread_index * writes_per_thread + write_index;
+                let key = format!("k-{row:04}");
+                let value = format!("v-{row:04}");
+                bucket
+                    .put_sync(key.into_bytes(), value.into_bytes())
+                    .expect("durable put");
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().expect("group commit writer joins");
+    }
+
+    assert_eq!(
+        db.last_committed_sequence().get(),
+        u64::try_from(concurrency * writes_per_thread).expect("write count fits u64")
+    );
     drop(db);
     cleanup_dir(&path);
 }
