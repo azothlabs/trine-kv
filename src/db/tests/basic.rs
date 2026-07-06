@@ -1,0 +1,696 @@
+use super::*;
+
+#[test]
+fn object_store_prefix_isolates_databases_in_one_bucket() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+
+    // Two databases sharing one object store under different key prefixes.
+    let a = block_on_test_future(Db::open_object_store_at(
+        Arc::clone(&client),
+        "app/a",
+        DbOptions::object_store(),
+    ))
+    .expect("open a");
+    let b = block_on_test_future(Db::open_object_store_at(
+        Arc::clone(&client),
+        "app/b",
+        DbOptions::object_store(),
+    ))
+    .expect("open b");
+    a.put_sync(b"k", b"from-a").expect("put a");
+    b.put_sync(b"k", b"from-b").expect("put b");
+    block_on_test_future(a.flush()).expect("flush a");
+    block_on_test_future(b.flush()).expect("flush b");
+    drop(a);
+    drop(b);
+
+    // Reopen each by prefix: fully isolated, each sees only its own value.
+    let a = block_on_test_future(Db::open_object_store_at(
+        Arc::clone(&client),
+        "app/a",
+        DbOptions::object_store(),
+    ))
+    .expect("reopen a");
+    let b = block_on_test_future(Db::open_object_store_at(
+        client,
+        "app/b",
+        DbOptions::object_store(),
+    ))
+    .expect("reopen b");
+    assert_eq!(
+        a.get_sync(b"k").expect("get a").as_deref(),
+        Some(b"from-a".as_slice())
+    );
+    assert_eq!(
+        b.get_sync(b"k").expect("get b").as_deref(),
+        Some(b"from-b".as_slice())
+    );
+}
+
+#[test]
+fn object_store_rejects_live_second_writer() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+
+    // A opens the prefix (fencing epoch 1) and is the sole writer.
+    let a = block_on_test_future(Db::open_object_store_at(
+        Arc::clone(&client),
+        "db",
+        DbOptions::object_store(),
+    ))
+    .expect("open a");
+    a.put_sync(b"k", b"a1").expect("put a");
+    block_on_test_future(a.flush()).expect("flush a");
+
+    // B cannot take over the SAME prefix while A's lease is live.
+    let error = block_on_test_future(Db::open_object_store_at(
+        Arc::clone(&client),
+        "db",
+        DbOptions::object_store(),
+    ))
+    .expect_err("open b while A is live");
+    assert!(
+        matches!(error, Error::RuntimeBusy { .. }),
+        "expected RuntimeBusy, got {error:?}"
+    );
+
+    // A remains the legitimate owner and can keep writing.
+    a.put_sync(b"k", b"a2").expect("put a again");
+    block_on_test_future(a.flush()).expect("A flushes as the owner");
+}
+
+#[test]
+fn object_store_database_persists_across_reopen() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+
+    {
+        let db = block_on_test_future(Db::open_object_store(
+            Arc::clone(&client),
+            DbOptions::object_store(),
+        ))
+        .expect("open object-store database");
+        db.put_sync(b"alpha", b"one").expect("put alpha");
+        db.put_sync(b"beta", b"two").expect("put beta");
+        assert_eq!(
+            db.get_sync(b"alpha").expect("get alpha").as_deref(),
+            Some(b"one".as_slice())
+        );
+        // A non-default bucket created post-open (manifest CAS create).
+        let docs = block_on_test_future(db.bucket_with_options("docs", BucketOptions::default()))
+            .expect("create docs bucket");
+        docs.put_sync(b"title", b"trine").expect("put into docs");
+    }
+
+    // Reopen from the same object store. Durable writes recover from the
+    // manifest plus the remote WAL head even without a flush.
+    let db = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+        .expect("reopen object-store database");
+    assert_eq!(
+        db.get_sync(b"alpha")
+            .expect("get alpha after reopen")
+            .as_deref(),
+        Some(b"one".as_slice())
+    );
+    assert_eq!(
+        db.get_sync(b"beta")
+            .expect("get beta after reopen")
+            .as_deref(),
+        Some(b"two".as_slice())
+    );
+    let docs = block_on_test_future(db.bucket_with_options("docs", BucketOptions::default()))
+        .expect("reopen docs bucket");
+    assert_eq!(
+        docs.get_sync(b"title").expect("get docs title").as_deref(),
+        Some(b"trine".as_slice())
+    );
+}
+
+#[test]
+fn object_store_open_rejects_file_sync_durability() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    for durability in [
+        DurabilityMode::SyncData,
+        DurabilityMode::SyncAll,
+        DurabilityMode::SyncAllStrict,
+    ] {
+        let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+        let error = block_on_test_future(Db::open_object_store(
+            client,
+            DbOptions::object_store().with_durability(durability),
+        ))
+        .expect_err("object-store open rejects file sync durability");
+        assert!(
+            matches!(error, Error::UnsupportedDurability { requested } if requested == durability),
+            "expected UnsupportedDurability({durability:?}), got {error:?}"
+        );
+    }
+}
+
+#[test]
+fn object_client_health_check_rejects_unsafe_put_if_client() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let inner: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let client: Arc<dyn ObjectClient> = Arc::new(UnsafePutIfObjectStore { inner });
+    let error = block_on_test_future(verify_object_client_contract(client, "health"))
+        .expect_err("unsafe object client must be rejected by health check");
+
+    assert!(
+        matches!(error, Error::Corruption { ref message } if message.contains("contract probe")),
+        "expected contract probe corruption, got {error:?}"
+    );
+}
+
+#[test]
+fn object_store_open_trusts_object_client_by_default() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let inner: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let client: Arc<dyn ObjectClient> = Arc::new(UnsafePutIfObjectStore { inner });
+    let db = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+        .expect("trusted open does not run the object-client health check");
+
+    assert_eq!(
+        db.options().object_client_trust,
+        ObjectClientTrustMode::Trusted
+    );
+}
+
+#[test]
+fn object_store_verify_on_open_rejects_unsafe_put_if_client() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let inner: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let client: Arc<dyn ObjectClient> = Arc::new(UnsafePutIfObjectStore { inner });
+    let error = block_on_test_future(Db::open_object_store(
+        client,
+        DbOptions::object_store().with_object_client_trust(ObjectClientTrustMode::VerifyOnOpen),
+    ))
+    .expect_err("verify-on-open must reject unsafe object clients");
+
+    assert!(
+        matches!(error, Error::Corruption { ref message } if message.contains("contract probe")),
+        "expected contract probe corruption, got {error:?}"
+    );
+}
+
+#[test]
+fn object_store_buffered_write_requires_flush_to_recover() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+
+    {
+        let db = block_on_test_future(Db::open_object_store(
+            Arc::clone(&client),
+            DbOptions::object_store().with_durability(DurabilityMode::Buffered),
+        ))
+        .expect("open object-store database");
+        db.put_sync(b"k", b"buffered").expect("buffered put");
+        assert_eq!(
+            db.get_sync(b"k").expect("in-process read").as_deref(),
+            Some(b"buffered".as_slice())
+        );
+    }
+
+    let db = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+        .expect("reopen object-store database");
+    assert_eq!(db.get_sync(b"k").expect("reopen read"), None);
+}
+
+#[test]
+fn object_store_wal_head_points_to_segment_not_per_commit_index() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let db = block_on_test_future(Db::open_object_store(
+        Arc::clone(&client),
+        DbOptions::object_store(),
+    ))
+    .expect("open object-store database");
+    db.put_sync(b"a", b"one").expect("put a");
+    db.put_sync(b"b", b"two").expect("put b");
+    db.put_sync(b"c", b"three").expect("put c");
+
+    let state = block_on_test_future(ObjectWriterLease::read_current(Arc::clone(&client), "LOCK"))
+        .expect("read WAL head")
+        .expect("WAL head exists");
+    let segment_key = state.current_wal_key.expect("segment key");
+    let segment = block_on_test_future(client.get(&segment_key))
+        .expect("read WAL segment")
+        .expect("segment exists");
+    let batches =
+        crate::wal::decode_frames_after(segment.as_ref(), Sequence::ZERO).expect("decode WAL");
+    assert_eq!(batches.len(), 3);
+    assert_eq!(state.committed_sequence, Sequence::new(3));
+    let objects = block_on_test_future(client.list("")).expect("list objects");
+    let wal_objects = objects
+        .iter()
+        .filter(|meta| crate::is_wal_object_key(&meta.key))
+        .count();
+    assert_eq!(wal_objects, 1, "stable WAL segment should be overwritten");
+
+    block_on_test_future(db.flush()).expect("flush");
+    let state = block_on_test_future(ObjectWriterLease::read_current(client, "LOCK"))
+        .expect("read WAL head after flush")
+        .expect("WAL head exists after flush");
+    assert_eq!(state.current_wal_key, None);
+    assert_eq!(state.committed_sequence, Sequence::new(3));
+}
+
+#[test]
+fn object_store_recovery_ignores_frames_beyond_remote_wal_head() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    {
+        let db = block_on_test_future(Db::open_object_store(
+            Arc::clone(&client),
+            DbOptions::object_store(),
+        ))
+        .expect("open object-store database");
+        db.put_sync(b"committed", b"yes").expect("put committed");
+
+        let state =
+            block_on_test_future(ObjectWriterLease::read_current(Arc::clone(&client), "LOCK"))
+                .expect("read WAL head")
+                .expect("WAL head exists");
+        assert_eq!(state.committed_sequence, Sequence::new(1));
+        let segment_key = state.current_wal_key.expect("segment key");
+        let mut segment = block_on_test_future(client.get(&segment_key))
+            .expect("read WAL segment")
+            .expect("segment exists")
+            .to_vec();
+        let uncommitted = crate::wal::encode_batch_frame(
+            Sequence::new(2),
+            &[BatchOperation::Put {
+                bucket: DEFAULT_BUCKET_NAME.to_owned(),
+                key: b"uncommitted".to_vec(),
+                value: b"no".to_vec(),
+            }],
+        )
+        .expect("encode uncommitted frame");
+        segment.extend_from_slice(&uncommitted);
+        block_on_test_future(client.put(&segment_key, Arc::from(segment.as_slice())))
+            .expect("overwrite segment before head advances");
+    }
+
+    let db = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+        .expect("reopen object-store database");
+    assert_eq!(
+        db.get_sync(b"committed")
+            .expect("read committed")
+            .as_deref(),
+        Some(b"yes".as_slice())
+    );
+    assert_eq!(db.get_sync(b"uncommitted").expect("read uncommitted"), None);
+    assert_eq!(
+        db.latest_read_version(),
+        ReadVersion::from_sequence(Sequence::new(1))
+    );
+}
+
+#[test]
+fn object_store_recovery_rejects_truncated_confirmed_wal_segment() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    {
+        let db = block_on_test_future(Db::open_object_store(
+            Arc::clone(&client),
+            DbOptions::object_store(),
+        ))
+        .expect("open object-store database");
+        db.put_sync(b"a", b"one").expect("put a");
+        db.put_sync(b"b", b"two").expect("put b");
+
+        let state =
+            block_on_test_future(ObjectWriterLease::read_current(Arc::clone(&client), "LOCK"))
+                .expect("read WAL head")
+                .expect("WAL head exists");
+        assert_eq!(state.committed_sequence, Sequence::new(2));
+        let segment_key = state.current_wal_key.expect("segment key");
+        let mut segment = block_on_test_future(client.get(&segment_key))
+            .expect("read WAL segment")
+            .expect("segment exists")
+            .to_vec();
+        segment.pop();
+        block_on_test_future(client.put(&segment_key, Arc::from(segment.as_slice())))
+            .expect("truncate confirmed WAL segment");
+    }
+
+    let error = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+        .expect_err("truncated confirmed WAL segment must fail closed");
+    assert!(
+        matches!(error, Error::Corruption { ref message } if message.contains("ended before confirmed head")),
+        "expected missing confirmed WAL corruption, got {error:?}"
+    );
+}
+
+#[test]
+fn object_store_split_wal_tier_recovers_unflushed_commits() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let storage_client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let wal_client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+
+    {
+        let db = block_on_test_future(Db::open_object_store_with_wal(
+            Arc::clone(&storage_client),
+            Arc::clone(&wal_client),
+            DbOptions::object_store(),
+        ))
+        .expect("open split-tier object-store database");
+        db.put_sync(b"k", b"from-wal-tier")
+            .expect("confirmed write");
+        assert_eq!(
+            db.get_sync(b"k").expect("in-process read").as_deref(),
+            Some(b"from-wal-tier".as_slice())
+        );
+    }
+
+    let storage_objects = block_on_test_future(storage_client.list("")).expect("list storage");
+    assert!(
+        storage_objects
+            .iter()
+            .all(|meta| !crate::is_wal_object_key(&meta.key) && meta.key != "LOCK"),
+        "storage tier must not receive WAL tier objects"
+    );
+    let wal_objects = block_on_test_future(wal_client.list("")).expect("list WAL tier");
+    assert!(
+        wal_objects.iter().any(|meta| meta.key == "LOCK"),
+        "WAL tier should hold the writer lease/head"
+    );
+    assert!(
+        wal_objects
+            .iter()
+            .any(|meta| crate::is_wal_object_key(&meta.key)),
+        "WAL tier should hold the remote WAL segment"
+    );
+
+    let db = block_on_test_future(Db::open_object_store_with_wal(
+        storage_client,
+        wal_client,
+        DbOptions::object_store(),
+    ))
+    .expect("reopen split-tier object-store database");
+    assert_eq!(
+        db.get_sync(b"k").expect("recovered read").as_deref(),
+        Some(b"from-wal-tier".as_slice())
+    );
+}
+
+#[test]
+fn object_store_split_wal_tier_refresh_reads_remote_wal() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let storage_client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let wal_client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let writer = block_on_test_future(Db::open_object_store_with_wal(
+        Arc::clone(&storage_client),
+        Arc::clone(&wal_client),
+        DbOptions::object_store(),
+    ))
+    .expect("open split-tier writer");
+    let reader = block_on_test_future(Db::open_object_store_with_wal(
+        storage_client,
+        wal_client,
+        DbOptions::object_store().read_only(),
+    ))
+    .expect("open split-tier reader");
+
+    writer
+        .put_sync(b"k", b"visible-after-refresh")
+        .expect("put");
+    assert_eq!(reader.get_sync(b"k").expect("stale reader"), None);
+
+    let refreshed = block_on_test_future(reader.refresh_object_store()).expect("refresh");
+    assert_eq!(refreshed, ReadVersion::from_sequence(Sequence::new(1)));
+    assert_eq!(
+        reader.get_sync(b"k").expect("refreshed read").as_deref(),
+        Some(b"visible-after-refresh".as_slice())
+    );
+}
+
+#[test]
+fn object_store_read_only_refresh_replays_remote_wal_segment() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let writer = block_on_test_future(Db::open_object_store(
+        Arc::clone(&client),
+        DbOptions::object_store(),
+    ))
+    .expect("open writer");
+    let reader = block_on_test_future(Db::open_object_store(
+        Arc::clone(&client),
+        DbOptions::object_store().read_only(),
+    ))
+    .expect("open reader");
+
+    writer.put_sync(b"k", b"wal").expect("writer put");
+    assert_eq!(reader.get_sync(b"k").expect("stale reader"), None);
+
+    let refreshed = block_on_test_future(reader.refresh_object_store()).expect("refresh");
+    assert_eq!(refreshed, ReadVersion::from_sequence(Sequence::new(1)));
+    assert_eq!(
+        reader.get_sync(b"k").expect("refreshed reader").as_deref(),
+        Some(b"wal".as_slice())
+    );
+}
+
+#[test]
+fn object_store_read_only_refresh_reloads_manifest_after_flush() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let writer = block_on_test_future(Db::open_object_store(
+        Arc::clone(&client),
+        DbOptions::object_store(),
+    ))
+    .expect("open writer");
+    let reader = block_on_test_future(Db::open_object_store(
+        Arc::clone(&client),
+        DbOptions::object_store().read_only(),
+    ))
+    .expect("open reader");
+
+    writer.put_sync(b"k", b"table").expect("writer put");
+    block_on_test_future(writer.flush()).expect("writer flush");
+
+    let refreshed = block_on_test_future(reader.refresh_object_store()).expect("refresh");
+    assert_eq!(refreshed, ReadVersion::from_sequence(Sequence::new(1)));
+    assert_eq!(
+        block_on_test_future(reader.get(b"k"))
+            .expect("refreshed async read")
+            .as_deref(),
+        Some(b"table".as_slice())
+    );
+}
+
+#[test]
+fn object_store_refresh_requires_read_only_object_store_handle() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let writer = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+        .expect("open writer");
+
+    assert!(matches!(
+        block_on_test_future(writer.refresh_object_store()),
+        Err(Error::InvalidOptions { .. })
+    ));
+    let memory = Db::open_sync(DbOptions::memory()).expect("open memory");
+    assert!(matches!(
+        block_on_test_future(memory.refresh_object_store()),
+        Err(Error::InvalidOptions { .. })
+    ));
+}
+
+#[test]
+fn object_store_orphan_objects_are_collected() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let db = block_on_test_future(Db::open_object_store(
+        Arc::clone(&client),
+        DbOptions::object_store(),
+    ))
+    .expect("open object-store database");
+    db.put_sync(b"k", b"v").expect("put");
+    block_on_test_future(db.flush()).expect("flush (writes a referenced table object)");
+
+    // Plant an orphan: a table object no manifest references, as a failed
+    // flush would leave behind.
+    let orphan_key =
+        crate::table::table_path(std::path::Path::new(""), crate::table::TableId(999_999))
+            .to_string_lossy()
+            .into_owned();
+    block_on_test_future(client.put(&orphan_key, Arc::from(b"junk".as_slice())))
+        .expect("plant orphan");
+    assert!(
+        block_on_test_future(client.head(&orphan_key))
+            .unwrap()
+            .is_some()
+    );
+
+    let deleted = block_on_test_future(db.cleanup_object_store_orphans_async()).expect("gc");
+    assert_eq!(deleted, 1, "only the unreferenced orphan object is removed");
+    assert!(
+        block_on_test_future(client.head(&orphan_key))
+            .unwrap()
+            .is_none(),
+        "orphan object removed"
+    );
+
+    // The referenced table object survived GC: reopen and read it back.
+    drop(db);
+    let db = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+        .expect("reopen");
+    assert_eq!(
+        db.get_sync(b"k").expect("get after gc").as_deref(),
+        Some(b"v".as_slice())
+    );
+}
+
+#[test]
+fn drop_bucket_reclaims_objects_on_object_store() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let db = block_on_test_future(Db::open_object_store(
+        Arc::clone(&client),
+        DbOptions::object_store(),
+    ))
+    .expect("open object-store database");
+
+    // A "scratch" bucket with a flushed table object, plus a "keep" bucket.
+    let scratch = block_on_test_future(db.bucket("scratch")).expect("scratch");
+    scratch.put_sync(b"k", b"v").expect("put scratch");
+    let keep = block_on_test_future(db.bucket("keep")).expect("keep");
+    keep.put_sync(b"k", b"keep").expect("put keep");
+    block_on_test_future(db.flush()).expect("flush");
+    drop(scratch);
+    drop(keep);
+
+    block_on_test_future(db.drop_bucket("scratch")).expect("drop scratch");
+
+    // drop_bucket already reclaimed scratch's now-orphaned objects, so a
+    // follow-up orphan GC finds nothing.
+    assert_eq!(
+        block_on_test_future(db.cleanup_object_store_orphans_async()).expect("gc"),
+        0,
+        "drop_bucket collected the dropped bucket's objects"
+    );
+
+    // scratch reopens empty; keep survives, including across a reopen.
+    assert_eq!(
+        block_on_test_future(db.bucket("scratch"))
+            .expect("scratch")
+            .get_sync(b"k")
+            .expect("get"),
+        None
+    );
+    drop(db);
+    let db = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+        .expect("reopen");
+    assert_eq!(
+        block_on_test_future(db.bucket("scratch"))
+            .expect("scratch")
+            .get_sync(b"k")
+            .expect("get"),
+        None,
+        "dropped bucket stays gone across reopen"
+    );
+    assert_eq!(
+        block_on_test_future(db.bucket("keep"))
+            .expect("keep")
+            .get_sync(b"k")
+            .expect("get")
+            .as_deref(),
+        Some(b"keep".as_slice()),
+        "an untouched bucket survives the drop"
+    );
+}
+
+#[test]
+fn object_store_compaction_merges_tables_and_reclaims_objects() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let db = block_on_test_future(Db::open_object_store(
+        Arc::clone(&client),
+        DbOptions::object_store(),
+    ))
+    .expect("open object-store database");
+
+    // Three flushed tables, including an overwrite of `a`.
+    db.put_sync(b"a", b"1").expect("put a");
+    block_on_test_future(db.flush()).expect("flush 1");
+    db.put_sync(b"b", b"2").expect("put b");
+    block_on_test_future(db.flush()).expect("flush 2");
+    db.put_sync(b"a", b"1b").expect("overwrite a");
+    block_on_test_future(db.flush()).expect("flush 3");
+
+    // Compact, then reclaim the now-obsolete input table objects.
+    block_on_test_future(db.compact_range(KeyRange::all())).expect("compact");
+    assert_eq!(
+        db.get_sync(b"a").expect("get a").as_deref(),
+        Some(b"1b".as_slice()),
+        "newest value wins after compaction"
+    );
+    assert_eq!(
+        db.get_sync(b"b").expect("get b").as_deref(),
+        Some(b"2".as_slice())
+    );
+    block_on_test_future(db.run_maintenance_with_budget(MaintenanceBudget::unbounded()))
+        .expect("maintenance reclaims obsolete objects");
+
+    // Reopen: the compacted tables are durable and reads are still correct.
+    drop(db);
+    let db = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+        .expect("reopen");
+    assert_eq!(
+        db.get_sync(b"a").expect("get a after reopen").as_deref(),
+        Some(b"1b".as_slice())
+    );
+    assert_eq!(
+        db.get_sync(b"b").expect("get b after reopen").as_deref(),
+        Some(b"2".as_slice())
+    );
+}
+
+#[test]
+fn object_store_flush_future_is_send() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    fn assert_send<T: Send>(_: T) {}
+
+    let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let db = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+        .expect("open object-store database");
+    // Compile-time guarantee: the object-store flush future is Send, so it can
+    // be spawned on a multi-threaded executor (the manifest CAS no longer holds
+    // the std mutex across the await).
+    assert_send(db.flush());
+    assert_send(db.bucket_with_options("docs", BucketOptions::default()));
+}
+
+#[test]
+fn object_store_flush_is_rejected_synchronously() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let db = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+        .expect("open object-store database");
+    assert!(
+        db.flush_sync().is_err(),
+        "object-store flush must require the async API"
+    );
+}

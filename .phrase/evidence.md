@@ -15220,3 +15220,39 @@ Negative check:
 - Treat these four review findings as fixed. Before a release, rerun the normal
   all-target/all-feature release gate and browser integration smoke if a real
   browser backend is available.
+
+## 2026-07-06: Large Rust file audit and db module split
+
+### Observation
+
+- Rust file audit found 1200+ line files in core engine, benchmarks, and tests.
+  The largest remaining files after the first split are `src/table.rs`,
+  `src/storage.rs`, `tests/internal/persistent_wal.rs`, `benches/v1_bench.rs`,
+  `src/wal.rs`, `src/manifest.rs`, `src/blob.rs`, `src/substrate.rs`,
+  `src/branch.rs`, `src/io.rs`, and `src/iterator.rs`.
+- `src/db.rs` was the largest file at 11756 lines before the split.
+
+### Interpretation
+
+- The database handle module was a real local maintainability blocker and had
+  an existing `src/db/` directory boundary, making it the lowest-risk first
+  split.
+- Remaining core format and storage modules should be split with focused tests
+  per module because they touch table encoding, storage backends, WAL, manifest,
+  blob, and iterator behavior.
+
+### Verification
+
+- `src/db.rs` was split into db submodules for async API, sync API groups,
+  open helpers, commit state/helpers/tests, and db tests while preserving public
+  `Db` API paths.
+- Checks passed: `cargo fmt --check`, `cargo check -q`, and `git diff --check`.
+- `cargo test -q db::` was attempted after the split; compilation was blocked
+  by `No space left on device` while writing Cargo incremental cache under
+  `target/`, not by a Rust compile error reported before that point.
+
+### Recommended Next Action
+
+- Free or rotate build-cache space under `target/`, rerun `cargo test -q db::`,
+  then continue splitting the remaining 1200+ files from lower-risk test/bench
+  files toward core table/storage/WAL modules.
