@@ -7,6 +7,7 @@ use super::*;
     feature = "platform-io-native",
     target_os = "linux"
 ))]
+#[test]
 fn platform_io_native_file_read_and_append_use_platform_driver() {
     let root = temp_storage_root("trine-kv-platform-io-storage");
     std::fs::create_dir_all(&root).expect("test dir creates");
