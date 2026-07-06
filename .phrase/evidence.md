@@ -15256,3 +15256,38 @@ Negative check:
 - Free or rotate build-cache space under `target/`, rerun `cargo test -q db::`,
   then continue splitting the remaining 1200+ files from lower-risk test/bench
   files toward core table/storage/WAL modules.
+
+## 2026-07-06: Remaining oversized Rust files split by module
+
+### Observation
+
+- The first pass after the db split exposed remaining 1200+ line files in
+  table, storage, WAL, manifest, blob, branch, I/O, iterator, substrate, the V1
+  bench, and persistent WAL integration tests.
+- A mechanical `part_xxx`/`include!` split was rejected during review because it
+  only shortened files and did not create useful Rust module boundaries.
+
+### Interpretation
+
+- The correct split is by stable code responsibility: table read/cursor/format,
+  storage backend families, WAL recovery/lane/codec, blob listing/value/I/O/file
+  format, manifest store/format, substrate lease helpers, and themed test/bench
+  modules.
+- Public and crate-visible paths need parent-module re-exports so existing
+  callers keep using `table::...`, `blob::...`, `wal::...`, and
+  `manifest::...` paths.
+
+### Verification
+
+- No individual Rust source file under `src`, `benches`, `examples`, or `tests`
+  exceeds 1200 lines; the audit prints only the aggregate `total` row.
+- Checks passed: `cargo fmt --check`, `cargo check -q`,
+  `cargo check -q --benches`, `cargo check -q --tests`,
+  `cargo test -q persistent_api_helpers_cover_open_options_and_bucket_writes`,
+  and `git diff --check`.
+
+### Recommended Next Action
+
+- Treat the oversized-file cleanup as complete for the current threshold.
+  Future cleanup can refine any module boundary based on ownership or API
+  pressure, but should not reintroduce mechanical chunk names.
