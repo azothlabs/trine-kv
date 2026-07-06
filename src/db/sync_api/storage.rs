@@ -102,10 +102,10 @@ impl Db {
     /// Flush all immutable memtables to objects, publish them via the manifest
     /// CAS, then clean remote WAL objects covered by the new replay floor.
     ///
-    /// NOTE: this holds the manifest mutex across the async CAS publish, so the
-    /// returned future is not `Send` (fine for the current async-only,
-    /// single-writer object-store path; a prepare/publish/install split — like
-    /// the browser backend — is the Send-hardening follow-up).
+    /// Object-store manifest changes use a checkout / mutate / publish /
+    /// install sequence. The async CAS runs on an owned manifest clone while
+    /// the async manifest lock serializes publishers; the std manifest mutex is
+    /// only held for short checkout and install steps.
     pub(in crate::db) async fn flush_object_store_async(&self) -> Result<()> {
         self.ensure_open()?;
         if self.inner.options.read_only {
@@ -228,10 +228,8 @@ impl Db {
             .iter()
             .map(|(bucket, table)| (bucket.clone(), table.properties().clone()))
             .collect::<Vec<_>>();
-        let (mut object, _serialize) = self.checkout_object_manifest().await?;
-        object.add_tables(edits, flush_sequence).await?;
-        self.install_object_manifest(object)
-            .map_err(|error| self.close_after_durable_publish_error("flush", &error))
+        self.publish_object_manifest_add_tables(edits, flush_sequence)
+            .await
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -255,13 +253,11 @@ impl Db {
             manifest.prepare_create_checkpoint_publish(name.to_owned(), sequence)?
         };
         prepared_publish.publish_async().await?;
-        manifest
-            .lock()
-            .map_err(|_| lock_poisoned("manifest store"))?
-            .install_prepared_publish(prepared_publish)
-            .map_err(|error| {
-                self.close_after_durable_publish_error("checkpoint creation", &error)
-            })?;
+        self.install_prepared_manifest_after_durable_publish(
+            "checkpoint creation",
+            manifest,
+            prepared_publish,
+        )?;
         Ok(ReadVersion::from_sequence(sequence))
     }
 
@@ -282,11 +278,11 @@ impl Db {
             manifest.prepare_delete_checkpoint_publish(name.to_owned())?
         };
         prepared_publish.publish_async().await?;
-        manifest
-            .lock()
-            .map_err(|_| lock_poisoned("manifest store"))?
-            .install_prepared_publish(prepared_publish)
-            .map_err(|error| self.close_after_durable_publish_error("checkpoint deletion", &error))
+        self.install_prepared_manifest_after_durable_publish(
+            "checkpoint deletion",
+            manifest,
+            prepared_publish,
+        )
     }
 
     /// Object-store manifest publishes run Send-safely as a checkout / mutate /
@@ -315,6 +311,71 @@ impl Db {
         Ok((object, serialize))
     }
 
+    pub(in crate::db) async fn publish_object_manifest_create_bucket(
+        &self,
+        name: String,
+        options: crate::BucketOptions,
+    ) -> Result<()> {
+        let (mut object, _serialize) = self.checkout_object_manifest().await?;
+        object.create_bucket(name, options).await?;
+        self.install_object_manifest_after_durable_publish("bucket creation", object)
+    }
+
+    pub(in crate::db) async fn publish_object_manifest_drop_bucket(
+        &self,
+        name: String,
+    ) -> Result<()> {
+        let (mut object, _serialize) = self.checkout_object_manifest().await?;
+        object.drop_bucket(name).await?;
+        self.install_object_manifest_after_durable_publish("bucket drop", object)
+    }
+
+    pub(in crate::db) async fn publish_object_manifest_create_checkpoint(
+        &self,
+        name: String,
+        sequence: Sequence,
+    ) -> Result<()> {
+        let (mut object, _serialize) = self.checkout_object_manifest().await?;
+        object.create_checkpoint(name, sequence).await?;
+        self.install_object_manifest_after_durable_publish("checkpoint creation", object)
+    }
+
+    pub(in crate::db) async fn publish_object_manifest_delete_checkpoint(
+        &self,
+        name: String,
+    ) -> Result<()> {
+        let (mut object, _serialize) = self.checkout_object_manifest().await?;
+        object.delete_checkpoint(name).await?;
+        self.install_object_manifest_after_durable_publish("checkpoint deletion", object)
+    }
+
+    pub(in crate::db) async fn publish_object_manifest_add_tables(
+        &self,
+        edits: Vec<(String, table::TableProperties)>,
+        flush_sequence: Sequence,
+    ) -> Result<()> {
+        let (mut object, _serialize) = self.checkout_object_manifest().await?;
+        object.add_tables(edits, flush_sequence).await?;
+        self.install_object_manifest_after_durable_publish("flush", object)
+    }
+
+    pub(in crate::db) async fn publish_object_manifest_replace_tables(
+        &self,
+        edits: Vec<(String, Vec<table::TableId>, Vec<table::TableProperties>)>,
+        obsolete_blob_ids: Vec<u64>,
+        pending_deletion_sequence: Sequence,
+    ) -> Result<()> {
+        let (mut object, _serialize) = self.checkout_object_manifest().await?;
+        object
+            .replace_tables_batch_and_mark_blob_deletions(
+                edits,
+                obsolete_blob_ids,
+                pending_deletion_sequence,
+            )
+            .await?;
+        self.install_object_manifest_after_durable_publish("compaction", object)
+    }
+
     pub(in crate::db) fn install_object_manifest(
         &self,
         object: crate::manifest::ObjectManifestStore<Arc<dyn ObjectClient>>,
@@ -328,6 +389,15 @@ impl Db {
             .lock()
             .map_err(|_| lock_poisoned("manifest store"))?
             .install_object_manifest(object)
+    }
+
+    pub(in crate::db) fn install_object_manifest_after_durable_publish(
+        &self,
+        operation: &'static str,
+        object: crate::manifest::ObjectManifestStore<Arc<dyn ObjectClient>>,
+    ) -> Result<()> {
+        self.install_object_manifest(object)
+            .map_err(|error| self.close_after_durable_publish_error(operation, &error))
     }
 
     /// Delete object-store table/blob objects the published manifest does not
@@ -486,18 +556,12 @@ impl Db {
             })
             .collect::<Vec<_>>();
         let pending_deletion_sequence = self.last_committed_sequence();
-        {
-            let (mut object, _serialize) = self.checkout_object_manifest().await?;
-            object
-                .replace_tables_batch_and_mark_blob_deletions(
-                    edits,
-                    obsolete_blob_ids,
-                    pending_deletion_sequence,
-                )
-                .await?;
-            self.install_object_manifest(object)
-                .map_err(|error| self.close_after_durable_publish_error("compaction", &error))?;
-        }
+        self.publish_object_manifest_replace_tables(
+            edits,
+            obsolete_blob_ids,
+            pending_deletion_sequence,
+        )
+        .await?;
 
         self.install_compacted_tables(written_tables)
             .map_err(|error| self.close_after_durable_publish_error("compaction", &error))?;
@@ -913,8 +977,10 @@ impl Db {
     ///
     /// # Parameters
     ///
-    /// - `budget`: limits how many flush and compaction inputs this call may
-    ///   process.
+    /// - `budget`: carries separate limits for flush inputs and compaction
+    ///   inputs. A call may consume work from both limits; if flushing reports
+    ///   busy or budget exhaustion, this call skips the follow-up compaction
+    ///   pass.
     ///
     /// # Errors
     ///

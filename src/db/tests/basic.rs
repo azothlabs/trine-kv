@@ -680,6 +680,10 @@ fn object_store_flush_future_is_send() {
     // the std mutex across the await).
     assert_send(db.flush());
     assert_send(db.bucket_with_options("docs", BucketOptions::default()));
+    assert_send(db.create_checkpoint("cp"));
+    assert_send(db.delete_checkpoint("cp"));
+    assert_send(db.compact_range(KeyRange::all()));
+    assert_send(db.run_maintenance_with_budget(MaintenanceBudget::single_unit()));
 }
 
 #[test]
@@ -692,5 +696,107 @@ fn object_store_flush_is_rejected_synchronously() {
     assert!(
         db.flush_sync().is_err(),
         "object-store flush must require the async API"
+    );
+}
+
+#[test]
+fn object_store_durable_manifest_install_failure_closes_handle() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let db = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+        .expect("open object-store database");
+
+    let error = block_on_test_future(async {
+        let sequence = db.last_committed_sequence();
+        let (mut object, _serialize) = db.checkout_object_manifest().await?;
+        object
+            .create_checkpoint("durable-only".to_owned(), sequence)
+            .await?;
+
+        let manifest = db
+            .inner
+            .manifest
+            .as_ref()
+            .expect("object-store database has manifest");
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let _guard = manifest.lock().expect("manifest lock before poison");
+                panic!("poison manifest store after durable publish");
+            });
+            assert!(handle.join().is_err());
+        });
+
+        db.install_object_manifest_after_durable_publish("checkpoint creation", object)
+    })
+    .expect_err("poisoned install after durable publish must fail");
+
+    assert!(
+        matches!(error, Error::Corruption { ref message }
+            if message.contains("checkpoint creation published durable state")
+                && message.contains("database handle closed")),
+        "expected durable-publish corruption with close guidance, got {error:?}"
+    );
+    assert!(db.closed_after_durable_publish_error());
+    assert!(
+        matches!(db.put_sync(b"k", b"v"), Err(Error::Closed)),
+        "closed handle must reject later writes"
+    );
+}
+
+#[test]
+fn object_store_maintenance_budget_reports_flush_exhaustion_before_compaction() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let mut options = DbOptions::object_store();
+    options.background_worker_count = 0;
+    options.write_buffer_bytes = 1;
+    let db = block_on_test_future(Db::open_object_store(client, options))
+        .expect("open object-store database");
+
+    db.put_sync(b"a", b"one").expect("write first immutable");
+    db.put_sync(b"b", b"two").expect("write second immutable");
+
+    let outcome =
+        block_on_test_future(db.run_maintenance_with_budget(MaintenanceBudget::single_unit()))
+            .expect("run budgeted maintenance");
+
+    assert_eq!(outcome.flushes, 1);
+    assert_eq!(outcome.compactions, 0);
+    assert!(outcome.budget_exhausted());
+    assert!(!outcome.busy());
+}
+
+#[test]
+fn object_store_compaction_busy_is_reported_as_runtime_busy() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let mut options = DbOptions::object_store();
+    options.background_worker_count = 0;
+    let db = block_on_test_future(Db::open_object_store(client, options))
+        .expect("open object-store database");
+
+    db.put_sync(b"a", b"one").expect("write first table");
+    block_on_test_future(db.flush()).expect("flush first table");
+    db.put_sync(b"b", b"two").expect("write second table");
+    block_on_test_future(db.flush()).expect("flush second table");
+
+    let _guard = db
+        .inner
+        .maintenance
+        .reserve_compactions(vec![CompactionReservation {
+            bucket: DEFAULT_BUCKET_NAME.to_owned(),
+            range: KeyRange::all(),
+        }])
+        .expect("test reserves compaction range");
+
+    let error = block_on_test_future(db.compact_range(KeyRange::all()))
+        .expect_err("overlapping object-store compaction must be busy");
+    assert!(
+        matches!(error, Error::RuntimeBusy { ref message }
+            if message == "object-store compaction is already active"),
+        "expected RuntimeBusy, got {error:?}"
     );
 }

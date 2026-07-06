@@ -50,6 +50,124 @@ struct DbInnerParts {
     runtime: Runtime,
 }
 
+#[derive(Debug)]
+struct ObjectStoreInnerParts {
+    substrate: DurabilitySubstrate,
+    storage: ObjectStoreBackend,
+    wal_storage: ObjectStoreBackend,
+    prefix: PathBuf,
+}
+
+impl DbInnerParts {
+    fn base(
+        options: DbOptions,
+        buckets: BTreeMap<String, Arc<LsmTree>>,
+        manifest: Option<ManifestStore>,
+        substrate: DurabilitySubstrate,
+        native_storage: NativeFileBackend,
+        runtime: Runtime,
+    ) -> Self {
+        Self {
+            options,
+            buckets,
+            manifest,
+            substrate,
+            native_storage,
+            object_storage: None,
+            object_wal_storage: None,
+            object_storage_prefix: PathBuf::new(),
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            browser_storage: None,
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            browser_writer_lease: None,
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            browser_wal: None,
+            runtime,
+        }
+    }
+
+    fn memory(
+        options: DbOptions,
+        buckets: BTreeMap<String, Arc<LsmTree>>,
+        runtime: Runtime,
+    ) -> Self {
+        Self::base(
+            options,
+            buckets,
+            None,
+            DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(None, None)),
+            NativeFileBackend::new(),
+            runtime,
+        )
+    }
+
+    fn native(
+        options: DbOptions,
+        buckets: BTreeMap<String, Arc<LsmTree>>,
+        manifest: ManifestStore,
+        native_storage: NativeFileBackend,
+        wal: Option<WalFrontDoor>,
+        process_lock: Option<recovery::ProcessLock>,
+        runtime: Runtime,
+    ) -> Self {
+        Self::base(
+            options,
+            buckets,
+            Some(manifest),
+            DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(wal, process_lock)),
+            native_storage,
+            runtime,
+        )
+    }
+
+    fn object_store(
+        options: DbOptions,
+        buckets: BTreeMap<String, Arc<LsmTree>>,
+        manifest: ManifestStore,
+        backend: ObjectStoreInnerParts,
+        runtime: Runtime,
+    ) -> Self {
+        Self {
+            object_storage: Some(backend.storage),
+            object_wal_storage: Some(backend.wal_storage),
+            object_storage_prefix: backend.prefix,
+            ..Self::base(
+                options,
+                buckets,
+                Some(manifest),
+                backend.substrate,
+                NativeFileBackend::new(),
+                runtime,
+            )
+        }
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    fn browser(
+        options: DbOptions,
+        buckets: BTreeMap<String, Arc<LsmTree>>,
+        manifest: ManifestStore,
+        storage: BrowserStorageBackend,
+        writer_lease: Option<BrowserWriterLease>,
+        wal: Option<BrowserWalFrontDoor>,
+        runtime: Runtime,
+    ) -> Self {
+        Self {
+            browser_storage: Some(storage),
+            browser_writer_lease: writer_lease,
+            browser_wal: wal,
+            ..Self::base(
+                options,
+                buckets,
+                Some(manifest),
+                DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(None, None)),
+                NativeFileBackend::new(),
+                runtime,
+            )
+        }
+    }
+}
+
 impl Db {
     #[cfg_attr(
         all(target_arch = "wasm32", target_os = "unknown"),
@@ -353,22 +471,15 @@ impl Db {
             )
         };
         let runtime = Runtime::new(options.runtime);
-        let db = Self::from_inner_parts(DbInnerParts {
+        let db = Self::from_inner_parts(DbInnerParts::browser(
             options,
             buckets,
-            manifest: Some(manifest),
-            // Browser durability rides the `browser_*` fields; the substrate
-            // is inert here.
-            substrate: DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(None, None)),
-            native_storage: NativeFileBackend::new(),
-            object_storage: None,
-            object_wal_storage: None,
-            object_storage_prefix: PathBuf::new(),
-            browser_storage: Some(storage),
-            browser_writer_lease: writer_lease,
+            manifest,
+            storage,
+            writer_lease,
             browser_wal,
             runtime,
-        });
+        ));
         db.replay_wal_batches(batches, replay_floor)?;
         Ok(db)
     }
@@ -599,23 +710,18 @@ impl Db {
         )?;
 
         let runtime = Runtime::new(options.runtime);
-        let db = Self::from_inner_parts(DbInnerParts {
+        let db = Self::from_inner_parts(DbInnerParts::object_store(
             options,
             buckets,
-            manifest: Some(manifest),
-            substrate,
-            native_storage: NativeFileBackend::new(),
-            object_storage: Some(backend),
-            object_wal_storage: Some(wal_backend),
-            object_storage_prefix: db_path,
-            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-            browser_storage: None,
-            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-            browser_writer_lease: None,
-            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-            browser_wal: None,
+            manifest,
+            ObjectStoreInnerParts {
+                substrate,
+                storage: backend,
+                wal_storage: wal_backend,
+                prefix: db_path,
+            },
             runtime,
-        });
+        ));
         db.replay_wal_batches(batches, replay_floor)?;
         Ok(db)
     }
@@ -674,24 +780,9 @@ impl Db {
         let mut buckets = BTreeMap::new();
         buckets.insert(DEFAULT_BUCKET_NAME.to_owned(), default_bucket);
 
-        Ok(Self::from_inner_parts(DbInnerParts {
-            options,
-            manifest: None,
-            buckets,
-            // In-memory: no WAL, no lease.
-            substrate: DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(None, None)),
-            native_storage: NativeFileBackend::new(),
-            object_storage: None,
-            object_wal_storage: None,
-            object_storage_prefix: PathBuf::new(),
-            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-            browser_storage: None,
-            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-            browser_writer_lease: None,
-            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-            browser_wal: None,
-            runtime,
-        }))
+        Ok(Self::from_inner_parts(DbInnerParts::memory(
+            options, buckets, runtime,
+        )))
     }
 
     #[cfg_attr(
@@ -908,23 +999,15 @@ impl Db {
             replay_floor,
             db_path_for_cleanup,
         } = parts;
-        let db = Self::from_inner_parts(DbInnerParts {
+        let db = Self::from_inner_parts(DbInnerParts::native(
             options,
             buckets,
-            manifest: Some(manifest),
-            substrate: DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(wal, process_lock)),
+            manifest,
             native_storage,
-            object_storage: None,
-            object_wal_storage: None,
-            object_storage_prefix: PathBuf::new(),
-            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-            browser_storage: None,
-            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-            browser_writer_lease: None,
-            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-            browser_wal: None,
+            wal,
+            process_lock,
             runtime,
-        });
+        ));
         db.replay_wal_batches(batches, replay_floor)?;
         if !db.inner.options.read_only {
             db.cleanup_pending_obsolete_blob_files(&db_path_for_cleanup)?;

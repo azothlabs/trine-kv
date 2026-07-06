@@ -139,13 +139,8 @@ impl Db {
         let _pin = self.snapshot_at(version)?;
 
         if self.inner.options.storage_mode.is_object_store_persistent() {
-            let (mut object, _serialize) = self.checkout_object_manifest().await?;
-            object
-                .create_checkpoint(name.to_owned(), version.to_sequence())
+            self.publish_object_manifest_create_checkpoint(name.to_owned(), version.to_sequence())
                 .await?;
-            self.install_object_manifest(object).map_err(|error| {
-                self.close_after_durable_publish_error("checkpoint creation", &error)
-            })?;
             return Ok(());
         }
 

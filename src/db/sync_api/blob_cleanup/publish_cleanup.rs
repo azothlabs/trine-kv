@@ -8,6 +8,7 @@ use super::{
     delete_pending_obsolete_blob_files, lock_poisoned, referenced_blob_file_ids_from_manifest,
     table, take_deletable_obsolete_tables, usize_to_u64_saturating,
 };
+use crate::manifest::PreparedManifestPublish;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::storage::{StorageObjectDeleteBackend, StorageObjectId};
 
@@ -31,6 +32,19 @@ impl Db {
 
     pub(in crate::db) fn closed_after_durable_publish_error(&self) -> bool {
         self.inner.closed.load(Ordering::Acquire)
+    }
+
+    pub(in crate::db) fn install_prepared_manifest_after_durable_publish(
+        &self,
+        operation: &'static str,
+        manifest: &Mutex<ManifestStore>,
+        prepared: PreparedManifestPublish,
+    ) -> Result<()> {
+        manifest
+            .lock()
+            .map_err(|_| lock_poisoned("manifest store"))?
+            .install_prepared_publish(prepared)
+            .map_err(|error| self.close_after_durable_publish_error(operation, &error))
     }
 
     pub(in crate::db) fn next_table_id(&self) -> Result<table::TableId> {
@@ -274,13 +288,11 @@ impl Db {
             return Ok(());
         };
         prepared.publish_async().await?;
-        manifest
-            .lock()
-            .map_err(|_| lock_poisoned("manifest store"))?
-            .install_prepared_publish(prepared)
-            .map_err(|error| {
-                self.close_after_durable_publish_error("obsolete blob cleanup", &error)
-            })
+        self.install_prepared_manifest_after_durable_publish(
+            "obsolete blob cleanup",
+            manifest,
+            prepared,
+        )
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -360,13 +372,11 @@ impl Db {
             return Ok(());
         };
         prepared.publish_async().await?;
-        manifest
-            .lock()
-            .map_err(|_| lock_poisoned("manifest store"))?
-            .install_prepared_publish(prepared)
-            .map_err(|error| {
-                self.close_after_durable_publish_error("obsolete blob cleanup", &error)
-            })
+        self.install_prepared_manifest_after_durable_publish(
+            "obsolete blob cleanup",
+            manifest,
+            prepared,
+        )
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]

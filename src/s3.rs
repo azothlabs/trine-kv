@@ -33,11 +33,11 @@ pub struct ObjectStoreClient {
 ///
 /// Use this when targeting an S3-compatible endpoint that needs settings beyond
 /// bucket, region, and credentials. The default keeps HTTP disabled even when a
-/// custom endpoint is supplied; set [`Self::allow_http`] only for local MinIO or
+/// custom endpoint is supplied; set [`Self::allow_http`] only for local `MinIO` or
 /// another explicitly trusted non-TLS deployment.
 #[derive(Debug, Clone, Default)]
 pub struct S3ClientOptions {
-    /// Custom S3-compatible endpoint such as an R2, MinIO, or Ceph URL.
+    /// Custom S3-compatible endpoint such as an R2, `MinIO`, or Ceph URL.
     ///
     /// Leave this as `None` for AWS S3. HTTP endpoints are rejected unless
     /// [`Self::allow_http`] is also set.
@@ -74,7 +74,7 @@ impl ObjectStoreClient {
     /// region `"auto"` and the `https://<account>.r2.cloudflarestorage.com`
     /// endpoint. Plain HTTP endpoints are intentionally rejected by this helper;
     /// use [`Self::s3_with_options`] with [`S3ClientOptions::allow_http`] for
-    /// local MinIO or another explicitly trusted non-TLS endpoint.
+    /// local `MinIO` or another explicitly trusted non-TLS endpoint.
     ///
     /// Conditional PUT (`ETagMatch`) is enabled explicitly: `object_store`
     /// disables conditional writes for non-AWS endpoints by default, but the
@@ -323,6 +323,17 @@ mod tests {
 
         assert!(options.endpoint.is_none());
         assert!(!options.allow_http);
+    }
+
+    #[test]
+    fn s3_client_options_require_explicit_http_opt_in() {
+        let options = S3ClientOptions {
+            endpoint: Some("http://127.0.0.1:9000".to_owned()),
+            allow_http: true,
+        };
+
+        assert_eq!(options.endpoint.as_deref(), Some("http://127.0.0.1:9000"));
+        assert!(options.allow_http);
     }
 
     #[derive(Debug, Default)]

@@ -28,6 +28,26 @@ fn maintenance_error_preserves_runtime_busy_category() {
 }
 
 #[test]
+fn maintenance_error_preserves_structured_fencing_fields() {
+    let coordinator = MaintenanceCoordinator::new();
+    coordinator.record_error(&Error::Fenced {
+        held_epoch: 7,
+        current_epoch: 8,
+    });
+
+    let error = coordinator
+        .take_error()
+        .expect("unreported background error remains visible");
+    assert!(matches!(
+        error,
+        Error::Fenced {
+            held_epoch: 7,
+            current_epoch: 8
+        }
+    ));
+}
+
+#[test]
 fn background_shutdown_cancels_runtime_token() {
     let maintenance = Arc::new(MaintenanceCoordinator::new());
     let runtime_shutdown = CancellationToken::new();

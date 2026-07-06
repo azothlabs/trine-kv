@@ -229,10 +229,8 @@ impl Db {
         if self.inner.options.storage_mode.is_object_store_persistent() {
             // Object store: remove the bucket from the manifest via CAS; its table
             // and blob objects are now unreferenced and reclaimed by orphan GC.
-            let (mut object, _serialize) = self.checkout_object_manifest().await?;
-            object.drop_bucket(name.as_str().to_owned()).await?;
-            self.install_object_manifest(object)
-                .map_err(|error| self.close_after_durable_publish_error("bucket drop", &error))?;
+            self.publish_object_manifest_drop_bucket(name.as_str().to_owned())
+                .await?;
             self.inner
                 .buckets
                 .write()
@@ -282,13 +280,11 @@ impl Db {
             };
             if let Some(prepared) = prepared {
                 prepared.publish_async().await?;
-                manifest
-                    .lock()
-                    .map_err(|_| lock_poisoned("manifest store"))?
-                    .install_prepared_publish(prepared)
-                    .map_err(|error| {
-                        self.close_after_durable_publish_error("bucket drop", &error)
-                    })?;
+                self.install_prepared_manifest_after_durable_publish(
+                    "bucket drop",
+                    manifest,
+                    prepared,
+                )?;
             }
             self.inner
                 .buckets
@@ -340,12 +336,8 @@ impl Db {
             return Err(Error::ReadOnly);
         }
 
-        let (mut object, _serialize) = self.checkout_object_manifest().await?;
-        object
-            .create_bucket(name.as_str().to_owned(), options.clone())
+        self.publish_object_manifest_create_bucket(name.as_str().to_owned(), options.clone())
             .await?;
-        self.install_object_manifest(object)
-            .map_err(|error| self.close_after_durable_publish_error("bucket creation", &error))?;
 
         let (bucket_options, state) = (|| -> Result<_> {
             let mut buckets = self
@@ -440,13 +432,11 @@ impl Db {
         };
         if let Some(prepared_publish) = prepared_publish {
             prepared_publish.publish_async().await?;
-            manifest
-                .lock()
-                .map_err(|_| lock_poisoned("manifest store"))?
-                .install_prepared_publish(prepared_publish)
-                .map_err(|error| {
-                    self.close_after_durable_publish_error("bucket creation", &error)
-                })?;
+            self.install_prepared_manifest_after_durable_publish(
+                "bucket creation",
+                manifest,
+                prepared_publish,
+            )?;
         }
 
         let (bucket_options, state) = (|| -> Result<_> {

@@ -532,11 +532,7 @@ impl Db {
             manifest.prepare_add_tables_publish(edits, flush_sequence)?
         };
         prepared.publish_async().await?;
-        manifest
-            .lock()
-            .map_err(|_| lock_poisoned("manifest store"))?
-            .install_prepared_publish(prepared)
-            .map_err(|error| self.close_after_durable_publish_error("flush", &error))
+        self.install_prepared_manifest_after_durable_publish("flush", manifest, prepared)
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -578,11 +574,7 @@ impl Db {
             )?
         };
         prepared.publish_async().await?;
-        manifest
-            .lock()
-            .map_err(|_| lock_poisoned("manifest store"))?
-            .install_prepared_publish(prepared)
-            .map_err(|error| self.close_after_durable_publish_error("compaction", &error))
+        self.install_prepared_manifest_after_durable_publish("compaction", manifest, prepared)
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -710,11 +702,7 @@ impl Db {
             manifest.prepare_add_tables_publish(edits, flush_sequence)?
         };
         prepared.publish_async().await?;
-        manifest
-            .lock()
-            .map_err(|_| lock_poisoned("manifest store"))?
-            .install_prepared_publish(prepared)
-            .map_err(|error| self.close_after_durable_publish_error("flush", &error))
+        self.install_prepared_manifest_after_durable_publish("flush", manifest, prepared)
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]

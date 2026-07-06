@@ -16,7 +16,7 @@ use crate::{
     blob::{self, ValueRef},
     bucket::{Bucket, BucketName, BucketReader, DEFAULT_BUCKET_NAME},
     cache, compaction,
-    error::{Error, Result},
+    error::{Error, ErrorSnapshot, Result},
     iterator::{Direction, Iter, LazyIter, ScanSelector, ScanSourceInput},
     lsm::{
         AsyncPointReadIo, CompactionInput as LsmCompactionInput,
@@ -218,6 +218,10 @@ impl MaintenanceOutcome {
             busy: true,
             ..Self::default()
         }
+    }
+
+    fn permits_follow_up_compaction(self) -> bool {
+        !self.busy && !self.budget_exhausted
     }
 
     fn add_assign(&mut self, other: Self) {
@@ -677,166 +681,7 @@ struct MaintenanceState {
     active_compactions: Vec<CompactionReservation>,
     progress: u64,
     shutdown: bool,
-    last_error: Option<MaintenanceError>,
-}
-
-#[derive(Debug, Clone)]
-enum MaintenanceError {
-    Io {
-        message: String,
-    },
-    Corruption {
-        message: String,
-    },
-    InvalidFormat {
-        message: String,
-    },
-    UnsupportedFormat {
-        message: String,
-    },
-    CodecUnavailable {
-        codec: String,
-    },
-    Conflict {
-        message: String,
-    },
-    Fenced {
-        held_epoch: u64,
-        current_epoch: u64,
-    },
-    ReadVersionTooNew {
-        requested: ReadVersion,
-        latest: ReadVersion,
-    },
-    ReadVersionExpired {
-        requested: ReadVersion,
-        oldest_retained: ReadVersion,
-    },
-    CheckpointAlreadyExists {
-        name: String,
-    },
-    CheckpointNotFound {
-        name: String,
-    },
-    ReadOnly,
-    Closed,
-    RuntimeBusy {
-        message: String,
-    },
-    BucketMissing {
-        name: String,
-    },
-    InvalidOptions {
-        message: String,
-    },
-    Unsupported {
-        feature: &'static str,
-    },
-    UnsupportedBackend {
-        feature: &'static str,
-    },
-    UnsupportedDurability {
-        requested: DurabilityMode,
-    },
-}
-
-impl MaintenanceError {
-    fn from_error(error: &Error) -> Self {
-        match error {
-            Error::Io(error) => Self::Io {
-                message: error.to_string(),
-            },
-            Error::Corruption { message } => Self::Corruption {
-                message: message.clone(),
-            },
-            Error::InvalidFormat { message } => Self::InvalidFormat {
-                message: message.clone(),
-            },
-            Error::UnsupportedFormat { message } => Self::UnsupportedFormat {
-                message: message.clone(),
-            },
-            Error::CodecUnavailable { codec } => Self::CodecUnavailable {
-                codec: codec.clone(),
-            },
-            Error::Conflict { message } => Self::Conflict {
-                message: message.clone(),
-            },
-            Error::Fenced {
-                held_epoch,
-                current_epoch,
-            } => Self::Fenced {
-                held_epoch: *held_epoch,
-                current_epoch: *current_epoch,
-            },
-            Error::ReadVersionTooNew { requested, latest } => Self::ReadVersionTooNew {
-                requested: *requested,
-                latest: *latest,
-            },
-            Error::ReadVersionExpired {
-                requested,
-                oldest_retained,
-            } => Self::ReadVersionExpired {
-                requested: *requested,
-                oldest_retained: *oldest_retained,
-            },
-            Error::CheckpointAlreadyExists { name } => {
-                Self::CheckpointAlreadyExists { name: name.clone() }
-            }
-            Error::CheckpointNotFound { name } => Self::CheckpointNotFound { name: name.clone() },
-            Error::ReadOnly => Self::ReadOnly,
-            Error::Closed => Self::Closed,
-            Error::RuntimeBusy { message } => Self::RuntimeBusy {
-                message: message.clone(),
-            },
-            Error::BucketMissing { name } => Self::BucketMissing { name: name.clone() },
-            Error::InvalidOptions { message } => Self::InvalidOptions {
-                message: message.clone(),
-            },
-            Error::Unsupported { feature } => Self::Unsupported { feature },
-            Error::UnsupportedBackend { feature } => Self::UnsupportedBackend { feature },
-            Error::UnsupportedDurability { requested } => Self::UnsupportedDurability {
-                requested: *requested,
-            },
-        }
-    }
-
-    fn into_error(self) -> Error {
-        match self {
-            Self::Io { message } => Error::Io(io::Error::other(message)),
-            Self::Corruption { message } => Error::Corruption { message },
-            Self::InvalidFormat { message } => Error::InvalidFormat { message },
-            Self::UnsupportedFormat { message } => Error::UnsupportedFormat { message },
-            Self::CodecUnavailable { codec } => Error::CodecUnavailable { codec },
-            Self::Conflict { message } => Error::Conflict { message },
-            Self::Fenced {
-                held_epoch,
-                current_epoch,
-            } => Error::Fenced {
-                held_epoch,
-                current_epoch,
-            },
-            Self::ReadVersionTooNew { requested, latest } => {
-                Error::ReadVersionTooNew { requested, latest }
-            }
-            Self::ReadVersionExpired {
-                requested,
-                oldest_retained,
-            } => Error::ReadVersionExpired {
-                requested,
-                oldest_retained,
-            },
-            Self::CheckpointAlreadyExists { name } => Error::CheckpointAlreadyExists { name },
-            Self::CheckpointNotFound { name } => Error::CheckpointNotFound { name },
-            Self::ReadOnly => Error::ReadOnly,
-            Self::Closed => Error::Closed,
-            Self::RuntimeBusy { message } => Error::RuntimeBusy { message },
-            Self::BucketMissing { name } => Error::BucketMissing { name },
-            Self::InvalidOptions { message } => Error::InvalidOptions { message },
-            Self::Unsupported { feature } => Error::Unsupported { feature },
-            Self::UnsupportedBackend { feature } => Error::UnsupportedBackend { feature },
-            Self::UnsupportedDurability { requested } => Error::UnsupportedDurability { requested },
-        }
-    }
+    last_error: Option<ErrorSnapshot>,
 }
 
 #[derive(Debug)]
@@ -1015,7 +860,7 @@ impl MaintenanceCoordinator {
     #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
     fn record_error(&self, error: &Error) {
         if let Ok(mut state) = self.state.lock() {
-            state.last_error = Some(MaintenanceError::from_error(error));
+            state.last_error = Some(ErrorSnapshot::capture(error));
             state.progress = state.progress.saturating_add(1);
             self.wake.notify_all();
         }
@@ -1026,7 +871,7 @@ impl MaintenanceCoordinator {
             .lock()
             .ok()
             .and_then(|mut state| state.last_error.take())
-            .map(MaintenanceError::into_error)
+            .map(ErrorSnapshot::into_error)
     }
 
     fn shutdown(&self) {

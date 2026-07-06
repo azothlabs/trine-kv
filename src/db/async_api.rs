@@ -259,11 +259,8 @@ impl Db {
 
         if self.inner.options.storage_mode.is_object_store_persistent() {
             let sequence = self.last_committed_sequence();
-            let (mut object, _serialize) = self.checkout_object_manifest().await?;
-            object.create_checkpoint(name.to_owned(), sequence).await?;
-            self.install_object_manifest(object).map_err(|error| {
-                self.close_after_durable_publish_error("checkpoint creation", &error)
-            })?;
+            self.publish_object_manifest_create_checkpoint(name.to_owned(), sequence)
+                .await?;
             return Ok(ReadVersion::from_sequence(sequence));
         }
 
@@ -296,11 +293,8 @@ impl Db {
         }
 
         if self.inner.options.storage_mode.is_object_store_persistent() {
-            let (mut object, _serialize) = self.checkout_object_manifest().await?;
-            object.delete_checkpoint(name.to_owned()).await?;
-            self.install_object_manifest(object).map_err(|error| {
-                self.close_after_durable_publish_error("checkpoint deletion", &error)
-            })?;
+            self.publish_object_manifest_delete_checkpoint(name.to_owned())
+                .await?;
             return Ok(());
         }
 
@@ -826,6 +820,11 @@ impl Db {
     }
 
     /// Runs cooperative flush and compaction work within `budget`.
+    ///
+    /// The budget carries separate limits for flush inputs and compaction
+    /// inputs. A call may consume work from both limits: it first flushes
+    /// immutable memtables, then runs one compaction pass if the flush step did
+    /// not report busy or budget exhaustion.
     pub async fn run_maintenance_with_budget(
         &self,
         budget: MaintenanceBudget,
@@ -836,13 +835,13 @@ impl Db {
                 return Err(Error::ReadOnly);
             }
             let mut outcome = MaintenanceOutcome::default();
-            let mut run_compaction = true;
+            let mut flush_permits_compaction = true;
             if self.has_immutable_memtables()? {
                 let flush = self.flush_object_store_with_budget_async(budget).await?;
-                run_compaction = !flush.busy && !flush.budget_exhausted;
+                flush_permits_compaction = flush.permits_follow_up_compaction();
                 outcome.add_assign(flush);
             }
-            if run_compaction {
+            if flush_permits_compaction {
                 let compaction = self
                     .run_compaction_once_object_store_async(
                         self.object_store_db_path(),
