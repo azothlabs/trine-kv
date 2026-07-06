@@ -15,7 +15,7 @@ impl Db {
 
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         {
-            Err(Error::unsupported_backend(
+            Err(crate::Error::unsupported_backend(
                 "browser persistent background workers",
             ))
         }
