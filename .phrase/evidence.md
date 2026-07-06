@@ -15166,3 +15166,57 @@ Negative check:
   The remaining object-store trust policy is an operational deployment choice:
   keep `Trusted` for qualified adapters and use `VerifyOnOpen` only when open
   should perform the probe.
+
+## 2026-07-06: SST read-path and WAL/browser close hardening
+
+### Observation
+
+- Review found four fail-closed gaps: SST data-block point lookup trusted the
+  encoded hash index, table/block filters could decide absence before coverage
+  was checked, native WAL recovery could ignore a truncated confirmed tail, and
+  browser persistent close did not explicitly release the Web Locks writer
+  lease while handles still referenced the database.
+
+### Interpretation
+
+- Read-path acceleration metadata that can produce "key absent" must be checked
+  against records before it is trusted.
+- Native WAL needs a local confirmed-sequence marker so recovery can distinguish
+  an unconfirmed torn tail from a damaged confirmed write.
+- Browser close must use the same publish-activity barrier as native close
+  before releasing its writer lease.
+
+### Verification
+
+- Data-block decode now rebuilds and compares the point lookup hash index on
+  normal read paths.
+- Pinned table filters are verified against table records during table metadata
+  open; block filters are verified when data blocks are read. Corrupt pinned
+  filter tables now fail closed at open, while filter-disabled tables still
+  defer data-block checksum work until read.
+- Native WAL group commit writes a confirmed marker only after durable sync, and
+  recovery rejects a WAL shard that ends before the marked sequence. WAL rewrite
+  clears markers already covered by the replay floor. Object-store WAL recovery
+  remains governed by its remote head/segment contract.
+- Browser persistent close now takes and drops the Web Locks writer lease, and
+  browser async commits enter the publish-activity barrier so close waits for
+  admitted writes.
+- Checks passed: `cargo test -q data_block_hash_index_mismatch_fails_closed`,
+  `cargo test -q table_point_filter_false_negative_fails_closed`,
+  `cargo test -q table_prefix_filter_false_negative_fails_closed`,
+  `cargo test -q persistent_wal_rejects_truncated_confirmed_tail`,
+  `cargo test -q persistent_wal_ignores_torn_final_record`,
+  `cargo test -q persistent_reopen_defers_data_block_checksum_until_read`,
+  `cargo test -q persistent_pinned_filter_table_rejects_corrupt_data_block_on_open`,
+  `cargo test -q persistent_flush_writes_table_and_reopen_can_skip_wal`,
+  `cargo test -q object_store_recovery_rejects_truncated_confirmed_wal_segment`,
+  `cargo test -q`, `cargo fmt --check`, `git diff --check`,
+  `cargo check -q`, `cargo check -q --all-features`, and
+  `cargo check -q --target wasm32-unknown-unknown`,
+  `cargo rustdoc --all-features -- -D warnings`.
+
+### Recommended Next Action
+
+- Treat these four review findings as fixed. Before a release, rerun the normal
+  all-target/all-feature release gate and browser integration smoke if a real
+  browser backend is available.

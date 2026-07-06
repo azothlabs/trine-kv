@@ -4012,6 +4012,15 @@ fn read_table_metadata_from_source(
         validate_index_top_level(top_level_block, &index_partitions, footer.indexes)?;
     let (point_key_filter, prefix_filter) =
         read_pinned_table_filters(source, payload_len, footer.filters, &properties)?;
+    validate_pinned_table_filter_coverage(
+        source,
+        payload_len,
+        footer.data_blocks,
+        properties.codec,
+        &index_partitions,
+        point_key_filter.as_ref(),
+        prefix_filter.as_ref(),
+    )?;
     let index_partition_cache = Arc::new(RwLock::new(read_pinned_index_partitions(
         source,
         payload_len,
@@ -4171,6 +4180,38 @@ fn read_pinned_table_filters(
     let filter_codec = filter_block.codec();
     validate_block_codec(filter_codec, properties.codec, TableSection::Filters)?;
     decode_filter_block(filter_block.payload())
+}
+
+fn validate_pinned_table_filter_coverage(
+    source: &impl BlockReadSource,
+    payload_len: usize,
+    data_blocks_section: SectionHandle,
+    expected_codec: CodecId,
+    partitions: &[IndexPartitionEntry],
+    point_filter: Option<&PointKeyFilter>,
+    prefix_filter: Option<&PrefixFilter>,
+) -> Result<()> {
+    if point_filter.is_none() && prefix_filter.is_none() {
+        return Ok(());
+    }
+
+    for partition in partitions {
+        let index_block =
+            read_checked_block_from_source_shared(source, payload_len, partition.block)?;
+        let index_codec = index_block.codec();
+        validate_block_codec(index_codec, expected_codec, TableSection::Indexes)?;
+        let index_entries = decode_index_block(index_block.payload())?;
+        validate_index_partition(partition, &index_entries, data_blocks_section)?;
+        for entry in index_entries {
+            let block = read_data_block_from_source(source, payload_len, expected_codec, &entry)?;
+            for record_index in 0..block.record_count() {
+                let record = block.record_view(record_index)?;
+                validate_table_filters_for_key(point_filter, prefix_filter, record.user_key)?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn read_pinned_index_partitions(
@@ -4696,6 +4737,11 @@ fn decode_table_from_storage_object(
     let filter_codec = filter_block.codec();
     validate_block_codec(filter_codec, properties.codec, TableSection::Filters)?;
     let (point_key_filter, prefix_filter) = decode_filter_block(filter_block.payload())?;
+    validate_table_filters(
+        point_key_filter.as_ref(),
+        prefix_filter.as_ref(),
+        &point_records,
+    )?;
     if properties
         != table_properties(
             properties.id,
@@ -5390,7 +5436,7 @@ fn read_data_block_from_source(
     let block = read_checked_block_from_source_shared(source, payload_len, entry.block)?;
     let actual_codec = block.codec();
     validate_block_codec(actual_codec, expected_codec, TableSection::DataBlocks)?;
-    let decoded = decode_data_block_from_block(block, false)?;
+    let decoded = decode_data_block_from_block(block, true)?;
     validate_decoded_data_block_entry(entry, &decoded)?;
     validate_decoded_data_block_filters(entry, &decoded)?;
     Ok(decoded)
@@ -5407,7 +5453,7 @@ async fn read_data_block_from_storage_object_async(
             .await?;
     let actual_codec = block.codec();
     validate_block_codec(actual_codec, expected_codec, TableSection::DataBlocks)?;
-    let decoded = decode_data_block_from_block(block, false)?;
+    let decoded = decode_data_block_from_block(block, true)?;
     validate_decoded_data_block_entry(entry, &decoded)?;
     validate_decoded_data_block_filters(entry, &decoded)?;
     Ok(decoded)
@@ -5588,13 +5634,6 @@ fn read_value_ref_header(cursor: &mut Cursor<'_>) -> Result<Option<ValueRefHeade
 }
 
 fn decode_data_block(bytes: Vec<u8>) -> Result<DecodedDataBlock> {
-    let len = bytes.len();
-    let bytes = Bytes::from(bytes);
-    decode_data_block_shared(bytes, 0..len, false)
-}
-
-#[cfg(test)]
-fn decode_data_block_for_verify(bytes: Vec<u8>) -> Result<DecodedDataBlock> {
     let len = bytes.len();
     let bytes = Bytes::from(bytes);
     decode_data_block_shared(bytes, 0..len, true)
@@ -5976,6 +6015,48 @@ fn validate_decoded_data_block_entry(
     }
 
     validate_sorted_decoded_data_block(block)
+}
+
+fn validate_table_filters(
+    point_filter: Option<&PointKeyFilter>,
+    prefix_filter: Option<&PrefixFilter>,
+    records: &[TablePointRecord],
+) -> Result<()> {
+    for record in records {
+        validate_table_filters_for_key(
+            point_filter,
+            prefix_filter,
+            record.internal_key.user_key(),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_table_filters_for_key(
+    point_filter: Option<&PointKeyFilter>,
+    prefix_filter: Option<&PrefixFilter>,
+    user_key: &[u8],
+) -> Result<()> {
+    if point_filter.is_some_and(|filter| !filter.may_contain_key(user_key)) {
+        return Err(Error::Corruption {
+            message: "table point-key filter misses a table key".to_owned(),
+        });
+    }
+
+    if let Some(filter) = prefix_filter {
+        if filter
+            .extractor()
+            .extract(user_key)
+            .is_some_and(|prefix| !filter.may_contain_prefix(prefix))
+        {
+            return Err(Error::Corruption {
+                message: "table prefix filter misses a table prefix".to_owned(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -7100,7 +7181,7 @@ mod tests {
     }
 
     #[test]
-    fn full_hash_index_validation_is_explicit() {
+    fn data_block_hash_index_mismatch_fails_closed() {
         let records = vec![
             test_point_record(b"a", 2, b"alpha"),
             test_point_record(b"b", 1, b"bravo"),
@@ -7113,15 +7194,8 @@ mod tests {
         encoded[hash_section..hash_section + 4].copy_from_slice(&1_u32.to_le_bytes());
         encoded.truncate(encoded.len() - MIN_DATA_BLOCK_HASH_ENTRY_BYTES);
 
-        let block = decode_data_block(encoded.clone()).expect("normal read decode is lightweight");
-        assert!(
-            data_block_point_records_for_key(&block, b"b", IndexSearchPolicy::Binary)
-                .expect("hash lookup runs")
-                .is_empty(),
-            "lightweight decode trusts the encoded lookup index after structural checks"
-        );
-        let error = decode_data_block_for_verify(encoded)
-            .expect_err("full verification should rebuild and compare the index");
+        let error = decode_data_block(encoded)
+            .expect_err("data block decode should rebuild and compare the index");
         assert_invalid_table_message(&error, "hash index does not match records");
     }
 
@@ -7597,6 +7671,34 @@ mod tests {
         assert!(decoded.may_contain_key(b"key-003"));
         let missing = point_filter_miss(decoded.point_key_filter.as_ref().expect("filter exists"));
         assert!(!decoded.may_contain_key(&missing));
+    }
+
+    #[test]
+    fn table_point_filter_false_negative_fails_closed() {
+        let mut table = table_with_records(8, CodecId::None);
+        table.point_key_filter =
+            Some(PointKeyFilter::from_parts(1, 1, vec![0]).expect("test filter decodes"));
+        let payload = encode_table(&table).expect("table encodes");
+
+        let error =
+            decode_table(&table_file_bytes(&payload)).expect_err("table filter miss fails closed");
+        assert!(matches!(error, Error::Corruption { .. }));
+        assert!(error.to_string().contains("table point-key filter"));
+    }
+
+    #[test]
+    fn table_prefix_filter_false_negative_fails_closed() {
+        let mut table = table_with_records(8, CodecId::None);
+        table.prefix_filter = Some(
+            PrefixFilter::from_parts(PrefixExtractor::FixedLen(6), 1, 1, vec![0])
+                .expect("test filter decodes"),
+        );
+        let payload = encode_table(&table).expect("table encodes");
+
+        let error =
+            decode_table(&table_file_bytes(&payload)).expect_err("prefix filter miss fails closed");
+        assert!(matches!(error, Error::Corruption { .. }));
+        assert!(error.to_string().contains("table prefix filter"));
     }
 
     #[test]

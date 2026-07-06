@@ -4266,7 +4266,11 @@ fn persistent_reopen_fails_when_table_checksum_is_corrupt() {
 #[test]
 fn persistent_reopen_defers_data_block_checksum_until_read() {
     let path = temp_db_path("corrupt-data-block-read");
-    let options = DbOptions::persistent(&path);
+    let options = DbOptions::persistent(&path).with_default_bucket_options(BucketOptions {
+        filter_policy: FilterPolicy::Disabled,
+        prefix_filter_policy: PrefixFilterPolicy::Disabled,
+        ..BucketOptions::default()
+    });
     let table_path = flushed_default_table_path(&path, &options);
 
     corrupt_first_data_block_payload(&table_path);
@@ -4284,8 +4288,8 @@ fn persistent_reopen_defers_data_block_checksum_until_read() {
 }
 
 #[test]
-fn persistent_filter_miss_does_not_read_corrupt_data_block() {
-    let path = temp_db_path("filter-miss-skips-data-block");
+fn persistent_pinned_filter_table_rejects_corrupt_data_block_on_open() {
+    let path = temp_db_path("filter-table-corrupt-data-block");
     let options = DbOptions::persistent(&path);
     let table_path;
 
@@ -4309,26 +4313,8 @@ fn persistent_filter_miss_does_not_read_corrupt_data_block() {
 
     corrupt_first_data_block_payload(&table_path);
 
-    {
-        let db = Db::open_sync(options).expect("metadata-only table open succeeds");
-        let bucket = db.default_bucket_sync().expect("bucket reopens");
-        assert_eq!(
-            bucket
-                .get_sync(b"b")
-                .expect("filter miss should not read data block"),
-            None
-        );
-        assert_eq!(
-            db.stats().block_cache_misses,
-            0,
-            "filter miss should avoid block cache lookup"
-        );
-        let filter_stats = db.stats().filters;
-        assert!(
-            filter_stats.table_point_misses + filter_stats.block_point_misses > 0,
-            "a point filter should reject the missing key before data-block read"
-        );
-    }
+    let error = Db::open_sync(options).expect_err("pinned filter table must verify data blocks");
+    assert!(matches!(error, Error::Corruption { .. }));
 
     fs::remove_dir_all(path).expect("cleanup test db");
 }
@@ -4451,6 +4437,35 @@ fn persistent_wal_ignores_torn_final_record() {
             Some(b"a1".to_vec())
         );
     }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
+fn persistent_wal_rejects_truncated_confirmed_tail() {
+    let path = temp_db_path("confirmed-tail-truncated");
+    let options = DbOptions::persistent(&path);
+
+    {
+        let db = Db::open_sync(options.clone()).expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
+        bucket.put_sync(b"a", b"a1").expect("write a");
+    }
+
+    let wal_path = wal::wal_path(&path);
+    let mut bytes = fs::read(&wal_path).expect("read WAL");
+    let new_len = bytes
+        .len()
+        .checked_sub(3)
+        .expect("test WAL has a payload tail");
+    bytes.truncate(new_len);
+    fs::write(&wal_path, bytes).expect("write truncated WAL");
+
+    let error = Db::open_sync(options).expect_err("confirmed WAL tail must fail closed");
+    assert!(
+        matches!(error, Error::Corruption { ref message } if message.contains("confirmed sequence")),
+        "expected confirmed sequence corruption, got {error:?}"
+    );
 
     fs::remove_dir_all(path).expect("cleanup test db");
 }

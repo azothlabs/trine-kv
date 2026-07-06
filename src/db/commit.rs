@@ -703,6 +703,7 @@ impl Db {
             return self.commit_write_request(request);
         }
 
+        let _publish_activity = self.inner.publish_barrier.begin_activity()?;
         let accepted_state = self.accept_write_request(request)?;
         self.publish_accepted_write_state_async(accepted_state)
             .await

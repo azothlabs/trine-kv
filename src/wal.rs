@@ -19,7 +19,8 @@ use crate::{
     options::DurabilityMode,
     storage::{
         BlockingStorageAppendBackend, BlockingStorageDirectoryListBackend,
-        BlockingStorageObjectReadBackend, BlockingStorageReadBackend, BlockingStorageReadObject,
+        BlockingStorageObjectDeleteBackend, BlockingStorageObjectReadBackend,
+        BlockingStorageObjectWriteBackend, BlockingStorageReadBackend, BlockingStorageReadObject,
         BlockingStorageWalRewriteBackend, NativeFileAppendObject, NativeFileBackend,
         StorageAppendBackend, StorageAppendObject, StorageCapability, StorageDirectoryFile,
         StorageDirectoryId, StorageDirectoryListBackend, StorageObjectDeleteBackend,
@@ -40,16 +41,20 @@ const HEADER_LEN: usize = 18;
 const WAL_FRONT_DOOR_QUEUE_CAPACITY: usize = 64;
 const WAL_SHARD_FILE_PREFIX: &str = "trine.wal.shard-";
 const WAL_SHARD_FILE_DIGITS: usize = 4;
+const WAL_CONFIRMED_FILE_PREFIX: &str = "trine.wal.confirmed-";
 const OBJECT_WAL_FILE_PREFIX: &str = "trine.wal.epoch-";
 const OBJECT_WAL_COMMIT_MARKER: &str = ".commit-";
 const OBJECT_WAL_REWRITE_PREFIX: &str = "trine.wal.rewrite-epoch-";
 const OBJECT_WAL_REWRITE_MARKER: &str = ".after-";
 const OBJECT_WAL_FILE_SUFFIX: &str = ".trinewal";
 const OBJECT_WAL_SEQUENCE_DIGITS: usize = 20;
+const WAL_CONFIRMED_MAGIC: u32 = 0x5452_5743;
+const WAL_CONFIRMED_VERSION: u16 = 1;
+const WAL_CONFIRMED_LEN: usize = 18;
 
-/// Whether an object-store `key` names a write-ahead-log object — the
-/// `trine.wal` file, a `trine.wal.shard-NNNN` shard, or the rewrite temp — as
-/// opposed to an `SSTable`, blob, manifest, or lease object.
+/// Whether an object-store `key` names a write-ahead-log object: a `trine.wal`
+/// shard, WAL rewrite temp, confirmed-marker file, or remote object-store WAL
+/// segment, as opposed to an `SSTable`, blob, manifest, or lease object.
 ///
 /// A database opened over object storage writes **all** of these through one
 /// [`ObjectClient`](crate::ObjectClient), and a commit is acknowledged only once
@@ -136,6 +141,7 @@ pub(crate) struct WalFrontDoorStats {
 #[derive(Debug)]
 enum WalLaneCommand {
     Append {
+        sequence: Sequence,
         frame: Vec<u8>,
         durability: DurabilityMode,
         reply: WalLaneReply,
@@ -148,6 +154,12 @@ enum WalLaneCommand {
         replay_floor: Sequence,
         reply: WalLaneReply,
     },
+}
+
+#[derive(Debug)]
+struct PendingWalAppend {
+    sequence: Sequence,
+    reply: WalLaneReply,
 }
 
 #[derive(Debug)]
@@ -440,6 +452,7 @@ impl WalFrontDoor {
         let frame = encode_batch_frame(sequence, operations)?;
         let frame_len = usize_to_u64_saturating(frame.len());
         send_wal_lane_command(lane, |reply| WalLaneCommand::Append {
+            sequence,
             frame,
             durability,
             reply,
@@ -464,6 +477,7 @@ impl WalFrontDoor {
         let frame = encode_batch_frame(sequence, operations)?;
         let frame_len = usize_to_u64_saturating(frame.len());
         let waiter = enqueue_wal_lane_command(lane, |reply| WalLaneCommand::Append {
+            sequence,
             frame,
             durability,
             reply,
@@ -755,10 +769,14 @@ pub(crate) fn read_batches_after_with_backend(
     path: &Path,
     replay_floor: Sequence,
 ) -> Result<Vec<WalBatch>> {
+    let confirmed_sequence = read_confirmed_wal_marker_with_backend(backend, path)?;
     let Some(bytes) = read_wal_object_with_backend(backend, path)? else {
+        validate_confirmed_wal_coverage(path, replay_floor, confirmed_sequence, &[])?;
         return Ok(Vec::new());
     };
-    decode_frames_after(bytes.as_ref(), replay_floor)
+    let batches = decode_frames_after(bytes.as_ref(), replay_floor)?;
+    validate_confirmed_wal_coverage(path, replay_floor, confirmed_sequence, &batches)?;
+    Ok(batches)
 }
 
 #[allow(dead_code)]
@@ -770,10 +788,14 @@ pub(crate) async fn read_batches_after_with_backend_async<B>(
 where
     B: StorageObjectReadBackend,
 {
+    let confirmed_sequence = read_confirmed_wal_marker_with_backend_async(backend, path).await?;
     let Some(bytes) = read_wal_object_with_backend_async(backend, path).await? else {
+        validate_confirmed_wal_coverage(path, replay_floor, confirmed_sequence, &[])?;
         return Ok(Vec::new());
     };
-    decode_frames_after(bytes.as_ref(), replay_floor)
+    let batches = decode_frames_after(bytes.as_ref(), replay_floor)?;
+    validate_confirmed_wal_coverage(path, replay_floor, confirmed_sequence, &batches)?;
+    Ok(batches)
 }
 
 pub(crate) fn read_recovery_streams_after_paths_with_backend(
@@ -1133,6 +1155,143 @@ where
     backend.read_object_bytes(wal_storage_object(path)).await
 }
 
+fn write_confirmed_wal_marker_with_backend(
+    backend: &NativeFileBackend,
+    path: &Path,
+    sequence: Sequence,
+    durability: DurabilityMode,
+) -> Result<()> {
+    let marker_path = wal_confirmed_marker_path(path)?
+        .ok_or_else(|| invalid_wal("confirmed WAL marker needs a shard WAL path"))?;
+    backend
+        .capabilities()
+        .require(StorageCapability::ObjectWrite)?;
+    backend.write_object_blocking(
+        wal_storage_object(&marker_path),
+        encode_confirmed_wal_marker(sequence),
+        durability,
+    )
+}
+
+fn read_confirmed_wal_marker_with_backend(
+    backend: &NativeFileBackend,
+    path: &Path,
+) -> Result<Option<Sequence>> {
+    let Some(marker_path) = wal_confirmed_marker_path(path)? else {
+        return Ok(None);
+    };
+    let Some(bytes) = backend.read_object_bytes_blocking(wal_storage_object(&marker_path))? else {
+        return Ok(None);
+    };
+    decode_confirmed_wal_marker(bytes.as_ref()).map(Some)
+}
+
+fn delete_confirmed_wal_marker_with_backend(
+    backend: &NativeFileBackend,
+    path: &Path,
+) -> Result<()> {
+    let Some(marker_path) = wal_confirmed_marker_path(path)? else {
+        return Ok(());
+    };
+    backend.delete_object_blocking(wal_storage_object(&marker_path))
+}
+
+async fn read_confirmed_wal_marker_with_backend_async<B>(
+    backend: &B,
+    path: &Path,
+) -> Result<Option<Sequence>>
+where
+    B: StorageObjectReadBackend,
+{
+    let Some(marker_path) = wal_confirmed_marker_path(path)? else {
+        return Ok(None);
+    };
+    let Some(bytes) = backend
+        .read_object_bytes(wal_storage_object(&marker_path))
+        .await?
+    else {
+        return Ok(None);
+    };
+    decode_confirmed_wal_marker(bytes.as_ref()).map(Some)
+}
+
+fn validate_confirmed_wal_coverage(
+    path: &Path,
+    replay_floor: Sequence,
+    confirmed_sequence: Option<Sequence>,
+    batches: &[WalBatch],
+) -> Result<()> {
+    let Some(confirmed_sequence) = confirmed_sequence else {
+        return Ok(());
+    };
+    if confirmed_sequence <= replay_floor {
+        return Ok(());
+    }
+    let last_sequence = batches
+        .iter()
+        .map(|batch| batch.sequence)
+        .max()
+        .unwrap_or(replay_floor);
+    if last_sequence >= confirmed_sequence {
+        return Ok(());
+    }
+
+    Err(Error::Corruption {
+        message: format!(
+            "WAL {} ended before confirmed sequence {}",
+            path.display(),
+            confirmed_sequence.get()
+        ),
+    })
+}
+
+fn wal_confirmed_marker_path(path: &Path) -> Result<Option<PathBuf>> {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(Error::Corruption {
+            message: format!("WAL file name is not valid UTF-8: {}", path.display()),
+        });
+    };
+    let Some(shard_index) = wal_shard_index_from_file_name(file_name)? else {
+        return Ok(None);
+    };
+    let width = WAL_SHARD_FILE_DIGITS;
+    Ok(Some(path.with_file_name(format!(
+        "{WAL_CONFIRMED_FILE_PREFIX}{shard_index:0width$}"
+    ))))
+}
+
+fn encode_confirmed_wal_marker(sequence: Sequence) -> Arc<[u8]> {
+    let mut bytes = Vec::with_capacity(WAL_CONFIRMED_LEN);
+    bytes.extend_from_slice(&WAL_CONFIRMED_MAGIC.to_le_bytes());
+    bytes.extend_from_slice(&WAL_CONFIRMED_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&sequence.get().to_le_bytes());
+    let marker_checksum = checksum(&bytes);
+    bytes.extend_from_slice(&marker_checksum.to_le_bytes());
+    Arc::from(bytes.into_boxed_slice())
+}
+
+fn decode_confirmed_wal_marker(bytes: &[u8]) -> Result<Sequence> {
+    if bytes.len() != WAL_CONFIRMED_LEN {
+        return Err(invalid_wal("confirmed WAL marker length mismatch"));
+    }
+    let magic = read_u32_at(bytes, 0)?;
+    let version = read_u16_at(bytes, 4)?;
+    let sequence = read_u64_at(bytes, 6)?;
+    let actual_checksum = read_u32_at(bytes, 14)?;
+    if magic != WAL_CONFIRMED_MAGIC {
+        return Err(invalid_wal("confirmed WAL marker magic mismatch"));
+    }
+    if version != WAL_CONFIRMED_VERSION {
+        return Err(Error::UnsupportedFormat {
+            message: format!("unsupported confirmed WAL marker version {version}"),
+        });
+    }
+    if checksum(&bytes[..14]) != actual_checksum {
+        return Err(invalid_wal("confirmed WAL marker checksum mismatch"));
+    }
+    Ok(Sequence::new(sequence))
+}
+
 #[allow(dead_code)]
 fn rewrite_wal_object_with_backend(
     backend: &NativeFileBackend,
@@ -1212,6 +1371,8 @@ fn run_wal_lane_worker(
 ) {
     let mut writer = None::<WalWriter>;
     let mut persisted_level = None::<DurabilityMode>;
+    let mut last_appended_sequence = None::<Sequence>;
+    let mut confirmed_sequence = None::<Sequence>;
     // Group commit: block for one command, then drain everything already queued
     // and serve the whole batch with a single fsync. Concurrent writers (or one
     // writer with many in-flight async commits) amortize the fsync cost; each
@@ -1231,6 +1392,8 @@ fn run_wal_lane_worker(
             &mut writer,
             &writer_open,
             &mut persisted_level,
+            &mut last_appended_sequence,
+            &mut confirmed_sequence,
             batch,
         );
     }
@@ -1242,16 +1405,19 @@ fn process_wal_lane_batch(
     writer: &mut Option<WalWriter>,
     writer_open: &AtomicBool,
     persisted_level: &mut Option<DurabilityMode>,
+    last_appended_sequence: &mut Option<Sequence>,
+    confirmed_sequence: &mut Option<Sequence>,
     batch: Vec<WalLaneCommand>,
 ) {
     // Appended-but-not-yet-synced waiters and the strongest durability any of
-    // them requested. They are completed together by the next fsush.
-    let mut pending: Vec<WalLaneReply> = Vec::new();
+    // them requested. They are completed together by the next fsync.
+    let mut pending: Vec<PendingWalAppend> = Vec::new();
     let mut pending_durability = DurabilityMode::Buffered;
 
     for command in batch {
         match command {
             WalLaneCommand::Append {
+                sequence,
                 frame,
                 durability,
                 reply,
@@ -1273,7 +1439,8 @@ fn process_wal_lane_batch(
                         // Mark the lane dirty: these bytes are unsynced, so a
                         // later persist (even in a separate batch) must fsync.
                         *persisted_level = Some(DurabilityMode::Buffered);
-                        pending.push(reply);
+                        *last_appended_sequence = Some(sequence);
+                        pending.push(PendingWalAppend { sequence, reply });
                     }
                     Err(error) => reply.complete(Err(error)),
                 }
@@ -1285,7 +1452,16 @@ fn process_wal_lane_batch(
                     } else {
                         pending_durability
                     };
-                let result = flush_wal_lane_batch(writer, persisted_level, combined, &mut pending);
+                let result = flush_wal_lane_batch(
+                    backend,
+                    path,
+                    writer,
+                    persisted_level,
+                    combined,
+                    &mut pending,
+                    *last_appended_sequence,
+                    confirmed_sequence,
+                );
                 reply.complete(duplicate_wal_lane_result(&result));
                 pending_durability = DurabilityMode::Buffered;
             }
@@ -1294,8 +1470,16 @@ fn process_wal_lane_batch(
                 reply,
             } => {
                 // A rewrite changes the file; flush queued appends first.
-                let _ =
-                    flush_wal_lane_batch(writer, persisted_level, pending_durability, &mut pending);
+                let _ = flush_wal_lane_batch(
+                    backend,
+                    path,
+                    writer,
+                    persisted_level,
+                    pending_durability,
+                    &mut pending,
+                    *last_appended_sequence,
+                    confirmed_sequence,
+                );
                 pending_durability = DurabilityMode::Buffered;
                 let result = rewrite_wal_lane_after_replay_floor(
                     backend,
@@ -1309,7 +1493,16 @@ fn process_wal_lane_batch(
         }
     }
 
-    let _ = flush_wal_lane_batch(writer, persisted_level, pending_durability, &mut pending);
+    let _ = flush_wal_lane_batch(
+        backend,
+        path,
+        writer,
+        persisted_level,
+        pending_durability,
+        &mut pending,
+        *last_appended_sequence,
+        confirmed_sequence,
+    );
 }
 
 /// Persist the buffered appends with a single fsync and complete their waiters.
@@ -1318,24 +1511,43 @@ fn process_wal_lane_batch(
 /// sync at `durability` is forced; for a standalone persist with no new appends
 /// the existing `persisted_level` can satisfy it without a redundant fsync.
 fn flush_wal_lane_batch(
+    backend: &NativeFileBackend,
+    path: &Path,
     writer: &mut Option<WalWriter>,
     persisted_level: &mut Option<DurabilityMode>,
     durability: DurabilityMode,
-    pending: &mut Vec<WalLaneReply>,
+    pending: &mut Vec<PendingWalAppend>,
+    last_appended_sequence: Option<Sequence>,
+    confirmed_sequence: &mut Option<Sequence>,
 ) -> Result<()> {
     let has_new_appends = !pending.is_empty();
-    let result = persist_wal_lane_batch(writer, persisted_level, durability, has_new_appends);
-    for reply in pending.drain(..) {
+    let pending_max_sequence = pending.iter().map(|append| append.sequence).max();
+    let result = persist_wal_lane_batch(
+        backend,
+        path,
+        writer,
+        persisted_level,
+        durability,
+        has_new_appends,
+        pending_max_sequence.or(last_appended_sequence),
+        confirmed_sequence,
+    );
+    for pending in pending.drain(..) {
+        let reply = pending.reply;
         reply.complete(duplicate_wal_lane_result(&result));
     }
     result
 }
 
 fn persist_wal_lane_batch(
+    backend: &NativeFileBackend,
+    path: &Path,
     writer: &mut Option<WalWriter>,
     persisted_level: &mut Option<DurabilityMode>,
     durability: DurabilityMode,
     has_new_appends: bool,
+    confirm_sequence: Option<Sequence>,
+    confirmed_sequence: &mut Option<Sequence>,
 ) -> Result<()> {
     let Some(writer) = writer.as_mut() else {
         return Ok(());
@@ -1348,6 +1560,12 @@ fn persist_wal_lane_batch(
     if has_new_appends || wal_lane_needs_persist(*persisted_level, durability) {
         writer.persist(durability)?;
         *persisted_level = Some(durability);
+    }
+    if let Some(sequence) = confirm_sequence {
+        if confirmed_sequence.is_none_or(|confirmed| sequence > confirmed) {
+            write_confirmed_wal_marker_with_backend(backend, path, sequence, durability)?;
+            *confirmed_sequence = Some(sequence);
+        }
     }
     Ok(())
 }
@@ -1439,6 +1657,11 @@ fn rewrite_wal_lane_after_replay_floor(
         path,
         replay_floor,
     ))?;
+    if read_confirmed_wal_marker_with_backend(backend, path)?
+        .is_some_and(|sequence| sequence <= replay_floor)
+    {
+        delete_confirmed_wal_marker_with_backend(backend, path)?;
+    }
     if let Some(writer) = writer.as_mut() {
         writer.reopen_append_with_backend(backend, path)?;
         *persisted_level = Some(DurabilityMode::SyncAll);

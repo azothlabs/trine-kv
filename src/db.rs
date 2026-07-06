@@ -279,7 +279,7 @@ pub(crate) struct DbInner {
     browser_storage: Option<BrowserStorageBackend>,
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     #[allow(dead_code)]
-    browser_writer_lease: Option<BrowserWriterLease>,
+    browser_writer_lease: Mutex<Option<BrowserWriterLease>>,
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     browser_wal: Option<BrowserWalFrontDoor>,
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -952,6 +952,19 @@ fn shutdown_background_workers(
     maintenance.wait_until_idle();
 }
 
+impl DbInner {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    fn release_browser_writer_lease(&self) {
+        let Ok(mut lease) = self.browser_writer_lease.lock() else {
+            return;
+        };
+        let _ = lease.take();
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn release_browser_writer_lease(&self) {}
+}
+
 impl Drop for DbInner {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::Release);
@@ -971,6 +984,7 @@ impl Drop for DbInner {
             &self.snapshots,
             self.manifest.as_ref(),
         );
+        self.release_browser_writer_lease();
     }
 }
 
@@ -999,6 +1013,7 @@ impl Drop for Db {
                 &self.inner.background_workers,
             );
             let _ = self.inner.publish_barrier.close();
+            self.inner.release_browser_writer_lease();
             self.inner.substrate.release_writer_lease();
         }
     }
@@ -1264,7 +1279,7 @@ impl Db {
                 object_storage_prefix: PathBuf::new(),
                 object_manifest_async_lock: futures::lock::Mutex::new(()),
                 browser_storage: Some(storage),
-                browser_writer_lease: writer_lease,
+                browser_writer_lease: Mutex::new(writer_lease),
                 browser_wal,
                 browser_manifest_async_lock: futures::lock::Mutex::new(()),
                 runtime,
@@ -1544,7 +1559,7 @@ impl Db {
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
                 browser_storage: None,
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                browser_writer_lease: None,
+                browser_writer_lease: Mutex::new(None),
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
                 browser_wal: None,
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -1655,7 +1670,7 @@ impl Db {
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
                 browser_storage: None,
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                browser_writer_lease: None,
+                browser_writer_lease: Mutex::new(None),
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
                 browser_wal: None,
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -1925,7 +1940,7 @@ impl Db {
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
                 browser_storage: None,
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                browser_writer_lease: None,
+                browser_writer_lease: Mutex::new(None),
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
                 browser_wal: None,
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -3530,6 +3545,7 @@ impl Db {
             self.cleanup_pending_obsolete_blob_files_native_async(&db_path)
                 .await?;
         }
+        self.inner.release_browser_writer_lease();
         self.inner.substrate.release_writer_lease();
         Ok(())
     }
@@ -4422,6 +4438,7 @@ impl Db {
             let _ = self.cleanup_pending_obsolete_table_files(&db_path);
             let _ = self.cleanup_pending_obsolete_blob_files(&db_path);
         }
+        self.inner.release_browser_writer_lease();
         self.inner.substrate.release_writer_lease();
     }
 
