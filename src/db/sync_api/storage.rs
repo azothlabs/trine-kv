@@ -1,4 +1,16 @@
-use super::*;
+use super::{
+    Arc, BlobLevelMergePolicy, CompactionReservation, Db, DurabilityMode, Error,
+    HostStorageBackend, KeyRange, LsmCompactionOutput, MaintenanceBudget, MaintenanceOutcome,
+    NamedCompactionInput, NamedCompactionOutput, NamedFlushInput, ObjectClient, ObjectStoreBackend,
+    Path, PendingCompactionOutputs, Result, Sequence, StorageMode, StorageObjectDeleteBackend,
+    StorageObjectId, StorageObjectKind, Table, blob, compaction_trigger_stat_deltas,
+    is_level_layout_compaction_error, lock_poisoned, referenced_blob_file_ids_from_manifest,
+    referenced_table_file_ids, should_rewrite_blob_indexes_for_compaction, table,
+};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use super::{Ordering, shutdown_background_workers};
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use crate::{ReadVersion, storage::BrowserStorageBackend};
 
 impl Db {
     /// Persists pending WAL bytes according to `mode`.
@@ -728,7 +740,7 @@ impl Db {
             self.cleanup_pending_obsolete_blob_files_native_async(&db_path)
                 .await?;
         }
-        self.inner.release_browser_writer_lease();
+        super::super::release_browser_writer_lease(&self.inner);
         self.inner.substrate.release_writer_lease();
         Ok(())
     }

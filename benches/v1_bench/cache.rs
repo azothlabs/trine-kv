@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    BenchResult, BucketOptions, Db, Instant, OPS, ROWS, RuntimeOptions,
+    benchmark_persistent_options, cleanup_dir, duration_micros, flushed_persistent_db, key,
+    labelled, measure, seed_index, temp_dir, value, xorshift,
+};
 
 pub(super) fn bench_block_cache_warm_read() -> BenchResult {
     let (dir, db, bucket) = flushed_persistent_db("warm-read", ROWS, BucketOptions::default());

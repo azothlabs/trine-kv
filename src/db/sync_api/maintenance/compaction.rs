@@ -1,4 +1,13 @@
-use super::*;
+use super::{
+    Arc, BlobLevelMergePolicy, CompactionReservation, Db, DurabilityMode, Error, KeyRange,
+    LsmCompactionOutput, MaintenanceBudget, MaintenanceOutcome, NamedCompactionInput,
+    NamedCompactionOutput, Path, PendingCompactionOutputs, Result, Sequence, compaction_options,
+    compaction_trigger_stat_deltas, is_level_layout_compaction_error, lock_poisoned,
+    remove_storage_files, should_rewrite_blob_indexes_for_compaction,
+    sync_storage_directory_after_renames, table,
+};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use super::{remove_storage_files_async, sync_storage_directory_after_renames_async};
 
 impl Db {
     pub(in crate::db) fn collect_compaction_inputs(

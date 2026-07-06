@@ -724,7 +724,11 @@ mod lane;
 mod recovery;
 
 pub(crate) use codec::*;
-use lane::*;
+use lane::{
+    enqueue_wal_lane_command, run_wal_lane_worker, send_wal_lane_command,
+    validate_wal_stream_order, wal_front_door_completion_poisoned, wal_shard_index_from_file_name,
+    wal_shard_index_from_final_file_name, wal_shard_index_from_path,
+};
 pub(crate) use recovery::*;
 
 #[cfg(test)]

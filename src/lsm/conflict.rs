@@ -281,6 +281,22 @@ fn collect_memtable_point_records(
         .collect())
 }
 
+fn collect_memtable_range_records(
+    memtable: &crate::memtable::Memtable,
+    range: &KeyRange,
+) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
+    let entries = memtable
+        .read_entries()
+        .map_err(|_| lock_poisoned("memtable entries"))?;
+    Ok(entries
+        .iter()
+        .filter(|(internal_key, _)| {
+            range_tombstone::key_is_in_range(internal_key.user_key(), range)
+        })
+        .map(|(internal_key, value)| (internal_key.clone(), value.clone()))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
@@ -384,20 +400,4 @@ mod tests {
             .clear();
         tree.immutable_memtable_count.store(0, Ordering::Release);
     }
-}
-
-fn collect_memtable_range_records(
-    memtable: &crate::memtable::Memtable,
-    range: &KeyRange,
-) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
-    let entries = memtable
-        .read_entries()
-        .map_err(|_| lock_poisoned("memtable entries"))?;
-    Ok(entries
-        .iter()
-        .filter(|(internal_key, _)| {
-            range_tombstone::key_is_in_range(internal_key.user_key(), range)
-        })
-        .map(|(internal_key, value)| (internal_key.clone(), value.clone()))
-        .collect())
 }

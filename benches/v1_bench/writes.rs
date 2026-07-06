@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    BenchResult, Db, DbOptions, DurabilityMode, OPS, PathBuf, ROWS, WRITE_DIAGNOSTIC_OPS,
+    WriteBatch, WriteOptions, cleanup_dir, key, measure, temp_dir, value,
+};
 
 pub(super) fn benchmark_persistent_options(path: impl Into<PathBuf>) -> DbOptions {
     DbOptions::new(path).with_durability(DurabilityMode::Buffered)

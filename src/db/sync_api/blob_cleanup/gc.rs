@@ -1,4 +1,12 @@
-use super::*;
+use super::{
+    Arc, BTreeSet, BlobGcCandidate, BlobGcRewritePlan, BlobGcRewriteRecord, BlobGcRewriteTable, Db,
+    DurabilityMode, Error, LsmCompactionOutput, NamedCompactionOutput, Ordering, Path, Result,
+    ValueRef, apply_blob_gc_indexes, blob, blob_gc_blob_records, blob_gc_table_write_options,
+    lock_poisoned, remove_storage_files, sync_storage_directory_after_renames, table,
+    write_blob_gc_replacement_tables,
+};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use super::{remove_storage_files_async, sync_storage_directory_after_renames_async};
 
 impl Db {
     pub(in crate::db) fn run_blob_gc_once_locked(&self, db_path: &Path) -> Result<()> {

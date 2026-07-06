@@ -1,4 +1,9 @@
 use super::*;
+use crate::table::format::decode_table;
+use crate::table::format::encode_table;
+use crate::table::format::read_checked_block_from_file;
+use crate::table::format::read_footer;
+use crate::table::format::validate_data_block_filters;
 
 #[test]
 fn level_adjusted_filter_bits_decreases_with_depth() {

@@ -1,4 +1,12 @@
-use super::*;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use super::BrowserStorageBackend;
+use super::{
+    Arc, BucketOptions, DurabilityMode, Error, ManifestState, ManifestStore, ManifestStoreBackend,
+    NativeFileBackend, ObjectClient, ObjectManifestStore, PathBuf, PreparedManifestPublish,
+    PublishOutcome, Result, Sequence, TableId, TableProperties, decode_manifest,
+    publish_manifest_with_backend, publish_manifest_with_backend_async,
+    read_manifest_bytes_with_backend, read_manifest_bytes_with_backend_async,
+};
 
 impl ManifestStore {
     #[cfg(test)]

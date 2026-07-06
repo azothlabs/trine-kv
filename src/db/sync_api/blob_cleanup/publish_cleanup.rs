@@ -1,4 +1,15 @@
-use super::*;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use super::delete_storage_object_async;
+use super::{
+    Arc, BTreeMap, BTreeSet, CompactionLevelStats, CompactionSkip, CompactionSkipStats,
+    CompactionTriggerStats, Db, Error, ManifestStore, Mutex, NamedCompactionInput,
+    NamedCompactionOutput, NamedFlushInput, Ordering, Path, Result, Sequence, StorageObjectKind,
+    Table, blob, cleanup_pending_obsolete_blob_files, cleanup_pending_obsolete_table_files,
+    delete_pending_obsolete_blob_files, lock_poisoned, referenced_blob_file_ids_from_manifest,
+    table, take_deletable_obsolete_tables, usize_to_u64_saturating,
+};
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use crate::storage::{StorageObjectDeleteBackend, StorageObjectId};
 
 impl Db {
     pub(in crate::db) fn next_table_id(&self) -> Result<table::TableId> {

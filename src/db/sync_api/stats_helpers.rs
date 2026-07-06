@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    BTreeMap, CompactionTrigger, CompactionTriggerStats, NamedCompactionInput,
+    NamedCompactionOutput, usize_to_u64_saturating,
+};
 
 pub(in crate::db) fn compaction_trigger_stat_deltas(
     inputs: &[NamedCompactionInput],

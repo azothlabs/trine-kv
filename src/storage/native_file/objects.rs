@@ -1,4 +1,21 @@
-use super::*;
+use super::super::poll_ready_storage_future;
+#[cfg(feature = "platform-io")]
+use super::super::{Context, Future, Poll, Waker};
+use super::{
+    Arc, BlockReadSource, BlockingAdapterIoDriver, BlockingStorageAppendObject,
+    BlockingStorageReadObject, DurabilityMode, Error, File, InlineIoDriver, Instant,
+    IoAppendObject, IoCompletion, IoDriver, IoReadObject, Mutex, MutexGuard,
+    NativeFileStorageMetrics, Result, Runtime, StorageAppendObject, StorageFuture, StorageObjectId,
+    StorageOperation, StorageReadBuffer, StorageReadFuture, StorageReadObject,
+    acquire_native_file_writer_lease, append_native_file_object,
+    clear_native_file_writer_lease_owner, fs, len_native_file_handle, lock_native_append_file,
+    open_native_append_file, open_native_file, persist_native_append_file,
+    read_exact_at_native_file_handle, read_exact_at_native_file_handle_owned,
+    read_exact_at_native_file_owned, read_exact_from_native_file, record_timed_storage_future,
+    record_timed_storage_result, write_native_file_writer_lease_owner, writer_lease_owner_text,
+};
+#[cfg(feature = "platform-io")]
+use super::{PlatformIoDriver, PlatformIoOperation, record_platform_io_task};
 
 #[derive(Debug)]
 pub(crate) struct NativeFileObject {
@@ -6,7 +23,7 @@ pub(crate) struct NativeFileObject {
     pub(in crate::storage) file: Arc<Mutex<File>>,
     pub(in crate::storage) runtime: Option<Runtime>,
     #[cfg(feature = "platform-io")]
-    platform_io: Option<PlatformIoDriver>,
+    pub(in crate::storage) platform_io: Option<PlatformIoDriver>,
     pub(in crate::storage) metrics: Arc<NativeFileStorageMetrics>,
 }
 
@@ -199,7 +216,7 @@ impl NativeFileAppendObject {
     }
 
     #[cfg(feature = "platform-io")]
-    fn open_platform(
+    pub(in crate::storage) fn open_platform(
         object: StorageObjectId,
         runtime: Option<Runtime>,
         platform_io: Option<PlatformIoDriver>,
@@ -406,7 +423,11 @@ impl NativeFileWriterLease {
     }
 
     #[cfg(feature = "platform-io")]
-    fn from_locked_file(object: StorageObjectId, owner: String, file: File) -> Self {
+    pub(in crate::storage) fn from_locked_file(
+        object: StorageObjectId,
+        owner: String,
+        file: File,
+    ) -> Self {
         Self {
             object,
             owner,

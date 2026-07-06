@@ -27,8 +27,19 @@ mod helpers;
 mod state;
 
 pub(super) use helpers::replay_wal_batches_into_buckets;
-use helpers::*;
-use state::*;
+use helpers::{
+    effective_durability, include_max_key, include_min_key, operation_estimated_bytes,
+    unique_lsm_trees, validate_operation_resource_bounds,
+};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use state::BackgroundWriteFuture;
+use state::{
+    AcceptedWrite, AcceptedWriteState, DurableSequencedWrite, PreparedCommit, PreparedShardDelta,
+    PreparedShardId, PublishedWrite, SequencedWrite, SequencedWriteState, TransactionReads,
+    WalAcceptState, WriteRequest, WriterLocalWriteState,
+};
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use state::{WriteCompletion, WriteWaiter};
 
 #[cfg(test)]
 mod tests;

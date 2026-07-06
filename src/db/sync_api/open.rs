@@ -1,4 +1,34 @@
-use super::*;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use super::super::open_helpers::run_persistent_recovery_checks_async;
+use super::{
+    Arc, AtomicBool, AtomicU64, AtomicUsize, BTreeMap, BlobReadMetrics, CancellationToken,
+    CommitTracker, DEFAULT_BUCKET_NAME, Db, DbInner, DbOptions, DurabilityMode,
+    DurabilitySubstrate, Error, FilesystemSubstrate, HostStorageBackend, IntoOpenOptions, LsmTree,
+    MaintenanceCoordinator, ManifestStore, Mutex, NativeFileBackend, ObjectClient,
+    ObjectClientTrustMode, ObjectLeaseState, ObjectStoreBackend, ObjectStoreSubstrate,
+    ObjectWriterLease, PathBuf, PersistentOpenParts, PublishBarrier, Result, Runtime, RwLock,
+    ScanWasteMetrics, Sequence, SnapshotTracker, StorageMode, WalFrontDoor,
+    acquire_persistent_process_lock, acquire_persistent_process_lock_async, buckets_from_manifest,
+    buckets_from_manifest_async, cache, create_storage_directory_all,
+    create_storage_directory_all_async, ensure_default_bucket_in_manifest,
+    ensure_default_bucket_in_manifest_async, ensure_default_bucket_loaded,
+    list_persistent_directory_files, list_persistent_directory_files_async, manifest,
+    object_store_committed_wal_batches, object_store_wal_paths_after_replay_floor,
+    persistent_path_from_options, recovery, repair_safe_temporary_files_for_open,
+    repair_safe_temporary_files_for_open_from_directory_files_async,
+    run_persistent_recovery_checks, run_persistent_recovery_checks_from_directory_files_async,
+    runtime, validate_common_options, validate_options, verify_object_client_contract_for_open,
+    wal,
+};
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use crate::{
+    storage::{
+        BrowserStorageBackend, StorageObjectId, StorageObjectKind, StorageWriterLeaseBackend,
+    },
+    wal::BrowserWalFrontDoor,
+};
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use std::path::Path;
 
 impl Db {
     /// Opens a database synchronously.

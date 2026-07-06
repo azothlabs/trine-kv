@@ -1,4 +1,12 @@
-use super::*;
+use super::{
+    Arc, AtomicBool, DurabilityMode, Error, NativeFileBackend, Ordering, Path, PathBuf,
+    PendingWalAppend, Result, Sequence, WAL_FILE_NAME, WAL_SHARD_FILE_DIGITS,
+    WAL_SHARD_FILE_PREFIX, WalBatch, WalFrontDoorLane, WalLaneCommand, WalLaneCompletion,
+    WalLaneReply, WalLaneWaiter, WalWriter, delete_confirmed_wal_marker_with_backend, invalid_wal,
+    is_wal_rewrite_temporary_file_name, mpsc, read_confirmed_wal_marker_with_backend,
+    read_wal_object_with_backend_async, rewrite_batches_after_with_backend_async,
+    wait_for_wal_storage_future, write_confirmed_wal_marker_with_backend,
+};
 
 pub(super) fn send_wal_lane_command(
     lane: &WalFrontDoorLane,
@@ -27,6 +35,14 @@ pub(super) fn enqueue_wal_lane_command(
 /// memory of a single drain pass when the queue is flooded.
 pub(super) const WAL_LANE_BATCH_MAX: usize = 1024;
 
+#[derive(Debug, Default)]
+pub(super) struct WalLaneWorkerState {
+    writer: Option<WalWriter>,
+    persisted_level: Option<DurabilityMode>,
+    last_appended_sequence: Option<Sequence>,
+    confirmed_sequence: Option<Sequence>,
+}
+
 // Thread entry point: it owns its lane state for the worker's lifetime.
 #[allow(clippy::needless_pass_by_value)]
 pub(super) fn run_wal_lane_worker(
@@ -35,10 +51,7 @@ pub(super) fn run_wal_lane_worker(
     writer_open: Arc<AtomicBool>,
     receiver: mpsc::Receiver<WalLaneCommand>,
 ) {
-    let mut writer = None::<WalWriter>;
-    let mut persisted_level = None::<DurabilityMode>;
-    let mut last_appended_sequence = None::<Sequence>;
-    let mut confirmed_sequence = None::<Sequence>;
+    let mut state = WalLaneWorkerState::default();
     // Group commit: block for one command, then drain everything already queued
     // and serve the whole batch with a single fsync. Concurrent writers (or one
     // writer with many in-flight async commits) amortize the fsync cost; each
@@ -52,27 +65,15 @@ pub(super) fn run_wal_lane_worker(
                 Err(_) => break,
             }
         }
-        process_wal_lane_batch(
-            &backend,
-            &path,
-            &mut writer,
-            &writer_open,
-            &mut persisted_level,
-            &mut last_appended_sequence,
-            &mut confirmed_sequence,
-            batch,
-        );
+        process_wal_lane_batch(&backend, &path, &writer_open, &mut state, batch);
     }
 }
 
 pub(super) fn process_wal_lane_batch(
     backend: &NativeFileBackend,
     path: &Path,
-    writer: &mut Option<WalWriter>,
     writer_open: &AtomicBool,
-    persisted_level: &mut Option<DurabilityMode>,
-    last_appended_sequence: &mut Option<Sequence>,
-    confirmed_sequence: &mut Option<Sequence>,
+    state: &mut WalLaneWorkerState,
     batch: Vec<WalLaneCommand>,
 ) {
     // Appended-but-not-yet-synced waiters and the strongest durability any of
@@ -92,7 +93,7 @@ pub(super) fn process_wal_lane_batch(
                 match append_wal_lane_frame(
                     backend,
                     path,
-                    writer,
+                    &mut state.writer,
                     writer_open,
                     &frame,
                     DurabilityMode::Buffered,
@@ -104,8 +105,8 @@ pub(super) fn process_wal_lane_batch(
                         }
                         // Mark the lane dirty: these bytes are unsynced, so a
                         // later persist (even in a separate batch) must fsync.
-                        *persisted_level = Some(DurabilityMode::Buffered);
-                        *last_appended_sequence = Some(sequence);
+                        state.persisted_level = Some(DurabilityMode::Buffered);
+                        state.last_appended_sequence = Some(sequence);
                         pending.push(PendingWalAppend { sequence, reply });
                     }
                     Err(error) => reply.complete(Err(error)),
@@ -118,16 +119,7 @@ pub(super) fn process_wal_lane_batch(
                     } else {
                         pending_durability
                     };
-                let result = flush_wal_lane_batch(
-                    backend,
-                    path,
-                    writer,
-                    persisted_level,
-                    combined,
-                    &mut pending,
-                    *last_appended_sequence,
-                    confirmed_sequence,
-                );
+                let result = flush_wal_lane_batch(backend, path, state, combined, &mut pending);
                 reply.complete(duplicate_wal_lane_result(&result));
                 pending_durability = DurabilityMode::Buffered;
             }
@@ -136,22 +128,14 @@ pub(super) fn process_wal_lane_batch(
                 reply,
             } => {
                 // A rewrite changes the file; flush queued appends first.
-                let _ = flush_wal_lane_batch(
-                    backend,
-                    path,
-                    writer,
-                    persisted_level,
-                    pending_durability,
-                    &mut pending,
-                    *last_appended_sequence,
-                    confirmed_sequence,
-                );
+                let _ =
+                    flush_wal_lane_batch(backend, path, state, pending_durability, &mut pending);
                 pending_durability = DurabilityMode::Buffered;
                 let result = rewrite_wal_lane_after_replay_floor(
                     backend,
                     path,
-                    writer,
-                    persisted_level,
+                    &mut state.writer,
+                    &mut state.persisted_level,
                     replay_floor,
                 );
                 reply.complete(result);
@@ -159,16 +143,7 @@ pub(super) fn process_wal_lane_batch(
         }
     }
 
-    let _ = flush_wal_lane_batch(
-        backend,
-        path,
-        writer,
-        persisted_level,
-        pending_durability,
-        &mut pending,
-        *last_appended_sequence,
-        confirmed_sequence,
-    );
+    let _ = flush_wal_lane_batch(backend, path, state, pending_durability, &mut pending);
 }
 
 /// Persist the buffered appends with a single fsync and complete their waiters.
@@ -179,24 +154,19 @@ pub(super) fn process_wal_lane_batch(
 pub(super) fn flush_wal_lane_batch(
     backend: &NativeFileBackend,
     path: &Path,
-    writer: &mut Option<WalWriter>,
-    persisted_level: &mut Option<DurabilityMode>,
+    state: &mut WalLaneWorkerState,
     durability: DurabilityMode,
     pending: &mut Vec<PendingWalAppend>,
-    last_appended_sequence: Option<Sequence>,
-    confirmed_sequence: &mut Option<Sequence>,
 ) -> Result<()> {
     let has_new_appends = !pending.is_empty();
     let pending_max_sequence = pending.iter().map(|append| append.sequence).max();
     let result = persist_wal_lane_batch(
         backend,
         path,
-        writer,
-        persisted_level,
+        state,
         durability,
         has_new_appends,
-        pending_max_sequence.or(last_appended_sequence),
-        confirmed_sequence,
+        pending_max_sequence.or(state.last_appended_sequence),
     );
     for pending in pending.drain(..) {
         let reply = pending.reply;
@@ -208,14 +178,12 @@ pub(super) fn flush_wal_lane_batch(
 pub(super) fn persist_wal_lane_batch(
     backend: &NativeFileBackend,
     path: &Path,
-    writer: &mut Option<WalWriter>,
-    persisted_level: &mut Option<DurabilityMode>,
+    state: &mut WalLaneWorkerState,
     durability: DurabilityMode,
     has_new_appends: bool,
     confirm_sequence: Option<Sequence>,
-    confirmed_sequence: &mut Option<Sequence>,
 ) -> Result<()> {
-    let Some(writer) = writer.as_mut() else {
+    let Some(writer) = state.writer.as_mut() else {
         return Ok(());
     };
     if !wal_durability_requires_sync(durability) {
@@ -223,14 +191,17 @@ pub(super) fn persist_wal_lane_batch(
     }
     // Freshly appended bytes are unsynced, so a sync is mandatory; a standalone
     // persist can skip when the lane is already synced at this level.
-    if has_new_appends || wal_lane_needs_persist(*persisted_level, durability) {
+    if has_new_appends || wal_lane_needs_persist(state.persisted_level, durability) {
         writer.persist(durability)?;
-        *persisted_level = Some(durability);
+        state.persisted_level = Some(durability);
     }
     if let Some(sequence) = confirm_sequence {
-        if confirmed_sequence.is_none_or(|confirmed| sequence > confirmed) {
+        if state
+            .confirmed_sequence
+            .is_none_or(|confirmed| sequence > confirmed)
+        {
             write_confirmed_wal_marker_with_backend(backend, path, sequence, durability)?;
-            *confirmed_sequence = Some(sequence);
+            state.confirmed_sequence = Some(sequence);
         }
     }
     Ok(())

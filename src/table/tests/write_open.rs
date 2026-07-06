@@ -1,4 +1,6 @@
 use super::*;
+use crate::table::format::encode_table;
+use crate::table::format::put_footer;
 
 #[test]
 fn table_write_sort_skips_sorted_point_records() {

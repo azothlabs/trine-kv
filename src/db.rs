@@ -62,7 +62,7 @@ use crate::{
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::{
-    storage::{BrowserStorageBackend, BrowserWriterLease, StorageWriterLeaseBackend},
+    storage::{BrowserStorageBackend, BrowserWriterLease},
     wal::BrowserWalFrontDoor,
 };
 
@@ -963,17 +963,16 @@ fn shutdown_background_workers(
     maintenance.wait_until_idle();
 }
 
-impl DbInner {
+fn release_browser_writer_lease(inner: &DbInner) {
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    fn release_browser_writer_lease(&self) {
-        let Ok(mut lease) = self.browser_writer_lease.lock() else {
+    {
+        let Ok(mut lease) = inner.browser_writer_lease.lock() else {
             return;
         };
         let _ = lease.take();
     }
-
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    fn release_browser_writer_lease(&self) {}
+    let _ = inner;
 }
 
 impl Drop for DbInner {
@@ -995,7 +994,7 @@ impl Drop for DbInner {
             &self.snapshots,
             self.manifest.as_ref(),
         );
-        self.release_browser_writer_lease();
+        release_browser_writer_lease(self);
     }
 }
 
@@ -1024,7 +1023,7 @@ impl Drop for Db {
                 &self.inner.background_workers,
             );
             let _ = self.inner.publish_barrier.close();
-            self.inner.release_browser_writer_lease();
+            release_browser_writer_lease(&self.inner);
             self.inner.substrate.release_writer_lease();
         }
     }

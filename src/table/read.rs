@@ -1,4 +1,17 @@
-use super::*;
+#[cfg(test)]
+use super::cursor::{
+    PrefixBlockDecision, data_block_newest_visible_point_record_for_key,
+    data_block_point_records_with_prefix,
+};
+use super::{
+    Arc, BlockCache, Error, FilterStats, HEADER_LEN, IndexSearchPolicy, KeyRange, PointBatchRead,
+    PointBatchScan, PointBlockDecision, PrefixExtractor, RangeBlockDecision, RangeTombstoneIndex,
+    ReadPathStats, Result, Sequence, Table, TableDataBlock, TableLevel, TablePointRecord,
+    TablePointValueRecord, TableProperties, TableRangeTombstone,
+    data_block_newest_visible_point_value_record_for_key, data_block_point_records_for_key,
+    data_block_point_records_in_range, key_is_after_end, key_is_before_start,
+    next_point_batch_block, usize_to_u64_saturating,
+};
 
 impl Table {
     #[must_use]

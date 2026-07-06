@@ -15291,3 +15291,33 @@ Negative check:
 - Treat the oversized-file cleanup as complete for the current threshold.
   Future cleanup can refine any module boundary based on ownership or API
   pressure, but should not reintroduce mechanical chunk names.
+
+## 2026-07-06: CI clippy cleanup after module split
+
+### Observation
+
+- CI reported pre-split lint failures for `unused_self`, `too_many_arguments`,
+  and `items_after_test_module`.
+- Running the CI clippy commands after the module split also exposed split-local
+  import fallout: wildcard imports in new modules/benches, missing sibling
+  visibility for platform I/O helpers, and target-specific imports that needed
+  `cfg` alignment.
+
+### Interpretation
+
+- The lint fixes should preserve the semantic module split rather than adding
+  `allow` attributes or reverting to wildcard imports.
+- WAL lane batching state is a real domain object, so grouping it in a worker
+  state struct is a better fix than suppressing `too_many_arguments`.
+
+### Verification
+
+- Checks passed: `cargo fmt --check`,
+  `cargo clippy --all-targets --all-features -- -D warnings`,
+  `cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings`, and
+  `git diff --check`.
+
+### Recommended Next Action
+
+- Use these CI clippy commands as the gate for future refactors that add Rust
+  modules, especially when replacing wildcard imports with explicit imports.

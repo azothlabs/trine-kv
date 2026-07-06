@@ -1171,6 +1171,11 @@ struct ObservedLeaseState {
 }
 
 mod lease_state;
-use lease_state::*;
+#[cfg(not(feature = "s3"))]
+use lease_state::block_on_substrate_future;
+use lease_state::{
+    current_epoch_millis, encode_lease_state, lock_poisoned_error, object_lease_deadline_ms,
+    read_lease_state,
+};
 #[cfg(test)]
 mod tests;

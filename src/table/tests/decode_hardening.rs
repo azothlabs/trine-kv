@@ -1,4 +1,12 @@
 use super::*;
+use crate::table::format::decode_table;
+use crate::table::format::encode_table;
+use crate::table::format::put_bytes;
+use crate::table::format::put_internal_key;
+use crate::table::format::put_u8;
+use crate::table::format::put_u32;
+use crate::table::format::put_u64;
+use crate::table::format::put_value_ref;
 
 #[test]
 fn unknown_data_block_codec_fails_closed() {

@@ -1,4 +1,10 @@
-use super::*;
+use super::{
+    Arc, Error, OBJECT_LEASE_MAGIC, OBJECT_LEASE_MAX_BYTES, OBJECT_LEASE_TTL,
+    OBJECT_LEASE_V2_HEADER_LEN, OBJECT_LEASE_VERSION, ObjectClient, ObjectLeaseState,
+    ObservedLeaseState, Result, Sequence, SystemTime, UNIX_EPOCH, io,
+};
+#[cfg(not(feature = "s3"))]
+use super::{Context, Future, Poll, Wake, Waker, thread};
 
 pub(super) async fn read_lease_state(
     client: &Arc<dyn ObjectClient>,

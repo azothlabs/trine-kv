@@ -1,4 +1,9 @@
-use super::*;
+use super::{
+    BTreeMap, Db, DbOptions, DbStats, Error, FilterStats, LevelFilterStats, LevelStats, Ordering,
+    Path, ReadVersion, Result, Sequence, Snapshot, Transaction, TransactionOptions,
+    add_obsolete_blob_stats, lock_poisoned, shutdown_background_workers, table, table_file_bytes,
+    validate_checkpoint_name,
+};
 
 impl Db {
     /// Creates a snapshot at the latest visible read version.
@@ -575,7 +580,7 @@ impl Db {
             let _ = self.cleanup_pending_obsolete_table_files(&db_path);
             let _ = self.cleanup_pending_obsolete_blob_files(&db_path);
         }
-        self.inner.release_browser_writer_lease();
+        super::super::release_browser_writer_lease(&self.inner);
         self.inner.substrate.release_writer_lease();
     }
 

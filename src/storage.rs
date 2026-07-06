@@ -990,7 +990,12 @@ mod native_file;
 #[allow(unused_imports)]
 pub(crate) use backend::*;
 pub(crate) use metrics::NativeFileStorageStats;
-use metrics::*;
+#[cfg(feature = "platform-io")]
+use metrics::record_platform_io_task;
+use metrics::{
+    NativeFileStorageMetrics, StorageOperation, record_timed_storage_future,
+    record_timed_storage_result,
+};
 pub(crate) use native_file::*;
 #[cfg(test)]
 mod backend_tests;

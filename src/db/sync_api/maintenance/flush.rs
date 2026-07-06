@@ -1,4 +1,13 @@
-use super::*;
+use super::{
+    Arc, BatchOperation, BucketOptions, Db, DurabilityMode, Error, KeyRange, LsmTree,
+    MaintenanceBudget, MaintenanceOutcome, NamedFlushInput, Path, Result, Sequence, Table,
+    WritePressure, lock_poisoned, remove_storage_files, sync_storage_directory_after_renames,
+    table, usize_to_u64_saturating,
+};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use super::{
+    NamedCompactionOutput, remove_storage_files_async, sync_storage_directory_after_renames_async,
+};
 
 impl Db {
     pub(in crate::db) fn bucket_state(&self, bucket: &str) -> Result<Arc<LsmTree>> {

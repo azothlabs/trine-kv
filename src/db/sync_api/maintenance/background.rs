@@ -1,4 +1,11 @@
-use super::*;
+use super::{
+    Arc, AsyncPointReadIo, BACKGROUND_MAINTENANCE_PROGRESS_WAIT, BucketReader, Db, Direction,
+    Duration, Error, Iter, KeyRange, LazyIter, LsmPointReadSnapshot, LsmTree, MaintenanceBudget,
+    MaintenanceRequest, Ordering, Path, PointValue, Result, ScanSelector, ScanSourceInput,
+    Sequence, Snapshot,
+};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use super::{background_worker_loop, lock_poisoned};
 
 impl Db {
     pub(in crate::db) fn start_background_workers(&self) -> Result<()> {

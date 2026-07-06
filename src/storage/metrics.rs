@@ -1,4 +1,9 @@
-use super::*;
+use super::{
+    Arc, AtomicU64, Duration, Instant, Ordering, PlatformIoOperationStats, Result, StorageFuture,
+    StorageOperationMetric, StorageOperationStats,
+};
+#[cfg(feature = "platform-io")]
+use super::{PlatformIoClassCounters, PlatformIoDriver, PlatformIoOperation, PlatformIoTaskClass};
 
 #[derive(Debug, Default)]
 pub(super) struct NativeFileStorageMetrics {
