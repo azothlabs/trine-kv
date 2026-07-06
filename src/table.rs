@@ -20,7 +20,7 @@ use crate::{
     internal_key::{InternalKey, ValueKind},
     iterator::{
         Direction, ForwardKeyState, RecordGroup, ReverseKeyState, ScanRecord, ScanSelector,
-        prefix_successor, sort_group_records,
+        prefix_successor, record_group_from_first_and_rest,
     },
     limits,
     options::{

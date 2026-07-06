@@ -1,6 +1,6 @@
 use super::{
     Arc, AsyncPointReadIo, BACKGROUND_MAINTENANCE_PROGRESS_WAIT, BucketReader, Db, Direction,
-    Duration, Error, Iter, KeyRange, LazyIter, LsmPointReadSnapshot, LsmTree, MaintenanceBudget,
+    Duration, Iter, KeyRange, LazyIter, LsmPointReadSnapshot, LsmTree, MaintenanceBudget,
     MaintenanceRequest, Ordering, Path, PointValue, Result, ScanSelector, ScanSourceInput,
     Sequence, Snapshot,
 };
@@ -79,9 +79,7 @@ impl Db {
 
     pub(in crate::db) fn take_background_maintenance_error(&self) -> Result<()> {
         if let Some(error) = self.inner.maintenance.take_error() {
-            Err(Error::Corruption {
-                message: format!("background maintenance failed: {error}"),
-            })
+            Err(error)
         } else {
             Ok(())
         }

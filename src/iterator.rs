@@ -401,13 +401,12 @@ impl LazyScan {
                 source_indices.push(entry.source_index);
             }
 
-            let mut first_record = None;
-            let mut rest_records = Vec::new();
+            let mut records = None;
 
             for source_index in source_indices {
                 match self.sources[source_index].take_current_group() {
                     Ok(Some(group)) => {
-                        push_group_records(&mut first_record, &mut rest_records, group);
+                        push_group_records(&mut records, group);
                     }
                     Ok(None) => {}
                     Err(error) => return Some(Err(error)),
@@ -417,10 +416,10 @@ impl LazyScan {
                 }
             }
 
-            let Some(first_record) = first_record else {
+            let Some(records) = records else {
                 continue;
             };
-            match self.visible_lazy_item_from_records(first_record, rest_records) {
+            match self.visible_lazy_item_from_records(records) {
                 Ok(Some(item)) => return Some(Ok(item)),
                 Ok(None) => {}
                 Err(error) => return Some(Err(error)),
@@ -451,23 +450,22 @@ impl LazyScan {
                 source_indices.push(entry.source_index);
             }
 
-            let mut first_record = None;
-            let mut rest_records = Vec::new();
+            let mut records = None;
 
             for source_index in source_indices {
                 if let Some(group) = self.sources[source_index]
                     .take_current_group_async()
                     .await?
                 {
-                    push_group_records(&mut first_record, &mut rest_records, group);
+                    push_group_records(&mut records, group);
                 }
                 self.push_source_heap_entry_async(source_index).await?;
             }
 
-            let Some(first_record) = first_record else {
+            let Some(records) = records else {
                 continue;
             };
-            if let Some(item) = self.visible_lazy_item_from_records(first_record, rest_records)? {
+            if let Some(item) = self.visible_lazy_item_from_records(records)? {
                 return Ok(Some(item));
             }
         }
@@ -518,19 +516,12 @@ impl LazyScan {
 
     fn visible_lazy_item_from_records(
         &self,
-        first_record: ScanRecord,
-        mut rest_records: Vec<ScanRecord>,
+        records: NonEmptyScanRecords,
     ) -> Result<Option<LazyKeyValue>> {
         // The merge handled this many version records for one user key; the ratio
         // of these to returned user keys is the scan read-amplification signal.
-        let group_records = 1 + rest_records.len();
-        let visibility = if rest_records.is_empty() {
-            self.visible_lazy_item_from_sorted_records(std::iter::once(first_record))?
-        } else {
-            rest_records.push(first_record);
-            rest_records.sort_by(|left, right| left.0.cmp(&right.0));
-            self.visible_lazy_item_from_sorted_records(rest_records)?
-        };
+        let group_records = records.len();
+        let visibility = self.visible_lazy_item_from_sorted_records(records.into_sorted_vec())?;
 
         if let Some(scan_waste) = &self.scan_waste {
             scan_waste.record_group(group_records as u64, visibility.outcome());
@@ -627,16 +618,11 @@ impl PartialOrd for SourceHeapEntry {
     }
 }
 
-fn push_group_records(
-    first_record: &mut Option<ScanRecord>,
-    rest_records: &mut Vec<ScanRecord>,
-    group: RecordGroup,
-) {
-    if let Some(previous_first) = first_record.take() {
-        rest_records.push(previous_first);
+fn push_group_records(records: &mut Option<NonEmptyScanRecords>, group: RecordGroup) {
+    match records {
+        Some(records) => records.extend(group.records),
+        None => *records = Some(group.records),
     }
-    *first_record = Some(group.first);
-    rest_records.extend(group.rest);
 }
 
 fn compare_scan_keys(left: &[u8], right: &[u8], direction: Direction) -> CmpOrdering {
@@ -649,10 +635,49 @@ fn compare_scan_keys(left: &[u8], right: &[u8], direction: Direction) -> CmpOrde
 pub(crate) type ScanRecord = (InternalKey, Option<ValueRef>);
 
 #[derive(Debug, Clone)]
+pub(crate) struct NonEmptyScanRecords {
+    records: Vec<ScanRecord>,
+}
+
+impl NonEmptyScanRecords {
+    pub(crate) fn from_first_and_rest(first: ScanRecord, rest: Vec<ScanRecord>) -> Self {
+        let mut records = Vec::with_capacity(1 + rest.len());
+        records.push(first);
+        records.extend(rest);
+        records.sort_by(|left, right| left.0.cmp(&right.0));
+        Self { records }
+    }
+
+    fn from_vec(records: Vec<ScanRecord>) -> Option<Self> {
+        if records.is_empty() {
+            None
+        } else {
+            Some(Self { records })
+        }
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.records.extend(other.records);
+    }
+
+    fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub(crate) fn into_vec(self) -> Vec<ScanRecord> {
+        self.records
+    }
+
+    fn into_sorted_vec(mut self) -> Vec<ScanRecord> {
+        self.records.sort_by(|left, right| left.0.cmp(&right.0));
+        self.records
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct RecordGroup {
     pub(crate) user_key: Vec<u8>,
-    pub(crate) first: ScanRecord,
-    pub(crate) rest: Vec<ScanRecord>,
+    pub(crate) records: NonEmptyScanRecords,
 }
 
 #[derive(Debug, Clone)]
@@ -865,33 +890,21 @@ impl MemtableCursor {
 }
 
 fn record_group_from_records(user_key: Vec<u8>, mut records: Vec<ScanRecord>) -> RecordGroup {
-    let first = records
-        .pop()
+    records.sort_by(|left, right| left.0.cmp(&right.0));
+    let records = NonEmptyScanRecords::from_vec(records)
         .expect("memtable cursor only builds groups after finding a record");
-    let (first, rest) = sort_group_records(first, records);
-    RecordGroup {
-        user_key,
-        first,
-        rest,
-    }
+    RecordGroup { user_key, records }
 }
 
-pub(crate) fn sort_group_records(
+pub(crate) fn record_group_from_first_and_rest(
+    user_key: Vec<u8>,
     first: ScanRecord,
-    mut rest: Vec<ScanRecord>,
-) -> (ScanRecord, Vec<ScanRecord>) {
-    if rest.is_empty() {
-        return (first, rest);
+    rest: Vec<ScanRecord>,
+) -> RecordGroup {
+    RecordGroup {
+        user_key,
+        records: NonEmptyScanRecords::from_first_and_rest(first, rest),
     }
-
-    rest.push(first);
-    rest.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut records = rest.into_iter();
-    let first = records
-        .next()
-        .expect("non-empty record group must keep a first record");
-    let rest = records.collect();
-    (first, rest)
 }
 
 fn memtable_scan_bounds(selector: &ScanSelector) -> (Bound<InternalKey>, Bound<InternalKey>) {

@@ -12,8 +12,19 @@ fn maintenance_success_does_not_clear_unreported_error() {
     let error = coordinator
         .take_error()
         .expect("unreported background error remains visible");
-    assert!(error.contains("publish failed"));
+    assert!(matches!(error, Error::Corruption { message } if message == "publish failed"));
     assert!(coordinator.take_error().is_none());
+}
+
+#[test]
+fn maintenance_error_preserves_runtime_busy_category() {
+    let coordinator = MaintenanceCoordinator::new();
+    coordinator.record_error(&Error::runtime_busy("flush already active"));
+
+    let error = coordinator
+        .take_error()
+        .expect("unreported background error remains visible");
+    assert!(matches!(error, Error::RuntimeBusy { message } if message == "flush already active"));
 }
 
 #[test]

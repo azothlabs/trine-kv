@@ -23,14 +23,111 @@ use super::{
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::{
     storage::{
-        BrowserStorageBackend, StorageObjectId, StorageObjectKind, StorageWriterLeaseBackend,
+        BrowserStorageBackend, BrowserWriterLease, StorageObjectId, StorageObjectKind,
+        StorageWriterLeaseBackend,
     },
     wal::BrowserWalFrontDoor,
 };
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use std::path::Path;
 
+#[derive(Debug)]
+struct DbInnerParts {
+    options: DbOptions,
+    buckets: BTreeMap<String, Arc<LsmTree>>,
+    manifest: Option<ManifestStore>,
+    substrate: DurabilitySubstrate,
+    native_storage: NativeFileBackend,
+    object_storage: Option<ObjectStoreBackend>,
+    object_wal_storage: Option<ObjectStoreBackend>,
+    object_storage_prefix: PathBuf,
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    browser_storage: Option<BrowserStorageBackend>,
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    browser_writer_lease: Option<BrowserWriterLease>,
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    browser_wal: Option<BrowserWalFrontDoor>,
+    runtime: Runtime,
+}
+
 impl Db {
+    #[cfg_attr(
+        all(target_arch = "wasm32", target_os = "unknown"),
+        allow(clippy::arc_with_non_send_sync)
+    )]
+    fn from_inner_parts(parts: DbInnerParts) -> Self {
+        let DbInnerParts {
+            options,
+            buckets,
+            manifest,
+            substrate,
+            native_storage,
+            object_storage,
+            object_wal_storage,
+            object_storage_prefix,
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            browser_storage,
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            browser_writer_lease,
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            browser_wal,
+            runtime,
+        } = parts;
+        let block_cache_bytes = options.block_cache_bytes;
+
+        Self {
+            inner: Arc::new(DbInner {
+                options,
+                user_handles: AtomicUsize::new(1),
+                commit_tracker: CommitTracker::new(Sequence::ZERO),
+                closed: AtomicBool::new(false),
+                publish_barrier: PublishBarrier::new(),
+                memtable_publish_lock: Mutex::new(()),
+                buckets: RwLock::new(buckets),
+                snapshots: Arc::new(SnapshotTracker::default()),
+                checkpoints: Mutex::new(BTreeMap::new()),
+                pending_obsolete_tables: Mutex::new(Vec::new()),
+                manifest: manifest.map(Mutex::new),
+                substrate,
+                block_cache: Arc::new(cache::BlockCache::new(block_cache_bytes)),
+                compaction_runs: AtomicU64::new(0),
+                compaction_input_tables: AtomicU64::new(0),
+                compaction_output_tables: AtomicU64::new(0),
+                compaction_input_bytes: AtomicU64::new(0),
+                compaction_output_bytes: AtomicU64::new(0),
+                compaction_level_stats: Mutex::new(BTreeMap::new()),
+                compaction_trigger_stats: Mutex::new(BTreeMap::new()),
+                compaction_skip_stats: Mutex::new(BTreeMap::new()),
+                blob_gc_runs: AtomicU64::new(0),
+                blob_gc_input_bytes: AtomicU64::new(0),
+                blob_gc_output_bytes: AtomicU64::new(0),
+                blob_gc_discarded_bytes: AtomicU64::new(0),
+                blob_reads: Arc::new(BlobReadMetrics::default()),
+                scan_waste: Arc::new(ScanWasteMetrics::default()),
+                maintenance_cooperative_yields: AtomicU64::new(0),
+                maintenance_budget_exhaustions: AtomicU64::new(0),
+                native_storage,
+                object_storage,
+                object_wal_storage,
+                object_storage_prefix,
+                object_manifest_async_lock: futures::lock::Mutex::new(()),
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                browser_storage,
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                browser_writer_lease: Mutex::new(browser_writer_lease),
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                browser_wal,
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                browser_manifest_async_lock: futures::lock::Mutex::new(()),
+                runtime,
+                runtime_shutdown: CancellationToken::new(),
+                maintenance: Arc::new(MaintenanceCoordinator::new()),
+                background_workers: Mutex::new(Vec::new()),
+            }),
+            counts_as_user_handle: true,
+        }
+    }
+
     /// Opens a database synchronously.
     ///
     /// The `options` argument accepts either [`DbOptions`] or any path-like
@@ -255,57 +352,23 @@ impl Db {
                 .await?,
             )
         };
-        let block_cache_bytes = options.block_cache_bytes;
         let runtime = Runtime::new(options.runtime);
-        let db = Self {
-            inner: Arc::new(DbInner {
-                options,
-                user_handles: AtomicUsize::new(1),
-                commit_tracker: CommitTracker::new(Sequence::ZERO),
-                closed: AtomicBool::new(false),
-                publish_barrier: PublishBarrier::new(),
-                memtable_publish_lock: Mutex::new(()),
-                buckets: RwLock::new(buckets),
-                snapshots: Arc::new(SnapshotTracker::default()),
-                checkpoints: Mutex::new(BTreeMap::new()),
-                pending_obsolete_tables: Mutex::new(Vec::new()),
-                manifest: Some(Mutex::new(manifest)),
-                // Browser durability rides the `browser_*` fields; the substrate
-                // is inert here.
-                substrate: DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(None, None)),
-                block_cache: Arc::new(cache::BlockCache::new(block_cache_bytes)),
-                compaction_runs: AtomicU64::new(0),
-                compaction_input_tables: AtomicU64::new(0),
-                compaction_output_tables: AtomicU64::new(0),
-                compaction_input_bytes: AtomicU64::new(0),
-                compaction_output_bytes: AtomicU64::new(0),
-                compaction_level_stats: Mutex::new(BTreeMap::new()),
-                compaction_trigger_stats: Mutex::new(BTreeMap::new()),
-                compaction_skip_stats: Mutex::new(BTreeMap::new()),
-                blob_gc_runs: AtomicU64::new(0),
-                blob_gc_input_bytes: AtomicU64::new(0),
-                blob_gc_output_bytes: AtomicU64::new(0),
-                blob_gc_discarded_bytes: AtomicU64::new(0),
-                blob_reads: Arc::new(BlobReadMetrics::default()),
-                scan_waste: Arc::new(ScanWasteMetrics::default()),
-                maintenance_cooperative_yields: AtomicU64::new(0),
-                maintenance_budget_exhaustions: AtomicU64::new(0),
-                native_storage: NativeFileBackend::new(),
-                object_storage: None,
-                object_wal_storage: None,
-                object_storage_prefix: PathBuf::new(),
-                object_manifest_async_lock: futures::lock::Mutex::new(()),
-                browser_storage: Some(storage),
-                browser_writer_lease: Mutex::new(writer_lease),
-                browser_wal,
-                browser_manifest_async_lock: futures::lock::Mutex::new(()),
-                runtime,
-                runtime_shutdown: CancellationToken::new(),
-                maintenance: Arc::new(MaintenanceCoordinator::new()),
-                background_workers: Mutex::new(Vec::new()),
-            }),
-            counts_as_user_handle: true,
-        };
+        let db = Self::from_inner_parts(DbInnerParts {
+            options,
+            buckets,
+            manifest: Some(manifest),
+            // Browser durability rides the `browser_*` fields; the substrate
+            // is inert here.
+            substrate: DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(None, None)),
+            native_storage: NativeFileBackend::new(),
+            object_storage: None,
+            object_wal_storage: None,
+            object_storage_prefix: PathBuf::new(),
+            browser_storage: Some(storage),
+            browser_writer_lease: writer_lease,
+            browser_wal,
+            runtime,
+        });
         db.replay_wal_batches(batches, replay_floor)?;
         Ok(db)
     }
@@ -535,59 +598,24 @@ impl Db {
             remote_wal_state.committed_sequence,
         )?;
 
-        let block_cache_bytes = options.block_cache_bytes;
         let runtime = Runtime::new(options.runtime);
-        let db = Self {
-            inner: Arc::new(DbInner {
-                options,
-                user_handles: AtomicUsize::new(1),
-                commit_tracker: CommitTracker::new(Sequence::ZERO),
-                closed: AtomicBool::new(false),
-                publish_barrier: PublishBarrier::new(),
-                memtable_publish_lock: Mutex::new(()),
-                buckets: RwLock::new(buckets),
-                snapshots: Arc::new(SnapshotTracker::default()),
-                checkpoints: Mutex::new(BTreeMap::new()),
-                pending_obsolete_tables: Mutex::new(Vec::new()),
-                manifest: Some(Mutex::new(manifest)),
-                substrate,
-                block_cache: Arc::new(cache::BlockCache::new(block_cache_bytes)),
-                compaction_runs: AtomicU64::new(0),
-                compaction_input_tables: AtomicU64::new(0),
-                compaction_output_tables: AtomicU64::new(0),
-                compaction_input_bytes: AtomicU64::new(0),
-                compaction_output_bytes: AtomicU64::new(0),
-                compaction_level_stats: Mutex::new(BTreeMap::new()),
-                compaction_trigger_stats: Mutex::new(BTreeMap::new()),
-                compaction_skip_stats: Mutex::new(BTreeMap::new()),
-                blob_gc_runs: AtomicU64::new(0),
-                blob_gc_input_bytes: AtomicU64::new(0),
-                blob_gc_output_bytes: AtomicU64::new(0),
-                blob_gc_discarded_bytes: AtomicU64::new(0),
-                blob_reads: Arc::new(BlobReadMetrics::default()),
-                scan_waste: Arc::new(ScanWasteMetrics::default()),
-                maintenance_cooperative_yields: AtomicU64::new(0),
-                maintenance_budget_exhaustions: AtomicU64::new(0),
-                native_storage: NativeFileBackend::new(),
-                object_storage: Some(backend),
-                object_wal_storage: Some(wal_backend),
-                object_storage_prefix: db_path,
-                object_manifest_async_lock: futures::lock::Mutex::new(()),
-                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                browser_storage: None,
-                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                browser_writer_lease: Mutex::new(None),
-                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                browser_wal: None,
-                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                browser_manifest_async_lock: futures::lock::Mutex::new(()),
-                runtime,
-                runtime_shutdown: CancellationToken::new(),
-                maintenance: Arc::new(MaintenanceCoordinator::new()),
-                background_workers: Mutex::new(Vec::new()),
-            }),
-            counts_as_user_handle: true,
-        };
+        let db = Self::from_inner_parts(DbInnerParts {
+            options,
+            buckets,
+            manifest: Some(manifest),
+            substrate,
+            native_storage: NativeFileBackend::new(),
+            object_storage: Some(backend),
+            object_wal_storage: Some(wal_backend),
+            object_storage_prefix: db_path,
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            browser_storage: None,
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            browser_writer_lease: None,
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            browser_wal: None,
+            runtime,
+        });
         db.replay_wal_batches(batches, replay_floor)?;
         Ok(db)
     }
@@ -638,7 +666,6 @@ impl Db {
     pub(in crate::db) fn memory_sync(mut options: DbOptions) -> Result<Self> {
         options.storage_mode = StorageMode::InMemory;
         validate_options(&options)?;
-        let block_cache_bytes = options.block_cache_bytes;
         let runtime = Runtime::new(options.runtime);
         let default_bucket = Arc::new(LsmTree::new(
             options.default_bucket_options.clone(),
@@ -647,58 +674,24 @@ impl Db {
         let mut buckets = BTreeMap::new();
         buckets.insert(DEFAULT_BUCKET_NAME.to_owned(), default_bucket);
 
-        Ok(Self {
-            inner: Arc::new(DbInner {
-                options,
-                user_handles: AtomicUsize::new(1),
-                commit_tracker: CommitTracker::new(Sequence::ZERO),
-                closed: AtomicBool::new(false),
-                publish_barrier: PublishBarrier::new(),
-                memtable_publish_lock: Mutex::new(()),
-                buckets: RwLock::new(buckets),
-                snapshots: Arc::new(SnapshotTracker::default()),
-                checkpoints: Mutex::new(BTreeMap::new()),
-                pending_obsolete_tables: Mutex::new(Vec::new()),
-                manifest: None,
-                // In-memory: no WAL, no lease.
-                substrate: DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(None, None)),
-                block_cache: Arc::new(cache::BlockCache::new(block_cache_bytes)),
-                compaction_runs: AtomicU64::new(0),
-                compaction_input_tables: AtomicU64::new(0),
-                compaction_output_tables: AtomicU64::new(0),
-                compaction_input_bytes: AtomicU64::new(0),
-                compaction_output_bytes: AtomicU64::new(0),
-                compaction_level_stats: Mutex::new(BTreeMap::new()),
-                compaction_trigger_stats: Mutex::new(BTreeMap::new()),
-                compaction_skip_stats: Mutex::new(BTreeMap::new()),
-                blob_gc_runs: AtomicU64::new(0),
-                blob_gc_input_bytes: AtomicU64::new(0),
-                blob_gc_output_bytes: AtomicU64::new(0),
-                blob_gc_discarded_bytes: AtomicU64::new(0),
-                blob_reads: Arc::new(BlobReadMetrics::default()),
-                scan_waste: Arc::new(ScanWasteMetrics::default()),
-                maintenance_cooperative_yields: AtomicU64::new(0),
-                maintenance_budget_exhaustions: AtomicU64::new(0),
-                native_storage: NativeFileBackend::new(),
-                object_storage: None,
-                object_wal_storage: None,
-                object_storage_prefix: PathBuf::new(),
-                object_manifest_async_lock: futures::lock::Mutex::new(()),
-                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                browser_storage: None,
-                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                browser_writer_lease: Mutex::new(None),
-                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                browser_wal: None,
-                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                browser_manifest_async_lock: futures::lock::Mutex::new(()),
-                runtime,
-                runtime_shutdown: CancellationToken::new(),
-                maintenance: Arc::new(MaintenanceCoordinator::new()),
-                background_workers: Mutex::new(Vec::new()),
-            }),
-            counts_as_user_handle: true,
-        })
+        Ok(Self::from_inner_parts(DbInnerParts {
+            options,
+            manifest: None,
+            buckets,
+            // In-memory: no WAL, no lease.
+            substrate: DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(None, None)),
+            native_storage: NativeFileBackend::new(),
+            object_storage: None,
+            object_wal_storage: None,
+            object_storage_prefix: PathBuf::new(),
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            browser_storage: None,
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            browser_writer_lease: None,
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            browser_wal: None,
+            runtime,
+        }))
     }
 
     #[cfg_attr(
@@ -915,62 +908,23 @@ impl Db {
             replay_floor,
             db_path_for_cleanup,
         } = parts;
-        let block_cache_bytes = options.block_cache_bytes;
-
-        let db = Self {
-            inner: Arc::new(DbInner {
-                options,
-                user_handles: AtomicUsize::new(1),
-                commit_tracker: CommitTracker::new(Sequence::ZERO),
-                closed: AtomicBool::new(false),
-                publish_barrier: PublishBarrier::new(),
-                memtable_publish_lock: Mutex::new(()),
-                buckets: RwLock::new(buckets),
-                snapshots: Arc::new(SnapshotTracker::default()),
-                checkpoints: Mutex::new(BTreeMap::new()),
-                pending_obsolete_tables: Mutex::new(Vec::new()),
-                manifest: Some(Mutex::new(manifest)),
-                substrate: DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(
-                    wal,
-                    process_lock,
-                )),
-                block_cache: Arc::new(cache::BlockCache::new(block_cache_bytes)),
-                compaction_runs: AtomicU64::new(0),
-                compaction_input_tables: AtomicU64::new(0),
-                compaction_output_tables: AtomicU64::new(0),
-                compaction_input_bytes: AtomicU64::new(0),
-                compaction_output_bytes: AtomicU64::new(0),
-                compaction_level_stats: Mutex::new(BTreeMap::new()),
-                compaction_trigger_stats: Mutex::new(BTreeMap::new()),
-                compaction_skip_stats: Mutex::new(BTreeMap::new()),
-                blob_gc_runs: AtomicU64::new(0),
-                blob_gc_input_bytes: AtomicU64::new(0),
-                blob_gc_output_bytes: AtomicU64::new(0),
-                blob_gc_discarded_bytes: AtomicU64::new(0),
-                blob_reads: Arc::new(BlobReadMetrics::default()),
-                scan_waste: Arc::new(ScanWasteMetrics::default()),
-                maintenance_cooperative_yields: AtomicU64::new(0),
-                maintenance_budget_exhaustions: AtomicU64::new(0),
-                native_storage,
-                object_storage: None,
-                object_wal_storage: None,
-                object_storage_prefix: PathBuf::new(),
-                object_manifest_async_lock: futures::lock::Mutex::new(()),
-                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                browser_storage: None,
-                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                browser_writer_lease: Mutex::new(None),
-                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                browser_wal: None,
-                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                browser_manifest_async_lock: futures::lock::Mutex::new(()),
-                runtime,
-                runtime_shutdown: CancellationToken::new(),
-                maintenance: Arc::new(MaintenanceCoordinator::new()),
-                background_workers: Mutex::new(Vec::new()),
-            }),
-            counts_as_user_handle: true,
-        };
+        let db = Self::from_inner_parts(DbInnerParts {
+            options,
+            buckets,
+            manifest: Some(manifest),
+            substrate: DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(wal, process_lock)),
+            native_storage,
+            object_storage: None,
+            object_wal_storage: None,
+            object_storage_prefix: PathBuf::new(),
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            browser_storage: None,
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            browser_writer_lease: None,
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            browser_wal: None,
+            runtime,
+        });
         db.replay_wal_batches(batches, replay_floor)?;
         if !db.inner.options.read_only {
             db.cleanup_pending_obsolete_blob_files(&db_path_for_cleanup)?;

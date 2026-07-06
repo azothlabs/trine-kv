@@ -166,8 +166,7 @@ impl LsmTree {
                     let group = source
                         .take_current_group()?
                         .expect("source current key must have a current group");
-                    records.push(group.first);
-                    records.extend(group.rest);
+                    records.extend(group.records.into_vec());
                 }
             }
 

@@ -30,7 +30,7 @@ impl Db {
     ///
     /// - `version`: read version previously obtained from this database
     ///   lineage, such as [`Db::latest_read_version`] or
-    ///   [`CommitInfo::read_version`].
+    ///   [`crate::CommitInfo::read_version`].
     ///
     /// # Errors
     ///

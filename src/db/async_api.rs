@@ -24,8 +24,8 @@ impl Db {
     ///
     /// # Parameters
     ///
-    /// - `options`: either [`DbOptions`] or a path-like value converted through
-    ///   [`DbOptions::new`].
+    /// - `options`: either [`crate::DbOptions`] or a path-like value converted
+    ///   through [`crate::DbOptions::new`].
     ///
     /// # Examples
     ///

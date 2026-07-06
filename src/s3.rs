@@ -29,6 +29,27 @@ pub struct ObjectStoreClient {
     store: Arc<dyn ObjectStore>,
 }
 
+/// Configuration for [`ObjectStoreClient::s3_with_options`].
+///
+/// Use this when targeting an S3-compatible endpoint that needs settings beyond
+/// bucket, region, and credentials. The default keeps HTTP disabled even when a
+/// custom endpoint is supplied; set [`Self::allow_http`] only for local MinIO or
+/// another explicitly trusted non-TLS deployment.
+#[derive(Debug, Clone, Default)]
+pub struct S3ClientOptions {
+    /// Custom S3-compatible endpoint such as an R2, MinIO, or Ceph URL.
+    ///
+    /// Leave this as `None` for AWS S3. HTTP endpoints are rejected unless
+    /// [`Self::allow_http`] is also set.
+    pub endpoint: Option<String>,
+    /// Whether the underlying object-store client may use plain HTTP.
+    ///
+    /// Keep this `false` for production S3-compatible services. Set it to
+    /// `true` only when the endpoint is local or otherwise protected by an
+    /// external transport boundary.
+    pub allow_http: bool,
+}
+
 impl std::fmt::Debug for ObjectStoreClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -51,7 +72,9 @@ impl ObjectStoreClient {
     /// `AWS_SECRET_ACCESS_KEY`, …). Pass `endpoint` to target an S3-compatible
     /// service (Cloudflare R2/MinIO/Ceph); leave it `None` for AWS S3. For R2 use
     /// region `"auto"` and the `https://<account>.r2.cloudflarestorage.com`
-    /// endpoint.
+    /// endpoint. Plain HTTP endpoints are intentionally rejected by this helper;
+    /// use [`Self::s3_with_options`] with [`S3ClientOptions::allow_http`] for
+    /// local MinIO or another explicitly trusted non-TLS endpoint.
     ///
     /// Conditional PUT (`ETagMatch`) is enabled explicitly: `object_store`
     /// disables conditional writes for non-AWS endpoints by default, but the
@@ -66,14 +89,43 @@ impl ObjectStoreClient {
         region: impl Into<String>,
         endpoint: Option<String>,
     ) -> Result<Self> {
+        Self::s3_with_options(
+            bucket,
+            region,
+            S3ClientOptions {
+                endpoint,
+                allow_http: false,
+            },
+        )
+    }
+
+    /// Convenience constructor for S3-compatible storage with explicit endpoint
+    /// transport settings.
+    ///
+    /// Credentials are read from the same environment variables as
+    /// [`Self::s3`]. Use [`S3ClientOptions::allow_http`] only for local or
+    /// otherwise trusted deployments; production S3/R2-compatible endpoints
+    /// should use HTTPS.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the S3 client cannot be configured.
+    pub fn s3_with_options(
+        bucket: impl Into<String>,
+        region: impl Into<String>,
+        options: S3ClientOptions,
+    ) -> Result<Self> {
         use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 
         let mut builder = AmazonS3Builder::from_env()
             .with_bucket_name(bucket.into())
             .with_region(region.into())
             .with_conditional_put(S3ConditionalPut::ETagMatch);
-        if let Some(endpoint) = endpoint {
-            builder = builder.with_endpoint(endpoint).with_allow_http(true);
+        if let Some(endpoint) = options.endpoint {
+            builder = builder.with_endpoint(endpoint);
+        }
+        if options.allow_http {
+            builder = builder.with_allow_http(true);
         }
         let store = builder.build().map_err(map_object_store_error)?;
         Ok(Self::new(Arc::new(store)))
@@ -263,6 +315,14 @@ mod tests {
 
     fn block_on<F: std::future::Future>(future: F) -> F::Output {
         futures::executor::block_on(future)
+    }
+
+    #[test]
+    fn s3_client_options_default_keeps_http_disabled() {
+        let options = S3ClientOptions::default();
+
+        assert!(options.endpoint.is_none());
+        assert!(!options.allow_http);
     }
 
     #[derive(Debug, Default)]

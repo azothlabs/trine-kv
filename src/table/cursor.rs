@@ -2,8 +2,8 @@ use super::{
     Arc, BlockCache, Bound, DecodedDataBlock, Direction, ForwardKeyState, IndexSearchPolicy,
     KeyRange, PrefixExtractor, Range, RecordGroup, Result, ReverseKeyState, ScanRecord,
     ScanSelector, Sequence, Table, TablePointRecord, TablePointValueRecord, invalid_table,
-    key_is_after_end, key_is_before_start, prefix_successor, sort_group_records, u32_to_usize,
-    user_key_hash,
+    key_is_after_end, key_is_before_start, prefix_successor, record_group_from_first_and_rest,
+    u32_to_usize, user_key_hash,
 };
 
 #[derive(Debug, Clone)]
@@ -73,13 +73,9 @@ impl TablePointCursor {
                 break;
             }
         }
-        let (first, rest) = sort_group_records(first, rest);
-
-        Ok(Some(RecordGroup {
-            user_key,
-            first,
-            rest,
-        }))
+        Ok(Some(record_group_from_first_and_rest(
+            user_key, first, rest,
+        )))
     }
 
     pub(crate) async fn next_group_async(&mut self) -> Result<Option<RecordGroup>> {
@@ -102,13 +98,9 @@ impl TablePointCursor {
                 break;
             }
         }
-        let (first, rest) = sort_group_records(first, rest);
-
-        Ok(Some(RecordGroup {
-            user_key,
-            first,
-            rest,
-        }))
+        Ok(Some(record_group_from_first_and_rest(
+            user_key, first, rest,
+        )))
     }
 
     pub(super) fn next_record(&mut self) -> Result<Option<ScanRecord>> {

@@ -509,9 +509,7 @@ fn persistent_background_maintenance_error_surfaces_to_later_write() {
             thread::sleep(std::time::Duration::from_millis(20));
             let key = format!("probe-{index:03}").into_bytes();
             match bucket.put_sync(key, b"value") {
-                Err(Error::Corruption { message })
-                    if message.contains("background maintenance failed") =>
-                {
+                Err(Error::Io(error)) if error.to_string().contains("Is a directory") => {
                     surfaced = true;
                     break;
                 }
