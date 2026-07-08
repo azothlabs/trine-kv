@@ -142,6 +142,7 @@ struct WalFrontDoorLane {
 #[derive(Debug)]
 pub(crate) struct BrowserWalFrontDoor {
     active_shard_count: usize,
+    shard_locks: Vec<futures::lock::Mutex<()>>,
     records_accepted: AtomicU64,
     bytes_accepted: AtomicU64,
 }
@@ -668,8 +669,12 @@ impl BrowserWalFrontDoor {
             return Err(Error::invalid_options("WAL shard count must be non-zero"));
         }
         discover_wal_paths_with_backend_async(backend, db_path).await?;
+        let shard_locks = (0..shard_count)
+            .map(|_| futures::lock::Mutex::new(()))
+            .collect();
         Ok(Self {
             active_shard_count: shard_count,
+            shard_locks,
             records_accepted: AtomicU64::new(0),
             bytes_accepted: AtomicU64::new(0),
         })
@@ -690,6 +695,7 @@ impl BrowserWalFrontDoor {
         let path = wal_shard_path(db_path, shard_index);
         let frame = encode_batch_frame(sequence, operations)?;
         let frame_len = usize_to_u64_saturating(frame.len());
+        let _shard_append = self.lock_shard(shard_index)?.lock().await;
         let mut append = open_wal_append_object_with_backend_async(backend, &path).await?;
         append.append(&frame, durability).await?;
         self.records_accepted.fetch_add(1, Ordering::Relaxed);
@@ -711,6 +717,7 @@ impl BrowserWalFrontDoor {
     {
         for shard_index in 0..self.active_shard_count {
             let path = wal_shard_path(db_path, shard_index);
+            let _shard_persist = self.lock_shard(shard_index)?.lock().await;
             let mut append = open_wal_append_object_with_backend_async(backend, &path).await?;
             append.persist(durability).await?;
         }
@@ -734,10 +741,23 @@ impl BrowserWalFrontDoor {
         for path in discover_wal_paths_with_backend_async(backend, db_path).await? {
             paths.insert(wal_shard_index_from_path(&path)?, path);
         }
-        for path in paths.into_values() {
-            rewrite_batches_after_with_backend_async(backend, &path, replay_floor).await?;
+        for (shard_index, path) in paths {
+            if let Some(lock) = self.shard_locks.get(shard_index) {
+                let _shard_rewrite = lock.lock().await;
+                rewrite_batches_after_with_backend_async(backend, &path, replay_floor).await?;
+            } else {
+                rewrite_batches_after_with_backend_async(backend, &path, replay_floor).await?;
+            }
         }
         Ok(())
+    }
+
+    fn lock_shard(&self, shard_index: usize) -> Result<&futures::lock::Mutex<()>> {
+        self.shard_locks
+            .get(shard_index)
+            .ok_or_else(|| Error::Corruption {
+                message: format!("browser WAL shard {shard_index} is missing"),
+            })
     }
 
     pub(crate) fn stats(&self) -> WalFrontDoorStats {

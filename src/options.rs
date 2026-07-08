@@ -303,8 +303,8 @@ pub struct DbOptions {
     pub background_worker_count: usize,
     /// Policy for the number of WAL shards (independent append lanes).
     ///
-    /// Defaults to [`WalShardPolicy::Auto`], which picks one lane for the
-    /// per-commit-fsync durable-write regime (so group commit engages) and a
+    /// Defaults to [`WalShardPolicy::Auto`], which picks one lane for WASI,
+    /// browser storage, and the per-commit-fsync durable-write regime, and a
     /// small parallel set otherwise. See [`WalShardPolicy`] for the trade-offs
     /// and use [`DbOptions::with_wal_shards`] / [`DbOptions::with_wal_shard_count`]
     /// to override.
@@ -643,8 +643,10 @@ pub enum WalShardPolicy {
     /// - Persistent storage without per-commit fsync ([`DurabilityMode::Buffered`]
     ///   / [`DurabilityMode::Flush`]) uses a small parallel set of lanes, since
     ///   there is no per-commit fsync to coalesce and parallel append lanes help.
-    /// - In-memory and host backends use one lane; there is no device fsync to
-    ///   parallelize.
+    /// - WASI and browser persistent storage use one lane by default. WASI has
+    ///   no native thread lane, and browser storage uses async host objects where
+    ///   same-shard WAL appends are serialized explicitly.
+    /// - In-memory mode does not create a WAL lane.
     ///
     /// Override with [`WalShardPolicy::Fixed`] on hardware that flushes files in
     /// parallel.
@@ -667,7 +669,7 @@ impl WalShardPolicy {
         match self {
             Self::Fixed(count) => count.max(1),
             Self::Auto => {
-                if storage_mode.is_wasi_persistent() {
+                if storage_mode.is_wasi_persistent() || storage_mode.is_browser_persistent() {
                     return 1;
                 }
                 let per_commit_fsync = matches!(storage_mode, StorageMode::Persistent { .. })
@@ -969,12 +971,26 @@ impl WriteOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::{DurabilityMode, StorageMode, WalShardPolicy};
+    use super::{DurabilityMode, HostStorageBackend, StorageMode, WalShardPolicy};
     use std::path::PathBuf;
 
     fn persistent() -> StorageMode {
         StorageMode::Persistent {
             path: PathBuf::from("/tmp/trine-wal-policy-test"),
+        }
+    }
+
+    fn wasi_persistent() -> StorageMode {
+        StorageMode::HostPersistent {
+            backend: HostStorageBackend::Wasi {
+                path: PathBuf::from("/tmp/trine-wasi-wal-policy-test"),
+            },
+        }
+    }
+
+    fn browser_persistent() -> StorageMode {
+        StorageMode::HostPersistent {
+            backend: HostStorageBackend::Browser,
         }
     }
 
@@ -1013,6 +1029,26 @@ mod tests {
         assert_eq!(
             WalShardPolicy::Fixed(8).resolve(&persistent(), DurabilityMode::SyncAll),
             8
+        );
+    }
+
+    #[test]
+    fn auto_uses_one_lane_for_wasm_host_backends() {
+        assert_eq!(
+            WalShardPolicy::Auto.resolve(&wasi_persistent(), DurabilityMode::Flush),
+            1
+        );
+        assert_eq!(
+            WalShardPolicy::Auto.resolve(&browser_persistent(), DurabilityMode::Flush),
+            1
+        );
+    }
+
+    #[test]
+    fn fixed_overrides_wasm_host_backend_lane_count() {
+        assert_eq!(
+            WalShardPolicy::Fixed(3).resolve(&browser_persistent(), DurabilityMode::Flush),
+            3
         );
     }
 }

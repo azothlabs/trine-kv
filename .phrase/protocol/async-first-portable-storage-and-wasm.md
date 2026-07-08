@@ -594,7 +594,12 @@ Rules:
 - if writer leasing or atomic manifest publish is unavailable, writable
   persistent open fails;
 - browser storage accepts `Buffered` and `Flush` durability and rejects
-  `SyncData` and `SyncAll`;
+  `SyncData`, `SyncAll`, and `SyncAllStrict`;
+- browser WAL append is a Trine-owned operation boundary. Because OPFS does not
+  provide a native append primitive through the current browser adapter, the
+  browser WAL front door must serialize read/append/write-back work per WAL
+  shard. `WalShardPolicy::Auto` uses one browser WAL lane; explicit fixed lane
+  counts are honored only with per-shard async append guards;
 - durability strength is capability-reported and may be weaker than native
   strict sync;
 - background maintenance must be cooperative and budgeted;

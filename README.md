@@ -265,8 +265,10 @@ cargo bench --bench v1_bench
   targets; current WASI file work completes inline and does not advertise
   platform async I/O.
 - Browser persistence is async-only: use `Db::open` plus async mutation
-  and maintenance methods. Synchronous browser persistent open, mutation, and
-  maintenance `*_sync` APIs return typed unsupported errors.
+  and maintenance methods. Browser WAL appends are serialized per shard, and
+  `WalShardPolicy::Auto` uses one browser WAL lane by default. Synchronous
+  browser persistent open, mutation, and maintenance `*_sync` APIs return typed
+  unsupported errors.
 - Read-only open is for inspecting a stable directory state; the current
   pre-`1.0` line does not define live multi-process reads against an active
   writer.

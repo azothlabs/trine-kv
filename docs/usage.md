@@ -248,13 +248,16 @@ db.flush().await?;
 
 The browser persistent backend uses browser storage APIs behind Trine's storage
 traits. Writable open acquires a Web Locks writer lease, replays WAL, and uses
-WAL-backed async writes. Browser storage accepts `Buffered` and `Flush`;
-`SyncData` and `SyncAll` return `UnsupportedDurability`. Synchronous browser
-persistent open, synchronous mutation, synchronous bucket creation, and
-synchronous maintenance return typed unsupported errors. On non-browser targets,
-browser persistent async open returns `UnsupportedBackend`. Browser persistent
-options default to `Flush`, the strongest currently accepted mode for that
-backend.
+WAL-backed async writes. Browser WAL appends are serialized per shard because
+OPFS does not provide Trine with a native append primitive. `WalShardPolicy::Auto`
+therefore uses one browser WAL lane by default; explicit `Fixed(n)` policies are
+honored and each lane has its own async append guard. Browser storage accepts
+`Buffered` and `Flush`; `SyncData`, `SyncAll`, and `SyncAllStrict` return
+`UnsupportedDurability`. Synchronous browser persistent open, synchronous
+mutation, synchronous bucket creation, and synchronous maintenance return typed
+unsupported errors. On non-browser targets, browser persistent async open returns
+`UnsupportedBackend`. Browser persistent options default to `Flush`, the
+strongest currently accepted mode for that backend.
 
 Read-only browser open is also async:
 

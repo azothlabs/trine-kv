@@ -474,7 +474,9 @@ impl Db {
                 BrowserWalFrontDoor::open_sharded_with_backend(
                     &storage,
                     db_path,
-                    wal::DEFAULT_WAL_SHARD_COUNT,
+                    options
+                        .wal_shards
+                        .resolve(&options.storage_mode, options.durability),
                 )
                 .await?,
             )

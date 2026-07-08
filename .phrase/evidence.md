@@ -15438,3 +15438,42 @@ Negative check:
 - Keep WASI CI on `cargo check --target wasm32-wasip1 --lib` plus the
   wasmtime-backed `wasi_persistent` runtime test unless the feature matrix is
   split so wasm targets do not enable `s3`.
+
+## 2026-07-08: Browser WAL shard serialization and option honoring
+
+### Observation
+
+- Review found that browser WAL append used an OPFS read/append/write-back
+  sequence, not a native append primitive. Browser async writes can interleave
+  across `await` points, so same-shard writes needed a Trine-owned async guard.
+- Review also found browser persistent open hard-coded
+  `DEFAULT_WAL_SHARD_COUNT`, ignoring `DbOptions::wal_shards`.
+- The browser/WASI durability boundary rejects `SyncAllStrict`, but the WASM
+  protocol and browser usage text still mentioned only `SyncData` and
+  `SyncAll`.
+
+### Interpretation
+
+- Browser single-thread execution is not enough to protect read/append/write-back
+  WAL updates. WAL serialization must be explicit at the browser WAL front door.
+- `WalShardPolicy::Auto` should default browser persistence to one WAL lane,
+  matching the conservative WASM host backend boundary; callers can still use
+  explicit fixed lane counts, with one async append guard per shard.
+- User docs and protocol text must keep the same durability vocabulary as the
+  implementation.
+
+### Verification
+
+- Checks passed: `cargo test -q wasm_host_backend`,
+  `cargo check -q --target wasm32-unknown-unknown --lib`,
+  `cargo clippy -q --target wasm32-unknown-unknown --lib -- -D warnings`,
+  `cargo fmt --check`, `cargo check -q`,
+  `cargo check -q --target wasm32-wasip1 --lib`, and
+  `CARGO_TARGET_WASM32_WASIP1_RUNNER="wasmtime run --dir ." cargo test -q --target wasm32-wasip1 --lib wasi_persistent`.
+
+### Recommended Next Action
+
+- Add a browser runtime harness that opens `DbOptions::browser_persistent()`,
+  runs concurrent async writes, closes/reopens, and verifies every acknowledged
+  key survives recovery. The current browser gate still proves compile/lint
+  behavior, not real OPFS/Web Locks behavior.
