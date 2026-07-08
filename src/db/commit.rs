@@ -1,13 +1,20 @@
 use std::{
     future::Future,
     ops::Bound,
-    sync::{Arc, Condvar, Mutex, atomic::Ordering},
+    sync::{Arc, Mutex, atomic::Ordering},
+};
+#[cfg(not(target_os = "wasi"))]
+use std::{
+    sync::Condvar,
     task::{Context, Poll, Waker},
 };
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use std::path::Path;
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[cfg(all(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    not(target_os = "wasi")
+))]
 use std::{pin::Pin, thread};
 
 use crate::{
@@ -31,7 +38,10 @@ use helpers::{
     effective_durability, include_max_key, include_min_key, operation_estimated_bytes,
     unique_lsm_trees, validate_operation_resource_bounds,
 };
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[cfg(all(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    not(target_os = "wasi")
+))]
 use state::BackgroundWriteFuture;
 use state::{
     AcceptedWrite, AcceptedWriteState, DurableSequencedWrite, PreparedCommit, PreparedShardDelta,
@@ -147,8 +157,17 @@ impl Db {
         &self,
         request: WriteRequest,
     ) -> impl Future<Output = Result<CommitInfo>> + Send + 'static {
-        let db = self.clone();
-        BackgroundWriteFuture::new(db, request)
+        #[cfg(target_os = "wasi")]
+        {
+            let db = self.clone();
+            return async move { db.run_accepted_write(request) };
+        }
+
+        #[cfg(not(target_os = "wasi"))]
+        {
+            let db = self.clone();
+            BackgroundWriteFuture::new(db, request)
+        }
     }
 
     fn commit_write_request(&self, request: WriteRequest) -> Result<CommitInfo> {
@@ -157,7 +176,10 @@ impl Db {
         self.publish_accepted_write_state(accepted_state)
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        not(all(target_arch = "wasm32", target_os = "unknown")),
+        not(target_os = "wasi")
+    ))]
     async fn commit_write_request_async(&self, request: WriteRequest) -> Result<CommitInfo> {
         let _publish_activity = self.inner.publish_barrier.begin_activity()?;
         let accepted_state = self.accept_write_request_with_wal_preaccept(request, false)?;
@@ -356,6 +378,7 @@ impl Db {
         Ok(DurableSequencedWrite::new(prepared, slot))
     }
 
+    #[cfg(not(target_os = "wasi"))]
     async fn publish_accepted_write_state_async(
         &self,
         accepted_state: AcceptedWriteState,
@@ -395,6 +418,7 @@ impl Db {
         }
     }
 
+    #[cfg(not(target_os = "wasi"))]
     async fn accept_deferred_wal_for_sequenced_write_async(
         &self,
         sequenced: SequencedWrite,
@@ -664,7 +688,10 @@ impl Db {
         self.accept_wal_front_door(sequence, operations, durability)
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[cfg(all(
+        not(all(target_arch = "wasm32", target_os = "unknown")),
+        not(target_os = "wasi")
+    ))]
     async fn accept_wal_front_door_async(
         &self,
         sequence: Sequence,

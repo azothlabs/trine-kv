@@ -103,6 +103,7 @@ impl DurabilitySubstrate {
 
     /// Append a commit's operations to the WAL and await the WAL lane
     /// completion when the substrate has one.
+    #[cfg(not(target_os = "wasi"))]
     #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
     pub(crate) async fn accept_commit_async(
         &self,
@@ -224,6 +225,7 @@ impl FilesystemSubstrate {
         Ok(())
     }
 
+    #[cfg(not(target_os = "wasi"))]
     #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
     async fn accept_commit_async(
         &self,

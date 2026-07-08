@@ -242,7 +242,7 @@ pub(in crate::storage) fn prepare_native_file_wal_rewrite(
     Ok((path, tmp_path))
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(any(unix, windows, target_os = "wasi"))]
 pub(in crate::storage) fn require_native_file_writer_lease(object: &StorageObjectId) -> Result<()> {
     if object.kind() != StorageObjectKind::WriterLease {
         return Err(Error::invalid_options(
@@ -299,6 +299,18 @@ pub(in crate::storage) fn open_native_append_file(object: &StorageObjectId) -> R
         fs::create_dir_all(parent)?;
     }
 
+    #[cfg(target_os = "wasi")]
+    {
+        return OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(object.path())
+            .map_err(Error::from);
+    }
+
+    #[cfg(not(target_os = "wasi"))]
     OpenOptions::new()
         .create(true)
         .append(true)
@@ -328,6 +340,8 @@ pub(in crate::storage) fn append_native_file_object(
     capabilities.require(StorageCapability::Append)?;
     capabilities.require_durability(durability)?;
 
+    #[cfg(target_os = "wasi")]
+    file.seek(SeekFrom::End(0))?;
     file.write_all(bytes)?;
     persist_native_append_file(file, durability)
 }
@@ -401,7 +415,34 @@ pub(in crate::storage) fn acquire_native_file_writer_lease(
     }
 }
 
+#[cfg(target_os = "wasi")]
+pub(in crate::storage) fn acquire_native_file_writer_lease(
+    object: &StorageObjectId,
+) -> Result<File> {
+    require_native_file_writer_lease(object)?;
+
+    if let Some(parent) = object.path().parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(object.path())
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                Error::Corruption {
+                    message: format!("database lock is already held: {}", object.path().display()),
+                }
+            } else {
+                Error::Io(error)
+            }
+        })
+}
+
 #[cfg(not(any(unix, windows)))]
+#[cfg(not(target_os = "wasi"))]
 pub(in crate::storage) fn acquire_native_file_writer_lease(
     _object: &StorageObjectId,
 ) -> Result<File> {
@@ -412,7 +453,17 @@ pub(in crate::storage) fn writer_lease_owner_text() -> String {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
-    format!("pid={}\nnonce={nonce}\n", std::process::id())
+    format!("pid={}\nnonce={nonce}\n", writer_lease_process_owner())
+}
+
+#[cfg(not(target_os = "wasi"))]
+fn writer_lease_process_owner() -> String {
+    std::process::id().to_string()
+}
+
+#[cfg(target_os = "wasi")]
+fn writer_lease_process_owner() -> String {
+    "wasi".to_owned()
 }
 
 pub(in crate::storage) fn write_native_file_writer_lease_owner(
@@ -430,10 +481,19 @@ pub(in crate::storage) fn write_native_file_writer_lease_owner(
 }
 
 pub(in crate::storage) fn clear_native_file_writer_lease_owner(file: &mut File) -> Result<()> {
-    file.set_len(0)?;
-    file.seek(SeekFrom::Start(0))?;
-    file.flush()?;
-    Ok(())
+    #[cfg(target_os = "wasi")]
+    {
+        let _ = file;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    {
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.flush()?;
+        Ok(())
+    }
 }
 
 pub(in crate::storage) fn create_native_file_directory_all(
@@ -449,6 +509,39 @@ pub(in crate::storage) fn list_native_file_directory_files(
 ) -> Result<Vec<StorageDirectoryFile>> {
     require_native_file_directory_listing()?;
 
+    match native_file_directory_discovery() {
+        #[cfg(not(target_os = "wasi"))]
+        NativeFileDirectoryDiscovery::ReadDir => list_native_file_directory_entries(directory),
+        #[cfg(target_os = "wasi")]
+        NativeFileDirectoryDiscovery::KnownDatabaseFiles => {
+            list_known_trine_database_files(directory)
+        }
+    }
+}
+
+enum NativeFileDirectoryDiscovery {
+    #[cfg(not(target_os = "wasi"))]
+    ReadDir,
+    #[cfg(target_os = "wasi")]
+    KnownDatabaseFiles,
+}
+
+const fn native_file_directory_discovery() -> NativeFileDirectoryDiscovery {
+    #[cfg(target_os = "wasi")]
+    {
+        NativeFileDirectoryDiscovery::KnownDatabaseFiles
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    {
+        NativeFileDirectoryDiscovery::ReadDir
+    }
+}
+
+#[cfg(not(target_os = "wasi"))]
+fn list_native_file_directory_entries(
+    directory: &StorageDirectoryId,
+) -> Result<Vec<StorageDirectoryFile>> {
     let mut files = Vec::new();
     for entry in fs::read_dir(directory.path())? {
         let entry = entry?;
@@ -462,6 +555,40 @@ pub(in crate::storage) fn list_native_file_directory_files(
         ));
     }
 
+    files.sort_unstable();
+    Ok(files)
+}
+
+#[cfg(target_os = "wasi")]
+fn list_known_trine_database_files(
+    directory: &StorageDirectoryId,
+) -> Result<Vec<StorageDirectoryFile>> {
+    const KNOWN_ROOT_FILES: &[&str] = &[
+        "LOCK",
+        "MANIFEST",
+        "MANIFEST.tmp",
+        "RECOVERY_REPORT",
+        "RECOVERY_REPORT.tmp",
+        "trine.wal",
+        "trine.wal.tmp",
+        "trine.wal.confirmed-0000",
+    ];
+
+    let mut files = Vec::new();
+    for name in KNOWN_ROOT_FILES {
+        let path = directory.path().join(name);
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(Error::Io(error)),
+        };
+        if metadata.is_file() {
+            files.push(StorageDirectoryFile::native_file_with_len(
+                path,
+                metadata.len(),
+            ));
+        }
+    }
     files.sort_unstable();
     Ok(files)
 }

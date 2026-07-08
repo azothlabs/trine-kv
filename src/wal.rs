@@ -3,16 +3,25 @@ use std::{
     future::Future,
     ops::Bound,
     path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    task::{Context, Poll, Waker},
+};
+#[cfg(not(target_os = "wasi"))]
+use std::{
     pin::Pin,
     sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Condvar,
         mpsc::{self, SyncSender},
     },
-    task::{Context, Poll, Wake, Waker},
+    task::Wake,
     thread::{self, JoinHandle},
 };
 
+#[cfg(target_os = "wasi")]
+use crate::storage::BlockingStorageAppendObject;
 use crate::{
     error::{Error, Result},
     limits,
@@ -116,9 +125,17 @@ pub(crate) struct WalFrontDoorAccept {
 #[derive(Debug)]
 struct WalFrontDoorLane {
     shard_index: usize,
+    #[cfg(not(target_os = "wasi"))]
     sender: Option<SyncSender<WalLaneCommand>>,
     writer_open: Arc<AtomicBool>,
+    #[cfg(not(target_os = "wasi"))]
     worker: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(target_os = "wasi")]
+    backend: NativeFileBackend,
+    #[cfg(target_os = "wasi")]
+    path: PathBuf,
+    #[cfg(target_os = "wasi")]
+    state: Mutex<lane::WalLaneWorkerState>,
 }
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -175,10 +192,13 @@ struct WalLaneWaiter {
 #[derive(Debug)]
 struct WalLaneCompletion {
     result: Mutex<Option<Result<()>>>,
+    #[cfg(not(target_os = "wasi"))]
     ready: Condvar,
+    #[cfg(not(target_os = "wasi"))]
     waker: Mutex<Option<Waker>>,
 }
 
+#[cfg(not(target_os = "wasi"))]
 struct WalStorageThreadWake {
     thread: thread::Thread,
 }
@@ -187,7 +207,9 @@ impl WalLaneCompletion {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             result: Mutex::new(None),
+            #[cfg(not(target_os = "wasi"))]
             ready: Condvar::new(),
+            #[cfg(not(target_os = "wasi"))]
             waker: Mutex::new(None),
         })
     }
@@ -203,21 +225,34 @@ impl WalLaneCompletion {
     }
 
     fn complete(&self, result: Result<()>) {
+        #[cfg(target_os = "wasi")]
         {
             let mut slot = match self.result.lock() {
                 Ok(slot) => slot,
                 Err(poisoned) => poisoned.into_inner(),
             };
             *slot = Some(result);
+            return;
         }
-        self.ready.notify_all();
 
-        let waker = match self.waker.lock() {
-            Ok(mut waker) => waker.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
-        };
-        if let Some(waker) = waker {
-            waker.wake();
+        #[cfg(not(target_os = "wasi"))]
+        {
+            {
+                let mut slot = match self.result.lock() {
+                    Ok(slot) => slot,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *slot = Some(result);
+            }
+            self.ready.notify_all();
+
+            let waker = match self.waker.lock() {
+                Ok(mut waker) => waker.take(),
+                Err(poisoned) => poisoned.into_inner().take(),
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
         }
     }
 }
@@ -230,23 +265,34 @@ impl WalLaneReply {
 
 impl WalLaneWaiter {
     fn wait(self) -> Result<()> {
-        let mut result = self
-            .completion
-            .result
-            .lock()
-            .map_err(|_| wal_front_door_completion_poisoned())?;
-        loop {
-            if let Some(result) = result.take() {
-                return result;
-            }
-            result = self
+        #[cfg(target_os = "wasi")]
+        {
+            return self.take_result()?.ok_or_else(|| {
+                Error::runtime_busy("WASI WAL lane command did not finish synchronously")
+            })?;
+        }
+
+        #[cfg(not(target_os = "wasi"))]
+        {
+            let mut result = self
                 .completion
-                .ready
-                .wait(result)
+                .result
+                .lock()
                 .map_err(|_| wal_front_door_completion_poisoned())?;
+            loop {
+                if let Some(result) = result.take() {
+                    return result;
+                }
+                result = self
+                    .completion
+                    .ready
+                    .wait(result)
+                    .map_err(|_| wal_front_door_completion_poisoned())?;
+            }
         }
     }
 
+    #[cfg(not(target_os = "wasi"))]
     fn register_waker(&self, context: &Context<'_>) -> Result<()> {
         let mut waker = self
             .completion
@@ -272,6 +318,7 @@ impl WalLaneWaiter {
     }
 }
 
+#[cfg(not(target_os = "wasi"))]
 impl Future for WalLaneWaiter {
     type Output = Result<()>;
 
@@ -294,6 +341,7 @@ impl Future for WalLaneWaiter {
     }
 }
 
+#[cfg(not(target_os = "wasi"))]
 impl Wake for WalStorageThreadWake {
     fn wake(self: Arc<Self>) {
         self.thread.unpark();
@@ -332,10 +380,22 @@ impl WalWriter {
     }
 
     fn append_frame(&mut self, frame: &[u8], durability: DurabilityMode) -> Result<()> {
+        #[cfg(target_os = "wasi")]
+        {
+            return self.append.append_blocking(frame, durability);
+        }
+
+        #[cfg(not(target_os = "wasi"))]
         wait_for_wal_storage_future(self.append.append(frame, durability))
     }
 
     fn persist(&mut self, durability: DurabilityMode) -> Result<()> {
+        #[cfg(target_os = "wasi")]
+        {
+            return self.append.persist_blocking(durability);
+        }
+
+        #[cfg(not(target_os = "wasi"))]
         wait_for_wal_storage_future(self.append.persist(durability))
     }
 
@@ -350,15 +410,31 @@ impl WalWriter {
 }
 
 fn wait_for_wal_storage_future<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
-    let waker = Waker::from(Arc::new(WalStorageThreadWake {
-        thread: thread::current(),
-    }));
-    let mut context = Context::from_waker(&waker);
-    let mut future = std::pin::pin!(future);
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(result) => return result,
-            Poll::Pending => thread::park(),
+    #[cfg(target_os = "wasi")]
+    {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut future = std::pin::pin!(future);
+        return match future.as_mut().poll(&mut context) {
+            Poll::Ready(result) => result,
+            Poll::Pending => Err(Error::unsupported_backend(
+                "runtime for pending WAL storage future",
+            )),
+        };
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    {
+        let waker = Waker::from(Arc::new(WalStorageThreadWake {
+            thread: thread::current(),
+        }));
+        let mut context = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(result) => return result,
+                Poll::Pending => thread::park(),
+            }
         }
     }
 }
@@ -465,7 +541,7 @@ impl WalFrontDoor {
         })
     }
 
-    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
+    #[cfg(not(target_os = "wasi"))]
     pub(crate) async fn accept_commit_async(
         &self,
         sequence: Sequence,
@@ -498,13 +574,18 @@ impl WalFrontDoor {
         Ok(())
     }
 
-    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
+    #[cfg(not(target_os = "wasi"))]
     pub(crate) async fn persist_async(&self, durability: DurabilityMode) -> Result<()> {
         for lane in &self.lanes {
             enqueue_wal_lane_command(lane, |reply| WalLaneCommand::Persist { durability, reply })?
                 .await?;
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "wasi")]
+    pub(crate) async fn persist_async(&self, durability: DurabilityMode) -> Result<()> {
+        self.persist(durability)
     }
 
     pub(crate) fn stats(&self) -> WalFrontDoorStats {
@@ -527,7 +608,7 @@ impl WalFrontDoor {
         Ok(())
     }
 
-    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
+    #[cfg(not(target_os = "wasi"))]
     pub(crate) async fn rewrite_after_replay_floor_async(
         &self,
         replay_floor: Sequence,
@@ -540,6 +621,14 @@ impl WalFrontDoor {
             .await?;
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "wasi")]
+    pub(crate) async fn rewrite_after_replay_floor_async(
+        &self,
+        replay_floor: Sequence,
+    ) -> Result<()> {
+        self.rewrite_after_replay_floor(replay_floor)
     }
 
     fn count_open_lanes(&self) -> usize {
@@ -675,32 +764,50 @@ impl WalFrontDoorLane {
         path: &Path,
         queue_capacity: usize,
     ) -> Result<Self> {
-        let (sender, receiver) = mpsc::sync_channel(queue_capacity);
-        let writer_open = Arc::new(AtomicBool::new(false));
-        let worker_open = Arc::clone(&writer_open);
-        let worker_backend = backend.clone();
-        let worker_path = path.to_path_buf();
-        let worker = thread::Builder::new()
-            .name(format!("trine-wal-shard-{shard_index}"))
-            .spawn(move || {
-                run_wal_lane_worker(worker_backend, worker_path, worker_open, receiver);
-            })?;
+        #[cfg(target_os = "wasi")]
+        {
+            let _ = queue_capacity;
+            return Ok(Self {
+                shard_index,
+                writer_open: Arc::new(AtomicBool::new(false)),
+                backend: backend.clone(),
+                path: path.to_path_buf(),
+                state: Mutex::new(lane::WalLaneWorkerState::default()),
+            });
+        }
 
-        Ok(Self {
-            shard_index,
-            sender: Some(sender),
-            writer_open,
-            worker: Mutex::new(Some(worker)),
-        })
+        #[cfg(not(target_os = "wasi"))]
+        {
+            let (sender, receiver) = mpsc::sync_channel(queue_capacity);
+            let writer_open = Arc::new(AtomicBool::new(false));
+            let worker_open = Arc::clone(&writer_open);
+            let worker_backend = backend.clone();
+            let worker_path = path.to_path_buf();
+            let worker = thread::Builder::new()
+                .name(format!("trine-wal-shard-{shard_index}"))
+                .spawn(move || {
+                    run_wal_lane_worker(worker_backend, worker_path, worker_open, receiver);
+                })?;
+
+            Ok(Self {
+                shard_index,
+                sender: Some(sender),
+                writer_open,
+                worker: Mutex::new(Some(worker)),
+            })
+        }
     }
 }
 
 impl Drop for WalFrontDoorLane {
     fn drop(&mut self) {
-        drop(self.sender.take());
-        if let Ok(mut worker) = self.worker.lock() {
-            if let Some(handle) = worker.take() {
-                let _ = handle.join();
+        #[cfg(not(target_os = "wasi"))]
+        {
+            drop(self.sender.take());
+            if let Ok(mut worker) = self.worker.lock() {
+                if let Some(handle) = worker.take() {
+                    let _ = handle.join();
+                }
             }
         }
     }
@@ -724,10 +831,14 @@ mod lane;
 mod recovery;
 
 pub(crate) use codec::*;
+#[cfg(not(target_os = "wasi"))]
+use lane::enqueue_wal_lane_command;
+#[cfg(not(target_os = "wasi"))]
+use lane::run_wal_lane_worker;
 use lane::{
-    enqueue_wal_lane_command, run_wal_lane_worker, send_wal_lane_command,
-    validate_wal_stream_order, wal_front_door_completion_poisoned, wal_shard_index_from_file_name,
-    wal_shard_index_from_final_file_name, wal_shard_index_from_path,
+    send_wal_lane_command, validate_wal_stream_order, wal_front_door_completion_poisoned,
+    wal_shard_index_from_file_name, wal_shard_index_from_final_file_name,
+    wal_shard_index_from_path,
 };
 pub(crate) use recovery::*;
 

@@ -71,10 +71,21 @@ pub(super) fn publish_manifest_with_backend(
 ) -> Result<PublishOutcome> {
     let bytes = encode_manifest_bytes(state)?;
     let object = manifest_storage_object(path);
-    backend.publish_manifest_blocking(object, bytes, DurabilityMode::SyncAll)?;
+    backend.publish_manifest_blocking(object, bytes, native_manifest_publish_durability())?;
     // Temp-write + atomic rename cannot lose a CAS race, so the filesystem
     // manifest always advances.
     Ok(PublishOutcome::Published)
+}
+
+pub(super) const fn native_manifest_publish_durability() -> DurabilityMode {
+    #[cfg(target_os = "wasi")]
+    {
+        DurabilityMode::Flush
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        DurabilityMode::SyncAll
+    }
 }
 
 pub(super) async fn publish_manifest_with_backend_async<B>(

@@ -1,12 +1,13 @@
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-use super::BrowserStorageBackend;
 use super::{
-    Arc, BucketOptions, DurabilityMode, Error, ManifestState, ManifestStore, ManifestStoreBackend,
+    Arc, BucketOptions, Error, ManifestState, ManifestStore, ManifestStoreBackend,
     NativeFileBackend, ObjectClient, ObjectManifestStore, PathBuf, PreparedManifestPublish,
     PublishOutcome, Result, Sequence, TableId, TableProperties, decode_manifest,
-    publish_manifest_with_backend, publish_manifest_with_backend_async,
-    read_manifest_bytes_with_backend, read_manifest_bytes_with_backend_async,
+    native_manifest_publish_durability, publish_manifest_with_backend,
+    publish_manifest_with_backend_async, read_manifest_bytes_with_backend,
+    read_manifest_bytes_with_backend_async,
 };
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use super::{BrowserStorageBackend, DurabilityMode};
 
 impl ManifestStore {
     #[cfg(test)]
@@ -57,7 +58,7 @@ impl ManifestStore {
                 &native_storage,
                 &path,
                 &state,
-                DurabilityMode::SyncAll,
+                native_manifest_publish_durability(),
             )
             .await?
             .published_or_err()?;
@@ -702,7 +703,7 @@ impl ManifestStore {
                     native_storage,
                     &self.path,
                     &next_state,
-                    DurabilityMode::SyncAll,
+                    native_manifest_publish_durability(),
                 )
                 .await?;
                 if matches!(outcome, PublishOutcome::Published) {

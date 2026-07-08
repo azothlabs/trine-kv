@@ -1,9 +1,18 @@
+#[cfg(not(target_os = "wasi"))]
+use super::Condvar;
+#[cfg(target_os = "wasi")]
+use super::Error;
 use super::{
-    Arc, BatchOperation, Bound, CommitInfo, CommitSlot, Condvar, Context, Db, DurabilityMode,
-    LsmTree, Mutex, Poll, Result, Sequence, TransactionReadSet, Waker, WriteBatch, WriteOptions,
-    include_max_key, include_min_key, lock_poisoned, operation_estimated_bytes, unique_lsm_trees,
+    Arc, BatchOperation, Bound, CommitInfo, CommitSlot, Db, DurabilityMode, LsmTree, Mutex, Result,
+    Sequence, TransactionReadSet, WriteBatch, WriteOptions, include_max_key, include_min_key,
+    lock_poisoned, operation_estimated_bytes, unique_lsm_trees,
 };
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[cfg(not(target_os = "wasi"))]
+use super::{Context, Poll, Waker};
+#[cfg(all(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    not(target_os = "wasi")
+))]
 use super::{Future, Pin, thread};
 
 #[derive(Debug)]
@@ -113,13 +122,19 @@ pub(super) struct WriteWaiter {
 }
 
 #[derive(Debug)]
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[cfg(all(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    not(target_os = "wasi")
+))]
 pub(super) struct BackgroundWriteFuture {
     pub(super) state: BackgroundWriteFutureState,
 }
 
 #[derive(Debug)]
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[cfg(all(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    not(target_os = "wasi")
+))]
 pub(super) enum BackgroundWriteFutureState {
     Start { db: Db, request: WriteRequest },
     Waiting { waiter: WriteWaiter },
@@ -127,7 +142,10 @@ pub(super) enum BackgroundWriteFutureState {
 }
 
 #[derive(Debug)]
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[cfg(all(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    not(target_os = "wasi")
+))]
 pub(super) enum BackgroundWriteStart {
     Ready(Result<CommitInfo>),
     Pending(WriteWaiter),
@@ -136,11 +154,16 @@ pub(super) enum BackgroundWriteStart {
 #[derive(Debug)]
 pub(super) struct WriteCompletion {
     pub(super) result: Mutex<Option<Result<CommitInfo>>>,
+    #[cfg(not(target_os = "wasi"))]
     pub(super) ready: Condvar,
+    #[cfg(not(target_os = "wasi"))]
     pub(super) waker: Mutex<Option<Waker>>,
 }
 
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[cfg(all(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    not(target_os = "wasi")
+))]
 pub(super) struct WriteThreadWake {
     pub(super) thread: thread::Thread,
 }
@@ -353,50 +376,76 @@ impl WriteCompletion {
     pub(super) fn new() -> Self {
         Self {
             result: Mutex::new(None),
+            #[cfg(not(target_os = "wasi"))]
             ready: Condvar::new(),
+            #[cfg(not(target_os = "wasi"))]
             waker: Mutex::new(None),
         }
     }
 
     pub(super) fn complete(&self, result: Result<CommitInfo>) {
+        #[cfg(target_os = "wasi")]
         {
             let mut slot = match self.result.lock() {
                 Ok(slot) => slot,
                 Err(poisoned) => poisoned.into_inner(),
             };
             *slot = Some(result);
+            return;
         }
-        self.ready.notify_all();
 
-        let waker = match self.waker.lock() {
-            Ok(mut waker) => waker.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
-        };
-        if let Some(waker) = waker {
-            waker.wake();
+        #[cfg(not(target_os = "wasi"))]
+        {
+            {
+                let mut slot = match self.result.lock() {
+                    Ok(slot) => slot,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *slot = Some(result);
+            }
+            self.ready.notify_all();
+
+            let waker = match self.waker.lock() {
+                Ok(mut waker) => waker.take(),
+                Err(poisoned) => poisoned.into_inner().take(),
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
         }
     }
 }
 
 impl WriteWaiter {
     pub(super) fn wait(self) -> Result<CommitInfo> {
-        let mut result = self
-            .completion
-            .result
-            .lock()
-            .map_err(|_| lock_poisoned("write completion"))?;
-        loop {
-            if let Some(result) = result.take() {
-                return result;
-            }
-            result = self
+        #[cfg(target_os = "wasi")]
+        {
+            return self.take_result()?.ok_or_else(|| {
+                Error::runtime_busy("WASI write completion did not finish synchronously")
+            })?;
+        }
+
+        #[cfg(not(target_os = "wasi"))]
+        {
+            let mut result = self
                 .completion
-                .ready
-                .wait(result)
+                .result
+                .lock()
                 .map_err(|_| lock_poisoned("write completion"))?;
+            loop {
+                if let Some(result) = result.take() {
+                    return result;
+                }
+                result = self
+                    .completion
+                    .ready
+                    .wait(result)
+                    .map_err(|_| lock_poisoned("write completion"))?;
+            }
         }
     }
 
+    #[cfg(not(target_os = "wasi"))]
     pub(super) fn poll_result(&self, context: &mut Context<'_>) -> Poll<Result<CommitInfo>> {
         match self.take_result() {
             Ok(Some(result)) => return Poll::Ready(result),
@@ -415,6 +464,7 @@ impl WriteWaiter {
         }
     }
 
+    #[cfg(not(target_os = "wasi"))]
     pub(super) fn register_waker(&self, context: &Context<'_>) -> Result<()> {
         let mut waker = self
             .completion
@@ -440,7 +490,10 @@ impl WriteWaiter {
     }
 }
 
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[cfg(all(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    not(target_os = "wasi")
+))]
 impl BackgroundWriteFuture {
     pub(super) fn new(db: Db, request: WriteRequest) -> Self {
         Self {
@@ -487,7 +540,10 @@ impl BackgroundWriteFuture {
     }
 }
 
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[cfg(all(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    not(target_os = "wasi")
+))]
 impl Future for BackgroundWriteFuture {
     type Output = Result<CommitInfo>;
 
@@ -517,7 +573,10 @@ impl Future for BackgroundWriteFuture {
     }
 }
 
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[cfg(all(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    not(target_os = "wasi")
+))]
 impl std::task::Wake for WriteThreadWake {
     fn wake(self: Arc<Self>) {
         self.thread.unpark();
@@ -528,7 +587,10 @@ impl std::task::Wake for WriteThreadWake {
     }
 }
 
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[cfg(all(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    not(target_os = "wasi")
+))]
 fn wait_for_engine_write_future<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
     let waker = Waker::from(Arc::new(WriteThreadWake {
         thread: thread::current(),

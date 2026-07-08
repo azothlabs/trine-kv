@@ -493,7 +493,7 @@ impl PreparedManifestPublish {
                     native_storage,
                     &self.path,
                     &self.next_state,
-                    DurabilityMode::SyncAll,
+                    native_manifest_publish_durability(),
                 )
                 .await?
             }

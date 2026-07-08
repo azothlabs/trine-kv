@@ -382,18 +382,28 @@ impl StorageCapabilities {
     }
 
     pub(crate) const fn native_file() -> Self {
-        Self::native_file_read()
+        let capabilities = Self::native_file_read()
             .with(StorageCapability::ObjectWrite)
             .with(StorageCapability::ObjectDelete)
             .with(StorageCapability::Append)
             .with(StorageCapability::AtomicWalRewrite)
             .with(StorageCapability::DirectoryCreate)
-            .with(StorageCapability::DirectorySync)
             .with(StorageCapability::AtomicManifestPublish)
             .with(StorageCapability::WriterLease)
-            .with(StorageCapability::Flush)
-            .with(StorageCapability::StrictDataSync)
-            .with(StorageCapability::StrictMetadataSync)
+            .with(StorageCapability::Flush);
+
+        #[cfg(target_os = "wasi")]
+        {
+            capabilities
+        }
+
+        #[cfg(not(target_os = "wasi"))]
+        {
+            capabilities
+                .with(StorageCapability::DirectorySync)
+                .with(StorageCapability::StrictDataSync)
+                .with(StorageCapability::StrictMetadataSync)
+        }
     }
 
     pub(crate) const fn memory_read() -> Self {

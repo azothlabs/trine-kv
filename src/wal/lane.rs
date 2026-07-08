@@ -1,11 +1,13 @@
+#[cfg(not(target_os = "wasi"))]
+use super::{Arc, PathBuf, mpsc};
 use super::{
-    Arc, AtomicBool, DurabilityMode, Error, NativeFileBackend, Ordering, Path, PathBuf,
-    PendingWalAppend, Result, Sequence, WAL_FILE_NAME, WAL_SHARD_FILE_DIGITS,
-    WAL_SHARD_FILE_PREFIX, WalBatch, WalFrontDoorLane, WalLaneCommand, WalLaneCompletion,
-    WalLaneReply, WalLaneWaiter, WalWriter, delete_confirmed_wal_marker_with_backend, invalid_wal,
-    is_wal_rewrite_temporary_file_name, mpsc, read_confirmed_wal_marker_with_backend,
-    read_wal_object_with_backend_async, rewrite_batches_after_with_backend_async,
-    wait_for_wal_storage_future, write_confirmed_wal_marker_with_backend,
+    AtomicBool, DurabilityMode, Error, NativeFileBackend, Ordering, Path, PendingWalAppend, Result,
+    Sequence, WAL_FILE_NAME, WAL_SHARD_FILE_DIGITS, WAL_SHARD_FILE_PREFIX, WalBatch,
+    WalFrontDoorLane, WalLaneCommand, WalLaneCompletion, WalLaneReply, WalLaneWaiter, WalWriter,
+    delete_confirmed_wal_marker_with_backend, invalid_wal, is_wal_rewrite_temporary_file_name,
+    read_confirmed_wal_marker_with_backend, read_wal_object_with_backend_async,
+    rewrite_batches_after_with_backend_async, wait_for_wal_storage_future,
+    write_confirmed_wal_marker_with_backend,
 };
 
 pub(super) fn send_wal_lane_command(
@@ -19,20 +21,52 @@ pub(super) fn enqueue_wal_lane_command(
     lane: &WalFrontDoorLane,
     command: impl FnOnce(WalLaneReply) -> WalLaneCommand,
 ) -> Result<WalLaneWaiter> {
-    let sender = lane
-        .sender
-        .as_ref()
-        .ok_or_else(wal_front_door_worker_stopped)?;
-    let (reply, waiter) = WalLaneCompletion::pair();
-    sender
-        .send(command(reply))
-        .map_err(|_| wal_front_door_worker_stopped())?;
-    Ok(waiter)
+    #[cfg(target_os = "wasi")]
+    {
+        let (reply, waiter) = WalLaneCompletion::pair();
+        let mut state = lane
+            .state
+            .lock()
+            .map_err(|_| wal_front_door_completion_poisoned())?;
+        process_wal_lane_batch(
+            &lane.backend,
+            &lane.path,
+            &lane.writer_open,
+            &mut state,
+            vec![command(reply)],
+        );
+        if waiter
+            .completion
+            .result
+            .lock()
+            .map_err(|_| wal_front_door_completion_poisoned())?
+            .is_none()
+        {
+            waiter.completion.complete(Err(Error::Corruption {
+                message: "WASI WAL lane command did not complete synchronously".to_owned(),
+            }));
+        }
+        return Ok(waiter);
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    {
+        let sender = lane
+            .sender
+            .as_ref()
+            .ok_or_else(wal_front_door_worker_stopped)?;
+        let (reply, waiter) = WalLaneCompletion::pair();
+        sender
+            .send(command(reply))
+            .map_err(|_| wal_front_door_worker_stopped())?;
+        Ok(waiter)
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
 /// Maximum commits coalesced into one group-commit fsync. Bounds the latency and
 /// memory of a single drain pass when the queue is flooded.
+#[cfg(not(target_os = "wasi"))]
 pub(super) const WAL_LANE_BATCH_MAX: usize = 1024;
 
 #[derive(Debug, Default)]
@@ -45,6 +79,7 @@ pub(super) struct WalLaneWorkerState {
 
 // Thread entry point: it owns its lane state for the worker's lifetime.
 #[allow(clippy::needless_pass_by_value)]
+#[cfg(not(target_os = "wasi"))]
 pub(super) fn run_wal_lane_worker(
     backend: NativeFileBackend,
     path: PathBuf,
@@ -306,6 +341,7 @@ pub(super) fn rewrite_wal_lane_after_replay_floor(
     Ok(())
 }
 
+#[cfg(not(target_os = "wasi"))]
 pub(super) fn wal_front_door_worker_stopped() -> Error {
     Error::Corruption {
         message: "WAL front door worker stopped".to_owned(),

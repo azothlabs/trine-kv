@@ -388,6 +388,15 @@ impl Db {
         ) {
             return Err(Error::unsupported_durability(options.durability));
         }
+        if options
+            .wal_shards
+            .resolve(&options.storage_mode, options.durability)
+            != 1
+        {
+            return Err(Error::invalid_options(
+                "WASI persistent backend supports one WAL lane",
+            ));
+        }
         Ok(())
     }
 

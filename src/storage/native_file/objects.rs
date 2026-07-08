@@ -445,13 +445,20 @@ impl Drop for NativeFileWriterLease {
                 let _ = clear_native_file_writer_lease_owner(file);
             }
         }
+        #[cfg(target_os = "wasi")]
+        {
+            let _ = self.file.take();
+            if should_clear {
+                let _ = fs::remove_file(self.object.path());
+            }
+        }
         #[cfg(any(unix, windows))]
         {
             if let Some(file) = self.file.as_ref() {
                 let _ = fs4::fs_std::FileExt::unlock(file);
             }
+            let _ = self.file.take();
         }
-        let _ = self.file.take();
     }
 }
 

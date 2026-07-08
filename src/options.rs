@@ -659,6 +659,9 @@ impl WalShardPolicy {
         match self {
             Self::Fixed(count) => count.max(1),
             Self::Auto => {
+                if storage_mode.is_wasi_persistent() {
+                    return 1;
+                }
                 let per_commit_fsync = matches!(storage_mode, StorageMode::Persistent { .. })
                     && matches!(
                         durability,
