@@ -77,6 +77,22 @@ jobs:
       - name: Lint browser target
         run: cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings
 
+      - name: Install wasm-bindgen test runner
+        run: cargo install wasm-bindgen-cli --version 0.2.122 --locked
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Install ChromeDriver
+        uses: nanasess/setup-chromedriver@v2
+
+      - name: Test browser persistence target
+        run: cargo test --target wasm32-unknown-unknown --test browser_persistent_wasm
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+          WASM_BINDGEN_TEST_ONLY_WEB: "1"
+          CHROMEDRIVER: chromedriver
+
       - name: Run examples
         run: |
           cargo run --example quickstart

@@ -27,6 +27,14 @@ whole-object reads, manifest/WAL payload lengths, blob file/property/record
 lengths, direct blob references, cursor byte-field overflow checks, and
 object-store `head` preflight before whole-object `get`.
 
+Post-phase browser WASM hardening found and fixed four support gaps:
+`platform-io` and `platform-io-native` now compile on
+`wasm32-unknown-unknown` without routing to native-thread writer-lease paths or
+advertising platform async I/O; browser persistence has explicit namespace
+options; browser WAL/OPFS/Web Locks behavior has a dedicated browser integration
+test; and CI/publish workflows now install Chrome, ChromeDriver, and
+`wasm-bindgen-test-runner` before running that browser test.
+
 ## Goal
 
 Reduce confirmed object-store write latency and allow deployments to place the
@@ -120,6 +128,14 @@ recoverable after process loss and writer takeover.
   allocation before decode validation. Met.
 - Malicious or corrupt manifest, WAL, table, or blob length fields cannot force
   unbounded buffer allocation before validation. Met.
+- Browser WASM with `platform-io` and `platform-io-native` compiles without
+  native-thread capability leakage. Met.
+- Browser persistent callers can select explicit origin-private namespaces.
+  Met.
+- Browser OPFS/Web Locks behavior is covered by a real browser test gate for
+  WAL reopen, namespace isolation, and second-writer rejection. Met in CI
+  workflow configuration; local no-run build and clippy pass, while this host
+  lacks Chrome/Chromedriver for local WebDriver execution.
 
 ## Verification
 
@@ -149,6 +165,12 @@ recoverable after process loss and writer takeover.
 - `cargo rustdoc --all-features -- -D warnings`
 - `cargo test -q --all-features`
 - `infisical run --silent --env=dev --path=/ --recursive -- cargo test -q --features s3 s3_live_measurement_and_fault_suite -- --ignored --nocapture`
+- `cargo check -q --target wasm32-unknown-unknown --no-default-features --features platform-io --lib`
+- `cargo check -q --target wasm32-unknown-unknown --no-default-features --features platform-io-native --lib`
+- `cargo clippy -q --target wasm32-unknown-unknown --no-default-features --features platform-io --lib -- -D warnings`
+- `cargo clippy -q --target wasm32-unknown-unknown --no-default-features --features platform-io-native --lib -- -D warnings`
+- `cargo clippy -q --target wasm32-unknown-unknown --test browser_persistent_wasm -- -D warnings`
+- `cargo test -q --target wasm32-unknown-unknown --test browser_persistent_wasm --no-run`
 
 ## Next Recommendation
 

@@ -63,7 +63,9 @@ explains persistence guarantees and limits. Release packaging notes live in
 - Explicit WASI and browser persistent options. WASI uses a host-preopened
   filesystem path on WASI targets and supports `Db::open` through the
   host storage boundary. Browser persistence uses the async API and the browser
-  persistent backend on `wasm32-unknown-unknown`.
+  persistent backend on `wasm32-unknown-unknown`; use
+  `DbOptions::browser_persistent_at(path)` when separate browser namespaces
+  should not share WAL, manifest, table, or blob files.
 
 ## Install
 

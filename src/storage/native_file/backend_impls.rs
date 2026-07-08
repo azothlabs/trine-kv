@@ -22,14 +22,20 @@ use super::{
 use super::{
     PlatformIoOperation, max_whole_object_read_bytes, native_file_objects_from_paths,
     prepare_native_file_manifest_publish, prepare_native_file_object_write,
-    prepare_native_file_wal_rewrite, record_platform_io_task, require_native_file_append,
-    require_native_file_directory_create, require_native_file_directory_listing,
-    require_native_file_directory_sync, require_native_file_manifest_read,
-    require_native_file_object_delete, require_native_file_object_listing,
-    require_native_file_object_read, wait_for_platform_io,
+    record_platform_io_task, require_native_file_append, require_native_file_directory_create,
+    require_native_file_directory_listing, require_native_file_directory_sync,
+    require_native_file_manifest_read, require_native_file_object_delete,
+    require_native_file_object_listing, wait_for_platform_io,
 };
-#[cfg(all(feature = "platform-io", any(unix, windows)))]
-use super::{require_native_file_writer_lease, writer_lease_owner_text};
+#[cfg(all(
+    feature = "platform-io",
+    any(unix, windows),
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
+use super::{
+    prepare_native_file_wal_rewrite, require_native_file_object_read,
+    require_native_file_writer_lease, writer_lease_owner_text,
+};
 
 impl StorageReadBackend for NativeFileBackend {
     type ReadObject = NativeFileObject;
@@ -95,7 +101,11 @@ impl BlockingStorageReadBackend for NativeFileBackend {
 
 impl StorageObjectReadBackend for NativeFileBackend {
     fn read_object_bytes(&self, object: StorageObjectId) -> StorageFuture<'_, Option<Arc<[u8]>>> {
-        #[cfg(feature = "platform-io")]
+        #[cfg(all(
+            feature = "platform-io",
+            any(unix, windows),
+            not(all(target_arch = "wasm32", target_os = "unknown"))
+        ))]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
             let task_metrics = Arc::clone(&metrics);
@@ -201,7 +211,11 @@ impl StorageWalRewriteBackend for NativeFileBackend {
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
     ) -> StorageFuture<'_, ()> {
-        #[cfg(feature = "platform-io")]
+        #[cfg(all(
+            feature = "platform-io",
+            any(unix, windows),
+            not(all(target_arch = "wasm32", target_os = "unknown"))
+        ))]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
             let task_metrics = Arc::clone(&metrics);
@@ -251,7 +265,11 @@ impl StorageWriterLeaseBackend for NativeFileBackend {
         &self,
         object: StorageObjectId,
     ) -> StorageFuture<'_, Self::WriterLease> {
-        #[cfg(feature = "platform-io")]
+        #[cfg(all(
+            feature = "platform-io",
+            any(unix, windows),
+            not(all(target_arch = "wasm32", target_os = "unknown"))
+        ))]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
             let task_metrics = Arc::clone(&metrics);
@@ -284,7 +302,11 @@ impl StorageWriterLeaseBackend for NativeFileBackend {
 
 impl BlockingStorageWriterLeaseBackend for NativeFileBackend {
     fn acquire_writer_lease_blocking(&self, object: StorageObjectId) -> Result<Self::WriterLease> {
-        #[cfg(feature = "platform-io")]
+        #[cfg(all(
+            feature = "platform-io",
+            any(unix, windows),
+            not(all(target_arch = "wasm32", target_os = "unknown"))
+        ))]
         if let Some(driver) = self.platform_io.clone() {
             return record_timed_storage_result(
                 self.metrics.as_ref(),

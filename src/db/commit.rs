@@ -9,8 +9,6 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-use std::path::Path;
 #[cfg(all(
     not(all(target_arch = "wasm32", target_os = "unknown")),
     not(target_os = "wasi")
@@ -679,7 +677,13 @@ impl Db {
                     message: "browser persistent database is missing storage backend".to_owned(),
                 })?;
             let accepted = wal
-                .accept_commit(storage, Path::new(""), sequence, operations, durability)
+                .accept_commit(
+                    storage,
+                    self.browser_db_path()?,
+                    sequence,
+                    operations,
+                    durability,
+                )
                 .await?;
             debug_assert_eq!(accepted.sequence(), sequence);
             return Ok(());

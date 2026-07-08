@@ -47,7 +47,7 @@ impl Db {
                 Self::open_persistent_with_options_async(options).await
             }
             StorageMode::HostPersistent {
-                backend: HostStorageBackend::Browser,
+                backend: HostStorageBackend::Browser { .. },
             } => Self::open_browser_persistent_with_options_async(options).await,
             StorageMode::HostPersistent {
                 backend: HostStorageBackend::Wasi { .. },
@@ -672,7 +672,7 @@ impl Db {
         if matches!(
             self.inner.options.storage_mode,
             StorageMode::HostPersistent {
-                backend: HostStorageBackend::Browser
+                backend: HostStorageBackend::Browser { .. }
             }
         ) {
             return self.persist_browser_async(mode).await;

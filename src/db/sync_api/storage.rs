@@ -76,6 +76,17 @@ impl Db {
             })
     }
 
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    pub(in crate::db) fn browser_db_path(&self) -> Result<&Path> {
+        self.inner
+            .options
+            .storage_mode
+            .browser_path()
+            .ok_or_else(|| Error::Corruption {
+                message: "browser persistent database is missing namespace path".to_owned(),
+            })
+    }
+
     pub(in crate::db) fn object_storage(&self) -> Result<ObjectStoreBackend> {
         self.inner
             .object_storage
@@ -722,7 +733,7 @@ impl Db {
             return Ok(());
         };
         let storage = self.browser_storage()?;
-        wal.persist(&storage, Path::new(""), mode).await
+        wal.persist(&storage, self.browser_db_path()?, mode).await
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -1074,7 +1085,7 @@ impl Db {
         }
         self.take_background_maintenance_error()?;
 
-        let db_path = Path::new("");
+        let db_path = self.browser_db_path()?;
         let target_sequence = self.freeze_public_flush_target()?;
         let mut should_compact = false;
 
@@ -1135,7 +1146,7 @@ impl Db {
 
         let outcome = self
             .run_compaction_once_with_budget_browser_async(
-                Path::new(""),
+                self.browser_db_path()?,
                 &range,
                 false,
                 MaintenanceBudget::unbounded(),
@@ -1161,8 +1172,13 @@ impl Db {
             return Err(Error::ReadOnly);
         }
 
-        self.run_compaction_once_with_budget_browser_async(Path::new(""), &range, false, budget)
-            .await
+        self.run_compaction_once_with_budget_browser_async(
+            self.browser_db_path()?,
+            &range,
+            false,
+            budget,
+        )
+        .await
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -1176,7 +1192,7 @@ impl Db {
             return Err(Error::ReadOnly);
         }
 
-        let db_path = Path::new("");
+        let db_path = self.browser_db_path()?;
         let mut outcome = MaintenanceOutcome::default();
         let mut should_compact = self.l0_pressure_exceeded()?;
 

@@ -16,7 +16,10 @@ use super::{PlatformIoBackendKind, PlatformIoBackendMatrix, PlatformIoTask, Plat
 
 #[cfg_attr(feature = "platform-io-native", allow(dead_code))]
 pub(super) fn matrix() -> PlatformIoBackendMatrix {
-    #[cfg(any(unix, windows))]
+    #[cfg(all(
+        any(unix, windows),
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
     {
         use PlatformIoTaskClass::ThreadPoolManagedAsync;
 
@@ -38,7 +41,10 @@ pub(super) fn matrix() -> PlatformIoBackendMatrix {
         }
     }
 
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(any(
+        not(any(unix, windows)),
+        all(target_arch = "wasm32", target_os = "unknown")
+    ))]
     {
         use PlatformIoTaskClass::Unsupported;
 
@@ -188,6 +194,10 @@ pub(super) fn list_file_paths(path: PathBuf) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+#[cfg(all(
+    any(unix, windows),
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
 pub(super) fn acquire_writer_lease(path: &Path, owner: &[u8]) -> Result<File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -215,6 +225,14 @@ pub(super) fn acquire_writer_lease(path: &Path, owner: &[u8]) -> Result<File> {
         return Err(Error::Io(error));
     }
     Ok(file)
+}
+
+#[cfg(any(
+    not(any(unix, windows)),
+    all(target_arch = "wasm32", target_os = "unknown")
+))]
+pub(super) fn acquire_writer_lease(_path: &Path, _owner: &[u8]) -> Result<File> {
+    Err(Error::unsupported_backend("platform I/O writer lease"))
 }
 
 fn persist_file(file: &File, durability: DurabilityMode) -> Result<()> {

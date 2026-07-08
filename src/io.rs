@@ -71,6 +71,7 @@ pub(crate) enum PlatformIoTaskClass {
 }
 
 #[cfg(feature = "platform-io")]
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlatformIoOperation {
     LengthLookup,
@@ -418,6 +419,7 @@ const PLATFORM_IO_THREAD_POOL_WORKERS: usize = 4;
 const PLATFORM_IO_THREAD_POOL_QUEUE_DEPTH: usize = 1024;
 
 #[cfg(feature = "platform-io")]
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
 enum PlatformIoTask {
     Len {
         path: PathBuf,
@@ -638,6 +640,7 @@ impl PlatformIoDriver {
         Ok(waiter)
     }
 
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
     pub(crate) fn submit_acquire_writer_lease_path(
         &self,
         path: PathBuf,

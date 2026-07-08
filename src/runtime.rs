@@ -255,7 +255,11 @@ impl RuntimeCapabilities {
 }
 
 const fn platform_io_driver_flag() -> u8 {
-    if cfg!(all(feature = "platform-io", any(unix, windows))) {
+    if cfg!(all(
+        feature = "platform-io",
+        any(unix, windows),
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    )) {
         PLATFORM_IO_DRIVER
     } else {
         0
@@ -263,7 +267,11 @@ const fn platform_io_driver_flag() -> u8 {
 }
 
 const fn platform_async_io_flag() -> u8 {
-    if cfg!(all(feature = "platform-io", any(unix, windows))) {
+    if cfg!(all(
+        feature = "platform-io",
+        any(unix, windows),
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    )) {
         PLATFORM_ASYNC_IO
     } else {
         0

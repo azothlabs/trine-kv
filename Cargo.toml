@@ -81,6 +81,9 @@ opfs = "0.2.0"
 wasm-bindgen = "0.2.122"
 wasm-bindgen-futures = "0.4.72"
 
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
+wasm-bindgen-test = "0.3.55"
+
 [target.'cfg(any(unix, windows))'.dependencies]
 # Cross-platform advisory file locks for native writer leases. The lock is bound
 # to the open LOCK file handle so crash recovery is handled by the OS.

@@ -18,11 +18,11 @@ use super::{
 
 pub(super) fn validate_options(options: &DbOptions) -> Result<()> {
     if let StorageMode::HostPersistent {
-        backend: HostStorageBackend::Browser,
+        backend: HostStorageBackend::Browser { .. },
     } = &options.storage_mode
     {
         return Err(Error::unsupported_backend(
-            HostStorageBackend::Browser.as_str(),
+            "browser persistent storage backend",
         ));
     }
     validate_common_options(options)

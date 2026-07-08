@@ -291,7 +291,7 @@ impl Db {
                 .write()
                 .map_err(|_| lock_poisoned("bucket registry"))?
                 .remove(name.as_str());
-            let db_path = std::path::Path::new("");
+            let db_path = self.browser_db_path()?;
             self.retire_obsolete_table_files_browser_async(db_path, tables)
                 .await?;
             self.cleanup_pending_obsolete_blob_files_browser_async(db_path)

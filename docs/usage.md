@@ -241,7 +241,7 @@ Browser persistence is async-only on `wasm32-unknown-unknown`. Use `Db::open`
 and the async mutation and maintenance APIs:
 
 ```rust
-let db = Db::open(DbOptions::browser_persistent()).await?;
+let db = Db::open(DbOptions::browser_persistent_at("my-app")).await?;
 db.put(b"user:001".to_vec(), b"Ada".to_vec()).await?;
 db.flush().await?;
 ```
@@ -259,10 +259,16 @@ unsupported errors. On non-browser targets, browser persistent async open return
 `UnsupportedBackend`. Browser persistent options default to `Flush`, the
 strongest currently accepted mode for that backend.
 
+`browser_persistent()` uses the default namespace in the current origin's
+private storage root. Prefer `browser_persistent_at(path)` for applications,
+tests, tenants, or components that need isolated WAL, manifest, table, and blob
+files. Browser paths are UTF-8 namespace paths scoped inside the origin-private
+root; parent-directory components and platform prefixes are rejected at open.
+
 Read-only browser open is also async:
 
 ```rust
-let db = Db::open(DbOptions::browser_persistent_read_only()).await?;
+let db = Db::open(DbOptions::browser_persistent_read_only_at("my-app")).await?;
 ```
 
 `Db`, `Bucket`, and `Snapshot` are cheap handles. `Db` writes to the built-in

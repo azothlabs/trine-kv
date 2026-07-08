@@ -1,6 +1,7 @@
 use super::*;
 #[cfg(target_os = "wasi")]
 use crate::{FailOnCorruptionPolicy, WriteOptions, recovery, table};
+use crate::{HostStorageBackend, StorageMode};
 
 #[test]
 fn maintenance_success_does_not_clear_unreported_error() {
@@ -400,6 +401,27 @@ fn browser_persistent_read_only_options_disable_creation() {
     assert!(!options.create_if_missing);
     assert_eq!(options.runtime.mode, crate::runtime::RuntimeMode::Inline);
     assert_eq!(options.background_worker_count, 0);
+}
+
+#[test]
+fn browser_persistent_at_records_namespace_path() {
+    let options = DbOptions::browser_persistent_at("app-a");
+    match &options.storage_mode {
+        StorageMode::HostPersistent {
+            backend: HostStorageBackend::Browser { path },
+        } => assert_eq!(path, std::path::Path::new("app-a")),
+        other => panic!("unexpected browser storage mode: {other:?}"),
+    }
+
+    let read_only = DbOptions::browser_persistent_read_only_at("app-a");
+    assert!(read_only.read_only);
+    assert!(!read_only.create_if_missing);
+    match &read_only.storage_mode {
+        StorageMode::HostPersistent {
+            backend: HostStorageBackend::Browser { path },
+        } => assert_eq!(path, std::path::Path::new("app-a")),
+        other => panic!("unexpected browser storage mode: {other:?}"),
+    }
 }
 
 #[test]

@@ -423,6 +423,7 @@ impl NativeFileWriterLease {
     }
 
     #[cfg(feature = "platform-io")]
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
     pub(in crate::storage) fn from_locked_file(
         object: StorageObjectId,
         owner: String,

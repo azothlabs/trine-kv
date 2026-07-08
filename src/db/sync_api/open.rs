@@ -28,9 +28,6 @@ use crate::{
     },
     wal::BrowserWalFrontDoor,
 };
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-use std::path::Path;
-
 #[derive(Debug)]
 struct DbInnerParts {
     options: DbOptions,
@@ -291,9 +288,9 @@ impl Db {
                 backend: HostStorageBackend::Wasi { .. },
             } => Self::open_wasi_persistent_with_options(options),
             StorageMode::HostPersistent {
-                backend: HostStorageBackend::Browser,
+                backend: HostStorageBackend::Browser { .. },
             } => Err(Error::unsupported_backend(
-                HostStorageBackend::Browser.as_str(),
+                "browser persistent storage backend",
             )),
             StorageMode::HostPersistent {
                 backend: HostStorageBackend::ObjectStore,
@@ -413,7 +410,7 @@ impl Db {
         {
             drop(options);
             Err(Error::unsupported_backend(
-                HostStorageBackend::Browser.as_str(),
+                "browser persistent storage backend",
             ))
         }
     }
@@ -425,7 +422,10 @@ impl Db {
     ) -> Result<Self> {
         Self::validate_browser_persistent_options(&options)?;
         let storage = BrowserStorageBackend::new().await?;
-        let db_path = Path::new("");
+        let db_path = options
+            .storage_mode
+            .browser_path()
+            .ok_or_else(|| Error::invalid_options("browser persistent open requires a path"))?;
         let manifest_path = manifest::manifest_path(db_path);
         let writer_lease = if options.read_only {
             None
@@ -745,7 +745,7 @@ impl Db {
         if !matches!(
             options.storage_mode,
             StorageMode::HostPersistent {
-                backend: HostStorageBackend::Browser
+                backend: HostStorageBackend::Browser { .. }
             }
         ) {
             return Err(Error::invalid_options(

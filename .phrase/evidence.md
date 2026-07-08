@@ -15477,3 +15477,62 @@ Negative check:
   runs concurrent async writes, closes/reopens, and verifies every acknowledged
   key survives recovery. The current browser gate still proves compile/lint
   behavior, not real OPFS/Web Locks behavior.
+
+## 2026-07-08: Browser WASM persistence hardening and runtime gate
+
+### Observation
+
+- Browser `wasm32-unknown-unknown` default check/lint passed, but
+  `--features platform-io` and `--features platform-io-native` still compiled
+  native platform-io writer-lease paths and failed on missing native-only file
+  lock symbols.
+- Runtime capability detection used the native `unix/windows` shorthand, which
+  was too broad for browser WASM. Browser WASM must compile the feature shape
+  without reporting platform-io driver or async-file capabilities.
+- Browser persistence used one implicit root namespace, so independent browser
+  databases could not select separate WAL, manifest, table, and blob paths.
+- Browser OPFS/Web Locks behavior had no runtime test gate; existing checks
+  only proved browser target compile/lint.
+
+### Interpretation
+
+- Platform-io native/thread-pool paths must be excluded from browser WASM even
+  when a broad target-family cfg matches. Unsupported operation rows are the
+  honest browser feature shape until a browser-specific platform backend exists.
+- Browser persistence needs explicit namespace options so callers can isolate
+  databases inside the same origin-private storage root.
+- The browser runtime gate should exercise Trine-visible behavior: unflushed
+  WAL recovery after close/reopen, namespace isolation, and Web Locks writer
+  lease rejection for a second writer.
+
+### Verification
+
+- Checks passed: `cargo check -q`,
+  `cargo check -q --target wasm32-unknown-unknown --lib`,
+  `cargo check -q --target wasm32-wasip1 --lib`,
+  `cargo check -q --all-features`,
+  `cargo check -q --target wasm32-unknown-unknown --no-default-features --features platform-io --lib`,
+  `cargo check -q --target wasm32-unknown-unknown --no-default-features --features platform-io-native --lib`,
+  `cargo clippy -q --target wasm32-unknown-unknown --lib -- -D warnings`,
+  `cargo clippy -q --target wasm32-unknown-unknown --no-default-features --features platform-io --lib -- -D warnings`,
+  `cargo clippy -q --target wasm32-unknown-unknown --no-default-features --features platform-io-native --lib -- -D warnings`,
+  `cargo clippy -q --target wasm32-unknown-unknown --test browser_persistent_wasm -- -D warnings`,
+  `cargo test -q --target wasm32-unknown-unknown --test browser_persistent_wasm --no-run`,
+  `CARGO_TARGET_WASM32_WASIP1_RUNNER="wasmtime run --dir ." cargo test -q --target wasm32-wasip1 --lib wasi_persistent`,
+  `cargo test -q browser_persistent`, `cargo test -q --all-targets --all-features`,
+  `cargo clippy -q --all-targets --all-features -- -D warnings`,
+  `cargo test -q --doc --all-features`,
+  `cargo rustdoc --all-features -- -D warnings`, `cargo fmt --check`, and
+  `git diff --check`.
+- Local browser execution could not complete because this machine has no
+  Chrome/Chromedriver and its Safari WebDriver process was killed by the host.
+  CI and publish workflows now install Chrome, ChromeDriver, and
+  `wasm-bindgen-test-runner`, then run
+  `cargo test --target wasm32-unknown-unknown --test browser_persistent_wasm`
+  with WebDriver env.
+
+### Recommended Next Action
+
+- Treat browser persistence as covered by a real CI browser gate once the
+  updated workflow runs green. Keep local development verification on wasm
+  compile/lint/no-run unless a local WebDriver is available.

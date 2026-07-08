@@ -27,8 +27,12 @@ pub enum HostStorageBackend {
         /// WASI preopened filesystem path.
         path: PathBuf,
     },
-    /// Use browser storage.
-    Browser,
+    /// Use browser storage under this path inside the origin-private storage
+    /// root.
+    Browser {
+        /// Browser storage namespace path.
+        path: PathBuf,
+    },
     /// Use object storage (S3 and compatible). The object-store client is
     /// supplied at open time, not encoded here. Async-only.
     ObjectStore,
@@ -38,7 +42,7 @@ impl HostStorageBackend {
     pub(crate) const fn as_str(&self) -> &'static str {
         match self {
             Self::Wasi { .. } => "WASI persistent storage backend",
-            Self::Browser => "browser persistent storage backend",
+            Self::Browser { .. } => "browser persistent storage backend",
             Self::ObjectStore => "object-store persistent storage backend",
         }
     }
@@ -53,7 +57,24 @@ impl StorageMode {
             } => Some(path.as_path()),
             Self::InMemory
             | Self::HostPersistent {
-                backend: HostStorageBackend::Browser | HostStorageBackend::ObjectStore,
+                backend: HostStorageBackend::Browser { .. } | HostStorageBackend::ObjectStore,
+            } => None,
+        }
+    }
+
+    #[cfg_attr(
+        not(all(target_arch = "wasm32", target_os = "unknown")),
+        allow(dead_code)
+    )]
+    pub(crate) fn browser_path(&self) -> Option<&Path> {
+        match self {
+            Self::HostPersistent {
+                backend: HostStorageBackend::Browser { path },
+            } => Some(path.as_path()),
+            Self::InMemory
+            | Self::Persistent { .. }
+            | Self::HostPersistent {
+                backend: HostStorageBackend::Wasi { .. } | HostStorageBackend::ObjectStore,
             } => None,
         }
     }
@@ -71,7 +92,7 @@ impl StorageMode {
         matches!(
             self,
             Self::HostPersistent {
-                backend: HostStorageBackend::Browser
+                backend: HostStorageBackend::Browser { .. }
             }
         )
     }
@@ -405,12 +426,35 @@ impl DbOptions {
         Self::wasi_persistent(path).read_only()
     }
 
-    /// Creates browser persistent options.
+    /// Creates browser persistent options for the default namespace.
+    ///
+    /// This is a convenience wrapper around [`Self::browser_persistent_at`]
+    /// with an empty namespace path. It is suitable for applications that need
+    /// only one Trine database in the current browser origin. Use
+    /// [`Self::browser_persistent_at`] when tests, tenants, or application
+    /// components need isolated WAL, manifest, table, and blob files.
     #[must_use]
     pub fn browser_persistent() -> Self {
+        Self::browser_persistent_at("")
+    }
+
+    /// Creates browser persistent options for a namespace path.
+    ///
+    /// Browser persistent databases store files under the current origin's
+    /// private storage root. The `path` parameter selects a namespace inside
+    /// that root, so independent applications or tests can use separate
+    /// databases without sharing WAL, manifest, table, or blob files. Empty
+    /// paths select the default namespace used by [`Self::browser_persistent`].
+    ///
+    /// The path must use normal UTF-8 path components. Parent-directory
+    /// components and platform prefixes are rejected when the browser backend
+    /// opens because browser storage is intentionally scoped to the origin's
+    /// private root.
+    #[must_use]
+    pub fn browser_persistent_at(path: impl Into<PathBuf>) -> Self {
         Self {
             storage_mode: StorageMode::HostPersistent {
-                backend: HostStorageBackend::Browser,
+                backend: HostStorageBackend::Browser { path: path.into() },
             },
             background_worker_count: 0,
             durability: DurabilityMode::Flush,
@@ -435,10 +479,29 @@ impl DbOptions {
         }
     }
 
-    /// Creates read-only browser persistent options.
+    /// Creates read-only browser persistent options for the default namespace.
+    ///
+    /// This opens the same namespace selected by [`Self::browser_persistent`]
+    /// without acquiring the writer lease or creating missing storage. Use
+    /// [`Self::browser_persistent_read_only_at`] to read a named browser
+    /// namespace.
     #[must_use]
     pub fn browser_persistent_read_only() -> Self {
         Self::browser_persistent().read_only()
+    }
+
+    /// Creates read-only browser persistent options for a namespace path.
+    ///
+    /// The `path` parameter has the same meaning and validation rules as
+    /// [`Self::browser_persistent_at`]. The returned options set
+    /// `read_only = true` and `create_if_missing = false`, so opening succeeds
+    /// only when the named browser namespace already contains a valid Trine
+    /// database. A read-only browser handle can serve reads, while write,
+    /// bucket creation, flush, and compaction APIs return typed read-only or
+    /// unsupported errors.
+    #[must_use]
+    pub fn browser_persistent_read_only_at(path: impl Into<PathBuf>) -> Self {
+        Self::browser_persistent_at(path).read_only()
     }
 
     /// Creates read-only native-filesystem options for `path`.
@@ -990,7 +1053,9 @@ mod tests {
 
     fn browser_persistent() -> StorageMode {
         StorageMode::HostPersistent {
-            backend: HostStorageBackend::Browser,
+            backend: HostStorageBackend::Browser {
+                path: PathBuf::from("/trine-browser-wal-policy-test"),
+            },
         }
     }
 
