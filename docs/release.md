@@ -46,6 +46,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 cargo check --target wasm32-unknown-unknown --lib
 cargo check --target wasm32-wasip1 --lib
+CARGO_TARGET_WASM32_WASIP1_RUNNER="wasmtime run --dir ." cargo test --target wasm32-wasip1 --lib wasi_persistent
 cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings
 cargo run --example quickstart
 cargo run --example sync_quickstart
@@ -77,6 +78,7 @@ The package list should not include `.github/`, `.phrase/`, `.rust-skills/`,
 - `cargo test --all-targets --all-features`
 - `cargo check --target wasm32-unknown-unknown --lib`
 - `cargo check --target wasm32-wasip1 --lib`
+- `cargo test --target wasm32-wasip1 --lib wasi_persistent` under `wasmtime run --dir .`
 - `cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings`
 - `cargo run --example quickstart`
 - `cargo run --example sync_quickstart`

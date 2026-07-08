@@ -131,6 +131,29 @@ pub(crate) fn write_table_with_backend(
     point_records: &[(InternalKey, Option<ValueRef>)],
     range_tombstones: &[TableRangeTombstone],
 ) -> Result<Table> {
+    write_table_with_backend_with_durability(
+        backend,
+        path,
+        table_id,
+        level,
+        options,
+        point_records,
+        range_tombstones,
+        DurabilityMode::SyncAll,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_table_with_backend_with_durability(
+    backend: &NativeFileBackend,
+    path: &Path,
+    table_id: TableId,
+    level: TableLevel,
+    options: &TableWriteOptions,
+    point_records: &[(InternalKey, Option<ValueRef>)],
+    range_tombstones: &[TableRangeTombstone],
+    durability: DurabilityMode,
+) -> Result<Table> {
     if point_records.is_empty() && range_tombstones.is_empty() {
         return Err(Error::invalid_options("cannot write an empty table"));
     }
@@ -150,13 +173,14 @@ pub(crate) fn write_table_with_backend(
     } else {
         point_records
     };
-    let point_records = crate::blob::write_large_values_with_backend(
+    let point_records = crate::blob::write_large_values_with_backend_with_durability(
         backend,
         db_path,
         table_id.get(),
         effective_blob_threshold_bytes(options.blob_threshold_bytes),
         CodecId::None,
         &point_records,
+        durability,
     )?
     .into_iter()
     .map(|(internal_key, value)| TablePointRecord {
@@ -219,7 +243,7 @@ pub(crate) fn write_table_with_backend(
     backend.write_object_blocking(
         object.clone(),
         Arc::from(bytes.into_boxed_slice()),
-        DurabilityMode::SyncAll,
+        durability,
     )?;
     backend
         .capabilities()

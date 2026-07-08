@@ -1,12 +1,13 @@
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use super::remove_storage_files_async;
 use super::{
     Arc, BTreeSet, BlobGcCandidate, BlobGcRewritePlan, BlobGcRewriteRecord, BlobGcRewriteTable, Db,
-    DurabilityMode, Error, LsmCompactionOutput, NamedCompactionOutput, Ordering, Path, Result,
-    ValueRef, apply_blob_gc_indexes, blob, blob_gc_blob_records, blob_gc_table_write_options,
-    lock_poisoned, remove_storage_files, sync_storage_directory_after_renames, table,
-    write_blob_gc_replacement_tables,
+    Error, LsmCompactionOutput, NamedCompactionOutput, Ordering, Path, Result, ValueRef,
+    apply_blob_gc_indexes, blob, blob_gc_blob_records, blob_gc_table_write_options, lock_poisoned,
+    remove_storage_files, table, write_blob_gc_replacement_tables,
 };
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-use super::{remove_storage_files_async, sync_storage_directory_after_renames_async};
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use crate::DurabilityMode;
 
 impl Db {
     pub(in crate::db) fn run_blob_gc_once_locked(&self, db_path: &Path) -> Result<()> {
@@ -76,9 +77,7 @@ impl Db {
                 }
             };
 
-        if let Err(error) =
-            sync_storage_directory_after_renames(&self.inner.native_storage, db_path)
-        {
+        if let Err(error) = self.sync_filesystem_directory_after_renames(db_path) {
             let _ = remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
             return Err(error);
         }
@@ -146,7 +145,7 @@ impl Db {
             plan.new_blob_file_id,
             header,
             &blob_records,
-            DurabilityMode::SyncAll,
+            self.filesystem_publish_durability(),
         )
         .await
         {
@@ -176,7 +175,10 @@ impl Db {
             }
         };
 
-        if let Err(error) = sync_storage_directory_after_renames_async(&storage, db_path).await {
+        if let Err(error) = self
+            .sync_filesystem_directory_after_renames_async(db_path)
+            .await
+        {
             let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
             return Err(error);
         }
@@ -766,7 +768,7 @@ impl Db {
                     &rewrite_table.options,
                     &point_records,
                     &rewrite_table.range_tombstones,
-                    DurabilityMode::SyncAll,
+                    self.filesystem_publish_durability(),
                 )
                 .await?,
             );

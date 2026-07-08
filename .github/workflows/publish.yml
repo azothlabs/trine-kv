@@ -66,6 +66,14 @@ jobs:
           cargo check --target wasm32-unknown-unknown --lib
           cargo check --target wasm32-wasip1 --lib
 
+      - name: Install Wasmtime
+        uses: bytecodealliance/actions/wasmtime/setup@v1
+
+      - name: Test WASI persistence target
+        run: cargo test --target wasm32-wasip1 --lib wasi_persistent
+        env:
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime run --dir .
+
       - name: Lint browser target
         run: cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings
 

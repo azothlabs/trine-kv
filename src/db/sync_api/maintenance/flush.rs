@@ -1,13 +1,12 @@
 use super::{
-    Arc, BatchOperation, BucketOptions, Db, DurabilityMode, Error, KeyRange, LsmTree,
-    MaintenanceBudget, MaintenanceOutcome, NamedFlushInput, Path, Result, Sequence, Table,
-    WritePressure, lock_poisoned, remove_storage_files, sync_storage_directory_after_renames,
-    table, usize_to_u64_saturating,
+    Arc, BatchOperation, BucketOptions, Db, Error, KeyRange, LsmTree, MaintenanceBudget,
+    MaintenanceOutcome, NamedFlushInput, Path, Result, Sequence, Table, WritePressure,
+    lock_poisoned, remove_storage_files, table, usize_to_u64_saturating,
 };
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-use super::{
-    NamedCompactionOutput, remove_storage_files_async, sync_storage_directory_after_renames_async,
-};
+use super::{NamedCompactionOutput, remove_storage_files_async};
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use crate::DurabilityMode;
 
 impl Db {
     pub(in crate::db) fn bucket_state(&self, bucket: &str) -> Result<Arc<LsmTree>> {
@@ -355,7 +354,7 @@ impl Db {
         for input in flush_inputs {
             let table_path = table::table_path(db_path, input.input.table_id);
             written_table_ids.push(input.input.table_id);
-            let table = match table::write_table_with_backend(
+            let table = match table::write_table_with_backend_with_durability(
                 &self.inner.native_storage,
                 &table_path,
                 input.input.table_id,
@@ -363,6 +362,7 @@ impl Db {
                 &input.input.table_options,
                 &input.input.point_records,
                 &input.input.range_tombstones,
+                self.filesystem_publish_durability(),
             ) {
                 Ok(table) => table,
                 Err(error) => {
@@ -377,9 +377,7 @@ impl Db {
             written_tables.push((input.bucket.clone(), Arc::new(table)));
         }
 
-        if let Err(error) =
-            sync_storage_directory_after_renames(&self.inner.native_storage, db_path)
-        {
+        if let Err(error) = self.sync_filesystem_directory_after_renames(db_path) {
             let _ = remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
             return Err(error);
         }
@@ -465,7 +463,7 @@ impl Db {
                 &input.input.table_options,
                 &input.input.point_records,
                 &input.input.range_tombstones,
-                DurabilityMode::SyncAll,
+                self.filesystem_publish_durability(),
             )
             .await
             {
@@ -478,7 +476,10 @@ impl Db {
             written_tables.push((input.bucket.clone(), Arc::new(table)));
         }
 
-        if let Err(error) = sync_storage_directory_after_renames_async(&storage, db_path).await {
+        if let Err(error) = self
+            .sync_filesystem_directory_after_renames_async(db_path)
+            .await
+        {
             let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
             return Err(error);
         }

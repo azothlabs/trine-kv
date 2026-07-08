@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(target_os = "wasi")]
+use crate::WriteOptions;
 
 #[test]
 fn maintenance_success_does_not_clear_unreported_error() {
@@ -250,7 +252,46 @@ fn wasi_persistent_backend_uses_host_filesystem() {
     );
     drop(db);
 
-    fs::remove_dir_all(path).expect("cleanup WASI test db");
+    cleanup_wasi_temp_db_path(path);
+}
+
+#[cfg(target_os = "wasi")]
+#[test]
+fn wasi_persistent_writable_reopen_releases_lock_file() {
+    let path = temp_db_path("wasi-persistent-writable-reopen");
+    let db = Db::open_sync(DbOptions::wasi_persistent(&path)).expect("WASI db opens");
+    db.put_sync(b"key", b"value").expect("WASI write succeeds");
+    drop(db);
+
+    let db = Db::open_sync(DbOptions::wasi_persistent(&path))
+        .expect("WASI writable reopen should not see a stale lock");
+    assert_eq!(
+        db.get_sync(b"key").expect("WASI read succeeds"),
+        Some(b"value".to_vec())
+    );
+    drop(db);
+
+    cleanup_wasi_temp_db_path(path);
+}
+
+#[cfg(target_os = "wasi")]
+#[test]
+fn wasi_persistent_write_rejects_strict_sync_durability() {
+    let path = temp_db_path("wasi-persistent-strict-write");
+    let db = Db::open_sync(DbOptions::wasi_persistent(&path)).expect("WASI db opens");
+
+    let error = db
+        .put_with_options_sync(b"key", b"value", WriteOptions::sync_all_strict())
+        .expect_err("WASI write rejects strict sync durability");
+    assert!(matches!(
+        error,
+        Error::UnsupportedDurability {
+            requested: DurabilityMode::SyncAllStrict
+        }
+    ));
+    drop(db);
+
+    cleanup_wasi_temp_db_path(path);
 }
 
 #[cfg(target_os = "wasi")]
@@ -271,7 +312,7 @@ fn wasi_persistent_open_async_uses_host_filesystem() {
     );
     drop(db);
 
-    fs::remove_dir_all(path).expect("cleanup WASI async test db");
+    cleanup_wasi_temp_db_path(path);
 }
 
 #[test]
@@ -763,5 +804,24 @@ fn temp_db_path(name: &str) -> std::path::PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system clock is after UNIX epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("trine-kv-{name}-{}-{nonce}", std::process::id()))
+    #[cfg(target_os = "wasi")]
+    let process_id = "wasi".to_owned();
+    #[cfg(not(target_os = "wasi"))]
+    let process_id = std::process::id().to_string();
+    let db_name = format!("trine-kv-{name}-{process_id}-{nonce}");
+
+    #[cfg(target_os = "wasi")]
+    {
+        std::path::PathBuf::from("target/wasi-test-data").join(db_name)
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    {
+        std::env::temp_dir().join(db_name)
+    }
+}
+
+#[cfg(target_os = "wasi")]
+fn cleanup_wasi_temp_db_path(path: std::path::PathBuf) {
+    let _ = fs::remove_dir_all(path);
 }

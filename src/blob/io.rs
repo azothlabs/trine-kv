@@ -157,6 +157,24 @@ pub(crate) fn write_blob_file_with_backend(
     header: BlobFileHeader,
     records: &[BlobRecord],
 ) -> Result<Vec<BlobIndex>> {
+    write_blob_file_with_backend_with_durability(
+        backend,
+        db_path,
+        file_id,
+        header,
+        records,
+        DurabilityMode::SyncAll,
+    )
+}
+
+pub(crate) fn write_blob_file_with_backend_with_durability(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+    file_id: u64,
+    header: BlobFileHeader,
+    records: &[BlobRecord],
+    durability: DurabilityMode,
+) -> Result<Vec<BlobIndex>> {
     if header.file_id != file_id {
         return Err(Error::invalid_options(
             "blob header file id must match the output file id",
@@ -170,7 +188,7 @@ pub(crate) fn write_blob_file_with_backend(
     backend.write_object_blocking(
         blob_storage_object(&path),
         Arc::from(blob_bytes.into_boxed_slice()),
-        DurabilityMode::SyncAll,
+        durability,
     )?;
     Ok(indexes)
 }

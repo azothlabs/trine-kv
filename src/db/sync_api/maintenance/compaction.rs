@@ -1,13 +1,14 @@
-use super::{
-    Arc, BlobLevelMergePolicy, CompactionReservation, Db, DurabilityMode, Error, KeyRange,
-    LsmCompactionOutput, MaintenanceBudget, MaintenanceOutcome, NamedCompactionInput,
-    NamedCompactionOutput, Path, PendingCompactionOutputs, Result, Sequence, compaction_options,
-    compaction_trigger_stat_deltas, is_level_layout_compaction_error, lock_poisoned,
-    remove_storage_files, should_rewrite_blob_indexes_for_compaction,
-    sync_storage_directory_after_renames, table,
-};
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-use super::{remove_storage_files_async, sync_storage_directory_after_renames_async};
+use super::remove_storage_files_async;
+use super::{
+    Arc, BlobLevelMergePolicy, CompactionReservation, Db, Error, KeyRange, LsmCompactionOutput,
+    MaintenanceBudget, MaintenanceOutcome, NamedCompactionInput, NamedCompactionOutput, Path,
+    PendingCompactionOutputs, Result, Sequence, compaction_options, compaction_trigger_stat_deltas,
+    is_level_layout_compaction_error, lock_poisoned, remove_storage_files,
+    should_rewrite_blob_indexes_for_compaction, table,
+};
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use crate::DurabilityMode;
 
 impl Db {
     pub(in crate::db) fn collect_compaction_inputs(
@@ -127,9 +128,7 @@ impl Db {
             self.obsolete_blob_ids_for_compaction(&compaction_inputs, &written_tables)?;
 
         if !written_table_ids.is_empty() {
-            if let Err(error) =
-                sync_storage_directory_after_renames(&self.inner.native_storage, db_path)
-            {
+            if let Err(error) = self.sync_filesystem_directory_after_renames(db_path) {
                 let _ =
                     remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
                 return Err(error);
@@ -272,7 +271,9 @@ impl Db {
 
         let storage = self.inner.native_storage.clone();
         if !written_table_ids.is_empty() {
-            if let Err(error) = sync_storage_directory_after_renames_async(&storage, db_path).await
+            if let Err(error) = self
+                .sync_filesystem_directory_after_renames_async(db_path)
+                .await
             {
                 let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
                 return Err(error);
@@ -614,7 +615,7 @@ impl Db {
                     &table_options,
                     &payload.point_records,
                     &payload.range_tombstones,
-                    DurabilityMode::SyncAll,
+                    self.filesystem_publish_durability(),
                 )
                 .await
                 {

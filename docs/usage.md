@@ -230,12 +230,12 @@ let wasi = Db::open(DbOptions::wasi_persistent("./trine-data")).await?;
 let wasi_sync = Db::open_sync(DbOptions::wasi_persistent("./trine-data"))?;
 ```
 
-Strict sync durability is not claimed for WASI yet; `SyncData` and `SyncAll`
-return `UnsupportedDurability`. On non-WASI targets, the same option returns
-`UnsupportedBackend`. Current WASI file work completes inline through the host
-filesystem boundary, so it does not report `PlatformAsyncIo`. WASI persistent
-options default to `Flush`, the strongest currently accepted mode for that
-backend.
+Strict sync durability is not claimed for WASI yet; `SyncData`, `SyncAll`, and
+`SyncAllStrict` return `UnsupportedDurability`. On non-WASI targets, the same
+option returns `UnsupportedBackend`. Current WASI file work completes inline
+through the host filesystem boundary, so it does not report `PlatformAsyncIo`.
+WASI persistent options default to `Flush`, the strongest currently accepted
+mode for that backend.
 
 Browser persistence is async-only on `wasm32-unknown-unknown`. Use `Db::open`
 and the async mutation and maintenance APIs:

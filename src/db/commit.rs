@@ -582,7 +582,7 @@ impl Db {
             || self.inner.options.storage_mode.is_browser_persistent())
             && matches!(
                 durability,
-                DurabilityMode::SyncData | DurabilityMode::SyncAll
+                DurabilityMode::SyncData | DurabilityMode::SyncAll | DurabilityMode::SyncAllStrict
             )
         {
             return Err(Error::unsupported_durability(durability));

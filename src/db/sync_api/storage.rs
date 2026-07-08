@@ -5,10 +5,11 @@ use super::{
     Path, PendingCompactionOutputs, Result, Sequence, StorageMode, StorageObjectDeleteBackend,
     StorageObjectId, StorageObjectKind, Table, blob, compaction_trigger_stat_deltas,
     is_level_layout_compaction_error, lock_poisoned, referenced_blob_file_ids_from_manifest,
-    referenced_table_file_ids, should_rewrite_blob_indexes_for_compaction, table,
+    referenced_table_file_ids, should_rewrite_blob_indexes_for_compaction,
+    sync_storage_directory_after_renames, table,
 };
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-use super::{Ordering, shutdown_background_workers};
+use super::{Ordering, shutdown_background_workers, sync_storage_directory_after_renames_async};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::{ReadVersion, storage::BrowserStorageBackend};
 
@@ -144,6 +145,37 @@ impl Db {
         }
         self.run_flush_once_with_budget_object_store_async(db_path, budget)
             .await
+    }
+
+    pub(in crate::db) fn filesystem_publish_durability(&self) -> DurabilityMode {
+        if self.inner.options.storage_mode.is_wasi_persistent() {
+            DurabilityMode::Flush
+        } else {
+            DurabilityMode::SyncAll
+        }
+    }
+
+    pub(in crate::db) fn sync_filesystem_directory_after_renames(
+        &self,
+        db_path: &Path,
+    ) -> Result<()> {
+        if self.inner.options.storage_mode.is_wasi_persistent() {
+            Ok(())
+        } else {
+            sync_storage_directory_after_renames(&self.inner.native_storage, db_path)
+        }
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    pub(in crate::db) async fn sync_filesystem_directory_after_renames_async(
+        &self,
+        db_path: &Path,
+    ) -> Result<()> {
+        if self.inner.options.storage_mode.is_wasi_persistent() {
+            Ok(())
+        } else {
+            sync_storage_directory_after_renames_async(&self.inner.native_storage, db_path).await
+        }
     }
 
     pub(in crate::db) async fn run_flush_once_with_budget_object_store_async(

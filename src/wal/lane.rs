@@ -317,8 +317,9 @@ pub(super) fn rewrite_wal_lane_after_replay_floor(
     persisted_level: &mut Option<DurabilityMode>,
     replay_floor: Sequence,
 ) -> Result<()> {
+    let rewrite_durability = filesystem_wal_rewrite_durability();
     if writer.is_some() {
-        persist_wal_lane(writer, persisted_level, DurabilityMode::SyncAll)?;
+        persist_wal_lane(writer, persisted_level, rewrite_durability)?;
     } else if wait_for_wal_storage_future(read_wal_object_with_backend_async(backend, path))?
         .is_none()
     {
@@ -336,9 +337,21 @@ pub(super) fn rewrite_wal_lane_after_replay_floor(
     }
     if let Some(writer) = writer.as_mut() {
         writer.reopen_append_with_backend(backend, path)?;
-        *persisted_level = Some(DurabilityMode::SyncAll);
+        *persisted_level = Some(rewrite_durability);
     }
     Ok(())
+}
+
+const fn filesystem_wal_rewrite_durability() -> DurabilityMode {
+    #[cfg(target_os = "wasi")]
+    {
+        DurabilityMode::Flush
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    {
+        DurabilityMode::SyncAll
+    }
 }
 
 #[cfg(not(target_os = "wasi"))]

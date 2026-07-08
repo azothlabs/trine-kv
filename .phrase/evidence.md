@@ -15321,3 +15321,38 @@ Negative check:
 
 - Use these CI clippy commands as the gate for future refactors that add Rust
   modules, especially when replacing wildcard imports with explicit imports.
+
+## 2026-07-08: WASI persistence runtime gate hardening
+
+### Observation
+
+- Running `wasmtime` against `wasm32-wasip1` persistence tests exposed runtime
+  failures that target-only `cargo check` missed: WASI test helpers could not
+  use `std::env::temp_dir()` or `std::process::id()`, `flush_sync()` reached
+  unsupported `SyncAll` paths, and directory sync was still required after
+  rename publish.
+- Commit-time durability validation for WASI/browser rejected `SyncData` and
+  `SyncAll` but did not pre-reject `SyncAllStrict`, while the open-time
+  validation and durability docs already rejected all three device-sync modes.
+
+### Interpretation
+
+- WASI persistence needs a runtime gate, not only target compilation, because
+  host filesystem behavior and std API availability differ at execution time.
+- The correct WASI boundary is still `Flush`: table/blob publish, WAL rewrite,
+  and post-rename directory handling must not request stronger filesystem
+  durability than the backend advertises.
+
+### Verification
+
+- Checks passed: `cargo fmt --check`, `cargo test -q maintenance`,
+  `cargo clippy -q --lib -- -D warnings`,
+  `cargo check -q --target wasm32-wasip1 --lib`,
+  `cargo clippy -q --target wasm32-unknown-unknown --lib -- -D warnings`,
+  `CARGO_TARGET_WASM32_WASIP1_RUNNER="wasmtime run --dir ." cargo test -q --target wasm32-wasip1 --lib wasi_persistent`,
+  and `git diff --check`.
+
+### Recommended Next Action
+
+- Keep the CI/publish WASI runtime gate targeted to `wasi_persistent` until the
+  rest of the lib test suite is audited for WASI runtime assumptions.

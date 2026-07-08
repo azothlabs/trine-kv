@@ -5,7 +5,8 @@ use super::{
     checksum, open_blob_read_object_with_backend, open_blob_read_object_with_backend_async,
     read_blob_exact_at, read_blob_exact_at_async, read_indexed_blob_record,
     read_indexed_value_with_backend, read_indexed_value_with_backend_async, usize_to_u64,
-    validate_indexed_blob_header, write_blob_file_with_backend, write_blob_file_with_backend_async,
+    validate_indexed_blob_header, write_blob_file_with_backend_async,
+    write_blob_file_with_backend_with_durability,
 };
 
 #[allow(dead_code)]
@@ -27,6 +28,26 @@ pub(crate) fn write_large_values_with_backend(
     threshold: usize,
     compression: CodecId,
     records: &[(InternalKey, Option<ValueRef>)],
+) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
+    write_large_values_with_backend_with_durability(
+        backend,
+        db_path,
+        file_id,
+        threshold,
+        compression,
+        records,
+        DurabilityMode::SyncAll,
+    )
+}
+
+pub(crate) fn write_large_values_with_backend_with_durability(
+    backend: &NativeFileBackend,
+    db_path: &Path,
+    file_id: u64,
+    threshold: usize,
+    compression: CodecId,
+    records: &[(InternalKey, Option<ValueRef>)],
+    durability: DurabilityMode,
 ) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
     let needs_blob_file = records.iter().any(
         |(_, value)| matches!(value, Some(ValueRef::Inline(bytes)) if bytes.len() >= threshold),
@@ -55,7 +76,14 @@ pub(crate) fn write_large_values_with_backend(
         .unwrap_or(Sequence::ZERO);
     let threshold_bytes = usize_to_u64(threshold, "blob threshold")?;
     let header = BlobFileHeader::new(file_id, creation_sequence, threshold_bytes, compression);
-    let indexes = write_blob_file_with_backend(backend, db_path, file_id, header, &blob_records)?;
+    let indexes = write_blob_file_with_backend_with_durability(
+        backend,
+        db_path,
+        file_id,
+        header,
+        &blob_records,
+        durability,
+    )?;
     let mut index_iter = indexes.into_iter();
 
     let mut rewritten = Vec::with_capacity(records.len());
