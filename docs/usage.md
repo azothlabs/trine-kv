@@ -263,13 +263,18 @@ strongest currently accepted mode for that backend.
 private storage root. Prefer `browser_persistent_at(path)` for applications,
 tests, tenants, or components that need isolated WAL, manifest, table, and blob
 files. Browser paths are UTF-8 namespace paths scoped inside the origin-private
-root; parent-directory components and platform prefixes are rejected at open.
+root. They are normalized before storage access and writer-lock naming, so path
+aliases share one writer lease. Parent-directory components and platform
+prefixes are rejected at open.
 
 Read-only browser open is also async:
 
 ```rust
 let db = Db::open(DbOptions::browser_persistent_read_only_at("my-app")).await?;
 ```
+
+Read-only browser open does not create missing storage. If the namespace does
+not already contain a Trine manifest, open returns a not-found I/O error.
 
 `Db`, `Bucket`, and `Snapshot` are cheap handles. `Db` writes to the built-in
 default bucket. A named `Bucket` keeps its database open, so release bucket

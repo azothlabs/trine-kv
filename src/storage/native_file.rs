@@ -43,7 +43,7 @@ mod browser_persistent_storage {
     use std::{
         cell::RefCell,
         io,
-        path::{Component, Path},
+        path::{Component, Path, PathBuf},
         rc::Rc,
         sync::Arc,
     };
@@ -66,7 +66,7 @@ mod browser_persistent_storage {
         StorageObjectId, StorageObjectKind, StorageObjectListBackend, StorageObjectListRequest,
         StorageObjectReadBackend, StorageObjectWriteBackend, StorageReadBackend, StorageReadFuture,
         StorageReadObject, StorageWalRewriteBackend, StorageWriterLeaseBackend,
-        native_file_objects_from_paths, usize_to_u64,
+        ensure_whole_object_read_len, native_file_objects_from_paths, usize_to_u64,
     };
 
     #[derive(Debug, Clone)]
@@ -84,6 +84,15 @@ mod browser_persistent_storage {
 
         pub(crate) fn from_root(root: DirectoryHandle) -> Self {
             Self { root }
+        }
+
+        pub(crate) fn normalize_namespace_path(path: &Path) -> Result<PathBuf> {
+            let segments = opfs_path_segments(path)?;
+            let mut normalized = PathBuf::new();
+            for segment in segments {
+                normalized.push(segment);
+            }
+            Ok(normalized)
         }
 
         fn capabilities_for_browser() -> StorageCapabilities {
@@ -177,7 +186,10 @@ mod browser_persistent_storage {
             let Some(file) = self.file_handle(object.path(), false).await? else {
                 return Ok(None);
             };
+            let len = file.size().await.map_err(|error| map_opfs_error(&error))?;
+            ensure_whole_object_read_len(object, len)?;
             let bytes = file.read().await.map_err(|error| map_opfs_error(&error))?;
+            ensure_whole_object_read_len(object, bytes.len())?;
             Ok(Some(Arc::from(bytes)))
         }
 

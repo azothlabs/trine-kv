@@ -35,6 +35,16 @@ options; browser WAL/OPFS/Web Locks behavior has a dedicated browser integration
 test; and CI/publish workflows now install Chrome, ChromeDriver, and
 `wasm-bindgen-test-runner` before running that browser test.
 
+Follow-up browser WASM review found and fixed three gaps: browser namespace
+paths are now normalized before OPFS access and Web Locks naming, so path aliases
+share one writer lease; browser whole-object reads check object-kind byte limits
+before reading bytes from OPFS; and read-only browser open now fails with
+not-found when the namespace lacks a Trine manifest. The browser integration
+test now covers unflushed WAL reopen, flush reopen, manual compaction reopen,
+blob-backed reads, bucket create/drop, namespace isolation, writer-lease
+rejection, path-alias writer locking, missing read-only namespace failure, and
+oversized manifest rejection.
+
 ## Goal
 
 Reduce confirmed object-store write latency and allow deployments to place the
@@ -136,6 +146,11 @@ recoverable after process loss and writer takeover.
   WAL reopen, namespace isolation, and second-writer rejection. Met in CI
   workflow configuration; local no-run build and clippy pass, while this host
   lacks Chrome/Chromedriver for local WebDriver execution.
+- Browser OPFS/Web Locks behavior is covered beyond smoke paths: flush,
+  compaction, blob reads, bucket drop, namespace aliases, missing read-only
+  manifest, and oversized manifest preflight all have browser-target integration
+  coverage. Met in no-run/clippy local verification; real local run is blocked
+  by missing ChromeDriver and a host-killed Safari WebDriver.
 
 ## Verification
 

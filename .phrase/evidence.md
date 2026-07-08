@@ -15536,3 +15536,63 @@ Negative check:
 - Treat browser persistence as covered by a real CI browser gate once the
   updated workflow runs green. Keep local development verification on wasm
   compile/lint/no-run unless a local WebDriver is available.
+
+## 2026-07-08: Browser WASM persistence coverage completion
+
+### Observation
+
+- Browser namespace paths are now normalized during open before any OPFS object
+  access or Web Locks writer-lease request. The normalized path is written back
+  into `DbOptions`, so subsequent WAL, manifest, table, blob, and lock paths all
+  use the same namespace string.
+- Browser whole-object reads now check the object kind's byte limit using OPFS
+  file size before calling `read()`, and recheck the returned byte length.
+- Browser manifest open now returns a not-found I/O error when
+  `create_if_missing` is false and no manifest exists, so read-only namespace
+  typos no longer become empty databases.
+- The browser wasm integration test now covers: unflushed WAL recovery, flush
+  reopen, manual compaction reopen, blob-backed value readback, bucket
+  create/drop, namespace isolation, second-writer rejection, path-alias writer
+  lease rejection, missing read-only namespace failure, and oversized manifest
+  preflight rejection.
+
+### Interpretation
+
+- Browser persistence is no longer just a smoke gate. The test suite now covers
+  the user-visible storage lifecycle paths needed to trust OPFS/Web Locks
+  behavior after CI runs the browser target.
+- The remaining local limitation is environment, not a compile/test definition
+  gap: this machine lacks ChromeDriver, and Safari WebDriver was killed by the
+  host during the real browser run.
+
+### Verification
+
+- Checks passed: `cargo fmt --check`,
+  `cargo test -q browser_persistent`,
+  `cargo test -q wasm_host_backend`,
+  `cargo check -q --target wasm32-wasip1 --lib`,
+  `cargo check -q --target wasm32-unknown-unknown --no-default-features --features platform-io --lib`,
+  `cargo check -q --target wasm32-unknown-unknown --no-default-features --features platform-io-native --lib`,
+  `cargo test -q --target wasm32-unknown-unknown --test browser_persistent_wasm --no-run`,
+  `cargo clippy -q --target wasm32-unknown-unknown --test browser_persistent_wasm -- -D warnings`,
+  `cargo test -q --all-targets --all-features`,
+  `cargo clippy -q --all-targets --all-features -- -D warnings`, and
+  `git diff --check`.
+- Real local browser execution was attempted with
+  `CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner
+  WASM_BINDGEN_TEST_ONLY_WEB=1 cargo test --target wasm32-unknown-unknown
+  --test browser_persistent_wasm`. In sandbox it failed to spawn a local server;
+  outside the sandbox the runner selected Safari and the driver exited with
+  SIGKILL. `chromedriver` is not installed locally.
+
+### Remaining Blockers
+
+- Local real-browser execution still needs a working WebDriver installation.
+  The CI/publish workflow remains the authoritative real browser gate because
+  it installs Chrome, ChromeDriver, and the wasm-bindgen runner.
+
+### Recommended Next Action
+
+- Let CI run the expanded browser wasm integration gate. If it fails, triage the
+  failing browser path directly instead of treating the suite as optional smoke
+  coverage.

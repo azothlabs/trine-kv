@@ -91,7 +91,10 @@ impl ManifestStore {
                     .published_or_err()?;
                 state
             } else {
-                ManifestState::empty()
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("manifest {} not found", path.display()),
+                )));
             };
 
         Ok(Self {

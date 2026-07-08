@@ -577,6 +577,8 @@ Rules:
   `wasm32-unknown-unknown` for read-only persistent open;
 - browser persistent storage uses an OPFS-backed adapter behind Trine storage
   traits on `wasm32-unknown-unknown`;
+- browser namespace paths are normalized once during open and that normalized
+  path is used for OPFS object paths and Web Locks writer-lease names;
 - browser storage exposes WAL append, WAL rewrite, and writer lease operations
   through Trine storage traits;
 - writable browser persistent open uses `Db::open_async` only, acquires a
@@ -595,6 +597,11 @@ Rules:
   persistent open fails;
 - browser storage accepts `Buffered` and `Flush` durability and rejects
   `SyncData`, `SyncAll`, and `SyncAllStrict`;
+- browser read-only persistent open must fail when the selected namespace lacks
+  a Trine manifest; it must not silently present a missing namespace as an empty
+  database;
+- browser whole-object reads must check the object kind's maximum byte length
+  before reading the object bytes and check the returned byte length again;
 - browser WAL append is a Trine-owned operation boundary. Because OPFS does not
   provide a native append primitive through the current browser adapter, the
   browser WAL front door must serialize read/append/write-back work per WAL
