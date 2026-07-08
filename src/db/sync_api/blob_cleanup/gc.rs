@@ -40,12 +40,13 @@ impl Db {
             .iter()
             .map(|table| table.output_table_id)
             .collect::<Vec<_>>();
-        let indexes = match blob::write_blob_file_with_backend(
+        let indexes = match blob::write_blob_file_with_backend_with_durability(
             &self.inner.native_storage,
             db_path,
             plan.new_blob_file_id,
             header,
             &blob_records,
+            self.filesystem_publish_durability(),
         ) {
             Ok(indexes) => indexes,
             Err(error) => {
@@ -64,18 +65,19 @@ impl Db {
                 return Err(error);
             }
         };
-        let outputs =
-            match write_blob_gc_replacement_tables(&self.inner.native_storage, db_path, tables) {
-                Ok(outputs) => outputs,
-                Err(error) => {
-                    let _ = remove_storage_files(
-                        &self.inner.native_storage,
-                        db_path,
-                        &written_table_ids,
-                    );
-                    return Err(error);
-                }
-            };
+        let outputs = match write_blob_gc_replacement_tables(
+            &self.inner.native_storage,
+            db_path,
+            tables,
+            self.filesystem_publish_durability(),
+        ) {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                let _ =
+                    remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
+                return Err(error);
+            }
+        };
 
         if let Err(error) = self.sync_filesystem_directory_after_renames(db_path) {
             let _ = remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);

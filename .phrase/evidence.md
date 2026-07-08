@@ -15396,3 +15396,45 @@ Negative check:
 - Keep WASI persistence on the explicit-host-backend path with `Flush`
   durability only. If a future host can provide real writer leases and stronger
   sync, add it behind a separate capability check and targeted runtime tests.
+
+## 2026-07-08: WASI maintenance and WAL durability fixes
+
+### Observation
+
+- Sync compaction and sync blob GC still used default table/blob publish helpers
+  that request `SyncAll`, even when the database was opened through
+  `wasi_persistent`.
+- The WAL lane skipped persistence for `Flush`, so the default WASI write
+  durability acknowledged commits without calling the WAL writer persist path.
+- WASI safe-temporary-file repair treated `LOCK` as removable before acquiring a
+  writer lease, which could delete the lock file of an active writer.
+
+### Interpretation
+
+- All native-file table/blob publish paths reached by WASI must use the
+  database filesystem publish durability helper, which maps WASI to `Flush`.
+- `Flush` is a real WAL durability boundary for WASI/browser-style targets and
+  must request backend persistence for dirty WAL bytes.
+- `LOCK` is not a safe temporary file on WASI because the host cannot prove
+  whether it belongs to a terminated writer or an active writer; startup should
+  fail closed and leave operator cleanup outside automatic repair.
+
+### Verification
+
+- Checks passed: `cargo test -q wal_front_door_flush_persists_dirty_lane`,
+  `cargo test -q backend_repair_safe_temporary_files_writes_report`,
+  `cargo fmt --check`, `cargo check -q --all-targets`, `git diff --check`,
+  `cargo check -q --target wasm32-wasip1 --lib`,
+  `cargo check -q --target wasm32-unknown-unknown --lib`,
+  `CARGO_TARGET_WASM32_WASIP1_RUNNER="wasmtime run --dir ." cargo test -q --target wasm32-wasip1 --lib wasi_persistent`,
+  `cargo rustdoc --all-features -- -D warnings`,
+  `cargo test -q --doc --all-features`, `cargo test -q`, and
+  `cargo clippy -q --all-targets -- -D warnings`.
+- `cargo check -q --target wasm32-wasip1 --all-features` remains unsupported
+  because the `s3` feature enables tokio features that tokio rejects on wasm.
+
+### Recommended Next Action
+
+- Keep WASI CI on `cargo check --target wasm32-wasip1 --lib` plus the
+  wasmtime-backed `wasi_persistent` runtime test unless the feature matrix is
+  split so wasm targets do not enable `s3`.

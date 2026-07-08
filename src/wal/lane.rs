@@ -111,8 +111,8 @@ pub(super) fn process_wal_lane_batch(
     state: &mut WalLaneWorkerState,
     batch: Vec<WalLaneCommand>,
 ) {
-    // Appended-but-not-yet-synced waiters and the strongest durability any of
-    // them requested. They are completed together by the next fsync.
+    // Appended-but-not-yet-persisted waiters and the strongest durability any
+    // of them requested. They are completed together by the next persist.
     let mut pending: Vec<PendingWalAppend> = Vec::new();
     let mut pending_durability = DurabilityMode::Buffered;
 
@@ -124,7 +124,7 @@ pub(super) fn process_wal_lane_batch(
                 durability,
                 reply,
             } => {
-                // Append without syncing; the batch fsync below covers it.
+                // Append without persisting; the batch persist below covers it.
                 match append_wal_lane_frame(
                     backend,
                     path,
@@ -138,8 +138,9 @@ pub(super) fn process_wal_lane_batch(
                         {
                             pending_durability = durability;
                         }
-                        // Mark the lane dirty: these bytes are unsynced, so a
-                        // later persist (even in a separate batch) must fsync.
+                        // Mark the lane dirty: these bytes are not yet covered
+                        // by the requested storage boundary, so a later persist
+                        // must touch the backend.
                         state.persisted_level = Some(DurabilityMode::Buffered);
                         state.last_appended_sequence = Some(sequence);
                         pending.push(PendingWalAppend { sequence, reply });
@@ -181,11 +182,11 @@ pub(super) fn process_wal_lane_batch(
     let _ = flush_wal_lane_batch(backend, path, state, pending_durability, &mut pending);
 }
 
-/// Persist the buffered appends with a single fsync and complete their waiters.
+/// Persist the buffered appends with one backend request and complete waiters.
 ///
-/// When `pending` is non-empty there are freshly appended, unsynced bytes, so a
-/// sync at `durability` is forced; for a standalone persist with no new appends
-/// the existing `persisted_level` can satisfy it without a redundant fsync.
+/// When `pending` is non-empty there are freshly appended bytes, so a persist at
+/// `durability` is forced; for a standalone persist with no new appends the
+/// existing `persisted_level` can satisfy it without a redundant backend call.
 pub(super) fn flush_wal_lane_batch(
     backend: &NativeFileBackend,
     path: &Path,
@@ -221,11 +222,11 @@ pub(super) fn persist_wal_lane_batch(
     let Some(writer) = state.writer.as_mut() else {
         return Ok(());
     };
-    if !wal_durability_requires_sync(durability) {
+    if !wal_durability_requires_persist(durability) {
         return Ok(());
     }
-    // Freshly appended bytes are unsynced, so a sync is mandatory; a standalone
-    // persist can skip when the lane is already synced at this level.
+    // Freshly appended bytes are unpersisted, so a backend persist is mandatory;
+    // a standalone persist can skip when the lane is already covered.
     if has_new_appends || wal_lane_needs_persist(state.persisted_level, durability) {
         writer.persist(durability)?;
         state.persisted_level = Some(durability);
@@ -242,8 +243,8 @@ pub(super) fn persist_wal_lane_batch(
     Ok(())
 }
 
-pub(super) const fn wal_durability_requires_sync(durability: DurabilityMode) -> bool {
-    wal_durability_rank(durability) >= wal_durability_rank(DurabilityMode::SyncData)
+pub(super) const fn wal_durability_requires_persist(durability: DurabilityMode) -> bool {
+    wal_durability_rank(durability) >= wal_durability_rank(DurabilityMode::Flush)
 }
 
 /// `Error` is not `Clone`, so reproduce it for each fan-out waiter, preserving

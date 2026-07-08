@@ -217,10 +217,10 @@ pub enum FailOnCorruptionPolicy {
     ///
     /// This only covers files that Trine knows are safe to remove before the
     /// manifest is trusted: temporary publish files such as `MANIFEST.tmp`,
-    /// `table-*.tmp`, `blob-*.tmp`, and WAL rewrite temps. On WASI targets it
-    /// also covers a stale `LOCK` marker left by a terminated writer, because
-    /// WASI does not provide the native file-lock handle used on Unix and
-    /// Windows. It never repairs corrupt WAL, manifest, table, or blob contents.
+    /// `table-*.tmp`, `blob-*.tmp`, and WAL rewrite temps. It never removes
+    /// `LOCK`, because WASI cannot distinguish a terminated writer from an
+    /// active writer that still owns the create-new lock file. It never repairs
+    /// corrupt WAL, manifest, table, or blob contents.
     RepairSafeTemporaryFiles,
 }
 

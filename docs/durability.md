@@ -269,7 +269,7 @@ formal storage files, and safe temporary files.
 `FailOnCorruptionPolicy::RepairSafeTemporaryFiles` is intentionally narrow. It
 can delete known safe temporary files and writes a repair report. It does not
 repair WAL corruption, manifest corruption, table corruption, missing referenced
-files, unreferenced formal storage files, or blob corruption.
+files, unreferenced formal storage files, blob corruption, or `LOCK`.
 
 ## Locking And Read-Only Open
 

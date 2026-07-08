@@ -511,7 +511,7 @@ impl Db {
 
                 let table_path = table::table_path(db_path, table_id);
                 written_table_ids.push(table_id);
-                let table = match table::write_table_with_backend(
+                let table = match table::write_table_with_backend_with_durability(
                     &self.inner.native_storage,
                     &table_path,
                     table_id,
@@ -519,6 +519,7 @@ impl Db {
                     &table_options,
                     &payload.point_records,
                     &payload.range_tombstones,
+                    self.filesystem_publish_durability(),
                 ) {
                     Ok(table) => table,
                     Err(error) => {

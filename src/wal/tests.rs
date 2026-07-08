@@ -199,6 +199,32 @@ fn wal_front_door_persists_only_dirty_shards() {
 }
 
 #[test]
+fn wal_front_door_flush_persists_dirty_lane() {
+    let dir = temp_dir("front-door-flush-persists");
+    fs::create_dir_all(&dir).expect("create WAL test dir");
+    let path = dir.join(WAL_FILE_NAME);
+    let backend = NativeFileBackend::new();
+    let front_door =
+        WalFrontDoor::open_single_lane_with_backend(&backend, &path).expect("front door opens");
+
+    front_door
+        .accept_commit(Sequence::new(1), &[put("k", "v")], DurabilityMode::Flush)
+        .expect("flush commit accepts");
+
+    let after_commit = backend.stats().operations.persist.requests;
+    assert!(
+        after_commit >= 1,
+        "Flush commits must request WAL backend persistence"
+    );
+
+    front_door
+        .persist(DurabilityMode::Flush)
+        .expect("clean flush persist succeeds");
+    assert_eq!(backend.stats().operations.persist.requests, after_commit);
+    cleanup_dir(&dir);
+}
+
+#[test]
 fn wal_discovery_orders_legacy_and_shard_files() {
     let dir = temp_dir("wal-discovery");
     fs::create_dir_all(&dir).expect("create WAL test dir");

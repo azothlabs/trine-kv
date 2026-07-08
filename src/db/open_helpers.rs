@@ -3,11 +3,11 @@ use super::{
     BlockingStorageDirectoryCreateBackend, BlockingStorageDirectoryListBackend,
     BlockingStorageDirectorySyncBackend, BlockingStorageObjectDeleteBackend,
     BlockingStorageReadBackend, BlockingStorageReadObject, BucketOptions, CancellationToken,
-    DEFAULT_BUCKET_NAME, Db, DbInner, DbOptions, DbStats, Error, FailOnCorruptionPolicy,
-    FilterPolicy, HostStorageBackend, LsmCompactionInput, LsmCompactionOutput,
-    LsmCompactionTablePayload, LsmTree, MaintenanceCoordinator, ManifestState, ManifestStore,
-    Mutex, NamedCompactionOutput, NativeFileBackend, ObjectLeaseState, Ordering, Path, PathBuf,
-    PrefixFilterPolicy, Result, Sequence, SnapshotTracker, StorageCapability,
+    DEFAULT_BUCKET_NAME, Db, DbInner, DbOptions, DbStats, DurabilityMode, Error,
+    FailOnCorruptionPolicy, FilterPolicy, HostStorageBackend, LsmCompactionInput,
+    LsmCompactionOutput, LsmCompactionTablePayload, LsmTree, MaintenanceCoordinator, ManifestState,
+    ManifestStore, Mutex, NamedCompactionOutput, NativeFileBackend, ObjectLeaseState, Ordering,
+    Path, PathBuf, PrefixFilterPolicy, Result, Sequence, SnapshotTracker, StorageCapability,
     StorageDirectoryCreateBackend, StorageDirectoryFile, StorageDirectoryId,
     StorageDirectoryListBackend, StorageDirectorySyncBackend, StorageManifestReadBackend,
     StorageMode, StorageObjectDeleteBackend, StorageObjectId, StorageObjectKind,
@@ -755,6 +755,7 @@ pub(super) fn write_blob_gc_replacement_tables(
     backend: &NativeFileBackend,
     db_path: &Path,
     tables: Vec<BlobGcRewriteTable>,
+    durability: DurabilityMode,
 ) -> Result<Vec<NamedCompactionOutput>> {
     let mut outputs = Vec::with_capacity(tables.len());
     for rewrite_table in tables {
@@ -764,7 +765,7 @@ pub(super) fn write_blob_gc_replacement_tables(
             .iter()
             .map(|record| (record.internal_key.clone(), record.value.clone()))
             .collect::<Vec<_>>();
-        let table = Arc::new(table::write_table_with_backend(
+        let table = Arc::new(table::write_table_with_backend_with_durability(
             backend,
             &table_path,
             rewrite_table.output_table_id,
@@ -772,6 +773,7 @@ pub(super) fn write_blob_gc_replacement_tables(
             &rewrite_table.options,
             &point_records,
             &rewrite_table.range_tombstones,
+            durability,
         )?);
 
         outputs.push(NamedCompactionOutput {

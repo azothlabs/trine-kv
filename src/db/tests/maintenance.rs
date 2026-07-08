@@ -296,7 +296,7 @@ fn wasi_persistent_write_rejects_strict_sync_durability() {
 
 #[cfg(target_os = "wasi")]
 #[test]
-fn wasi_persistent_stale_lock_requires_explicit_repair() {
+fn wasi_persistent_safe_temp_repair_does_not_remove_leftover_lock() {
     let path = temp_db_path("wasi-persistent-stale-lock");
     let db = Db::open_sync(DbOptions::wasi_persistent(&path)).expect("WASI db opens");
     db.put_sync(b"key", b"value").expect("WASI write succeeds");
@@ -314,12 +314,30 @@ fn wasi_persistent_stale_lock_requires_explicit_repair() {
 
     let mut options = DbOptions::wasi_persistent(&path);
     options.fail_on_corruption = FailOnCorruptionPolicy::RepairSafeTemporaryFiles;
-    let db = Db::open_sync(options).expect("WASI stale lock is repaired explicitly");
-    assert_eq!(
-        db.get_sync(b"key")
-            .expect("WASI read succeeds after repair"),
-        Some(b"value".to_vec())
-    );
+    let error = Db::open_sync(options)
+        .expect_err("safe temporary repair must not delete a WASI lock marker");
+    assert!(matches!(error, Error::Corruption { .. }));
+    assert!(error.to_string().contains("LOCK"));
+    assert!(path.join(recovery::PROCESS_LOCK_FILE_NAME).exists());
+
+    cleanup_wasi_temp_db_path(path);
+}
+
+#[cfg(target_os = "wasi")]
+#[test]
+fn wasi_persistent_repair_policy_does_not_remove_active_lock() {
+    let path = temp_db_path("wasi-persistent-active-lock");
+    let db = Db::open_sync(DbOptions::wasi_persistent(&path)).expect("WASI db opens");
+
+    let mut options = DbOptions::wasi_persistent(&path);
+    options.fail_on_corruption = FailOnCorruptionPolicy::RepairSafeTemporaryFiles;
+    let error = Db::open_sync(options).expect_err("active WASI writer keeps its lock");
+    assert!(matches!(error, Error::Corruption { .. }));
+    assert!(error.to_string().contains("LOCK"));
+    assert!(path.join(recovery::PROCESS_LOCK_FILE_NAME).exists());
+
+    db.put_sync(b"key", b"value")
+        .expect("original WASI writer remains usable");
     drop(db);
 
     cleanup_wasi_temp_db_path(path);

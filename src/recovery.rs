@@ -752,10 +752,6 @@ fn is_safe_temporary_file(name: &str) -> bool {
     // These names come from atomic write paths before their final rename.
     // The manifest never references them, so recovery may delete them only
     // when the caller explicitly chooses the repair policy.
-    if cfg!(target_os = "wasi") && name == PROCESS_LOCK_FILE_NAME {
-        return true;
-    }
-
     name == "MANIFEST.tmp"
         || name == "RECOVERY_REPORT.tmp"
         || wal::is_wal_rewrite_temporary_file_name(name)
