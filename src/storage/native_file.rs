@@ -223,6 +223,47 @@ mod browser_persistent_storage {
                 .map_err(|error| map_opfs_error(&error))?;
             Ok(())
         }
+
+        async fn append_object_bytes(&self, object: &StorageObjectId, bytes: &[u8]) -> Result<()> {
+            require_browser_wal_object(object)?;
+            let Some((directory, name)) =
+                self.parent_directory_and_name(object.path(), true).await?
+            else {
+                return Err(Error::invalid_options(
+                    "browser persistent WAL parent cannot be opened",
+                ));
+            };
+            let options = GetFileHandleOptions { create: true };
+            let mut file = directory
+                .get_file_handle_with_options(&name, &options)
+                .await
+                .map_err(|error| map_opfs_error(&error))?;
+            let len = file.size().await.map_err(|error| map_opfs_error(&error))?;
+            let next_len = len.checked_add(bytes.len()).ok_or_else(|| {
+                Error::invalid_options("browser persistent WAL append length overflow")
+            })?;
+            ensure_whole_object_read_len(object, next_len)?;
+            let write_options = CreateWritableOptions {
+                keep_existing_data: true,
+            };
+            let mut stream = file
+                .create_writable_with_options(&write_options)
+                .await
+                .map_err(|error| map_opfs_error(&error))?;
+            stream
+                .seek(len)
+                .await
+                .map_err(|error| map_opfs_error(&error))?;
+            stream
+                .write_at_cursor_pos(bytes)
+                .await
+                .map_err(|error| map_opfs_error(&error))?;
+            stream
+                .close()
+                .await
+                .map_err(|error| map_opfs_error(&error))?;
+            Ok(())
+        }
     }
 
     impl StorageReadBackend for BrowserStorageBackend {
@@ -496,15 +537,7 @@ mod browser_persistent_storage {
             Box::pin(async move {
                 require_browser_wal_object(&self.object)?;
                 require_browser_durability(durability)?;
-                let mut existing = self
-                    .backend
-                    .read_object_bytes_inner(&self.object)
-                    .await?
-                    .map_or_else(Vec::new, |bytes| bytes.as_ref().to_vec());
-                existing.extend_from_slice(bytes);
-                self.backend
-                    .write_object_bytes(&self.object, &existing)
-                    .await
+                self.backend.append_object_bytes(&self.object, bytes).await
             })
         }
 

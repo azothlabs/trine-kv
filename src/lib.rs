@@ -80,6 +80,9 @@
 mod blob;
 mod block;
 pub mod branch;
+/// Browser storage-manager helpers for OPFS-backed persistent databases.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub mod browser;
 /// Bucket handles and bucket-bound readers.
 pub mod bucket;
 #[allow(dead_code)]

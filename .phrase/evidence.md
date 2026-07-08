@@ -26,6 +26,65 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-07-08: Browser WASM Production KV Hardening
+
+### Observation
+
+- Browser WAL append no longer reads the whole OPFS WAL object before every
+  commit. It now opens an OPFS writable stream with existing data kept, seeks to
+  the current file end, and writes only the new WAL bytes.
+- Added `trine_kv::browser` helpers for `navigator.storage.estimate()`,
+  `persisted()`, and `persist()`, with Rustdoc and user docs explaining quota
+  estimates, browser eviction risk, and persistent-storage denial.
+- Added browser integration coverage for many unflushed WAL appends, safe WAL
+  rewrite temp fail-closed behavior, explicit safe-temp repair, and browser
+  storage-manager status.
+- Real Chromium OPFS execution exposed two additional browser production bugs:
+  safe-temp repair wrote the recovery report with native `SyncAll`, and browser
+  bucket drop held the manifest async lock while entering cleanup that wanted
+  the same lock. After fixing that, bucket drop exposed that its local bucket
+  tree reference kept obsolete table files pinned until after cleanup.
+
+### Interpretation
+
+- Browser persistent storage now has an append path with commit cost tied to
+  new WAL bytes rather than current WAL size.
+- Browser durability support is now more internally consistent: browser repair
+  reports use `Flush`, and bucket drop no longer deadlocks or leaves a normal
+  dropped-bucket table behind for read-only reopen to reject.
+- Browser support is now strong enough for production-style local browser KV
+  use when the caller follows documented quota/persistence checks and accepts
+  browser eviction policy as a host boundary.
+
+### Verification
+
+- `cargo test -q`
+- `cargo clippy -q --all-features --all-targets -- -D warnings`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test --doc --all-features -q`
+- `cargo test --target wasm32-unknown-unknown --test browser_persistent_wasm --no-run`
+- `cargo fmt --check`
+- `git diff --check`
+- Real Chromium OPFS run through a temporary wasm-bindgen + Playwright harness:
+  14 browser integration tests passed, including WAL reopen, many WAL appends,
+  flush, compaction, blob-backed reads, bucket create/drop, namespace isolation,
+  Web Locks second-writer rejection, path alias locking, missing read-only
+  namespace, oversized manifest preflight, storage-manager status, safe-temp
+  fail-closed, and safe-temp repair.
+
+### Remaining Blockers
+
+- `wasm-bindgen-test-runner` still defaults to Safari WebDriver on this host and
+  that driver is killed locally. The browser tests are nevertheless executable
+  locally through the temporary Chromium/Playwright harness and should remain
+  covered by CI with ChromeDriver.
+
+### Recommended Next Action
+
+- Keep browser persistent changes behind real Chromium/ChromeDriver execution in
+  CI. Future browser storage work should add a browser integration test before
+  claiming support for a new OPFS/Web Locks behavior.
+
 ## 2026-06-29: 0.5.8 Local Release Prep
 
 ### Observation

@@ -902,12 +902,12 @@ fn sync_recovery_report_parent_directory_after_rename_with_backend(
 }
 
 const fn recovery_report_publish_durability() -> DurabilityMode {
-    #[cfg(target_os = "wasi")]
+    #[cfg(any(target_os = "wasi", all(target_arch = "wasm32", target_os = "unknown")))]
     {
         DurabilityMode::Flush
     }
 
-    #[cfg(not(target_os = "wasi"))]
+    #[cfg(not(any(target_os = "wasi", all(target_arch = "wasm32", target_os = "unknown"))))]
     {
         DurabilityMode::SyncAll
     }

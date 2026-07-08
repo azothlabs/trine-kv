@@ -658,7 +658,11 @@ impl Db {
     /// This is the async form of [`Db::persist_sync`]. Native persistent
     /// databases run blocking persistence work through the configured runtime;
     /// browser persistent databases use the browser storage path on supported
-    /// targets.
+    /// targets. Browser persistent persistence is tied to the active write
+    /// front door and is not a storage-quota reservation; on browser builds,
+    /// use `trine_kv::browser::browser_storage_estimate` and
+    /// `trine_kv::browser::request_browser_persistent_storage` before opening
+    /// a browser database when eviction risk matters.
     ///
     /// # Parameters
     ///
@@ -691,6 +695,11 @@ impl Db {
     /// This is the async form of [`Db::flush_sync`]. It can be used by async
     /// applications to force committed memtable data into table files without
     /// blocking the caller's executor thread on native persistent storage.
+    ///
+    /// On browser persistent databases, once this future is first polled the
+    /// flush runs in a browser-local task. Dropping the future after that point
+    /// does not cancel the flush; the task finishes or reports its result to
+    /// the waiting future.
     pub async fn flush(&self) -> Result<()> {
         if self.inner.options.storage_mode.is_object_store_persistent() {
             return self.flush_object_store_async().await;
@@ -715,6 +724,11 @@ impl Db {
     }
 
     /// Compacts table files that overlap `range`.
+    ///
+    /// On browser persistent databases, once this future is first polled the
+    /// compaction runs in a browser-local task. Dropping the future after that
+    /// point does not cancel the compaction, because partially abandoned table
+    /// publish work would make startup recovery more expensive.
     pub async fn compact_range(&self, range: KeyRange) -> Result<()> {
         if self.inner.options.storage_mode.is_object_store_persistent() {
             self.ensure_open()?;
@@ -767,6 +781,10 @@ impl Db {
     }
 
     /// Compacts table files that overlap `range` within `budget`.
+    ///
+    /// On browser persistent databases, once this future is first polled the
+    /// compaction runs in a browser-local task. Dropping the future after that
+    /// point does not cancel the underlying storage work.
     pub async fn compact_range_with_budget(
         &self,
         range: KeyRange,
@@ -825,6 +843,10 @@ impl Db {
     /// inputs. A call may consume work from both limits: it first flushes
     /// immutable memtables, then runs one compaction pass if the flush step did
     /// not report busy or budget exhaustion.
+    ///
+    /// On browser persistent databases, once this future is first polled the
+    /// maintenance pass runs in a browser-local task. Dropping the future after
+    /// that point does not cancel the pass.
     pub async fn run_maintenance_with_budget(
         &self,
         budget: MaintenanceBudget,

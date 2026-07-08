@@ -45,6 +45,17 @@ blob-backed reads, bucket create/drop, namespace isolation, writer-lease
 rejection, path-alias writer locking, missing read-only namespace failure, and
 oversized manifest rejection.
 
+Second follow-up browser WASM production hardening fixed the remaining browser
+KV gaps: WAL append now writes only new bytes through OPFS instead of rereading
+and rewriting the whole WAL; browser callers have public storage-manager helpers
+for quota estimates, persisted status, and persistent-storage requests; browser
+async write/maintenance lifecycle is documented as non-cancelable after first
+poll; safe-temp recovery writes browser repair reports with `Flush`; and browser
+bucket drop no longer self-deadlocks or leaves a normally dropped bucket's table
+file behind. The browser integration test now also covers many unflushed WAL
+appends, browser storage-manager status, safe WAL temp fail-closed behavior, and
+explicit safe-temp repair.
+
 ## Goal
 
 Reduce confirmed object-store write latency and allow deployments to place the
@@ -143,14 +154,15 @@ recoverable after process loss and writer takeover.
 - Browser persistent callers can select explicit origin-private namespaces.
   Met.
 - Browser OPFS/Web Locks behavior is covered by a real browser test gate for
-  WAL reopen, namespace isolation, and second-writer rejection. Met in CI
-  workflow configuration; local no-run build and clippy pass, while this host
-  lacks Chrome/Chromedriver for local WebDriver execution.
+  WAL reopen, namespace isolation, and second-writer rejection. Met in local
+  Chromium/Playwright execution and CI workflow configuration.
 - Browser OPFS/Web Locks behavior is covered beyond smoke paths: flush,
   compaction, blob reads, bucket drop, namespace aliases, missing read-only
-  manifest, and oversized manifest preflight all have browser-target integration
-  coverage. Met in no-run/clippy local verification; real local run is blocked
-  by missing ChromeDriver and a host-killed Safari WebDriver.
+  manifest, oversized manifest preflight, many WAL appends, storage-manager
+  status, safe-temp fail-closed behavior, and safe-temp repair all have
+  browser-target integration coverage. Met in local Chromium/Playwright
+  execution; Safari WebDriver remains host-killed, so CI should continue using
+  ChromeDriver.
 
 ## Verification
 
@@ -186,11 +198,22 @@ recoverable after process loss and writer takeover.
 - `cargo clippy -q --target wasm32-unknown-unknown --no-default-features --features platform-io-native --lib -- -D warnings`
 - `cargo clippy -q --target wasm32-unknown-unknown --test browser_persistent_wasm -- -D warnings`
 - `cargo test -q --target wasm32-unknown-unknown --test browser_persistent_wasm --no-run`
+- `cargo test -q`
+- `cargo clippy -q --all-features --all-targets -- -D warnings`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test --doc --all-features -q`
+- `cargo test --target wasm32-unknown-unknown --test browser_persistent_wasm --no-run`
+- real Chromium OPFS browser integration run via temporary wasm-bindgen +
+  Playwright harness: 14 browser tests passed
 
 ## Next Recommendation
 
 - Stop this phase here. Trine now has stable WAL objects, measured group commit
   scheduling, an explicit split WAL tier API, and billing-aware live guards.
+- Browser persistent KV is now production-grade for the documented browser
+  boundary: callers can check quota/persistence, WAL append is efficient, safe
+  temp repair and bucket drop are covered, and the real Chromium OPFS gate
+  passes locally.
 - Only start another phase if we need a concrete external WAL service/provider
   adapter. That phase should implement the adapter behind `ObjectClient`, then
   measure single-commit latency against R2 storage plus that WAL tier.

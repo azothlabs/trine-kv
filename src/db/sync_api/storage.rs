@@ -714,6 +714,8 @@ impl Db {
         T: 'static,
     {
         let (sender, receiver) = futures::channel::oneshot::channel();
+        // Once an OPFS maintenance task has started, let it reach its own
+        // cleanup path even if the caller drops the waiting future.
         wasm_bindgen_futures::spawn_local(async move {
             let _ = sender.send(task.await);
         });

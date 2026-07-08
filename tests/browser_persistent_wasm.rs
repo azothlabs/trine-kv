@@ -6,12 +6,16 @@ use opfs::{
     CreateWritableOptions, DirectoryHandle as _, FileHandle as _, GetDirectoryHandleOptions,
     GetFileHandleOptions, WritableFileStream as _, persistent,
 };
-use trine_kv::{BucketOptions, Db, DbOptions, Error, KeyRange};
+use trine_kv::{
+    BucketOptions, Db, DbOptions, Error, FailOnCorruptionPolicy, KeyRange,
+    browser::{browser_persistent_storage_granted, browser_storage_estimate},
+};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_browser);
 
 const OVERSIZED_MANIFEST_BYTES: usize = 65 * 1024 * 1024;
+const WAL_REWRITE_TMP_FILE_NAME: &str = "trine.wal.tmp";
 
 fn test_namespace(name: &str) -> String {
     let millis = js_sys::Date::now().to_string().replace('.', "-");
@@ -72,6 +76,33 @@ async fn browser_persistent_reopens_unflushed_wal_in_namespace() {
 }
 
 #[wasm_bindgen_test]
+async fn browser_persistent_reopens_many_unflushed_wal_appends() {
+    let namespace = test_namespace("many-wal-appends");
+    let db = Db::open(DbOptions::browser_persistent_at(&namespace))
+        .await
+        .expect("browser database opens");
+
+    for index in 0..192_u16 {
+        let key = format!("append-key-{index:03}");
+        let value = vec![index as u8; 256];
+        db.put(key.into_bytes(), value)
+            .await
+            .expect("browser WAL append succeeds");
+    }
+    drop(db);
+
+    let db = Db::open(DbOptions::browser_persistent_read_only_at(&namespace))
+        .await
+        .expect("browser read-only database reopens after many WAL appends");
+    assert_eq!(
+        db.get(b"append-key-191")
+            .await
+            .expect("browser read succeeds"),
+        Some(vec![191_u8; 256])
+    );
+}
+
+#[wasm_bindgen_test]
 async fn browser_persistent_reopens_after_flush() {
     let namespace = test_namespace("flush-reopen");
     let db = Db::open(DbOptions::browser_persistent_at(&namespace))
@@ -91,6 +122,67 @@ async fn browser_persistent_reopens_after_flush() {
         db.get(b"user:002").await.expect("browser read succeeds"),
         Some(b"Grace".to_vec())
     );
+}
+
+#[wasm_bindgen_test]
+async fn browser_persistent_rejects_leftover_wal_rewrite_temp_by_default() {
+    let namespace = test_namespace("wal-temp-fail-closed");
+    let db = Db::open(DbOptions::browser_persistent_at(&namespace))
+        .await
+        .expect("browser database opens");
+    db.put(b"k", b"v")
+        .await
+        .expect("browser write succeeds before temp injection");
+    drop(db);
+
+    write_opfs_file(
+        &namespace,
+        WAL_REWRITE_TMP_FILE_NAME,
+        b"partial-wal-rewrite",
+    )
+    .await;
+
+    let error = Db::open(DbOptions::browser_persistent_read_only_at(&namespace))
+        .await
+        .expect_err("safe browser WAL temp should fail closed by default");
+    assert!(
+        matches!(error, Error::Corruption { ref message } if message.contains("safe temporary")),
+        "{error}"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn browser_persistent_repairs_leftover_wal_rewrite_temp_when_requested() {
+    let namespace = test_namespace("wal-temp-repair");
+    let db = Db::open(DbOptions::browser_persistent_at(&namespace))
+        .await
+        .expect("browser database opens");
+    db.put(b"k", b"survives-temp")
+        .await
+        .expect("browser write succeeds before temp injection");
+    drop(db);
+
+    write_opfs_file(
+        &namespace,
+        WAL_REWRITE_TMP_FILE_NAME,
+        b"partial-wal-rewrite",
+    )
+    .await;
+
+    let mut options = DbOptions::browser_persistent_at(&namespace);
+    options.fail_on_corruption = FailOnCorruptionPolicy::RepairSafeTemporaryFiles;
+    let db = Db::open(options)
+        .await
+        .expect("browser database repairs safe WAL temp");
+    assert_eq!(
+        db.get(b"k").await.expect("browser read succeeds"),
+        Some(b"survives-temp".to_vec())
+    );
+    drop(db);
+
+    Db::open(DbOptions::browser_persistent_read_only_at(&namespace))
+        .await
+        .expect("browser read-only reopen confirms WAL temp was removed");
 }
 
 #[wasm_bindgen_test]
@@ -266,6 +358,20 @@ async fn browser_persistent_read_only_missing_namespace_fails() {
         Error::Io(error) => assert_eq!(error.kind(), io::ErrorKind::NotFound),
         other => panic!("expected NotFound for missing browser namespace, got {other}"),
     }
+}
+
+#[wasm_bindgen_test]
+async fn browser_storage_manager_reports_estimate_and_persisted_status() {
+    let estimate = browser_storage_estimate()
+        .await
+        .expect("browser storage estimate succeeds");
+    if let (Some(usage), Some(quota)) = (estimate.usage_bytes, estimate.quota_bytes) {
+        assert!(quota >= usage, "quota {quota} should cover usage {usage}");
+    }
+
+    let _persisted = browser_persistent_storage_granted()
+        .await
+        .expect("browser persisted status succeeds");
 }
 
 #[wasm_bindgen_test]

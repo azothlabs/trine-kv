@@ -264,33 +264,36 @@ impl Db {
                 .flat_map(|table| table.blob_file_ids())
                 .collect();
             let sequence = self.last_committed_sequence();
-            let _publish = self.inner.browser_manifest_async_lock.lock().await;
-            let manifest = self
-                .inner
-                .manifest
-                .as_ref()
-                .ok_or_else(|| Error::Corruption {
-                    message: "browser persistent database is missing manifest store".to_owned(),
-                })?;
-            let prepared = {
-                manifest
-                    .lock()
-                    .map_err(|_| lock_poisoned("manifest store"))?
-                    .prepare_drop_bucket_publish(name.as_str(), blob_ids, sequence)?
-            };
-            if let Some(prepared) = prepared {
-                prepared.publish_async().await?;
-                self.install_prepared_manifest_after_durable_publish(
-                    "bucket drop",
-                    manifest,
-                    prepared,
-                )?;
+            {
+                let _publish = self.inner.browser_manifest_async_lock.lock().await;
+                let manifest = self
+                    .inner
+                    .manifest
+                    .as_ref()
+                    .ok_or_else(|| Error::Corruption {
+                        message: "browser persistent database is missing manifest store".to_owned(),
+                    })?;
+                let prepared = {
+                    manifest
+                        .lock()
+                        .map_err(|_| lock_poisoned("manifest store"))?
+                        .prepare_drop_bucket_publish(name.as_str(), blob_ids, sequence)?
+                };
+                if let Some(prepared) = prepared {
+                    prepared.publish_async().await?;
+                    self.install_prepared_manifest_after_durable_publish(
+                        "bucket drop",
+                        manifest,
+                        prepared,
+                    )?;
+                }
             }
             self.inner
                 .buckets
                 .write()
                 .map_err(|_| lock_poisoned("bucket registry"))?
                 .remove(name.as_str());
+            drop(tree);
             let db_path = self.browser_db_path()?;
             self.retire_obsolete_table_files_browser_async(db_path, tables)
                 .await?;

@@ -65,7 +65,8 @@ impl Db {
 
     #[must_use = "write futures do nothing unless polled"]
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    /// Commits an atomic write batch asynchronously with explicit write options.
+    /// Commits an atomic write batch asynchronously with explicit write
+    /// options.
     pub fn write(
         &self,
         batch: WriteBatch,
@@ -74,8 +75,15 @@ impl Db {
         self.run_accepted_write_async(WriteRequest::batch(batch, options))
     }
 
+    #[must_use = "write futures do nothing unless polled"]
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    /// Commits an atomic write batch asynchronously with explicit write options.
+    /// Commits an atomic write batch asynchronously with explicit write
+    /// options.
+    ///
+    /// Browser persistent writes start their OPFS work in a browser-local task
+    /// after the returned future is first polled. Dropping that future after
+    /// polling no longer cancels the underlying write; Trine lets it finish so
+    /// WAL acceptance and in-memory publish stay in one ordered commit path.
     pub fn write(
         &self,
         batch: WriteBatch,

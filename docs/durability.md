@@ -91,12 +91,19 @@ provide:
 - Browser persistence is async-only on `wasm32-unknown-unknown`. It accepts
   `Buffered` and `Flush`, defaults to `Flush`, rejects the device-sync modes
   (`SyncData`, `SyncAll`, `SyncAllStrict`), acquires a Web Locks writer lease for
-  writable open, and uses WAL-backed async writes.
+  writable open, and uses WAL-backed async writes. Browser WAL append keeps the
+  existing OPFS file and writes only new bytes at the current file end; WAL
+  rewrite and manifest publish use OPFS writable-stream close as the visible
+  cutover point and leave safe temporary files for recovery policy checks.
 
 Synchronous browser persistent open, mutation, bucket creation, and maintenance
 `*_sync` adapters return typed unsupported errors. Browser callers should use
 `Db::open` and the async write, bucket, flush, compaction, and maintenance
-methods.
+methods. Browser callers can use `trine_kv::browser::browser_storage_estimate`,
+`trine_kv::browser::browser_persistent_storage_granted`, and
+`trine_kv::browser::request_browser_persistent_storage` to inspect quota
+estimates and request stronger browser-side eviction protection before opening
+user-critical local data.
 
 ## Commit Ordering
 

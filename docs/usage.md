@@ -248,16 +248,36 @@ db.flush().await?;
 
 The browser persistent backend uses browser storage APIs behind Trine's storage
 traits. Writable open acquires a Web Locks writer lease, replays WAL, and uses
-WAL-backed async writes. Browser WAL appends are serialized per shard because
-OPFS does not provide Trine with a native append primitive. `WalShardPolicy::Auto`
-therefore uses one browser WAL lane by default; explicit `Fixed(n)` policies are
-honored and each lane has its own async append guard. Browser storage accepts
-`Buffered` and `Flush`; `SyncData`, `SyncAll`, and `SyncAllStrict` return
+WAL-backed async writes. Browser WAL appends use an OPFS writable stream with
+existing data kept and the cursor moved to the current file end, so ordinary
+commits write only the new WAL bytes instead of rewriting the whole WAL file.
+Browser WAL appends are still serialized per shard because OPFS does not expose
+Trine's native append contract. `WalShardPolicy::Auto` therefore uses one
+browser WAL lane by default; explicit `Fixed(n)` policies are honored and each
+lane has its own async append guard. Browser storage accepts `Buffered` and
+`Flush`; `SyncData`, `SyncAll`, and `SyncAllStrict` return
 `UnsupportedDurability`. Synchronous browser persistent open, synchronous
 mutation, synchronous bucket creation, and synchronous maintenance return typed
-unsupported errors. On non-browser targets, browser persistent async open returns
-`UnsupportedBackend`. Browser persistent options default to `Flush`, the
-strongest currently accepted mode for that backend.
+unsupported errors. On non-browser targets, browser persistent async open
+returns `UnsupportedBackend`. Browser persistent options default to `Flush`,
+the strongest currently accepted mode for that backend.
+
+For production browser applications, check the origin storage boundary before
+placing user-critical data in OPFS:
+
+```rust
+let estimate = trine_kv::browser::browser_storage_estimate().await?;
+let persistent = trine_kv::browser::browser_persistent_storage_granted().await?;
+if !persistent {
+    let _granted = trine_kv::browser::request_browser_persistent_storage().await?;
+}
+```
+
+`browser_storage_estimate()` returns browser-provided estimates, not a
+reservation. `request_browser_persistent_storage()` asks the browser to protect
+the current origin from normal eviction; the browser may still deny it. When the
+request is denied, Trine can still use OPFS, but the application should treat
+the data as more vulnerable to browser storage pressure.
 
 `browser_persistent()` uses the default namespace in the current origin's
 private storage root. Prefer `browser_persistent_at(path)` for applications,
@@ -275,6 +295,14 @@ let db = Db::open(DbOptions::browser_persistent_read_only_at("my-app")).await?;
 
 Read-only browser open does not create missing storage. If the namespace does
 not already contain a Trine manifest, open returns a not-found I/O error.
+
+Browser async writes, flush, compaction, and maintenance run in browser-local
+tasks after their returned future is first polled. Dropping such a future after
+it starts does not cancel the underlying OPFS work; Trine lets it finish so WAL,
+manifest, table, and cleanup steps reach their normal recovery boundaries.
+Startup fails closed on safe temporary files by default. Set
+`FailOnCorruptionPolicy::RepairSafeTemporaryFiles` when a writable browser open
+should remove safe leftover files such as `trine.wal.tmp`.
 
 `Db`, `Bucket`, and `Snapshot` are cheap handles. `Db` writes to the built-in
 default bucket. A named `Bucket` keeps its database open, so release bucket
