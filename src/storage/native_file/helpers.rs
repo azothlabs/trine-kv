@@ -509,36 +509,9 @@ pub(in crate::storage) fn list_native_file_directory_files(
 ) -> Result<Vec<StorageDirectoryFile>> {
     require_native_file_directory_listing()?;
 
-    match native_file_directory_discovery() {
-        #[cfg(not(target_os = "wasi"))]
-        NativeFileDirectoryDiscovery::ReadDir => list_native_file_directory_entries(directory),
-        #[cfg(target_os = "wasi")]
-        NativeFileDirectoryDiscovery::KnownDatabaseFiles => {
-            list_known_trine_database_files(directory)
-        }
-    }
+    list_native_file_directory_entries(directory)
 }
 
-enum NativeFileDirectoryDiscovery {
-    #[cfg(not(target_os = "wasi"))]
-    ReadDir,
-    #[cfg(target_os = "wasi")]
-    KnownDatabaseFiles,
-}
-
-const fn native_file_directory_discovery() -> NativeFileDirectoryDiscovery {
-    #[cfg(target_os = "wasi")]
-    {
-        NativeFileDirectoryDiscovery::KnownDatabaseFiles
-    }
-
-    #[cfg(not(target_os = "wasi"))]
-    {
-        NativeFileDirectoryDiscovery::ReadDir
-    }
-}
-
-#[cfg(not(target_os = "wasi"))]
 fn list_native_file_directory_entries(
     directory: &StorageDirectoryId,
 ) -> Result<Vec<StorageDirectoryFile>> {
@@ -555,40 +528,6 @@ fn list_native_file_directory_entries(
         ));
     }
 
-    files.sort_unstable();
-    Ok(files)
-}
-
-#[cfg(target_os = "wasi")]
-fn list_known_trine_database_files(
-    directory: &StorageDirectoryId,
-) -> Result<Vec<StorageDirectoryFile>> {
-    const KNOWN_ROOT_FILES: &[&str] = &[
-        "LOCK",
-        "MANIFEST",
-        "MANIFEST.tmp",
-        "RECOVERY_REPORT",
-        "RECOVERY_REPORT.tmp",
-        "trine.wal",
-        "trine.wal.tmp",
-        "trine.wal.confirmed-0000",
-    ];
-
-    let mut files = Vec::new();
-    for name in KNOWN_ROOT_FILES {
-        let path = directory.path().join(name);
-        let metadata = match fs::metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(Error::Io(error)),
-        };
-        if metadata.is_file() {
-            files.push(StorageDirectoryFile::native_file_with_len(
-                path,
-                metadata.len(),
-            ));
-        }
-    }
     files.sort_unstable();
     Ok(files)
 }

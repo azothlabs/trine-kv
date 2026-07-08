@@ -766,7 +766,8 @@ let db = Db::open_sync(options)?;
 
 This policy is intentionally narrow. It does not repair WAL corruption,
 manifest corruption, table corruption, missing referenced files, or blob
-corruption.
+corruption. On WASI it can also remove a stale `LOCK` marker left by a
+terminated writer; without this explicit policy, startup fails closed.
 
 ## Verification Path
 

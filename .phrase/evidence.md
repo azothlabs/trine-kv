@@ -15356,3 +15356,43 @@ Negative check:
 
 - Keep the CI/publish WASI runtime gate targeted to `wasi_persistent` until the
   rest of the lib test suite is audited for WASI runtime assumptions.
+
+## 2026-07-08: WASI startup recovery hardening
+
+### Observation
+
+- Review found that WASI writer leases used a `LOCK` file created with
+  `create_new`, so a crash-left `LOCK` blocked future writable opens with no
+  explicit repair path.
+- Review also found that WASI startup directory discovery used a fixed root-file
+  list, so table/blob files and their temporary publish files were invisible to
+  startup temporary-file repair and unreferenced-file checks.
+
+### Interpretation
+
+- WASI still cannot claim native file-lock semantics, so stale writer markers
+  must remain fail-closed by default and be removed only when the caller opts
+  into explicit safe startup repair.
+- WASI host filesystem discovery must enumerate the real database directory
+  when checking recovery files; otherwise startup checks are weaker than native
+  filesystem checks.
+
+### Verification
+
+- Checks passed: `cargo fmt --check`, `cargo clippy -q --lib -- -D warnings`,
+  `cargo check -q`, `cargo check -q --target wasm32-wasip1 --lib`,
+  `cargo check -q --target wasm32-unknown-unknown --lib`,
+  `cargo check -q --all-features`,
+  `cargo clippy -q --all-features --lib -- -D warnings`,
+  `cargo clippy -q --target wasm32-unknown-unknown --lib -- -D warnings`,
+  `cargo test -q recovery`, `cargo test -q wasi_persistent`,
+  `cargo rustdoc --all-features -- -D warnings`,
+  `cargo test -q --doc --all-features`,
+  `CARGO_TARGET_WASM32_WASIP1_RUNNER="wasmtime run --dir ." cargo test -q --target wasm32-wasip1 --lib wasi_persistent`,
+  and `git diff --check`.
+
+### Recommended Next Action
+
+- Keep WASI persistence on the explicit-host-backend path with `Flush`
+  durability only. If a future host can provide real writer leases and stronger
+  sync, add it behind a separate capability check and targeted runtime tests.

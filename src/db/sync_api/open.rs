@@ -818,9 +818,8 @@ impl Db {
             return Err(Error::invalid_options("database path does not exist"));
         }
 
-        let process_lock = acquire_persistent_process_lock(&native_storage, path, &options)?;
-        let directory_files = list_persistent_directory_files(&native_storage, path)?;
-        repair_safe_temporary_files_for_open(&native_storage, path, &options, &directory_files)?;
+        let (process_lock, directory_files) =
+            Self::prepare_persistent_lock_and_directory_files(&native_storage, path, &options)?;
 
         let manifest_path = manifest::manifest_path(path);
         let mut manifest = ManifestStore::open_or_create_with_backend(
@@ -912,16 +911,13 @@ impl Db {
             return Err(Error::invalid_options("database path does not exist"));
         }
 
-        let process_lock =
-            acquire_persistent_process_lock_async(&native_storage, path, &options).await?;
-        let directory_files = list_persistent_directory_files_async(&native_storage, path).await?;
-        repair_safe_temporary_files_for_open_from_directory_files_async(
-            &native_storage,
-            path,
-            &options,
-            &directory_files,
-        )
-        .await?;
+        let (process_lock, directory_files) =
+            Self::prepare_persistent_lock_and_directory_files_async(
+                &native_storage,
+                path,
+                &options,
+            )
+            .await?;
 
         let manifest_path = manifest::manifest_path(path);
         let mut manifest = ManifestStore::open_or_create_with_backend_async(
@@ -989,6 +985,75 @@ impl Db {
             replay_floor,
             db_path_for_cleanup,
         })
+    }
+
+    fn prepare_persistent_lock_and_directory_files(
+        native_storage: &NativeFileBackend,
+        path: &std::path::Path,
+        options: &DbOptions,
+    ) -> Result<(
+        Option<recovery::ProcessLock>,
+        Vec<crate::storage::StorageDirectoryFile>,
+    )> {
+        #[cfg(target_os = "wasi")]
+        {
+            let directory_files = list_persistent_directory_files(native_storage, path)?;
+            repair_safe_temporary_files_for_open(native_storage, path, options, &directory_files)?;
+            let directory_files = list_persistent_directory_files(native_storage, path)?;
+            let process_lock = acquire_persistent_process_lock(native_storage, path, options)?;
+            Ok((process_lock, directory_files))
+        }
+
+        #[cfg(not(target_os = "wasi"))]
+        {
+            let process_lock = acquire_persistent_process_lock(native_storage, path, options)?;
+            let directory_files = list_persistent_directory_files(native_storage, path)?;
+            repair_safe_temporary_files_for_open(native_storage, path, options, &directory_files)?;
+            Ok((process_lock, directory_files))
+        }
+    }
+
+    async fn prepare_persistent_lock_and_directory_files_async(
+        native_storage: &NativeFileBackend,
+        path: &std::path::Path,
+        options: &DbOptions,
+    ) -> Result<(
+        Option<recovery::ProcessLock>,
+        Vec<crate::storage::StorageDirectoryFile>,
+    )> {
+        #[cfg(target_os = "wasi")]
+        {
+            let directory_files =
+                list_persistent_directory_files_async(native_storage, path).await?;
+            repair_safe_temporary_files_for_open_from_directory_files_async(
+                native_storage,
+                path,
+                options,
+                &directory_files,
+            )
+            .await?;
+            let directory_files =
+                list_persistent_directory_files_async(native_storage, path).await?;
+            let process_lock =
+                acquire_persistent_process_lock_async(native_storage, path, options).await?;
+            Ok((process_lock, directory_files))
+        }
+
+        #[cfg(not(target_os = "wasi"))]
+        {
+            let process_lock =
+                acquire_persistent_process_lock_async(native_storage, path, options).await?;
+            let directory_files =
+                list_persistent_directory_files_async(native_storage, path).await?;
+            repair_safe_temporary_files_for_open_from_directory_files_async(
+                native_storage,
+                path,
+                options,
+                &directory_files,
+            )
+            .await?;
+            Ok((process_lock, directory_files))
+        }
     }
 
     #[cfg_attr(

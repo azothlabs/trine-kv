@@ -7,6 +7,7 @@ use std::{
 
 use crate::{
     blob,
+    durability::requires_parent_dir_sync_after_rename,
     error::{Error, Result},
     manifest::ManifestState,
     options::{DurabilityMode, FailOnCorruptionPolicy},
@@ -751,6 +752,10 @@ fn is_safe_temporary_file(name: &str) -> bool {
     // These names come from atomic write paths before their final rename.
     // The manifest never references them, so recovery may delete them only
     // when the caller explicitly chooses the repair policy.
+    if cfg!(target_os = "wasi") && name == PROCESS_LOCK_FILE_NAME {
+        return true;
+    }
+
     name == "MANIFEST.tmp"
         || name == "RECOVERY_REPORT.tmp"
         || wal::is_wal_rewrite_temporary_file_name(name)
@@ -832,15 +837,12 @@ fn write_recovery_report_with_backend(
 ) -> Result<()> {
     let path = recovery_report_path(db_path);
     let bytes: Arc<[u8]> = Arc::from(encode_report(report).into_bytes());
+    let durability = recovery_report_publish_durability();
     backend
         .capabilities()
         .require(StorageCapability::ObjectWrite)?;
-    backend.write_object_blocking(
-        recovery_report_storage_object(&path),
-        bytes,
-        DurabilityMode::SyncAll,
-    )?;
-    sync_recovery_report_parent_directory_after_rename_with_backend(backend, &path)?;
+    backend.write_object_blocking(recovery_report_storage_object(&path), bytes, durability)?;
+    sync_recovery_report_parent_directory_after_rename_with_backend(backend, &path, durability)?;
 
     Ok(())
 }
@@ -862,7 +864,7 @@ where
         .write_object(
             recovery_report_storage_object(&path),
             bytes,
-            DurabilityMode::Flush,
+            recovery_report_publish_durability(),
         )
         .await
 }
@@ -889,7 +891,11 @@ fn recovery_report_storage_object(path: &Path) -> StorageObjectId {
 fn sync_recovery_report_parent_directory_after_rename_with_backend(
     backend: &NativeFileBackend,
     path: &Path,
+    durability: DurabilityMode,
 ) -> Result<()> {
+    if !requires_parent_dir_sync_after_rename(durability) {
+        return Ok(());
+    }
     let Some(parent) = StorageDirectoryId::native_file_parent_of(path) else {
         return Ok(());
     };
@@ -897,6 +903,18 @@ fn sync_recovery_report_parent_directory_after_rename_with_backend(
         .capabilities()
         .require(StorageCapability::DirectorySync)?;
     backend.sync_directory_after_renames_blocking(parent)
+}
+
+const fn recovery_report_publish_durability() -> DurabilityMode {
+    #[cfg(target_os = "wasi")]
+    {
+        DurabilityMode::Flush
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    {
+        DurabilityMode::SyncAll
+    }
 }
 
 fn encode_report(report: &RecoveryReport) -> String {

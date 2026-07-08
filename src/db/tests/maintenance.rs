@@ -1,6 +1,6 @@
 use super::*;
 #[cfg(target_os = "wasi")]
-use crate::WriteOptions;
+use crate::{FailOnCorruptionPolicy, WriteOptions, recovery, table};
 
 #[test]
 fn maintenance_success_does_not_clear_unreported_error() {
@@ -290,6 +290,54 @@ fn wasi_persistent_write_rejects_strict_sync_durability() {
         }
     ));
     drop(db);
+
+    cleanup_wasi_temp_db_path(path);
+}
+
+#[cfg(target_os = "wasi")]
+#[test]
+fn wasi_persistent_stale_lock_requires_explicit_repair() {
+    let path = temp_db_path("wasi-persistent-stale-lock");
+    let db = Db::open_sync(DbOptions::wasi_persistent(&path)).expect("WASI db opens");
+    db.put_sync(b"key", b"value").expect("WASI write succeeds");
+    drop(db);
+    fs::write(
+        path.join(recovery::PROCESS_LOCK_FILE_NAME),
+        b"pid=wasi\nnonce=stale\n",
+    )
+    .expect("stale lock marker writes");
+
+    let error = Db::open_sync(DbOptions::wasi_persistent(&path))
+        .expect_err("stale WASI lock requires explicit repair");
+    assert!(matches!(error, Error::Corruption { .. }));
+    assert!(error.to_string().contains("LOCK"));
+
+    let mut options = DbOptions::wasi_persistent(&path);
+    options.fail_on_corruption = FailOnCorruptionPolicy::RepairSafeTemporaryFiles;
+    let db = Db::open_sync(options).expect("WASI stale lock is repaired explicitly");
+    assert_eq!(
+        db.get_sync(b"key")
+            .expect("WASI read succeeds after repair"),
+        Some(b"value".to_vec())
+    );
+    drop(db);
+
+    cleanup_wasi_temp_db_path(path);
+}
+
+#[cfg(target_os = "wasi")]
+#[test]
+fn wasi_persistent_open_rejects_unreferenced_table_file() {
+    let path = temp_db_path("wasi-persistent-unreferenced-table");
+    let db = Db::open_sync(DbOptions::wasi_persistent(&path)).expect("WASI db opens");
+    drop(db);
+    let table_name = format!("table-{:020}.{}", 999_u64, table::TABLE_FILE_EXTENSION);
+    fs::write(path.join(&table_name), b"orphan table").expect("orphan table writes");
+
+    let error = Db::open_sync(DbOptions::wasi_persistent(&path))
+        .expect_err("WASI open rejects unreferenced table files");
+    assert!(matches!(error, Error::Corruption { .. }));
+    assert!(error.to_string().contains(&table_name));
 
     cleanup_wasi_temp_db_path(path);
 }

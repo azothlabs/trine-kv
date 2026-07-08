@@ -207,13 +207,20 @@ pub enum IndexSearchPolicy {
     Auto,
 }
 
-/// Startup policy when repairable temporary files are found.
+/// Startup policy when repairable files are found during open.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FailOnCorruptionPolicy {
     /// Report the files as corruption and leave them untouched.
     #[default]
     FailClosed,
-    /// Delete safe temporary files and write a recovery report.
+    /// Delete safe startup leftovers and write a recovery report.
+    ///
+    /// This only covers files that Trine knows are safe to remove before the
+    /// manifest is trusted: temporary publish files such as `MANIFEST.tmp`,
+    /// `table-*.tmp`, `blob-*.tmp`, and WAL rewrite temps. On WASI targets it
+    /// also covers a stale `LOCK` marker left by a terminated writer, because
+    /// WASI does not provide the native file-lock handle used on Unix and
+    /// Windows. It never repairs corrupt WAL, manifest, table, or blob contents.
     RepairSafeTemporaryFiles,
 }
 
@@ -304,7 +311,8 @@ pub struct DbOptions {
     pub wal_shards: WalShardPolicy,
     /// Runtime used for async, blocking, and background work.
     pub runtime: RuntimeOptions,
-    /// Startup policy for safe temporary files left by interrupted writes.
+    /// Startup policy for safe files left by interrupted writes or WASI writer
+    /// termination.
     pub fail_on_corruption: FailOnCorruptionPolicy,
     /// Number of most recent read versions retained even when no snapshot or
     /// checkpoint pins them.
