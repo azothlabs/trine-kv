@@ -2,6 +2,40 @@
 
 All public crate releases use Semantic Versioning.
 
+## 0.5.11 - 2026-07-09
+
+Browser worker OPFS hardening release. This patch keeps the `0.5.x` storage
+format compatible while making the browser persistent backend usable from
+DedicatedWorker and SharedWorker globals that expose OPFS.
+
+### Added
+
+- Browser persistent storage now opens the OPFS root through the current
+  global's `navigator.storage.getDirectory()`, so the backend is no longer tied
+  to a `window` object.
+- Worker-context browser file operations now use
+  `FileSystemSyncAccessHandle` for whole-object reads, random reads, object
+  writes, WAL append, manifest publish, and WAL rewrite.
+- The browser wasm integration suite now includes real DedicatedWorker and
+  SharedWorker Trine database round trips, plus SharedWorker sync-access
+  capability, exclusivity, and timing probes.
+
+### Fixed
+
+- SharedWorker browser opens no longer fail merely because `web_sys::window()`
+  is unavailable.
+- Worker contexts that expose OPFS without `FileSystemSyncAccessHandle` now
+  return `UnsupportedBackend` instead of falling through to the Window-oriented
+  async file path.
+- OPFS sync access handles are scoped to one storage operation and closed before
+  returning, avoiding a live-handle conflict with later operations on the same
+  file.
+
+### Changed
+
+- Browser persistence docs now describe the Window and worker backend split and
+  the worker requirement for `FileSystemSyncAccessHandle`.
+
 ## 0.5.10 - 2026-07-09
 
 WASI and browser persistence hardening release. This patch keeps the `0.5.x`
