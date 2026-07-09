@@ -2,6 +2,54 @@
 
 All public crate releases use Semantic Versioning.
 
+## 0.5.10 - 2026-07-09
+
+WASI and browser persistence hardening release. This patch keeps the `0.5.x`
+storage format compatible while making host-selected persistent backends more
+usable and better covered by runtime verification.
+
+### Added
+
+- **WASI persistent open support**: `DbOptions::wasi_persistent` now uses the
+  host-preopened filesystem on `wasm32-wasip1`, including inline WAL behavior,
+  WASI-safe writer lease handling, and startup recovery for interrupted writes.
+- **Browser persistent namespace options**:
+  `DbOptions::browser_persistent`, `DbOptions::browser_persistent_at`,
+  `DbOptions::browser_persistent_read_only`, and
+  `DbOptions::browser_persistent_read_only_at` select OPFS-backed browser
+  storage namespaces explicitly.
+- **`trine_kv::browser` storage helpers**:
+  `browser_storage_estimate`, `browser_persistent_storage_granted`, and
+  `request_browser_persistent_storage` expose the browser storage-manager
+  checks callers need before keeping important local data in OPFS.
+- CI and publish verification now include targeted WASI runtime checks and a
+  real browser OPFS/Web Locks integration gate.
+
+### Fixed
+
+- WASI flush, compaction, blob cleanup, and WAL paths now honor the host
+  backend's `Flush` durability boundary instead of requesting unsupported file
+  sync modes.
+- WASI startup recovery now treats stale `LOCK` markers as repair candidates
+  instead of letting a leftover marker permanently block reopen.
+- Browser WAL appends now write only new bytes through OPFS, serialize appends
+  per WAL shard, and honor explicit `WalShardPolicy` choices while defaulting
+  host-selected WASM persistence to one WAL lane.
+- Browser namespace paths are normalized before OPFS access and Web Locks
+  naming, so path aliases share the same writer lease.
+- Read-only browser open now fails with not-found when the selected namespace
+  has no manifest instead of creating missing storage.
+- Browser bucket drop, safe-temporary repair, blob-backed reads, oversized
+  manifest rejection, and unflushed WAL reopen are covered by the browser
+  integration test.
+
+### Changed
+
+- Browser persistence is documented as async-only and operation-level
+  non-cancelable after first poll for writes and maintenance.
+- WASI and browser persistent options now default to `Flush`, and unsupported
+  durability modes return typed errors.
+
 ## 0.5.9 - 2026-07-06
 
 Maintenance hardening release. This patch keeps the `0.5.x` storage format
