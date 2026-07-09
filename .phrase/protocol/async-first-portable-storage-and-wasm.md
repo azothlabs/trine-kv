@@ -577,6 +577,9 @@ Rules:
   `wasm32-unknown-unknown` for read-only persistent open;
 - browser persistent storage uses an OPFS-backed adapter behind Trine storage
   traits on `wasm32-unknown-unknown`;
+- browser persistent storage must open the OPFS root through the current browser
+  global's `navigator.storage.getDirectory()` rather than through a `window`
+  object;
 - browser namespace paths are normalized once during open and that normalized
   path is used for OPFS object paths and Web Locks writer-lease names;
 - browser storage exposes WAL append, WAL rewrite, and writer lease operations
@@ -603,10 +606,18 @@ Rules:
 - browser whole-object reads must check the object kind's maximum byte length
   before reading the object bytes and check the returned byte length again;
 - browser WAL append is a Trine-owned operation boundary. Because OPFS does not
-  provide a native append primitive through the current browser adapter, the
-  browser WAL front door must serialize read/append/write-back work per WAL
-  shard. `WalShardPolicy::Auto` uses one browser WAL lane; explicit fixed lane
-  counts are honored only with per-shard async append guards;
+  provide a shared append primitive across Window and worker contexts, the
+  browser WAL front door must serialize append work per WAL shard.
+  `WalShardPolicy::Auto` uses one browser WAL lane; explicit fixed lane counts
+  are honored only with per-shard async append guards;
+- worker-context browser storage uses OPFS synchronous access handles for file
+  byte reads, whole-object reads, object writes, WAL append, manifest publish,
+  and WAL rewrite. The access handle must be opened for one operation and
+  closed before returning to Trine. Worker globals that expose OPFS but do not
+  expose `FileSystemSyncAccessHandle` must fail with `UnsupportedBackend`
+  instead of falling back to the Window-oriented async file-byte path;
+- Window-context browser storage continues to use the async OPFS writable-stream
+  and file APIs because synchronous access handles are Worker-only;
 - durability strength is capability-reported and may be weaker than native
   strict sync;
 - background maintenance must be cooperative and budgeted;

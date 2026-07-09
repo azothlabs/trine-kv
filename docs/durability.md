@@ -94,7 +94,16 @@ provide:
   writable open, and uses WAL-backed async writes. Browser WAL append keeps the
   existing OPFS file and writes only new bytes at the current file end; WAL
   rewrite and manifest publish use OPFS writable-stream close as the visible
-  cutover point and leave safe temporary files for recovery policy checks.
+  cutover point and leave safe temporary files for recovery policy checks. The
+  OPFS root is opened from the current browser global's
+  `navigator.storage.getDirectory()` instead of a `window` object. In worker
+  contexts, Trine requires `FileSystemSyncAccessHandle`; file byte reads,
+  writes, WAL append, manifest publish, and WAL rewrite use OPFS synchronous
+  access handles and call `flush()` for Trine's `Flush` durability mode. Window
+  contexts continue to use the async OPFS writable-stream path. The browser
+  integration gate covers this with real DedicatedWorker and SharedWorker
+  database round trips, a SharedWorker sync-handle exclusivity probe, and a
+  lightweight sync-handle timing probe.
 
 Synchronous browser persistent open, mutation, bucket creation, and maintenance
 `*_sync` adapters return typed unsupported errors. Browser callers should use

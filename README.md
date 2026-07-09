@@ -63,7 +63,12 @@ explains persistence guarantees and limits. Release packaging notes live in
 - Explicit WASI and browser persistent options. WASI uses a host-preopened
   filesystem path on WASI targets and supports `Db::open` through the
   host storage boundary. Browser persistence uses the async API and the browser
-  persistent backend on `wasm32-unknown-unknown`; use
+  persistent backend on `wasm32-unknown-unknown` when the host global exposes
+  `navigator.storage.getDirectory()`, including Window and worker contexts that
+  provide that API. Worker contexts also need OPFS
+  `FileSystemSyncAccessHandle` support; Trine uses those handles for byte
+  reads, WAL append, manifest publish, and WAL rewrite while keeping the public
+  database API async. Use
   `DbOptions::browser_persistent_at(path)` when separate browser namespaces
   should not share WAL, manifest, table, or blob files. Browser builds also
   expose `trine_kv::browser` helpers for storage estimates and persistent
@@ -271,7 +276,10 @@ cargo bench --bench v1_bench
 - Browser persistence is async-only: use `Db::open` plus async mutation
   and maintenance methods. Browser WAL appends write only new bytes through
   OPFS, are serialized per shard, and `WalShardPolicy::Auto` uses one browser
-  WAL lane by default. Use `trine_kv::browser` helpers to inspect storage
+  WAL lane by default. In Window contexts Trine uses the browser async OPFS API;
+  in worker contexts it uses OPFS synchronous access handles for file byte
+  reads, writes, WAL append, manifest publish, and WAL rewrite. Use
+  `trine_kv::browser` helpers to inspect storage
   estimates and request persistent browser storage when eviction risk matters.
   Synchronous browser persistent open, mutation, and maintenance `*_sync` APIs
   return typed unsupported errors.

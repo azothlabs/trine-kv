@@ -52,11 +52,18 @@ mod browser_persistent_storage {
     use js_sys::{Function, Promise, Reflect};
     use opfs::{
         CreateWritableOptions, DirectoryEntry, DirectoryHandle as _, FileHandle as _,
-        FileSystemRemoveOptions, GetDirectoryHandleOptions, GetFileHandleOptions,
-        WritableFileStream as _,
+        FileSystemRemoveOptions, GetDirectoryHandleOptions as OpfsGetDirectoryHandleOptions,
+        GetFileHandleOptions as OpfsGetFileHandleOptions, WritableFileStream as _,
         persistent::{self, DirectoryHandle, FileHandle},
     };
     use wasm_bindgen::{JsCast, JsValue};
+    use wasm_bindgen_futures::JsFuture;
+    use web_sys::{
+        FileSystemDirectoryHandle, FileSystemFileHandle,
+        FileSystemGetDirectoryOptions as WebGetDirectoryOptions,
+        FileSystemGetFileOptions as WebGetFileOptions, FileSystemReadWriteOptions,
+        FileSystemSyncAccessHandle,
+    };
 
     use super::{
         DurabilityMode, Error, Result, StorageAppendBackend, StorageAppendObject,
@@ -66,24 +73,20 @@ mod browser_persistent_storage {
         StorageObjectId, StorageObjectKind, StorageObjectListBackend, StorageObjectListRequest,
         StorageObjectReadBackend, StorageObjectWriteBackend, StorageReadBackend, StorageReadFuture,
         StorageReadObject, StorageWalRewriteBackend, StorageWriterLeaseBackend,
-        ensure_whole_object_read_len, native_file_objects_from_paths, usize_to_u64,
+        allocate_read_buffer, ensure_whole_object_read_len, native_file_objects_from_paths,
+        usize_to_u64,
     };
 
     #[derive(Debug, Clone)]
     pub(crate) struct BrowserStorageBackend {
         root: DirectoryHandle,
+        web_root: FileSystemDirectoryHandle,
     }
 
     impl BrowserStorageBackend {
         pub(crate) async fn new() -> Result<Self> {
-            let root = persistent::app_specific_dir()
-                .await
-                .map_err(|error| map_opfs_error(&error))?;
-            Ok(Self { root })
-        }
-
-        pub(crate) fn from_root(root: DirectoryHandle) -> Self {
-            Self { root }
+            let (root, web_root) = browser_opfs_roots().await?;
+            Ok(Self { root, web_root })
         }
 
         pub(crate) fn normalize_namespace_path(path: &Path) -> Result<PathBuf> {
@@ -124,7 +127,7 @@ mod browser_persistent_storage {
             create: bool,
         ) -> Result<Option<DirectoryHandle>> {
             let mut directory = self.root.clone();
-            let options = GetDirectoryHandleOptions { create };
+            let options = OpfsGetDirectoryHandleOptions { create };
             for segment in segments {
                 directory = match directory
                     .get_directory_handle_with_options(segment, &options)
@@ -167,7 +170,7 @@ mod browser_persistent_storage {
             else {
                 return Ok(None);
             };
-            let options = GetFileHandleOptions { create };
+            let options = OpfsGetFileHandleOptions { create };
             match directory
                 .get_file_handle_with_options(&name, &options)
                 .await
@@ -178,11 +181,74 @@ mod browser_persistent_storage {
             }
         }
 
+        async fn web_directory_from_segments(
+            &self,
+            segments: &[String],
+            create: bool,
+        ) -> Result<Option<FileSystemDirectoryHandle>> {
+            let mut directory = self.web_root.clone();
+            let options = WebGetDirectoryOptions::new();
+            options.set_create(create);
+            for segment in segments {
+                let promise = directory.get_directory_handle_with_options(segment, &options);
+                directory = match JsFuture::from(promise).await {
+                    Ok(directory) => directory
+                        .dyn_into::<FileSystemDirectoryHandle>()
+                        .map_err(|_| Error::unsupported_backend("browser OPFS directory handle"))?,
+                    Err(error) if !create && is_opfs_not_found(&error) => return Ok(None),
+                    Err(error) => {
+                        return Err(map_js_value_error(&error, "open browser OPFS directory"));
+                    }
+                };
+            }
+            Ok(Some(directory))
+        }
+
+        async fn web_parent_directory_and_name(
+            &self,
+            path: &Path,
+            create: bool,
+        ) -> Result<Option<(FileSystemDirectoryHandle, String)>> {
+            let mut segments = opfs_path_segments(path)?;
+            let name = segments.pop().ok_or_else(|| {
+                Error::invalid_options("browser persistent object path must include a file name")
+            })?;
+            let Some(directory) = self.web_directory_from_segments(&segments, create).await? else {
+                return Ok(None);
+            };
+            Ok(Some((directory, name)))
+        }
+
+        async fn web_file_handle(
+            &self,
+            path: &Path,
+            create: bool,
+        ) -> Result<Option<FileSystemFileHandle>> {
+            let Some((directory, name)) = self.web_parent_directory_and_name(path, create).await?
+            else {
+                return Ok(None);
+            };
+            let options = WebGetFileOptions::new();
+            options.set_create(create);
+            let promise = directory.get_file_handle_with_options(&name, &options);
+            match JsFuture::from(promise).await {
+                Ok(file) => file
+                    .dyn_into::<FileSystemFileHandle>()
+                    .map(Some)
+                    .map_err(|_| Error::unsupported_backend("browser OPFS file handle")),
+                Err(error) if !create && is_opfs_not_found(&error) => Ok(None),
+                Err(error) => Err(map_js_value_error(&error, "open browser OPFS file")),
+            }
+        }
+
         async fn read_object_bytes_inner(
             &self,
             object: &StorageObjectId,
         ) -> Result<Option<Arc<[u8]>>> {
             Self::capabilities_for_browser().require(StorageCapability::ObjectRead)?;
+            if browser_uses_sync_access_handles()? {
+                return self.read_object_bytes_sync(object).await;
+            }
             let Some(file) = self.file_handle(object.path(), false).await? else {
                 return Ok(None);
             };
@@ -190,6 +256,21 @@ mod browser_persistent_storage {
             ensure_whole_object_read_len(object, len)?;
             let bytes = file.read().await.map_err(|error| map_opfs_error(&error))?;
             ensure_whole_object_read_len(object, bytes.len())?;
+            Ok(Some(Arc::from(bytes)))
+        }
+
+        async fn read_object_bytes_sync(
+            &self,
+            object: &StorageObjectId,
+        ) -> Result<Option<Arc<[u8]>>> {
+            let Some(file) = self.web_file_handle(object.path(), false).await? else {
+                return Ok(None);
+            };
+            let handle = BrowserSyncAccessHandle::open(&file, Some(object.clone())).await?;
+            let len = handle.len()?;
+            ensure_whole_object_read_len(object, len)?;
+            let mut bytes = allocate_read_buffer(len)?;
+            handle.read_exact_at(0, &mut bytes)?;
             Ok(Some(Arc::from(bytes)))
         }
 
@@ -201,7 +282,7 @@ mod browser_persistent_storage {
                     "browser persistent object path parent cannot be opened",
                 ));
             };
-            let options = GetFileHandleOptions { create: true };
+            let options = OpfsGetFileHandleOptions { create: true };
             let mut file = directory
                 .get_file_handle_with_options(&name, &options)
                 .await
@@ -224,6 +305,39 @@ mod browser_persistent_storage {
             Ok(())
         }
 
+        async fn write_object_bytes_with_durability(
+            &self,
+            object: &StorageObjectId,
+            bytes: &[u8],
+            durability: DurabilityMode,
+        ) -> Result<()> {
+            if browser_uses_sync_access_handles()? {
+                self.write_object_bytes_sync(object, bytes, durability)
+                    .await
+            } else {
+                self.write_object_bytes(object, bytes).await
+            }
+        }
+
+        async fn write_object_bytes_sync(
+            &self,
+            object: &StorageObjectId,
+            bytes: &[u8],
+            durability: DurabilityMode,
+        ) -> Result<()> {
+            let Some(file) = self.web_file_handle(object.path(), true).await? else {
+                return Err(Error::invalid_options(
+                    "browser persistent object path parent cannot be opened",
+                ));
+            };
+            let handle = BrowserSyncAccessHandle::open(&file, Some(object.clone())).await?;
+            handle.truncate(0)?;
+            handle.write_all_at(0, bytes)?;
+            handle.truncate(bytes.len())?;
+            handle.flush_if_needed(durability)?;
+            Ok(())
+        }
+
         async fn append_object_bytes(&self, object: &StorageObjectId, bytes: &[u8]) -> Result<()> {
             require_browser_wal_object(object)?;
             let Some((directory, name)) =
@@ -233,7 +347,7 @@ mod browser_persistent_storage {
                     "browser persistent WAL parent cannot be opened",
                 ));
             };
-            let options = GetFileHandleOptions { create: true };
+            let options = OpfsGetFileHandleOptions { create: true };
             let mut file = directory
                 .get_file_handle_with_options(&name, &options)
                 .await
@@ -264,6 +378,43 @@ mod browser_persistent_storage {
                 .map_err(|error| map_opfs_error(&error))?;
             Ok(())
         }
+
+        async fn append_object_bytes_with_durability(
+            &self,
+            object: &StorageObjectId,
+            bytes: &[u8],
+            durability: DurabilityMode,
+        ) -> Result<()> {
+            if browser_uses_sync_access_handles()? {
+                self.append_object_bytes_sync(object, bytes, durability)
+                    .await
+            } else {
+                self.append_object_bytes(object, bytes).await
+            }
+        }
+
+        async fn append_object_bytes_sync(
+            &self,
+            object: &StorageObjectId,
+            bytes: &[u8],
+            durability: DurabilityMode,
+        ) -> Result<()> {
+            require_browser_wal_object(object)?;
+            let Some(file) = self.web_file_handle(object.path(), true).await? else {
+                return Err(Error::invalid_options(
+                    "browser persistent WAL parent cannot be opened",
+                ));
+            };
+            let handle = BrowserSyncAccessHandle::open(&file, Some(object.clone())).await?;
+            let len = handle.len()?;
+            let next_len = len.checked_add(bytes.len()).ok_or_else(|| {
+                Error::invalid_options("browser persistent WAL append length overflow")
+            })?;
+            ensure_whole_object_read_len(object, next_len)?;
+            handle.write_all_at(len, bytes)?;
+            handle.flush_if_needed(durability)?;
+            Ok(())
+        }
     }
 
     impl StorageReadBackend for BrowserStorageBackend {
@@ -275,14 +426,16 @@ mod browser_persistent_storage {
 
         fn open_read(&self, object: StorageObjectId) -> StorageReadFuture<'_, Self::ReadObject> {
             Box::pin(async move {
-                let Some(file) = self.file_handle(object.path(), false).await? else {
-                    return Err(Error::Corruption {
-                        message: format!(
-                            "referenced browser persistent {} {} cannot be opened",
-                            object.kind().as_str(),
-                            object.path().display()
-                        ),
-                    });
+                let file = if browser_uses_sync_access_handles()? {
+                    let Some(file) = self.web_file_handle(object.path(), false).await? else {
+                        return Err(referenced_browser_object_missing(&object));
+                    };
+                    BrowserStorageObjectFile::Sync(file)
+                } else {
+                    let Some(file) = self.file_handle(object.path(), false).await? else {
+                        return Err(referenced_browser_object_missing(&object));
+                    };
+                    BrowserStorageObjectFile::Async(file)
                 };
                 Ok(BrowserStorageObject { object, file })
             })
@@ -362,7 +515,8 @@ mod browser_persistent_storage {
                 Self::capabilities_for_browser()
                     .require(StorageCapability::AtomicManifestPublish)?;
                 require_browser_durability(durability)?;
-                self.write_object_bytes(&object, &bytes).await
+                self.write_object_bytes_with_durability(&object, &bytes, durability)
+                    .await
             })
         }
     }
@@ -378,7 +532,8 @@ mod browser_persistent_storage {
                 require_browser_object_write(&object)?;
                 Self::capabilities_for_browser().require(StorageCapability::ObjectWrite)?;
                 require_browser_durability(durability)?;
-                self.write_object_bytes(&object, &bytes).await
+                self.write_object_bytes_with_durability(&object, &bytes, durability)
+                    .await
             })
         }
     }
@@ -453,8 +608,10 @@ mod browser_persistent_storage {
         ) -> StorageFuture<'_, ()> {
             Box::pin(async move {
                 prepare_browser_wal_rewrite(&object, &temporary_object, durability)?;
-                self.write_object_bytes(&temporary_object, &bytes).await?;
-                self.write_object_bytes(&object, &bytes).await?;
+                self.write_object_bytes_with_durability(&temporary_object, &bytes, durability)
+                    .await?;
+                self.write_object_bytes_with_durability(&object, &bytes, durability)
+                    .await?;
                 self.delete_object(temporary_object).await
             })
         }
@@ -474,7 +631,13 @@ mod browser_persistent_storage {
     #[derive(Debug, Clone)]
     pub(crate) struct BrowserStorageObject {
         object: StorageObjectId,
-        file: FileHandle,
+        file: BrowserStorageObjectFile,
+    }
+
+    #[derive(Debug, Clone)]
+    enum BrowserStorageObjectFile {
+        Async(FileHandle),
+        Sync(FileSystemFileHandle),
     }
 
     impl StorageReadObject for BrowserStorageObject {
@@ -484,12 +647,17 @@ mod browser_persistent_storage {
 
         fn len(&self) -> StorageReadFuture<'_, u64> {
             Box::pin(async move {
-                let len = self
-                    .file
-                    .size()
-                    .await
-                    .map_err(|error| map_opfs_error(&error))?;
-                usize_to_u64(len, "browser persistent object length")
+                match &self.file {
+                    BrowserStorageObjectFile::Async(file) => {
+                        let len = file.size().await.map_err(|error| map_opfs_error(&error))?;
+                        usize_to_u64(len, "browser persistent object length")
+                    }
+                    BrowserStorageObjectFile::Sync(file) => {
+                        let handle =
+                            BrowserSyncAccessHandle::open(file, Some(self.object.clone())).await?;
+                        usize_to_u64(handle.len()?, "browser persistent object length")
+                    }
+                }
             })
         }
 
@@ -499,25 +667,26 @@ mod browser_persistent_storage {
             bytes: &'op mut [u8],
         ) -> StorageReadFuture<'op, ()> {
             Box::pin(async move {
-                let end = offset.checked_add(bytes.len()).ok_or_else(|| {
-                    Error::invalid_options("browser persistent object read offset overflow")
-                })?;
-                let read = self
-                    .file
-                    .read_range(offset..end)
-                    .await
-                    .map_err(|error| map_opfs_error(&error))?;
-                if read.len() != bytes.len() {
-                    return Err(Error::Io(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "referenced browser persistent {} {} short read",
-                            self.object.kind().as_str(),
-                            self.object.path().display()
-                        ),
-                    )));
+                match &self.file {
+                    BrowserStorageObjectFile::Async(file) => {
+                        let end = offset.checked_add(bytes.len()).ok_or_else(|| {
+                            Error::invalid_options("browser persistent object read offset overflow")
+                        })?;
+                        let read = file
+                            .read_range(offset..end)
+                            .await
+                            .map_err(|error| map_opfs_error(&error))?;
+                        if read.len() != bytes.len() {
+                            return Err(short_browser_read(&self.object));
+                        }
+                        bytes.copy_from_slice(&read);
+                    }
+                    BrowserStorageObjectFile::Sync(file) => {
+                        let handle =
+                            BrowserSyncAccessHandle::open(file, Some(self.object.clone())).await?;
+                        handle.read_exact_at(offset, bytes)?;
+                    }
                 }
-                bytes.copy_from_slice(&read);
                 Ok(())
             })
         }
@@ -537,7 +706,9 @@ mod browser_persistent_storage {
             Box::pin(async move {
                 require_browser_wal_object(&self.object)?;
                 require_browser_durability(durability)?;
-                self.backend.append_object_bytes(&self.object, bytes).await
+                self.backend
+                    .append_object_bytes_with_durability(&self.object, bytes, durability)
+                    .await
             })
         }
 
@@ -573,6 +744,27 @@ mod browser_persistent_storage {
             ));
         }
         Ok(())
+    }
+
+    fn referenced_browser_object_missing(object: &StorageObjectId) -> Error {
+        Error::Corruption {
+            message: format!(
+                "referenced browser persistent {} {} cannot be opened",
+                object.kind().as_str(),
+                object.path().display()
+            ),
+        }
+    }
+
+    fn short_browser_read(object: &StorageObjectId) -> Error {
+        Error::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "referenced browser persistent {} {} short read",
+                object.kind().as_str(),
+                object.path().display()
+            ),
+        ))
     }
 
     fn require_browser_object_write(object: &StorageObjectId) -> Result<()> {
@@ -722,8 +914,76 @@ mod browser_persistent_storage {
         Ok(locks)
     }
 
+    async fn browser_opfs_roots() -> Result<(DirectoryHandle, FileSystemDirectoryHandle)> {
+        let navigator = Reflect::get(&js_sys::global(), &JsValue::from_str("navigator"))
+            .map_err(|error| map_js_value_error(&error, "read browser navigator"))?;
+        if navigator.is_null() || navigator.is_undefined() {
+            return Err(Error::unsupported_backend("browser navigator"));
+        }
+
+        let storage = Reflect::get(&navigator, &JsValue::from_str("storage"))
+            .map_err(|error| map_js_value_error(&error, "read browser storage manager"))?;
+        if storage.is_null() || storage.is_undefined() {
+            return Err(Error::unsupported_backend("browser storage manager"));
+        }
+
+        let get_directory = Reflect::get(&storage, &JsValue::from_str("getDirectory"))
+            .map_err(|error| map_js_value_error(&error, "read browser OPFS root function"))?
+            .dyn_into::<Function>()
+            .map_err(|_| Error::unsupported_backend("browser OPFS root function"))?;
+        let promise = get_directory
+            .call0(&storage)
+            .map_err(|error| map_js_value_error(&error, "request browser OPFS root"))?
+            .dyn_into::<Promise>()
+            .map_err(|_| Error::unsupported_backend("browser OPFS root promise"))?;
+        let root = JsFuture::from(promise)
+            .await
+            .map_err(|error| map_js_value_error(&error, "await browser OPFS root"))?
+            .dyn_into::<FileSystemDirectoryHandle>()
+            .map_err(|_| Error::unsupported_backend("browser OPFS root handle"))?;
+        Ok((DirectoryHandle::from(root.clone()), root))
+    }
+
     fn browser_web_locks_available() -> bool {
         browser_lock_manager().is_ok()
+    }
+
+    fn browser_uses_sync_access_handles() -> Result<bool> {
+        if browser_window_global_available() {
+            return Ok(false);
+        }
+        if browser_sync_access_handle_api_available() {
+            return Ok(true);
+        }
+        Err(Error::unsupported_backend(
+            "browser OPFS sync access handle in Worker",
+        ))
+    }
+
+    fn browser_window_global_available() -> bool {
+        Reflect::get(&js_sys::global(), &JsValue::from_str("window"))
+            .is_ok_and(|window| !window.is_null() && !window.is_undefined())
+    }
+
+    fn browser_sync_access_handle_api_available() -> bool {
+        let Ok(file_handle_ctor) = Reflect::get(
+            &js_sys::global(),
+            &JsValue::from_str("FileSystemFileHandle"),
+        ) else {
+            return false;
+        };
+        if file_handle_ctor.is_null() || file_handle_ctor.is_undefined() {
+            return false;
+        }
+        let Ok(prototype) = Reflect::get(&file_handle_ctor, &JsValue::from_str("prototype")) else {
+            return false;
+        };
+        let Ok(create_sync_access_handle) =
+            Reflect::get(&prototype, &JsValue::from_str("createSyncAccessHandle"))
+        else {
+            return false;
+        };
+        create_sync_access_handle.dyn_ref::<Function>().is_some()
     }
 
     fn browser_writer_lease_name(object: &StorageObjectId) -> String {
@@ -799,6 +1059,135 @@ mod browser_persistent_storage {
         Reflect::get(value, &JsValue::from_str(property))
             .ok()
             .and_then(|value| value.as_string())
+    }
+
+    struct BrowserSyncAccessHandle {
+        object: Option<StorageObjectId>,
+        handle: FileSystemSyncAccessHandle,
+    }
+
+    impl BrowserSyncAccessHandle {
+        async fn open(
+            file: &FileSystemFileHandle,
+            object: Option<StorageObjectId>,
+        ) -> Result<Self> {
+            let handle = JsFuture::from(file.create_sync_access_handle())
+                .await
+                .map_err(|error| map_sync_access_open_error(&error))?
+                .dyn_into::<FileSystemSyncAccessHandle>()
+                .map_err(|_| Error::unsupported_backend("browser OPFS sync access handle"))?;
+            Ok(Self { object, handle })
+        }
+
+        fn len(&self) -> Result<usize> {
+            js_number_to_usize(
+                self.handle
+                    .get_size()
+                    .map_err(|error| map_js_value_error(&error, "read browser OPFS file size"))?,
+                "browser OPFS file size",
+            )
+        }
+
+        fn read_exact_at(&self, offset: usize, bytes: &mut [u8]) -> Result<()> {
+            let options = FileSystemReadWriteOptions::new();
+            options.set_at(usize_to_js_number(offset, "browser OPFS read offset")?);
+            let read = self
+                .handle
+                .read_with_u8_array_and_options(bytes, &options)
+                .map_err(|error| map_js_value_error(&error, "read browser OPFS sync handle"))?;
+            let read = js_number_to_usize(read, "browser OPFS read length")?;
+            if read == bytes.len() {
+                return Ok(());
+            }
+            if let Some(object) = &self.object {
+                return Err(short_browser_read(object));
+            }
+            Err(Error::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "browser OPFS sync handle short read",
+            )))
+        }
+
+        fn write_all_at(&self, offset: usize, bytes: &[u8]) -> Result<()> {
+            let options = FileSystemReadWriteOptions::new();
+            options.set_at(usize_to_js_number(offset, "browser OPFS write offset")?);
+            let written = self
+                .handle
+                .write_with_u8_array_and_options(bytes, &options)
+                .map_err(|error| map_js_value_error(&error, "write browser OPFS sync handle"))?;
+            let written = js_number_to_usize(written, "browser OPFS write length")?;
+            if written == bytes.len() {
+                return Ok(());
+            }
+            Err(Error::Io(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "browser OPFS sync handle short write",
+            )))
+        }
+
+        fn truncate(&self, len: usize) -> Result<()> {
+            self.handle
+                .truncate_with_f64(usize_to_js_number(len, "browser OPFS truncate length")?)
+                .map_err(|error| map_js_value_error(&error, "truncate browser OPFS sync handle"))
+        }
+
+        fn flush_if_needed(&self, durability: DurabilityMode) -> Result<()> {
+            require_browser_durability(durability)?;
+            if durability == DurabilityMode::Flush {
+                self.handle.flush().map_err(|error| {
+                    map_js_value_error(&error, "flush browser OPFS sync handle")
+                })?;
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for BrowserSyncAccessHandle {
+        fn drop(&mut self) {
+            self.handle.close();
+        }
+    }
+
+    fn map_sync_access_open_error(error: &JsValue) -> Error {
+        let name = js_value_property(error, "name");
+        if name.as_deref() == Some("InvalidStateError") {
+            return Error::runtime_busy("browser OPFS sync access handle is already open");
+        }
+        if matches!(
+            name.as_deref(),
+            Some("NotAllowedError" | "NotSupportedError" | "SecurityError" | "TypeError")
+        ) {
+            return Error::unsupported_backend("browser OPFS sync access handle");
+        }
+        map_js_value_error(error, "open browser OPFS sync access handle")
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
+    fn js_number_to_usize(value: f64, context: &'static str) -> Result<usize> {
+        if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > usize::MAX as f64 {
+            return Err(Error::Io(io::Error::other(format!(
+                "{context} was out of range"
+            ))));
+        }
+        Ok(value as usize)
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn usize_to_js_number(value: usize, context: &'static str) -> Result<f64> {
+        const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+        let value = u64::try_from(value).map_err(|_| {
+            Error::invalid_options(format!("{context} exceeds JavaScript safe integer range"))
+        })?;
+        if value > MAX_SAFE_INTEGER {
+            return Err(Error::invalid_options(format!(
+                "{context} exceeds JavaScript safe integer range"
+            )));
+        }
+        Ok(value as f64)
     }
 }
 

@@ -80,6 +80,14 @@ js-sys = "0.3.99"
 opfs = "0.2.0"
 wasm-bindgen = "0.2.122"
 wasm-bindgen-futures = "0.4.72"
+web-sys = { version = "0.3.99", features = [
+    "FileSystemDirectoryHandle",
+    "FileSystemFileHandle",
+    "FileSystemGetDirectoryOptions",
+    "FileSystemGetFileOptions",
+    "FileSystemReadWriteOptions",
+    "FileSystemSyncAccessHandle",
+] }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
 wasm-bindgen-test = "0.3.55"

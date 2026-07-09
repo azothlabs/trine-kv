@@ -247,15 +247,27 @@ db.flush().await?;
 ```
 
 The browser persistent backend uses browser storage APIs behind Trine's storage
-traits. Writable open acquires a Web Locks writer lease, replays WAL, and uses
-WAL-backed async writes. Browser WAL appends use an OPFS writable stream with
-existing data kept and the cursor moved to the current file end, so ordinary
-commits write only the new WAL bytes instead of rewriting the whole WAL file.
+traits. It opens the OPFS root through `navigator.storage.getDirectory()` on the
+current browser global, so it is not tied to a `window` object when the same
+storage manager API is available from a worker context. Writable open acquires
+a Web Locks writer lease, replays WAL, and uses WAL-backed async writes. Browser
+WAL appends write only the new WAL bytes instead of rewriting the whole WAL
+file. In Window contexts that append uses an OPFS writable stream with existing
+data kept and the cursor moved to the current file end. In worker contexts Trine
+uses `FileSystemSyncAccessHandle` for file byte reads, writes, WAL append,
+manifest publish, and WAL rewrite, opening the access handle only for the
+operation and closing it immediately afterward. If a worker global has OPFS but
+does not expose synchronous access handles, browser persistent open reports an
+unsupported backend instead of silently using the Window-oriented path. The
+browser integration test runs the same database round trip from both
+DedicatedWorker and SharedWorker: write and delete through WAL, flush, compact,
+reopen read-only, and verify default-bucket plus named-bucket blob-backed data.
 Browser WAL appends are still serialized per shard because OPFS does not expose
-Trine's native append contract. `WalShardPolicy::Auto` therefore uses one
-browser WAL lane by default; explicit `Fixed(n)` policies are honored and each
-lane has its own async append guard. Browser storage accepts `Buffered` and
-`Flush`; `SyncData`, `SyncAll`, and `SyncAllStrict` return
+Trine's native append contract as a shared cross-context file primitive.
+`WalShardPolicy::Auto` therefore uses one browser WAL lane by default; explicit
+`Fixed(n)` policies are honored and each lane has its own async append guard.
+Browser storage accepts `Buffered` and `Flush`; `SyncData`, `SyncAll`, and
+`SyncAllStrict` return
 `UnsupportedDurability`. Synchronous browser persistent open, synchronous
 mutation, synchronous bucket creation, and synchronous maintenance return typed
 unsupported errors. On non-browser targets, browser persistent async open

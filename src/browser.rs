@@ -153,6 +153,11 @@ fn storage_function(storage: &JsValue, method: &'static str) -> Result<Function>
         .map_err(|_| Error::unsupported_backend("browser storage manager function"))
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 fn reflect_optional_u64(value: &JsValue, property: &'static str) -> Result<Option<u64>> {
     let value = Reflect::get(value, &JsValue::from_str(property))
         .map_err(|error| map_js_value_error(&error, "read browser storage estimate field"))?;

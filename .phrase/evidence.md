@@ -85,6 +85,82 @@ Record only evidence that can change planning or durable decisions.
   CI. Future browser storage work should add a browser integration test before
   claiming support for a new OPFS/Web Locks behavior.
 
+## 2026-07-09: Browser OPFS Worker Sync Access
+
+### Observation
+
+- The `opfs` crate v0.2.0 helper `persistent::app_specific_dir()` calls
+  `web_sys::window()` before opening `navigator.storage.getDirectory()`.
+- Trine's browser backend and browser test helper used that helper, so OPFS open
+  depended on a Window global even though worker globals can expose
+  `navigator.storage`.
+- Trine now opens the OPFS root through
+  `globalThis.navigator.storage.getDirectory()` and keeps both the existing
+  `opfs` wrapper root and the native `web_sys::FileSystemDirectoryHandle`.
+- Worker-context file byte operations now use OPFS synchronous access handles:
+  whole-object reads, random reads, object writes, WAL append, manifest publish,
+  and WAL rewrite open a `FileSystemSyncAccessHandle` for one operation and close
+  it before returning.
+- Window-context browser storage keeps the async OPFS writable-stream path.
+- Worker-context browser storage now explicitly requires
+  `FileSystemSyncAccessHandle`; OPFS workers without that API report
+  `UnsupportedBackend` instead of falling back to the Window-oriented file-byte
+  path.
+- The browser wasm test now exports a Rust `workerTrineDbRoundTrip` entrypoint
+  and runs it from both DedicatedWorker and SharedWorker. The worker task opens
+  a browser persistent database, writes and deletes through WAL, flushes,
+  compacts, reopens read-only, and verifies default-bucket plus named-bucket
+  blob-backed data.
+- The browser wasm test also includes SharedWorker probes for sync-access
+  capability, sync-handle exclusivity, and a lightweight timing report for 64
+  sync writes plus one flush.
+- CI and publish workflows already install Chrome, ChromeDriver, and
+  `wasm-bindgen-test-runner` before running `browser_persistent_wasm`, so the
+  new Worker tests are part of the existing real browser gate.
+
+### Interpretation
+
+- Browser persistent storage is no longer structurally main-thread-only and now
+  has a real Worker-only OPFS sync-access path for file bytes.
+- Trine still exposes this through the primary async database API; synchronous
+  browser `*_sync` public adapters remain unsupported.
+- DedicatedWorker and SharedWorker now exercise the actual Trine DB path inside
+  the worker, not only the raw host OPFS API.
+- The exclusivity probe verifies the browser behavior that Trine maps to
+  `RuntimeBusy`, while the timing probe records that the fast sync-access path
+  is the path under test without asserting machine-specific latency.
+
+### Verification
+
+- `cargo fmt --check`
+- `cargo check -q`
+- `cargo check -q --all-features`
+- `cargo check -q --target wasm32-unknown-unknown --no-default-features --lib`
+- `cargo check -q --target wasm32-unknown-unknown --no-default-features --features platform-io --lib`
+- `cargo check -q --target wasm32-unknown-unknown --no-default-features --features platform-io-native --lib`
+- `cargo clippy -q --target wasm32-unknown-unknown --test browser_persistent_wasm -- -D warnings`
+- `cargo test -q --target wasm32-unknown-unknown --test browser_persistent_wasm --no-run`
+- `cargo test -q`
+- `cargo clippy -q --all-features --all-targets -- -D warnings`
+- `CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner cargo
+  test --target wasm32-unknown-unknown --test browser_persistent_wasm` was
+  attempted locally. Without escalation, the runner could not spawn its local
+  test server. With escalation, it launched the runner but defaulted to Safari
+  WebDriver on `http://127.0.0.1:*`; the driver exited with SIGKILL before tests
+  entered the page.
+- Checked local browser driver availability: `/Applications/Google Chrome.app`
+  exists, but `chromedriver` was not found on `PATH` or under the user tree.
+### Remaining Blockers
+
+- Local runtime execution on this Mac still needs either a working Safari
+  WebDriver or local ChromeDriver. CI already provisions ChromeDriver.
+
+### Recommended Next Action
+
+- Treat CI ChromeDriver as the authoritative runtime browser gate until this
+  host has a working local WebDriver. Future Worker storage changes should add
+  cases to `browser_persistent_wasm` before claiming support.
+
 ## 2026-06-29: 0.5.8 Local Release Prep
 
 ### Observation

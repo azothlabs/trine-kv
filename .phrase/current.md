@@ -56,6 +56,22 @@ file behind. The browser integration test now also covers many unflushed WAL
 appends, browser storage-manager status, safe WAL temp fail-closed behavior, and
 explicit safe-temp repair.
 
+SharedWorker review found a browser host-boundary leak: Trine's OPFS backend
+used the `opfs` crate's `app_specific_dir()` helper, which calls
+`web_sys::window()` and therefore cannot open OPFS from worker globals. Trine now
+opens the OPFS root through `globalThis.navigator.storage.getDirectory()` and
+keeps both the existing `opfs` wrapper root and the native `web_sys` root.
+Worker-context file bytes now use OPFS synchronous access handles for
+whole-object reads, random reads, object writes, WAL append, manifest publish,
+and WAL rewrite; each access handle is scoped to one storage operation and
+closed before returning. Window-context browser storage keeps the async OPFS
+path. Worker globals that expose OPFS without `FileSystemSyncAccessHandle` now
+fail with `UnsupportedBackend` instead of silently using the Window path. The
+browser wasm test now includes real DedicatedWorker and SharedWorker Trine DB
+round trips, a SharedWorker sync-access capability probe, a sync-handle
+exclusivity probe, and a lightweight sync-handle timing probe; CI and publish
+workflows already run that test under Chrome/ChromeDriver.
+
 ## Goal
 
 Reduce confirmed object-store write latency and allow deployments to place the
@@ -163,6 +179,15 @@ recoverable after process loss and writer takeover.
   browser-target integration coverage. Met in local Chromium/Playwright
   execution; Safari WebDriver remains host-killed, so CI should continue using
   ChromeDriver.
+- Browser OPFS root open is no longer tied to `window`; it uses the current
+  browser global's `navigator.storage.getDirectory()`. Met by wasm target build
+  and browser test no-run.
+- Worker-context browser storage uses OPFS synchronous access handles for file
+  byte operations. Met by wasm target build, wasm clippy, and browser-target
+  integration tests that run Trine DB round trips from DedicatedWorker and
+  SharedWorker, plus SharedWorker capability, exclusivity, and timing probes.
+  Local runtime execution still needs ChromeDriver because Safari WebDriver is
+  host-killed; CI provisions ChromeDriver.
 
 ## Verification
 
@@ -203,6 +228,22 @@ recoverable after process loss and writer takeover.
 - `cargo rustdoc --all-features -- -D warnings`
 - `cargo test --doc --all-features -q`
 - `cargo test --target wasm32-unknown-unknown --test browser_persistent_wasm --no-run`
+- `cargo check -q`
+- `cargo check -q --all-features`
+- `cargo check -q --target wasm32-unknown-unknown --no-default-features --lib`
+- `cargo check -q --target wasm32-unknown-unknown --no-default-features --features platform-io --lib`
+- `cargo check -q --target wasm32-unknown-unknown --no-default-features --features platform-io-native --lib`
+- `cargo clippy -q --target wasm32-unknown-unknown --test browser_persistent_wasm -- -D warnings`
+- `cargo test -q --target wasm32-unknown-unknown --test browser_persistent_wasm --no-run`
+- `cargo test -q`
+- `cargo clippy -q --all-features --all-targets -- -D warnings`
+- Attempted real browser run with
+  `CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner
+  cargo test --target wasm32-unknown-unknown --test browser_persistent_wasm`;
+  sandboxed execution cannot spawn the local test server; escalated execution
+  starts the runner but Safari WebDriver is host-killed before tests enter the
+  page. CI provisions ChromeDriver for this gate.
+- `git diff --check`
 - real Chromium OPFS browser integration run via temporary wasm-bindgen +
   Playwright harness: 14 browser tests passed
 
@@ -213,7 +254,11 @@ recoverable after process loss and writer takeover.
 - Browser persistent KV is now production-grade for the documented browser
   boundary: callers can check quota/persistence, WAL append is efficient, safe
   temp repair and bucket drop are covered, and the real Chromium OPFS gate
-  passes locally.
+  passed locally in the prior harness. The OPFS entry no longer depends on
+  `window`, and Worker contexts now use synchronous access handles for file byte
+  operations. DedicatedWorker and SharedWorker now both run a real Trine DB
+  open/write/delete/flush/compact/reopen cycle in the browser test harness; the
+  remaining runtime gap is only this host's local WebDriver setup.
 - Only start another phase if we need a concrete external WAL service/provider
   adapter. That phase should implement the adapter behind `ObjectClient`, then
   measure single-commit latency against R2 storage plus that WAL tier.
