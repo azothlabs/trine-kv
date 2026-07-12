@@ -1,12 +1,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     io,
-    ops::Bound,
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, MutexGuard, RwLock, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
@@ -325,6 +325,8 @@ pub(super) struct CommitTracker {
     visible_sequence: AtomicU64,
     skipped_slots: AtomicU64,
     slots: Mutex<BTreeMap<u64, CommitSlotState>>,
+    visible_changed: Condvar,
+    visible_wakers: Mutex<Vec<Waker>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -375,6 +377,8 @@ impl CommitTracker {
             visible_sequence: AtomicU64::new(visible_sequence.get()),
             skipped_slots: AtomicU64::new(0),
             slots: Mutex::new(BTreeMap::new()),
+            visible_changed: Condvar::new(),
+            visible_wakers: Mutex::new(Vec::new()),
         }
     }
 
@@ -468,7 +472,11 @@ impl CommitTracker {
                 if terminal_state == CommitSlotState::Skipped {
                     self.skipped_slots.fetch_add(1, Ordering::AcqRel);
                 }
-                self.advance_visible_sequence(&mut slots);
+                let advanced = self.advance_visible_sequence(&mut slots);
+                drop(slots);
+                if advanced {
+                    self.notify_visible_waiters();
+                }
                 Ok(())
             }
             CommitSlotState::Visible | CommitSlotState::Skipped => Err(Error::Corruption {
@@ -477,8 +485,9 @@ impl CommitTracker {
         }
     }
 
-    fn advance_visible_sequence(&self, slots: &mut BTreeMap<u64, CommitSlotState>) {
+    fn advance_visible_sequence(&self, slots: &mut BTreeMap<u64, CommitSlotState>) -> bool {
         let mut visible = self.visible_sequence.load(Ordering::Acquire);
+        let previous = visible;
         while let Some(next) = visible.checked_add(1) {
             match slots.get(&next).copied() {
                 Some(CommitSlotState::Visible | CommitSlotState::Skipped) => {
@@ -488,6 +497,60 @@ impl CommitTracker {
                 }
                 Some(CommitSlotState::Open) | None => break,
             }
+        }
+        visible != previous
+    }
+
+    fn wait_until_visible(&self, sequence: Sequence) -> Result<()> {
+        let mut slots = self
+            .slots
+            .lock()
+            .map_err(|_| lock_poisoned("commit tracker slots"))?;
+        while self.visible_sequence().get() < sequence.get() {
+            slots = self
+                .visible_changed
+                .wait(slots)
+                .map_err(|_| lock_poisoned("commit tracker visible wait"))?;
+        }
+        Ok(())
+    }
+
+    async fn wait_until_visible_async(&self, sequence: Sequence) -> Result<()> {
+        std::future::poll_fn(|context| self.poll_until_visible(sequence, context)).await
+    }
+
+    fn poll_until_visible(&self, sequence: Sequence, context: &Context<'_>) -> Poll<Result<()>> {
+        if self.visible_sequence().get() >= sequence.get() {
+            return Poll::Ready(Ok(()));
+        }
+
+        let mut wakers = self
+            .visible_wakers
+            .lock()
+            .map_err(|_| lock_poisoned("commit tracker visible wakers"))?;
+        if self.visible_sequence().get() >= sequence.get() {
+            return Poll::Ready(Ok(()));
+        }
+        if !wakers
+            .iter()
+            .any(|registered| registered.will_wake(context.waker()))
+        {
+            wakers.push(context.waker().clone());
+        }
+        Poll::Pending
+    }
+
+    fn notify_visible_waiters(&self) {
+        self.visible_changed.notify_all();
+        let wakers = {
+            let mut wakers = self
+                .visible_wakers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *wakers)
+        };
+        for waker in wakers {
+            waker.wake();
         }
     }
 }
@@ -814,7 +877,7 @@ impl MaintenanceCoordinator {
         let Ok(mut state) = self.state.lock() else {
             return None;
         };
-        if state.shutdown || state.active_flushes != 0 {
+        if state.shutdown || state.active_flushes != 0 || !state.active_compactions.is_empty() {
             return None;
         }
         state.active_flushes = 1;
@@ -830,7 +893,7 @@ impl MaintenanceCoordinator {
         let Ok(mut state) = self.state.lock() else {
             return None;
         };
-        if state.shutdown {
+        if state.shutdown || state.active_flushes != 0 {
             return None;
         }
 
@@ -930,21 +993,11 @@ fn compaction_reservations_conflict(
     left: &CompactionReservation,
     right: &CompactionReservation,
 ) -> bool {
-    left.bucket == right.bucket && key_ranges_overlap(&left.range, &right.range)
-}
-
-fn key_ranges_overlap(left: &KeyRange, right: &KeyRange) -> bool {
-    !range_end_is_before_start(&left.end, &right.start)
-        && !range_end_is_before_start(&right.end, &left.start)
-}
-
-fn range_end_is_before_start(end: &Bound<Vec<u8>>, start: &Bound<Vec<u8>>) -> bool {
-    match (end, start) {
-        (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
-        (Bound::Included(end), Bound::Included(start)) => end < start,
-        (Bound::Included(end), Bound::Excluded(start))
-        | (Bound::Excluded(end), Bound::Included(start) | Bound::Excluded(start)) => end <= start,
-    }
+    // Every compaction and blob-GC rewrite replaces tables in one bucket's
+    // current LSM version. Serializing that replacement boundary prevents two
+    // independently planned outputs from installing incompatible views even
+    // when their requested key ranges appeared disjoint before either publish.
+    left.bucket == right.bucket
 }
 
 fn shutdown_background_workers(

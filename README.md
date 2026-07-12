@@ -98,7 +98,7 @@ Most applications can start with no feature flags:
 
 ```toml
 [dependencies]
-trine-kv = "0.4"
+trine-kv = "0.5"
 ```
 
 Enable `platform-io` when native-file storage should complete through Trine's
@@ -107,7 +107,7 @@ thread pool and avoids native async backend dependencies:
 
 ```toml
 [dependencies]
-trine-kv = { version = "0.4", features = ["platform-io"] }
+trine-kv = { version = "0.5", features = ["platform-io"] }
 ```
 
 Enable `platform-io-native` when you want native async where Trine has audited
@@ -115,7 +115,7 @@ operation support, with the same thread-pool backend for the remaining rows:
 
 ```toml
 [dependencies]
-trine-kv = { version = "0.4", features = ["platform-io-native"] }
+trine-kv = { version = "0.5", features = ["platform-io-native"] }
 ```
 
 After enabling either feature, select the runtime for a database:
@@ -245,6 +245,7 @@ cargo bench --bench v1_bench
 - [Usage guide](docs/usage.md)
 - [Platform I/O and feature selection](docs/platform-io.md)
 - [Durability notes](docs/durability.md)
+- [Production readiness evidence](docs/production-readiness.md)
 - [Release packaging](docs/release.md)
 - [0.1 benchmark baseline](docs/benchmarks/0.1-baseline.md)
 - [Large-value direct read tuning](docs/benchmarks/v1-large-value-direct-read.md)

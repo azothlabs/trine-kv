@@ -674,14 +674,14 @@ fn browser_persistent_open_async_requires_browser_target() {
 }
 
 #[test]
-fn compaction_reservation_conflicts_are_bucket_and_range_scoped() {
+fn compaction_reservations_serialize_table_rewrites_within_one_bucket() {
     let base = reservation("default", KeyRange::half_open(b"a", b"c"));
 
     assert!(compaction_reservations_conflict(
         &base,
         &reservation("default", KeyRange::half_open(b"b", b"d"))
     ));
-    assert!(!compaction_reservations_conflict(
+    assert!(compaction_reservations_conflict(
         &base,
         &reservation("default", KeyRange::half_open(b"c", b"e"))
     ));
@@ -692,7 +692,7 @@ fn compaction_reservation_conflicts_are_bucket_and_range_scoped() {
 }
 
 #[test]
-fn maintenance_coordinator_allows_non_overlapping_compactions() {
+fn maintenance_coordinator_allows_compactions_in_different_buckets() {
     let coordinator = Arc::new(MaintenanceCoordinator::new());
     let first = coordinator
         .reserve_compactions(vec![reservation(
@@ -709,7 +709,7 @@ fn maintenance_coordinator_allows_non_overlapping_compactions() {
         .expect("non-overlapping compactions reserve");
 
     assert!(!second.contains("default", &KeyRange::half_open(b"b", b"d")));
-    assert!(second.contains("default", &KeyRange::half_open(b"c", b"e")));
+    assert!(!second.contains("default", &KeyRange::half_open(b"c", b"e")));
     assert!(second.contains("other", &KeyRange::half_open(b"b", b"d")));
 
     drop(first);
@@ -721,6 +721,30 @@ fn maintenance_coordinator_allows_non_overlapping_compactions() {
         )])
         .expect("released range can reserve again");
     assert!(third.contains("default", &KeyRange::half_open(b"b", b"d")));
+}
+
+#[test]
+fn maintenance_coordinator_serializes_flush_with_table_rewrites() {
+    let coordinator = Arc::new(MaintenanceCoordinator::new());
+    let compaction = coordinator
+        .reserve_compactions(vec![reservation("default", KeyRange::all())])
+        .expect("compaction reserves");
+    assert!(coordinator.try_start_flush().is_none());
+    drop(compaction);
+
+    let flush = coordinator.try_start_flush().expect("flush starts");
+    assert!(
+        coordinator
+            .reserve_compactions(vec![reservation("other", KeyRange::all())])
+            .is_none()
+    );
+    drop(flush);
+
+    assert!(
+        coordinator
+            .reserve_compactions(vec![reservation("other", KeyRange::all())])
+            .is_some()
+    );
 }
 
 #[test]

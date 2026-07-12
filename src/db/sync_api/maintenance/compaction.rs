@@ -109,6 +109,9 @@ impl Db {
         if compaction_inputs.is_empty() {
             return Ok(MaintenanceOutcome::default());
         }
+        if !Self::compaction_inputs_are_current(&compaction_inputs)? {
+            return Ok(MaintenanceOutcome::busy_outcome());
+        }
 
         let PendingCompactionOutputs {
             outputs: written_tables,
@@ -159,6 +162,7 @@ impl Db {
         );
         self.retire_obsolete_table_files(db_path, obsolete_tables)?;
         self.delete_pending_obsolete_blob_files(db_path)?;
+        drop(compaction_guard);
         if self.inner.options.blob_gc_enabled {
             self.run_blob_gc_once_locked(db_path)?;
         }
@@ -245,6 +249,9 @@ impl Db {
         if compaction_inputs.is_empty() {
             return Ok(MaintenanceOutcome::default());
         }
+        if !Self::compaction_inputs_are_current(&compaction_inputs)? {
+            return Ok(MaintenanceOutcome::busy_outcome());
+        }
 
         let PendingCompactionOutputs {
             outputs: written_tables,
@@ -318,6 +325,7 @@ impl Db {
             .await?;
         self.delete_pending_obsolete_blob_files_native_async(db_path)
             .await?;
+        drop(compaction_guard);
         if self.inner.options.blob_gc_enabled {
             self.run_blob_gc_once_native_async(db_path).await?;
         }
@@ -372,6 +380,9 @@ impl Db {
         compaction_inputs.truncate(limit);
         if compaction_inputs.is_empty() {
             return Ok(MaintenanceOutcome::default());
+        }
+        if !Self::compaction_inputs_are_current(&compaction_inputs)? {
+            return Ok(MaintenanceOutcome::busy_outcome());
         }
 
         let PendingCompactionOutputs {
@@ -431,6 +442,7 @@ impl Db {
             .await?;
         self.delete_pending_obsolete_blob_files_browser_async(db_path)
             .await?;
+        drop(compaction_guard);
         if self.inner.options.blob_gc_enabled {
             self.run_blob_gc_once_browser_async(db_path).await?;
         }

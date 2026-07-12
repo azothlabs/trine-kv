@@ -13,10 +13,11 @@ use crate::{
     types::{KeyRange, Sequence},
 };
 
-use super::tree::LsmTree;
+use super::{tree::LsmTree, version::LsmVersion};
 
 #[derive(Debug)]
 pub(crate) struct CompactionInput {
+    pub(crate) source_version: Arc<LsmVersion>,
     pub(crate) table_level: table::TableLevel,
     pub(crate) table_options: table::TableWriteOptions,
     pub(crate) input_table_ids: Vec<table::TableId>,
@@ -105,6 +106,7 @@ impl LsmTree {
 
         Ok(CompactionPlanResult {
             input: Some(CompactionInput {
+                source_version: version,
                 table_level: plan.output_level,
                 table_options: table_write_options(&self.options),
                 input_table_ids,

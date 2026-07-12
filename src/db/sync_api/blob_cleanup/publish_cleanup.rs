@@ -223,6 +223,18 @@ impl Db {
         Ok(())
     }
 
+    pub(in crate::db) fn compaction_inputs_are_current(
+        inputs: &[NamedCompactionInput],
+    ) -> Result<bool> {
+        for input in inputs {
+            let current = input.tree.current_version()?;
+            if !Arc::ptr_eq(&current, &input.input.source_version) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(in crate::db) fn live_blob_bytes_by_file(&self) -> Result<BTreeMap<u64, u64>> {
         let buckets = self
             .inner

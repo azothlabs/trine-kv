@@ -30,11 +30,14 @@ const LARGE_OPS: usize = 256;
 const LARGE_VALUE_BYTES: usize = 16 * 1024;
 const WAL_REPLAY_DIAGNOSTIC_RUNS: usize = 32;
 const BENCH_RUNS_ENV: &str = "TRINE_BENCH_RUNS";
+const BENCH_PROFILE_ENV: &str = "TRINE_BENCH_PROFILE";
+const PRODUCTION_GATE_PROFILE: &str = "production-gate";
 
 fn main() {
     let runs = benchmark_runs();
     println!("trine-kv v1 benchmark");
     println!("rows={ROWS} ops={OPS}");
+    println!("profile={}", benchmark_profile());
 
     if runs == 1 {
         print_single_run(run_benchmarks());
@@ -45,6 +48,10 @@ fn main() {
 }
 
 fn run_benchmarks() -> Vec<BenchResult> {
+    if benchmark_profile() == PRODUCTION_GATE_PROFILE {
+        return run_production_gate_benchmarks();
+    }
+
     let mut results = vec![
         bench_single_key_put(),
         bench_batch_write(),
@@ -108,6 +115,25 @@ fn run_benchmarks() -> Vec<BenchResult> {
     results.extend(bench_iterator_advance_to());
     results.extend(bench_codec_comparison());
     results
+}
+
+fn run_production_gate_benchmarks() -> Vec<BenchResult> {
+    vec![
+        bench_single_key_put(),
+        bench_batch_write(),
+        bench_random_get(),
+        bench_bounded_range_scan(),
+        bench_prefix_scan(),
+        bench_wal_replay(),
+        bench_flush_throughput(),
+        bench_compaction_throughput(),
+        bench_separated_blob_values(),
+        bench_cold_table_read_only(),
+    ]
+}
+
+fn benchmark_profile() -> String {
+    env::var(BENCH_PROFILE_ENV).unwrap_or_else(|_| "full".to_owned())
 }
 
 fn benchmark_runs() -> usize {

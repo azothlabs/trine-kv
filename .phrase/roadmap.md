@@ -4726,3 +4726,36 @@ completion.
 - Persisted guard metadata, manifest/SSTable format changes, public API names,
   durability changes, platform I/O backend changes, publishing, tagging,
   non-uniform per-level compaction policy, or bottom-level tiering changes.
+
+### Phase 191: Production Evidence And Performance Gate
+
+**Status**: In Progress
+
+**Goal**: Turn performance, cross-platform behavior, and abnormal-process
+recovery into repeatable production evidence instead of release-time judgment.
+
+**Entry Condition**: The production-readiness audit found strong deterministic
+coverage but no paired performance regression gate, no macOS CI runtime gate,
+and no repeated cross-process forced-exit recovery or configurable mixed-load
+soak harness.
+
+**Acceptance Gate**:
+
+- A bounded benchmark profile records representative write, read, scan,
+  recovery, flush, compaction, blob, and cold-open rows without running the
+  entire diagnostic suite.
+- A same-runner comparison rejects material median regressions while allowing
+  an explicit absolute noise floor and produces an artifact for review.
+- Linux, macOS, and Windows run the same forced-process-exit recovery and mixed
+  concurrent workload harness with reproducible seeds and machine-readable
+  reports.
+- macOS CI executes Trine's platform-I/O and native platform-I/O paths rather
+  than relying on cross-compilation or local-only evidence.
+- Focused tests, full tests, strict clippy, Rustdoc, doctests, formatting, and
+  diff checks pass; remaining host or power-failure gaps are documented.
+
+**Major Out Of Scope**:
+
+- Storage format, MVCC, WAL, manifest, SSTable, blob, compaction-policy, public
+  API, durability-contract, provider-adapter, publishing, tagging, or pushing
+  changes.

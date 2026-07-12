@@ -1,0 +1,160 @@
+name: Production Evidence
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/production-evidence.yml"
+      - "benches/**"
+      - "scripts/**"
+      - "src/**"
+      - "tests/production_maturity.rs"
+      - "Cargo.lock"
+      - "Cargo.toml"
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      soak_operations:
+        description: Mixed-load operations per operating system.
+        required: true
+        default: "10000"
+        type: string
+      benchmark_base_ref:
+        description: Git ref used as the paired performance baseline.
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  maturity:
+    name: Maturity (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-14
+          - windows-latest
+    env:
+      TRINE_MATURITY_OPERATIONS: ${{ github.event_name == 'schedule' && '50000' || inputs.soak_operations || '10000' }}
+      TRINE_MATURITY_REPORT: production-maturity-${{ runner.os }}.jsonl
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Run forced-process-exit recovery
+        run: >-
+          cargo test -q --test production_maturity forced_process_exit_recovery
+          -- --ignored --nocapture --test-threads=1
+
+      - name: Run concurrent mixed-load soak
+        run: >-
+          cargo test -q --test production_maturity concurrent_mixed_load_soak_reopens_cleanly
+          -- --ignored --nocapture --test-threads=1
+
+      - name: Exercise portable platform I/O
+        run: cargo test -q --features platform-io platform_io
+
+      - name: Exercise native-first platform I/O
+        run: cargo test -q --features platform-io-native platform_io
+
+      - name: Upload maturity report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-maturity-${{ runner.os }}
+          path: production-maturity-${{ runner.os }}.jsonl
+          if-no-files-found: warn
+
+  performance-regression:
+    name: Paired Performance Regression
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout current code
+        uses: actions/checkout@v4
+        with:
+          path: current
+
+      - name: Checkout paired baseline
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || inputs.benchmark_base_ref }}
+          path: baseline
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Record baseline
+        working-directory: baseline
+        env:
+          TRINE_BENCH_PROFILE: production-gate
+          TRINE_BENCH_RUNS: "3"
+        run: cargo bench --bench v1_bench > ../baseline.csv
+
+      - name: Record current code
+        working-directory: current
+        env:
+          TRINE_BENCH_PROFILE: production-gate
+          TRINE_BENCH_RUNS: "3"
+        run: cargo bench --bench v1_bench > ../current.csv
+
+      - name: Compare paired medians
+        run: >-
+          python3 current/scripts/compare_benchmarks.py
+          --baseline baseline.csv
+          --current current.csv
+          --output comparison.md
+          --max-regression-percent 20
+          --absolute-noise-us 500
+
+      - name: Add comparison to job summary
+        if: always()
+        run: cat comparison.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload performance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: paired-performance
+          path: |
+            baseline.csv
+            current.csv
+            comparison.md
+          if-no-files-found: warn
+
+  scheduled-performance-record:
+    name: Scheduled Performance Record
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Record current medians
+        env:
+          TRINE_BENCH_PROFILE: production-gate
+          TRINE_BENCH_RUNS: "5"
+        run: cargo bench --bench v1_bench > scheduled-performance.csv
+
+      - name: Upload scheduled performance evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: scheduled-performance
+          path: scheduled-performance.csv

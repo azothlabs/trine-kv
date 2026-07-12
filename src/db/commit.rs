@@ -307,6 +307,9 @@ impl Db {
                 if published.request_flush {
                     self.request_background_flush();
                 }
+                self.inner
+                    .commit_tracker
+                    .wait_until_visible(published.commit_info.read_version().to_sequence())?;
                 Ok(published.commit_info)
             }
         }
@@ -419,6 +422,10 @@ impl Db {
                 if published.request_flush {
                     self.request_background_flush();
                 }
+                self.inner
+                    .commit_tracker
+                    .wait_until_visible_async(published.commit_info.read_version().to_sequence())
+                    .await?;
                 Ok(published.commit_info)
             }
         }

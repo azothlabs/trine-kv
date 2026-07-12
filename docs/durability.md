@@ -252,9 +252,14 @@ recovery and manifest-publish rules apply to manual and automatic compaction.
 `Db::flush().await` and `Db::flush_sync()` are foreground barriers for writes
 committed before the call: those writes must be published out of active and
 immutable memtables before the method returns `Ok(())`.
-`Db::compact_range().await` and `Db::compact_range_sync()` wait for overlapping
-active compaction reservations instead of treating a busy maintenance guard as
-success.
+`Db::compact_range().await` and `Db::compact_range_sync()` wait for active table
+replacement in the same bucket instead of treating a busy maintenance guard as
+success. Compaction and Blob GC table replacement are serialized per bucket;
+different buckets can still make compaction progress independently. Flush
+publication is mutually exclusive with active table replacement because one
+flush pass may publish tables for several buckets. A compaction plan is dropped
+and rebuilt whenever flush or another rewrite changes the LSM version it was
+planned against.
 
 When immutable memtables or L0 files exceed configured limits, writes apply
 pressure handling before taking the writer coordinator. They may wait for the

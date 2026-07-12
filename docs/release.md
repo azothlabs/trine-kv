@@ -16,7 +16,7 @@ Before `1.0.0`, the crate still uses SemVer-formatted versions. Breaking public
 API or storage-contract changes should increment the minor version, and patch
 releases should stay compatible with the same minor line.
 
-The current crate minor release target is `0.5.0`. The v1 engine protocol
+The current crate minor release line is `0.5.x`. The v1 engine protocol
 remains documented separately in `.phrase/protocol/trine-kv-v1-spec.md`.
 
 ## Package Contents
@@ -64,6 +64,11 @@ For performance-sensitive changes, also run:
 ```text
 cargo bench --bench v1_bench
 ```
+
+For changes to commit ordering, recovery, platform I/O, maintenance, or other
+production-sensitive paths, also run the ignored evidence harness documented in
+`docs/production-readiness.md`. Pull requests that touch those paths run the
+paired performance and cross-platform maturity workflow automatically.
 
 The package list should not include `.github/`, `.phrase/`, `.rust-skills/`,
 `.claude/`, or other repository-only workflow directories.

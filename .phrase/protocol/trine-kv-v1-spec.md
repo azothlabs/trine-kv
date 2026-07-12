@@ -236,8 +236,8 @@ API rules:
   when it returns `Ok(())`, data committed before the call has left active and
   immutable memtables and has been published as SSTables. Concurrent writes
   committed after the call boundary may remain in the active memtable.
-- `Db::compact_range(range).await` waits and retries if an overlapping
-  compaction reservation is already active. It may return after one successful
+- `Db::compact_range(range).await` waits and retries if a table rewrite for the
+  same bucket is already active. It may return after one successful
   compaction pass or when no compaction plan exists, but it must not report
   success solely because a maintenance guard was busy.
 - named buckets are optional and used for logical isolation or different
@@ -427,8 +427,15 @@ Background work:
   error;
 - public `flush` waits until pending flush requests and active flushes that can
   contain its captured sequence boundary are idle before reporting success;
-- public `compact_range` waits for overlapping active compaction reservations
-  instead of treating a busy guard as a successful no-op;
+- table-replacing compaction and Blob GC are serialized within one bucket;
+  different buckets may still rewrite tables concurrently;
+- flush publication is mutually exclusive with active table rewrites because a
+  flush can add tables to several buckets in one maintenance pass;
+- every compaction plan is bound to the exact in-memory LSM version used to
+  close its input and lower-level overlaps; a version change makes the plan
+  stale even when all original input table ids still exist;
+- public `compact_range` waits for an active same-bucket table rewrite instead
+  of treating a busy guard as a successful no-op;
 - writes apply pressure handling before taking the writer coordinator when
   immutable memtables or L0 files exceed configured limits; pressure handling
   may wait for a background worker or help with a foreground maintenance pass;

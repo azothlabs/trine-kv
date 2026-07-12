@@ -1,10 +1,11 @@
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use super::remove_storage_files_async;
 use super::{
-    Arc, BTreeSet, BlobGcCandidate, BlobGcRewritePlan, BlobGcRewriteRecord, BlobGcRewriteTable, Db,
-    Error, LsmCompactionOutput, NamedCompactionOutput, Ordering, Path, Result, ValueRef,
-    apply_blob_gc_indexes, blob, blob_gc_blob_records, blob_gc_table_write_options, lock_poisoned,
-    remove_storage_files, table, write_blob_gc_replacement_tables,
+    Arc, BTreeSet, BlobGcCandidate, BlobGcRewritePlan, BlobGcRewriteRecord, BlobGcRewriteTable,
+    CompactionReservation, Db, Error, KeyRange, LsmCompactionOutput, MaintenanceCompactionGuard,
+    NamedCompactionOutput, Ordering, Path, Result, ValueRef, apply_blob_gc_indexes, blob,
+    blob_gc_blob_records, blob_gc_table_write_options, lock_poisoned, remove_storage_files, table,
+    write_blob_gc_replacement_tables,
 };
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::DurabilityMode;
@@ -14,6 +15,12 @@ impl Db {
         let Some(plan) = self.build_blob_gc_rewrite_plan(db_path)? else {
             return Ok(());
         };
+        let Some(_rewrite_guard) = self.reserve_blob_gc_rewrite(&plan.tables) else {
+            return Ok(());
+        };
+        if !self.blob_gc_rewrite_inputs_are_current(&plan.tables)? {
+            return Ok(());
+        }
 
         let input_bytes = plan.candidates.iter().fold(0_u64, |bytes, candidate| {
             bytes.saturating_add(candidate.total_bytes)
@@ -115,6 +122,12 @@ impl Db {
         else {
             return Ok(());
         };
+        let Some(_rewrite_guard) = self.reserve_blob_gc_rewrite(&plan.tables) else {
+            return Ok(());
+        };
+        if !self.blob_gc_rewrite_inputs_are_current(&plan.tables)? {
+            return Ok(());
+        }
 
         let input_bytes = plan.candidates.iter().fold(0_u64, |bytes, candidate| {
             bytes.saturating_add(candidate.total_bytes)
@@ -225,6 +238,12 @@ impl Db {
         else {
             return Ok(());
         };
+        let Some(_rewrite_guard) = self.reserve_blob_gc_rewrite(&plan.tables) else {
+            return Ok(());
+        };
+        if !self.blob_gc_rewrite_inputs_are_current(&plan.tables)? {
+            return Ok(());
+        }
 
         let input_bytes = plan.candidates.iter().fold(0_u64, |bytes, candidate| {
             bytes.saturating_add(candidate.total_bytes)
@@ -411,6 +430,45 @@ impl Db {
             tables,
             records: rewrite_records,
         }))
+    }
+
+    fn reserve_blob_gc_rewrite(
+        &self,
+        tables: &[BlobGcRewriteTable],
+    ) -> Option<MaintenanceCompactionGuard> {
+        let mut buckets = BTreeSet::<String>::new();
+        for rewrite in tables {
+            buckets.insert(rewrite.bucket.clone());
+        }
+        let reservations = buckets
+            .into_iter()
+            .map(|bucket| CompactionReservation {
+                bucket,
+                range: KeyRange::all(),
+            })
+            .collect();
+        self.inner.maintenance.reserve_compactions(reservations)
+    }
+
+    fn blob_gc_rewrite_inputs_are_current(&self, tables: &[BlobGcRewriteTable]) -> Result<bool> {
+        let buckets = self
+            .inner
+            .buckets
+            .read()
+            .map_err(|_| lock_poisoned("bucket registry"))?;
+        for rewrite in tables {
+            let Some(tree) = buckets.get(&rewrite.bucket) else {
+                return Ok(false);
+            };
+            let current = tree.tables_snapshot()?;
+            if !current
+                .iter()
+                .any(|table| table.properties().id == rewrite.input_table_id)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]

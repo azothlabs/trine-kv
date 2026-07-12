@@ -550,6 +550,9 @@ impl Db {
         if compaction_inputs.is_empty() {
             return Ok(MaintenanceOutcome::default());
         }
+        if !Self::compaction_inputs_are_current(&compaction_inputs)? {
+            return Ok(MaintenanceOutcome::busy_outcome());
+        }
 
         let PendingCompactionOutputs {
             outputs: written_tables,

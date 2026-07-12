@@ -2,9 +2,9 @@ use std::{
     fs,
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
-    sync::{Arc, Barrier},
+    sync::{Arc, Barrier, mpsc},
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -102,6 +102,59 @@ fn commit_tracker_rejects_second_terminal_transition() {
 
     assert!(tracker.mark_skipped(slot).is_err());
     assert_eq!(tracker.visible_sequence(), Sequence::new(1));
+}
+
+#[test]
+fn commit_tracker_sync_waiter_returns_only_after_contiguous_visibility() {
+    let tracker = Arc::new(CommitTracker::new(Sequence::ZERO));
+    let first = tracker.reserve_slot().expect("reserve first slot");
+    let second = tracker.reserve_slot().expect("reserve second slot");
+    tracker.mark_visible(second).expect("mark second visible");
+
+    let (sent, received) = mpsc::channel();
+    let waiting_tracker = Arc::clone(&tracker);
+    let waiter = thread::spawn(move || {
+        waiting_tracker
+            .wait_until_visible(second.sequence())
+            .expect("sync visibility wait succeeds");
+        sent.send(()).expect("sync waiter reports completion");
+    });
+    assert!(matches!(
+        received.recv_timeout(Duration::from_millis(20)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+
+    tracker.mark_visible(first).expect("mark first visible");
+    received
+        .recv_timeout(Duration::from_secs(1))
+        .expect("sync waiter wakes after gap closes");
+    waiter.join().expect("sync waiter joins");
+}
+
+#[test]
+fn commit_tracker_async_waiter_returns_only_after_contiguous_visibility() {
+    let tracker = Arc::new(CommitTracker::new(Sequence::ZERO));
+    let first = tracker.reserve_slot().expect("reserve first slot");
+    let second = tracker.reserve_slot().expect("reserve second slot");
+    tracker.mark_visible(second).expect("mark second visible");
+
+    let (sent, received) = mpsc::channel();
+    let waiting_tracker = Arc::clone(&tracker);
+    let waiter = thread::spawn(move || {
+        futures::executor::block_on(waiting_tracker.wait_until_visible_async(second.sequence()))
+            .expect("async visibility wait succeeds");
+        sent.send(()).expect("async waiter reports completion");
+    });
+    assert!(matches!(
+        received.recv_timeout(Duration::from_millis(20)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+
+    tracker.mark_visible(first).expect("mark first visible");
+    received
+        .recv_timeout(Duration::from_secs(1))
+        .expect("async waiter wakes after gap closes");
+    waiter.join().expect("async waiter joins");
 }
 
 #[test]

@@ -26,6 +26,89 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-07-12: Production Evidence And Performance Gate
+
+### Observation
+
+- Added a ten-row `production-gate` benchmark profile covering representative
+  writes, reads, scans, recovery, flush, compaction, blob, and cold-open work.
+- Added a paired benchmark comparator. A row fails only when its median exceeds
+  both a 20 percent relative limit and a 500 microsecond absolute noise floor.
+- Same-host before/after comparison passed all rows. Compaction changed from
+  59,410 us to 67,813 us (+14.1 percent); the other rows ranged from -8.6
+  percent to +1.9 percent.
+- Added a forced-process-exit recovery test. Four child-process exit rounds and
+  128 confirmed writes recovered successfully without running child destructors.
+- Added a configurable concurrent mixed-load harness with puts, deletes, reads,
+  snapshots, periodic WAL sync, flush, compaction, Blob GC, close, and reopen
+  verification.
+- The first mixed-load run exposed that a later commit could return while an
+  earlier open sequence slot kept the database-wide visible sequence behind it.
+  Sync commits now wait on a condition variable and async commits register a
+  waker until their read version is continuously visible.
+- Higher-pressure mixed-load runs exposed stale compaction plans and concurrent
+  LSM table-replacement hazards. Plans now retain the exact source `LsmVersion`,
+  are discarded after any version change, and flush is mutually exclusive with
+  active table rewrites. Compaction and Blob GC replacement are serialized per
+  bucket; different buckets can still compact independently.
+- After the fixes, one 100,000-operation four-writer run and five separate
+  50,000-operation seeds passed full close/reopen model verification.
+- Added a production-evidence workflow for Linux, macOS, and Windows, artifact
+  reports, scheduled performance records, PR paired comparison, and normal-CI
+  macOS platform-I/O runtime coverage.
+
+### Interpretation
+
+- The maturity harness produced decision-changing evidence immediately: it
+  found two concurrency correctness boundaries that deterministic short tests
+  had not exposed.
+- Commit success now matches the existing protocol and `CommitInfo` contract:
+  the returned read version is visible to a snapshot created after return.
+- Compaction plans are valid only for the complete LSM layout used during
+  planning, not merely while their original input table ids remain present.
+- The conservative maintenance coordination trades some same-bucket rewrite
+  concurrency for correctness. The paired local performance gate did not show
+  a material representative regression, though compaction should remain watched
+  on fixed-runner history.
+
+### Verification
+
+- `cargo test -q commit_tracker_`
+- forced-exit recovery: 4 rounds, 128 confirmed writes
+- mixed-load soak: 100,000 operations, 4 writers, 441 maintenance passes
+- mixed-load multi-seed: 5 seeds x 50,000 operations
+- `TRINE_BENCH_PROFILE=production-gate TRINE_BENCH_RUNS=3 cargo bench --bench v1_bench`
+- paired benchmark comparator: all 10 rows passed
+- `cargo test -q --all-features`: 518 passed, 5 ignored
+- `cargo clippy -q --all-features --all-targets -- -D warnings`
+- `cargo rustdoc --all-features -- -D warnings`
+- `cargo test -q --doc --all-features`: 18 passed
+- `cargo test -q --features platform-io platform_io`
+- `cargo test -q --features platform-io-native platform_io`
+- Python comparator unit tests: 3 passed
+- workflow YAML parse, `cargo fmt --check`, and `git diff --check`
+
+### Remaining Blockers
+
+- The new remote Linux/macOS/Windows workflow has not run in this local-only
+  session. Its JSONL and paired-performance artifacts must be inspected before
+  Phase 191 closes.
+- Forced process exit is not sudden-power-loss, kernel, controller-cache, or
+  broken-filesystem evidence.
+- Disk-full, I/O fault injection, sanitizer, and long-duration deployment
+  history remain outside this slice.
+- The real S3/R2 live tests still require credentials and remain ignored in the
+  default local gate.
+
+### Recommended Next Action
+
+- Run the production-evidence workflow on the branch, inspect all three OS
+  reports and the paired benchmark artifact, and close Phase 191 only when they
+  pass.
+- Then choose the next maturity slice from real deployment evidence: disk-full
+  fault injection, a longer hardware soak, or sanitizer/fuzz coverage rather
+  than another speculative engine optimization.
+
 ## 2026-07-08: Browser WASM Production KV Hardening
 
 ### Observation
