@@ -50,6 +50,20 @@ def check_dependency_versions() -> list[str]:
     return errors
 
 
+def check_local_markdown_links(path: str) -> list[str]:
+    source = ROOT / path
+    text = source.read_text(encoding="utf-8")
+    links = re.findall(r"\[[^\]]+\]\(([^)]+)\)", text)
+    errors: list[str] = []
+    for link in links:
+        if link.startswith(("http://", "https://", "#")):
+            continue
+        target = link.split("#", 1)[0]
+        if target and not (source.parent / target).exists():
+            errors.append(f"{path}: local link target does not exist: {link}")
+    return errors
+
+
 def check_release_contract() -> list[str]:
     common_gate = (
         "python3 scripts/check_docs_drift.py",
@@ -96,11 +110,31 @@ def check_release_contract() -> list[str]:
             (".github/workflows/production-evidence.yml", "Linux, macOS, and Windows"),
         )
     )
+    errors.extend(
+        require_snippets(
+            "README.md",
+            (
+                "Production Status",
+                "pre-`1.0`",
+                "docs/production-readiness.md",
+                ".github/workflows/production-evidence.yml",
+                "Linux, macOS, and Windows",
+                "sudden power loss",
+                "disk-full behavior",
+                "online backup",
+                "python3 scripts/check_docs_drift.py",
+            ),
+        )
+    )
     return errors
 
 
 def main() -> int:
-    errors = check_dependency_versions() + check_release_contract()
+    errors = (
+        check_dependency_versions()
+        + check_release_contract()
+        + check_local_markdown_links("README.md")
+    )
     if errors:
         print("documentation drift detected:", file=sys.stderr)
         for error in errors:

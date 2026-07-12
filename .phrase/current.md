@@ -43,6 +43,9 @@ contracts.
 - Added the forced-exit and 10,000-operation mixed-load evidence harness to the
   publish workflow while retaining the Linux/macOS/Windows workflow as the
   phase-closing cross-platform gate.
+- Reworked README adoption guidance around production status, a five-minute
+  verification path, evidence-backed capabilities, and explicit deployment
+  boundaries; its maturity claims and local links are now checked in CI.
 
 ## Out Of Scope
 

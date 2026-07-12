@@ -1,145 +1,60 @@
 # Trine KV
 
-Trine KV is an embedded Rust key-value database for applications that need
-ordered local storage without running a separate server. It gives small
-programs a default bucket, and lets larger applications add named buckets with
-their own prefix, filter, compression, and large-value settings.
+[![CI](https://github.com/azothlabs/trine-kv/actions/workflows/ci.yml/badge.svg)](https://github.com/azothlabs/trine-kv/actions/workflows/ci.yml)
+[![Production Evidence](https://github.com/azothlabs/trine-kv/actions/workflows/production-evidence.yml/badge.svg)](https://github.com/azothlabs/trine-kv/actions/workflows/production-evidence.yml)
+[![Crates.io](https://img.shields.io/crates/v/trine-kv.svg)](https://crates.io/crates/trine-kv)
+[![Docs.rs](https://docs.rs/trine-kv/badge.svg)](https://docs.rs/trine-kv)
 
-The crate is implemented and verified by the repository test suite, benchmark
-harness, and durability notes. To see the main path work end to end:
+Trine KV is an embedded, async-first Rust key-value database for applications
+that need ordered local storage without operating a separate database server.
+It combines buckets, atomic batches, stable snapshots, optimistic transactions,
+range scans, WAL recovery, compaction, and optional large-value files behind one
+crate.
 
-```text
-cargo run --example quickstart
-```
+## Production Status
 
-Then read [docs/usage.md](docs/usage.md) for the API path and
-[docs/platform-io.md](docs/platform-io.md) when you need the feature/runtime
-choice for async native-file I/O. [docs/durability.md](docs/durability.md)
-explains persistence guarantees and limits. Release packaging notes live in
-[docs/release.md](docs/release.md).
+Trine KV is pre-`1.0`. It is suitable for evaluation and controlled production
+adoption when the application owner validates Trine against the real workload,
+filesystem, storage device, restart policy, and backup procedure. It should not
+yet be presented as a universally production-proven database.
 
-## Common Capabilities
+Repository evidence currently includes:
 
-- Async-first default-bucket reads and writes with `Db::put`, `Db::get`,
-  `Db::range`, and `Db::prefix`.
-- Explicit sync adapters with `*_sync` names, such as `Db::open_sync`,
-  `db.put_sync`, `bucket.get_sync`, and `db.flush_sync`.
-- Optional named buckets through `db.bucket("users").await?` when data needs
-  logical separation or independent tuning.
-- Atomic write batches across the default bucket and named buckets.
-- MVCC snapshots that keep old reads stable while newer writes commit.
-- Public `ReadVersion` cursors for reopening a retained committed state with
-  `Db::snapshot_at`.
-- Named checkpoints that pin important read versions until the application
-  deletes them.
-- Configurable recent read-version retention with
-  `DbOptions::with_keep_last_read_versions`.
-- Snapshot-bound point readers that can avoid copying inline table values when
-  callers can work with borrowed bytes.
-- Optimistic transactions with point and range conflict checks.
-- Ordered range scans and prefix scans.
-- Value-lazy range and prefix scans for large-value workloads that need keys
-  before reading blob bytes.
-- Persistent mode with WAL replay, manifest recovery, directory locking,
-  safe native defaults, background maintenance, backpressure, flush,
-  compaction, and read-only open.
-- Explicit in-memory mode for tests, examples, and short-lived data that should
-  disappear when the `Db` is dropped.
-- Async open/read/write/scan/transaction/maintenance entry points. Native
-  persistent async APIs enter operation-level storage waits through Trine's
-  storage boundary; platform-io chooses native, partial native, or managed
-  thread-pool completion below that boundary.
-- Block-based SSTables with partitioned index/filter blocks, data-block hash
-  lookup for point reads, high-priority metadata caching, compression, and
-  linear/binary/auto index seek policies.
-- Large values can be separated into Titan-like blob files with `BlobIndex`
-  records in SSTables.
-- Automatic blob Level Merge can rewrite retained large values into output blob
-  files during compaction when it improves locality or removes stale blob refs.
-- Snapshot-safe blob GC rewrites still-live large values out of stale blob
-  files and delays old-file deletion while a read can still reach them.
-- Live stats report table, cache, filter, blob read, blob byte, and blob GC
-  counters.
-- Explicit WASI and browser persistent options. WASI uses a host-preopened
-  filesystem path on WASI targets and supports `Db::open` through the
-  host storage boundary. Browser persistence uses the async API and the browser
-  persistent backend on `wasm32-unknown-unknown` when the host global exposes
-  `navigator.storage.getDirectory()`, including Window and worker contexts that
-  provide that API. Worker contexts also need OPFS
-  `FileSystemSyncAccessHandle` support; Trine uses those handles for byte
-  reads, WAL append, manifest publish, and WAL rewrite while keeping the public
-  database API async. Use
-  `DbOptions::browser_persistent_at(path)` when separate browser namespaces
-  should not share WAL, manifest, table, or blob files. Browser builds also
-  expose `trine_kv::browser` helpers for storage estimates and persistent
-  storage requests.
+- full Rust tests, strict linting, Rustdoc, doctests, WASI, and real-browser
+  persistence gates;
+- repeated child-process exit and reopen verification;
+- deterministic concurrent mixed-load soak and reopen verification;
+- paired benchmark regression checks on the same runner;
+- target-native Linux, macOS, and Windows maturity jobs with retained reports.
 
-## Install
+The current result of those jobs is visible in the badges above. Read
+[Production readiness evidence](docs/production-readiness.md) for the exact
+commands, what each test proves, and what still needs deployment evidence. The
+cross-platform definition lives in
+[`.github/workflows/production-evidence.yml`](.github/workflows/production-evidence.yml).
 
-Add Trine KV from [crates.io](https://crates.io/crates/trine-kv):
+Trine is a reasonable candidate when you need one local writer, ordered keys,
+atomic changes across buckets, snapshots, and crash recovery inside a Rust
+application. Evaluate another design, or add application-level safeguards, when
+you require a database server, live multi-process readers, online backup,
+replication, sudden-power-loss certification, or established fleet incident
+history.
+
+## Try It in Five Minutes
+
+Add the crate:
 
 ```text
 cargo add trine-kv
 ```
 
-`cargo install` is for crates that provide command-line binaries. Trine KV is a
-library crate, so application projects should depend on it instead.
-
-For local development, depend on a path:
-
-```toml
-[dependencies]
-trine-kv = { path = "../trine-kv" }
-```
-
-## Feature Flags
-
-Most applications can start with no feature flags:
-
-```toml
-[dependencies]
-trine-kv = "0.5"
-```
-
-Enable `platform-io` when native-file storage should complete through Trine's
-portable async platform boundary. This baseline uses a bounded Trine-owned
-thread pool and avoids native async backend dependencies:
-
-```toml
-[dependencies]
-trine-kv = { version = "0.5", features = ["platform-io"] }
-```
-
-Enable `platform-io-native` when you want native async where Trine has audited
-operation support, with the same thread-pool backend for the remaining rows:
-
-```toml
-[dependencies]
-trine-kv = { version = "0.5", features = ["platform-io-native"] }
-```
-
-After enabling either feature, select the runtime for a database:
-
-```rust
-use trine_kv::{Db, DbOptions, RuntimeOptions};
-
-let mut options = DbOptions::new("./trine-data");
-options.runtime = RuntimeOptions::platform_io();
-
-let db = Db::open(options).await?;
-```
-
-Verify the path with:
+Run the repository's persistent end-to-end example:
 
 ```text
-cargo run --example platform_io --features platform-io
-cargo run --example platform_io --features platform-io-native
+cargo run --example quickstart
 ```
 
-See [docs/platform-io.md](docs/platform-io.md) for the operation matrix and
-stats fields.
-
-## Common API Example
+Or start with the main async API:
 
 ```rust
 use trine_kv::{Db, KeyRange, TransactionOptions, WriteBatch, WriteOptions};
@@ -147,33 +62,24 @@ use trine_kv::{Db, KeyRange, TransactionOptions, WriteBatch, WriteOptions};
 async fn run() -> trine_kv::Result<()> {
     let db = Db::open("./trine-data").await?;
 
-    // Simple applications can use the built-in default bucket directly.
     db.put(b"settings:theme", b"dark").await?;
     assert_eq!(db.get(b"settings:theme").await?, Some(b"dark".to_vec()));
 
-    // Named buckets are created on demand when you need logical separation.
     let users = db.bucket("users").await?;
     users.put(b"user:001", b"Ada").await?;
 
-    // Snapshots keep a stable read version while newer writes continue.
     let snapshot = db.snapshot();
     users.put(b"user:002", b"Lin").await?;
     assert_eq!(snapshot.get(&users, b"user:002").await?, None);
 
-    // Batches can atomically span buckets.
     let mut batch = WriteBatch::new();
     batch.put(b"audit:001", b"user-created");
     batch.put_bucket("users", b"user:003", b"Grace")?;
     db.write(batch, WriteOptions::default()).await?;
 
-    // Transactions validate their read set when they commit.
-    let mut txn = db.transaction(TransactionOptions::default());
-    assert_eq!(
-        txn.get_bucket("users", b"user:001").await?,
-        Some(b"Ada".to_vec())
-    );
-    txn.put_bucket("users", b"user:004", b"Barbara")?;
-    txn.commit().await?;
+    let mut transaction = db.transaction(TransactionOptions::default());
+    transaction.put_bucket("users", b"user:004", b"Barbara")?;
+    transaction.commit().await?;
 
     let mut rows = users
         .range(&KeyRange::half_open(b"user:001", b"user:999"))
@@ -184,61 +90,134 @@ async fn run() -> trine_kv::Result<()> {
     }
     assert_eq!(row_count, 4);
 
+    db.flush().await?;
     Ok(())
 }
 ```
 
-For the runnable async-first persistent path, use:
+Use `cargo run --example sync_quickstart` for the explicit `*_sync` adapter
+path. Use `DbOptions::memory()` when data should disappear after the database is
+dropped.
 
-```text
-cargo run --example quickstart
+## What You Get
+
+- **Ordered storage:** point reads, forward/reverse range scans, prefix scans,
+  and value-lazy iteration for large values.
+- **Consistent changes:** atomic batches across the default and named buckets,
+  stable MVCC snapshots, retained read versions, named checkpoints, and
+  optimistic transaction conflict checks.
+- **Local persistence:** WAL replay, manifest recovery, one-writer directory
+  locking, flush, compaction, backpressure, background maintenance, and
+  read-only reopen.
+- **Workload controls:** per-bucket prefix, filter, compression, index-seek, and
+  large-value settings; separated blob files and snapshot-safe blob cleanup.
+- **Runtime choices:** async-first APIs, explicit sync adapters, portable
+  thread-pool platform I/O, audited native-first platform I/O with fallback,
+  WASI host storage, and browser OPFS persistence.
+- **Operational evidence:** live statistics plus repeatable recovery, soak,
+  platform, browser, WASI, and benchmark gates.
+
+## Install and Features
+
+Most native applications can start without feature flags:
+
+```toml
+[dependencies]
+trine-kv = "0.5"
 ```
 
-For tests or short-lived data, opt into memory mode explicitly:
+Enable `platform-io` for Trine's bounded portable async file-I/O thread pool:
+
+```toml
+[dependencies]
+trine-kv = { version = "0.5", features = ["platform-io"] }
+```
+
+Enable `platform-io-native` for audited native async operations with the same
+thread-pool fallback for unsupported operation rows:
+
+```toml
+[dependencies]
+trine-kv = { version = "0.5", features = ["platform-io-native"] }
+```
+
+Select platform I/O for a database explicitly:
 
 ```rust
-use trine_kv::{Db, DbOptions};
+use trine_kv::{Db, DbOptions, RuntimeOptions};
 
-let db = Db::open(DbOptions::memory()).await?;
+let mut options = DbOptions::new("./trine-data");
+options.runtime = RuntimeOptions::platform_io();
+let db = Db::open(options).await?;
 ```
 
-For the explicit sync-adapter path, use:
+Verify both feature paths with:
 
 ```text
-cargo run --example sync_quickstart
-```
-
-## Common Commands
-
-```text
-cargo fmt --check
-cargo clippy
-cargo test
-cargo run --example quickstart
-cargo run --example sync_quickstart
 cargo run --example platform_io --features platform-io
-cargo run --example read_versions
-cargo run --example user_store
-cargo run --example event_index
-cargo run --example durability
-cargo bench --bench v1_bench
+cargo run --example platform_io --features platform-io-native
 ```
 
-## Examples
+See [Platform I/O and feature selection](docs/platform-io.md) for the
+operation-by-operation runtime matrix and statistics fields.
 
-- `quickstart`: first pass through `Db::open`, async writes, lazy scans,
-  transaction commit, maintenance, read-only reopen, and storage runtime stats.
-- `sync_quickstart`: first pass through the explicit sync adapters, including
-  persistent open, buckets, scans, transactions, flush, reopen, and stats.
-- `platform_io`: runs a small write/read/flush path and, when a platform-io
-  feature is enabled, checks `RuntimeOptions::platform_io()` operation counters.
-- `read_versions`: captures public read-version cursors, creates a named
-  checkpoint, reopens from the checkpoint, and shows expiration after deletion.
-- `user_store`: wraps Trine KV behind a small repository-style API.
-- `event_index`: stores event payloads and a secondary account index with one
-  atomic write batch.
-- `durability`: shows the non-strict default versus strict (`SyncAllStrict` /
-  `F_FULLFSYNC`) writes, per write and as a database-wide floor.
+## Durability in Plain Terms
+
+Native persistent databases default to `SyncAll` for confirmed writes. On
+macOS this uses ordinary `fsync`: it covers application crashes and kernel
+panics, but does not claim survival across sudden power loss. Select
+`SyncAllStrict` for macOS `F_FULLFSYNC`, either per write or as a database-wide
+minimum. Select `Buffered` only when losing recent confirmed writes is an
+accepted application tradeoff.
+
+WASI and browser storage do not claim native device-sync modes. Browser
+persistence is async-only and depends on OPFS; synchronous persistent mutation
+and maintenance methods return typed unsupported errors.
+
+Read [Durability notes](docs/durability.md) before choosing a durability mode.
+
+## Current Boundaries
+
+- One persistent database directory has one live writer. Read-only open is for
+  a stable directory state, not live multi-process access beside a writer.
+- There is no replication or database-server protocol.
+- Online backup semantics are not defined; validate an application-level
+  backup and restore procedure before relying on it.
+- Forced process exit is tested, but sudden power loss, disk-full behavior, and
+  damaged-filesystem recovery require deployment-specific evidence.
+- Browser persistence depends on host OPFS and persistent-storage behavior;
+  applications should inspect quota and eviction risk through the browser
+  helpers.
+- Repair is deliberately narrow and only removes known safe temporary files
+  when explicitly requested.
+
+These are adoption constraints, not footnotes. The maintained list and test
+commands are in [Production readiness evidence](docs/production-readiness.md).
+
+## Examples and Verification
+
+| Command | What it verifies |
+| --- | --- |
+| `cargo run --example quickstart` | Async persistent lifecycle, transactions, maintenance, reopen, and stats. |
+| `cargo run --example sync_quickstart` | The explicit synchronous adapter path. |
+| `cargo run --example platform_io --features platform-io-native` | Selected platform-I/O path and operation counters. |
+| `cargo run --example read_versions` | Retained read versions and named checkpoints. |
+| `cargo run --example user_store` | A repository-style application wrapper. |
+| `cargo run --example event_index` | Payload and secondary-index updates in one atomic batch. |
+| `cargo run --example durability` | Default, strict, and database-wide durability selection. |
+
+Repository verification starts with:
+
+```text
+python3 scripts/check_docs_drift.py
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+```
+
+Performance-sensitive changes should use the bounded paired procedure in
+[Production readiness evidence](docs/production-readiness.md), not compare raw
+wall times from different machines.
 
 ## Documentation
 
@@ -247,45 +226,8 @@ cargo bench --bench v1_bench
 - [Durability notes](docs/durability.md)
 - [Production readiness evidence](docs/production-readiness.md)
 - [Release packaging](docs/release.md)
-- [0.1 benchmark baseline](docs/benchmarks/0.1-baseline.md)
-- [Large-value direct read tuning](docs/benchmarks/v1-large-value-direct-read.md)
-- [Blob maintenance and lazy value benchmark](docs/benchmarks/v1-blob-level-merge-lazy-gc.md)
-- [Read-pruning measurement](docs/benchmarks/v1-read-pruning-measurement.md)
-- [Cold table open read](docs/benchmarks/v1-cold-table-open-read.md)
-- [Cold manifest/open reopen](docs/benchmarks/v1-cold-manifest-open-reopen.md)
-- [Read-only cold reopen](docs/benchmarks/v1-read-only-cold-reopen.md)
-- [Read-only cold open breakdown](docs/benchmarks/v1-read-only-cold-open-breakdown.md)
-- [Batched point reads](docs/benchmarks/v1-batched-point-reads.md)
-- [Get-many internal batching](docs/benchmarks/v1-get-many-internal-batching.md)
+- [Benchmark notes](docs/benchmarks/)
+- [Changelog](CHANGELOG.md)
 
-## Current Boundaries
-
-- Persistent mode uses a single local database directory.
-- Native persistent open defaults to `SyncAll` (non-strict) for confirmed
-  writes: on macOS that is a plain `fsync`, which is fast and survives a crash or
-  kernel panic but is not guaranteed across sudden power loss. For power-loss
-  durability use `SyncAllStrict` (macOS `F_FULLFSYNC`), per write with
-  `WriteOptions::sync_all_strict()` or database-wide with
-  `DbOptions::with_durability`. `Buffered` is an explicit advanced mode for data
-  that can tolerate losing recent writes after a crash. See
-  [docs/durability.md](docs/durability.md).
-- WASI and browser persistent backends do not claim the device-sync modes
-  (`SyncData`, `SyncAll`, `SyncAllStrict`).
-- WASI persistent `Db::open` uses the host-preopened filesystem on WASI
-  targets; current WASI file work completes inline and does not advertise
-  platform async I/O.
-- Browser persistence is async-only: use `Db::open` plus async mutation
-  and maintenance methods. Browser WAL appends write only new bytes through
-  OPFS, are serialized per shard, and `WalShardPolicy::Auto` uses one browser
-  WAL lane by default. In Window contexts Trine uses the browser async OPFS API;
-  in worker contexts it uses OPFS synchronous access handles for file byte
-  reads, writes, WAL append, manifest publish, and WAL rewrite. Use
-  `trine_kv::browser` helpers to inspect storage
-  estimates and request persistent browser storage when eviction risk matters.
-  Synchronous browser persistent open, mutation, and maintenance `*_sync` APIs
-  return typed unsupported errors.
-- Read-only open is for inspecting a stable directory state; the current
-  pre-`1.0` line does not define live multi-process reads against an active
-  writer.
-- Repair is intentionally narrow and only removes known safe temporary files
-  when explicitly requested.
+Trine KV is dual-licensed under the repository's MIT and Apache-2.0 license
+files.

@@ -15850,3 +15850,40 @@ Negative check:
 - Push the commits and inspect the production-evidence artifacts from Linux,
   macOS, and Windows. Phase 191 remains open until those target-native jobs pass
   for the same commit.
+
+## 2026-07-12: README production adoption path
+
+### Observation
+
+- The README had the correct dependency line and a production-readiness link,
+  but opened with a long capability inventory. A reader could not quickly tell
+  whether the crate was ready for their deployment, what evidence existed, or
+  which missing guarantees should stop adoption.
+- Production limitations appeared after examples and a long benchmark-note
+  list, making the most important pre-`1.0` decision information easy to miss.
+
+### Interpretation
+
+- README quality is part of production maturity: overstating readiness or
+  hiding operational limits creates adoption risk even when implementation and
+  CI are sound.
+- The first screen should state the product boundary and maturity level; the
+  next action should produce a runnable result; detailed engine capabilities
+  belong after that decision path.
+
+### Verification
+
+- The README now leads with dynamic CI and production-evidence status, a
+  pre-`1.0` adoption statement, suitable and unsuitable deployment conditions,
+  and a five-minute runnable path.
+- Its main Rust API example passed `cargo check` as a temporary Cargo example;
+  the temporary file was removed after verification.
+- The documentation drift check now asserts the README maturity vocabulary,
+  workflow link, verification command, current dependency minor, and every
+  local Markdown link.
+
+### Recommended Next Action
+
+- Use the README production status as the public entry point and keep detailed
+  procedures in `docs/production-readiness.md`; do not duplicate changing test
+  counts or machine-specific benchmark timings in the README.

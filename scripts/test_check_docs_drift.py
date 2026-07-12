@@ -14,6 +14,7 @@ class DocumentationDriftTests(unittest.TestCase):
     def test_repository_release_contract_is_aligned(self) -> None:
         self.assertEqual(CHECK.check_dependency_versions(), [])
         self.assertEqual(CHECK.check_release_contract(), [])
+        self.assertEqual(CHECK.check_local_markdown_links("README.md"), [])
 
 
 if __name__ == "__main__":
