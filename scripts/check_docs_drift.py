@@ -90,11 +90,37 @@ def check_release_contract() -> list[str]:
         "production_maturity forced_process_exit_recovery",
         "production_maturity concurrent_mixed_load_soak_reopens_cleanly",
     )
+    destructive_gate = ("cargo test -q destructive_ --lib -- --test-threads=1",)
     errors: list[str] = []
 
     for path in (".github/workflows/ci.yml", ".github/workflows/publish.yml"):
         errors.extend(require_snippets(path, common_gate))
     errors.extend(require_snippets(".github/workflows/publish.yml", maturity_gate))
+    for path in (
+        ".github/workflows/production-evidence.yml",
+        ".github/workflows/publish.yml",
+        "docs/production-readiness.md",
+        "docs/release.md",
+    ):
+        errors.extend(require_snippets(path, destructive_gate))
+
+    publish = (ROOT / ".github/workflows/publish.yml").read_text(encoding="utf-8")
+    version_step = publish.partition("- name: Verify requested version")[2].partition(
+        "- name: Check documentation drift"
+    )[0]
+    for snippet in ("cargo_version=", "CHANGELOG.md is missing an entry"):
+        if snippet not in version_step:
+            errors.append(
+                ".github/workflows/publish.yml: Verify requested version step must contain "
+                f"`{snippet}`"
+            )
+    if not re.search(
+        r"- name: Check documentation drift\s+run: python3 scripts/check_docs_drift\.py",
+        publish,
+    ):
+        errors.append(
+            ".github/workflows/publish.yml: documentation drift step has no direct run command"
+        )
 
     release_contract = common_gate + maturity_gate + (
         ".github/workflows/production-evidence.yml",
@@ -122,6 +148,7 @@ def check_release_contract() -> list[str]:
                 "sudden power loss",
                 "disk-full behavior",
                 "online backup",
+                "deterministic I/O failure injection",
                 "python3 scripts/check_docs_drift.py",
             ),
         )

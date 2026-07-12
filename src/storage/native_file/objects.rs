@@ -233,14 +233,16 @@ impl NativeFileAppendObject {
 
     #[allow(dead_code)]
     fn append_to_file(&mut self, bytes: &[u8], durability: DurabilityMode) -> Result<()> {
+        let object = self.object.clone();
         let mut file = self.lock_or_open_file()?;
-        append_native_file_object(&mut file, bytes, durability)
+        append_native_file_object(&mut file, &object, bytes, durability)
     }
 
     #[allow(dead_code)]
     fn persist_file(&mut self, durability: DurabilityMode) -> Result<()> {
+        let object = self.object.clone();
         let mut file = self.lock_or_open_file()?;
-        persist_native_append_file(&mut file, durability)
+        persist_native_append_file(&mut file, &object, durability)
     }
 
     fn file_handle(&self) -> Result<Arc<Mutex<File>>> {
@@ -274,7 +276,7 @@ impl IoAppendObject for NativeFileAppendObject {
         let file = self.file_handle()?;
         InlineIoDriver.submit_append(move || {
             let mut file = lock_native_append_file(file.as_ref(), &object)?;
-            append_native_file_object(&mut file, bytes.as_ref(), durability)
+            append_native_file_object(&mut file, &object, bytes.as_ref(), durability)
         })
     }
 
@@ -288,7 +290,7 @@ impl IoAppendObject for NativeFileAppendObject {
         let file = self.file_handle()?;
         InlineIoDriver.submit_sync(move || {
             let mut file = lock_native_append_file(file.as_ref(), &object)?;
-            persist_native_append_file(&mut file, durability)
+            persist_native_append_file(&mut file, &object, durability)
         })
     }
 }
@@ -325,7 +327,12 @@ impl StorageAppendObject for NativeFileAppendObject {
                         BlockingAdapterIoDriver::new(runtime)
                             .submit_append(move || {
                                 let mut file = lock_native_append_file(file.as_ref(), &object)?;
-                                append_native_file_object(&mut file, bytes.as_ref(), durability)
+                                append_native_file_object(
+                                    &mut file,
+                                    &object,
+                                    bytes.as_ref(),
+                                    durability,
+                                )
                             })?
                             .await
                     }),
@@ -367,7 +374,7 @@ impl StorageAppendObject for NativeFileAppendObject {
                         BlockingAdapterIoDriver::new(runtime)
                             .submit_sync(move || {
                                 let mut file = lock_native_append_file(file.as_ref(), &object)?;
-                                persist_native_append_file(&mut file, durability)
+                                persist_native_append_file(&mut file, &object, durability)
                             })?
                             .await
                     }),

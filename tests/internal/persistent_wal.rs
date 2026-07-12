@@ -186,3 +186,5 @@ mod blob_gc;
 mod corruption;
 #[path = "persistent_wal/durability.rs"]
 mod durability;
+#[path = "persistent_wal/destructive.rs"]
+mod destructive;

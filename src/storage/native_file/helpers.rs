@@ -333,6 +333,7 @@ pub(in crate::storage) fn lock_native_append_file<'file>(
 
 pub(in crate::storage) fn append_native_file_object(
     file: &mut File,
+    object: &StorageObjectId,
     bytes: &[u8],
     durability: DurabilityMode,
 ) -> Result<()> {
@@ -340,18 +341,36 @@ pub(in crate::storage) fn append_native_file_object(
     capabilities.require(StorageCapability::Append)?;
     capabilities.require_durability(durability)?;
 
+    #[cfg(test)]
+    crate::storage::fault_injection::check(
+        crate::storage::fault_injection::StorageFaultPoint::WalAppend,
+        Some(object.kind()),
+        object.path(),
+    )?;
+
     #[cfg(target_os = "wasi")]
     file.seek(SeekFrom::End(0))?;
     file.write_all(bytes)?;
-    persist_native_append_file(file, durability)
+    persist_native_append_file(file, object, durability)
 }
 
 pub(in crate::storage) fn persist_native_append_file(
     file: &mut File,
+    object: &StorageObjectId,
     durability: DurabilityMode,
 ) -> Result<()> {
     let capabilities = StorageCapabilities::native_file();
     capabilities.require_durability(durability)?;
+
+    #[cfg(not(test))]
+    let _ = object;
+
+    #[cfg(test)]
+    crate::storage::fault_injection::check(
+        crate::storage::fault_injection::StorageFaultPoint::WalPersist,
+        Some(object.kind()),
+        object.path(),
+    )?;
 
     match durability {
         DurabilityMode::Buffered => Ok(()),
@@ -381,6 +400,12 @@ pub(in crate::storage) fn rewrite_native_file_wal(
         file.write_all(bytes)?;
         sync_native_file_for_durability(&file, durability)?;
     }
+    #[cfg(test)]
+    crate::storage::fault_injection::check(
+        crate::storage::fault_injection::StorageFaultPoint::WalRewritePublish,
+        Some(object.kind()),
+        object.path(),
+    )?;
     fs::rename(&tmp_path, &path)?;
     if requires_parent_dir_sync_after_rename(durability) {
         sync_native_file_parent_directory_after_rename(&path)?;
@@ -537,6 +562,13 @@ pub(in crate::storage) fn sync_native_file_directory_after_renames(
 ) -> Result<()> {
     require_native_file_directory_sync()?;
 
+    #[cfg(test)]
+    crate::storage::fault_injection::check(
+        crate::storage::fault_injection::StorageFaultPoint::DirectorySync,
+        None,
+        directory.path(),
+    )?;
+
     sync_dir_after_renames(directory.path())
 }
 
@@ -544,6 +576,13 @@ pub(in crate::storage) fn sync_native_file_parent_directory_after_rename(
     path: &Path,
 ) -> Result<()> {
     require_native_file_directory_sync()?;
+
+    #[cfg(test)]
+    crate::storage::fault_injection::check(
+        crate::storage::fault_injection::StorageFaultPoint::DirectorySync,
+        None,
+        path,
+    )?;
 
     sync_parent_dir_after_rename(path)
 }
@@ -616,6 +655,12 @@ pub(in crate::storage) fn write_native_file_object(
         file.write_all(bytes)?;
         sync_native_file_for_durability(&file, durability)?;
     }
+    #[cfg(test)]
+    crate::storage::fault_injection::check(
+        crate::storage::fault_injection::StorageFaultPoint::ObjectPublish,
+        Some(object.kind()),
+        object.path(),
+    )?;
     fs::rename(&tmp_path, &path)?;
     if requires_parent_dir_sync_after_rename(durability) {
         sync_native_file_parent_directory_after_rename(&path)?;
@@ -626,6 +671,13 @@ pub(in crate::storage) fn write_native_file_object(
 
 pub(in crate::storage) fn delete_native_file_object(object: &StorageObjectId) -> Result<()> {
     require_native_file_object_delete(object)?;
+
+    #[cfg(test)]
+    crate::storage::fault_injection::check(
+        crate::storage::fault_injection::StorageFaultPoint::ObjectDelete,
+        Some(object.kind()),
+        object.path(),
+    )?;
 
     match fs::remove_file(object.path()) {
         Ok(()) => Ok(()),
@@ -645,6 +697,12 @@ pub(in crate::storage) fn publish_manifest_to_native_file(
         file.write_all(bytes)?;
         sync_native_file_for_durability(&file, durability)?;
     }
+    #[cfg(test)]
+    crate::storage::fault_injection::check(
+        crate::storage::fault_injection::StorageFaultPoint::ManifestPublish,
+        Some(object.kind()),
+        object.path(),
+    )?;
     fs::rename(&tmp_path, &path)?;
     if requires_parent_dir_sync_after_rename(durability) {
         sync_native_file_parent_directory_after_rename(&path)?;

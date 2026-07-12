@@ -76,6 +76,7 @@ The publish workflow always runs the forced-process-exit recovery test and a
 ```text
 cargo test -q --test production_maturity forced_process_exit_recovery -- --ignored --nocapture --test-threads=1
 cargo test -q --test production_maturity concurrent_mixed_load_soak_reopens_cleanly -- --ignored --nocapture --test-threads=1
+cargo test -q destructive_ --lib -- --test-threads=1
 ```
 
 Pull requests that touch production-sensitive paths also run the paired
@@ -133,8 +134,9 @@ The package-content guard fails if repository-only workflow directories such as
 - the `crates-io` environment when environment protection is desired.
 
 The workflow always runs the full verification gate and `cargo publish
---dry-run --locked`, plus forced-exit recovery and mixed-load evidence. It runs
-`cargo publish --locked` only when `mode` is `publish`.
+--dry-run --locked`, plus forced-exit recovery, deterministic destructive, and
+mixed-load evidence. It runs `cargo publish --locked` only when `mode` is
+`publish`.
 
 Recommended release flow:
 

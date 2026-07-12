@@ -22,6 +22,9 @@ contracts.
   then reopen and verify every confirmed write across repeated rounds.
 - Soak: use a reproducible seed, concurrent disjoint writers, reads, snapshots,
   maintenance, flush, compaction, close, and reopen verification.
+- Destructive I/O: inject one deterministic failure at a named native-storage
+  boundary, then verify the returned error, file state, retry or repair path,
+  and reopened contents.
 
 ## Current Task Slice
 
@@ -46,12 +49,16 @@ contracts.
 - Reworked README adoption guidance around production status, a five-minute
   verification path, evidence-backed capabilities, and explicit deployment
   boundaries; its maturity claims and local links are now checked in CI.
+- Added a path-scoped test-only storage fault model and a six-scenario matrix
+  for WAL append/persist, table/manifest publish, directory sync, WAL rewrite,
+  and delete retry; the matrix now runs in cross-platform and publish gates.
 
 ## Out Of Scope
 
 - Optimizing code before this phase identifies a measured retained hotspot.
 - Claiming sudden-power-loss proof from forced process exit.
-- Simulating kernel, filesystem, controller, or physical-device failure.
+- Claiming deterministic returned-I/O-error injection is equivalent to real
+  kernel, filesystem, controller, quota, or physical-device failure.
 - Changing public API, storage formats, durability semantics, or provider
   adapters.
 
@@ -69,6 +76,10 @@ contracts.
   Met.
 - Active release documentation, CI, and publish automation pass the automated
   drift contract. Met.
+- Deterministic destructive scenarios cover pre-write failure, post-write
+  persistence failure, pre-rename publish failure, post-rename directory-sync
+  failure, atomic rewrite retry, and delete retry. Met locally; remote matrix
+  pending with the rest of Phase 191.
 
 ## Known Blockers
 
@@ -77,5 +88,5 @@ contracts.
 - GitHub-hosted timing varies; the paired gate uses broad relative limits plus
   an absolute noise floor and is not a hardware SLA.
 - Process exit validates application-crash recovery, not sudden power loss.
-- Disk-full, I/O fault injection, sanitizer, and long-duration fleet evidence
+- Real disk-full/quota exhaustion, sanitizer, and long-duration fleet evidence
   remain follow-up candidates.

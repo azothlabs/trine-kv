@@ -47,13 +47,13 @@ jobs:
             exit 1
           fi
 
-      - name: Check documentation drift
-        run: python3 scripts/check_docs_drift.py
-
           if ! grep -F "## ${{ inputs.version }}" CHANGELOG.md; then
             echo "CHANGELOG.md is missing an entry for ${{ inputs.version }}" >&2
             exit 1
           fi
+
+      - name: Check documentation drift
+        run: python3 scripts/check_docs_drift.py
 
       - name: Format
         run: cargo fmt --check
@@ -111,6 +111,9 @@ jobs:
         run: >-
           cargo test -q --test production_maturity forced_process_exit_recovery
           -- --ignored --nocapture --test-threads=1
+
+      - name: Run deterministic destructive matrix
+        run: cargo test -q destructive_ --lib -- --test-threads=1
 
       - name: Run concurrent mixed-load evidence
         env:

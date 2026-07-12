@@ -61,6 +61,40 @@ the application-process exit and stale writer-lease recovery boundary. It does
 not emulate sudden power loss, kernel failure, controller-cache loss, or a
 damaged filesystem.
 
+## Deterministic Destructive Matrix
+
+Run the storage-failure matrix with:
+
+```text
+cargo test -q destructive_ --lib -- --test-threads=1
+```
+
+The test-only storage hooks fail one named operation on one database path and
+then remove themselves. They cover:
+
+- WAL failure before any record bytes are appended;
+- persistence failure after a complete WAL record has been appended;
+- table and manifest temporary files written completely but not renamed;
+- directory synchronization failure after a rename;
+- WAL rewrite failure before atomic rename;
+- object deletion failure and successful retry.
+
+Every scenario checks the returned error, the exact number of injected calls,
+the state of temporary and published files, and the next open or retry. Earlier
+confirmed data must remain readable. A failure before WAL append must not make
+the rejected write visible.
+
+A persistence error after complete WAL bytes were written has an explicitly
+unknown commit result: the caller receives an error, while recovery may either
+find the complete record or omit it. Applications that retry after such an
+error need idempotent operation identifiers or an application-level read-back
+rule. Recovery must never return arbitrary bytes or lose earlier confirmed
+records.
+
+These hooks prove Trine's response to returned I/O errors at deterministic code
+boundaries. They do not emulate real `ENOSPC`, quota exhaustion, kernel failure,
+filesystem corruption, controller-cache loss, or sudden power loss.
+
 ## Concurrent Mixed-Load Soak
 
 Run the local default workload with:
@@ -98,6 +132,7 @@ The `.github/workflows/production-evidence.yml` workflow runs on Linux, macOS,
 and Windows. Every
 runner executes:
 
+- deterministic storage-failure injection and retry/reopen checks;
 - forced-process-exit recovery;
 - concurrent mixed-load soak and reopen verification;
 - portable `platform-io` tests;

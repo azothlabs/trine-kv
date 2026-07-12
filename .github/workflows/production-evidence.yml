@@ -7,7 +7,7 @@ on:
       - "benches/**"
       - "scripts/**"
       - "src/**"
-      - "tests/production_maturity.rs"
+      - "tests/**"
       - "Cargo.lock"
       - "Cargo.toml"
   schedule:
@@ -45,6 +45,7 @@ jobs:
     env:
       TRINE_MATURITY_OPERATIONS: ${{ github.event_name == 'schedule' && '50000' || inputs.soak_operations || '10000' }}
       TRINE_MATURITY_REPORT: production-maturity-${{ runner.os }}.jsonl
+      TRINE_DESTRUCTIVE_REPORT: production-maturity-${{ runner.os }}.jsonl
 
     steps:
       - name: Checkout
@@ -52,6 +53,9 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Run deterministic destructive matrix
+        run: cargo test -q destructive_ --lib -- --test-threads=1
 
       - name: Run forced-process-exit recovery
         run: >-

@@ -994,6 +994,8 @@ impl Default for NativeFileBackend {
 }
 
 mod backend;
+#[cfg(test)]
+pub(crate) mod fault_injection;
 mod metrics;
 mod native_file;
 

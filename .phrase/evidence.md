@@ -15887,3 +15887,52 @@ Negative check:
 - Use the README production status as the public entry point and keep detailed
   procedures in `docs/production-readiness.md`; do not duplicate changing test
   counts or machine-specific benchmark timings in the README.
+
+## 2026-07-12: Deterministic destructive storage matrix
+
+### Observation
+
+- Existing corruption coverage was broad but organized as individual format
+  tests. It did not provide one storage-operation fault model for failures that
+  happen while a database is open.
+- A test-only, path-scoped fault registry can target one operation and call
+  number without changing `DbOptions`, the public API, storage formats, or
+  non-test builds.
+- Six destructive scenarios pass locally: WAL append before write, WAL persist
+  after append, table publish before rename, manifest publish before rename,
+  directory sync after rename, and WAL rewrite/delete retry.
+- The audit also found the publish workflow's changelog check had drifted out
+  of its intended shell block. YAML parsing alone accepted the malformed step
+  shape; the workflow and drift checker now verify that relationship directly.
+
+### Interpretation
+
+- A WAL append failure before bytes are written has a definite rejected result
+  and must not become visible. A persistence failure after a complete record is
+  appended has an unknown commit result: callers must not assume either commit
+  or rollback and need an idempotent retry/read-back policy.
+- Pre-rename failures must preserve the old published object and leave an
+  explicit temporary file. Trine should fail closed by default and only remove
+  known safe temporary files under the explicit repair policy.
+- Deterministic injection proves handling of returned I/O errors. It is not
+  evidence for real disk exhaustion, quota enforcement, filesystem damage,
+  controller-cache loss, or sudden power loss.
+
+### Verification
+
+- `cargo test -q destructive_ --lib -- --test-threads=1`: 6 passed.
+- The matrix checks injected call counts, typed I/O errors, rejected visibility,
+  unknown-result constraints, old-file preservation, safe-temp repair, retry,
+  and reopen behavior.
+- `cargo test -q --all-features`: 524 passed, 5 ignored.
+- `cargo clippy -q --all-targets --all-features -- -D warnings` passed.
+- WASI and browser-WASM library target checks passed.
+- The JSONL evidence path produced six valid, uniquely named scenario records.
+- Documentation drift tests, workflow YAML parsing, formatting, and diff checks
+  passed.
+
+### Recommended Next Action
+
+- Run the expanded production-evidence workflow on Linux, macOS, and Windows
+  and inspect the combined JSONL artifacts. Treat real `ENOSPC`/quota testing as
+  a separate host-level phase rather than weakening this deterministic gate.

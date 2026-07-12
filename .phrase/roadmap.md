@@ -4749,6 +4749,9 @@ soak harness.
 - Linux, macOS, and Windows run the same forced-process-exit recovery and mixed
   concurrent workload harness with reproducible seeds and machine-readable
   reports.
+- Linux, macOS, and Windows run a deterministic returned-I/O-error matrix that
+  checks WAL, publish, directory-sync, rewrite, cleanup, repair, retry, and
+  reopen behavior without exposing fault controls in the public crate API.
 - macOS CI executes Trine's platform-I/O and native platform-I/O paths rather
   than relying on cross-compilation or local-only evidence.
 - Focused tests, full tests, strict clippy, Rustdoc, doctests, formatting, and

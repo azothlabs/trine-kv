@@ -23,6 +23,8 @@ Repository evidence currently includes:
 - full Rust tests, strict linting, Rustdoc, doctests, WASI, and real-browser
   persistence gates;
 - repeated child-process exit and reopen verification;
+- deterministic I/O failure injection across WAL, publish, directory-sync, and
+  cleanup boundaries;
 - deterministic concurrent mixed-load soak and reopen verification;
 - paired benchmark regression checks on the same runner;
 - target-native Linux, macOS, and Windows maturity jobs with retained reports.
