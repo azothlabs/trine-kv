@@ -37,6 +37,12 @@ contracts.
   bucket while different buckets retain independent compaction progress.
 - Documented local commands, evidence meaning, deployment gaps, and the updated
   `0.5` dependency line.
+- Added an executable documentation-drift gate that ties active dependency
+  examples and release documentation to the commands enforced by CI and the
+  publish workflow.
+- Added the forced-exit and 10,000-operation mixed-load evidence harness to the
+  publish workflow while retaining the Linux/macOS/Windows workflow as the
+  phase-closing cross-platform gate.
 
 ## Out Of Scope
 
@@ -58,6 +64,8 @@ contracts.
   reports as artifacts. Implemented; remote execution pending.
 - Full local verification passes and evidence delta records remaining gaps.
   Met.
+- Active release documentation, CI, and publish automation pass the automated
+  drift contract. Met.
 
 ## Known Blockers
 

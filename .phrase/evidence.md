@@ -15814,3 +15814,39 @@ Negative check:
 - Let CI run the expanded browser wasm integration gate. If it fails, triage the
   failing browser path directly instead of treating the suite as optional smoke
   coverage.
+## 2026-07-12: Release contract and documentation drift gate
+
+### Observation
+
+- The release document listed `read_versions` as a normal CI command while CI
+  did not run it. The publish workflow also omitted the platform-I/O and
+  read-version examples now described by the release gate.
+- The publish path ran the normal test suite but did not execute the ignored
+  forced-process-exit or mixed-load production evidence harness.
+- Active dependency examples were manually aligned to the crate minor version,
+  so another version bump could silently make README and usage instructions
+  stale.
+
+### Interpretation
+
+- Documentation drift was a release-contract problem, not only a prose cleanup
+  problem. The repository needed one executable check covering the active crate
+  minor line and the commands promised across CI, publishing, and release docs.
+- An Ubuntu publish job can provide a final local recovery and soak check, but
+  it cannot replace target-native Linux, macOS, and Windows evidence for the
+  exact release commit.
+
+### Verification
+
+- `python3 scripts/check_docs_drift.py` passed.
+- `python3 -m unittest discover -s scripts -p 'test_*.py'` passed four tests.
+- CI, publish, and production-evidence workflow YAML parsed successfully.
+- The newly aligned `read_versions` and default `platform_io` examples ran
+  successfully.
+- `git diff --check` passed.
+
+### Recommended Next Action
+
+- Push the commits and inspect the production-evidence artifacts from Linux,
+  macOS, and Windows. Phase 191 remains open until those target-native jobs pass
+  for the same commit.

@@ -28,6 +28,9 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown, wasm32-wasip1
 
+      - name: Check documentation drift
+        run: python3 scripts/check_docs_drift.py
+
       - name: Format
         run: cargo fmt --check
 
@@ -76,6 +79,7 @@ jobs:
           cargo run --example platform_io
           cargo run --example platform_io --features platform-io
           cargo run --example platform_io --features platform-io-native
+          cargo run --example read_versions
           cargo run --example user_store
           cargo run --example event_index
 

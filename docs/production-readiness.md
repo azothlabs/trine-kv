@@ -94,7 +94,8 @@ cross-machine performance comparison.
 
 ## Runtime Matrix
 
-The production-evidence workflow runs on Linux, macOS, and Windows. Every
+The `.github/workflows/production-evidence.yml` workflow runs on Linux, macOS,
+and Windows. Every
 runner executes:
 
 - forced-process-exit recovery;

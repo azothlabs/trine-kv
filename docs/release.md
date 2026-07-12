@@ -41,6 +41,7 @@ of the crate package.
 Run this gate before tagging or publishing:
 
 ```text
+python3 scripts/check_docs_drift.py
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
@@ -48,8 +49,12 @@ cargo check --target wasm32-unknown-unknown --lib
 cargo check --target wasm32-wasip1 --lib
 CARGO_TARGET_WASM32_WASIP1_RUNNER="wasmtime run --dir ." cargo test --target wasm32-wasip1 --lib wasi_persistent
 cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings
+CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner WASM_BINDGEN_TEST_ONLY_WEB=1 cargo test --target wasm32-unknown-unknown --test browser_persistent_wasm
 cargo run --example quickstart
 cargo run --example sync_quickstart
+cargo run --example platform_io
+cargo run --example platform_io --features platform-io
+cargo run --example platform_io --features platform-io-native
 cargo run --example read_versions
 cargo run --example user_store
 cargo run --example event_index
@@ -65,10 +70,20 @@ For performance-sensitive changes, also run:
 cargo bench --bench v1_bench
 ```
 
-For changes to commit ordering, recovery, platform I/O, maintenance, or other
-production-sensitive paths, also run the ignored evidence harness documented in
-`docs/production-readiness.md`. Pull requests that touch those paths run the
-paired performance and cross-platform maturity workflow automatically.
+The publish workflow always runs the forced-process-exit recovery test and a
+10,000-operation concurrent mixed-load test. Run the same evidence locally with:
+
+```text
+cargo test -q --test production_maturity forced_process_exit_recovery -- --ignored --nocapture --test-threads=1
+cargo test -q --test production_maturity concurrent_mixed_load_soak_reopens_cleanly -- --ignored --nocapture --test-threads=1
+```
+
+Pull requests that touch production-sensitive paths also run the paired
+performance and cross-platform maturity workflow in
+`.github/workflows/production-evidence.yml`. Its maturity matrix covers Linux,
+macOS, and Windows. A release is not production-evidence complete until that
+workflow has passed for the release commit; the Ubuntu publish job does not
+substitute for the cross-platform result.
 
 The package list should not include `.github/`, `.phrase/`, `.rust-skills/`,
 `.claude/`, or other repository-only workflow directories.
@@ -79,19 +94,30 @@ The package list should not include `.github/`, `.phrase/`, `.rust-skills/`,
 `main`, pull requests, and manual dispatch:
 
 - `cargo fmt --check`
+- `python3 scripts/check_docs_drift.py`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --all-targets --all-features`
 - `cargo check --target wasm32-unknown-unknown --lib`
 - `cargo check --target wasm32-wasip1 --lib`
 - `cargo test --target wasm32-wasip1 --lib wasi_persistent` under `wasmtime run --dir .`
 - `cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings`
+- `cargo test --target wasm32-unknown-unknown --test browser_persistent_wasm`
+  under the browser test runner
 - `cargo run --example quickstart`
 - `cargo run --example sync_quickstart`
+- `cargo run --example platform_io`
+- `cargo run --example platform_io --features platform-io`
+- `cargo run --example platform_io --features platform-io-native`
 - `cargo run --example read_versions`
 - `cargo run --example user_store`
 - `cargo run --example event_index`
 - `cargo package --list` with a package-content guard
 - `cargo package --locked`
+
+The `Windows Platform I/O` and `macOS Platform I/O` jobs additionally check,
+test, and run both platform I/O feature modes on their named operating systems.
+The separate production-evidence workflow supplies the broader Linux, macOS,
+and Windows crash-recovery and mixed-load matrix.
 
 The package-content guard fails if repository-only workflow directories such as
 `.github/`, `.phrase/`, `.rust-skills/`, or `.claude/` enter the crate package.
@@ -107,8 +133,8 @@ The package-content guard fails if repository-only workflow directories such as
 - the `crates-io` environment when environment protection is desired.
 
 The workflow always runs the full verification gate and `cargo publish
---dry-run --locked`. It runs `cargo publish --locked` only when `mode` is
-`publish`.
+--dry-run --locked`, plus forced-exit recovery and mixed-load evidence. It runs
+`cargo publish --locked` only when `mode` is `publish`.
 
 Recommended release flow:
 

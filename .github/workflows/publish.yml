@@ -47,6 +47,9 @@ jobs:
             exit 1
           fi
 
+      - name: Check documentation drift
+        run: python3 scripts/check_docs_drift.py
+
           if ! grep -F "## ${{ inputs.version }}" CHANGELOG.md; then
             echo "CHANGELOG.md is missing an entry for ${{ inputs.version }}" >&2
             exit 1
@@ -97,8 +100,24 @@ jobs:
         run: |
           cargo run --example quickstart
           cargo run --example sync_quickstart
+          cargo run --example platform_io
+          cargo run --example platform_io --features platform-io
+          cargo run --example platform_io --features platform-io-native
+          cargo run --example read_versions
           cargo run --example user_store
           cargo run --example event_index
+
+      - name: Run forced-process-exit recovery evidence
+        run: >-
+          cargo test -q --test production_maturity forced_process_exit_recovery
+          -- --ignored --nocapture --test-threads=1
+
+      - name: Run concurrent mixed-load evidence
+        env:
+          TRINE_MATURITY_OPERATIONS: "10000"
+        run: >-
+          cargo test -q --test production_maturity concurrent_mixed_load_soak_reopens_cleanly
+          -- --ignored --nocapture --test-threads=1
 
       - name: Check package contents
         run: |
