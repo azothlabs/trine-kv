@@ -43,6 +43,10 @@ checks.
   context available while job-level environment expressions are evaluated.
 - Production WASI builds no longer retain native/browser-only CommitTracker
   waker machinery, and the WASI target check now rejects rustc warnings.
+- Browser persistence now selects synchronous OPFS access handles only inside
+  DedicatedWorker, while SharedWorker keeps the async OPFS path used by shared
+  multi-tab instances. Separate real Worker test targets replace the broken
+  nested Blob-worker harness.
 
 ### Changed
 
@@ -58,26 +62,26 @@ checks.
 
 ## 0.5.11 - 2026-07-09
 
-Browser worker OPFS hardening release. This patch keeps the `0.5.x` storage
-format compatible while making the browser persistent backend usable from
-DedicatedWorker and SharedWorker globals that expose OPFS.
+Browser worker OPFS groundwork release. This patch keeps the `0.5.x` storage
+format compatible while removing the Window-only OPFS-root dependency and
+adding the DedicatedWorker synchronous-access path. The SharedWorker backend
+selection and Worker test harness are corrected in `0.5.12`.
 
 ### Added
 
 - Browser persistent storage now opens the OPFS root through the current
   global's `navigator.storage.getDirectory()`, so the backend is no longer tied
   to a `window` object.
-- Worker-context browser file operations now use
+- DedicatedWorker browser file operations now use
   `FileSystemSyncAccessHandle` for whole-object reads, random reads, object
   writes, WAL append, manifest publish, and WAL rewrite.
-- The browser wasm integration suite now includes real DedicatedWorker and
-  SharedWorker Trine database round trips, plus SharedWorker sync-access
-  capability, exclusivity, and timing probes.
+- Initial Worker round-trip and sync-access probes were added; `0.5.12` moves
+  them to wasm-bindgen's real DedicatedWorker and SharedWorker test targets.
 
 ### Fixed
 
-- SharedWorker browser opens no longer fail merely because `web_sys::window()`
-  is unavailable.
+- Worker OPFS-root discovery no longer fails merely because
+  `web_sys::window()` is unavailable.
 - Worker contexts that expose OPFS without `FileSystemSyncAccessHandle` now
   return `UnsupportedBackend` instead of falling through to the Window-oriented
   async file path.

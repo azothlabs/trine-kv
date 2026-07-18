@@ -16086,3 +16086,56 @@ Negative check:
 - Commit and push this correction, require the normal CI workflow to pass, then
   manually dispatch Production Evidence against `v0.5.11` as its performance
   baseline.
+
+## 2026-07-18: browser Worker platform split and real-context test gate
+
+### Observation
+
+- GitHub Chrome ran all 14 Window OPFS tests successfully, then failed every
+  nested Worker test: three SharedWorker sync-access probes returned
+  `SecurityError`, DedicatedWorker reported a script error without details, and
+  SharedWorker database execution timed out.
+- The File System Living Standard exposes `FileSystemSyncAccessHandle` only to
+  `DedicatedWorker`. Trine selected that path for every non-Window global, so a
+  SharedWorker was sent down a host-unsupported path instead of the existing
+  async OPFS implementation.
+- The nested database Worker imported `import.meta.url` from wasm-bindgen's
+  inline snippet. That URL names the snippet, not the generated glue module
+  exporting the Rust entrypoint, so DedicatedWorker module loading failed and
+  SharedWorker had no script-error observer to distinguish the same load failure
+  from a timeout.
+- wasm-bindgen-test provides native `run_in_dedicated_worker` and
+  `run_in_shared_worker` modes that load and initialize the generated module in
+  the target Worker context without the nested Blob bootstrap.
+
+### Interpretation
+
+- This was a product capability-boundary error plus a test-harness error, not a
+  ChromeDriver configuration failure. The missing `webdriver.json` message is
+  informational because the runner had already launched Chrome and completed
+  Window tests.
+- DedicatedWorker should retain synchronous OPFS file-byte operations.
+  SharedWorker remains the multi-tab shared-instance context, but must use the
+  async writable-stream path together with the existing Web Locks writer lease.
+- `NoModificationAllowedError` and `InvalidStateError` both represent failure
+  to obtain the exclusive synchronous file handle and should map to Trine's
+  typed `RuntimeBusy` result.
+
+### Verification
+
+- `cargo test -q --target wasm32-unknown-unknown --test
+  browser_dedicated_worker_wasm --test browser_shared_worker_wasm --no-run`
+  passed after introducing separate Worker targets.
+- Full real Chrome execution remains the next required evidence; this host has
+  no Chrome/ChromeDriver installation.
+
+### Remaining Blockers
+
+- The combined Window, DedicatedWorker, and SharedWorker command must pass on a
+  GitHub-hosted Chrome runner before the browser production gate is considered
+  restored.
+
+### Recommended Next Action
+
+- Run normal CI on this commit, inspect all three browser test binaries, and
+  only then move the `v0.5.12` tag or publish the crate.

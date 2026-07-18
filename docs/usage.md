@@ -252,16 +252,18 @@ current browser global, so it is not tied to a `window` object when the same
 storage manager API is available from a worker context. Writable open acquires
 a Web Locks writer lease, replays WAL, and uses WAL-backed async writes. Browser
 WAL appends write only the new WAL bytes instead of rewriting the whole WAL
-file. In Window contexts that append uses an OPFS writable stream with existing
-data kept and the cursor moved to the current file end. In worker contexts Trine
-uses `FileSystemSyncAccessHandle` for file byte reads, writes, WAL append,
-manifest publish, and WAL rewrite, opening the access handle only for the
-operation and closing it immediately afterward. If a worker global has OPFS but
-does not expose synchronous access handles, browser persistent open reports an
-unsupported backend instead of silently using the Window-oriented path. The
-browser integration test runs the same database round trip from both
-DedicatedWorker and SharedWorker: write and delete through WAL, flush, compact,
-reopen read-only, and verify default-bucket plus named-bucket blob-backed data.
+file. In Window and SharedWorker contexts that append uses an OPFS writable
+stream with existing data kept and the cursor moved to the current file end.
+DedicatedWorker contexts use `FileSystemSyncAccessHandle` for file byte reads,
+writes, WAL append, manifest publish, and WAL rewrite, opening the access handle
+only for the operation and closing it immediately afterward. This split follows
+the File System API boundary: synchronous access handles are exposed only in
+DedicatedWorker, while SharedWorker remains useful for one database instance
+shared by multiple tabs through Trine's async API and Web Locks writer lease.
+The browser integration gate runs separate Window, DedicatedWorker, and
+SharedWorker targets. Both worker targets write and delete through WAL, flush,
+compact, reopen read-only, and verify default-bucket plus named-bucket
+blob-backed data.
 Browser WAL appends are still serialized per shard because OPFS does not expose
 Trine's native append contract as a shared cross-context file primitive.
 `WalShardPolicy::Auto` therefore uses one browser WAL lane by default; explicit

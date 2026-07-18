@@ -115,7 +115,10 @@ dropped.
   large-value settings; separated blob files and snapshot-safe blob cleanup.
 - **Runtime choices:** async-first APIs, explicit sync adapters, portable
   thread-pool platform I/O, audited native-first platform I/O with fallback,
-  WASI host storage, and browser OPFS persistence.
+  WASI host storage, and browser OPFS persistence. Browser databases run in
+  Window, DedicatedWorker, and SharedWorker contexts; DedicatedWorker uses the
+  synchronous OPFS fast path, while SharedWorker keeps the async path for a
+  database instance shared across tabs.
 - **Operational evidence:** live statistics plus repeatable recovery, soak,
   platform, browser, WASI, and benchmark gates.
 

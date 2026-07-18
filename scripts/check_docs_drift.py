@@ -80,7 +80,12 @@ def check_release_contract() -> list[str]:
         "cargo check --target wasm32-wasip1 --lib",
         "cargo test --target wasm32-wasip1 --lib wasi_persistent",
         "cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings",
-        "cargo test --target wasm32-unknown-unknown --test browser_persistent_wasm",
+        (
+            "cargo test --target wasm32-unknown-unknown "
+            "--test browser_persistent_wasm "
+            "--test browser_dedicated_worker_wasm "
+            "--test browser_shared_worker_wasm"
+        ),
         "cargo run --example quickstart",
         "cargo run --example sync_quickstart",
         "cargo run --example platform_io",

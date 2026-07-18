@@ -63,6 +63,9 @@ contracts.
 - Removed native/browser-only CommitTracker waker state from production WASI
   builds while retaining its unit-test coverage, and made WASI rustc warnings a
   CI and publish failure.
+- Corrected the browser platform split so DedicatedWorker uses synchronous OPFS
+  handles while SharedWorker preserves the async multi-tab path, and replaced
+  the nested Blob-worker tests with native wasm-bindgen Worker targets.
 
 ## Out Of Scope
 
@@ -94,8 +97,9 @@ contracts.
 
 ## Known Blockers
 
-- The Rust 1.88 wasm-bindgen tool install and strict WASI warning gate have
-  passed locally but have not yet rerun on GitHub-hosted CI.
+- The Rust 1.88 wasm-bindgen tool install and strict WASI warning gate reached
+  the browser gate on GitHub-hosted CI; the corrected three-context browser
+  suite still requires a fresh remote run.
 - The corrected Linux/macOS/Windows workflow has not run remotely in this
   local-only session; Phase 191 cannot close until those jobs and artifacts are
   inspected.

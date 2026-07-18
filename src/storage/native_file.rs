@@ -59,7 +59,7 @@ mod browser_persistent_storage {
     use wasm_bindgen::{JsCast, JsValue};
     use wasm_bindgen_futures::JsFuture;
     use web_sys::{
-        FileSystemDirectoryHandle, FileSystemFileHandle,
+        DedicatedWorkerGlobalScope, FileSystemDirectoryHandle, FileSystemFileHandle,
         FileSystemGetDirectoryOptions as WebGetDirectoryOptions,
         FileSystemGetFileOptions as WebGetFileOptions, FileSystemReadWriteOptions,
         FileSystemSyncAccessHandle,
@@ -949,20 +949,21 @@ mod browser_persistent_storage {
     }
 
     fn browser_uses_sync_access_handles() -> Result<bool> {
-        if browser_window_global_available() {
+        if !browser_dedicated_worker_global_available() {
             return Ok(false);
         }
         if browser_sync_access_handle_api_available() {
             return Ok(true);
         }
         Err(Error::unsupported_backend(
-            "browser OPFS sync access handle in Worker",
+            "browser OPFS sync access handle in DedicatedWorker",
         ))
     }
 
-    fn browser_window_global_available() -> bool {
-        Reflect::get(&js_sys::global(), &JsValue::from_str("window"))
-            .is_ok_and(|window| !window.is_null() && !window.is_undefined())
+    fn browser_dedicated_worker_global_available() -> bool {
+        js_sys::global()
+            .dyn_ref::<DedicatedWorkerGlobalScope>()
+            .is_some()
     }
 
     fn browser_sync_access_handle_api_available() -> bool {
@@ -1150,7 +1151,10 @@ mod browser_persistent_storage {
 
     fn map_sync_access_open_error(error: &JsValue) -> Error {
         let name = js_value_property(error, "name");
-        if name.as_deref() == Some("InvalidStateError") {
+        if matches!(
+            name.as_deref(),
+            Some("InvalidStateError" | "NoModificationAllowedError")
+        ) {
             return Error::runtime_busy("browser OPFS sync access handle is already open");
         }
         if matches!(
