@@ -59,6 +59,9 @@ checks.
 
 ### Changed
 
+- GitHub workflows now use `actions/checkout@v7`, whose Node.js 24 runtime
+  removes the Node.js 20 deprecation warning on hosted Linux, macOS, and Windows
+  runners; the release drift gate rejects older checkout action versions.
 - Normal CI now includes macOS platform-I/O runtime coverage in addition to the
   existing Windows path.
 - README production guidance now leads with pre-`1.0` adoption boundaries,

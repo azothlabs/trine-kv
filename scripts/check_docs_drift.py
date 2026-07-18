@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CHECKOUT_ACTION_VERSION = "v7"
 
 
 def require_snippets(path: str, snippets: tuple[str, ...]) -> list[str]:
@@ -64,6 +65,19 @@ def check_local_markdown_links(path: str) -> list[str]:
     return errors
 
 
+def check_checkout_action_versions() -> list[str]:
+    errors: list[str] = []
+    for workflow in sorted((ROOT / ".github/workflows").glob("*.y*ml")):
+        text = workflow.read_text(encoding="utf-8")
+        for version in re.findall(r"actions/checkout@([^\s]+)", text):
+            if version != CHECKOUT_ACTION_VERSION:
+                errors.append(
+                    f"{workflow.relative_to(ROOT)}: actions/checkout uses {version}; "
+                    f"expected {CHECKOUT_ACTION_VERSION} for the Node.js 24 runtime"
+                )
+    return errors
+
+
 def check_release_contract() -> list[str]:
     lockfile = tomllib.loads((ROOT / "Cargo.lock").read_text(encoding="utf-8"))
     wasm_bindgen_version = next(
@@ -114,7 +128,7 @@ def check_release_contract() -> list[str]:
         "benches|docs|tests",
         "crate package contains repository-only files",
     )
-    errors: list[str] = []
+    errors = check_checkout_action_versions()
 
     for path in (".github/workflows/ci.yml", ".github/workflows/publish.yml"):
         errors.extend(require_snippets(path, common_gate))

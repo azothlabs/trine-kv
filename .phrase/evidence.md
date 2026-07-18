@@ -16268,3 +16268,39 @@ Negative check:
 
 - Commit and push the workflow correction, then inspect the next CI browser
   step before publishing `0.5.12`.
+
+## 2026-07-18: GitHub Actions Node.js 24 checkout runtime
+
+### Observation
+
+- Production-evidence run `29631321057` emitted the same warning on hosted
+  Linux, macOS, and Windows: `actions/checkout@v4` declares the deprecated
+  Node.js 20 action runtime and GitHub temporarily forced it onto Node.js 24.
+- GitHub's current checkout release is `actions/checkout@v7`, which declares a
+  Node.js 24 runtime. All repository checkout steps still used v4.
+
+### Interpretation
+
+- This is shared workflow maintenance debt, not a macOS, Windows, or Linux I/O
+  failure. The forced runtime keeps the current run moving, but relying on it
+  leaves future runner behavior outside the repository's declared contract.
+- All jobs use GitHub-hosted runners, so they can use the current checkout action
+  and its runner requirements without changing the platform evidence boundary.
+
+### Verification
+
+- All three workflow files parse as YAML after replacing all eight checkout pins
+  with v7.
+- The documentation-drift suite passed two tests, including a regression that
+  rejects a legacy checkout version in either `.yml` or `.yaml` workflows.
+- The repository drift command and `git diff --check` passed.
+
+### Remaining Blockers
+
+- An already-created workflow run uses the workflow at its triggering commit;
+  only a fresh run can prove that the warning is gone on all three platforms.
+
+### Recommended Next Action
+
+- Push this workflow runtime update, then inspect the checkout steps in the next
+  hosted Linux, macOS, and Windows run.

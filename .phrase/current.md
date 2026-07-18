@@ -69,6 +69,9 @@ contracts.
 - Released browser compaction's internal input-table handles before its awaited
   cleanup pass, preventing successful compaction from leaving old tables that
   fail the next read-only reopen.
+- Updated every GitHub workflow checkout step to `actions/checkout@v7` so its
+  declared Node.js 24 runtime matches the hosted-runner transition, and made the
+  release drift gate reject legacy checkout versions.
 
 ## Out Of Scope
 
@@ -108,6 +111,9 @@ contracts.
 - The corrected Linux/macOS/Windows workflow has not run remotely in this
   local-only session; Phase 191 cannot close until those jobs and artifacts are
   inspected.
+- The currently running workflow was created from the preceding commit and will
+  retain its `actions/checkout@v4` warning; the Node.js 24 action update needs a
+  fresh remote run.
 - GitHub-hosted timing varies; the paired gate uses broad relative limits plus
   an absolute noise floor and is not a hardware SLA.
 - Process exit validates application-crash recovery, not sudden power loss.
