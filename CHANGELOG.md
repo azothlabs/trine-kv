@@ -47,6 +47,9 @@ checks.
   DedicatedWorker, while SharedWorker keeps the async OPFS path used by shared
   multi-tab instances. Separate real Worker test targets replace the broken
   nested Blob-worker harness.
+- Browser compaction releases its own input-table handles before awaiting OPFS
+  cleanup, so obsolete inputs are deleted before a successful compaction
+  returns instead of making the next fail-closed reopen report orphaned tables.
 
 ### Changed
 

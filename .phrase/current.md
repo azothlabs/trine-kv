@@ -66,6 +66,9 @@ contracts.
 - Corrected the browser platform split so DedicatedWorker uses synchronous OPFS
   handles while SharedWorker preserves the async multi-tab path, and replaced
   the nested Blob-worker tests with native wasm-bindgen Worker targets.
+- Released browser compaction's internal input-table handles before its awaited
+  cleanup pass, preventing successful compaction from leaving old tables that
+  fail the next read-only reopen.
 
 ## Out Of Scope
 
@@ -97,9 +100,9 @@ contracts.
 
 ## Known Blockers
 
-- The Rust 1.88 wasm-bindgen tool install and strict WASI warning gate reached
-  the browser gate on GitHub-hosted CI; the corrected three-context browser
-  suite still requires a fresh remote run.
+- The Rust 1.88 wasm-bindgen tool install, strict WASI warning gate, Window
+  suite, and DedicatedWorker sync-access probes passed on GitHub-hosted CI. The
+  compaction cleanup correction still requires a fresh Worker run.
 - The corrected Linux/macOS/Windows workflow has not run remotely in this
   local-only session; Phase 191 cannot close until those jobs and artifacts are
   inspected.

@@ -16139,3 +16139,47 @@ Negative check:
 
 - Run normal CI on this commit, inspect all three browser test binaries, and
   only then move the `v0.5.12` tag or publish the crate.
+
+## 2026-07-18: DedicatedWorker compaction input cleanup
+
+### Observation
+
+- The real DedicatedWorker target passed all three raw synchronous OPFS tests,
+  then completed Trine writes, flushes, and compaction before read-only reopen
+  failed on unreferenced `table-00000000000000000001.trinet` and
+  `table-00000000000000000003.trinet`.
+- Browser compaction installed and published its output, then queued obsolete
+  inputs for liveness-gated deletion. At that first cleanup pass,
+  `compaction_inputs` and the statistics input list still held internal
+  `Arc<Table>` references. The cleanup correctly treated the files as pinned
+  and retained them.
+- The browser async state machine used `compaction_inputs.len()` after awaited
+  cleanup to build its result, guaranteeing that the input plan stayed live
+  across cleanup. Browser `Drop` cannot perform a later asynchronous OPFS retry,
+  so immediate read-only reopen observed the old files.
+
+### Interpretation
+
+- This is an engine-owned handle-lifetime bug, not damaged data and not a reason
+  to weaken the fail-closed unreferenced-file check.
+- Capture the compaction count, record statistics, then explicitly release the
+  internal input-table references before liveness-gated cleanup. External
+  readers retain their independent table handles and continue to defer deletion
+  safely.
+
+### Verification
+
+- The focused host compaction suite passed 9 tests.
+- The obsolete-table delayed-deletion regression passed.
+- Strict wasm Clippy and no-run builds passed for DedicatedWorker and
+  SharedWorker targets.
+
+### Remaining Blockers
+
+- The exact DedicatedWorker round trip must rerun in real Chrome to prove the
+  obsolete inputs are now deleted before reopen.
+
+### Recommended Next Action
+
+- Commit and push the cleanup correction, then require the combined Window,
+  DedicatedWorker, and SharedWorker browser gate to pass before publishing.

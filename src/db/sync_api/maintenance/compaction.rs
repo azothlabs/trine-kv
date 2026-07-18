@@ -429,15 +429,21 @@ impl Db {
             return Err(error);
         }
 
+        let compaction_count = compaction_inputs.len();
         let obsolete_tables = self
             .install_compacted_tables(written_tables)
             .map_err(|error| self.close_after_durable_publish_error("compaction", &error))?;
         self.record_compaction_stats_from_tables(
-            compaction_inputs.len(),
+            compaction_count,
             &input_tables,
             &output_tables,
             &trigger_stats,
         );
+        // Browser Drop cannot perform asynchronous OPFS deletion, so release
+        // the plan's input-table references before the awaited cleanup pass.
+        // Actual readers still defer deletion through their own table handles.
+        drop(input_tables);
+        drop(compaction_inputs);
         self.retire_obsolete_table_files_browser_async(db_path, obsolete_tables)
             .await?;
         self.delete_pending_obsolete_blob_files_browser_async(db_path)
@@ -448,7 +454,7 @@ impl Db {
         }
 
         let outcome = MaintenanceOutcome {
-            compactions: compaction_inputs.len(),
+            compactions: compaction_count,
             budget_exhausted,
             ..MaintenanceOutcome::default()
         };
