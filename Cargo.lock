@@ -1825,7 +1825,7 @@ dependencies = [
 
 [[package]]
 name = "trine-kv"
-version = "0.5.12"
+version = "0.5.13"
 dependencies = [
  "block2",
  "bytes",

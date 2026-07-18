@@ -72,6 +72,11 @@ contracts.
 - Updated every GitHub workflow checkout step to `actions/checkout@v7` so its
   declared Node.js 24 runtime matches the hosted-runner transition, and made the
   release drift gate reject legacy checkout versions.
+- Prepared `0.5.13` metadata from the seven commits after the `v0.5.12` tag and
+  moved post-tag fixes out of the `0.5.12` changelog section so published
+  release history matches the code contained in each tag. The 140-file,
+  approximately 417-KiB package rebuild and crates.io publish dry-run pass
+  locally.
 
 ## Out Of Scope
 
@@ -114,6 +119,8 @@ contracts.
 - The currently running workflow was created from the preceding commit and will
   retain its `actions/checkout@v4` warning; the Node.js 24 action update needs a
   fresh remote run.
+- `v0.5.13` is intentionally not created until the release-preparation commit
+  passes the hosted browser and Linux/macOS/Windows production-evidence gates.
 - GitHub-hosted timing varies; the paired gate uses broad relative limits plus
   an absolute noise floor and is not a hardware SLA.
 - Process exit validates application-crash recovery, not sudden power loss.

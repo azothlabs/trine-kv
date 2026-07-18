@@ -16304,3 +16304,44 @@ Negative check:
 
 - Push this workflow runtime update, then inspect the checkout steps in the next
   hosted Linux, macOS, and Windows run.
+
+## 2026-07-18: 0.5.13 release metadata boundary
+
+### Observation
+
+- `v0.5.12` points to `9ebdf61`; release preparation started seven commits later
+  at `c083184`.
+- The active `0.5.12` changelog section had accumulated fixes from those seven
+  post-tag commits, so it described browser Worker, WASI, packaging, and CI
+  behavior that the tagged `0.5.12` source did not contain.
+
+### Interpretation
+
+- `0.5.13` is the compatible patch boundary for the post-tag Worker persistence,
+  WASI/CI, package-content, and GitHub Actions runtime corrections.
+- Moving those entries into a new release section repairs historical accuracy;
+  merely changing the Cargo version would preserve misleading release notes.
+
+### Verification
+
+- Cargo and the lockfile both resolve the local crate as `trine-kv v0.5.13`.
+- Strict all-target/all-feature Clippy passed. The all-target/all-feature test
+  gate passed, including 458 core tests with two intentionally ignored tests.
+- Strict browser WASM Clippy, browser WASM library check, strict WASI check, all
+  three browser test-target builds, and seven Wasmtime persistence tests passed.
+- All documented examples, documentation drift, formatting, and diff checks
+  passed.
+- On the clean release-preparation commit, `cargo package --list`, `cargo
+  package --locked`, and `cargo publish --dry-run --locked` passed. Cargo
+  packaged and rebuilt 140 consumer files at 416.9 KiB compressed; the dry-run
+  stopped before upload as intended.
+
+### Remaining Blockers
+
+- The release commit must pass hosted browser and Linux/macOS/Windows production
+  evidence before `v0.5.13` is created.
+
+### Recommended Next Action
+
+- Commit and push the prepared metadata, then require the hosted release-commit
+  gates before tagging.

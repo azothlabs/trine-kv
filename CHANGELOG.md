@@ -2,6 +2,45 @@
 
 All public crate releases use Semantic Versioning.
 
+## 0.5.13 - 2026-07-18
+
+Browser Worker persistence and release-maintenance patch. This release remains
+compatible with the `0.5.x` public API and storage format while correcting the
+Worker execution paths and keeping hosted verification on supported runtimes.
+
+### Fixed
+
+- Browser persistence now selects synchronous OPFS access handles only inside
+  DedicatedWorker. SharedWorker keeps the async OPFS path used by shared
+  multi-tab database instances, and the browser gate runs both contexts as real
+  wasm-bindgen Worker targets.
+- Browser compaction releases its own input-table handles before awaiting OPFS
+  cleanup, so obsolete inputs are deleted before a successful compaction
+  returns and do not make the next fail-closed reopen report orphaned files.
+- Browser persistence tests preserve the default and named-bucket options used
+  at creation when reopening, allowing persisted reads to run instead of
+  correctly stopping at `InvalidOptions` because of test configuration drift.
+- Browser CI and publish tests disable wasm-bindgen-test's optional COOP/COEP
+  origin-isolation headers, which prevent Chrome SharedWorker from opening its
+  OPFS root in this test environment.
+- Production WASI builds no longer retain native/browser-only CommitTracker
+  waker machinery, and WASI warnings now fail CI and publishing checks.
+- CI and publishing install `wasm-bindgen-cli 0.2.122` with Rust 1.88 while
+  continuing to compile and test Trine with its declared Rust 1.85 MSRV.
+- The production-evidence workflow uses the valid matrix context for report
+  names, and all workflows use the Node.js 24-based `actions/checkout@v7`.
+
+### Changed
+
+- Crates.io packages exclude repository-only integration tests, benchmarks,
+  and extended documentation, reducing the compressed package from about
+  548 KiB to about 417 KiB while keeping those assets in Git and CI.
+- Browser persistence guidance now distinguishes Window, DedicatedWorker, and
+  SharedWorker behavior, and bucket documentation states that explicit options
+  must match the options stored when the bucket was created.
+- The release drift gate now checks the browser runner environment, WASI warning
+  policy, package exclusions, and checkout action runtime.
+
 ## 0.5.12 - 2026-07-18
 
 Production-evidence and maintenance-correctness release. This patch keeps the
@@ -36,32 +75,9 @@ checks.
 - The publish workflow keeps Cargo-version and changelog validation in the
   intended release step and runs recovery, destructive, and mixed-load gates
   before publishing.
-- CI and publishing install the matching `wasm-bindgen-cli 0.2.122` with Rust
-  1.88 while continuing to compile and test Trine with its declared Rust 1.85
-  MSRV.
-- The production-evidence matrix now derives report names from `matrix.os`, a
-  context available while job-level environment expressions are evaluated.
-- Production WASI builds no longer retain native/browser-only CommitTracker
-  waker machinery, and the WASI target check now rejects rustc warnings.
-- Browser persistence now selects synchronous OPFS access handles only inside
-  DedicatedWorker, while SharedWorker keeps the async OPFS path used by shared
-  multi-tab instances. Separate real Worker test targets replace the broken
-  nested Blob-worker harness.
-- Browser compaction releases its own input-table handles before awaiting OPFS
-  cleanup, so obsolete inputs are deleted before a successful compaction
-  returns instead of making the next fail-closed reopen report orphaned tables.
-- Browser persistence tests now reuse the default and named-bucket options from
-  creation when reopening, so the Worker gate exercises persisted reads instead
-  of correctly failing early with `InvalidOptions` on test configuration drift.
-- Browser CI and publish tests now disable wasm-bindgen-test's optional
-  COOP/COEP origin-isolation headers, which Chrome otherwise rejects when a
-  SharedWorker requests its OPFS root.
 
 ### Changed
 
-- GitHub workflows now use `actions/checkout@v7`, whose Node.js 24 runtime
-  removes the Node.js 20 deprecation warning on hosted Linux, macOS, and Windows
-  runners; the release drift gate rejects older checkout action versions.
 - Normal CI now includes macOS platform-I/O runtime coverage in addition to the
   existing Windows path.
 - README production guidance now leads with pre-`1.0` adoption boundaries,
@@ -69,15 +85,13 @@ checks.
 - An executable documentation-drift check now keeps active dependency
   examples, release commands, maturity claims, local links, CI, and publishing
   automation aligned.
-- Crates.io packages now exclude repository-only integration tests,
-  benchmarks, and extended documentation while retaining them in Git and CI.
 
 ## 0.5.11 - 2026-07-09
 
 Browser worker OPFS groundwork release. This patch keeps the `0.5.x` storage
 format compatible while removing the Window-only OPFS-root dependency and
 adding the DedicatedWorker synchronous-access path. The SharedWorker backend
-selection and Worker test harness are corrected in `0.5.12`.
+selection and Worker test harness are corrected in `0.5.13`.
 
 ### Added
 
@@ -87,7 +101,7 @@ selection and Worker test harness are corrected in `0.5.12`.
 - DedicatedWorker browser file operations now use
   `FileSystemSyncAccessHandle` for whole-object reads, random reads, object
   writes, WAL append, manifest publish, and WAL rewrite.
-- Initial Worker round-trip and sync-access probes were added; `0.5.12` moves
+- Initial Worker round-trip and sync-access probes were added; `0.5.13` moves
   them to wasm-bindgen's real DedicatedWorker and SharedWorker test targets.
 
 ### Fixed
