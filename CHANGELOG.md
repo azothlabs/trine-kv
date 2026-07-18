@@ -2,6 +2,51 @@
 
 All public crate releases use Semantic Versioning.
 
+## 0.5.12 - 2026-07-18
+
+Production-evidence and maintenance-correctness release. This patch keeps the
+`0.5.x` public API and storage format compatible while turning performance,
+abnormal-process recovery, and returned I/O failures into repeatable release
+checks.
+
+### Added
+
+- A bounded ten-row production benchmark profile and same-runner comparison
+  gate now cover representative write, read, scan, recovery, flush,
+  compaction, large-value, and cold-open work without treating shared-runner
+  timing as an application SLA.
+- Configurable forced-process-exit recovery and concurrent mixed-load soak
+  harnesses now verify confirmed writes, snapshots, maintenance, close, and
+  reopen behavior with reproducible reports.
+- A path-scoped test-only storage fault model and six-scenario destructive
+  matrix now cover WAL append and persist failures, table and manifest publish
+  failures, directory-sync failure, WAL rewrite, object deletion, repair,
+  retry, and reopen behavior.
+- The production-evidence workflow now runs target-native maturity checks on
+  Linux, macOS, and Windows and retains JSONL and paired performance artifacts.
+
+### Fixed
+
+- A successful commit no longer returns before its sequence is continuously
+  visible when an earlier concurrent commit slot is still open.
+- Flush and table-replacing maintenance no longer race, and compaction plans
+  are rejected after the source LSM version changes. Same-bucket compaction and
+  Blob GC replacement are serialized while different buckets retain
+  independent progress.
+- The publish workflow keeps Cargo-version and changelog validation in the
+  intended release step and runs recovery, destructive, and mixed-load gates
+  before publishing.
+
+### Changed
+
+- Normal CI now includes macOS platform-I/O runtime coverage in addition to the
+  existing Windows path.
+- README production guidance now leads with pre-`1.0` adoption boundaries,
+  evidence, a runnable verification path, and explicit limitations.
+- An executable documentation-drift check now keeps active dependency
+  examples, release commands, maturity claims, local links, CI, and publishing
+  automation aligned.
+
 ## 0.5.11 - 2026-07-09
 
 Browser worker OPFS hardening release. This patch keeps the `0.5.x` storage

@@ -52,6 +52,8 @@ contracts.
 - Added a path-scoped test-only storage fault model and a six-scenario matrix
   for WAL append/persist, table/manifest publish, directory sync, WAL rewrite,
   and delete retry; the matrix now runs in cross-platform and publish gates.
+- Prepared the compatible `0.5.12` patch release metadata and changelog, and
+  passed the local Cargo package and publish dry-run gates.
 
 ## Out Of Scope
 

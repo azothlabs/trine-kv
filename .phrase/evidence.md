@@ -15936,3 +15936,53 @@ Negative check:
 - Run the expanded production-evidence workflow on Linux, macOS, and Windows
   and inspect the combined JSONL artifacts. Treat real `ENOSPC`/quota testing as
   a separate host-level phase rather than weakening this deterministic gate.
+
+## 2026-07-18: 0.5.12 local release candidate
+
+### Observation
+
+- `v0.5.11..HEAD` contains four compatible production-evidence, maintenance
+  correctness, documentation, and destructive-test commits. No public API or
+  storage-format change requires a pre-`1.0` minor bump.
+- `Cargo.toml` and the root package entry in `Cargo.lock` now identify version
+  `0.5.12`; the changelog records only changes present in those four commits.
+- The package contains 206 files and excludes `.github`, `.phrase`,
+  `.rust-skills`, and `.claude` repository-only directories.
+
+### Interpretation
+
+- `0.5.12` is an appropriate patch release: it tightens correctness, release
+  evidence, and documentation without changing the compatible `0.5.x` public
+  or persisted-data contract.
+- Local package verification is complete, but the release tag still needs the
+  configured real-browser and Linux/macOS/Windows workflows before actual
+  publication should be treated as fully evidenced.
+
+### Verification
+
+- Documentation drift, Cargo metadata version, formatting, and diff checks
+  passed.
+- `cargo clippy -q --all-targets --all-features -- -D warnings` passed.
+- `cargo test -q --all-targets --all-features` passed all executed suites; five
+  production-only tests remained intentionally ignored.
+- Browser-WASM and WASI target checks plus browser-WASM strict clippy passed;
+  the Wasmtime persistence suite passed 7 tests.
+- Eight release example commands passed, including both platform-I/O feature
+  selections.
+- The deterministic destructive matrix passed 6 scenarios, forced-exit
+  recovery passed 4 rounds, and the 10,000-operation mixed-load soak passed.
+- `cargo package --locked --allow-dirty` and
+  `cargo publish --dry-run --locked --allow-dirty` passed.
+
+### Remaining Blockers
+
+- This machine has no Chrome/ChromeDriver, so real browser execution remains a
+  CI/publish gate.
+- The release commit has not yet run through target-native Linux, macOS, and
+  Windows production-evidence jobs.
+
+### Recommended Next Action
+
+- Commit and tag `v0.5.12`, push both only when requested, inspect remote CI and
+  production-evidence artifacts for the exact tag commit, then use the manual
+  publish workflow rather than bypassing its protected gates.
