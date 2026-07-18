@@ -190,8 +190,9 @@ impl Db {
     /// Returns an existing named bucket or creates it with default options.
     ///
     /// Bucket creation is durable for persistent databases: Trine publishes the
-    /// bucket metadata before returning the handle. If the bucket already
-    /// exists, the existing options are reused.
+    /// bucket metadata before returning the handle. If the bucket already uses
+    /// non-default options, this returns [`Error::InvalidOptions`]; call
+    /// [`Db::bucket_with_options`] with the options used at creation instead.
     ///
     /// # Parameters
     ///

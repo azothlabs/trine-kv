@@ -16183,3 +16183,45 @@ Negative check:
 
 - Commit and push the cleanup correction, then require the combined Window,
   DedicatedWorker, and SharedWorker browser gate to pass before publishing.
+
+## 2026-07-18: Browser Worker reopen option consistency
+
+### Observation
+
+- The next real DedicatedWorker run again passed all three raw synchronous OPFS
+  probes and no longer reported unreferenced table/blob files after compaction.
+- The Trine round trip instead reached its read-only verification and returned
+  `InvalidOptions`: the test created the default bucket with a 4-byte blob
+  threshold, then reopened the database with the default threshold.
+- The same helper also tried to retrieve a named bucket created with a custom
+  blob threshold through `Db::bucket`, which requests default bucket options.
+  The Window blob-reopen test contained the same default-bucket reopen drift.
+
+### Interpretation
+
+- The compaction input-lifetime correction reached the next verification step;
+  the new error is not corruption or an engine recovery failure.
+- Bucket options are fixed when created. Rejecting different options on reopen
+  protects the persistent storage contract, so the test must preserve the
+  original default and named-bucket options rather than weakening validation.
+- Public async bucket documentation incorrectly said existing options were
+  reused automatically and contributed to the test error.
+
+### Verification
+
+- The Window, DedicatedWorker, and SharedWorker WASM targets compile with
+  `--no-run` and pass strict WASM Clippy.
+- `cargo test -q` passed 452 core tests plus all host integration suites.
+- Strict all-target/all-feature Clippy, Rustdoc warnings, 18 doctests, formatting,
+  diff checks, and the documentation-drift contract passed.
+
+### Remaining Blockers
+
+- The corrected Worker round trip still needs the authoritative GitHub-hosted
+  Chrome execution; this host has no working local ChromeDriver gate.
+
+### Recommended Next Action
+
+- Commit and push the reopen correction, then require Window,
+  DedicatedWorker, and SharedWorker browser jobs to pass before publishing
+  `0.5.12`.

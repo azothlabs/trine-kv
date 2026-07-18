@@ -50,6 +50,9 @@ checks.
 - Browser compaction releases its own input-table handles before awaiting OPFS
   cleanup, so obsolete inputs are deleted before a successful compaction
   returns instead of making the next fail-closed reopen report orphaned tables.
+- Browser persistence tests now reuse the default and named-bucket options from
+  creation when reopening, so the Worker gate exercises persisted reads instead
+  of correctly failing early with `InvalidOptions` on test configuration drift.
 
 ### Changed
 

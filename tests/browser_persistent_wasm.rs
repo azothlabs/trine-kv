@@ -245,11 +245,13 @@ async fn browser_persistent_reopens_after_manual_compaction() {
 #[wasm_bindgen_test]
 async fn browser_persistent_reopens_blob_backed_values() {
     let namespace = test_namespace("blob-reopen");
-    let mut options = DbOptions::browser_persistent_at(&namespace);
-    options.default_bucket_options = BucketOptions::default().with_blob_threshold_bytes(4);
-    let db = Db::open(options)
-        .await
-        .expect("browser database opens with blob threshold");
+    let bucket_options = BucketOptions::default().with_blob_threshold_bytes(4);
+    let db = Db::open(
+        DbOptions::browser_persistent_at(&namespace)
+            .with_default_bucket_options(bucket_options.clone()),
+    )
+    .await
+    .expect("browser database opens with blob threshold");
     let value = b"value-stored-through-browser-blob".to_vec();
 
     db.put(b"blob-key", value.clone())
@@ -258,9 +260,12 @@ async fn browser_persistent_reopens_blob_backed_values() {
     db.flush().await.expect("browser blob flush succeeds");
     drop(db);
 
-    let db = Db::open(DbOptions::browser_persistent_read_only_at(&namespace))
-        .await
-        .expect("browser read-only database reopens with blob");
+    let db = Db::open(
+        DbOptions::browser_persistent_read_only_at(&namespace)
+            .with_default_bucket_options(bucket_options),
+    )
+    .await
+    .expect("browser read-only database reopens with blob");
     assert_eq!(
         db.get(b"blob-key")
             .await

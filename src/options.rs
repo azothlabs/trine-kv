@@ -278,7 +278,10 @@ pub struct DbOptions {
     pub create_if_missing: bool,
     /// Open without allowing writes or maintenance that mutates storage.
     pub read_only: bool,
-    /// Options used when the built-in default bucket is first created.
+    /// Options used by the built-in default bucket.
+    ///
+    /// Persistent reopens must supply the same options used when the bucket was
+    /// created; a mismatch is rejected with [`crate::Error::InvalidOptions`].
     pub default_bucket_options: BucketOptions,
     /// Default durability used by write helpers that do not pass `WriteOptions`.
     pub durability: DurabilityMode,
@@ -524,6 +527,9 @@ impl DbOptions {
     /// Sets the options used by the built-in default bucket.
     ///
     /// Named buckets still use the options passed to `Db::bucket_with_options`.
+    /// When reopening a persistent database, `options` must match the options
+    /// stored for the default bucket; Trine rejects a mismatch rather than
+    /// silently changing its storage behavior.
     #[must_use]
     pub fn with_default_bucket_options(mut self, options: BucketOptions) -> Self {
         self.default_bucket_options = options;

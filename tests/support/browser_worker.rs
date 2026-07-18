@@ -1,5 +1,7 @@
 use trine_kv::{BucketOptions, Db, DbOptions, Error, KeyRange};
 
+const WORKER_BLOB_THRESHOLD_BYTES: usize = 4;
+
 pub(crate) fn test_namespace(name: &str) -> String {
     let millis = js_sys::Date::now().to_string().replace('.', "-");
     let random = js_sys::Math::random().to_string().replace('.', "-");
@@ -7,9 +9,9 @@ pub(crate) fn test_namespace(name: &str) -> String {
 }
 
 pub(crate) async fn run_trine_db_round_trip(namespace: &str) -> Result<(), String> {
-    let mut options = DbOptions::browser_persistent_at(namespace);
-    options.default_bucket_options = BucketOptions::default().with_blob_threshold_bytes(4);
-    let db = Db::open(options).await.map_err(display_error)?;
+    let db = Db::open(worker_db_options(namespace))
+        .await
+        .map_err(display_error)?;
 
     db.put(b"worker:wal", b"first")
         .await
@@ -27,10 +29,7 @@ pub(crate) async fn run_trine_db_round_trip(namespace: &str) -> Result<(), Strin
     }
 
     let docs = db
-        .bucket_with_options(
-            "worker-docs",
-            BucketOptions::default().with_blob_threshold_bytes(4),
-        )
+        .bucket_with_options("worker-docs", worker_bucket_options())
         .await
         .map_err(display_error)?;
     let blob_value = b"value-stored-through-browser-worker".to_vec();
@@ -49,7 +48,7 @@ pub(crate) async fn run_trine_db_round_trip(namespace: &str) -> Result<(), Strin
     drop(docs);
     drop(db);
 
-    let db = Db::open(DbOptions::browser_persistent_read_only_at(namespace))
+    let db = Db::open(worker_read_only_db_options(namespace))
         .await
         .map_err(display_error)?;
     expect_value(
@@ -72,12 +71,28 @@ pub(crate) async fn run_trine_db_round_trip(namespace: &str) -> Result<(), Strin
         "worker:after-flush",
     )?;
 
-    let docs = db.bucket("worker-docs").await.map_err(display_error)?;
+    let docs = db
+        .bucket_with_options("worker-docs", worker_bucket_options())
+        .await
+        .map_err(display_error)?;
     expect_value(
         docs.get(b"doc:blob").await.map_err(display_error)?,
         &blob_value,
         "worker-docs/doc:blob",
     )
+}
+
+fn worker_db_options(namespace: &str) -> DbOptions {
+    DbOptions::browser_persistent_at(namespace).with_default_bucket_options(worker_bucket_options())
+}
+
+fn worker_read_only_db_options(namespace: &str) -> DbOptions {
+    DbOptions::browser_persistent_read_only_at(namespace)
+        .with_default_bucket_options(worker_bucket_options())
+}
+
+fn worker_bucket_options() -> BucketOptions {
+    BucketOptions::default().with_blob_threshold_bytes(WORKER_BLOB_THRESHOLD_BYTES)
 }
 
 fn expect_value(actual: Option<Vec<u8>>, expected: &[u8], label: &str) -> Result<(), String> {

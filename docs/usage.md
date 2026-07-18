@@ -657,16 +657,30 @@ Configure the default bucket threshold and Level Merge policy through
 ```rust
 use trine_kv::{BlobLevelMergePolicy, BucketOptions, Db, DbOptions};
 
+let bucket_options = BucketOptions {
+    blob_threshold_bytes: 64 * 1024,
+    blob_level_merge_policy: BlobLevelMergePolicy::Auto,
+    ..BucketOptions::default()
+};
+
 let db = Db::open_sync(
-    DbOptions::new("./trine-data").with_default_bucket_options(
-        BucketOptions {
-            blob_threshold_bytes: 64 * 1024,
-            blob_level_merge_policy: BlobLevelMergePolicy::Auto,
-            ..BucketOptions::default()
-        },
-    ),
+    DbOptions::new("./trine-data")
+        .with_default_bucket_options(bucket_options.clone()),
 )?;
+drop(db);
+
+let read_only = Db::open_sync(
+    DbOptions::persistent_read_only("./trine-data")
+        .with_default_bucket_options(bucket_options),
+)?;
+drop(read_only);
 ```
+
+Default-bucket options are part of the persistent database contract. Pass the
+same options on every reopen, including read-only opens; Trine returns
+`Error::InvalidOptions` when they differ. Named buckets follow the same rule:
+reopen a bucket created with custom options through `bucket_with_options`, not
+`bucket`.
 
 `Auto` is the default. It rewrites retained blob values during compaction when
 the output would otherwise keep references to multiple blob files or leave

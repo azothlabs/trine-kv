@@ -101,8 +101,10 @@ contracts.
 ## Known Blockers
 
 - The Rust 1.88 wasm-bindgen tool install, strict WASI warning gate, Window
-  suite, and DedicatedWorker sync-access probes passed on GitHub-hosted CI. The
-  compaction cleanup correction still requires a fresh Worker run.
+  suite, and DedicatedWorker sync-access probes passed on GitHub-hosted CI. A
+  fresh DedicatedWorker run crossed the compaction cleanup failure and exposed
+  a test-only bucket-option mismatch on read-only reopen. The corrected reopen
+  configuration still requires a fresh Worker run.
 - The corrected Linux/macOS/Windows workflow has not run remotely in this
   local-only session; Phase 191 cannot close until those jobs and artifacts are
   inspected.
