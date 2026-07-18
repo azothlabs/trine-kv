@@ -81,7 +81,9 @@ jobs:
         run: cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings
 
       - name: Install wasm-bindgen test runner
-        run: cargo install wasm-bindgen-cli --version 0.2.122 --locked
+        run: |
+          rustup toolchain install 1.86.0 --profile minimal
+          cargo +1.86.0 install wasm-bindgen-cli --version 0.2.122 --locked
 
       - name: Install Chrome
         uses: browser-actions/setup-chrome@v1
@@ -126,8 +128,8 @@ jobs:
         run: |
           cargo package --list > package-files.txt
           cat package-files.txt
-          if grep -E '(^|/)(\.github|\.phrase|\.rust-skills|\.claude)/' package-files.txt; then
-            echo "crate package contains local workflow files" >&2
+          if grep -E '(^|/)(\.github|\.phrase|\.rust-skills|\.claude)/|^(benches|docs|tests)/' package-files.txt; then
+            echo "crate package contains repository-only files" >&2
             exit 1
           fi
 

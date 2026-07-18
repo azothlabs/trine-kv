@@ -24,17 +24,16 @@ remains documented separately in `.phrase/protocol/trine-kv-v1-spec.md`.
 The crate package should contain only files useful to crate consumers:
 
 - `src/`
-- `tests/`
 - `examples/`
-- `benches/`
-- `docs/`
 - `README.md`
 - `CHANGELOG.md`
 - license files
 - Cargo manifest and lockfile
 
-Agent workflow files, local skill files, and repository-only notes are not part
-of the crate package.
+Integration tests, benchmarks, extended repository documentation, agent
+workflow files, local skill files, and repository-only notes remain in the Git
+repository and CI checkout; they are not part of the crate downloaded by
+consumers.
 
 ## Pre-Publish Gate
 
@@ -115,13 +114,17 @@ The package list should not include `.github/`, `.phrase/`, `.rust-skills/`,
 - `cargo package --list` with a package-content guard
 - `cargo package --locked`
 
+The browser runner stays at `wasm-bindgen-cli 0.2.122` to match the crate's
+locked `wasm-bindgen` version. CI installs that tool with Rust 1.86, while all
+Trine compilation and tests continue to use the declared Rust 1.85 MSRV.
+
 The `Windows Platform I/O` and `macOS Platform I/O` jobs additionally check,
 test, and run both platform I/O feature modes on their named operating systems.
 The separate production-evidence workflow supplies the broader Linux, macOS,
 and Windows crash-recovery and mixed-load matrix.
 
-The package-content guard fails if repository-only workflow directories such as
-`.github/`, `.phrase/`, `.rust-skills/`, or `.claude/` enter the crate package.
+The package-content guard fails if repository-only workflow directories or the
+repository's `tests/`, `benches/`, and `docs/` trees enter the crate package.
 
 ## Publishing Workflow
 

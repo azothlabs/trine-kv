@@ -36,6 +36,11 @@ checks.
 - The publish workflow keeps Cargo-version and changelog validation in the
   intended release step and runs recovery, destructive, and mixed-load gates
   before publishing.
+- CI and publishing install the matching `wasm-bindgen-cli 0.2.122` with Rust
+  1.86 while continuing to compile and test Trine with its declared Rust 1.85
+  MSRV.
+- The production-evidence matrix now derives report names from `matrix.os`, a
+  context available while job-level environment expressions are evaluated.
 
 ### Changed
 
@@ -46,6 +51,8 @@ checks.
 - An executable documentation-drift check now keeps active dependency
   examples, release commands, maturity claims, local links, CI, and publishing
   automation aligned.
+- Crates.io packages now exclude repository-only integration tests,
+  benchmarks, and extended documentation while retaining them in Git and CI.
 
 ## 0.5.11 - 2026-07-09
 

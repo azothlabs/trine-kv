@@ -44,8 +44,8 @@ jobs:
           - windows-latest
     env:
       TRINE_MATURITY_OPERATIONS: ${{ github.event_name == 'schedule' && '50000' || inputs.soak_operations || '10000' }}
-      TRINE_MATURITY_REPORT: production-maturity-${{ runner.os }}.jsonl
-      TRINE_DESTRUCTIVE_REPORT: production-maturity-${{ runner.os }}.jsonl
+      TRINE_MATURITY_REPORT: production-maturity-${{ matrix.os }}.jsonl
+      TRINE_DESTRUCTIVE_REPORT: production-maturity-${{ matrix.os }}.jsonl
 
     steps:
       - name: Checkout
@@ -77,8 +77,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: production-maturity-${{ runner.os }}
-          path: production-maturity-${{ runner.os }}.jsonl
+          name: production-maturity-${{ matrix.os }}
+          path: production-maturity-${{ matrix.os }}.jsonl
           if-no-files-found: warn
 
   performance-regression:

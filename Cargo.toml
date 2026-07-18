@@ -11,11 +11,8 @@ documentation = "https://docs.rs/trine-kv"
 keywords = ["database", "embedded", "kv", "lsm", "mvcc"]
 categories = ["database-implementations"]
 include = [
-    "/benches",
-    "/docs",
     "/examples",
     "/src",
-    "/tests",
     "/CHANGELOG.md",
     "/LICENSE-APACHE",
     "/LICENSE-MIT",

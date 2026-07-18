@@ -65,6 +65,12 @@ def check_local_markdown_links(path: str) -> list[str]:
 
 
 def check_release_contract() -> list[str]:
+    lockfile = tomllib.loads((ROOT / "Cargo.lock").read_text(encoding="utf-8"))
+    wasm_bindgen_version = next(
+        package["version"]
+        for package in lockfile["package"]
+        if package["name"] == "wasm-bindgen"
+    )
     common_gate = (
         "python3 scripts/check_docs_drift.py",
         "cargo fmt --check",
@@ -91,10 +97,41 @@ def check_release_contract() -> list[str]:
         "production_maturity concurrent_mixed_load_soak_reopens_cleanly",
     )
     destructive_gate = ("cargo test -q destructive_ --lib -- --test-threads=1",)
+    wasm_runner_install = (
+        "rustup toolchain install 1.86.0 --profile minimal",
+        f"cargo +1.86.0 install wasm-bindgen-cli --version {wasm_bindgen_version} --locked",
+    )
+    package_exclusions = (
+        "benches|docs|tests",
+        "crate package contains repository-only files",
+    )
     errors: list[str] = []
 
     for path in (".github/workflows/ci.yml", ".github/workflows/publish.yml"):
         errors.extend(require_snippets(path, common_gate))
+        errors.extend(require_snippets(path, wasm_runner_install))
+        errors.extend(require_snippets(path, package_exclusions))
+    errors.extend(
+        require_snippets(
+            "docs/release.md",
+            (f"wasm-bindgen-cli {wasm_bindgen_version}", "Rust 1.86", "Rust 1.85"),
+        )
+    )
+
+    production = (ROOT / ".github/workflows/production-evidence.yml").read_text(
+        encoding="utf-8"
+    )
+    matrix_report = "production-maturity-${{ matrix.os }}"
+    if production.count(matrix_report) != 4:
+        errors.append(
+            ".github/workflows/production-evidence.yml: maturity report and artifact "
+            "names must consistently use `matrix.os`"
+        )
+    if "production-maturity-${{ runner.os }}" in production:
+        errors.append(
+            ".github/workflows/production-evidence.yml: `runner.os` is unavailable in "
+            "job-level report environment expressions"
+        )
     errors.extend(require_snippets(".github/workflows/publish.yml", maturity_gate))
     for path in (
         ".github/workflows/production-evidence.yml",

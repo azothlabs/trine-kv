@@ -15986,3 +15986,51 @@ Negative check:
 - Commit and tag `v0.5.12`, push both only when requested, inspect remote CI and
   production-evidence artifacts for the exact tag commit, then use the manual
   publish workflow rather than bypassing its protected gates.
+
+## 2026-07-18: release package and CI definition corrections
+
+### Observation
+
+- The prepared crate archive contained 206 files and compressed to 548 KiB
+  because the package allowlist included the repository's integration tests,
+  benchmark harness, and extended documentation.
+- `wasm-bindgen-cli 0.2.122` matches the locked `wasm-bindgen 0.2.122` but needs
+  Rust 1.86 to install; Trine's declared compiler floor remains Rust 1.85.
+- `runner.os` is not available while GitHub evaluates job-level `env`, whereas
+  the maturity job's `matrix.os` is available there.
+
+### Interpretation
+
+- Repository verification assets should remain in Git and CI without being
+  downloaded by crate consumers. Excluding them does not remove local or CI
+  test and benchmark targets.
+- A separate compiler for a build-time CI tool preserves exact wasm-bindgen
+  compatibility without silently raising the compiler used to verify Trine's
+  MSRV.
+- Report and artifact names should use the same matrix value at both job and
+  step evaluation points.
+
+### Verification
+
+- `cargo package --list --allow-dirty` reports 140 package files and no
+  top-level `tests/`, `benches/`, or `docs/` paths.
+- A fresh isolated `cargo package --locked --allow-dirty --offline` produced a
+  2.3 MiB archive compressed to 415.7 KiB and rebuilt Trine successfully from
+  that archive.
+- Ruby parsed `ci.yml`, `publish.yml`, and `production-evidence.yml` as valid
+  YAML; the GitHub context-availability table confirms `matrix` is legal and
+  `runner` is unavailable in `jobs.<job_id>.env`.
+- `python3 scripts/check_docs_drift.py` and `git diff --check` passed.
+- The locally installed `wasm-bindgen` and `wasm-bindgen-test-runner` both
+  report version `0.2.122`.
+
+### Remaining Blockers
+
+- The corrected workflow definitions still require a remote GitHub Actions run
+  on the release commit; local YAML parsing cannot execute GitHub's service-side
+  workflow validator or hosted runners.
+
+### Recommended Next Action
+
+- Commit the corrections, push the release commit, and require CI plus all
+  three production-evidence matrix jobs to pass before publishing `0.5.12`.

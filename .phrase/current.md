@@ -54,6 +54,12 @@ contracts.
   and delete retry; the matrix now runs in cross-platform and publish gates.
 - Prepared the compatible `0.5.12` patch release metadata and changelog, and
   passed the local Cargo package and publish dry-run gates.
+- Reduced the consumer package from 206 files and 548 KiB compressed to 140
+  files and 415.7 KiB by excluding repository-only tests, benchmarks, and
+  extended documentation; the package rebuilds successfully from the archive.
+- Corrected the production-evidence job-level report expressions to use the
+  available matrix context, and isolated the `wasm-bindgen-cli 0.2.122` tool
+  install on Rust 1.86 while keeping Trine verification on Rust 1.85.
 
 ## Out Of Scope
 
@@ -85,8 +91,9 @@ contracts.
 
 ## Known Blockers
 
-- The new Linux/macOS/Windows workflow has not run remotely in this local-only
-  session; Phase 191 cannot close until those jobs and artifacts are inspected.
+- The corrected Linux/macOS/Windows workflow has not run remotely in this
+  local-only session; Phase 191 cannot close until those jobs and artifacts are
+  inspected.
 - GitHub-hosted timing varies; the paired gate uses broad relative limits plus
   an absolute noise floor and is not a hardware SLA.
 - Process exit validates application-crash recovery, not sudden power loss.
