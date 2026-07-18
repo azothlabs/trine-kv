@@ -6,9 +6,11 @@ use std::{
         Arc, Condvar, Mutex, MutexGuard, RwLock, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
-    task::{Context, Poll, Waker},
     time::Duration,
 };
+
+#[cfg(any(not(target_os = "wasi"), test))]
+use std::task::{Context, Poll, Waker};
 
 const BACKGROUND_MAINTENANCE_PROGRESS_WAIT: Duration = Duration::from_millis(2);
 
@@ -326,6 +328,7 @@ pub(super) struct CommitTracker {
     skipped_slots: AtomicU64,
     slots: Mutex<BTreeMap<u64, CommitSlotState>>,
     visible_changed: Condvar,
+    #[cfg(any(not(target_os = "wasi"), test))]
     visible_wakers: Mutex<Vec<Waker>>,
 }
 
@@ -378,6 +381,7 @@ impl CommitTracker {
             skipped_slots: AtomicU64::new(0),
             slots: Mutex::new(BTreeMap::new()),
             visible_changed: Condvar::new(),
+            #[cfg(any(not(target_os = "wasi"), test))]
             visible_wakers: Mutex::new(Vec::new()),
         }
     }
@@ -515,10 +519,12 @@ impl CommitTracker {
         Ok(())
     }
 
+    #[cfg(any(not(target_os = "wasi"), test))]
     async fn wait_until_visible_async(&self, sequence: Sequence) -> Result<()> {
         std::future::poll_fn(|context| self.poll_until_visible(sequence, context)).await
     }
 
+    #[cfg(any(not(target_os = "wasi"), test))]
     fn poll_until_visible(&self, sequence: Sequence, context: &Context<'_>) -> Poll<Result<()>> {
         if self.visible_sequence().get() >= sequence.get() {
             return Poll::Ready(Ok(()));
@@ -542,15 +548,18 @@ impl CommitTracker {
 
     fn notify_visible_waiters(&self) {
         self.visible_changed.notify_all();
-        let wakers = {
-            let mut wakers = self
-                .visible_wakers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            std::mem::take(&mut *wakers)
-        };
-        for waker in wakers {
-            waker.wake();
+        #[cfg(any(not(target_os = "wasi"), test))]
+        {
+            let wakers = {
+                let mut wakers = self
+                    .visible_wakers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                std::mem::take(&mut *wakers)
+            };
+            for waker in wakers {
+                waker.wake();
+            }
         }
     }
 }

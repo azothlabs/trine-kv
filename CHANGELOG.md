@@ -37,10 +37,12 @@ checks.
   intended release step and runs recovery, destructive, and mixed-load gates
   before publishing.
 - CI and publishing install the matching `wasm-bindgen-cli 0.2.122` with Rust
-  1.86 while continuing to compile and test Trine with its declared Rust 1.85
+  1.88 while continuing to compile and test Trine with its declared Rust 1.85
   MSRV.
 - The production-evidence matrix now derives report names from `matrix.os`, a
   context available while job-level environment expressions are evaluated.
+- Production WASI builds no longer retain native/browser-only CommitTracker
+  waker machinery, and the WASI target check now rejects rustc warnings.
 
 ### Changed
 

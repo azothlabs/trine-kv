@@ -59,7 +59,10 @@ contracts.
   extended documentation; the package rebuilds successfully from the archive.
 - Corrected the production-evidence job-level report expressions to use the
   available matrix context, and isolated the `wasm-bindgen-cli 0.2.122` tool
-  install on Rust 1.86 while keeping Trine verification on Rust 1.85.
+  install on Rust 1.88 while keeping Trine verification on Rust 1.85.
+- Removed native/browser-only CommitTracker waker state from production WASI
+  builds while retaining its unit-test coverage, and made WASI rustc warnings a
+  CI and publish failure.
 
 ## Out Of Scope
 
@@ -91,6 +94,8 @@ contracts.
 
 ## Known Blockers
 
+- The Rust 1.88 wasm-bindgen tool install and strict WASI warning gate have
+  passed locally but have not yet rerun on GitHub-hosted CI.
 - The corrected Linux/macOS/Windows workflow has not run remotely in this
   local-only session; Phase 191 cannot close until those jobs and artifacts are
   inspected.

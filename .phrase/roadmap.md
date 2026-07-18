@@ -114,8 +114,9 @@ Versioning.
 **Acceptance Gate**:
 
 - Cargo package metadata is ready for a `0.1.0` SemVer release candidate.
-- Package contents exclude local workflow files and include user-facing docs,
-  examples, tests, benches, changelog, and license files.
+- Package contents exclude repository-only workflows, integration tests,
+  benchmarks, and extended documentation while retaining consumer source,
+  examples, changelog, README, manifest, lockfile, and license files.
 - Release checklist documents versioning and verification.
 - `cargo package --list`, `cargo package`, `cargo fmt --check`,
   `cargo clippy`, `cargo test`, `cargo run --example quickstart`, and

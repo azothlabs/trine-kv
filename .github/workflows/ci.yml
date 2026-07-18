@@ -40,10 +40,10 @@ jobs:
       - name: Test
         run: cargo test --all-targets --all-features
 
-      - name: Check host targets
+      - name: Check WASM targets
         run: |
           cargo check --target wasm32-unknown-unknown --lib
-          cargo check --target wasm32-wasip1 --lib
+          RUSTFLAGS="-D warnings" cargo check --target wasm32-wasip1 --lib
 
       - name: Install Wasmtime
         uses: bytecodealliance/actions/wasmtime/setup@v1
@@ -58,8 +58,8 @@ jobs:
 
       - name: Install wasm-bindgen test runner
         run: |
-          rustup toolchain install 1.86.0 --profile minimal
-          cargo +1.86.0 install wasm-bindgen-cli --version 0.2.122 --locked
+          rustup toolchain install 1.88.0 --profile minimal
+          cargo +1.88.0 install wasm-bindgen-cli --version 0.2.122 --locked
 
       - name: Install Chrome
         uses: browser-actions/setup-chrome@v1

@@ -45,7 +45,7 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 cargo check --target wasm32-unknown-unknown --lib
-cargo check --target wasm32-wasip1 --lib
+RUSTFLAGS="-D warnings" cargo check --target wasm32-wasip1 --lib
 CARGO_TARGET_WASM32_WASIP1_RUNNER="wasmtime run --dir ." cargo test --target wasm32-wasip1 --lib wasi_persistent
 cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings
 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner WASM_BINDGEN_TEST_ONLY_WEB=1 cargo test --target wasm32-unknown-unknown --test browser_persistent_wasm
@@ -98,7 +98,7 @@ The package list should not include `.github/`, `.phrase/`, `.rust-skills/`,
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --all-targets --all-features`
 - `cargo check --target wasm32-unknown-unknown --lib`
-- `cargo check --target wasm32-wasip1 --lib`
+- `RUSTFLAGS="-D warnings" cargo check --target wasm32-wasip1 --lib`
 - `cargo test --target wasm32-wasip1 --lib wasi_persistent` under `wasmtime run --dir .`
 - `cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings`
 - `cargo test --target wasm32-unknown-unknown --test browser_persistent_wasm`
@@ -115,8 +115,11 @@ The package list should not include `.github/`, `.phrase/`, `.rust-skills/`,
 - `cargo package --locked`
 
 The browser runner stays at `wasm-bindgen-cli 0.2.122` to match the crate's
-locked `wasm-bindgen` version. CI installs that tool with Rust 1.86, while all
-Trine compilation and tests continue to use the declared Rust 1.85 MSRV.
+locked `wasm-bindgen` version. Its packaged lockfile currently requires Rust
+1.88 through the `time` dependency, so CI uses Rust 1.88 only to install that
+tool; all Trine compilation and tests continue to use the declared Rust 1.85
+MSRV. The WASI library check treats rustc warnings as errors so target-only cfg
+drift cannot pass silently.
 
 The `Windows Platform I/O` and `macOS Platform I/O` jobs additionally check,
 test, and run both platform I/O feature modes on their named operating systems.

@@ -15994,8 +15994,10 @@ Negative check:
 - The prepared crate archive contained 206 files and compressed to 548 KiB
   because the package allowlist included the repository's integration tests,
   benchmark harness, and extended documentation.
-- `wasm-bindgen-cli 0.2.122` matches the locked `wasm-bindgen 0.2.122` but needs
-  Rust 1.86 to install; Trine's declared compiler floor remains Rust 1.85.
+- `wasm-bindgen-cli 0.2.122` matches the locked `wasm-bindgen 0.2.122`. Although
+  its manifest names Rust 1.86, its packaged lockfile selects `time 0.3.47` and
+  `time-core 0.1.8`, which require Rust 1.88; Trine's compiler floor remains
+  Rust 1.85.
 - `runner.os` is not available while GitHub evaluates job-level `env`, whereas
   the maturity job's `matrix.os` is available there.
 
@@ -16004,9 +16006,9 @@ Negative check:
 - Repository verification assets should remain in Git and CI without being
   downloaded by crate consumers. Excluding them does not remove local or CI
   test and benchmark targets.
-- A separate compiler for a build-time CI tool preserves exact wasm-bindgen
-  compatibility without silently raising the compiler used to verify Trine's
-  MSRV.
+- Rust 1.88 as a separate compiler for this build-time CI tool preserves exact
+  wasm-bindgen compatibility without silently raising the compiler used to
+  verify Trine's MSRV.
 - Report and artifact names should use the same matrix value at both job and
   step evaluation points.
 
@@ -16034,3 +16036,53 @@ Negative check:
 
 - Commit the corrections, push the release commit, and require CI plus all
   three production-evidence matrix jobs to pass before publishing `0.5.12`.
+
+## 2026-07-18: WASI commit visibility cfg and CI toolchain correction
+
+### Observation
+
+- `CommitTracker::wait_until_visible_async` is required by native and browser
+  asynchronous commit publication, but WASI adapts its async API to the
+  synchronous commit path. The caller was excluded on WASI while the async
+  waiter and waker state were still compiled, producing target-only dead-code
+  warnings.
+- `wasm-bindgen-cli 0.2.122` declares Rust 1.86 at the package level, but its
+  packaged lockfile selects `time 0.3.47` and `time-core 0.1.8`, which both
+  require Rust 1.88. `cargo install --locked` therefore cannot succeed with
+  Rust 1.86.
+
+### Interpretation
+
+- The async visibility waiter is live concurrency machinery, not obsolete
+  code. Production WASI should omit it because it has no async caller, while
+  unit-test builds should retain it so the contiguous-visibility wakeup
+  contract remains covered.
+- The wasm-bindgen CLI compiler is a CI-tool requirement, not Trine's MSRV.
+  Compiling that exact CLI and lockfile with Rust 1.88 keeps Trine verification
+  on Rust 1.85 without downgrading the matching browser runner or abandoning a
+  reproducible install.
+
+### Verification
+
+- Four focused CommitTracker tests passed on the host, including synchronous
+  and asynchronous waiters across an earlier open sequence slot.
+- Browser-WASM and WASI library checks passed with rustc warnings denied.
+- The WASI persistence suite passed 7 tests under Wasmtime.
+- Host `cargo clippy -q --all-targets --all-features -- -D warnings` passed.
+- An isolated Rust 1.88 `cargo install wasm-bindgen-cli --version 0.2.122
+  --locked` completed in 29.54 seconds; both installed browser tools reported
+  version `0.2.122`.
+- CI, publish, and production-evidence YAML parsed successfully; documentation
+  drift, formatting, and diff checks passed.
+
+### Remaining Blockers
+
+- The corrected install and target-warning gate still require a GitHub-hosted
+  CI run. A full strict WASI Clippy run also reports cfg-specific style lints
+  beyond rustc warnings; that broader cleanup is separate from this failure.
+
+### Recommended Next Action
+
+- Commit and push this correction, require the normal CI workflow to pass, then
+  manually dispatch Production Evidence against `v0.5.11` as its performance
+  baseline.

@@ -97,9 +97,12 @@ def check_release_contract() -> list[str]:
         "production_maturity concurrent_mixed_load_soak_reopens_cleanly",
     )
     destructive_gate = ("cargo test -q destructive_ --lib -- --test-threads=1",)
+    wasi_warning_gate = (
+        'RUSTFLAGS="-D warnings" cargo check --target wasm32-wasip1 --lib',
+    )
     wasm_runner_install = (
-        "rustup toolchain install 1.86.0 --profile minimal",
-        f"cargo +1.86.0 install wasm-bindgen-cli --version {wasm_bindgen_version} --locked",
+        "rustup toolchain install 1.88.0 --profile minimal",
+        f"cargo +1.88.0 install wasm-bindgen-cli --version {wasm_bindgen_version} --locked",
     )
     package_exclusions = (
         "benches|docs|tests",
@@ -109,14 +112,16 @@ def check_release_contract() -> list[str]:
 
     for path in (".github/workflows/ci.yml", ".github/workflows/publish.yml"):
         errors.extend(require_snippets(path, common_gate))
+        errors.extend(require_snippets(path, wasi_warning_gate))
         errors.extend(require_snippets(path, wasm_runner_install))
         errors.extend(require_snippets(path, package_exclusions))
     errors.extend(
         require_snippets(
             "docs/release.md",
-            (f"wasm-bindgen-cli {wasm_bindgen_version}", "Rust 1.86", "Rust 1.85"),
+            (f"wasm-bindgen-cli {wasm_bindgen_version}", "Rust 1.88", "Rust 1.85"),
         )
     )
+    errors.extend(require_snippets("docs/release.md", wasi_warning_gate))
 
     production = (ROOT / ".github/workflows/production-evidence.yml").read_text(
         encoding="utf-8"
