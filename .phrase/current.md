@@ -101,10 +101,10 @@ contracts.
 ## Known Blockers
 
 - The Rust 1.88 wasm-bindgen tool install, strict WASI warning gate, Window
-  suite, and DedicatedWorker sync-access probes passed on GitHub-hosted CI. A
-  fresh DedicatedWorker run crossed the compaction cleanup failure and exposed
-  a test-only bucket-option mismatch on read-only reopen. The corrected reopen
-  configuration still requires a fresh Worker run.
+  suite, and all four DedicatedWorker tests passed on GitHub-hosted CI. The
+  SharedWorker test then reproduced Chrome's `SecurityError` for OPFS under the
+  wasm-bindgen-test runner's default COOP/COEP headers. CI and publish now
+  disable those optional test-server headers; a fresh remote run is pending.
 - The corrected Linux/macOS/Windows workflow has not run remotely in this
   local-only session; Phase 191 cannot close until those jobs and artifacts are
   inspected.

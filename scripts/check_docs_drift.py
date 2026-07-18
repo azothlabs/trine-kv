@@ -109,6 +109,7 @@ def check_release_contract() -> list[str]:
         "rustup toolchain install 1.88.0 --profile minimal",
         f"cargo +1.88.0 install wasm-bindgen-cli --version {wasm_bindgen_version} --locked",
     )
+    browser_runner_environment = ('WASM_BINDGEN_TEST_NO_ORIGIN_ISOLATION: "1"',)
     package_exclusions = (
         "benches|docs|tests",
         "crate package contains repository-only files",
@@ -143,6 +144,8 @@ def check_release_contract() -> list[str]:
             "job-level report environment expressions"
         )
     errors.extend(require_snippets(".github/workflows/publish.yml", maturity_gate))
+    for path in (".github/workflows/ci.yml", ".github/workflows/publish.yml"):
+        errors.extend(require_snippets(path, browser_runner_environment))
     for path in (
         ".github/workflows/production-evidence.yml",
         ".github/workflows/publish.yml",

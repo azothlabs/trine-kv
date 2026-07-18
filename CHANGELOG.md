@@ -53,6 +53,9 @@ checks.
 - Browser persistence tests now reuse the default and named-bucket options from
   creation when reopening, so the Worker gate exercises persisted reads instead
   of correctly failing early with `InvalidOptions` on test configuration drift.
+- Browser CI and publish tests now disable wasm-bindgen-test's optional
+  COOP/COEP origin-isolation headers, which Chrome otherwise rejects when a
+  SharedWorker requests its OPFS root.
 
 ### Changed
 

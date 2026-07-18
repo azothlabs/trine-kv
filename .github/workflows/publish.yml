@@ -96,6 +96,7 @@ jobs:
         env:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
           WASM_BINDGEN_TEST_ONLY_WEB: "1"
+          WASM_BINDGEN_TEST_NO_ORIGIN_ISOLATION: "1"
           CHROMEDRIVER: chromedriver
 
       - name: Run examples

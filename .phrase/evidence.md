@@ -16225,3 +16225,46 @@ Negative check:
 - Commit and push the reopen correction, then require Window,
   DedicatedWorker, and SharedWorker browser jobs to pass before publishing
   `0.5.12`.
+
+## 2026-07-18: SharedWorker OPFS test-server origin isolation
+
+### Observation
+
+- CI run `29630322762` passed the DedicatedWorker target 4/4 and the Window
+  target 14/14. The SharedWorker target alone failed before database open when
+  `navigator.storage.getDirectory()` returned Chrome `SecurityError`.
+- wasm-bindgen-test adds `Cross-Origin-Opener-Policy: same-origin` and
+  `Cross-Origin-Embedder-Policy: require-corp` to its server by default. It
+  provides `WASM_BINDGEN_TEST_NO_ORIGIN_ISOLATION` to omit those optional
+  headers.
+- A local same-origin SharedWorker probe successfully obtained the OPFS root,
+  created a directory, and wrote a file without the headers. Serving the same
+  page and worker with the default COOP/COEP pair reproduced the exact CI
+  `SecurityError` at `getDirectory()`.
+
+### Interpretation
+
+- The failure is a browser test-server configuration conflict, not a Trine
+  SharedWorker async-OPFS, Web Locks, or recovery defect.
+- Browser persistence tests do not require cross-origin isolation or shared
+  Wasm memory. Disabling the runner's optional isolation headers keeps the
+  application-like same-origin storage environment while preserving the real
+  SharedWorker execution context.
+
+### Verification
+
+- The minimal local browser probe passed without origin-isolation headers and
+  failed with the exact CI error when those headers were enabled.
+- The documentation-drift contract now requires the opt-out environment in
+  both CI and publish workflows.
+
+### Remaining Blockers
+
+- The combined Window, DedicatedWorker, and SharedWorker command must rerun on
+  GitHub-hosted Chrome with the corrected environment before the browser gate
+  is closed.
+
+### Recommended Next Action
+
+- Commit and push the workflow correction, then inspect the next CI browser
+  step before publishing `0.5.12`.
