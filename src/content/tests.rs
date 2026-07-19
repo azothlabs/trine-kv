@@ -5,17 +5,66 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use futures::executor::block_on;
 
 use crate::{
-    ContentId, ContentUploadOptions, ContentUploadResume, Db, DbOptions, ETag, Error,
-    InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta, Precondition, PutIf,
+    ContentAttachmentScope, ContentChangeId, ContentId, ContentUploadOptions, ContentUploadResume,
+    Db, DbOptions, ETag, Error, InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta,
+    OwnerScopeId, Precondition, PutIf, StorageDomainId, TransactionOptions, UploadToken,
 };
 
 const TEST_CHUNK_BYTES: usize = 64 * 1024;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn test_scope() -> ContentAttachmentScope {
+    ContentAttachmentScope::new(
+        StorageDomainId::from_bytes([3_u8; 16]),
+        OwnerScopeId::from_bytes([7_u8; 16]),
+    )
+}
+
+fn test_upload_options() -> ContentUploadOptions {
+    ContentUploadOptions::new(test_scope(), Duration::from_secs(60 * 60))
+}
+
+#[test]
+fn token_expiry_overflow_does_not_publish_content() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let mut upload = db
+            .begin_content_upload(ContentUploadOptions::new(
+                test_scope(),
+                Duration::from_millis(u64::MAX),
+            ))
+            .await
+            .expect("upload begins before seal fixes the expiry epoch");
+        upload.write(b"unpublished").await.expect("bytes write");
+        let upload_id = upload.upload_id();
+        let content_id = ContentId::for_bytes(b"unpublished");
+
+        assert!(matches!(
+            upload.seal().await,
+            Err(Error::InvalidOptions { .. })
+        ));
+        assert!(matches!(
+            db.open_content(test_scope().storage_domain_id(), content_id)
+                .await,
+            Err(Error::ContentNotFound { .. })
+        ));
+        assert!(
+            db.resume_content_upload(upload_id)
+                .await
+                .expect("upload remains resumable")
+                .into_open()
+                .is_some()
+        );
+    });
+}
 
 #[test]
 fn memory_content_ranges_stream_and_expectations_fail_closed() {
@@ -30,7 +79,7 @@ fn memory_content_ranges_stream_and_expectations_fail_closed() {
 
         let mut upload = db
             .begin_content_upload(
-                ContentUploadOptions::new()
+                test_upload_options()
                     .with_chunk_bytes(TEST_CHUNK_BYTES)
                     .with_expected_length(bytes.len() as u64)
                     .with_expected_content_id(ContentId::for_bytes(&bytes)),
@@ -42,8 +91,16 @@ fn memory_content_ranges_stream_and_expectations_fail_closed() {
             assert!(upload.buffered_bytes() <= TEST_CHUNK_BYTES);
         }
         let sealed = upload.seal().await.expect("upload seals");
+        assert!(matches!(
+            db.open_content(
+                StorageDomainId::from_bytes([88_u8; 16]),
+                sealed.content_id(),
+            )
+            .await,
+            Err(Error::ContentNotFound { .. })
+        ));
         let handle = db
-            .open_content(sealed.content_id())
+            .open_content(test_scope().storage_domain_id(), sealed.content_id())
             .await
             .expect("sealed content opens");
 
@@ -81,7 +138,7 @@ fn memory_content_ranges_stream_and_expectations_fail_closed() {
 
         let mut mismatch = db
             .begin_content_upload(
-                ContentUploadOptions::new()
+                test_upload_options()
                     .with_chunk_bytes(TEST_CHUNK_BYTES)
                     .with_expected_length(1),
             )
@@ -115,7 +172,7 @@ fn native_upload_resumes_across_reopen_and_remembers_seal() {
     let upload_id = block_on(async {
         let db = Db::open(&path).await.expect("native db opens");
         let mut upload = db
-            .begin_content_upload(ContentUploadOptions::new().with_chunk_bytes(TEST_CHUNK_BYTES))
+            .begin_content_upload(test_upload_options().with_chunk_bytes(TEST_CHUNK_BYTES))
             .await
             .expect("upload begins");
         upload
@@ -168,10 +225,25 @@ fn native_upload_resumes_across_reopen_and_remembers_seal() {
             sealed
         );
         let handle = db
-            .open_content(sealed.content_id())
+            .open_content(test_scope().storage_domain_id(), sealed.content_id())
             .await
             .expect("resumed content opens");
         handle.verify().await.expect("resumed content verifies");
+        let mut transaction = db.transaction(TransactionOptions::default());
+        let attached = transaction
+            .consume_upload_token(
+                sealed.upload_token(),
+                test_scope(),
+                ContentChangeId::from_bytes([21_u8; 16]),
+            )
+            .await
+            .expect("reopened token stages consumption");
+        assert_eq!(attached.content_id(), sealed.content_id());
+        transaction.put(b"native:attached", b"yes");
+        transaction
+            .commit()
+            .await
+            .expect("reopened token and marker commit");
         drop(handle);
         drop(db);
     });
@@ -186,7 +258,7 @@ fn stale_upload_writer_conflicts_with_newer_revision() {
             .await
             .expect("memory db opens");
         let mut first = db
-            .begin_content_upload(ContentUploadOptions::new().with_chunk_bytes(TEST_CHUNK_BYTES))
+            .begin_content_upload(test_upload_options().with_chunk_bytes(TEST_CHUNK_BYTES))
             .await
             .expect("upload begins");
         let upload_id = first.upload_id();
@@ -211,13 +283,193 @@ fn stale_upload_writer_conflicts_with_newer_revision() {
 }
 
 #[test]
+fn upload_token_rejects_wrong_scope_expiry_and_invalid_bearer() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let mut upload = db
+            .begin_content_upload(test_upload_options().with_chunk_bytes(TEST_CHUNK_BYTES))
+            .await
+            .expect("upload begins");
+        upload.write(b"attach me").await.expect("content writes");
+        let sealed = upload.seal().await.expect("content seals");
+        let token = sealed.upload_token();
+        let change_a = ContentChangeId::from_bytes([11_u8; 16]);
+        let before_expiry = sealed.token_expires_at_unix_ms() - 1;
+
+        let wrong_scope = ContentAttachmentScope::new(
+            test_scope().storage_domain_id(),
+            OwnerScopeId::from_bytes([99_u8; 16]),
+        );
+        let mut wrong = db.transaction(TransactionOptions::default());
+        assert!(matches!(
+            wrong
+                .consume_upload_token_at(token, wrong_scope, change_a, before_expiry)
+                .await,
+            Err(Error::UploadTokenScopeMismatch)
+        ));
+
+        let mut expired = db.transaction(TransactionOptions::default());
+        assert!(matches!(
+            expired
+                .consume_upload_token_at(
+                    token,
+                    test_scope(),
+                    change_a,
+                    sealed.token_expires_at_unix_ms(),
+                )
+                .await,
+            Err(Error::UploadTokenExpired { .. })
+        ));
+
+        let mut invalid_bytes = token.to_bytes();
+        invalid_bytes[32] ^= 0xff;
+        let invalid_token = UploadToken::from_bytes(invalid_bytes).expect("version remains valid");
+        let mut invalid = db.transaction(TransactionOptions::default());
+        assert!(matches!(
+            invalid
+                .consume_upload_token_at(invalid_token, test_scope(), change_a, before_expiry,)
+                .await,
+            Err(Error::UploadTokenInvalid)
+        ));
+    });
+}
+
+#[test]
+fn upload_token_consumption_is_idempotent_and_atomic_with_catalog_writes() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let mut upload = db
+            .begin_content_upload(test_upload_options().with_chunk_bytes(TEST_CHUNK_BYTES))
+            .await
+            .expect("upload begins");
+        upload.write(b"attach me").await.expect("content writes");
+        let sealed = upload.seal().await.expect("content seals");
+        let token = sealed.upload_token();
+        let change_a = ContentChangeId::from_bytes([11_u8; 16]);
+        let change_b = ContentChangeId::from_bytes([12_u8; 16]);
+        let before_expiry = sealed.token_expires_at_unix_ms() - 1;
+
+        let mut abandoned = db.transaction(TransactionOptions::default());
+        let claims = abandoned
+            .consume_upload_token_at(token, test_scope(), change_a, before_expiry)
+            .await
+            .expect("available token stages");
+        assert_eq!(claims.content_id(), sealed.content_id());
+        abandoned.put(b"catalog:abandoned", b"must not commit");
+        drop(abandoned);
+        assert_eq!(
+            db.get(b"catalog:abandoned").await.expect("marker reads"),
+            None
+        );
+
+        let mut committed = db.transaction(TransactionOptions::default());
+        committed
+            .consume_upload_token_at(token, test_scope(), change_a, before_expiry)
+            .await
+            .expect("dropped transaction left token available");
+        committed.put(b"catalog:file", b"visible");
+        committed.commit().await.expect("token and catalog commit");
+        assert_eq!(
+            db.get(b"catalog:file").await.expect("catalog reads"),
+            Some(b"visible".to_vec())
+        );
+
+        let mut idempotent = db.transaction(TransactionOptions::default());
+        let repeated = idempotent
+            .consume_upload_token_at(
+                token,
+                test_scope(),
+                change_a,
+                sealed.token_expires_at_unix_ms() + 1,
+            )
+            .await
+            .expect("same committed ChangeId remains idempotent after expiry");
+        assert_eq!(repeated, claims);
+        idempotent.commit().await.expect("idempotent retry commits");
+
+        let mut sync_retry = db.transaction(TransactionOptions::default());
+        assert_eq!(
+            sync_retry
+                .consume_upload_token_sync(token, test_scope(), change_a)
+                .expect("sync API returns the same committed claims"),
+            claims
+        );
+        sync_retry
+            .commit_sync()
+            .expect("sync idempotent retry commits");
+
+        let mut reused = db.transaction(TransactionOptions::default());
+        assert!(matches!(
+            reused
+                .consume_upload_token_at(token, test_scope(), change_b, before_expiry)
+                .await,
+            Err(Error::UploadTokenAlreadyConsumed)
+        ));
+    });
+}
+
+#[test]
+fn competing_token_consumptions_commit_with_exactly_one_catalog_write() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let change_a = ContentChangeId::from_bytes([11_u8; 16]);
+        let change_b = ContentChangeId::from_bytes([12_u8; 16]);
+        let mut second_upload = db
+            .begin_content_upload(test_upload_options().with_chunk_bytes(TEST_CHUNK_BYTES))
+            .await
+            .expect("second upload begins");
+        second_upload
+            .write(b"conflict content")
+            .await
+            .expect("second content writes");
+        let second = second_upload.seal().await.expect("second content seals");
+        let second_before_expiry = second.token_expires_at_unix_ms() - 1;
+        let mut loser = db.transaction(TransactionOptions::default());
+        loser
+            .consume_upload_token_at(
+                second.upload_token(),
+                test_scope(),
+                change_a,
+                second_before_expiry,
+            )
+            .await
+            .expect("loser stages token");
+        loser.put(b"catalog:loser", b"must not commit");
+        let mut winner = db.transaction(TransactionOptions::default());
+        winner
+            .consume_upload_token_at(
+                second.upload_token(),
+                test_scope(),
+                change_b,
+                second_before_expiry,
+            )
+            .await
+            .expect("winner stages same available token");
+        winner.put(b"catalog:winner", b"committed");
+        winner.commit().await.expect("winner commits first");
+        assert!(matches!(loser.commit().await, Err(Error::Conflict { .. })));
+        assert_eq!(db.get(b"catalog:loser").await.expect("loser reads"), None);
+        assert_eq!(
+            db.get(b"catalog:winner").await.expect("winner reads"),
+            Some(b"committed".to_vec())
+        );
+    });
+}
+
+#[test]
 fn native_content_exceeds_ordinary_value_limit_and_reopens() {
     let path = temp_db_path("content-large-native");
     let content_id = block_on(async {
         let db = Db::open(&path).await.expect("native db opens");
         let one_mib = 1024 * 1024;
         let mut upload = db
-            .begin_content_upload(ContentUploadOptions::new().with_chunk_bytes(one_mib))
+            .begin_content_upload(test_upload_options().with_chunk_bytes(one_mib))
             .await
             .expect("large upload begins");
         let mut piece = vec![0_u8; one_mib];
@@ -235,7 +487,7 @@ fn native_content_exceeds_ordinary_value_limit_and_reopens() {
     block_on(async {
         let reopened = Db::open(&path).await.expect("native db reopens");
         let handle = reopened
-            .open_content(content_id)
+            .open_content(test_scope().storage_domain_id(), content_id)
             .await
             .expect("large content reopens");
         assert_eq!(handle.len(), 65 * 1024 * 1024);
@@ -265,19 +517,19 @@ fn object_store_counts_requests_detects_tampering_and_hides_failed_seal() {
 
         let bytes = vec![7_u8; TEST_CHUNK_BYTES * 2 + 17];
         let mut upload = db
-            .begin_content_upload(ContentUploadOptions::new().with_chunk_bytes(TEST_CHUNK_BYTES))
+            .begin_content_upload(test_upload_options().with_chunk_bytes(TEST_CHUNK_BYTES))
             .await
             .expect("object upload begins");
         upload.write(&bytes).await.expect("object bytes write");
         let sealed = upload.seal().await.expect("object upload seals");
         let after_seal = client.counts();
         assert_eq!(
-            after_seal.put, 7,
-            "begin and progress state, three chunks, descriptor, sealed state"
+            after_seal.put, 9,
+            "begin/progress, chunks, descriptor, sealing, token WAL, and sealed state"
         );
 
         let handle = db
-            .open_content(sealed.content_id())
+            .open_content(test_scope().storage_domain_id(), sealed.content_id())
             .await
             .expect("object content opens");
         let after_open = client.counts();
@@ -337,7 +589,7 @@ fn object_store_counts_requests_detects_tampering_and_hides_failed_seal() {
             .store(true, Ordering::Release);
         let expected = ContentId::for_bytes(b"not published");
         let mut failed_upload = failed_db
-            .begin_content_upload(ContentUploadOptions::new().with_chunk_bytes(TEST_CHUNK_BYTES))
+            .begin_content_upload(test_upload_options().with_chunk_bytes(TEST_CHUNK_BYTES))
             .await
             .expect("failed upload begins");
         failed_upload
@@ -346,7 +598,9 @@ fn object_store_counts_requests_detects_tampering_and_hides_failed_seal() {
             .expect("failed upload chunk buffers");
         assert!(failed_upload.seal().await.is_err());
         assert!(matches!(
-            failed_db.open_content(expected).await,
+            failed_db
+                .open_content(test_scope().storage_domain_id(), expected)
+                .await,
             Err(Error::ContentNotFound { .. })
         ));
         drop(failed_db);
@@ -366,7 +620,7 @@ fn seal_retry_repairs_descriptor_session_crash_window() {
         .expect("object db opens");
         let bytes = vec![11_u8; TEST_CHUNK_BYTES + 31];
         let mut upload = db
-            .begin_content_upload(ContentUploadOptions::new().with_chunk_bytes(TEST_CHUNK_BYTES))
+            .begin_content_upload(test_upload_options().with_chunk_bytes(TEST_CHUNK_BYTES))
             .await
             .expect("upload begins");
         upload.write(&bytes).await.expect("bytes write");
@@ -374,15 +628,15 @@ fn seal_retry_repairs_descriptor_session_crash_window() {
         let content_id = ContentId::for_bytes(&bytes);
 
         client
-            .fail_sealed_upload_states
+            .fail_sealing_upload_states
             .store(true, Ordering::Release);
         assert!(upload.seal().await.is_err());
-        db.open_content(content_id)
+        db.open_content(test_scope().storage_domain_id(), content_id)
             .await
             .expect("published descriptor is visible");
 
         client
-            .fail_sealed_upload_states
+            .fail_sealing_upload_states
             .store(false, Ordering::Release);
         let repaired = db
             .seal_content_upload(upload_id)
@@ -401,6 +655,59 @@ fn seal_retry_repairs_descriptor_session_crash_window() {
 }
 
 #[test]
+fn resume_repairs_token_issued_before_sealed_session_state() {
+    block_on(async {
+        let client = Arc::new(MeasuredClient::new());
+        let db = Db::open_object_store_at(
+            client.clone(),
+            "token-seal-retry-probe",
+            DbOptions::object_store(),
+        )
+        .await
+        .expect("object db opens");
+        let mut upload = db
+            .begin_content_upload(test_upload_options().with_chunk_bytes(TEST_CHUNK_BYTES))
+            .await
+            .expect("upload begins");
+        upload
+            .write(b"token crash window")
+            .await
+            .expect("bytes write");
+        let upload_id = upload.upload_id();
+
+        client
+            .fail_sealed_upload_states
+            .store(true, Ordering::Release);
+        assert!(upload.seal().await.is_err());
+        client
+            .fail_sealed_upload_states
+            .store(false, Ordering::Release);
+
+        let sealed = db
+            .resume_content_upload(upload_id)
+            .await
+            .expect("resume completes sealing state")
+            .sealed()
+            .expect("session is sealed after recovery");
+        let mut transaction = db.transaction(TransactionOptions::default());
+        let claims = transaction
+            .consume_upload_token(
+                sealed.upload_token(),
+                test_scope(),
+                ContentChangeId::from_bytes([31_u8; 16]),
+            )
+            .await
+            .expect("recovered token stages consumption");
+        assert_eq!(claims.content_id(), sealed.content_id());
+        transaction.put(b"token:recovered", b"yes");
+        transaction
+            .commit()
+            .await
+            .expect("recovered token commits atomically");
+    });
+}
+
+#[test]
 fn resume_ignores_chunk_bytes_not_confirmed_by_session_revision() {
     block_on(async {
         let client = Arc::new(MeasuredClient::new());
@@ -413,7 +720,7 @@ fn resume_ignores_chunk_bytes_not_confirmed_by_session_revision() {
         .expect("object db opens");
         let bytes = vec![19_u8; TEST_CHUNK_BYTES + 29];
         let mut upload = db
-            .begin_content_upload(ContentUploadOptions::new().with_chunk_bytes(TEST_CHUNK_BYTES))
+            .begin_content_upload(test_upload_options().with_chunk_bytes(TEST_CHUNK_BYTES))
             .await
             .expect("upload begins");
         let upload_id = upload.upload_id();
@@ -440,7 +747,7 @@ fn resume_ignores_chunk_bytes_not_confirmed_by_session_revision() {
             .expect("unconfirmed chunks are overwritten");
         let sealed = resumed.seal().await.expect("retried upload seals");
         assert_eq!(sealed.content_id(), ContentId::for_bytes(&bytes));
-        db.open_content(sealed.content_id())
+        db.open_content(test_scope().storage_domain_id(), sealed.content_id())
             .await
             .expect("retried content opens")
             .verify()
@@ -466,6 +773,7 @@ struct MeasuredClient {
     head: AtomicUsize,
     fail_descriptors: AtomicBool,
     fail_open_upload_states: AtomicBool,
+    fail_sealing_upload_states: AtomicBool,
     fail_sealed_upload_states: AtomicBool,
 }
 
@@ -479,6 +787,7 @@ impl MeasuredClient {
             head: AtomicUsize::new(0),
             fail_descriptors: AtomicBool::new(false),
             fail_open_upload_states: AtomicBool::new(false),
+            fail_sealing_upload_states: AtomicBool::new(false),
             fail_sealed_upload_states: AtomicBool::new(false),
         }
     }
@@ -520,9 +829,19 @@ impl ObjectClient for MeasuredClient {
                 )))
             });
         }
-        if self.fail_sealed_upload_states.load(Ordering::Acquire)
+        if self.fail_sealing_upload_states.load(Ordering::Acquire)
             && key.contains("/uploads/")
             && bytes.get(8) == Some(&1)
+        {
+            return Box::pin(async move {
+                Err(Error::Io(io::Error::other(
+                    "injected sealing upload state failure",
+                )))
+            });
+        }
+        if self.fail_sealed_upload_states.load(Ordering::Acquire)
+            && key.contains("/uploads/")
+            && bytes.get(8) == Some(&2)
         {
             return Box::pin(async move {
                 Err(Error::Io(io::Error::other(

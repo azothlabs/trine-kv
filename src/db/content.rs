@@ -1,19 +1,25 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use futures::lock::MutexGuard;
 use sha2::{Digest, Sha256};
 
 use crate::{
     content::{
-        ContentDescriptor, ContentHandle, ContentId, ContentUpload, ContentUploadOptions,
-        ContentUploadResume, SealedContent, UploadId, UploadSessionState, UploadSessionStatus,
+        CONTENT_TOKEN_BUCKET, ContentDescriptor, ContentHandle, ContentId, ContentUpload,
+        ContentUploadOptions, ContentUploadResume, SealedContent, StorageDomainId, UploadId,
+        UploadSessionState, UploadSessionStatus, UploadToken, UploadTokenRecord, upload_token_key,
     },
     error::{Error, Result},
-    options::{DurabilityMode, HostStorageBackend, StorageMode},
+    options::{DurabilityMode, HostStorageBackend, StorageMode, WriteOptions},
     storage::{
         StorageObjectDeleteBackend, StorageObjectId, StorageObjectKind, StorageObjectReadBackend,
         StorageObjectWriteBackend,
     },
+    transaction::TransactionOptions,
 };
 
 use super::Db;
@@ -33,8 +39,9 @@ impl Db {
     ///
     /// # Parameters
     ///
-    /// - `options`: chunk bound plus optional expected original length and
-    ///   `ContentId`. Chunk bounds outside 64 KiB through 16 MiB are rejected.
+    /// - `options`: attachment scope, token lifetime, chunk bound, and optional
+    ///   expected original length and `ContentId`. Chunk bounds outside 64 KiB
+    ///   through 16 MiB and token lifetimes below one millisecond are rejected.
     ///
     /// # Errors
     ///
@@ -47,17 +54,30 @@ impl Db {
     /// # Examples
     ///
     /// ```rust
-    /// use trine_kv::{ContentUploadOptions, Db, DbOptions};
+    /// use std::time::Duration;
+    /// use trine_kv::{
+    ///     ContentAttachmentScope, ContentUploadOptions, Db, DbOptions, OwnerScopeId,
+    ///     StorageDomainId,
+    /// };
     ///
     /// async fn example() -> trine_kv::Result<()> {
     ///     let db = Db::open(DbOptions::memory()).await?;
+    ///     let scope = ContentAttachmentScope::new(
+    ///         StorageDomainId::from_bytes([1; 16]),
+    ///         OwnerScopeId::from_bytes([2; 16]),
+    ///     );
     ///     let mut upload = db
-    ///         .begin_content_upload(ContentUploadOptions::new())
+    ///         .begin_content_upload(ContentUploadOptions::new(
+    ///             scope,
+    ///             Duration::from_secs(3600),
+    ///         ))
     ///         .await?;
     ///     upload.write(b"immutable bytes").await?;
     ///     let sealed = upload.seal().await?;
     ///
-    ///     let content = db.open_content(sealed.content_id()).await?;
+    ///     let content = db
+    ///         .open_content(scope.storage_domain_id(), sealed.content_id())
+    ///         .await?;
     ///     assert_eq!(&*content.read_range(0, 9).await?, b"immutable");
     ///     Ok(())
     /// }
@@ -73,9 +93,10 @@ impl Db {
         self.ensure_content_backend_supported()?;
         let options = options.validate()?;
         let upload_id = UploadId::generate()?;
+        let upload_token = UploadToken::generate()?;
         let _upload = self.lock_content_upload(upload_id).await;
-        let state = UploadSessionState::initial(upload_id, options)?;
-        self.write_upload_state(state).await?;
+        let state = UploadSessionState::initial(upload_id, options, upload_token)?;
+        self.write_upload_state(&state).await?;
         Ok(ContentUpload::new(
             self.clone(),
             upload_id,
@@ -91,8 +112,9 @@ impl Db {
     ///
     /// Open state returns a writer positioned at its durable original-byte
     /// length. A partial chunk is reloaded and verified into a buffer no larger
-    /// than the configured chunk bound. Already sealed state returns the exact
-    /// prior [`SealedContent`] instead of reopening a writer.
+    /// than the configured chunk bound. A session interrupted while issuing its
+    /// attachment token completes seal recovery. Already sealed state returns
+    /// the exact prior [`SealedContent`] instead of reopening a writer.
     ///
     /// A write publishes chunk bytes before advancing the session revision. If
     /// a crash leaves a newer partial frame than the session record, resume
@@ -108,12 +130,23 @@ impl Db {
     /// # Examples
     ///
     /// ```rust
-    /// use trine_kv::{ContentUploadOptions, ContentUploadResume, Db, DbOptions};
+    /// use std::time::Duration;
+    /// use trine_kv::{
+    ///     ContentAttachmentScope, ContentUploadOptions, ContentUploadResume, Db, DbOptions,
+    ///     OwnerScopeId, StorageDomainId,
+    /// };
     ///
     /// async fn example() -> trine_kv::Result<()> {
     ///     let db = Db::open(DbOptions::memory()).await?;
+    ///     let scope = ContentAttachmentScope::new(
+    ///         StorageDomainId::from_bytes([1; 16]),
+    ///         OwnerScopeId::from_bytes([2; 16]),
+    ///     );
     ///     let mut first = db
-    ///         .begin_content_upload(ContentUploadOptions::new())
+    ///         .begin_content_upload(ContentUploadOptions::new(
+    ///             scope,
+    ///             Duration::from_secs(3600),
+    ///         ))
     ///         .await?;
     ///     first.write(b"confirmed prefix").await?;
     ///     let upload_id = first.upload_id();
@@ -136,10 +169,16 @@ impl Db {
     pub async fn resume_content_upload(&self, upload_id: UploadId) -> Result<ContentUploadResume> {
         self.ensure_open()?;
         self.ensure_content_backend_supported()?;
-        let _upload = self.lock_content_upload(upload_id).await;
+        let upload_guard = self.lock_content_upload(upload_id).await;
         let state = self.require_upload_state(upload_id).await?;
         match state.status() {
             UploadSessionStatus::Sealed(sealed) => Ok(ContentUploadResume::Sealed(sealed)),
+            UploadSessionStatus::Sealing(_) => {
+                drop(upload_guard);
+                self.seal_content_upload(upload_id)
+                    .await
+                    .map(ContentUploadResume::Sealed)
+            }
             UploadSessionStatus::Open => {
                 let mut buffer = Vec::with_capacity(state.options().chunk_bytes());
                 if state.partial_len() != 0 {
@@ -181,9 +220,10 @@ impl Db {
     ///
     /// The complete SHA-256 is recomputed from verified durable chunks, so this
     /// works after process restart without serializing hash-library internals.
-    /// Descriptor publication happens before the session becomes `sealed`; a
-    /// retry after a crash in that window observes the descriptor and completes
-    /// the same session result.
+    /// Descriptor publication happens first, followed by a durable `sealing`
+    /// checkpoint, one transactional token record, and the final `sealed`
+    /// checkpoint. A retry after any crash observes those records and returns
+    /// the same bearer token, expiry, identity, length, and durability result.
     ///
     /// # Errors
     ///
@@ -206,16 +246,26 @@ impl Db {
     /// Returns [`Error::ContentNotFound`] when no sealed descriptor exists,
     /// [`Error::Closed`] for a closed database, or a storage/format/integrity
     /// error when the descriptor cannot be trusted.
-    pub async fn open_content(&self, content_id: ContentId) -> Result<ContentHandle> {
+    ///
+    /// # Parameters
+    ///
+    /// - `storage_domain_id`: exact deduplication and physical-lifecycle domain.
+    /// - `content_id`: cryptographic identity of the original bytes.
+    pub async fn open_content(
+        &self,
+        storage_domain_id: StorageDomainId,
+        content_id: ContentId,
+    ) -> Result<ContentHandle> {
         self.ensure_open()?;
         self.ensure_content_backend_supported()?;
         let bytes = self
-            .read_content_descriptor(content_id)
+            .read_content_descriptor(storage_domain_id, content_id)
             .await?
             .ok_or_else(|| Error::ContentNotFound {
+                storage_domain_id: storage_domain_id.to_string(),
                 content_id: content_id.to_string(),
             })?;
-        let descriptor = ContentDescriptor::decode(&bytes, content_id)?;
+        let descriptor = ContentDescriptor::decode(&bytes, storage_domain_id, content_id)?;
         Ok(ContentHandle::new(self.clone(), descriptor))
     }
 
@@ -236,61 +286,140 @@ impl Db {
         if let UploadSessionStatus::Sealed(sealed) = state.status() {
             return Ok(sealed);
         }
+        let (sealing_state, sealed, reused) = self.prepare_upload_seal(&state).await?;
 
-        let content_id = self.hash_upload_state(state).await?;
-        if let Some(expected) = state.options().expected_length()
-            && expected != state.length()
-        {
-            self.discard_open_upload(state).await?;
-            return Err(Error::ContentLengthMismatch {
-                expected,
-                actual: state.length(),
-            });
-        }
-        if let Some(expected) = state.options().expected_content_id()
-            && expected != content_id
-        {
-            self.discard_open_upload(state).await?;
-            return Err(Error::ContentDigestMismatch {
-                expected: expected.to_string(),
-                actual: content_id.to_string(),
-            });
-        }
-
-        let descriptor = ContentDescriptor::new(
-            content_id,
-            upload_id,
-            state.length(),
-            state.options().chunk_bytes(),
-            state.chunk_count(),
-        )?;
-        let seal_guard = self.lock_content_seal().await;
-        let (sealed, reused) = if let Some(existing) =
-            self.read_content_descriptor(content_id).await?
-        {
-            let existing = ContentDescriptor::decode(&existing, content_id)?;
-            if existing.length() != state.length() {
-                return Err(Error::Corruption {
-                    message: format!(
-                        "content descriptor {content_id} length {} differs from upload length {}",
-                        existing.length(),
-                        state.length()
-                    ),
-                });
-            }
-            (existing.sealed(), existing.upload_id() != upload_id)
-        } else {
-            self.write_content_descriptor(content_id, descriptor.encode())
-                .await?;
-            (descriptor.sealed(), false)
-        };
-        self.write_upload_state(state.into_sealed(sealed)?).await?;
-        drop(seal_guard);
-
+        self.ensure_upload_token_record(upload_id, sealed).await?;
+        let sealed_state = sealing_state.into_sealed()?;
+        self.write_upload_state(&sealed_state).await?;
         if reused {
-            self.cleanup_upload_chunks(state).await;
+            self.cleanup_upload_chunks(&sealing_state).await;
         }
         Ok(sealed)
+    }
+
+    async fn prepare_upload_seal(
+        &self,
+        state: &UploadSessionState,
+    ) -> Result<(UploadSessionState, SealedContent, bool)> {
+        let upload_id = state.upload_id();
+        match state.status() {
+            UploadSessionStatus::Sealed(_) => Err(Error::InvalidFormat {
+                message: "sealed upload entered seal preparation".to_owned(),
+            }),
+            UploadSessionStatus::Sealing(sealed) => {
+                let descriptor = self
+                    .read_content_descriptor(sealed.storage_domain_id(), sealed.content_id())
+                    .await?
+                    .ok_or_else(|| Error::Corruption {
+                        message: format!(
+                            "sealing upload {upload_id} is missing content descriptor {}",
+                            sealed.content_id()
+                        ),
+                    })?;
+                let descriptor = ContentDescriptor::decode(
+                    &descriptor,
+                    sealed.storage_domain_id(),
+                    sealed.content_id(),
+                )?;
+                Ok((*state, sealed, descriptor.upload_id() != upload_id))
+            }
+            UploadSessionStatus::Open => {
+                let content_id = self.hash_upload_state(state).await?;
+                if let Some(expected) = state.options().expected_length()
+                    && expected != state.length()
+                {
+                    self.discard_open_upload(state).await?;
+                    return Err(Error::ContentLengthMismatch {
+                        expected,
+                        actual: state.length(),
+                    });
+                }
+                if let Some(expected) = state.options().expected_content_id()
+                    && expected != content_id
+                {
+                    self.discard_open_upload(state).await?;
+                    return Err(Error::ContentDigestMismatch {
+                        expected: expected.to_string(),
+                        actual: content_id.to_string(),
+                    });
+                }
+
+                let expires_at = current_epoch_millis()?
+                    .checked_add(state.options().token_ttl_ms()?)
+                    .ok_or_else(|| Error::invalid_options("upload token expiry overflow"))?;
+
+                let storage_domain_id = state.options().attachment_scope().storage_domain_id();
+                let descriptor = ContentDescriptor::new(
+                    storage_domain_id,
+                    content_id,
+                    upload_id,
+                    state.length(),
+                    state.options().chunk_bytes(),
+                    state.chunk_count(),
+                )?;
+                let seal_guard = self.lock_content_seal().await;
+                let reused = if let Some(existing) = self
+                    .read_content_descriptor(storage_domain_id, content_id)
+                    .await?
+                {
+                    let existing =
+                        ContentDescriptor::decode(&existing, storage_domain_id, content_id)?;
+                    if existing.length() != state.length() {
+                        return Err(Error::Corruption {
+                            message: format!(
+                                "content descriptor {content_id} length {} differs from upload length {}",
+                                existing.length(),
+                                state.length()
+                            ),
+                        });
+                    }
+                    existing.upload_id() != upload_id
+                } else {
+                    self.write_content_descriptor(
+                        storage_domain_id,
+                        content_id,
+                        descriptor.encode(),
+                    )
+                    .await?;
+                    false
+                };
+                let sealing_state =
+                    (*state).into_sealing(content_id, expires_at, self.content_durability())?;
+                self.write_upload_state(&sealing_state).await?;
+                drop(seal_guard);
+                let UploadSessionStatus::Sealing(sealed) = sealing_state.status() else {
+                    return Err(Error::InvalidFormat {
+                        message: "content upload did not enter sealing state".to_owned(),
+                    });
+                };
+                Ok((sealing_state, sealed, reused))
+            }
+        }
+    }
+
+    async fn ensure_upload_token_record(
+        &self,
+        upload_id: UploadId,
+        sealed: SealedContent,
+    ) -> Result<()> {
+        self.bucket(CONTENT_TOKEN_BUCKET).await?;
+        let expected = UploadTokenRecord::available(upload_id, sealed);
+        let key = upload_token_key(sealed.upload_token());
+        let mut transaction = self.transaction(TransactionOptions {
+            write_options: WriteOptions::new(sealed.durability()),
+        });
+        if let Some(bytes) = transaction.get_bucket(CONTENT_TOKEN_BUCKET, &key).await? {
+            let existing = UploadTokenRecord::decode(&bytes, sealed.upload_token())?;
+            if existing.attachment() != expected.attachment() {
+                return Err(Error::Corruption {
+                    message: format!("upload {upload_id} token claims changed during seal retry"),
+                });
+            }
+            return Ok(());
+        }
+        transaction.put_bucket(CONTENT_TOKEN_BUCKET, key, expected.encode())?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Aborts durable upload state and schedules no content visibility.
@@ -322,15 +451,18 @@ impl Db {
         if let Some(expected_revision) = expected_revision {
             state.require_open_revision(expected_revision)?;
         }
-        if matches!(state.status(), UploadSessionStatus::Sealed(_)) {
+        if matches!(
+            state.status(),
+            UploadSessionStatus::Sealing(_) | UploadSessionStatus::Sealed(_)
+        ) {
             return Err(Error::ContentUploadSealed {
                 upload_id: upload_id.to_string(),
             });
         }
-        self.discard_open_upload(state).await
+        self.discard_open_upload(&state).await
     }
 
-    async fn hash_upload_state(&self, state: UploadSessionState) -> Result<ContentId> {
+    async fn hash_upload_state(&self, state: &UploadSessionState) -> Result<ContentId> {
         let mut hasher = Sha256::new();
         let expected_full_len = state.options().chunk_bytes();
         for index in 0..state.complete_chunks() {
@@ -384,13 +516,13 @@ impl Db {
         Ok(ContentId::from_sha256(hasher.finalize().into()))
     }
 
-    async fn discard_open_upload(&self, state: UploadSessionState) -> Result<()> {
+    async fn discard_open_upload(&self, state: &UploadSessionState) -> Result<()> {
         self.delete_upload_state(state.upload_id()).await?;
         self.cleanup_upload_chunks(state).await;
         Ok(())
     }
 
-    async fn cleanup_upload_chunks(&self, state: UploadSessionState) {
+    async fn cleanup_upload_chunks(&self, state: &UploadSessionState) {
         for index in 0..state.chunk_count() {
             let _ = self.delete_content_chunk(state.upload_id(), index).await;
         }
@@ -422,24 +554,26 @@ impl Db {
 
     pub(crate) async fn write_content_descriptor(
         &self,
+        storage_domain_id: StorageDomainId,
         content_id: ContentId,
         bytes: Arc<[u8]>,
     ) -> Result<()> {
-        let object = self.content_descriptor_object(content_id)?;
+        let object = self.content_descriptor_object(storage_domain_id, content_id)?;
         self.write_content_object(object, bytes).await
     }
 
     pub(crate) async fn read_content_descriptor(
         &self,
+        storage_domain_id: StorageDomainId,
         content_id: ContentId,
     ) -> Result<Option<Arc<[u8]>>> {
-        let object = self.content_descriptor_object(content_id)?;
+        let object = self.content_descriptor_object(storage_domain_id, content_id)?;
         self.read_content_object(object).await
     }
 
-    pub(crate) async fn write_upload_state(&self, state: UploadSessionState) -> Result<()> {
+    pub(crate) async fn write_upload_state(&self, state: &UploadSessionState) -> Result<()> {
         let object = self.content_upload_state_object(state.upload_id())?;
-        self.write_content_object(object, state.encode()?).await
+        self.write_content_object(object, (*state).encode()?).await
     }
 
     pub(crate) async fn require_upload_state(
@@ -523,12 +657,18 @@ impl Db {
         ))
     }
 
-    fn content_descriptor_object(&self, content_id: ContentId) -> Result<StorageObjectId> {
+    fn content_descriptor_object(
+        &self,
+        storage_domain_id: StorageDomainId,
+        content_id: ContentId,
+    ) -> Result<StorageObjectId> {
         let path = self
             .content_root()?
+            .join("domains")
+            .join(hex_identifier(storage_domain_id.to_bytes()))
             .join("descriptors")
             .join("sha256")
-            .join(format!("{}.trined", hex_digest(content_id.digest())));
+            .join(format!("{}.trined", hex_identifier(content_id.digest())));
         Ok(StorageObjectId::native_file(
             StorageObjectKind::ContentDescriptor,
             path,
@@ -635,12 +775,20 @@ impl Db {
     }
 }
 
-fn hex_digest(digest: [u8; 32]) -> String {
+fn hex_identifier<const N: usize>(bytes: [u8; N]) -> String {
     use std::fmt::Write;
 
-    let mut value = String::with_capacity(digest.len() * 2);
-    for byte in digest {
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
         let _ = write!(value, "{byte:02x}");
     }
     value
+}
+
+fn current_epoch_millis() -> Result<u64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| Error::Io(std::io::Error::other(error)))?;
+    u64::try_from(duration.as_millis())
+        .map_err(|_| Error::invalid_options("system time milliseconds exceed u64::MAX"))
 }

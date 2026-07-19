@@ -74,6 +74,8 @@ pub enum Error {
     },
     /// No sealed `ContentObject` descriptor exists for the requested identity.
     ContentNotFound {
+        /// `StorageDomainId` rendered for diagnostics.
+        storage_domain_id: String,
         /// Algorithm-tagged `ContentId` rendered for diagnostics.
         content_id: String,
     },
@@ -96,6 +98,17 @@ pub enum Error {
         /// Current durable revision.
         actual_revision: u64,
     },
+    /// No issued attachment authority matches the supplied bearer token.
+    UploadTokenInvalid,
+    /// The authenticated domain or owner does not match the token claims.
+    UploadTokenScopeMismatch,
+    /// Available attachment authority reached its wall-clock deadline.
+    UploadTokenExpired {
+        /// Token deadline as Unix epoch milliseconds.
+        expired_at_unix_ms: u64,
+    },
+    /// Another `ChangeId` has already consumed this attachment authority.
+    UploadTokenAlreadyConsumed,
     /// A content range begins after the original byte sequence.
     ContentRangeOutOfBounds {
         /// Requested zero-based start offset.
@@ -192,6 +205,7 @@ pub(crate) enum ErrorSnapshot {
         name: String,
     },
     ContentNotFound {
+        storage_domain_id: String,
         content_id: String,
     },
     ContentUploadNotFound {
@@ -205,6 +219,12 @@ pub(crate) enum ErrorSnapshot {
         expected_revision: u64,
         actual_revision: u64,
     },
+    UploadTokenInvalid,
+    UploadTokenScopeMismatch,
+    UploadTokenExpired {
+        expired_at_unix_ms: u64,
+    },
+    UploadTokenAlreadyConsumed,
     ContentRangeOutOfBounds {
         start: u64,
         length: u64,
@@ -283,7 +303,11 @@ impl ErrorSnapshot {
                 Self::CheckpointAlreadyExists { name: name.clone() }
             }
             Error::CheckpointNotFound { name } => Self::CheckpointNotFound { name: name.clone() },
-            Error::ContentNotFound { content_id } => Self::ContentNotFound {
+            Error::ContentNotFound {
+                storage_domain_id,
+                content_id,
+            } => Self::ContentNotFound {
+                storage_domain_id: storage_domain_id.clone(),
                 content_id: content_id.clone(),
             },
             Error::ContentUploadNotFound { upload_id } => Self::ContentUploadNotFound {
@@ -301,6 +325,12 @@ impl ErrorSnapshot {
                 expected_revision: *expected_revision,
                 actual_revision: *actual_revision,
             },
+            Error::UploadTokenInvalid => Self::UploadTokenInvalid,
+            Error::UploadTokenScopeMismatch => Self::UploadTokenScopeMismatch,
+            Error::UploadTokenExpired { expired_at_unix_ms } => Self::UploadTokenExpired {
+                expired_at_unix_ms: *expired_at_unix_ms,
+            },
+            Error::UploadTokenAlreadyConsumed => Self::UploadTokenAlreadyConsumed,
             Error::ContentRangeOutOfBounds { start, length } => Self::ContentRangeOutOfBounds {
                 start: *start,
                 length: *length,
@@ -357,7 +387,13 @@ impl ErrorSnapshot {
             },
             Self::CheckpointAlreadyExists { name } => Error::CheckpointAlreadyExists { name },
             Self::CheckpointNotFound { name } => Error::CheckpointNotFound { name },
-            Self::ContentNotFound { content_id } => Error::ContentNotFound { content_id },
+            Self::ContentNotFound {
+                storage_domain_id,
+                content_id,
+            } => Error::ContentNotFound {
+                storage_domain_id,
+                content_id,
+            },
             Self::ContentUploadNotFound { upload_id } => Error::ContentUploadNotFound { upload_id },
             Self::ContentUploadSealed { upload_id } => Error::ContentUploadSealed { upload_id },
             Self::ContentUploadConflict {
@@ -369,6 +405,12 @@ impl ErrorSnapshot {
                 expected_revision,
                 actual_revision,
             },
+            Self::UploadTokenInvalid => Error::UploadTokenInvalid,
+            Self::UploadTokenScopeMismatch => Error::UploadTokenScopeMismatch,
+            Self::UploadTokenExpired { expired_at_unix_ms } => {
+                Error::UploadTokenExpired { expired_at_unix_ms }
+            }
+            Self::UploadTokenAlreadyConsumed => Error::UploadTokenAlreadyConsumed,
             Self::ContentRangeOutOfBounds { start, length } => {
                 Error::ContentRangeOutOfBounds { start, length }
             }
@@ -463,9 +505,13 @@ impl fmt::Display for Error {
                 write!(formatter, "checkpoint already exists: {name}")
             }
             Self::CheckpointNotFound { name } => write!(formatter, "checkpoint not found: {name}"),
-            Self::ContentNotFound { content_id } => {
-                write!(formatter, "content not found: {content_id}")
-            }
+            Self::ContentNotFound {
+                storage_domain_id,
+                content_id,
+            } => write!(
+                formatter,
+                "content not found in storage domain {storage_domain_id}: {content_id}"
+            ),
             Self::ContentUploadNotFound { upload_id } => {
                 write!(formatter, "content upload not found: {upload_id}")
             }
@@ -480,6 +526,17 @@ impl fmt::Display for Error {
                 formatter,
                 "content upload {upload_id} revision conflict: caller has {expected_revision}, durable state is {actual_revision}"
             ),
+            Self::UploadTokenInvalid => formatter.write_str("upload token is invalid"),
+            Self::UploadTokenScopeMismatch => {
+                formatter.write_str("upload token scope does not match the authenticated scope")
+            }
+            Self::UploadTokenExpired { expired_at_unix_ms } => write!(
+                formatter,
+                "upload token expired at Unix millisecond {expired_at_unix_ms}"
+            ),
+            Self::UploadTokenAlreadyConsumed => {
+                formatter.write_str("upload token was consumed by another change")
+            }
             Self::ContentRangeOutOfBounds { start, length } => write!(
                 formatter,
                 "content range starts at {start}, after content length {length}"

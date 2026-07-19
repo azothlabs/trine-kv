@@ -6,23 +6,200 @@
 //! and read through verified ranges or a sequential stream. Ordinary key/value
 //! values do not enter this path automatically.
 
-use std::{fmt, mem, sync::Arc};
+use std::{fmt, mem, sync::Arc, time::Duration};
 
 use sha2::{Digest, Sha256};
 
-use crate::{Db, Error, Result};
+use crate::{Db, DurabilityMode, Error, Result};
 
 const CONTENT_ID_SHA256_TAG: u8 = 1;
-const DESCRIPTOR_MAGIC: &[u8; 8] = b"TRNCNTD1";
+const UPLOAD_TOKEN_VERSION: u8 = 1;
+const DESCRIPTOR_MAGIC: &[u8; 8] = b"TRNCNTD2";
 const CHUNK_MAGIC: &[u8; 8] = b"TRNCNTC1";
-const UPLOAD_STATE_MAGIC: &[u8; 8] = b"TRNUPLD1";
-const DESCRIPTOR_LEN: usize = 8 + 1 + 32 + 16 + 8 + 4 + 8;
+const UPLOAD_STATE_MAGIC: &[u8; 8] = b"TRNUPLD2";
+const DESCRIPTOR_LEN: usize = 8 + 16 + 1 + 32 + 16 + 8 + 4 + 8;
 const CHUNK_HEADER_LEN: usize = 8 + 16 + 8 + 4 + 32;
-const UPLOAD_STATE_LEN: usize = 8 + 1 + 16 + 8 + 4 + 8 + 8 + 4 + 1 + 8 + 1 + 33 + 33;
+const UPLOAD_STATE_LEN: usize =
+    8 + 1 + 16 + 8 + 4 + 8 + 8 + 4 + 1 + 8 + 1 + 33 + 16 + 16 + 32 + 8 + 8 + 1 + 33;
 const UPLOAD_STATE_OPEN: u8 = 0;
-const UPLOAD_STATE_SEALED: u8 = 1;
+const UPLOAD_STATE_SEALING: u8 = 1;
+const UPLOAD_STATE_SEALED: u8 = 2;
 const MIN_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+
+/// Opaque control-plane identity for one physical content boundary.
+///
+/// Deduplication, encryption, physical quota, and reclamation are scoped to
+/// this identity. Trine KV compares and persists the bytes but does not parse
+/// tenant or project semantics from them.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StorageDomainId([u8; 16]);
+
+impl StorageDomainId {
+    /// Reconstructs an identity from its portable bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the portable bytes.
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl fmt::Debug for StorageDomainId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("StorageDomainId(")?;
+        write_hex(formatter, &self.0)?;
+        formatter.write_str(")")
+    }
+}
+
+impl fmt::Display for StorageDomainId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_hex(formatter, &self.0)
+    }
+}
+
+/// Opaque authenticated owner scope supplied by the database layer.
+///
+/// This identity can represent a project, tenant, or another authorization
+/// boundary. Trine KV only requires exact equality when a token is consumed.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OwnerScopeId([u8; 16]);
+
+impl OwnerScopeId {
+    /// Reconstructs an identity from its portable bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the portable bytes.
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl fmt::Debug for OwnerScopeId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("OwnerScopeId(")?;
+        write_hex(formatter, &self.0)?;
+        formatter.write_str(")")
+    }
+}
+
+/// Scope that an attachment token is issued to and later verified against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ContentAttachmentScope {
+    storage_domain_id: StorageDomainId,
+    owner_scope_id: OwnerScopeId,
+}
+
+impl ContentAttachmentScope {
+    /// Creates an exact storage-domain and owner binding.
+    #[must_use]
+    pub const fn new(storage_domain_id: StorageDomainId, owner_scope_id: OwnerScopeId) -> Self {
+        Self {
+            storage_domain_id,
+            owner_scope_id,
+        }
+    }
+
+    /// Returns the physical content boundary.
+    #[must_use]
+    pub const fn storage_domain_id(self) -> StorageDomainId {
+        self.storage_domain_id
+    }
+
+    /// Returns the authenticated owner boundary.
+    #[must_use]
+    pub const fn owner_scope_id(self) -> OwnerScopeId {
+        self.owner_scope_id
+    }
+}
+
+/// Opaque bearer authority returned only after an upload is sealed.
+///
+/// The 32 random bytes are secret. Logging implementations deliberately redact
+/// them; callers that persist or transmit a token should protect it like any
+/// other short-lived capability.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UploadToken([u8; 32]);
+
+impl UploadToken {
+    pub(crate) fn generate() -> Result<Self> {
+        let mut bytes = [0_u8; 32];
+        getrandom::fill(&mut bytes)
+            .map_err(|error| Error::runtime_busy(format!("upload token entropy: {error}")))?;
+        Ok(Self(bytes))
+    }
+
+    pub(crate) const fn secret(self) -> [u8; 32] {
+        self.0
+    }
+
+    /// Decodes the versioned 33-byte bearer representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedFormat`] when the first byte names an
+    /// unknown token format version.
+    pub fn from_bytes(bytes: [u8; 33]) -> Result<Self> {
+        if bytes[0] != UPLOAD_TOKEN_VERSION {
+            return Err(Error::UnsupportedFormat {
+                message: format!("unsupported upload token version {}", bytes[0]),
+            });
+        }
+        let mut secret = [0_u8; 32];
+        secret.copy_from_slice(&bytes[1..]);
+        Ok(Self(secret))
+    }
+
+    /// Returns the versioned 33-byte bearer representation.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; 33] {
+        let mut bytes = [0_u8; 33];
+        bytes[0] = UPLOAD_TOKEN_VERSION;
+        bytes[1..].copy_from_slice(&self.0);
+        bytes
+    }
+}
+
+impl fmt::Debug for UploadToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("UploadToken([REDACTED])")
+    }
+}
+
+/// Opaque database-layer change identity used for idempotent consumption.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ContentChangeId([u8; 16]);
+
+impl ContentChangeId {
+    /// Reconstructs a change identity from its portable bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the portable bytes.
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl fmt::Debug for ContentChangeId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ContentChangeId(")?;
+        write_hex(formatter, &self.0)?;
+        formatter.write_str(")")
+    }
+}
 
 /// Cryptographic algorithm carried by a [`ContentId`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -167,6 +344,8 @@ impl fmt::Display for UploadId {
 /// Configuration for a sequential content upload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContentUploadOptions {
+    attachment_scope: ContentAttachmentScope,
+    token_ttl: Duration,
     chunk_bytes: usize,
     expected_length: Option<u64>,
     expected_content_id: Option<ContentId>,
@@ -176,10 +355,17 @@ impl ContentUploadOptions {
     /// Default chunk size used by uploads and sequential reads.
     pub const DEFAULT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
-    /// Creates options with a 4 MiB chunk bound and no expected identity.
+    /// Creates options with an explicit attachment scope and token lifetime.
+    ///
+    /// The token lifetime starts when seal first reaches its durable sealing
+    /// state, not when the upload begins. A zero or sub-millisecond lifetime is
+    /// rejected by [`Db::begin_content_upload`](crate::Db::begin_content_upload).
+    /// The default chunk bound is 4 MiB and no final identity is expected.
     #[must_use]
-    pub const fn new() -> Self {
+    pub const fn new(attachment_scope: ContentAttachmentScope, token_ttl: Duration) -> Self {
         Self {
+            attachment_scope,
+            token_ttl,
             chunk_bytes: Self::DEFAULT_CHUNK_BYTES,
             expected_length: None,
             expected_content_id: None,
@@ -217,12 +403,30 @@ impl ContentUploadOptions {
         self.chunk_bytes
     }
 
+    /// Returns the scope that the sealed token will be bound to.
+    #[must_use]
+    pub const fn attachment_scope(self) -> ContentAttachmentScope {
+        self.attachment_scope
+    }
+
+    /// Returns the requested retry lifetime starting at seal.
+    #[must_use]
+    pub const fn token_ttl(self) -> Duration {
+        self.token_ttl
+    }
+
     pub(crate) fn validate(self) -> Result<Self> {
         if !(MIN_CHUNK_BYTES..=MAX_CHUNK_BYTES).contains(&self.chunk_bytes) {
             return Err(Error::invalid_options(format!(
                 "content chunk size {} is outside {MIN_CHUNK_BYTES}..={MAX_CHUNK_BYTES}",
                 self.chunk_bytes
             )));
+        }
+        let ttl_ms = self.token_ttl.as_millis();
+        if ttl_ms == 0 || ttl_ms > u128::from(u64::MAX) {
+            return Err(Error::invalid_options(
+                "upload token lifetime must be 1..=u64::MAX milliseconds",
+            ));
         }
         Ok(self)
     }
@@ -234,19 +438,23 @@ impl ContentUploadOptions {
     pub(crate) const fn expected_content_id(self) -> Option<ContentId> {
         self.expected_content_id
     }
-}
 
-impl Default for ContentUploadOptions {
-    fn default() -> Self {
-        Self::new()
+    pub(crate) fn token_ttl_ms(self) -> Result<u64> {
+        u64::try_from(self.token_ttl.as_millis()).map_err(|_| {
+            Error::invalid_options("upload token lifetime milliseconds exceed u64::MAX")
+        })
     }
 }
 
 /// Result of sealing one immutable content upload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SealedContent {
+    attachment_scope: ContentAttachmentScope,
     content_id: ContentId,
     length: u64,
+    upload_token: UploadToken,
+    token_expires_at_unix_ms: u64,
+    durability: DurabilityMode,
 }
 
 impl SealedContent {
@@ -254,6 +462,18 @@ impl SealedContent {
     #[must_use]
     pub const fn content_id(self) -> ContentId {
         self.content_id
+    }
+
+    /// Returns the storage domain in which this content was sealed.
+    #[must_use]
+    pub const fn storage_domain_id(self) -> StorageDomainId {
+        self.attachment_scope.storage_domain_id
+    }
+
+    /// Returns the exact domain and owner binding carried by the token.
+    #[must_use]
+    pub const fn attachment_scope(self) -> ContentAttachmentScope {
+        self.attachment_scope
     }
 
     /// Returns the original byte length.
@@ -267,6 +487,252 @@ impl SealedContent {
     pub const fn is_empty(self) -> bool {
         self.length == 0
     }
+
+    /// Returns the short-lived bearer authority for atomic attachment.
+    #[must_use]
+    pub const fn upload_token(self) -> UploadToken {
+        self.upload_token
+    }
+
+    /// Returns the token deadline as Unix epoch milliseconds.
+    ///
+    /// An available token is invalid once the current time is greater than or
+    /// equal to this value. A token already consumed by its `ChangeId` remains an
+    /// idempotency record rather than reusable authority.
+    #[must_use]
+    pub const fn token_expires_at_unix_ms(self) -> u64 {
+        self.token_expires_at_unix_ms
+    }
+
+    /// Returns the durability result satisfied before token issue.
+    #[must_use]
+    pub const fn durability(self) -> DurabilityMode {
+        self.durability
+    }
+}
+
+/// Claims verified while staging one upload-token consumption.
+///
+/// Returning this value does not itself attach content. The token transition
+/// and the caller's catalog writes become durable together only if the owning
+/// [`crate::Transaction`] commits successfully.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentAttachment {
+    upload_id: UploadId,
+    scope: ContentAttachmentScope,
+    content_id: ContentId,
+    length: u64,
+    token_expires_at_unix_ms: u64,
+    durability: DurabilityMode,
+}
+
+impl ContentAttachment {
+    pub(crate) const fn new(
+        upload_id: UploadId,
+        scope: ContentAttachmentScope,
+        content_id: ContentId,
+        length: u64,
+        token_expires_at_unix_ms: u64,
+        durability: DurabilityMode,
+    ) -> Self {
+        Self {
+            upload_id,
+            scope,
+            content_id,
+            length,
+            token_expires_at_unix_ms,
+            durability,
+        }
+    }
+
+    /// Returns the upload attempt that issued the token.
+    #[must_use]
+    pub const fn upload_id(self) -> UploadId {
+        self.upload_id
+    }
+
+    /// Returns the exact storage-domain and owner binding.
+    #[must_use]
+    pub const fn scope(self) -> ContentAttachmentScope {
+        self.scope
+    }
+
+    /// Returns the immutable byte identity authorized for attachment.
+    #[must_use]
+    pub const fn content_id(self) -> ContentId {
+        self.content_id
+    }
+
+    /// Returns the original byte length.
+    #[must_use]
+    pub const fn len(self) -> u64 {
+        self.length
+    }
+
+    /// Returns whether the authorized original byte sequence is empty.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.length == 0
+    }
+
+    /// Returns the original token deadline as Unix epoch milliseconds.
+    #[must_use]
+    pub const fn token_expires_at_unix_ms(self) -> u64 {
+        self.token_expires_at_unix_ms
+    }
+
+    /// Returns the durability result that was satisfied before token issue.
+    #[must_use]
+    pub const fn durability(self) -> DurabilityMode {
+        self.durability
+    }
+}
+
+pub(crate) const CONTENT_TOKEN_BUCKET: &str = "\u{1}trine-content-token\u{1}";
+const TOKEN_RECORD_MAGIC: &[u8; 8] = b"TRNTOKN1";
+const TOKEN_RECORD_LEN: usize = 8 + 32 + 16 + 16 + 16 + 33 + 8 + 8 + 1 + 1 + 16;
+const TOKEN_AVAILABLE: u8 = 0;
+const TOKEN_CONSUMED: u8 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UploadTokenStatus {
+    Available,
+    Consumed(ContentChangeId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UploadTokenRecord {
+    token_hash: [u8; 32],
+    attachment: ContentAttachment,
+    status: UploadTokenStatus,
+}
+
+impl UploadTokenRecord {
+    pub(crate) fn available(upload_id: UploadId, sealed: SealedContent) -> Self {
+        Self {
+            token_hash: upload_token_hash(sealed.upload_token),
+            attachment: ContentAttachment::new(
+                upload_id,
+                sealed.attachment_scope,
+                sealed.content_id,
+                sealed.length,
+                sealed.token_expires_at_unix_ms,
+                sealed.durability,
+            ),
+            status: UploadTokenStatus::Available,
+        }
+    }
+
+    pub(crate) const fn attachment(self) -> ContentAttachment {
+        self.attachment
+    }
+
+    pub(crate) fn consume(
+        self,
+        expected_scope: ContentAttachmentScope,
+        change_id: ContentChangeId,
+        now_unix_ms: u64,
+    ) -> Result<Self> {
+        if self.attachment.scope != expected_scope {
+            return Err(Error::UploadTokenScopeMismatch);
+        }
+        match self.status {
+            UploadTokenStatus::Consumed(existing) if existing == change_id => Ok(self),
+            UploadTokenStatus::Consumed(_) => Err(Error::UploadTokenAlreadyConsumed),
+            UploadTokenStatus::Available
+                if now_unix_ms >= self.attachment.token_expires_at_unix_ms =>
+            {
+                Err(Error::UploadTokenExpired {
+                    expired_at_unix_ms: self.attachment.token_expires_at_unix_ms,
+                })
+            }
+            UploadTokenStatus::Available => Ok(Self {
+                status: UploadTokenStatus::Consumed(change_id),
+                ..self
+            }),
+        }
+    }
+
+    pub(crate) fn encode(self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(TOKEN_RECORD_LEN);
+        bytes.extend_from_slice(TOKEN_RECORD_MAGIC);
+        bytes.extend_from_slice(&self.token_hash);
+        bytes.extend_from_slice(&self.attachment.upload_id.to_bytes());
+        bytes.extend_from_slice(&self.attachment.scope.storage_domain_id.to_bytes());
+        bytes.extend_from_slice(&self.attachment.scope.owner_scope_id.to_bytes());
+        self.attachment.content_id.encode_into(&mut bytes);
+        bytes.extend_from_slice(&self.attachment.length.to_le_bytes());
+        bytes.extend_from_slice(&self.attachment.token_expires_at_unix_ms.to_le_bytes());
+        bytes.push(encode_durability(self.attachment.durability));
+        match self.status {
+            UploadTokenStatus::Available => {
+                bytes.push(TOKEN_AVAILABLE);
+                bytes.extend_from_slice(&[0_u8; 16]);
+            }
+            UploadTokenStatus::Consumed(change_id) => {
+                bytes.push(TOKEN_CONSUMED);
+                bytes.extend_from_slice(&change_id.to_bytes());
+            }
+        }
+        debug_assert_eq!(bytes.len(), TOKEN_RECORD_LEN);
+        bytes
+    }
+
+    pub(crate) fn decode(bytes: &[u8], token: UploadToken) -> Result<Self> {
+        if bytes.len() != TOKEN_RECORD_LEN || bytes.get(..8) != Some(TOKEN_RECORD_MAGIC) {
+            return Err(Error::InvalidFormat {
+                message: "invalid upload token record header or length".to_owned(),
+            });
+        }
+        let expected_hash = upload_token_hash(token);
+        let token_hash = array_at::<32>(bytes, 8, "upload token hash")?;
+        if token_hash != expected_hash {
+            return Err(Error::InvalidFormat {
+                message: "upload token record hash mismatch".to_owned(),
+            });
+        }
+        let upload_id = UploadId(array_at::<16>(bytes, 40, "token upload id")?);
+        let storage_domain_id = StorageDomainId(array_at::<16>(bytes, 56, "token storage domain")?);
+        let owner_scope_id = OwnerScopeId(array_at::<16>(bytes, 72, "token owner scope")?);
+        let content_id = decode_content_id(bytes, 88, "token content identity")?;
+        let length = u64::from_le_bytes(array_at::<8>(bytes, 121, "token content length")?);
+        let token_expires_at_unix_ms =
+            u64::from_le_bytes(array_at::<8>(bytes, 129, "upload token expiry")?);
+        let durability = decode_durability(bytes[137])?;
+        let status = match bytes[138] {
+            TOKEN_AVAILABLE => UploadTokenStatus::Available,
+            TOKEN_CONSUMED => UploadTokenStatus::Consumed(ContentChangeId(array_at::<16>(
+                bytes,
+                139,
+                "token consuming change",
+            )?)),
+            tag => {
+                return Err(Error::UnsupportedFormat {
+                    message: format!("unsupported upload token state tag {tag}"),
+                });
+            }
+        };
+        Ok(Self {
+            token_hash,
+            attachment: ContentAttachment::new(
+                upload_id,
+                ContentAttachmentScope::new(storage_domain_id, owner_scope_id),
+                content_id,
+                length,
+                token_expires_at_unix_ms,
+                durability,
+            ),
+            status,
+        })
+    }
+}
+
+pub(crate) fn upload_token_key(token: UploadToken) -> Vec<u8> {
+    upload_token_hash(token).to_vec()
+}
+
+fn upload_token_hash(token: UploadToken) -> [u8; 32] {
+    Sha256::digest(token.to_bytes()).into()
 }
 
 /// Result of resuming durable state for an [`UploadId`].
@@ -451,8 +917,9 @@ impl ContentUpload {
             self.complete_chunks,
             u32::try_from(self.buffer.len())
                 .map_err(|_| Error::invalid_options("content partial chunk exceeds u32"))?,
+            durable.upload_token(),
         )?;
-        if let Err(error) = self.db.write_upload_state(state).await {
+        if let Err(error) = self.db.write_upload_state(&state).await {
             self.failed = true;
             return Err(error);
         }
@@ -547,6 +1014,12 @@ impl ContentHandle {
     #[must_use]
     pub const fn content_id(&self) -> ContentId {
         self.descriptor.content_id
+    }
+
+    /// Returns the storage domain fixed by this handle.
+    #[must_use]
+    pub const fn storage_domain_id(&self) -> StorageDomainId {
+        self.descriptor.storage_domain_id
     }
 
     /// Returns the original byte length.
@@ -709,6 +1182,7 @@ impl ContentStream {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UploadSessionStatus {
     Open,
+    Sealing(SealedContent),
     Sealed(SealedContent),
 }
 
@@ -720,12 +1194,17 @@ pub(crate) struct UploadSessionState {
     length: u64,
     complete_chunks: u64,
     partial_len: u32,
+    upload_token: UploadToken,
     status: UploadSessionStatus,
 }
 
 impl UploadSessionState {
-    pub(crate) fn initial(upload_id: UploadId, options: ContentUploadOptions) -> Result<Self> {
-        Self::open(upload_id, 0, options, 0, 0, 0)
+    pub(crate) fn initial(
+        upload_id: UploadId,
+        options: ContentUploadOptions,
+        upload_token: UploadToken,
+    ) -> Result<Self> {
+        Self::open(upload_id, 0, options, 0, 0, 0, upload_token)
     }
 
     pub(crate) fn open(
@@ -735,6 +1214,7 @@ impl UploadSessionState {
         length: u64,
         complete_chunks: u64,
         partial_len: u32,
+        upload_token: UploadToken,
     ) -> Result<Self> {
         let state = Self {
             upload_id,
@@ -743,18 +1223,43 @@ impl UploadSessionState {
             length,
             complete_chunks,
             partial_len,
+            upload_token,
             status: UploadSessionStatus::Open,
         };
         state.validate()?;
         Ok(state)
     }
 
-    pub(crate) fn into_sealed(self, sealed: SealedContent) -> Result<Self> {
-        if sealed.length != self.length {
+    pub(crate) fn into_sealing(
+        self,
+        content_id: ContentId,
+        token_expires_at_unix_ms: u64,
+        durability: DurabilityMode,
+    ) -> Result<Self> {
+        let sealed = SealedContent {
+            attachment_scope: self.options.attachment_scope,
+            content_id,
+            length: self.length,
+            upload_token: self.upload_token,
+            token_expires_at_unix_ms,
+            durability,
+        };
+        Ok(Self {
+            revision: self
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_options("content upload revision overflow"))?,
+            status: UploadSessionStatus::Sealing(sealed),
+            ..self
+        })
+    }
+
+    pub(crate) fn into_sealed(self) -> Result<Self> {
+        let UploadSessionStatus::Sealing(sealed) = self.status else {
             return Err(Error::InvalidFormat {
-                message: "sealed upload length differs from durable session length".to_owned(),
+                message: "content upload can become sealed only from sealing state".to_owned(),
             });
-        }
+        };
         Ok(Self {
             revision: self
                 .revision
@@ -793,15 +1298,21 @@ impl UploadSessionState {
         self.partial_len
     }
 
+    pub(crate) const fn upload_token(self) -> UploadToken {
+        self.upload_token
+    }
+
     pub(crate) const fn chunk_count(self) -> u64 {
         self.complete_chunks + if self.partial_len == 0 { 0 } else { 1 }
     }
 
     pub(crate) fn require_open_revision(self, expected_revision: u64) -> Result<()> {
         match self.status {
-            UploadSessionStatus::Sealed(_) => Err(Error::ContentUploadSealed {
-                upload_id: self.upload_id.to_string(),
-            }),
+            UploadSessionStatus::Sealing(_) | UploadSessionStatus::Sealed(_) => {
+                Err(Error::ContentUploadSealed {
+                    upload_id: self.upload_id.to_string(),
+                })
+            }
             UploadSessionStatus::Open if self.revision == expected_revision => Ok(()),
             UploadSessionStatus::Open => Err(Error::ContentUploadConflict {
                 upload_id: self.upload_id.to_string(),
@@ -816,6 +1327,7 @@ impl UploadSessionState {
         bytes.extend_from_slice(UPLOAD_STATE_MAGIC);
         bytes.push(match self.status {
             UploadSessionStatus::Open => UPLOAD_STATE_OPEN,
+            UploadSessionStatus::Sealing(_) => UPLOAD_STATE_SEALING,
             UploadSessionStatus::Sealed(_) => UPLOAD_STATE_SEALED,
         });
         bytes.extend_from_slice(&self.upload_id.bytes());
@@ -828,9 +1340,21 @@ impl UploadSessionState {
         bytes.extend_from_slice(&self.partial_len.to_le_bytes());
         encode_optional_u64(&mut bytes, self.options.expected_length);
         encode_optional_content_id(&mut bytes, self.options.expected_content_id);
+        bytes.extend_from_slice(&self.options.attachment_scope.storage_domain_id.to_bytes());
+        bytes.extend_from_slice(&self.options.attachment_scope.owner_scope_id.to_bytes());
+        bytes.extend_from_slice(&self.upload_token.secret());
+        bytes.extend_from_slice(&self.options.token_ttl_ms()?.to_le_bytes());
         match self.status {
-            UploadSessionStatus::Open => bytes.extend_from_slice(&[0_u8; 33]),
-            UploadSessionStatus::Sealed(sealed) => sealed.content_id.encode_into(&mut bytes),
+            UploadSessionStatus::Open => {
+                bytes.extend_from_slice(&0_u64.to_le_bytes());
+                bytes.push(0);
+                bytes.extend_from_slice(&[0_u8; 33]);
+            }
+            UploadSessionStatus::Sealing(sealed) | UploadSessionStatus::Sealed(sealed) => {
+                bytes.extend_from_slice(&sealed.token_expires_at_unix_ms.to_le_bytes());
+                bytes.push(encode_durability(sealed.durability));
+                sealed.content_id.encode_into(&mut bytes);
+            }
         }
         debug_assert_eq!(bytes.len(), UPLOAD_STATE_LEN);
         Ok(Arc::from(bytes))
@@ -869,9 +1393,21 @@ impl UploadSessionState {
         let expected_length = decode_optional_u64(bytes, 57, "content expected length")?;
         let expected_content_id =
             decode_optional_content_id(bytes, 66, "content expected identity")?;
+        let storage_domain_id =
+            StorageDomainId(array_at::<16>(bytes, 100, "content upload storage domain")?);
+        let owner_scope_id =
+            OwnerScopeId(array_at::<16>(bytes, 116, "content upload owner scope")?);
+        let upload_token = UploadToken(array_at::<32>(bytes, 132, "content upload token")?);
+        let token_ttl_ms =
+            u64::from_le_bytes(array_at::<8>(bytes, 164, "content upload token lifetime")?);
+        let token_expires_at_unix_ms =
+            u64::from_le_bytes(array_at::<8>(bytes, 172, "content upload token expiry")?);
+        let durability = decode_durability(bytes[180])?;
         let sealed_id = match status_tag {
             UPLOAD_STATE_OPEN => None,
-            UPLOAD_STATE_SEALED => Some(decode_content_id(bytes, 100, "sealed content identity")?),
+            UPLOAD_STATE_SEALING | UPLOAD_STATE_SEALED => {
+                Some(decode_content_id(bytes, 181, "sealed content identity")?)
+            }
             _ => {
                 return Err(Error::UnsupportedFormat {
                     message: format!("unsupported content upload state tag {status_tag}"),
@@ -879,13 +1415,27 @@ impl UploadSessionState {
             }
         };
         let options = ContentUploadOptions {
+            attachment_scope: ContentAttachmentScope::new(storage_domain_id, owner_scope_id),
+            token_ttl: Duration::from_millis(token_ttl_ms),
             chunk_bytes,
             expected_length,
             expected_content_id,
         }
         .validate()?;
         let status = sealed_id.map_or(UploadSessionStatus::Open, |content_id| {
-            UploadSessionStatus::Sealed(SealedContent { content_id, length })
+            let sealed = SealedContent {
+                attachment_scope: options.attachment_scope,
+                content_id,
+                length,
+                upload_token,
+                token_expires_at_unix_ms,
+                durability,
+            };
+            if status_tag == UPLOAD_STATE_SEALING {
+                UploadSessionStatus::Sealing(sealed)
+            } else {
+                UploadSessionStatus::Sealed(sealed)
+            }
         });
         let state = Self {
             upload_id,
@@ -894,6 +1444,7 @@ impl UploadSessionState {
             length,
             complete_chunks,
             partial_len,
+            upload_token,
             status,
         };
         state.validate()?;
@@ -932,12 +1483,27 @@ impl UploadSessionState {
                 ),
             });
         }
+        match self.status {
+            UploadSessionStatus::Open => {}
+            UploadSessionStatus::Sealing(sealed) | UploadSessionStatus::Sealed(sealed) => {
+                if sealed.length != self.length
+                    || sealed.attachment_scope != self.options.attachment_scope
+                    || sealed.upload_token != self.upload_token
+                    || sealed.token_expires_at_unix_ms == 0
+                {
+                    return Err(Error::InvalidFormat {
+                        message: "sealed content claims differ from upload session".to_owned(),
+                    });
+                }
+            }
+        }
         Ok(())
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ContentDescriptor {
+    storage_domain_id: StorageDomainId,
     content_id: ContentId,
     upload_id: UploadId,
     length: u64,
@@ -947,6 +1513,7 @@ pub(crate) struct ContentDescriptor {
 
 impl ContentDescriptor {
     pub(crate) fn new(
+        storage_domain_id: StorageDomainId,
         content_id: ContentId,
         upload_id: UploadId,
         length: u64,
@@ -956,6 +1523,7 @@ impl ContentDescriptor {
         let chunk_bytes = u32::try_from(chunk_bytes)
             .map_err(|_| Error::invalid_options("content chunk size exceeds u32"))?;
         Ok(Self {
+            storage_domain_id,
             content_id,
             upload_id,
             length,
@@ -975,6 +1543,7 @@ impl ContentDescriptor {
     pub(crate) fn encode(self) -> Arc<[u8]> {
         let mut bytes = Vec::with_capacity(DESCRIPTOR_LEN);
         bytes.extend_from_slice(DESCRIPTOR_MAGIC);
+        bytes.extend_from_slice(&self.storage_domain_id.to_bytes());
         self.content_id.encode_into(&mut bytes);
         bytes.extend_from_slice(&self.upload_id.bytes());
         bytes.extend_from_slice(&self.length.to_le_bytes());
@@ -983,27 +1552,41 @@ impl ContentDescriptor {
         Arc::from(bytes)
     }
 
-    pub(crate) fn decode(bytes: &[u8], expected: ContentId) -> Result<Self> {
+    pub(crate) fn decode(
+        bytes: &[u8],
+        expected_domain: StorageDomainId,
+        expected_content: ContentId,
+    ) -> Result<Self> {
         if bytes.len() != DESCRIPTOR_LEN || bytes.get(..8) != Some(DESCRIPTOR_MAGIC) {
             return Err(Error::InvalidFormat {
                 message: "invalid content descriptor header or length".to_owned(),
             });
         }
-        let algorithm = ContentHashAlgorithm::from_tag(bytes[8])?;
-        let digest = array_at::<32>(bytes, 9, "content descriptor digest")?;
+        let storage_domain_id = StorageDomainId(array_at::<16>(
+            bytes,
+            8,
+            "content descriptor storage domain",
+        )?);
+        if storage_domain_id != expected_domain {
+            return Err(Error::InvalidFormat {
+                message: "content descriptor storage domain mismatch".to_owned(),
+            });
+        }
+        let algorithm = ContentHashAlgorithm::from_tag(bytes[24])?;
+        let digest = array_at::<32>(bytes, 25, "content descriptor digest")?;
         let content_id = ContentId { algorithm, digest };
-        if content_id != expected {
+        if content_id != expected_content {
             return Err(Error::ContentDigestMismatch {
-                expected: expected.to_string(),
+                expected: expected_content.to_string(),
                 actual: content_id.to_string(),
             });
         }
-        let upload_id = UploadId(array_at::<16>(bytes, 41, "content descriptor upload id")?);
-        let length = u64::from_le_bytes(array_at::<8>(bytes, 57, "content descriptor length")?);
+        let upload_id = UploadId(array_at::<16>(bytes, 57, "content descriptor upload id")?);
+        let length = u64::from_le_bytes(array_at::<8>(bytes, 73, "content descriptor length")?);
         let chunk_bytes =
-            u32::from_le_bytes(array_at::<4>(bytes, 65, "content descriptor chunk size")?);
+            u32::from_le_bytes(array_at::<4>(bytes, 81, "content descriptor chunk size")?);
         let chunk_count =
-            u64::from_le_bytes(array_at::<8>(bytes, 69, "content descriptor chunk count")?);
+            u64::from_le_bytes(array_at::<8>(bytes, 85, "content descriptor chunk count")?);
         if !(MIN_CHUNK_BYTES..=MAX_CHUNK_BYTES).contains(&usize::try_from(chunk_bytes).map_err(
             |_| Error::InvalidFormat {
                 message: "content descriptor chunk size exceeds usize".to_owned(),
@@ -1026,19 +1609,13 @@ impl ContentDescriptor {
             });
         }
         Ok(Self {
+            storage_domain_id,
             content_id,
             upload_id,
             length,
             chunk_bytes,
             chunk_count,
         })
-    }
-
-    pub(crate) const fn sealed(self) -> SealedContent {
-        SealedContent {
-            content_id: self.content_id,
-            length: self.length,
-        }
     }
 }
 
@@ -1153,6 +1730,29 @@ fn decode_optional_content_id(
         1 => decode_content_id(bytes, offset + 1, field).map(Some),
         tag => Err(Error::InvalidFormat {
             message: format!("{field} has invalid presence flag {tag}"),
+        }),
+    }
+}
+
+pub(crate) const fn encode_durability(durability: DurabilityMode) -> u8 {
+    match durability {
+        DurabilityMode::Buffered => 0,
+        DurabilityMode::Flush => 1,
+        DurabilityMode::SyncData => 2,
+        DurabilityMode::SyncAll => 3,
+        DurabilityMode::SyncAllStrict => 4,
+    }
+}
+
+pub(crate) fn decode_durability(tag: u8) -> Result<DurabilityMode> {
+    match tag {
+        0 => Ok(DurabilityMode::Buffered),
+        1 => Ok(DurabilityMode::Flush),
+        2 => Ok(DurabilityMode::SyncData),
+        3 => Ok(DurabilityMode::SyncAll),
+        4 => Ok(DurabilityMode::SyncAllStrict),
+        _ => Err(Error::UnsupportedFormat {
+            message: format!("unsupported content durability tag {tag}"),
         }),
     }
 }
