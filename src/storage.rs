@@ -39,6 +39,8 @@ use crate::stats::PlatformIoClassCounters;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum StorageObjectKind {
     Blob,
+    ContentChunk,
+    ContentDescriptor,
     Manifest,
     RecoveryReport,
     Table,
@@ -51,6 +53,8 @@ impl StorageObjectKind {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Blob => "blob",
+            Self::ContentChunk => "content chunk",
+            Self::ContentDescriptor => "content descriptor",
             Self::Manifest => "manifest",
             Self::RecoveryReport => "recovery report",
             Self::Table => "table",
@@ -64,6 +68,8 @@ impl StorageObjectKind {
 pub(crate) fn max_whole_object_read_bytes(kind: StorageObjectKind) -> usize {
     match kind {
         StorageObjectKind::Blob => limits::MAX_WHOLE_BLOB_DECODE_BYTES,
+        StorageObjectKind::ContentChunk => 16 * 1024 * 1024 + 128,
+        StorageObjectKind::ContentDescriptor => 4 * 1024,
         StorageObjectKind::Manifest => limits::MAX_MANIFEST_PAYLOAD_BYTES + 14,
         StorageObjectKind::RecoveryReport => limits::MAX_MANIFEST_PAYLOAD_BYTES,
         StorageObjectKind::Table => 14 + limits::MAX_WHOLE_TABLE_DECODE_BYTES,
@@ -793,6 +799,26 @@ impl StorageObjectReadBackend for MemoryStorageBackend {
 impl BlockingStorageObjectReadBackend for MemoryStorageBackend {
     fn read_object_bytes_blocking(&self, object: StorageObjectId) -> Result<Option<Arc<[u8]>>> {
         poll_ready_storage_future(self.read_object_bytes(object))
+    }
+}
+
+impl StorageObjectWriteBackend for MemoryStorageBackend {
+    fn write_object(
+        &self,
+        object: StorageObjectId,
+        bytes: Arc<[u8]>,
+        _durability: DurabilityMode,
+    ) -> StorageFuture<'_, ()> {
+        Box::pin(async move { self.insert_read_object(object, bytes) })
+    }
+}
+
+impl StorageObjectDeleteBackend for MemoryStorageBackend {
+    fn delete_object(&self, object: StorageObjectId) -> StorageFuture<'_, ()> {
+        Box::pin(async move {
+            self.lock_objects()?.remove(&object);
+            Ok(())
+        })
     }
 }
 

@@ -20,6 +20,7 @@ use super::{
     runtime, validate_common_options, validate_options, verify_object_client_contract_for_open,
     wal,
 };
+use crate::storage::MemoryStorageBackend;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::{
     storage::{
@@ -222,6 +223,8 @@ impl Db {
                 maintenance_cooperative_yields: AtomicU64::new(0),
                 maintenance_budget_exhaustions: AtomicU64::new(0),
                 native_storage,
+                content_memory: MemoryStorageBackend::new(),
+                content_seal_lock: futures::lock::Mutex::new(()),
                 object_storage,
                 object_wal_storage,
                 object_storage_prefix,

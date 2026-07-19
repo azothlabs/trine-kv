@@ -72,6 +72,32 @@ pub enum Error {
         /// Missing checkpoint name.
         name: String,
     },
+    /// No sealed `ContentObject` descriptor exists for the requested identity.
+    ContentNotFound {
+        /// Algorithm-tagged `ContentId` rendered for diagnostics.
+        content_id: String,
+    },
+    /// A content range begins after the original byte sequence.
+    ContentRangeOutOfBounds {
+        /// Requested zero-based start offset.
+        start: u64,
+        /// Original content length.
+        length: u64,
+    },
+    /// Content bytes did not match their expected cryptographic identity.
+    ContentDigestMismatch {
+        /// Expected algorithm-tagged digest.
+        expected: String,
+        /// Digest computed from the observed bytes.
+        actual: String,
+    },
+    /// A sealed upload's original byte length differed from its expectation.
+    ContentLengthMismatch {
+        /// Length declared when the upload was opened.
+        expected: u64,
+        /// Length accepted before seal.
+        actual: u64,
+    },
     /// The database was opened read-only and a write was requested.
     ReadOnly,
     /// The database handle is closed.
@@ -146,6 +172,21 @@ pub(crate) enum ErrorSnapshot {
     CheckpointNotFound {
         name: String,
     },
+    ContentNotFound {
+        content_id: String,
+    },
+    ContentRangeOutOfBounds {
+        start: u64,
+        length: u64,
+    },
+    ContentDigestMismatch {
+        expected: String,
+        actual: String,
+    },
+    ContentLengthMismatch {
+        expected: u64,
+        actual: u64,
+    },
     ReadOnly,
     Closed,
     RuntimeBusy {
@@ -212,6 +253,21 @@ impl ErrorSnapshot {
                 Self::CheckpointAlreadyExists { name: name.clone() }
             }
             Error::CheckpointNotFound { name } => Self::CheckpointNotFound { name: name.clone() },
+            Error::ContentNotFound { content_id } => Self::ContentNotFound {
+                content_id: content_id.clone(),
+            },
+            Error::ContentRangeOutOfBounds { start, length } => Self::ContentRangeOutOfBounds {
+                start: *start,
+                length: *length,
+            },
+            Error::ContentDigestMismatch { expected, actual } => Self::ContentDigestMismatch {
+                expected: expected.clone(),
+                actual: actual.clone(),
+            },
+            Error::ContentLengthMismatch { expected, actual } => Self::ContentLengthMismatch {
+                expected: *expected,
+                actual: *actual,
+            },
             Error::ReadOnly => Self::ReadOnly,
             Error::Closed => Self::Closed,
             Error::RuntimeBusy { message } => Self::RuntimeBusy {
@@ -256,6 +312,16 @@ impl ErrorSnapshot {
             },
             Self::CheckpointAlreadyExists { name } => Error::CheckpointAlreadyExists { name },
             Self::CheckpointNotFound { name } => Error::CheckpointNotFound { name },
+            Self::ContentNotFound { content_id } => Error::ContentNotFound { content_id },
+            Self::ContentRangeOutOfBounds { start, length } => {
+                Error::ContentRangeOutOfBounds { start, length }
+            }
+            Self::ContentDigestMismatch { expected, actual } => {
+                Error::ContentDigestMismatch { expected, actual }
+            }
+            Self::ContentLengthMismatch { expected, actual } => {
+                Error::ContentLengthMismatch { expected, actual }
+            }
             Self::ReadOnly => Error::ReadOnly,
             Self::Closed => Error::Closed,
             Self::RuntimeBusy { message } => Error::RuntimeBusy { message },
@@ -341,6 +407,21 @@ impl fmt::Display for Error {
                 write!(formatter, "checkpoint already exists: {name}")
             }
             Self::CheckpointNotFound { name } => write!(formatter, "checkpoint not found: {name}"),
+            Self::ContentNotFound { content_id } => {
+                write!(formatter, "content not found: {content_id}")
+            }
+            Self::ContentRangeOutOfBounds { start, length } => write!(
+                formatter,
+                "content range starts at {start}, after content length {length}"
+            ),
+            Self::ContentDigestMismatch { expected, actual } => write!(
+                formatter,
+                "content digest mismatch: expected {expected}, got {actual}"
+            ),
+            Self::ContentLengthMismatch { expected, actual } => write!(
+                formatter,
+                "content length mismatch: expected {expected}, got {actual}"
+            ),
             Self::ReadOnly => formatter.write_str("database is read-only"),
             Self::Closed => formatter.write_str("database is closed"),
             Self::RuntimeBusy { message } => write!(formatter, "runtime busy: {message}"),

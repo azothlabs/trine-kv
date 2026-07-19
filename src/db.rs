@@ -45,11 +45,11 @@ use crate::{
     storage::{
         BlockingStorageDirectoryCreateBackend, BlockingStorageDirectoryListBackend,
         BlockingStorageDirectorySyncBackend, BlockingStorageObjectDeleteBackend,
-        BlockingStorageReadBackend, BlockingStorageReadObject, NativeFileBackend,
-        StorageCapability, StorageDirectoryCreateBackend, StorageDirectoryFile, StorageDirectoryId,
-        StorageDirectoryListBackend, StorageDirectorySyncBackend, StorageManifestReadBackend,
-        StorageObjectDeleteBackend, StorageObjectId, StorageObjectKind, StorageObjectListBackend,
-        StorageObjectReadBackend, StorageReadBackend,
+        BlockingStorageReadBackend, BlockingStorageReadObject, MemoryStorageBackend,
+        NativeFileBackend, StorageCapability, StorageDirectoryCreateBackend, StorageDirectoryFile,
+        StorageDirectoryId, StorageDirectoryListBackend, StorageDirectorySyncBackend,
+        StorageManifestReadBackend, StorageObjectDeleteBackend, StorageObjectId, StorageObjectKind,
+        StorageObjectListBackend, StorageObjectReadBackend, StorageReadBackend,
     },
     substrate::{
         DurabilitySubstrate, FilesystemSubstrate, ObjectLeaseState, ObjectStoreSubstrate,
@@ -70,6 +70,7 @@ use crate::{
 
 mod async_api;
 mod commit;
+mod content;
 mod open_helpers;
 mod sync_api;
 
@@ -274,6 +275,11 @@ pub(crate) struct DbInner {
     maintenance_cooperative_yields: AtomicU64,
     maintenance_budget_exhaustions: AtomicU64,
     native_storage: NativeFileBackend,
+    /// Private object registry used only by `ContentObject` chunks and
+    /// descriptors in an in-memory database.
+    content_memory: MemoryStorageBackend,
+    /// Serializes descriptor publication and same-ContentId deduplication.
+    content_seal_lock: futures::lock::Mutex<()>,
     /// Object-storage byte backend for object-store databases (async-only),
     /// mirroring `browser_storage`. `None` for every other backend; when set,
     /// `native_storage` is an unused default and `substrate` is `ObjectStore`.

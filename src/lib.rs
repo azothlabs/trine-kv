@@ -90,6 +90,8 @@ mod cache;
 mod checksum;
 mod codec;
 mod compaction;
+/// Immutable ContentObject upload, seal, verified range, and stream APIs.
+pub mod content;
 /// Database open, read, write, scan, and maintenance APIs.
 pub mod db;
 mod durability;
@@ -147,6 +149,10 @@ pub mod write_batch;
 
 pub use branch::{Branch, BranchInfo, BranchRange};
 pub use bucket::{Bucket, BucketName, BucketReader};
+pub use content::{
+    ContentHandle, ContentHashAlgorithm, ContentId, ContentStream, ContentUpload,
+    ContentUploadOptions, SealedContent, UploadId,
+};
 pub use db::{Db, IntoOpenOptions, MaintenanceBudget, MaintenanceOutcome};
 pub use error::{Error, Result};
 pub use iterator::{Direction, Iter, LazyIter, LazyKeyValue, LazyValue};
