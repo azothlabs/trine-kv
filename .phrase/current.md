@@ -1,6 +1,6 @@
 # Current Phase
 
-## Consumer-driven compatible delta — 2026-07-19
+## Consumer-driven compatible deltas — 2026-07-19
 
 TrineDB's protected logical Version catalog required the exact accepted local
 commit sequence inside metadata written by that same transaction. Added
@@ -10,6 +10,13 @@ slot assignment. WAL and memtable publication receive the same final bytes;
 conflicts publish nothing; persistent reopen is covered. This does not change
 the production-evidence phase status below and does not expose sequence
 prediction or reservation.
+
+TrineDB's protected FileState also needs to persist algorithm-tagged ContentId
+without parsing display text or depending on private ContentDescriptor layout.
+`ContentId::to_bytes` and `ContentId::from_bytes` now expose its fixed 33-byte
+portable identity; unknown algorithm tags fail closed. This is a compatible
+identity-codec addition only and does not change hashing, descriptor, upload,
+deduplication, or object-storage behavior.
 
 ## Status
 

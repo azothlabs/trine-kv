@@ -31,6 +31,22 @@ fn test_upload_options() -> ContentUploadOptions {
 }
 
 #[test]
+fn content_id_portable_bytes_round_trip_and_reject_unknown_algorithms() {
+    let id = ContentId::for_bytes(b"portable content identity");
+    assert_eq!(
+        ContentId::from_bytes(id.to_bytes()).expect("identity decodes"),
+        id
+    );
+
+    let mut unknown = id.to_bytes();
+    unknown[0] = u8::MAX;
+    assert!(matches!(
+        ContentId::from_bytes(unknown),
+        Err(Error::UnsupportedFormat { .. })
+    ));
+}
+
+#[test]
 fn token_expiry_overflow_does_not_publish_content() {
     block_on(async {
         let db = Db::open(DbOptions::memory())

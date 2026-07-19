@@ -237,6 +237,32 @@ pub struct ContentId {
 }
 
 impl ContentId {
+    /// Decodes the portable 33-byte content identity.
+    ///
+    /// Byte zero selects the digest algorithm and the remaining 32 bytes carry
+    /// its digest. Unknown algorithm tags fail closed so stored catalog values
+    /// are never reinterpreted under a different hash scheme.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedFormat`] when the algorithm tag is not
+    /// supported by this build.
+    pub fn from_bytes(bytes: [u8; 33]) -> Result<Self> {
+        let algorithm = ContentHashAlgorithm::from_tag(bytes[0])?;
+        let mut digest = [0_u8; 32];
+        digest.copy_from_slice(&bytes[1..]);
+        Ok(Self { algorithm, digest })
+    }
+
+    /// Returns the portable algorithm-tagged 33-byte content identity.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; 33] {
+        let mut bytes = [0_u8; 33];
+        bytes[0] = self.algorithm.tag();
+        bytes[1..].copy_from_slice(&self.digest);
+        bytes
+    }
+
     /// Computes the identity of an in-memory byte slice.
     ///
     /// Incremental uploads compute the same value without retaining all bytes;

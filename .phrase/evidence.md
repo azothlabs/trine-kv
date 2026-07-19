@@ -26,6 +26,37 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-07-19: portable ContentId catalog encoding
+
+### Observation
+
+- TrineDB FileState must persist immutable content identity independently of
+  ContentDescriptor and object layout. ContentId already carried a private
+  algorithm tag plus 32-byte digest but exposed no lossless decoding boundary.
+- `ContentId::to_bytes` and `ContentId::from_bytes` now round-trip a fixed
+  33-byte algorithm-tagged identity. Unknown tags return UnsupportedFormat and
+  are never interpreted as SHA-256.
+- The change does not alter content hashing, upload/seal, token consumption,
+  descriptor keys, deduplication scope, range reads, or physical placement.
+
+### Interpretation
+
+- Upper layers can store ContentId as a stable typed value without copying
+  Trine KV's private descriptor encoding or using a display string as protocol.
+  Future hash algorithms retain a fail-closed format boundary.
+
+### Verification
+
+- A focused round-trip/unknown-tag test passed.
+- Full all-feature tests passed: 472 core tests, 2 ignored, plus 15 integration
+  tests. Strict all-target/all-feature Clippy, strict Rustdoc, 22 doctests,
+  all-feature check, formatting, and diff checks passed.
+
+### Recommended next action
+
+- Keep this encoding limited to ContentId identity. Physical ContentDescriptor
+  and object-layout bytes remain private and independently evolvable.
+
 ## 2026-07-19: commit-sequence-stamped transaction values
 
 ### Observation
