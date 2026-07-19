@@ -80,6 +80,15 @@ impl BatchOperation {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WriteBatch {
     operations: Vec<BatchOperation>,
+    commit_sequence_stamps: Vec<CommitSequenceStamp>,
+}
+
+/// One fixed-width slot inside a staged put value that is replaced with the
+/// accepted commit sequence after conflict validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommitSequenceStamp {
+    pub(crate) operation_index: u32,
+    pub(crate) value_offset: u32,
 }
 
 impl WriteBatch {
@@ -91,6 +100,7 @@ impl WriteBatch {
     pub const fn new() -> Self {
         Self {
             operations: Vec::new(),
+            commit_sequence_stamps: Vec::new(),
         }
     }
 
@@ -135,6 +145,36 @@ impl WriteBatch {
             bucket,
             key: key.into(),
             value: value.into(),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn put_bucket_with_commit_sequence(
+        &mut self,
+        bucket: impl Into<String>,
+        key: impl Into<Vec<u8>>,
+        prefix: &[u8],
+        suffix: &[u8],
+    ) -> Result<()> {
+        let bucket = bucket.into();
+        validate_named_bucket(&bucket)?;
+        let operation_index = u32::try_from(self.operations.len())
+            .map_err(|_| Error::invalid_options("write batch operation count exceeds u32::MAX"))?;
+        let value_offset = u32::try_from(prefix.len())
+            .map_err(|_| Error::invalid_options("commit sequence value prefix is too large"))?;
+        let mut value =
+            Vec::with_capacity(prefix.len().saturating_add(8).saturating_add(suffix.len()));
+        value.extend_from_slice(prefix);
+        value.extend_from_slice(&[0_u8; 8]);
+        value.extend_from_slice(suffix);
+        self.operations.push(BatchOperation::Put {
+            bucket,
+            key: key.into(),
+            value,
+        });
+        self.commit_sequence_stamps.push(CommitSequenceStamp {
+            operation_index,
+            value_offset,
         });
         Ok(())
     }
@@ -200,6 +240,10 @@ impl WriteBatch {
     #[must_use]
     pub fn into_operations(self) -> Vec<BatchOperation> {
         self.operations
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<BatchOperation>, Vec<CommitSequenceStamp>) {
+        (self.operations, self.commit_sequence_stamps)
     }
 
     /// Returns the number of operations in the batch.

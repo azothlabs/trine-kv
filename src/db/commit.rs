@@ -22,7 +22,7 @@ use crate::{
     transaction::TransactionReadSet,
     types::{CommitInfo, Sequence},
     wal::WalBatch,
-    write_batch::{BatchOperation, WriteBatch},
+    write_batch::{BatchOperation, CommitSequenceStamp, WriteBatch},
 };
 
 use super::open_helpers::{usize_to_u64_saturating, validate_batch_len};
@@ -234,6 +234,7 @@ impl Db {
     ) -> Result<AcceptedWriteState> {
         let WriteRequest {
             operations,
+            commit_sequence_stamps,
             write_options,
             transaction_reads,
         } = request;
@@ -263,8 +264,12 @@ impl Db {
             self.apply_write_backpressure()?;
         }
 
-        let prepared =
-            self.prepare_writer_local_commit(operations, write_options, transaction_reads)?;
+        let prepared = self.prepare_writer_local_commit(
+            operations,
+            commit_sequence_stamps,
+            write_options,
+            transaction_reads,
+        )?;
         let wal_accept = if preaccept_wal {
             self.preaccept_wal_front_door_if_ready(&prepared)?
         } else {
@@ -321,7 +326,7 @@ impl Db {
         _publish: &PublishSequenceGuard<'_>,
     ) -> Result<SequencedWriteState> {
         let WriterLocalWriteState {
-            prepared,
+            mut prepared,
             wal_accept,
         } = writer_state;
 
@@ -355,6 +360,10 @@ impl Db {
                 slot
             }
         };
+        if let Err(error) = prepared.resolve_commit_sequence(slot.sequence()) {
+            self.inner.commit_tracker.mark_skipped(slot)?;
+            return Err(error);
+        }
 
         Ok(SequencedWriteState::Pending(SequencedWrite::new(
             prepared,
@@ -573,6 +582,7 @@ impl Db {
     fn can_preaccept_wal_front_door(&self, prepared: &PreparedCommit) -> bool {
         prepared.operation_count() != 0
             && prepared.transaction_reads.is_none()
+            && !prepared.has_commit_sequence_stamps()
             && self.inner.substrate.wal_is_present()
             && self.inner.options.storage_mode.persistent_path().is_some()
     }
@@ -606,6 +616,7 @@ impl Db {
     fn prepare_writer_local_commit(
         &self,
         operations: Vec<BatchOperation>,
+        commit_sequence_stamps: Vec<CommitSequenceStamp>,
         write_options: WriteOptions,
         transaction_reads: Option<TransactionReads>,
     ) -> Result<PreparedCommit> {
@@ -635,6 +646,7 @@ impl Db {
             write_options,
             transaction_reads,
             wal_operations,
+            commit_sequence_stamps,
             deltas,
         ))
     }

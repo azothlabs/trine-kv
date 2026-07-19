@@ -1,11 +1,9 @@
 #[cfg(not(target_os = "wasi"))]
 use super::Condvar;
-#[cfg(target_os = "wasi")]
-use super::Error;
 use super::{
-    Arc, BatchOperation, Bound, CommitInfo, CommitSlot, Db, DurabilityMode, LsmTree, Mutex, Result,
-    Sequence, TransactionReadSet, WriteBatch, WriteOptions, include_max_key, include_min_key,
-    lock_poisoned, operation_estimated_bytes, unique_lsm_trees,
+    Arc, BatchOperation, Bound, CommitInfo, CommitSequenceStamp, CommitSlot, Db, DurabilityMode,
+    Error, LsmTree, Mutex, Result, Sequence, TransactionReadSet, WriteBatch, WriteOptions,
+    include_max_key, include_min_key, lock_poisoned, operation_estimated_bytes, unique_lsm_trees,
 };
 #[cfg(not(target_os = "wasi"))]
 use super::{Context, Poll, Waker};
@@ -18,6 +16,7 @@ use super::{Future, Pin, thread};
 #[derive(Debug)]
 pub(super) struct WriteRequest {
     pub(super) operations: Vec<BatchOperation>,
+    pub(super) commit_sequence_stamps: Vec<CommitSequenceStamp>,
     pub(super) write_options: WriteOptions,
     pub(super) transaction_reads: Option<TransactionReads>,
 }
@@ -59,6 +58,7 @@ pub(super) struct PreparedCommit {
     pub(super) write_options: WriteOptions,
     pub(super) transaction_reads: Option<TransactionReads>,
     pub(super) wal_operations: Vec<BatchOperation>,
+    pub(super) commit_sequence_stamps: Vec<CommitSequenceStamp>,
     pub(super) deltas: Vec<PreparedShardDelta>,
     pub(super) touched_states: Vec<Arc<LsmTree>>,
     pub(super) estimated_bytes: u64,
@@ -170,8 +170,10 @@ pub(super) struct WriteThreadWake {
 
 impl WriteRequest {
     pub(super) fn batch(batch: WriteBatch, write_options: WriteOptions) -> Self {
+        let (operations, commit_sequence_stamps) = batch.into_parts();
         Self {
-            operations: batch.into_operations(),
+            operations,
+            commit_sequence_stamps,
             write_options,
             transaction_reads: None,
         }
@@ -183,8 +185,10 @@ impl WriteRequest {
         batch: WriteBatch,
         write_options: WriteOptions,
     ) -> Self {
+        let (operations, commit_sequence_stamps) = batch.into_parts();
         Self {
-            operations: batch.into_operations(),
+            operations,
+            commit_sequence_stamps,
             write_options,
             transaction_reads: Some(TransactionReads {
                 read_sequence,
@@ -230,6 +234,7 @@ impl PreparedCommit {
         write_options: WriteOptions,
         transaction_reads: Option<TransactionReads>,
         wal_operations: Vec<BatchOperation>,
+        commit_sequence_stamps: Vec<CommitSequenceStamp>,
         deltas: Vec<PreparedShardDelta>,
     ) -> Self {
         let touched_states = unique_lsm_trees(deltas.iter().map(|delta| Arc::clone(&delta.state)));
@@ -240,6 +245,7 @@ impl PreparedCommit {
             write_options,
             transaction_reads,
             wal_operations,
+            commit_sequence_stamps,
             deltas,
             touched_states,
             estimated_bytes,
@@ -250,6 +256,72 @@ impl PreparedCommit {
     pub(super) fn operation_count(&self) -> usize {
         self.wal_operations.len()
     }
+
+    pub(super) fn has_commit_sequence_stamps(&self) -> bool {
+        !self.commit_sequence_stamps.is_empty()
+    }
+
+    pub(super) fn resolve_commit_sequence(&mut self, sequence: Sequence) -> Result<()> {
+        let bytes = sequence.get().to_be_bytes();
+        for stamp in &self.commit_sequence_stamps {
+            let batch_index =
+                usize::try_from(stamp.operation_index).map_err(|_| Error::Corruption {
+                    message: "commit sequence operation index is not addressable".to_owned(),
+                })?;
+            let operation =
+                self.wal_operations
+                    .get_mut(batch_index)
+                    .ok_or_else(|| Error::Corruption {
+                        message: "commit sequence operation index is out of bounds".to_owned(),
+                    })?;
+            stamp_commit_sequence(operation, stamp.value_offset, bytes)?;
+
+            let mut resolved_delta = false;
+            for delta in &mut self.deltas {
+                if let Some(prepared) = delta
+                    .operations
+                    .iter_mut()
+                    .find(|prepared| prepared.batch_index == stamp.operation_index)
+                {
+                    stamp_commit_sequence(&mut prepared.operation, stamp.value_offset, bytes)?;
+                    resolved_delta = true;
+                    break;
+                }
+            }
+            if !resolved_delta {
+                return Err(Error::Corruption {
+                    message: "commit sequence operation is missing from prepared deltas".to_owned(),
+                });
+            }
+        }
+        self.commit_sequence_stamps.clear();
+        Ok(())
+    }
+}
+
+fn stamp_commit_sequence(
+    operation: &mut BatchOperation,
+    value_offset: u32,
+    bytes: [u8; 8],
+) -> Result<()> {
+    let BatchOperation::Put { value, .. } = operation else {
+        return Err(Error::Corruption {
+            message: "commit sequence stamp targets a non-put operation".to_owned(),
+        });
+    };
+    let start = usize::try_from(value_offset).map_err(|_| Error::Corruption {
+        message: "commit sequence value offset is not addressable".to_owned(),
+    })?;
+    let end = start
+        .checked_add(bytes.len())
+        .ok_or_else(|| Error::Corruption {
+            message: "commit sequence value offset overflowed".to_owned(),
+        })?;
+    let slot = value.get_mut(start..end).ok_or_else(|| Error::Corruption {
+        message: "commit sequence value slot is out of bounds".to_owned(),
+    })?;
+    slot.copy_from_slice(&bytes);
+    Ok(())
 }
 
 impl PreparedShardDelta {

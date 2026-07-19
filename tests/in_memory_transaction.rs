@@ -19,6 +19,55 @@ fn transaction_commits_staged_writes_without_reads() {
 }
 
 #[test]
+fn transaction_stamps_the_accepted_commit_sequence_into_a_named_value() {
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
+    let metadata = db.bucket_sync("metadata").expect("metadata bucket opens");
+    db.put_sync(b"seed", b"value")
+        .expect("seed advances sequence");
+    let mut txn = db.transaction(TransactionOptions::default());
+
+    txn.put_bucket_with_commit_sequence(
+        metadata.name().as_str(),
+        b"version",
+        b"prefix:",
+        b":suffix",
+    )
+    .expect("stamped value stages");
+    let info = txn.commit_sync().expect("transaction commits");
+
+    let stored = metadata
+        .get_sync(b"version")
+        .expect("stamped value reads")
+        .expect("stamped value exists");
+    assert_eq!(&stored[..7], b"prefix:");
+    assert_eq!(
+        u64::from_be_bytes(stored[7..15].try_into().expect("sequence bytes")),
+        info.read_version().as_u64()
+    );
+    assert_eq!(&stored[15..], b":suffix");
+}
+
+#[test]
+fn conflicting_transaction_does_not_publish_a_commit_sequence_value() {
+    let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
+    let metadata = db.bucket_sync("metadata").expect("metadata bucket opens");
+    db.put_sync(b"guard", b"before").expect("guard seeds");
+    let mut txn = db.transaction(TransactionOptions::default());
+    assert_eq!(
+        txn.get_sync(b"guard").expect("guard reads"),
+        Some(b"before".to_vec())
+    );
+    txn.put_bucket_with_commit_sequence(metadata.name().as_str(), b"version", b"", b"")
+        .expect("stamped value stages");
+    db.put_sync(b"guard", b"after")
+        .expect("concurrent guard write");
+
+    let error = txn.commit_sync().expect_err("read conflict rejects commit");
+    assert!(matches!(error, Error::Conflict { .. }));
+    assert_eq!(metadata.get_sync(b"version").expect("metadata reads"), None);
+}
+
+#[test]
 fn transaction_exposes_read_version_boundary() {
     let db = Db::open_sync(DbOptions::memory()).expect("memory db opens");
     db.put_sync(b"a", b"v1").expect("seed value");

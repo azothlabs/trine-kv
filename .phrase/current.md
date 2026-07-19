@@ -1,5 +1,16 @@
 # Current Phase
 
+## Consumer-driven compatible delta — 2026-07-19
+
+TrineDB's protected logical Version catalog required the exact accepted local
+commit sequence inside metadata written by that same transaction. Added
+`Transaction::put_bucket_with_commit_sequence`, a compatible API that fills one
+fixed eight-byte big-endian value slot only after conflict validation and commit
+slot assignment. WAL and memtable publication receive the same final bytes;
+conflicts publish nothing; persistent reopen is covered. This does not change
+the production-evidence phase status below and does not expose sequence
+prediction or reservation.
+
 ## Status
 
 Phase 191 implementation and local verification are complete. Remote Linux,

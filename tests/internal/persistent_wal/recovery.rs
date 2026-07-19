@@ -1,6 +1,48 @@
 use super::*;
 
 #[test]
+fn commit_sequence_value_replays_with_the_same_sequence_after_reopen() {
+    let path = temp_db_path("commit-sequence-value-reopen");
+    let options = DbOptions::persistent(&path);
+    let committed_sequence;
+
+    {
+        let db = Db::open_sync(options.clone()).expect("persistent db opens");
+        let metadata = db.bucket_sync("metadata").expect("metadata bucket opens");
+        let mut transaction = db.transaction(TransactionOptions::default());
+        transaction
+            .put_bucket_with_commit_sequence(
+                metadata.name().as_str(),
+                b"version",
+                b"v1:",
+                b"",
+            )
+            .expect("sequence value stages");
+        committed_sequence = transaction
+            .commit_sync()
+            .expect("transaction commits")
+            .read_version()
+            .as_u64();
+    }
+
+    {
+        let db = Db::open_sync(options).expect("persistent db reopens");
+        let metadata = db.bucket_sync("metadata").expect("metadata bucket reopens");
+        let value = metadata
+            .get_sync(b"version")
+            .expect("version reads")
+            .expect("version exists");
+        assert_eq!(&value[..3], b"v1:");
+        assert_eq!(
+            u64::from_be_bytes(value[3..11].try_into().expect("sequence bytes")),
+            committed_sequence
+        );
+    }
+
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_api_helpers_cover_open_options_and_bucket_writes() {
     let path = temp_db_path("api-helpers");
     let mut options = DbOptions::persistent(&path).with_durability(DurabilityMode::Flush);

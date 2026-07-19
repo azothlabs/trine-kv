@@ -26,6 +26,49 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-07-19: commit-sequence-stamped transaction values
+
+### Observation
+
+- An upper storage layer needed to persist the exact instance-local visibility
+  sequence inside metadata written by the same transaction. Trine previously
+  exposed that sequence only after commit, so a follow-up write would have
+  created a second atomic boundary and guessing the next sequence would fail
+  under concurrent writers.
+- `Transaction::put_bucket_with_commit_sequence` now stages
+  `prefix || eight-byte big-endian sequence || suffix`. The staged operation
+  keeps a private fixed-width slot; after optimistic validation succeeds and a
+  commit slot is reserved, Trine resolves both the WAL operation and prepared
+  memtable operation to identical ordinary bytes.
+- Writes carrying a sequence slot cannot use the early WAL preaccept path,
+  because their bytes are not final until sequence assignment. If internal slot
+  resolution fails after reservation, the slot is marked skipped before the
+  error returns.
+- A transaction conflict publishes no stamped value. A persistent reopen test
+  proves WAL replay returns the same sequence bytes as the original
+  `CommitInfo::read_version`.
+
+### Interpretation
+
+- This is a narrow compatible transaction primitive, not a portable identity or
+  a sequence reservation API. It lets database layers persist local commit
+  metadata without weakening Trine's sequence assignment, conflict, WAL, or
+  visibility rules.
+
+### Verification
+
+- Focused in-memory tests cover successful stamping and conflict rollback; a
+  persistent WAL test covers close/reopen equality.
+- Full all-feature tests passed: 471 core tests, 2 ignored, followed by every
+  integration target. Strict all-target/all-feature Clippy, strict Rustdoc, 22
+  doctests, formatting, and diff checks passed.
+
+### Recommended Next Action
+
+- Keep the primitive limited to metadata that must describe its own accepted
+  commit. Do not expose sequence prediction or use the local sequence as a
+  portable logical identifier.
+
 ## 2026-07-12: Production Evidence And Performance Gate
 
 ### Observation

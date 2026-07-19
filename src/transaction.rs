@@ -245,6 +245,73 @@ impl Transaction {
         self.writes.put_bucket(bucket, key, value)
     }
 
+    /// Stages a named-bucket value containing this transaction's final commit
+    /// sequence in unsigned big-endian form.
+    ///
+    /// The stored value is `prefix || sequence.to_be_bytes() || suffix`. The
+    /// eight-byte sequence is filled only after optimistic read validation
+    /// succeeds and Trine reserves the transaction's commit slot. The resolved
+    /// bytes are then used by both the WAL and memtable publish paths, so a
+    /// successful reopen observes the same value returned by
+    /// [`CommitInfo::read_version`]. A conflict publishes neither the value nor
+    /// a guessed sequence.
+    ///
+    /// This is intended for upper storage layers that must persist an
+    /// instance-local visibility coordinate in the exact write it describes.
+    /// It does not provide a portable logical identity and it does not expose or
+    /// reserve a sequence before commit.
+    ///
+    /// # Parameters
+    ///
+    /// - `bucket`: existing named bucket that receives the value.
+    /// - `key`: user key within `bucket`.
+    /// - `prefix`: bytes stored before the eight-byte sequence.
+    /// - `suffix`: bytes stored after the eight-byte sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidOptions`] when `bucket` is empty or names the
+    /// built-in default bucket, or when the staged value cannot be represented
+    /// by this transaction's bounded batch format. Commit may later return
+    /// [`Error::Conflict`] or the ordinary storage and durability errors.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use trine_kv::{Db, DbOptions, TransactionOptions};
+    ///
+    /// # fn main() -> trine_kv::Result<()> {
+    /// let db = Db::open_sync(DbOptions::memory())?;
+    /// let metadata = db.bucket_sync("metadata")?;
+    /// let mut transaction = db.transaction(TransactionOptions::default());
+    /// transaction.put_bucket_with_commit_sequence(
+    ///     metadata.name().as_str(),
+    ///     b"latest",
+    ///     b"v1:",
+    ///     b":accepted",
+    /// )?;
+    /// let commit = transaction.commit_sync()?;
+    /// let stored = metadata.get_sync(b"latest")?.expect("committed value");
+    /// assert_eq!(&stored[..3], b"v1:");
+    /// assert_eq!(
+    ///     u64::from_be_bytes(stored[3..11].try_into().expect("eight-byte sequence")),
+    ///     commit.read_version().as_u64(),
+    /// );
+    /// assert_eq!(&stored[11..], b":accepted");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn put_bucket_with_commit_sequence(
+        &mut self,
+        bucket: impl Into<String>,
+        key: impl Into<Vec<u8>>,
+        prefix: &[u8],
+        suffix: &[u8],
+    ) -> Result<()> {
+        self.writes
+            .put_bucket_with_commit_sequence(bucket, key, prefix, suffix)
+    }
+
     /// Stages a point delete for the default bucket.
     pub fn delete(&mut self, key: impl Into<Vec<u8>>) {
         self.writes.delete(key);
