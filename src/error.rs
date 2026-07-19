@@ -77,6 +77,25 @@ pub enum Error {
         /// Algorithm-tagged `ContentId` rendered for diagnostics.
         content_id: String,
     },
+    /// No durable upload session exists for the requested identity.
+    ContentUploadNotFound {
+        /// `UploadId` rendered for diagnostics.
+        upload_id: String,
+    },
+    /// A write or abort targeted an upload that was already sealed.
+    ContentUploadSealed {
+        /// `UploadId` rendered for diagnostics.
+        upload_id: String,
+    },
+    /// A stale upload handle attempted to advance a newer durable revision.
+    ContentUploadConflict {
+        /// `UploadId` rendered for diagnostics.
+        upload_id: String,
+        /// Revision held by the caller.
+        expected_revision: u64,
+        /// Current durable revision.
+        actual_revision: u64,
+    },
     /// A content range begins after the original byte sequence.
     ContentRangeOutOfBounds {
         /// Requested zero-based start offset.
@@ -175,6 +194,17 @@ pub(crate) enum ErrorSnapshot {
     ContentNotFound {
         content_id: String,
     },
+    ContentUploadNotFound {
+        upload_id: String,
+    },
+    ContentUploadSealed {
+        upload_id: String,
+    },
+    ContentUploadConflict {
+        upload_id: String,
+        expected_revision: u64,
+        actual_revision: u64,
+    },
     ContentRangeOutOfBounds {
         start: u64,
         length: u64,
@@ -256,6 +286,21 @@ impl ErrorSnapshot {
             Error::ContentNotFound { content_id } => Self::ContentNotFound {
                 content_id: content_id.clone(),
             },
+            Error::ContentUploadNotFound { upload_id } => Self::ContentUploadNotFound {
+                upload_id: upload_id.clone(),
+            },
+            Error::ContentUploadSealed { upload_id } => Self::ContentUploadSealed {
+                upload_id: upload_id.clone(),
+            },
+            Error::ContentUploadConflict {
+                upload_id,
+                expected_revision,
+                actual_revision,
+            } => Self::ContentUploadConflict {
+                upload_id: upload_id.clone(),
+                expected_revision: *expected_revision,
+                actual_revision: *actual_revision,
+            },
             Error::ContentRangeOutOfBounds { start, length } => Self::ContentRangeOutOfBounds {
                 start: *start,
                 length: *length,
@@ -313,6 +358,17 @@ impl ErrorSnapshot {
             Self::CheckpointAlreadyExists { name } => Error::CheckpointAlreadyExists { name },
             Self::CheckpointNotFound { name } => Error::CheckpointNotFound { name },
             Self::ContentNotFound { content_id } => Error::ContentNotFound { content_id },
+            Self::ContentUploadNotFound { upload_id } => Error::ContentUploadNotFound { upload_id },
+            Self::ContentUploadSealed { upload_id } => Error::ContentUploadSealed { upload_id },
+            Self::ContentUploadConflict {
+                upload_id,
+                expected_revision,
+                actual_revision,
+            } => Error::ContentUploadConflict {
+                upload_id,
+                expected_revision,
+                actual_revision,
+            },
             Self::ContentRangeOutOfBounds { start, length } => {
                 Error::ContentRangeOutOfBounds { start, length }
             }
@@ -410,6 +466,20 @@ impl fmt::Display for Error {
             Self::ContentNotFound { content_id } => {
                 write!(formatter, "content not found: {content_id}")
             }
+            Self::ContentUploadNotFound { upload_id } => {
+                write!(formatter, "content upload not found: {upload_id}")
+            }
+            Self::ContentUploadSealed { upload_id } => {
+                write!(formatter, "content upload is already sealed: {upload_id}")
+            }
+            Self::ContentUploadConflict {
+                upload_id,
+                expected_revision,
+                actual_revision,
+            } => write!(
+                formatter,
+                "content upload {upload_id} revision conflict: caller has {expected_revision}, durable state is {actual_revision}"
+            ),
             Self::ContentRangeOutOfBounds { start, length } => write!(
                 formatter,
                 "content range starts at {start}, after content length {length}"

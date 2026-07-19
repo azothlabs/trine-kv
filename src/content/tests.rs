@@ -10,8 +10,8 @@ use std::{
 use futures::executor::block_on;
 
 use crate::{
-    ContentId, ContentUploadOptions, Db, DbOptions, ETag, Error, InMemoryObjectStore, ObjectClient,
-    ObjectFuture, ObjectMeta, Precondition, PutIf,
+    ContentId, ContentUploadOptions, ContentUploadResume, Db, DbOptions, ETag, Error,
+    InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta, Precondition, PutIf,
 };
 
 const TEST_CHUNK_BYTES: usize = 64 * 1024;
@@ -87,6 +87,7 @@ fn memory_content_ranges_stream_and_expectations_fail_closed() {
             )
             .await
             .expect("mismatch upload begins");
+        let mismatch_id = mismatch.upload_id();
         mismatch.write(b"two").await.expect("mismatch bytes write");
         assert!(matches!(
             mismatch.seal().await,
@@ -95,6 +96,117 @@ fn memory_content_ranges_stream_and_expectations_fail_closed() {
                 actual: 3
             })
         ));
+        assert!(matches!(
+            db.resume_content_upload(mismatch_id).await,
+            Err(Error::ContentUploadNotFound { .. })
+        ));
+    });
+}
+
+#[test]
+fn native_upload_resumes_across_reopen_and_remembers_seal() {
+    let path = temp_db_path("content-resume-native");
+    let mut bytes = vec![0_u8; TEST_CHUNK_BYTES * 2 + 37];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::try_from(index % 239).expect("pattern is within u8");
+    }
+    let first_len = TEST_CHUNK_BYTES + 123;
+
+    let upload_id = block_on(async {
+        let db = Db::open(&path).await.expect("native db opens");
+        let mut upload = db
+            .begin_content_upload(ContentUploadOptions::new().with_chunk_bytes(TEST_CHUNK_BYTES))
+            .await
+            .expect("upload begins");
+        upload
+            .write(&bytes[..first_len])
+            .await
+            .expect("durable prefix writes");
+        assert_eq!(upload.len(), first_len as u64);
+        assert_eq!(upload.buffered_bytes(), 123);
+        let upload_id = upload.upload_id();
+        drop(upload);
+        drop(db);
+        upload_id
+    });
+
+    let sealed = block_on(async {
+        let db = Db::open(&path).await.expect("native db reopens");
+        let mut resumed = match db
+            .resume_content_upload(upload_id)
+            .await
+            .expect("upload resumes")
+        {
+            ContentUploadResume::Open(upload) => upload,
+            ContentUploadResume::Sealed(_) => panic!("upload unexpectedly sealed"),
+        };
+        assert_eq!(resumed.len(), first_len as u64);
+        assert_eq!(resumed.buffered_bytes(), 123);
+        resumed
+            .write(&bytes[first_len..])
+            .await
+            .expect("remaining bytes write");
+        let sealed = resumed.seal().await.expect("resumed upload seals");
+        assert_eq!(sealed.content_id(), ContentId::for_bytes(&bytes));
+        drop(db);
+        sealed
+    });
+
+    block_on(async {
+        let db = Db::open(&path).await.expect("sealed db reopens");
+        let remembered = db
+            .resume_content_upload(upload_id)
+            .await
+            .expect("sealed upload state reopens")
+            .sealed()
+            .expect("seal result is remembered");
+        assert_eq!(remembered, sealed);
+        assert_eq!(
+            db.seal_content_upload(upload_id)
+                .await
+                .expect("seal retry is idempotent"),
+            sealed
+        );
+        let handle = db
+            .open_content(sealed.content_id())
+            .await
+            .expect("resumed content opens");
+        handle.verify().await.expect("resumed content verifies");
+        drop(handle);
+        drop(db);
+    });
+
+    std::fs::remove_dir_all(&path).expect("test database removes");
+}
+
+#[test]
+fn stale_upload_writer_conflicts_with_newer_revision() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let mut first = db
+            .begin_content_upload(ContentUploadOptions::new().with_chunk_bytes(TEST_CHUNK_BYTES))
+            .await
+            .expect("upload begins");
+        let upload_id = first.upload_id();
+        let mut stale = db
+            .resume_content_upload(upload_id)
+            .await
+            .expect("second writer resumes")
+            .into_open()
+            .expect("upload is open");
+
+        first.write(b"winner").await.expect("first writer advances");
+        assert!(matches!(
+            stale.write(b"stale").await,
+            Err(Error::ContentUploadConflict {
+                expected_revision: 0,
+                actual_revision: 1,
+                ..
+            })
+        ));
+        first.abort().await.expect("winning session aborts");
     });
 }
 
@@ -159,7 +271,10 @@ fn object_store_counts_requests_detects_tampering_and_hides_failed_seal() {
         upload.write(&bytes).await.expect("object bytes write");
         let sealed = upload.seal().await.expect("object upload seals");
         let after_seal = client.counts();
-        assert_eq!(after_seal.put, 4, "three chunks plus one descriptor");
+        assert_eq!(
+            after_seal.put, 7,
+            "begin and progress state, three chunks, descriptor, sealed state"
+        );
 
         let handle = db
             .open_content(sealed.content_id())
@@ -238,6 +353,102 @@ fn object_store_counts_requests_detects_tampering_and_hides_failed_seal() {
     });
 }
 
+#[test]
+fn seal_retry_repairs_descriptor_session_crash_window() {
+    block_on(async {
+        let client = Arc::new(MeasuredClient::new());
+        let db = Db::open_object_store_at(
+            client.clone(),
+            "seal-retry-probe",
+            DbOptions::object_store(),
+        )
+        .await
+        .expect("object db opens");
+        let bytes = vec![11_u8; TEST_CHUNK_BYTES + 31];
+        let mut upload = db
+            .begin_content_upload(ContentUploadOptions::new().with_chunk_bytes(TEST_CHUNK_BYTES))
+            .await
+            .expect("upload begins");
+        upload.write(&bytes).await.expect("bytes write");
+        let upload_id = upload.upload_id();
+        let content_id = ContentId::for_bytes(&bytes);
+
+        client
+            .fail_sealed_upload_states
+            .store(true, Ordering::Release);
+        assert!(upload.seal().await.is_err());
+        db.open_content(content_id)
+            .await
+            .expect("published descriptor is visible");
+
+        client
+            .fail_sealed_upload_states
+            .store(false, Ordering::Release);
+        let repaired = db
+            .seal_content_upload(upload_id)
+            .await
+            .expect("seal retry completes session state");
+        assert_eq!(repaired.content_id(), content_id);
+        assert_eq!(repaired.len(), bytes.len() as u64);
+        assert_eq!(
+            db.resume_content_upload(upload_id)
+                .await
+                .expect("repaired session resumes")
+                .sealed(),
+            Some(repaired)
+        );
+    });
+}
+
+#[test]
+fn resume_ignores_chunk_bytes_not_confirmed_by_session_revision() {
+    block_on(async {
+        let client = Arc::new(MeasuredClient::new());
+        let db = Db::open_object_store_at(
+            client.clone(),
+            "progress-retry-probe",
+            DbOptions::object_store(),
+        )
+        .await
+        .expect("object db opens");
+        let bytes = vec![19_u8; TEST_CHUNK_BYTES + 29];
+        let mut upload = db
+            .begin_content_upload(ContentUploadOptions::new().with_chunk_bytes(TEST_CHUNK_BYTES))
+            .await
+            .expect("upload begins");
+        let upload_id = upload.upload_id();
+
+        client
+            .fail_open_upload_states
+            .store(true, Ordering::Release);
+        assert!(upload.write(&bytes).await.is_err());
+        client
+            .fail_open_upload_states
+            .store(false, Ordering::Release);
+
+        let mut resumed = db
+            .resume_content_upload(upload_id)
+            .await
+            .expect("upload resumes from old revision")
+            .into_open()
+            .expect("session remains open");
+        assert_eq!(resumed.len(), 0);
+        assert_eq!(resumed.buffered_bytes(), 0);
+        resumed
+            .write(&bytes)
+            .await
+            .expect("unconfirmed chunks are overwritten");
+        let sealed = resumed.seal().await.expect("retried upload seals");
+        assert_eq!(sealed.content_id(), ContentId::for_bytes(&bytes));
+        db.open_content(sealed.content_id())
+            .await
+            .expect("retried content opens")
+            .verify()
+            .await
+            .expect("retried content verifies");
+    });
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct RequestCounts {
     get: usize,
@@ -254,6 +465,8 @@ struct MeasuredClient {
     put: AtomicUsize,
     head: AtomicUsize,
     fail_descriptors: AtomicBool,
+    fail_open_upload_states: AtomicBool,
+    fail_sealed_upload_states: AtomicBool,
 }
 
 impl MeasuredClient {
@@ -265,6 +478,8 @@ impl MeasuredClient {
             put: AtomicUsize::new(0),
             head: AtomicUsize::new(0),
             fail_descriptors: AtomicBool::new(false),
+            fail_open_upload_states: AtomicBool::new(false),
+            fail_sealed_upload_states: AtomicBool::new(false),
         }
     }
 
@@ -302,6 +517,26 @@ impl ObjectClient for MeasuredClient {
             return Box::pin(async move {
                 Err(Error::Io(io::Error::other(
                     "injected content descriptor publish failure",
+                )))
+            });
+        }
+        if self.fail_sealed_upload_states.load(Ordering::Acquire)
+            && key.contains("/uploads/")
+            && bytes.get(8) == Some(&1)
+        {
+            return Box::pin(async move {
+                Err(Error::Io(io::Error::other(
+                    "injected sealed upload state failure",
+                )))
+            });
+        }
+        if self.fail_open_upload_states.load(Ordering::Acquire)
+            && key.contains("/uploads/")
+            && bytes.get(8) == Some(&0)
+        {
+            return Box::pin(async move {
+                Err(Error::Io(io::Error::other(
+                    "injected open upload state failure",
                 )))
             });
         }

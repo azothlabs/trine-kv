@@ -15,8 +15,12 @@ use crate::{Db, Error, Result};
 const CONTENT_ID_SHA256_TAG: u8 = 1;
 const DESCRIPTOR_MAGIC: &[u8; 8] = b"TRNCNTD1";
 const CHUNK_MAGIC: &[u8; 8] = b"TRNCNTC1";
+const UPLOAD_STATE_MAGIC: &[u8; 8] = b"TRNUPLD1";
 const DESCRIPTOR_LEN: usize = 8 + 1 + 32 + 16 + 8 + 4 + 8;
 const CHUNK_HEADER_LEN: usize = 8 + 16 + 8 + 4 + 32;
+const UPLOAD_STATE_LEN: usize = 8 + 1 + 16 + 8 + 4 + 8 + 8 + 4 + 1 + 8 + 1 + 33 + 33;
+const UPLOAD_STATE_OPEN: u8 = 0;
+const UPLOAD_STATE_SEALED: u8 = 1;
 const MIN_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
@@ -82,7 +86,7 @@ impl ContentId {
         self.digest
     }
 
-    fn from_sha256(digest: [u8; 32]) -> Self {
+    pub(crate) fn from_sha256(digest: [u8; 32]) -> Self {
         Self {
             algorithm: ContentHashAlgorithm::Sha256,
             digest,
@@ -126,6 +130,25 @@ impl UploadId {
 
     pub(crate) const fn bytes(self) -> [u8; 16] {
         self.0
+    }
+
+    /// Reconstructs an upload identity from its portable 16-byte form.
+    ///
+    /// Upload identities are not secrets. Persist this value when an upload
+    /// must be resumed after the current process or database handle is gone.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the portable 16-byte representation.
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+
+    pub(crate) const fn lock_shard(self) -> usize {
+        self.0[0] as usize
     }
 }
 
@@ -203,6 +226,14 @@ impl ContentUploadOptions {
         }
         Ok(self)
     }
+
+    pub(crate) const fn expected_length(self) -> Option<u64> {
+        self.expected_length
+    }
+
+    pub(crate) const fn expected_content_id(self) -> Option<ContentId> {
+        self.expected_content_id
+    }
 }
 
 impl Default for ContentUploadOptions {
@@ -238,21 +269,55 @@ impl SealedContent {
     }
 }
 
+/// Result of resuming durable state for an [`UploadId`].
+///
+/// A successful seal is remembered by upload identity. Callers therefore get
+/// either a writable open session or the exact prior seal result; they never
+/// reopen a sealed upload as writable state.
+#[derive(Debug)]
+pub enum ContentUploadResume {
+    /// The upload remains open and may accept bytes at [`ContentUpload::len`].
+    Open(ContentUpload),
+    /// The upload was already sealed; this is the idempotent prior result.
+    Sealed(SealedContent),
+}
+
+impl ContentUploadResume {
+    /// Returns the open upload, or `None` when it was already sealed.
+    #[must_use]
+    pub fn into_open(self) -> Option<ContentUpload> {
+        match self {
+            Self::Open(upload) => Some(upload),
+            Self::Sealed(_) => None,
+        }
+    }
+
+    /// Returns the prior seal result, or `None` while the upload remains open.
+    #[must_use]
+    pub const fn sealed(&self) -> Option<SealedContent> {
+        match self {
+            Self::Open(_) => None,
+            Self::Sealed(sealed) => Some(*sealed),
+        }
+    }
+}
+
 /// In-progress sequential upload with memory bounded by its configured chunk.
 ///
 /// Calls to [`write`](Self::write) may be any size and are split into fixed
 /// chunks. `seal` consumes the upload and publishes the fixed-size descriptor
 /// only after all chunks have been stored and the complete identity verified.
-/// Dropping an unsealed upload never publishes content; cleanup of abandoned
-/// chunks is a maintenance concern.
+/// Dropping an unsealed upload never publishes content. Its durable
+/// [`UploadId`] can be resumed or explicitly aborted later; cleanup of uploads
+/// that are never resumed or aborted is a maintenance concern.
 pub struct ContentUpload {
     db: Db,
     upload_id: UploadId,
     options: ContentUploadOptions,
-    hasher: Sha256,
     buffer: Vec<u8>,
     length: u64,
-    chunk_count: u64,
+    complete_chunks: u64,
+    revision: u64,
     failed: bool,
 }
 
@@ -264,22 +329,31 @@ impl fmt::Debug for ContentUpload {
             .field("chunk_bytes", &self.options.chunk_bytes)
             .field("buffered_bytes", &self.buffer.len())
             .field("length", &self.length)
-            .field("chunk_count", &self.chunk_count)
+            .field("complete_chunks", &self.complete_chunks)
+            .field("revision", &self.revision)
             .field("failed", &self.failed)
             .finish_non_exhaustive()
     }
 }
 
 impl ContentUpload {
-    pub(crate) fn new(db: Db, upload_id: UploadId, options: ContentUploadOptions) -> Self {
+    pub(crate) fn new(
+        db: Db,
+        upload_id: UploadId,
+        options: ContentUploadOptions,
+        buffer: Vec<u8>,
+        length: u64,
+        complete_chunks: u64,
+        revision: u64,
+    ) -> Self {
         Self {
             db,
             upload_id,
             options,
-            hasher: Sha256::new(),
-            buffer: Vec::with_capacity(options.chunk_bytes),
-            length: 0,
-            chunk_count: 0,
+            buffer,
+            length,
+            complete_chunks,
+            revision,
             failed: false,
         }
     }
@@ -313,8 +387,10 @@ impl ContentUpload {
 
     /// Accepts more original bytes and stores each completed chunk.
     ///
-    /// Empty writes are no-ops. If a storage write fails, this upload becomes
-    /// failed and cannot be sealed; start a new upload or abort this one.
+    /// Empty writes are no-ops. If a storage write fails, this in-memory writer
+    /// becomes unusable because the failure may have happened between the chunk
+    /// and session writes. Resume or abort its [`UploadId`] through [`Db`] to
+    /// recover from the last durable session revision.
     ///
     /// # Errors
     ///
@@ -327,13 +403,17 @@ impl ContentUpload {
             return Ok(());
         }
 
+        let db = self.db.clone();
+        let _upload = db.lock_content_upload(self.upload_id).await;
+        let durable = db.require_upload_state(self.upload_id).await?;
+        durable.require_open_revision(self.revision)?;
+
         let incoming = u64::try_from(bytes.len())
             .map_err(|_| Error::invalid_options("content write length exceeds u64"))?;
         self.length = self
             .length
             .checked_add(incoming)
             .ok_or_else(|| Error::invalid_options("content length overflow"))?;
-        self.hasher.update(bytes);
 
         while !bytes.is_empty() {
             let available = self.options.chunk_bytes - self.buffer.len();
@@ -341,12 +421,42 @@ impl ContentUpload {
             self.buffer.extend_from_slice(&bytes[..take]);
             bytes = &bytes[take..];
             if self.buffer.len() == self.options.chunk_bytes {
-                if let Err(error) = self.flush_chunk().await {
+                if let Err(error) = self.flush_full_chunk().await {
                     self.failed = true;
                     return Err(error);
                 }
             }
         }
+
+        if !self.buffer.is_empty() {
+            let frame = encode_chunk(self.upload_id, self.complete_chunks, &self.buffer)?;
+            if let Err(error) = self
+                .db
+                .write_content_chunk(self.upload_id, self.complete_chunks, frame)
+                .await
+            {
+                self.failed = true;
+                return Err(error);
+            }
+        }
+        let next_revision = self
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid_options("content upload revision overflow"))?;
+        let state = UploadSessionState::open(
+            self.upload_id,
+            next_revision,
+            self.options,
+            self.length,
+            self.complete_chunks,
+            u32::try_from(self.buffer.len())
+                .map_err(|_| Error::invalid_options("content partial chunk exceeds u32"))?,
+        )?;
+        if let Err(error) = self.db.write_upload_state(state).await {
+            self.failed = true;
+            return Err(error);
+        }
+        self.revision = next_revision;
         Ok(())
     }
 
@@ -359,97 +469,51 @@ impl ContentUpload {
     ///
     /// # Errors
     ///
-    /// Returns a typed length or digest mismatch when an expectation fails,
+    /// Returns a typed length or digest mismatch and aborts the session when an
+    /// expectation fails,
     /// [`Error::InvalidOptions`] when the upload previously failed, or a storage
     /// error if the final chunk or descriptor cannot be made durable. A failed
-    /// descriptor write does not publish the `ContentObject`.
-    pub async fn seal(mut self) -> Result<SealedContent> {
+    /// descriptor write does not publish the `ContentObject`. If descriptor
+    /// publication succeeds but the sealed session write fails, retry
+    /// [`Db::seal_content_upload`] with the same [`UploadId`].
+    pub async fn seal(self) -> Result<SealedContent> {
         self.ensure_active()?;
-        if !self.buffer.is_empty() {
-            if let Err(error) = self.flush_chunk().await {
-                self.failed = true;
-                return Err(error);
-            }
-        }
-
-        let digest: [u8; 32] = self.hasher.clone().finalize().into();
-        let content_id = ContentId::from_sha256(digest);
-        if let Some(expected) = self.options.expected_length
-            && expected != self.length
-        {
-            self.cleanup_chunks().await;
-            return Err(Error::ContentLengthMismatch {
-                expected,
-                actual: self.length,
-            });
-        }
-        if let Some(expected) = self.options.expected_content_id
-            && expected != content_id
-        {
-            self.cleanup_chunks().await;
-            return Err(Error::ContentDigestMismatch {
-                expected: expected.to_string(),
-                actual: content_id.to_string(),
-            });
-        }
-
-        let descriptor = ContentDescriptor {
-            content_id,
-            upload_id: self.upload_id,
-            length: self.length,
-            chunk_bytes: u32::try_from(self.options.chunk_bytes)
-                .map_err(|_| Error::invalid_options("content chunk size exceeds u32"))?,
-            chunk_count: self.chunk_count,
-        };
-        let _seal = self.db.lock_content_seal().await;
-        if let Some(existing) = self.db.read_content_descriptor(content_id).await? {
-            let existing = ContentDescriptor::decode(&existing, content_id)?;
-            self.cleanup_chunks().await;
-            return Ok(existing.sealed());
-        }
         self.db
-            .write_content_descriptor(content_id, descriptor.encode())
-            .await?;
-        Ok(descriptor.sealed())
+            .seal_content_upload_at(self.upload_id, Some(self.revision))
+            .await
     }
 
-    /// Aborts the upload and removes every chunk successfully written by it.
+    /// Aborts the upload and makes every staging chunk unreachable.
     ///
-    /// No descriptor is ever published. Deletion is idempotent, so retrying
-    /// cleanup after a partial failure is safe while the upload value remains
-    /// available to the caller.
+    /// No descriptor is published. The durable session is deleted before
+    /// best-effort chunk cleanup, so a crash cannot leave a resumable session
+    /// that points at missing bytes.
     ///
     /// # Errors
     ///
-    /// Returns the first backend deletion error.
-    pub async fn abort(mut self) -> Result<()> {
-        self.buffer.clear();
-        for index in 0..self.chunk_count {
-            self.db.delete_content_chunk(self.upload_id, index).await?;
-        }
-        Ok(())
+    /// Returns a conflict if another writer advanced the session, or the
+    /// backend error that prevented deletion of the durable session.
+    pub async fn abort(self) -> Result<()> {
+        self.ensure_active()?;
+        self.db
+            .abort_content_upload_at(self.upload_id, Some(self.revision))
+            .await
     }
 
-    async fn flush_chunk(&mut self) -> Result<()> {
+    async fn flush_full_chunk(&mut self) -> Result<()> {
         let payload = mem::replace(
             &mut self.buffer,
             Vec::with_capacity(self.options.chunk_bytes),
         );
-        let frame = encode_chunk(self.upload_id, self.chunk_count, &payload)?;
+        let frame = encode_chunk(self.upload_id, self.complete_chunks, &payload)?;
         self.db
-            .write_content_chunk(self.upload_id, self.chunk_count, frame)
+            .write_content_chunk(self.upload_id, self.complete_chunks, frame)
             .await?;
-        self.chunk_count = self
-            .chunk_count
+        self.complete_chunks = self
+            .complete_chunks
             .checked_add(1)
             .ok_or_else(|| Error::invalid_options("content chunk count overflow"))?;
         Ok(())
-    }
-
-    async fn cleanup_chunks(&self) {
-        for index in 0..self.chunk_count {
-            let _ = self.db.delete_content_chunk(self.upload_id, index).await;
-        }
     }
 
     fn ensure_active(&self) -> Result<()> {
@@ -643,6 +707,236 @@ impl ContentStream {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UploadSessionStatus {
+    Open,
+    Sealed(SealedContent),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UploadSessionState {
+    upload_id: UploadId,
+    revision: u64,
+    options: ContentUploadOptions,
+    length: u64,
+    complete_chunks: u64,
+    partial_len: u32,
+    status: UploadSessionStatus,
+}
+
+impl UploadSessionState {
+    pub(crate) fn initial(upload_id: UploadId, options: ContentUploadOptions) -> Result<Self> {
+        Self::open(upload_id, 0, options, 0, 0, 0)
+    }
+
+    pub(crate) fn open(
+        upload_id: UploadId,
+        revision: u64,
+        options: ContentUploadOptions,
+        length: u64,
+        complete_chunks: u64,
+        partial_len: u32,
+    ) -> Result<Self> {
+        let state = Self {
+            upload_id,
+            revision,
+            options,
+            length,
+            complete_chunks,
+            partial_len,
+            status: UploadSessionStatus::Open,
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub(crate) fn into_sealed(self, sealed: SealedContent) -> Result<Self> {
+        if sealed.length != self.length {
+            return Err(Error::InvalidFormat {
+                message: "sealed upload length differs from durable session length".to_owned(),
+            });
+        }
+        Ok(Self {
+            revision: self
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_options("content upload revision overflow"))?,
+            status: UploadSessionStatus::Sealed(sealed),
+            ..self
+        })
+    }
+
+    pub(crate) const fn upload_id(self) -> UploadId {
+        self.upload_id
+    }
+
+    pub(crate) const fn revision(self) -> u64 {
+        self.revision
+    }
+
+    pub(crate) const fn status(self) -> UploadSessionStatus {
+        self.status
+    }
+
+    pub(crate) const fn options(self) -> ContentUploadOptions {
+        self.options
+    }
+
+    pub(crate) const fn length(self) -> u64 {
+        self.length
+    }
+
+    pub(crate) const fn complete_chunks(self) -> u64 {
+        self.complete_chunks
+    }
+
+    pub(crate) const fn partial_len(self) -> u32 {
+        self.partial_len
+    }
+
+    pub(crate) const fn chunk_count(self) -> u64 {
+        self.complete_chunks + if self.partial_len == 0 { 0 } else { 1 }
+    }
+
+    pub(crate) fn require_open_revision(self, expected_revision: u64) -> Result<()> {
+        match self.status {
+            UploadSessionStatus::Sealed(_) => Err(Error::ContentUploadSealed {
+                upload_id: self.upload_id.to_string(),
+            }),
+            UploadSessionStatus::Open if self.revision == expected_revision => Ok(()),
+            UploadSessionStatus::Open => Err(Error::ContentUploadConflict {
+                upload_id: self.upload_id.to_string(),
+                expected_revision,
+                actual_revision: self.revision,
+            }),
+        }
+    }
+
+    pub(crate) fn encode(self) -> Result<Arc<[u8]>> {
+        let mut bytes = Vec::with_capacity(UPLOAD_STATE_LEN);
+        bytes.extend_from_slice(UPLOAD_STATE_MAGIC);
+        bytes.push(match self.status {
+            UploadSessionStatus::Open => UPLOAD_STATE_OPEN,
+            UploadSessionStatus::Sealed(_) => UPLOAD_STATE_SEALED,
+        });
+        bytes.extend_from_slice(&self.upload_id.bytes());
+        bytes.extend_from_slice(&self.revision.to_le_bytes());
+        let chunk_bytes = u32::try_from(self.options.chunk_bytes)
+            .map_err(|_| Error::invalid_options("content chunk size exceeds u32"))?;
+        bytes.extend_from_slice(&chunk_bytes.to_le_bytes());
+        bytes.extend_from_slice(&self.length.to_le_bytes());
+        bytes.extend_from_slice(&self.complete_chunks.to_le_bytes());
+        bytes.extend_from_slice(&self.partial_len.to_le_bytes());
+        encode_optional_u64(&mut bytes, self.options.expected_length);
+        encode_optional_content_id(&mut bytes, self.options.expected_content_id);
+        match self.status {
+            UploadSessionStatus::Open => bytes.extend_from_slice(&[0_u8; 33]),
+            UploadSessionStatus::Sealed(sealed) => sealed.content_id.encode_into(&mut bytes),
+        }
+        debug_assert_eq!(bytes.len(), UPLOAD_STATE_LEN);
+        Ok(Arc::from(bytes))
+    }
+
+    pub(crate) fn decode(bytes: &[u8], expected_upload: UploadId) -> Result<Self> {
+        if bytes.len() != UPLOAD_STATE_LEN || bytes.get(..8) != Some(UPLOAD_STATE_MAGIC) {
+            return Err(Error::InvalidFormat {
+                message: "invalid content upload state header or length".to_owned(),
+            });
+        }
+        let status_tag = bytes[8];
+        let upload_id = UploadId(array_at::<16>(bytes, 9, "content upload id")?);
+        if upload_id != expected_upload {
+            return Err(Error::InvalidFormat {
+                message: format!("content upload identity mismatch for {expected_upload}"),
+            });
+        }
+        let revision = u64::from_le_bytes(array_at::<8>(bytes, 25, "content upload revision")?);
+        let chunk_bytes = usize::try_from(u32::from_le_bytes(array_at::<4>(
+            bytes,
+            33,
+            "content upload chunk size",
+        )?))
+        .map_err(|_| Error::InvalidFormat {
+            message: "content upload chunk size exceeds usize".to_owned(),
+        })?;
+        let length = u64::from_le_bytes(array_at::<8>(bytes, 37, "content upload length")?);
+        let complete_chunks = u64::from_le_bytes(array_at::<8>(
+            bytes,
+            45,
+            "content upload complete chunk count",
+        )?);
+        let partial_len =
+            u32::from_le_bytes(array_at::<4>(bytes, 53, "content upload partial length")?);
+        let expected_length = decode_optional_u64(bytes, 57, "content expected length")?;
+        let expected_content_id =
+            decode_optional_content_id(bytes, 66, "content expected identity")?;
+        let sealed_id = match status_tag {
+            UPLOAD_STATE_OPEN => None,
+            UPLOAD_STATE_SEALED => Some(decode_content_id(bytes, 100, "sealed content identity")?),
+            _ => {
+                return Err(Error::UnsupportedFormat {
+                    message: format!("unsupported content upload state tag {status_tag}"),
+                });
+            }
+        };
+        let options = ContentUploadOptions {
+            chunk_bytes,
+            expected_length,
+            expected_content_id,
+        }
+        .validate()?;
+        let status = sealed_id.map_or(UploadSessionStatus::Open, |content_id| {
+            UploadSessionStatus::Sealed(SealedContent { content_id, length })
+        });
+        let state = Self {
+            upload_id,
+            revision,
+            options,
+            length,
+            complete_chunks,
+            partial_len,
+            status,
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    fn validate(self) -> Result<()> {
+        let chunk_bytes =
+            u64::try_from(self.options.chunk_bytes).map_err(|_| Error::InvalidFormat {
+                message: "content upload chunk size exceeds u64".to_owned(),
+            })?;
+        if u64::from(self.partial_len) >= chunk_bytes && self.partial_len != 0 {
+            return Err(Error::InvalidFormat {
+                message: format!(
+                    "content upload partial length {} is not below chunk size {chunk_bytes}",
+                    self.partial_len
+                ),
+            });
+        }
+        let complete_bytes = self
+            .complete_chunks
+            .checked_mul(chunk_bytes)
+            .ok_or_else(|| Error::InvalidFormat {
+                message: "content upload complete length overflow".to_owned(),
+            })?;
+        let derived_length = complete_bytes
+            .checked_add(u64::from(self.partial_len))
+            .ok_or_else(|| Error::InvalidFormat {
+                message: "content upload length overflow".to_owned(),
+            })?;
+        if derived_length != self.length {
+            return Err(Error::InvalidFormat {
+                message: format!(
+                    "content upload length {} does not match durable chunks {derived_length}",
+                    self.length
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ContentDescriptor {
     content_id: ContentId,
     upload_id: UploadId,
@@ -652,7 +946,33 @@ pub(crate) struct ContentDescriptor {
 }
 
 impl ContentDescriptor {
-    fn encode(self) -> Arc<[u8]> {
+    pub(crate) fn new(
+        content_id: ContentId,
+        upload_id: UploadId,
+        length: u64,
+        chunk_bytes: usize,
+        chunk_count: u64,
+    ) -> Result<Self> {
+        let chunk_bytes = u32::try_from(chunk_bytes)
+            .map_err(|_| Error::invalid_options("content chunk size exceeds u32"))?;
+        Ok(Self {
+            content_id,
+            upload_id,
+            length,
+            chunk_bytes,
+            chunk_count,
+        })
+    }
+
+    pub(crate) const fn upload_id(self) -> UploadId {
+        self.upload_id
+    }
+
+    pub(crate) const fn length(self) -> u64 {
+        self.length
+    }
+
+    pub(crate) fn encode(self) -> Arc<[u8]> {
         let mut bytes = Vec::with_capacity(DESCRIPTOR_LEN);
         bytes.extend_from_slice(DESCRIPTOR_MAGIC);
         self.content_id.encode_into(&mut bytes);
@@ -714,7 +1034,7 @@ impl ContentDescriptor {
         })
     }
 
-    const fn sealed(self) -> SealedContent {
+    pub(crate) const fn sealed(self) -> SealedContent {
         SealedContent {
             content_id: self.content_id,
             length: self.length,
@@ -736,7 +1056,11 @@ fn encode_chunk(upload_id: UploadId, index: u64, payload: &[u8]) -> Result<Arc<[
     Ok(Arc::from(bytes))
 }
 
-fn decode_chunk(bytes: &[u8], expected_upload: UploadId, expected_index: u64) -> Result<&[u8]> {
+pub(crate) fn decode_chunk(
+    bytes: &[u8],
+    expected_upload: UploadId,
+    expected_index: u64,
+) -> Result<&[u8]> {
     if bytes.len() < CHUNK_HEADER_LEN || bytes.get(..8) != Some(CHUNK_MAGIC) {
         return Err(Error::InvalidFormat {
             message: format!("invalid content chunk {expected_index} header"),
@@ -779,6 +1103,67 @@ fn decode_chunk(bytes: &[u8], expected_upload: UploadId, expected_index: u64) ->
         });
     }
     Ok(payload)
+}
+
+fn encode_optional_u64(bytes: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        None => bytes.extend_from_slice(&[0_u8; 9]),
+    }
+}
+
+fn decode_optional_u64(bytes: &[u8], offset: usize, field: &'static str) -> Result<Option<u64>> {
+    match *bytes.get(offset).ok_or_else(|| Error::InvalidFormat {
+        message: format!("{field} presence flag is truncated"),
+    })? {
+        0 => Ok(None),
+        1 => Ok(Some(u64::from_le_bytes(array_at::<8>(
+            bytes,
+            offset + 1,
+            field,
+        )?))),
+        tag => Err(Error::InvalidFormat {
+            message: format!("{field} has invalid presence flag {tag}"),
+        }),
+    }
+}
+
+fn encode_optional_content_id(bytes: &mut Vec<u8>, value: Option<ContentId>) {
+    match value {
+        Some(value) => {
+            bytes.push(1);
+            value.encode_into(bytes);
+        }
+        None => bytes.extend_from_slice(&[0_u8; 34]),
+    }
+}
+
+fn decode_optional_content_id(
+    bytes: &[u8],
+    offset: usize,
+    field: &'static str,
+) -> Result<Option<ContentId>> {
+    match *bytes.get(offset).ok_or_else(|| Error::InvalidFormat {
+        message: format!("{field} presence flag is truncated"),
+    })? {
+        0 => Ok(None),
+        1 => decode_content_id(bytes, offset + 1, field).map(Some),
+        tag => Err(Error::InvalidFormat {
+            message: format!("{field} has invalid presence flag {tag}"),
+        }),
+    }
+}
+
+fn decode_content_id(bytes: &[u8], offset: usize, field: &'static str) -> Result<ContentId> {
+    let tag = *bytes.get(offset).ok_or_else(|| Error::InvalidFormat {
+        message: format!("{field} algorithm tag is truncated"),
+    })?;
+    let algorithm = ContentHashAlgorithm::from_tag(tag)?;
+    let digest = array_at::<32>(bytes, offset + 1, field)?;
+    Ok(ContentId { algorithm, digest })
 }
 
 fn array_at<const N: usize>(bytes: &[u8], offset: usize, field: &'static str) -> Result<[u8; N]> {

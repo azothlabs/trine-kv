@@ -167,6 +167,7 @@ pub(in crate::storage) fn prepare_native_file_object_write(
         StorageObjectKind::Blob
         | StorageObjectKind::ContentChunk
         | StorageObjectKind::ContentDescriptor
+        | StorageObjectKind::ContentUpload
         | StorageObjectKind::RecoveryReport
         | StorageObjectKind::Table
         | StorageObjectKind::Wal
