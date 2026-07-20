@@ -97,6 +97,9 @@ malformed records block intent.
 Read leases retain the existing exact-content key and record format defined by
 `content-read-lease-v1.md`.
 
+Migration, backup, repair, provider, and administrative work use the unified
+exact-content hold registry defined by `content-physical-hold-v1.md`.
+
 ## Acceptance algorithm
 
 `Transaction::stage_content_reclaim_intent` performs these checks at the
@@ -108,7 +111,8 @@ transaction's one read sequence:
    high-water `<= S`;
 4. the exact token-authority range contains no unexpired valid record;
 5. the exact read-lease range contains no unexpired valid record;
-6. the intent write preserves the prior activity high-water and binds the
+6. the exact physical-hold range contains no active valid record;
+7. the intent write preserves the prior activity high-water and binds the
    opaque token, `S`, expiry, and final acceptance commit sequence.
 
 The point read of control plus the two transaction range reads are part of the
@@ -120,11 +124,8 @@ intent while preserving the same prior activity high-water.
 ## Current exclusions
 
 - `open_content` remains a compatible unleased read and is explicitly unsafe
-  against future physical deletion. This v1 intent does not block it because no
-  deletion occurs in this slice.
-- Migration, backup, repair, provider, and administrative physical holds do not
-  yet exist in the content API. They must join the same control boundary before
-  deletion can be enabled.
+  against future physical deletion. Automated deletion remains disabled while
+  any deployment permits that path; see `content-physical-hold-v1.md`.
 - Grace, a second logical/physical recheck, representation fencing, replica
   deletion, provider-version cleanup, and completion audit are later protocols.
 - Intent alone is never accepted by a deletion worker as deletion authority.
@@ -132,6 +133,7 @@ intent while preserving the same prior activity high-water.
 ## Required evidence
 
 - available token and unexpired lease block intent;
+- every active physical-hold class blocks intent with typed coordinates;
 - token consumption permits later intent and exact retry is idempotent;
 - leased open racing a staged intent causes one transaction to conflict;
 - leased open after intent returns control to Active and supersedes the old `S`;

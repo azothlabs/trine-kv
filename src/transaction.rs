@@ -6,13 +6,14 @@ use std::{
 use crate::{
     bucket::DEFAULT_BUCKET_NAME,
     content::{
-        CONTENT_CONTROL_BUCKET, CONTENT_LEASE_BUCKET, CONTENT_TOKEN_BUCKET,
-        CONTENT_TOKEN_INDEX_BUCKET, ContentAttachment, ContentAttachmentScope, ContentChangeId,
-        ContentControlRecord, ContentDescriptor, ContentLeaseId, ContentLeaseRecord,
+        CONTENT_CONTROL_BUCKET, CONTENT_LEASE_BUCKET, CONTENT_PHYSICAL_HOLD_BUCKET,
+        CONTENT_TOKEN_BUCKET, CONTENT_TOKEN_INDEX_BUCKET, ContentAttachment,
+        ContentAttachmentScope, ContentChangeId, ContentControlRecord, ContentDescriptor,
+        ContentLeaseId, ContentLeaseRecord, ContentPhysicalHoldId, ContentPhysicalHoldRecord,
         ContentReclaimAuthorization, ContentReclaimIntentStage, ContentTokenIndexRecord,
         UploadToken, UploadTokenRecord, content_control_key, content_lease_prefix,
-        content_prefix_range, content_token_index_key, content_token_index_prefix,
-        upload_token_key,
+        content_physical_hold_prefix, content_prefix_range, content_token_index_key,
+        content_token_index_prefix, upload_token_key,
     },
     db::Db,
     error::{ContentReclaimBlocker, Error, Result},
@@ -793,6 +794,7 @@ impl Transaction {
         self.db.bucket(CONTENT_CONTROL_BUCKET).await?;
         self.db.bucket(CONTENT_TOKEN_INDEX_BUCKET).await?;
         self.db.bucket(CONTENT_LEASE_BUCKET).await?;
+        self.db.bucket(CONTENT_PHYSICAL_HOLD_BUCKET).await?;
         let descriptor = self
             .db
             .read_content_descriptor(
@@ -838,6 +840,8 @@ impl Transaction {
         self.require_no_active_content_token(authorization, now_unix_ms)
             .await?;
         self.require_no_active_content_lease(authorization, now_unix_ms)
+            .await?;
+        self.require_no_active_content_physical_hold(authorization, now_unix_ms)
             .await?;
         if control.matches_authorization(authorization) {
             let accepted_at = control.accepted_at().ok_or_else(|| Error::Corruption {
@@ -930,6 +934,55 @@ impl Transaction {
                 return Err(Error::ContentReclaimBlocked {
                     blocker: ContentReclaimBlocker::ReadLease {
                         expires_at_unix_ms: lease.expires_at_unix_ms,
+                    },
+                });
+            }
+        }
+        Ok(())
+    }
+
+    async fn require_no_active_content_physical_hold(
+        &mut self,
+        authorization: ContentReclaimAuthorization,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        let prefix = content_physical_hold_prefix(
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        );
+        let range = content_prefix_range(prefix.clone())?;
+        for entry in self
+            .range_bucket(CONTENT_PHYSICAL_HOLD_BUCKET, range)
+            .await?
+        {
+            let entry = entry?;
+            let hold_id = ContentPhysicalHoldId::from_bytes(
+                entry
+                    .key
+                    .get(prefix.len()..)
+                    .ok_or_else(|| Error::Corruption {
+                        message: "content physical-hold key is shorter than its content prefix"
+                            .to_owned(),
+                    })?
+                    .try_into()
+                    .map_err(|_| Error::Corruption {
+                        message: "content physical-hold key has a malformed identity length"
+                            .to_owned(),
+                    })?,
+            )?;
+            let hold = ContentPhysicalHoldRecord::decode(
+                &entry.value,
+                authorization.storage_domain_id(),
+                authorization.content_id(),
+                hold_id,
+            )?;
+            if hold.is_active_at(now_unix_ms) {
+                return Err(Error::ContentReclaimBlocked {
+                    blocker: ContentReclaimBlocker::PhysicalHold {
+                        hold_id,
+                        kind: hold.kind,
+                        expires_at_unix_ms: (hold.expires_at_unix_ms != 0)
+                            .then_some(hold.expires_at_unix_ms),
                     },
                 });
             }

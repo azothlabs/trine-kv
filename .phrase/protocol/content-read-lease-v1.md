@@ -90,6 +90,11 @@ only a conservative precheck and is not deletion authority. Final grace,
 unleased-read handling, representation fencing, and physical deletion remain
 outside this protocol.
 
+Migration, backup, repair, provider, and administrative work does not borrow a
+read-lease identity. Those actors use the common durable registry in
+`content-physical-hold-v1.md`, which joins the same control-key and exact-range
+fence.
+
 Physical relocation and reclamation are outside this slice. Their future tests
 must cover a read spanning relocation, expiry races, lease renewal races, and
 crash/reopen behavior against this record format.

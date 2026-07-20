@@ -152,9 +152,11 @@ pub use bucket::{Bucket, BucketName, BucketReader};
 pub use content::{
     ContentAttachment, ContentAttachmentScope, ContentChangeId, ContentHandle,
     ContentHashAlgorithm, ContentId, ContentLeaseId, ContentLeaseOptions, ContentLeaseOwnerId,
-    ContentReclaimAuthorization, ContentReclaimIntentStage, ContentReclaimProofToken,
-    ContentStream, ContentUpload, ContentUploadOptions, ContentUploadResume, OwnerScopeId,
-    SealedContent, StorageDomainId, UploadId, UploadToken,
+    ContentPhysicalHold, ContentPhysicalHoldId, ContentPhysicalHoldKind,
+    ContentPhysicalHoldOptions, ContentPhysicalHoldOwnerId, ContentReclaimAuthorization,
+    ContentReclaimIntentStage, ContentReclaimProofToken, ContentStream, ContentUpload,
+    ContentUploadOptions, ContentUploadResume, OwnerScopeId, SealedContent, StorageDomainId,
+    UploadId, UploadToken,
 };
 pub use db::{Db, IntoOpenOptions, MaintenanceBudget, MaintenanceOutcome};
 pub use error::{ContentReclaimBlocker, Error, Result};

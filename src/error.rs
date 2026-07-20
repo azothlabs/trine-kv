@@ -1,6 +1,10 @@
 use std::{error, fmt, io};
 
-use crate::{options::DurabilityMode, types::ReadVersion};
+use crate::{
+    content::{ContentPhysicalHoldId, ContentPhysicalHoldKind},
+    options::DurabilityMode,
+    types::ReadVersion,
+};
 
 /// Convenient result alias used by Trine KV APIs.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -34,6 +38,15 @@ pub enum ContentReclaimBlocker {
         /// Read-lease deadline as Unix epoch milliseconds.
         expires_at_unix_ms: u64,
     },
+    /// A migration, backup, repair, provider, or administrative hold remains.
+    PhysicalHold {
+        /// Durable hold identity that blocked intent.
+        hold_id: ContentPhysicalHoldId,
+        /// Operational reason for retaining the physical bytes.
+        kind: ContentPhysicalHoldKind,
+        /// Exclusive deadline, or `None` when explicit release is required.
+        expires_at_unix_ms: Option<u64>,
+    },
 }
 
 impl fmt::Display for ContentReclaimBlocker {
@@ -58,6 +71,20 @@ impl fmt::Display for ContentReclaimBlocker {
                 formatter,
                 "a read lease remains until Unix millisecond {expires_at_unix_ms}"
             ),
+            Self::PhysicalHold {
+                hold_id,
+                kind,
+                expires_at_unix_ms,
+            } => match expires_at_unix_ms {
+                Some(expires_at_unix_ms) => write!(
+                    formatter,
+                    "{kind} physical hold {hold_id} remains until Unix millisecond {expires_at_unix_ms}"
+                ),
+                None => write!(
+                    formatter,
+                    "{kind} physical hold {hold_id} remains until explicit release"
+                ),
+            },
         }
     }
 }
@@ -152,6 +179,18 @@ pub enum Error {
         /// Lease deadline as Unix epoch milliseconds.
         expired_at_unix_ms: u64,
     },
+    /// No durable physical content hold exists for the supplied identity.
+    ContentPhysicalHoldNotFound {
+        /// Missing hold identity rendered for diagnostics.
+        hold_id: String,
+    },
+    /// A physical content hold reached its exclusive wall-clock deadline.
+    ContentPhysicalHoldExpired {
+        /// Hold deadline as Unix epoch milliseconds.
+        expired_at_unix_ms: u64,
+    },
+    /// The supplied owner does not control the durable physical content hold.
+    ContentPhysicalHoldOwnerMismatch,
     /// Physical state currently prevents durable reclaim intent.
     ContentReclaimBlocked {
         /// Typed blocker and its recovery coordinate.
@@ -292,6 +331,13 @@ pub(crate) enum ErrorSnapshot {
     ContentLeaseExpired {
         expired_at_unix_ms: u64,
     },
+    ContentPhysicalHoldNotFound {
+        hold_id: String,
+    },
+    ContentPhysicalHoldExpired {
+        expired_at_unix_ms: u64,
+    },
+    ContentPhysicalHoldOwnerMismatch,
     ContentReclaimBlocked {
         blocker: ContentReclaimBlocker,
     },
@@ -347,8 +393,31 @@ pub(crate) enum ErrorSnapshot {
 }
 
 impl ErrorSnapshot {
+    fn content_missing(storage_domain_id: &str, content_id: &str) -> Self {
+        Self::ContentNotFound {
+            storage_domain_id: storage_domain_id.to_owned(),
+            content_id: content_id.to_owned(),
+        }
+    }
+
+    fn lease_missing(lease_id: &str) -> Self {
+        Self::ContentLeaseNotFound {
+            lease_id: lease_id.to_owned(),
+        }
+    }
+
     const fn lease_dead(expired_at_unix_ms: u64) -> Self {
         Self::ContentLeaseExpired { expired_at_unix_ms }
+    }
+
+    fn physical_hold_missing(hold_id: &str) -> Self {
+        Self::ContentPhysicalHoldNotFound {
+            hold_id: hold_id.to_owned(),
+        }
+    }
+
+    const fn physical_hold_dead(expired_at_unix_ms: u64) -> Self {
+        Self::ContentPhysicalHoldExpired { expired_at_unix_ms }
     }
 
     const fn content_reclaim_blocked(blocker: ContentReclaimBlocker) -> Self {
@@ -417,16 +486,16 @@ impl ErrorSnapshot {
             Error::ContentNotFound {
                 storage_domain_id,
                 content_id,
-            } => Self::ContentNotFound {
-                storage_domain_id: storage_domain_id.clone(),
-                content_id: content_id.clone(),
-            },
-            Error::ContentLeaseNotFound { lease_id } => Self::ContentLeaseNotFound {
-                lease_id: lease_id.clone(),
-            },
+            } => Self::content_missing(storage_domain_id, content_id),
+            Error::ContentLeaseNotFound { lease_id } => Self::lease_missing(lease_id),
             Error::ContentLeaseExpired {
                 expired_at_unix_ms: expiry,
             } => Self::lease_dead(*expiry),
+            Error::ContentPhysicalHoldNotFound { hold_id } => Self::physical_hold_missing(hold_id),
+            Error::ContentPhysicalHoldExpired { expired_at_unix_ms } => {
+                Self::physical_hold_dead(*expired_at_unix_ms)
+            }
+            Error::ContentPhysicalHoldOwnerMismatch => Self::ContentPhysicalHoldOwnerMismatch,
             Error::ContentReclaimBlocked { blocker } => Self::content_reclaim_blocked(*blocker),
             Error::ContentUploadNotFound { upload_id } => Self::upload_missing(upload_id),
             Error::ContentUploadSealed { upload_id } => Self::upload_sealed(upload_id),
@@ -512,6 +581,13 @@ impl ErrorSnapshot {
             Self::ContentLeaseExpired { expired_at_unix_ms } => {
                 Error::ContentLeaseExpired { expired_at_unix_ms }
             }
+            Self::ContentPhysicalHoldNotFound { hold_id } => {
+                Error::ContentPhysicalHoldNotFound { hold_id }
+            }
+            Self::ContentPhysicalHoldExpired { expired_at_unix_ms } => {
+                Error::ContentPhysicalHoldExpired { expired_at_unix_ms }
+            }
+            Self::ContentPhysicalHoldOwnerMismatch => Error::ContentPhysicalHoldOwnerMismatch,
             Self::ContentReclaimBlocked { blocker } => Error::ContentReclaimBlocked { blocker },
             Self::ContentUploadNotFound { upload_id } => Error::ContentUploadNotFound { upload_id },
             Self::ContentUploadSealed { upload_id } => Error::ContentUploadSealed { upload_id },
@@ -627,17 +703,16 @@ impl fmt::Display for Error {
             Self::ContentNotFound {
                 storage_domain_id,
                 content_id,
-            } => write!(
-                formatter,
-                "content not found in storage domain {storage_domain_id}: {content_id}"
-            ),
-            Self::ContentLeaseNotFound { lease_id } => {
-                write!(formatter, "content lease not found: {lease_id}")
+            } => fmt_content_missing(formatter, storage_domain_id, content_id),
+            Self::ContentLeaseNotFound { lease_id } => fmt_lease_missing(formatter, lease_id),
+            Self::ContentLeaseExpired { expired_at_unix_ms } => {
+                fmt_lease_expired(formatter, *expired_at_unix_ms)
             }
-            Self::ContentLeaseExpired { expired_at_unix_ms } => write!(
-                formatter,
-                "content lease expired at Unix millisecond {expired_at_unix_ms}"
-            ),
+            Self::ContentPhysicalHoldNotFound { hold_id } => fmt_hold_missing(formatter, hold_id),
+            Self::ContentPhysicalHoldExpired { expired_at_unix_ms } => {
+                fmt_hold_expired(formatter, *expired_at_unix_ms)
+            }
+            Self::ContentPhysicalHoldOwnerMismatch => fmt_hold_owner_mismatch(formatter),
             Self::ContentReclaimBlocked { blocker } => blocker.fmt_as_error(formatter),
             Self::ContentUploadNotFound { upload_id } => fmt_upload_missing(formatter, upload_id),
             Self::ContentUploadSealed { upload_id } => fmt_upload_sealed(formatter, upload_id),
@@ -707,6 +782,43 @@ fn fmt_upload_missing(formatter: &mut fmt::Formatter<'_>, upload_id: &str) -> fm
 
 fn fmt_upload_sealed(formatter: &mut fmt::Formatter<'_>, upload_id: &str) -> fmt::Result {
     write!(formatter, "content upload {upload_id} is already sealed")
+}
+
+fn fmt_content_missing(
+    formatter: &mut fmt::Formatter<'_>,
+    storage_domain_id: &str,
+    content_id: &str,
+) -> fmt::Result {
+    write!(
+        formatter,
+        "content not found in storage domain {storage_domain_id}: {content_id}"
+    )
+}
+
+fn fmt_lease_missing(formatter: &mut fmt::Formatter<'_>, lease_id: &str) -> fmt::Result {
+    write!(formatter, "content lease not found: {lease_id}")
+}
+
+fn fmt_lease_expired(formatter: &mut fmt::Formatter<'_>, expired_at_unix_ms: u64) -> fmt::Result {
+    write!(
+        formatter,
+        "content lease expired at Unix millisecond {expired_at_unix_ms}"
+    )
+}
+
+fn fmt_hold_missing(formatter: &mut fmt::Formatter<'_>, hold_id: &str) -> fmt::Result {
+    write!(formatter, "content physical hold not found: {hold_id}")
+}
+
+fn fmt_hold_expired(formatter: &mut fmt::Formatter<'_>, expired_at_unix_ms: u64) -> fmt::Result {
+    write!(
+        formatter,
+        "content physical hold expired at Unix millisecond {expired_at_unix_ms}"
+    )
+}
+
+fn fmt_hold_owner_mismatch(formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter.write_str("content physical hold owner does not match")
 }
 
 impl From<io::Error> for Error {

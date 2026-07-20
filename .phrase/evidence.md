@@ -16564,3 +16564,59 @@ Negative check:
 - Design the complete content access/physical-hold fence. It must account for
   compatible unleased handles and future migration, backup, repair, provider,
   and administrative holds before grace or physical deletion can be enabled.
+
+## 2026-07-20: unified physical content holds and honest unleased boundary
+
+### Observation
+
+- Migration, backup, repair, provider, and administrative work had no common
+  durable way to retain exact content or participate in reclaim-intent races.
+- A process-local pin cannot solve compatible `open_content`: Trine KV permits
+  concurrent read-only instances, and a read-only process may be unable to
+  publish a durable lease or heartbeat.
+- An unleased handle has no maximum lifetime, so a grace duration is not proof
+  that cross-process readers drained.
+
+### Interpretation
+
+- Known storage actors need one typed hold registry, not separate booleans or
+  subsystem-specific pins.
+- Automated deletion must stay disabled while unleased reads remain possible.
+  Correct enablement requires a future persisted leased-only access mode and a
+  proved reader-drain or external coordination transition.
+
+### Fix
+
+- Added versioned hold and owner identities, five operational classes,
+  expiring and explicit-release options, clone-shared local observations, and
+  durable acquire/resume/renew/release APIs.
+- HoldId is caller-retained and acquisition is exact-retry idempotent. This
+  closes commit-before-response for until-released holds; conflicting semantics
+  fail, expired identities cannot be revived, and Released identity tombstones
+  reject delayed reacquisition.
+- Added the protected exact-content hold bucket. Acquisition and renewal write
+  the shared content control key; release is idempotent and advances only the
+  exact owner-validated hold to a Released tombstone.
+- Reclaim intent now exact-range reads holds and returns typed id/class/expiry
+  blockers. Malformed records block intent; expiry cannot be revived.
+- Recorded byte layout, crash behavior, transaction races, and the unleased
+  deployment blocker in `content-physical-hold-v1.md`, and linked the existing
+  read-lease and reclaim-intent protocols.
+
+### Verification
+
+- Twenty-five focused content tests cover all hold classes, acquisition retry,
+  Released non-revival, release retry, intent blocking, acquire-vs-intent
+  conflict, post-intent supersession, renewal, expiry, owner mismatch, native
+  resume, and malformed records.
+- `cargo test -q --all-features` passes with 487 library tests (485 passed, two
+  ignored) plus all integration targets.
+- Strict all-target/all-feature Clippy with wildcard imports denied is clean.
+  Strict Rustdoc and 25 doctests pass, as do formatting and explicit-import
+  checks.
+
+### Recommended next action
+
+- Design the persisted leased-only content-access mode and its reader-drain
+  transition. Do not add grace or physical deletion until that transition has
+  cross-process native and object-store evidence.

@@ -1,5 +1,45 @@
 # Current Phase
 
+## Consumer-driven unified physical content holds — 2026-07-20
+
+Migration, backup, repair, provider, and administrative work now uses one
+durable exact-content `ContentPhysicalHold` registry. Holds have a generated,
+caller-retained versioned identity, opaque owner, typed class, and either an
+exclusive expiry or explicit-release lifetime. Acquisition and renewal publish
+Active content control in the same optimistic transaction; release advances
+the exact record to a durable Released tombstone; explicit holds survive native
+reopen through owner-checked
+resume. Drop performs no asynchronous I/O.
+
+Acquisition is idempotent by caller-retained HoldId. An exact retry after a lost
+response returns the original active record; owner/class/lifetime mismatch
+fails and an expired identity cannot be revived. Until-released holds therefore
+do not become undiscoverable permanent blockers at commit-before-response.
+Released HoldIds also cannot be reacquired by a delayed request.
+
+Reclaim-intent acceptance exact-range reads the hold registry and returns a
+typed blocker containing hold id, class, and optional deadline. Concurrent
+hold acquisition conflicts with staged intent; later acquisition or renewal
+supersedes older intent by returning the control record to Active. Expired
+records are inert, cannot be revived, and malformed protected state fails
+closed.
+
+Safety result: the known storage actors now share one complete durable hold
+mechanism, but compatible unleased `open_content` remains fundamentally
+unobservable across concurrent read-only processes. Automated physical
+deletion therefore remains disabled wherever that path is permitted. A future
+delete protocol first needs a persisted leased-only mode plus proved reader
+drain or external coordination; grace alone cannot bound an unleased handle.
+
+Acceptance result: 25 focused content tests pass, including all five hold
+classes, exact acquisition retry, Released non-revival, release/idempotency,
+expiry/renewal, owner mismatch, native resume, intent races, post-intent
+supersession, and malformed-state failure. The full
+all-feature suite passes with 487 library tests (485 passed, two ignored) and
+all integration targets. Strict Clippy/import, Rustdoc, 25 doctests,
+formatting, and diff gates pass. Stable ownership and byte layouts are in
+`.phrase/protocol/content-physical-hold-v1.md`.
+
 ## Consumer-driven atomic content reclaim intent — 2026-07-20
 
 TrineDB now produces exact, short-lived ReclaimProofs, but Trine KV previously

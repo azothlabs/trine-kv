@@ -5,12 +5,15 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     content::{
-        CONTENT_CONTROL_BUCKET, CONTENT_LEASE_BUCKET, CONTENT_TOKEN_BUCKET,
-        CONTENT_TOKEN_INDEX_BUCKET, ContentDescriptor, ContentHandle, ContentId, ContentLease,
-        ContentLeaseId, ContentLeaseOptions, ContentLeaseRecord, ContentTokenIndexRecord,
-        ContentUpload, ContentUploadOptions, ContentUploadResume, SealedContent, StorageDomainId,
-        UploadId, UploadSessionState, UploadSessionStatus, UploadToken, UploadTokenRecord,
-        content_lease_key, content_lease_prefix, content_token_index_key, current_epoch_millis,
+        CONTENT_CONTROL_BUCKET, CONTENT_LEASE_BUCKET, CONTENT_PHYSICAL_HOLD_BUCKET,
+        CONTENT_TOKEN_BUCKET, CONTENT_TOKEN_INDEX_BUCKET, ContentDescriptor, ContentHandle,
+        ContentId, ContentLease, ContentLeaseId, ContentLeaseOptions, ContentLeaseRecord,
+        ContentPhysicalHold, ContentPhysicalHoldId, ContentPhysicalHoldOptions,
+        ContentPhysicalHoldOwnerId, ContentPhysicalHoldRecord, ContentPhysicalHoldRecordState,
+        ContentTokenIndexRecord, ContentUpload, ContentUploadOptions, ContentUploadResume,
+        SealedContent, StorageDomainId, UploadId, UploadSessionState, UploadSessionStatus,
+        UploadToken, UploadTokenRecord, content_lease_key, content_lease_prefix,
+        content_physical_hold_key, content_token_index_key, current_epoch_millis, duration_millis,
         upload_token_key,
     },
     error::{Error, Result},
@@ -26,6 +29,7 @@ use super::Db;
 
 impl Db {
     const CONTENT_LEASE_COMMIT_ATTEMPTS: usize = 8;
+    const CONTENT_PHYSICAL_HOLD_COMMIT_ATTEMPTS: usize = 8;
 
     /// Starts a bounded-memory upload for one immutable `ContentObject`.
     ///
@@ -444,6 +448,349 @@ impl Db {
         }
         Err(Error::runtime_busy(
             "content lease renewal did not converge after repeated conflicts",
+        ))
+    }
+
+    /// Acquires a durable physical hold on sealed immutable content.
+    ///
+    /// Before returning, Trine KV validates the exact descriptor and atomically
+    /// publishes both the hold and newer per-content activity. A reclaim-intent
+    /// transaction racing acquisition must conflict; acquisition after intent
+    /// returns the content to Active state. Migration, backup, repair, provider,
+    /// and administrative workflows therefore share one physical fence.
+    ///
+    /// An expiring hold becomes inert at its exclusive Unix-millisecond
+    /// deadline and cannot be revived. An until-released hold survives process
+    /// restart and must be recovered with [`Db::resume_content_physical_hold`].
+    /// Dropping the returned value performs no I/O. `hold_id` is supplied by
+    /// the caller: retrying the exact same active identity returns its original
+    /// durable record, closing the commit-before-response crash boundary.
+    ///
+    /// # Parameters
+    ///
+    /// - `storage_domain_id`: exact physical lifecycle and deduplication domain.
+    /// - `content_id`: immutable original-byte identity to retain.
+    /// - `hold_id`: stable caller-retained idempotency and recovery identity.
+    /// - `options`: operational class, opaque owner, and expiring or explicit
+    ///   release lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ContentNotFound`] for a missing descriptor,
+    /// [`Error::ReadOnly`] when protected state cannot be written,
+    /// [`Error::ContentPhysicalHoldOwnerMismatch`] when an existing identity
+    /// belongs to another owner, [`Error::ContentPhysicalHoldExpired`] when an
+    /// existing identity cannot be revived, [`Error::InvalidOptions`] when an
+    /// existing identity names different class/lifetime semantics or the
+    /// lifetime is invalid, or a storage/format/transaction error when
+    /// acquisition cannot converge.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use trine_kv::{
+    ///     ContentAttachmentScope, ContentPhysicalHoldId, ContentPhysicalHoldKind,
+    ///     ContentPhysicalHoldOptions, ContentPhysicalHoldOwnerId, ContentUploadOptions, Db,
+    ///     DbOptions, OwnerScopeId, StorageDomainId,
+    /// };
+    ///
+    /// async fn example() -> trine_kv::Result<()> {
+    ///     let db = Db::open(DbOptions::memory()).await?;
+    ///     let domain = StorageDomainId::from_bytes([1; 16]);
+    ///     let scope = ContentAttachmentScope::new(domain, OwnerScopeId::from_bytes([2; 16]));
+    ///     let mut upload = db
+    ///         .begin_content_upload(ContentUploadOptions::new(
+    ///             scope,
+    ///             Duration::from_secs(60),
+    ///         ))
+    ///         .await?;
+    ///     upload.write(b"backup bytes").await?;
+    ///     let sealed = upload.seal().await?;
+    ///     let hold = db
+    ///         .acquire_content_physical_hold(
+    ///             domain,
+    ///             sealed.content_id(),
+    ///             ContentPhysicalHoldId::generate()?,
+    ///             ContentPhysicalHoldOptions::expiring(
+    ///                 ContentPhysicalHoldKind::Backup,
+    ///                 ContentPhysicalHoldOwnerId::from_bytes([3; 16]),
+    ///                 Duration::from_secs(30),
+    ///             ),
+    ///         )
+    ///         .await?;
+    ///     hold.renew(Duration::from_secs(30)).await?;
+    ///     hold.release().await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn acquire_content_physical_hold(
+        &self,
+        storage_domain_id: StorageDomainId,
+        content_id: ContentId,
+        hold_id: ContentPhysicalHoldId,
+        options: ContentPhysicalHoldOptions,
+    ) -> Result<ContentPhysicalHold> {
+        self.ensure_open()?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+        self.ensure_content_backend_supported()?;
+        let descriptor = self
+            .read_content_descriptor(storage_domain_id, content_id)
+            .await?
+            .ok_or_else(|| Error::ContentNotFound {
+                storage_domain_id: storage_domain_id.to_string(),
+                content_id: content_id.to_string(),
+            })?;
+        ContentDescriptor::decode(&descriptor, storage_domain_id, content_id)?;
+        let now_unix_ms = current_epoch_millis()?;
+        let requested = ContentPhysicalHoldRecord {
+            hold_id,
+            owner_id: options.owner_id(),
+            storage_domain_id,
+            content_id,
+            kind: options.kind(),
+            expires_at_unix_ms: options.expires_at_unix_ms(now_unix_ms)?,
+            state: ContentPhysicalHoldRecordState::Active,
+        };
+        self.bucket(CONTENT_PHYSICAL_HOLD_BUCKET).await?;
+        let key = content_physical_hold_key(storage_domain_id, content_id, hold_id);
+        for _ in 0..Self::CONTENT_PHYSICAL_HOLD_COMMIT_ATTEMPTS {
+            let mut transaction = self.transaction(TransactionOptions::default());
+            if let Some(bytes) = transaction
+                .get_bucket(CONTENT_PHYSICAL_HOLD_BUCKET, &key)
+                .await?
+            {
+                let existing = ContentPhysicalHoldRecord::decode(
+                    &bytes,
+                    storage_domain_id,
+                    content_id,
+                    hold_id,
+                )?;
+                if existing.owner_id != requested.owner_id {
+                    return Err(Error::ContentPhysicalHoldOwnerMismatch);
+                }
+                if existing.is_released() {
+                    return Err(Error::ContentPhysicalHoldNotFound {
+                        hold_id: hold_id.to_string(),
+                    });
+                }
+                if existing.kind != requested.kind
+                    || (existing.expires_at_unix_ms == 0) != (requested.expires_at_unix_ms == 0)
+                {
+                    return Err(Error::invalid_options(
+                        "content physical-hold identity already names different semantics",
+                    ));
+                }
+                if !existing.is_active_at(now_unix_ms) {
+                    return Err(Error::ContentPhysicalHoldExpired {
+                        expired_at_unix_ms: existing.expires_at_unix_ms,
+                    });
+                }
+                match transaction.commit().await {
+                    Ok(_) => return Ok(ContentPhysicalHold::from_record(self.clone(), existing)),
+                    Err(Error::Conflict { .. }) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            transaction.put_bucket(
+                CONTENT_PHYSICAL_HOLD_BUCKET,
+                key.clone(),
+                requested.encode(),
+            )?;
+            transaction
+                .stage_content_activity(storage_domain_id, content_id)
+                .await?;
+            match transaction.commit().await {
+                Ok(_) => return Ok(ContentPhysicalHold::from_record(self.clone(), requested)),
+                Err(Error::Conflict { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::runtime_busy(
+            "content physical-hold acquisition did not converge after repeated conflicts",
+        ))
+    }
+
+    /// Resumes a durable physical hold after process or handle loss.
+    ///
+    /// This read-only operation validates the protected key/value identity and
+    /// exact opaque owner. It does not extend expiry or reacquire a released
+    /// hold. The caller must perform its higher-layer authorization before
+    /// supplying `owner_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ContentPhysicalHoldNotFound`] when the exact record is
+    /// absent, [`Error::ContentPhysicalHoldOwnerMismatch`] for a wrong owner,
+    /// [`Error::ContentPhysicalHoldExpired`] for an expired record, or a
+    /// storage/format/integrity error when protected state cannot be trusted.
+    pub async fn resume_content_physical_hold(
+        &self,
+        storage_domain_id: StorageDomainId,
+        content_id: ContentId,
+        hold_id: ContentPhysicalHoldId,
+        owner_id: ContentPhysicalHoldOwnerId,
+    ) -> Result<ContentPhysicalHold> {
+        self.ensure_open()?;
+        let bucket = self.bucket(CONTENT_PHYSICAL_HOLD_BUCKET).await?;
+        let key = content_physical_hold_key(storage_domain_id, content_id, hold_id);
+        let bytes = bucket
+            .get(&key)
+            .await?
+            .ok_or_else(|| Error::ContentPhysicalHoldNotFound {
+                hold_id: hold_id.to_string(),
+            })?;
+        let record =
+            ContentPhysicalHoldRecord::decode(&bytes, storage_domain_id, content_id, hold_id)?;
+        if record.owner_id != owner_id {
+            return Err(Error::ContentPhysicalHoldOwnerMismatch);
+        }
+        if record.is_released() {
+            return Err(Error::ContentPhysicalHoldNotFound {
+                hold_id: hold_id.to_string(),
+            });
+        }
+        if !record.is_active_at(current_epoch_millis()?) {
+            return Err(Error::ContentPhysicalHoldExpired {
+                expired_at_unix_ms: record.expires_at_unix_ms,
+            });
+        }
+        Ok(ContentPhysicalHold::from_record(self.clone(), record))
+    }
+
+    pub(crate) async fn renew_content_physical_hold(
+        &self,
+        hold: &ContentPhysicalHold,
+        ttl: Duration,
+    ) -> Result<u64> {
+        self.ensure_open()?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+        if hold.is_released() {
+            return Err(Error::ContentPhysicalHoldNotFound {
+                hold_id: hold.id().to_string(),
+            });
+        }
+        if hold.expires_at_unix_ms().is_none() {
+            return Err(Error::invalid_options(
+                "an until-released content physical hold cannot be renewed",
+            ));
+        }
+        let ttl_ms = duration_millis(ttl, "content physical-hold renewal lifetime")?;
+        let key = content_physical_hold_key(hold.storage_domain_id(), hold.content_id(), hold.id());
+        for _ in 0..Self::CONTENT_PHYSICAL_HOLD_COMMIT_ATTEMPTS {
+            let mut transaction = self.transaction(TransactionOptions::default());
+            let bytes = transaction
+                .get_bucket(CONTENT_PHYSICAL_HOLD_BUCKET, &key)
+                .await?
+                .ok_or_else(|| Error::ContentPhysicalHoldNotFound {
+                    hold_id: hold.id().to_string(),
+                })?;
+            let mut record = ContentPhysicalHoldRecord::decode(
+                &bytes,
+                hold.storage_domain_id(),
+                hold.content_id(),
+                hold.id(),
+            )?;
+            if record.owner_id != hold.owner_id() {
+                return Err(Error::ContentPhysicalHoldOwnerMismatch);
+            }
+            if record.is_released() {
+                return Err(Error::ContentPhysicalHoldNotFound {
+                    hold_id: hold.id().to_string(),
+                });
+            }
+            let now_unix_ms = current_epoch_millis()?;
+            if !record.is_active_at(now_unix_ms) {
+                return Err(Error::ContentPhysicalHoldExpired {
+                    expired_at_unix_ms: record.expires_at_unix_ms,
+                });
+            }
+            if record.expires_at_unix_ms == 0 {
+                return Err(Error::invalid_options(
+                    "an until-released content physical hold cannot be renewed",
+                ));
+            }
+            let requested_expiry = now_unix_ms
+                .checked_add(ttl_ms)
+                .ok_or_else(|| Error::invalid_options("content physical-hold expiry overflow"))?;
+            let next_expiry = record.expires_at_unix_ms.max(requested_expiry);
+            if next_expiry == record.expires_at_unix_ms {
+                hold.publish_expiry(next_expiry);
+                return Ok(next_expiry);
+            }
+            record.expires_at_unix_ms = next_expiry;
+            transaction.put_bucket(CONTENT_PHYSICAL_HOLD_BUCKET, key.clone(), record.encode())?;
+            transaction
+                .stage_content_activity(hold.storage_domain_id(), hold.content_id())
+                .await?;
+            match transaction.commit().await {
+                Ok(_) => {
+                    hold.publish_expiry(next_expiry);
+                    return Ok(next_expiry);
+                }
+                Err(Error::Conflict { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::runtime_busy(
+            "content physical-hold renewal did not converge after repeated conflicts",
+        ))
+    }
+
+    pub(crate) async fn release_content_physical_hold(
+        &self,
+        hold: &ContentPhysicalHold,
+    ) -> Result<()> {
+        self.ensure_open()?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+        if hold.is_released() {
+            return Ok(());
+        }
+        let key = content_physical_hold_key(hold.storage_domain_id(), hold.content_id(), hold.id());
+        for _ in 0..Self::CONTENT_PHYSICAL_HOLD_COMMIT_ATTEMPTS {
+            let mut transaction = self.transaction(TransactionOptions::default());
+            let Some(bytes) = transaction
+                .get_bucket(CONTENT_PHYSICAL_HOLD_BUCKET, &key)
+                .await?
+            else {
+                hold.publish_released();
+                return Ok(());
+            };
+            let record = ContentPhysicalHoldRecord::decode(
+                &bytes,
+                hold.storage_domain_id(),
+                hold.content_id(),
+                hold.id(),
+            )?;
+            if record.owner_id != hold.owner_id() {
+                return Err(Error::ContentPhysicalHoldOwnerMismatch);
+            }
+            if record.is_released() {
+                hold.publish_released();
+                return Ok(());
+            }
+            transaction.put_bucket(
+                CONTENT_PHYSICAL_HOLD_BUCKET,
+                key.clone(),
+                record.released().encode(),
+            )?;
+            match transaction.commit().await {
+                Ok(_) => {
+                    hold.publish_released();
+                    return Ok(());
+                }
+                Err(Error::Conflict { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::runtime_busy(
+            "content physical-hold release did not converge after repeated conflicts",
         ))
     }
 

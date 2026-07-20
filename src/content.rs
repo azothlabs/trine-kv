@@ -10,7 +10,7 @@ use std::{
     fmt, mem,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -22,6 +22,7 @@ use crate::{Db, DurabilityMode, Error, Result};
 const CONTENT_ID_SHA256_TAG: u8 = 1;
 const UPLOAD_TOKEN_VERSION: u8 = 1;
 const CONTENT_LEASE_ID_VERSION: u8 = 1;
+const CONTENT_PHYSICAL_HOLD_ID_VERSION: u8 = 1;
 const DESCRIPTOR_MAGIC: &[u8; 8] = b"TRNCNTD2";
 const CHUNK_MAGIC: &[u8; 8] = b"TRNCNTC1";
 const UPLOAD_STATE_MAGIC: &[u8; 8] = b"TRNUPLD2";
@@ -36,6 +37,8 @@ const MIN_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const CONTENT_LEASE_BUCKET: &str = "\u{1}trine-content-lease\u{1}";
 pub(crate) const CONTENT_LEASE_MAGIC: &[u8; 8] = b"TRNCNLS1";
+pub(crate) const CONTENT_PHYSICAL_HOLD_BUCKET: &str = "\u{1}trine-content-physical-hold\u{1}";
+const CONTENT_PHYSICAL_HOLD_MAGIC: &[u8; 8] = b"TRNCPHL1";
 pub(crate) const CONTENT_CONTROL_BUCKET: &str = "\u{1}trine-content-control\u{1}";
 pub(crate) const CONTENT_TOKEN_INDEX_BUCKET: &str = "\u{1}trine-content-token-index\u{1}";
 const CONTENT_CONTROL_MAGIC: &[u8; 8] = b"TRNCRCL1";
@@ -333,6 +336,234 @@ impl ContentLeaseOptions {
             ));
         }
         Ok(millis)
+    }
+}
+
+/// Classifies why physical content bytes must remain available.
+///
+/// The class is operational metadata, not authorization. Every class enters
+/// the same reclaim fence; callers must not infer weaker protection from one
+/// variant than another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum ContentPhysicalHoldKind {
+    /// A storage migration still reads or copies a representation.
+    Migration,
+    /// A backup workflow has not durably completed its copy.
+    Backup,
+    /// A repair workflow needs the current bytes or replicas.
+    Repair,
+    /// A storage provider operation still references provider-side objects.
+    Provider,
+    /// An explicit operator or compliance hold remains in force.
+    Administrative,
+}
+
+impl ContentPhysicalHoldKind {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Migration => 1,
+            Self::Backup => 2,
+            Self::Repair => 3,
+            Self::Provider => 4,
+            Self::Administrative => 5,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Result<Self> {
+        match tag {
+            1 => Ok(Self::Migration),
+            2 => Ok(Self::Backup),
+            3 => Ok(Self::Repair),
+            4 => Ok(Self::Provider),
+            5 => Ok(Self::Administrative),
+            _ => Err(Error::UnsupportedFormat {
+                message: format!("unsupported content physical-hold kind {tag}"),
+            }),
+        }
+    }
+}
+
+impl fmt::Display for ContentPhysicalHoldKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Migration => "migration",
+            Self::Backup => "backup",
+            Self::Repair => "repair",
+            Self::Provider => "provider",
+            Self::Administrative => "administrative",
+        })
+    }
+}
+
+/// Generated identity of one durable physical content hold.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ContentPhysicalHoldId([u8; 16]);
+
+impl ContentPhysicalHoldId {
+    /// Generates a new versioned hold identity from operating-system entropy.
+    ///
+    /// Callers should durably retain this identity before acquiring an
+    /// until-released hold. Passing the same identity to acquisition after a
+    /// lost response makes the operation idempotent and recoverable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RuntimeBusy`] when secure entropy is unavailable.
+    pub fn generate() -> Result<Self> {
+        let mut bytes = [0_u8; 16];
+        getrandom::fill(&mut bytes).map_err(|error| {
+            Error::runtime_busy(format!("content physical-hold entropy: {error}"))
+        })?;
+        bytes[0] = CONTENT_PHYSICAL_HOLD_ID_VERSION;
+        Ok(Self(bytes))
+    }
+
+    /// Decodes the versioned portable hold identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedFormat`] when byte zero names an unknown
+    /// identity format.
+    pub fn from_bytes(bytes: [u8; 16]) -> Result<Self> {
+        if bytes[0] != CONTENT_PHYSICAL_HOLD_ID_VERSION {
+            return Err(Error::UnsupportedFormat {
+                message: format!(
+                    "unsupported content physical-hold identity version {}",
+                    bytes[0]
+                ),
+            });
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the versioned portable identity bytes.
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl fmt::Debug for ContentPhysicalHoldId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ContentPhysicalHoldId(")?;
+        write_hex(formatter, &self.0)?;
+        formatter.write_str(")")
+    }
+}
+
+impl fmt::Display for ContentPhysicalHoldId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_hex(formatter, &self.0)
+    }
+}
+
+/// Opaque higher-layer owner of a physical content hold.
+///
+/// Trine KV compares this identity during resume, renewal, and release but does
+/// not interpret it as a Principal, tenant, workflow, or Policy identity.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ContentPhysicalHoldOwnerId([u8; 16]);
+
+impl ContentPhysicalHoldOwnerId {
+    /// Reconstructs an opaque owner from portable bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the opaque owner bytes.
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl fmt::Debug for ContentPhysicalHoldOwnerId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ContentPhysicalHoldOwnerId(")?;
+        write_hex(formatter, &self.0)?;
+        formatter.write_str(")")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentPhysicalHoldLifetime {
+    Expiring(Duration),
+    UntilReleased,
+}
+
+/// Options for acquiring one durable physical content hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentPhysicalHoldOptions {
+    kind: ContentPhysicalHoldKind,
+    owner_id: ContentPhysicalHoldOwnerId,
+    lifetime: ContentPhysicalHoldLifetime,
+}
+
+impl ContentPhysicalHoldOptions {
+    /// Creates an expiring hold for an already-authorized workflow.
+    ///
+    /// `ttl` is rounded down to whole milliseconds and must retain at least one
+    /// millisecond. An expired hold is inert and cannot be renewed.
+    #[must_use]
+    pub const fn expiring(
+        kind: ContentPhysicalHoldKind,
+        owner_id: ContentPhysicalHoldOwnerId,
+        ttl: Duration,
+    ) -> Self {
+        Self {
+            kind,
+            owner_id,
+            lifetime: ContentPhysicalHoldLifetime::Expiring(ttl),
+        }
+    }
+
+    /// Creates a hold that remains active until an explicit durable release.
+    ///
+    /// This form is appropriate only when the owner has a recovery path that
+    /// can resume and release the hold after a process crash.
+    #[must_use]
+    pub const fn until_released(
+        kind: ContentPhysicalHoldKind,
+        owner_id: ContentPhysicalHoldOwnerId,
+    ) -> Self {
+        Self {
+            kind,
+            owner_id,
+            lifetime: ContentPhysicalHoldLifetime::UntilReleased,
+        }
+    }
+
+    /// Returns the operational hold class.
+    #[must_use]
+    pub const fn kind(self) -> ContentPhysicalHoldKind {
+        self.kind
+    }
+
+    /// Returns the opaque higher-layer owner.
+    #[must_use]
+    pub const fn owner_id(self) -> ContentPhysicalHoldOwnerId {
+        self.owner_id
+    }
+
+    /// Returns the requested expiring lifetime, or `None` for explicit release.
+    #[must_use]
+    pub const fn ttl(self) -> Option<Duration> {
+        match self.lifetime {
+            ContentPhysicalHoldLifetime::Expiring(ttl) => Some(ttl),
+            ContentPhysicalHoldLifetime::UntilReleased => None,
+        }
+    }
+
+    pub(crate) fn expires_at_unix_ms(self, now_unix_ms: u64) -> Result<u64> {
+        let ContentPhysicalHoldLifetime::Expiring(ttl) = self.lifetime else {
+            return Ok(0);
+        };
+        let ttl_ms = duration_millis(ttl, "content physical-hold lifetime")?;
+        now_unix_ms
+            .checked_add(ttl_ms)
+            .ok_or_else(|| Error::invalid_options("content physical-hold expiry overflow"))
     }
 }
 
@@ -1684,12 +1915,292 @@ pub(crate) fn content_lease_key(
     key
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContentPhysicalHoldRecordState {
+    Active,
+    Released,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContentPhysicalHoldRecord {
+    pub(crate) hold_id: ContentPhysicalHoldId,
+    pub(crate) owner_id: ContentPhysicalHoldOwnerId,
+    pub(crate) storage_domain_id: StorageDomainId,
+    pub(crate) content_id: ContentId,
+    pub(crate) kind: ContentPhysicalHoldKind,
+    pub(crate) expires_at_unix_ms: u64,
+    pub(crate) state: ContentPhysicalHoldRecordState,
+}
+
+impl ContentPhysicalHoldRecord {
+    pub(crate) const fn is_active_at(self, now_unix_ms: u64) -> bool {
+        matches!(self.state, ContentPhysicalHoldRecordState::Active)
+            && (self.expires_at_unix_ms == 0 || now_unix_ms < self.expires_at_unix_ms)
+    }
+
+    pub(crate) const fn is_released(self) -> bool {
+        matches!(self.state, ContentPhysicalHoldRecordState::Released)
+    }
+
+    pub(crate) const fn released(mut self) -> Self {
+        self.state = ContentPhysicalHoldRecordState::Released;
+        self
+    }
+
+    pub(crate) fn encode(self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(8 + 16 + 16 + 16 + 33 + 1 + 1 + 8);
+        bytes.extend_from_slice(CONTENT_PHYSICAL_HOLD_MAGIC);
+        bytes.extend_from_slice(&self.hold_id.to_bytes());
+        bytes.extend_from_slice(&self.owner_id.to_bytes());
+        bytes.extend_from_slice(&self.storage_domain_id.to_bytes());
+        bytes.extend_from_slice(&self.content_id.to_bytes());
+        bytes.push(self.kind.tag());
+        bytes.push(match self.state {
+            ContentPhysicalHoldRecordState::Active => 0,
+            ContentPhysicalHoldRecordState::Released => 1,
+        });
+        bytes.extend_from_slice(&self.expires_at_unix_ms.to_le_bytes());
+        bytes
+    }
+
+    pub(crate) fn decode(
+        bytes: &[u8],
+        storage_domain_id: StorageDomainId,
+        content_id: ContentId,
+        hold_id: ContentPhysicalHoldId,
+    ) -> Result<Self> {
+        const RECORD_LEN: usize = 8 + 16 + 16 + 16 + 33 + 1 + 1 + 8;
+        if bytes.len() != RECORD_LEN || bytes.get(..8) != Some(CONTENT_PHYSICAL_HOLD_MAGIC) {
+            return Err(Error::InvalidFormat {
+                message: "invalid content physical-hold record header or length".to_owned(),
+            });
+        }
+        let stored_hold_id = ContentPhysicalHoldId::from_bytes(array_at::<16>(
+            bytes,
+            8,
+            "content physical-hold identity",
+        )?)?;
+        let owner_id = ContentPhysicalHoldOwnerId::from_bytes(array_at::<16>(
+            bytes,
+            24,
+            "content physical-hold owner",
+        )?);
+        let stored_domain = StorageDomainId::from_bytes(array_at::<16>(
+            bytes,
+            40,
+            "content physical-hold storage domain",
+        )?);
+        let stored_content =
+            decode_content_id(bytes, 56, "content physical-hold content identity")?;
+        let kind = ContentPhysicalHoldKind::from_tag(bytes[89])?;
+        let state = match bytes[90] {
+            0 => ContentPhysicalHoldRecordState::Active,
+            1 => ContentPhysicalHoldRecordState::Released,
+            state => {
+                return Err(Error::UnsupportedFormat {
+                    message: format!("unsupported content physical-hold state {state}"),
+                });
+            }
+        };
+        let expires_at_unix_ms =
+            u64::from_le_bytes(array_at::<8>(bytes, 91, "content physical-hold expiry")?);
+        if stored_hold_id != hold_id
+            || stored_domain != storage_domain_id
+            || stored_content != content_id
+        {
+            return Err(Error::Corruption {
+                message: "content physical-hold record differs from its protected key".to_owned(),
+            });
+        }
+        Ok(Self {
+            hold_id,
+            owner_id,
+            storage_domain_id,
+            content_id,
+            kind,
+            expires_at_unix_ms,
+            state,
+        })
+    }
+}
+
+pub(crate) fn content_physical_hold_prefix(
+    storage_domain_id: StorageDomainId,
+    content_id: ContentId,
+) -> Vec<u8> {
+    content_lease_prefix(storage_domain_id, content_id)
+}
+
+pub(crate) fn content_physical_hold_key(
+    storage_domain_id: StorageDomainId,
+    content_id: ContentId,
+    hold_id: ContentPhysicalHoldId,
+) -> Vec<u8> {
+    let mut key = content_physical_hold_prefix(storage_domain_id, content_id);
+    key.extend_from_slice(&hold_id.to_bytes());
+    key
+}
+
 pub(crate) fn current_epoch_millis() -> Result<u64> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| Error::Io(std::io::Error::other(error)))?;
     u64::try_from(duration.as_millis())
         .map_err(|_| Error::invalid_options("system time milliseconds exceed u64::MAX"))
+}
+
+pub(crate) fn duration_millis(duration: Duration, name: &str) -> Result<u64> {
+    let millis = u64::try_from(duration.as_millis())
+        .map_err(|_| Error::invalid_options(format!("{name} milliseconds exceed u64::MAX")))?;
+    if millis == 0 {
+        return Err(Error::invalid_options(format!(
+            "{name} must be at least one millisecond"
+        )));
+    }
+    Ok(millis)
+}
+
+#[derive(Debug)]
+struct ContentPhysicalHoldState {
+    expires_at_unix_ms: AtomicU64,
+    released: AtomicBool,
+}
+
+/// Durable reason that one exact content identity must remain physically readable.
+///
+/// Clones share local release and expiry state, while the protected database
+/// record is the cross-process source of truth. Dropping the value performs no
+/// asynchronous I/O. Expiring holds become inert at their deadline; an
+/// until-released hold must be resumed and explicitly released after a crash.
+#[derive(Clone)]
+pub struct ContentPhysicalHold {
+    db: Db,
+    storage_domain_id: StorageDomainId,
+    content_id: ContentId,
+    hold_id: ContentPhysicalHoldId,
+    owner_id: ContentPhysicalHoldOwnerId,
+    kind: ContentPhysicalHoldKind,
+    state: Arc<ContentPhysicalHoldState>,
+}
+
+impl ContentPhysicalHold {
+    pub(crate) fn from_record(db: Db, record: ContentPhysicalHoldRecord) -> Self {
+        Self {
+            db,
+            storage_domain_id: record.storage_domain_id,
+            content_id: record.content_id,
+            hold_id: record.hold_id,
+            owner_id: record.owner_id,
+            kind: record.kind,
+            state: Arc::new(ContentPhysicalHoldState {
+                expires_at_unix_ms: AtomicU64::new(record.expires_at_unix_ms),
+                released: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    /// Returns the exact physical lifecycle domain.
+    #[must_use]
+    pub const fn storage_domain_id(&self) -> StorageDomainId {
+        self.storage_domain_id
+    }
+
+    /// Returns the immutable byte identity protected by this hold.
+    #[must_use]
+    pub const fn content_id(&self) -> ContentId {
+        self.content_id
+    }
+
+    /// Returns the durable hold identity.
+    #[must_use]
+    pub const fn id(&self) -> ContentPhysicalHoldId {
+        self.hold_id
+    }
+
+    /// Returns the operational hold class.
+    #[must_use]
+    pub const fn kind(&self) -> ContentPhysicalHoldKind {
+        self.kind
+    }
+
+    /// Returns the current exclusive deadline, or `None` for explicit release.
+    ///
+    /// All clones observe a successful renewal only after its durable commit.
+    #[must_use]
+    pub fn expires_at_unix_ms(&self) -> Option<u64> {
+        match self.state.expires_at_unix_ms.load(Ordering::Acquire) {
+            0 => None,
+            expires_at_unix_ms => Some(expires_at_unix_ms),
+        }
+    }
+
+    /// Returns whether this process has observed a successful explicit release.
+    ///
+    /// This local convenience flag is not the cross-process source of truth.
+    #[must_use]
+    pub fn is_released(&self) -> bool {
+        self.state.released.load(Ordering::Acquire)
+    }
+
+    /// Renews an unexpired expiring hold for `ttl` from the current time.
+    ///
+    /// The caller must repeat higher-layer authorization first. Renewal cannot
+    /// revive expiry and does not convert an until-released hold.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ContentPhysicalHoldNotFound`] after release or missing
+    /// durable state, [`Error::ContentPhysicalHoldExpired`] after the deadline,
+    /// [`Error::InvalidOptions`] for an until-released hold or invalid `ttl`,
+    /// [`Error::ContentPhysicalHoldOwnerMismatch`] for wrong authority,
+    /// [`Error::ReadOnly`] when protected state cannot be written, or a
+    /// storage/conflict error when renewal cannot publish.
+    pub async fn renew(&self, ttl: Duration) -> Result<u64> {
+        self.db.renew_content_physical_hold(self, ttl).await
+    }
+
+    /// Durably releases this exact hold idempotently.
+    ///
+    /// All clones observe release after the durable Released tombstone commits.
+    /// A missing record is accepted as an already-completed retry for recovery
+    /// compatibility. Drop does not call this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ContentPhysicalHoldOwnerMismatch`] if the durable owner
+    /// differs, [`Error::ReadOnly`] when protected state cannot be updated, or
+    /// a storage/conflict error if release cannot converge.
+    pub async fn release(&self) -> Result<()> {
+        self.db.release_content_physical_hold(self).await
+    }
+
+    pub(crate) const fn owner_id(&self) -> ContentPhysicalHoldOwnerId {
+        self.owner_id
+    }
+
+    pub(crate) fn publish_expiry(&self, expires_at_unix_ms: u64) {
+        self.state
+            .expires_at_unix_ms
+            .store(expires_at_unix_ms, Ordering::Release);
+    }
+
+    pub(crate) fn publish_released(&self) {
+        self.state.released.store(true, Ordering::Release);
+    }
+}
+
+impl fmt::Debug for ContentPhysicalHold {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ContentPhysicalHold")
+            .field("storage_domain_id", &self.storage_domain_id)
+            .field("content_id", &self.content_id)
+            .field("hold_id", &self.hold_id)
+            .field("kind", &self.kind)
+            .field("expires_at_unix_ms", &self.expires_at_unix_ms())
+            .field("released", &self.is_released())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Stable read handle for one sealed immutable `ContentObject`.
