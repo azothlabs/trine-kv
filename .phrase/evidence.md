@@ -16511,3 +16511,56 @@ Negative check:
 - Keep higher layers on typed async lineage APIs. If physical orphan cleanup is
   later automated, enumerate only checkpoint/registry discrepancies and retain
   history on uncertainty; do not reinterpret upper-layer logical Branch roots.
+
+## 2026-07-20: atomic content reclaim intent
+
+### Observation
+
+- The exact-content lease prefix was only a conservative precheck. A leased
+  open could race after it, and available UploadToken authority had no
+  ContentId-ordered index.
+- Trine KV had no protected per-content sequence that a higher-layer proof at
+  `S` could compare with later physical activity.
+- TrineDB owns logical proof meaning; Trine KV owns descriptor, token, lease,
+  and physical lifecycle state. One crate cannot safely infer the other's
+  authority.
+
+### Interpretation
+
+- Logical and physical checks must share one optimistic Trine KV transaction.
+  Per-content control supplies the point conflict; token and lease ranges supply
+  phantom protection.
+- Durable intent is coordination state, not deletion authority. Existing
+  compatible unleased handles and future physical holds must join a later fence
+  before grace or replica deletion.
+
+### Fix
+
+- Added typed opaque proof claims and blocker outcomes plus protected
+  Active/ReclaimIntent control records with exact final commit sequences.
+- Seal atomically publishes a ContentId-ordered token-authority index and Active
+  state. Consumption removes the index and advances Active with the attachment
+  transaction. Seal retry validates token/index/control agreement.
+- Leased open and durable renewal advance the same Active key. Intent checks the
+  descriptor, expiry, physical activity `<= S`, token range, and lease range in
+  the caller's transaction. Exact retries preserve the original acceptance
+  sequence; newer token or lease activity returns state to Active.
+- Recorded byte layouts, ownership, concurrency, and exclusions in
+  `.phrase/protocol/content-reclaim-intent-v1.md` and updated the lease protocol.
+
+### Verification
+
+- Twenty content tests pass. Five new lifecycle tests cover available token and
+  lease blockers, native reopen/idempotency, lease-vs-intent conflict, later
+  lease/token activity, proof expiry, and malformed control/token index state.
+- The complete all-feature suite passes with 482 library tests (480 passed, two
+  ignored) and every integration target.
+- Strict all-target/all-feature Clippy with wildcard imports denied passes with
+  no findings. Strict Rustdoc and 24 doctests pass, as do locked check,
+  formatting, explicit-import scan, and diff checks.
+
+### Recommended next action
+
+- Design the complete content access/physical-hold fence. It must account for
+  compatible unleased handles and future migration, backup, repair, provider,
+  and administrative holds before grace or physical deletion can be enabled.

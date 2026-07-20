@@ -1,5 +1,42 @@
 # Current Phase
 
+## Consumer-driven atomic content reclaim intent — 2026-07-20
+
+TrineDB now produces exact, short-lived ReclaimProofs, but Trine KV previously
+had no atomic physical boundary for accepting one. The existing exact-content
+lease scan was deliberately only a conservative precheck: a new lease could
+race immediately after it, UploadToken authority was keyed by bearer hash
+rather than ContentId, and no per-content physical activity high-water existed.
+
+Current slice: add durable ReclaimIntent coordination without making bytes
+unavailable. A protected per-content control record holds Active or intent
+state. Seal, token consumption, leased open, and durable renewal write Active
+with their final commit sequence. Seal also publishes a ContentId-ordered token
+authority index; consumption removes it. `Transaction::stage_content_reclaim_intent`
+checks descriptor, proof expiry and `S`, physical high-water, available token
+authority, and exact read leases before staging intent in the caller's same
+optimistic transaction.
+
+Concurrency result: the control point read and token/lease range reads join the
+transaction read set. Concurrent token or lease activity either appears before
+the check and blocks it, or makes commit conflict. Later leased/token activity
+replaces old intent with Active. Exact retry returns the original acceptance
+sequence. Typed `ContentReclaimBlocker` values distinguish expired proof,
+newer physical activity, upload authority, and read lease.
+
+Safety boundary: intent neither starts grace nor deletes or hides content.
+Compatible unleased `open_content` remains unsafe against future deletion, and
+additional migration/backup/repair/provider/administrative holds do not yet
+exist. They must join the fence before a deletion protocol is possible.
+
+Acceptance result: 20 content tests pass, including five new lifecycle tests
+for native reopen, idempotency, token/lease blockers, lease conflict, later
+lease/token activity, proof expiry, and malformed records. The complete suite
+passes with 482 library tests (480 passed, two ignored) and every integration
+target. Strict all-target/all-feature Clippy, Rustdoc, 24 doctests, formatting,
+and diff checks pass. Stable ownership and byte layouts are recorded in
+`.phrase/protocol/content-reclaim-intent-v1.md`.
+
 ## Consumer-driven Branch metadata symmetry — 2026-07-20
 
 TrineDB's protected logical Branch-root publication needs the physical fork and

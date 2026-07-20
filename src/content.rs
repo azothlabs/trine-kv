@@ -36,6 +36,13 @@ const MIN_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const CONTENT_LEASE_BUCKET: &str = "\u{1}trine-content-lease\u{1}";
 pub(crate) const CONTENT_LEASE_MAGIC: &[u8; 8] = b"TRNCNLS1";
+pub(crate) const CONTENT_CONTROL_BUCKET: &str = "\u{1}trine-content-control\u{1}";
+pub(crate) const CONTENT_TOKEN_INDEX_BUCKET: &str = "\u{1}trine-content-token-index\u{1}";
+const CONTENT_CONTROL_MAGIC: &[u8; 8] = b"TRNCRCL1";
+const CONTENT_TOKEN_INDEX_MAGIC: &[u8; 8] = b"TRNCTIX1";
+const CONTENT_CONTROL_ACTIVE: u8 = 0;
+const CONTENT_CONTROL_RECLAIM_INTENT: u8 = 1;
+const CONTENT_RECLAIM_PROOF_TOKEN_BYTES: usize = 49;
 
 /// Opaque control-plane identity for one physical content boundary.
 ///
@@ -71,6 +78,111 @@ impl fmt::Display for StorageDomainId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write_hex(formatter, &self.0)
     }
+}
+
+/// Opaque identity and digest bytes for one higher-layer reclaim proof.
+///
+/// Trine KV persists and compares this token but does not parse logical roots,
+/// Policies, Versions, or proof-digest semantics. The higher layer must verify
+/// those claims in the same optimistic transaction that stages reclaim intent.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ContentReclaimProofToken([u8; CONTENT_RECLAIM_PROOF_TOKEN_BYTES]);
+
+impl ContentReclaimProofToken {
+    /// Reconstructs an opaque proof token from its fixed portable bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; CONTENT_RECLAIM_PROOF_TOKEN_BYTES]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the fixed opaque proof bytes.
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; CONTENT_RECLAIM_PROOF_TOKEN_BYTES] {
+        self.0
+    }
+}
+
+impl fmt::Debug for ContentReclaimProofToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ContentReclaimProofToken([REDACTED])")
+    }
+}
+
+/// Physical claims Trine KV checks before recording reclaim intent.
+///
+/// `verified_at` is the instance-local commit sequence `S` used by the
+/// higher-layer exact absence proof. Trine KV rejects the request if later
+/// durable content activity exists. `expires_at_unix_ms` is an exclusive
+/// wall-clock deadline: a request at or after that millisecond is expired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentReclaimAuthorization {
+    storage_domain_id: StorageDomainId,
+    content_id: ContentId,
+    proof_token: ContentReclaimProofToken,
+    verified_at: crate::ReadVersion,
+    expires_at_unix_ms: u64,
+}
+
+impl ContentReclaimAuthorization {
+    /// Creates physical reclaim claims supplied by a verified higher layer.
+    #[must_use]
+    pub const fn new(
+        storage_domain_id: StorageDomainId,
+        content_id: ContentId,
+        proof_token: ContentReclaimProofToken,
+        verified_at: crate::ReadVersion,
+        expires_at_unix_ms: u64,
+    ) -> Self {
+        Self {
+            storage_domain_id,
+            content_id,
+            proof_token,
+            verified_at,
+            expires_at_unix_ms,
+        }
+    }
+
+    /// Returns the exact physical lifecycle domain.
+    #[must_use]
+    pub const fn storage_domain_id(self) -> StorageDomainId {
+        self.storage_domain_id
+    }
+
+    /// Returns the immutable byte identity being considered.
+    #[must_use]
+    pub const fn content_id(self) -> ContentId {
+        self.content_id
+    }
+
+    /// Returns the opaque higher-layer proof identity and digest.
+    #[must_use]
+    pub const fn proof_token(self) -> ContentReclaimProofToken {
+        self.proof_token
+    }
+
+    /// Returns the stable commit sequence checked by the higher layer.
+    #[must_use]
+    pub const fn verified_at(self) -> crate::ReadVersion {
+        self.verified_at
+    }
+
+    /// Returns the exclusive proof deadline as Unix epoch milliseconds.
+    #[must_use]
+    pub const fn expires_at_unix_ms(self) -> u64 {
+        self.expires_at_unix_ms
+    }
+}
+
+/// Result of staging physical reclaim intent in an optimistic transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentReclaimIntentStage {
+    /// This transaction staged a new or replacement intent record.
+    Staged,
+    /// The exact same intent was already durable at this commit sequence.
+    Existing {
+        /// Commit sequence that durably accepted the existing intent.
+        accepted_at: crate::ReadVersion,
+    },
 }
 
 /// Opaque authenticated owner scope supplied by the database layer.
@@ -785,6 +897,10 @@ impl UploadTokenRecord {
         self.attachment
     }
 
+    pub(crate) const fn is_available(self) -> bool {
+        matches!(self.status, UploadTokenStatus::Available)
+    }
+
     pub(crate) fn consume(
         self,
         expected_scope: ContentAttachmentScope,
@@ -889,8 +1005,306 @@ pub(crate) fn upload_token_key(token: UploadToken) -> Vec<u8> {
     upload_token_hash(token).to_vec()
 }
 
-fn upload_token_hash(token: UploadToken) -> [u8; 32] {
+pub(crate) fn upload_token_hash(token: UploadToken) -> [u8; 32] {
     Sha256::digest(token.to_bytes()).into()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContentTokenIndexRecord {
+    storage_domain_id: StorageDomainId,
+    content_id: ContentId,
+    token_hash: [u8; 32],
+    expires_at_unix_ms: u64,
+}
+
+impl ContentTokenIndexRecord {
+    pub(crate) fn for_token(sealed: SealedContent) -> Self {
+        Self {
+            storage_domain_id: sealed.storage_domain_id(),
+            content_id: sealed.content_id(),
+            token_hash: upload_token_hash(sealed.upload_token()),
+            expires_at_unix_ms: sealed.token_expires_at_unix_ms(),
+        }
+    }
+
+    pub(crate) const fn expires_at_unix_ms(self) -> u64 {
+        self.expires_at_unix_ms
+    }
+
+    pub(crate) fn encode(self) -> Vec<u8> {
+        const RECORD_LEN: usize = 8 + 16 + 33 + 32 + 8;
+        let mut bytes = Vec::with_capacity(RECORD_LEN);
+        bytes.extend_from_slice(CONTENT_TOKEN_INDEX_MAGIC);
+        bytes.extend_from_slice(&self.storage_domain_id.to_bytes());
+        bytes.extend_from_slice(&self.content_id.to_bytes());
+        bytes.extend_from_slice(&self.token_hash);
+        bytes.extend_from_slice(&self.expires_at_unix_ms.to_le_bytes());
+        bytes
+    }
+
+    pub(crate) fn decode(
+        bytes: &[u8],
+        storage_domain_id: StorageDomainId,
+        content_id: ContentId,
+        token_hash: [u8; 32],
+    ) -> Result<Self> {
+        const RECORD_LEN: usize = 8 + 16 + 33 + 32 + 8;
+        if bytes.len() != RECORD_LEN || bytes.get(..8) != Some(CONTENT_TOKEN_INDEX_MAGIC) {
+            return Err(Error::InvalidFormat {
+                message: "invalid content token-index record header or length".to_owned(),
+            });
+        }
+        let stored_domain = StorageDomainId::from_bytes(array_at::<16>(
+            bytes,
+            8,
+            "content token-index storage domain",
+        )?);
+        let stored_content = decode_content_id(bytes, 24, "content token-index identity")?;
+        let stored_hash = array_at::<32>(bytes, 57, "content token-index hash")?;
+        let expires_at_unix_ms =
+            u64::from_le_bytes(array_at::<8>(bytes, 89, "content token-index expiry")?);
+        if stored_domain != storage_domain_id
+            || stored_content != content_id
+            || stored_hash != token_hash
+        {
+            return Err(Error::Corruption {
+                message: "content token-index record differs from its protected key".to_owned(),
+            });
+        }
+        if expires_at_unix_ms == 0 {
+            return Err(Error::Corruption {
+                message: "content token-index expiry cannot be zero".to_owned(),
+            });
+        }
+        Ok(Self {
+            storage_domain_id,
+            content_id,
+            token_hash,
+            expires_at_unix_ms,
+        })
+    }
+}
+
+pub(crate) fn content_token_index_prefix(
+    storage_domain_id: StorageDomainId,
+    content_id: ContentId,
+) -> Vec<u8> {
+    content_control_key(storage_domain_id, content_id)
+}
+
+pub(crate) fn content_token_index_key(
+    storage_domain_id: StorageDomainId,
+    content_id: ContentId,
+    token: UploadToken,
+) -> Vec<u8> {
+    let mut key = content_token_index_prefix(storage_domain_id, content_id);
+    key.extend_from_slice(&upload_token_hash(token));
+    key
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContentControlState {
+    Active,
+    ReclaimIntent {
+        proof_token: ContentReclaimProofToken,
+        verified_at: crate::ReadVersion,
+        expires_at_unix_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContentControlRecord {
+    storage_domain_id: StorageDomainId,
+    content_id: ContentId,
+    prior_activity_commit_seq: u64,
+    state: ContentControlState,
+    state_commit_seq: u64,
+}
+
+impl ContentControlRecord {
+    pub(crate) const fn active(storage_domain_id: StorageDomainId, content_id: ContentId) -> Self {
+        Self {
+            storage_domain_id,
+            content_id,
+            prior_activity_commit_seq: 0,
+            state: ContentControlState::Active,
+            state_commit_seq: 0,
+        }
+    }
+
+    pub(crate) fn reclaim_intent(self, authorization: ContentReclaimAuthorization) -> Self {
+        Self {
+            storage_domain_id: self.storage_domain_id,
+            content_id: self.content_id,
+            prior_activity_commit_seq: self.physical_activity_commit_seq(),
+            state: ContentControlState::ReclaimIntent {
+                proof_token: authorization.proof_token(),
+                verified_at: authorization.verified_at(),
+                expires_at_unix_ms: authorization.expires_at_unix_ms(),
+            },
+            state_commit_seq: 0,
+        }
+    }
+
+    pub(crate) const fn physical_activity_commit_seq(self) -> u64 {
+        match self.state {
+            ContentControlState::Active => self.state_commit_seq,
+            ContentControlState::ReclaimIntent { .. } => self.prior_activity_commit_seq,
+        }
+    }
+
+    pub(crate) fn matches_authorization(self, authorization: ContentReclaimAuthorization) -> bool {
+        self.storage_domain_id == authorization.storage_domain_id()
+            && self.content_id == authorization.content_id()
+            && matches!(
+                self.state,
+                ContentControlState::ReclaimIntent {
+                    proof_token,
+                    verified_at,
+                    expires_at_unix_ms,
+                } if proof_token.to_bytes() == authorization.proof_token().to_bytes()
+                    && verified_at.as_u64() == authorization.verified_at().as_u64()
+                    && expires_at_unix_ms == authorization.expires_at_unix_ms()
+            )
+    }
+
+    pub(crate) const fn accepted_at(self) -> Option<crate::ReadVersion> {
+        match self.state {
+            ContentControlState::Active => None,
+            ContentControlState::ReclaimIntent { .. } => {
+                Some(crate::ReadVersion::from_u64(self.state_commit_seq))
+            }
+        }
+    }
+
+    pub(crate) fn encode_prefix(self) -> Vec<u8> {
+        const PREFIX_LEN: usize = 8 + 16 + 33 + 8 + 1 + 49 + 8 + 8;
+        let mut bytes = Vec::with_capacity(PREFIX_LEN);
+        bytes.extend_from_slice(CONTENT_CONTROL_MAGIC);
+        bytes.extend_from_slice(&self.storage_domain_id.to_bytes());
+        bytes.extend_from_slice(&self.content_id.to_bytes());
+        bytes.extend_from_slice(&self.prior_activity_commit_seq.to_be_bytes());
+        match self.state {
+            ContentControlState::Active => {
+                bytes.push(CONTENT_CONTROL_ACTIVE);
+                bytes.extend_from_slice(&[0_u8; CONTENT_RECLAIM_PROOF_TOKEN_BYTES]);
+                bytes.extend_from_slice(&0_u64.to_be_bytes());
+                bytes.extend_from_slice(&0_u64.to_le_bytes());
+            }
+            ContentControlState::ReclaimIntent {
+                proof_token,
+                verified_at,
+                expires_at_unix_ms,
+            } => {
+                bytes.push(CONTENT_CONTROL_RECLAIM_INTENT);
+                bytes.extend_from_slice(&proof_token.to_bytes());
+                bytes.extend_from_slice(&verified_at.as_u64().to_be_bytes());
+                bytes.extend_from_slice(&expires_at_unix_ms.to_le_bytes());
+            }
+        }
+        bytes
+    }
+
+    pub(crate) fn decode(
+        bytes: &[u8],
+        storage_domain_id: StorageDomainId,
+        content_id: ContentId,
+    ) -> Result<Self> {
+        const RECORD_LEN: usize = 8 + 16 + 33 + 8 + 1 + 49 + 8 + 8 + 8;
+        if bytes.len() != RECORD_LEN || bytes.get(..8) != Some(CONTENT_CONTROL_MAGIC) {
+            return Err(Error::InvalidFormat {
+                message: "invalid content control record header or length".to_owned(),
+            });
+        }
+        let stored_domain = StorageDomainId::from_bytes(array_at::<16>(
+            bytes,
+            8,
+            "content control storage domain",
+        )?);
+        let stored_content = decode_content_id(bytes, 24, "content control identity")?;
+        if stored_domain != storage_domain_id || stored_content != content_id {
+            return Err(Error::Corruption {
+                message: "content control record differs from its protected key".to_owned(),
+            });
+        }
+        let prior_activity_commit_seq =
+            u64::from_be_bytes(array_at::<8>(bytes, 57, "prior content activity")?);
+        let proof_token = ContentReclaimProofToken::from_bytes(array_at::<49>(
+            bytes,
+            66,
+            "content reclaim proof token",
+        )?);
+        let verified_at = crate::ReadVersion::from_u64(u64::from_be_bytes(array_at::<8>(
+            bytes,
+            115,
+            "content reclaim verified sequence",
+        )?));
+        let expires_at_unix_ms =
+            u64::from_le_bytes(array_at::<8>(bytes, 123, "content reclaim expiry")?);
+        let state_commit_seq =
+            u64::from_be_bytes(array_at::<8>(bytes, 131, "content control state sequence")?);
+        let state = match bytes[65] {
+            CONTENT_CONTROL_ACTIVE
+                if prior_activity_commit_seq == 0
+                    && proof_token.to_bytes() == [0_u8; 49]
+                    && verified_at.as_u64() == 0
+                    && expires_at_unix_ms == 0 =>
+            {
+                ContentControlState::Active
+            }
+            CONTENT_CONTROL_RECLAIM_INTENT
+                if prior_activity_commit_seq > 0
+                    && verified_at.as_u64() >= prior_activity_commit_seq
+                    && expires_at_unix_ms > 0 =>
+            {
+                ContentControlState::ReclaimIntent {
+                    proof_token,
+                    verified_at,
+                    expires_at_unix_ms,
+                }
+            }
+            _ => {
+                return Err(Error::Corruption {
+                    message: "content control record has invalid lifecycle coordinates".to_owned(),
+                });
+            }
+        };
+        if state_commit_seq == 0 || state_commit_seq < prior_activity_commit_seq {
+            return Err(Error::Corruption {
+                message: "content control state sequence is invalid".to_owned(),
+            });
+        }
+        Ok(Self {
+            storage_domain_id,
+            content_id,
+            prior_activity_commit_seq,
+            state,
+            state_commit_seq,
+        })
+    }
+}
+
+pub(crate) fn content_control_key(
+    storage_domain_id: StorageDomainId,
+    content_id: ContentId,
+) -> Vec<u8> {
+    let mut key = Vec::with_capacity(16 + 33);
+    key.extend_from_slice(&storage_domain_id.to_bytes());
+    key.extend_from_slice(&content_id.to_bytes());
+    key
+}
+
+pub(crate) fn content_prefix_range(prefix: Vec<u8>) -> Result<crate::KeyRange> {
+    let mut end = prefix.clone();
+    let position = end
+        .iter()
+        .rposition(|byte| *byte != u8::MAX)
+        .ok_or_else(|| Error::Corruption {
+            message: "protected content prefix has no finite successor".to_owned(),
+        })?;
+    end[position] = end[position].saturating_add(1);
+    end.truncate(position + 1);
+    Ok(crate::KeyRange::half_open(prefix, end))
 }
 
 /// Result of resuming durable state for an [`UploadId`].

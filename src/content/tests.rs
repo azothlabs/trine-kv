@@ -5,17 +5,22 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
+    thread,
     time::Duration,
 };
 
 use futures::executor::block_on;
 
-use super::{CONTENT_LEASE_BUCKET, ContentLeaseRecord, content_lease_key};
+use super::{
+    CONTENT_CONTROL_BUCKET, CONTENT_LEASE_BUCKET, CONTENT_TOKEN_INDEX_BUCKET, ContentLeaseRecord,
+    content_control_key, content_lease_key, content_token_index_key,
+};
 use crate::{
     ContentAttachmentScope, ContentChangeId, ContentId, ContentLeaseOptions, ContentLeaseOwnerId,
-    ContentUploadOptions, ContentUploadResume, Db, DbOptions, ETag, Error, InMemoryObjectStore,
-    ObjectClient, ObjectFuture, ObjectMeta, OwnerScopeId, Precondition, PutIf, StorageDomainId,
-    TransactionOptions, UploadToken,
+    ContentReclaimAuthorization, ContentReclaimBlocker, ContentReclaimIntentStage,
+    ContentReclaimProofToken, ContentUploadOptions, ContentUploadResume, Db, DbOptions, ETag,
+    Error, InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta, OwnerScopeId, Precondition,
+    PutIf, SealedContent, StorageDomainId, TransactionOptions, UploadToken,
 };
 
 const TEST_CHUNK_BYTES: usize = 64 * 1024;
@@ -30,6 +35,292 @@ fn test_scope() -> ContentAttachmentScope {
 
 fn test_upload_options() -> ContentUploadOptions {
     ContentUploadOptions::new(test_scope(), Duration::from_secs(60 * 60))
+}
+
+async fn seal_reclaim_content(db: &Db, bytes: &[u8]) -> SealedContent {
+    let mut upload = db
+        .begin_content_upload(test_upload_options())
+        .await
+        .expect("upload begins");
+    upload.write(bytes).await.expect("content writes");
+    upload.seal().await.expect("content seals")
+}
+
+async fn consume_reclaim_token(db: &Db, sealed: SealedContent, change: u8) {
+    let mut transaction = db.transaction(TransactionOptions::default());
+    transaction
+        .consume_upload_token(
+            sealed.upload_token(),
+            test_scope(),
+            ContentChangeId::from_bytes([change; 16]),
+        )
+        .await
+        .expect("upload token consumption stages");
+    transaction
+        .commit()
+        .await
+        .expect("upload token consumption commits");
+}
+
+fn reclaim_authorization(
+    transaction: &crate::Transaction,
+    sealed: SealedContent,
+    proof: u8,
+) -> ContentReclaimAuthorization {
+    ContentReclaimAuthorization::new(
+        sealed.storage_domain_id(),
+        sealed.content_id(),
+        ContentReclaimProofToken::from_bytes([proof; 49]),
+        transaction.read_version(),
+        u64::MAX,
+    )
+}
+
+#[test]
+fn reclaim_intent_checks_token_and_is_durable_and_idempotent() {
+    let path = temp_db_path("content-reclaim-intent");
+    let authorization = block_on(async {
+        let db = Db::open(&path).await.expect("native db opens");
+        let sealed = seal_reclaim_content(&db, b"reclaim intent bytes").await;
+        let mut blocked = db.transaction(TransactionOptions::default());
+        let blocked_authorization = reclaim_authorization(&blocked, sealed, 31);
+        assert!(matches!(
+            blocked
+                .stage_content_reclaim_intent(blocked_authorization)
+                .await,
+            Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::UploadToken { .. },
+            })
+        ));
+
+        consume_reclaim_token(&db, sealed, 41).await;
+        let mut accepted = db.transaction(TransactionOptions::default());
+        let authorization = reclaim_authorization(&accepted, sealed, 32);
+        assert_eq!(
+            accepted
+                .stage_content_reclaim_intent(authorization)
+                .await
+                .expect("reclaim intent stages"),
+            ContentReclaimIntentStage::Staged
+        );
+        accepted.commit().await.expect("reclaim intent commits");
+
+        let mut repeated = db.transaction(TransactionOptions::default());
+        assert!(matches!(
+            repeated
+                .stage_content_reclaim_intent(authorization)
+                .await
+                .expect("reclaim intent repeats"),
+            ContentReclaimIntentStage::Existing { .. }
+        ));
+        authorization
+    });
+
+    block_on(async {
+        let db = Db::open(&path).await.expect("native db reopens");
+        let mut repeated = db.transaction(TransactionOptions::default());
+        assert!(matches!(
+            repeated
+                .stage_content_reclaim_intent(authorization)
+                .await
+                .expect("durable reclaim intent reads"),
+            ContentReclaimIntentStage::Existing { .. }
+        ));
+    });
+    std::fs::remove_dir_all(path).expect("test database removes");
+}
+
+#[test]
+fn reclaim_intent_is_blocked_by_lease_and_later_lease_supersedes_it() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let sealed = seal_reclaim_content(&db, b"leased reclaim bytes").await;
+        consume_reclaim_token(&db, sealed, 42).await;
+        let handle = db
+            .open_content_leased(
+                sealed.storage_domain_id(),
+                sealed.content_id(),
+                ContentLeaseOptions::new(
+                    ContentLeaseOwnerId::from_bytes([12; 16]),
+                    Duration::from_millis(2),
+                ),
+            )
+            .await
+            .expect("leased content opens");
+        let mut blocked = db.transaction(TransactionOptions::default());
+        assert!(matches!(
+            blocked
+                .stage_content_reclaim_intent(reclaim_authorization(&blocked, sealed, 33))
+                .await,
+            Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::ReadLease { .. },
+            })
+        ));
+        thread::sleep(Duration::from_millis(10));
+
+        let mut accepted = db.transaction(TransactionOptions::default());
+        let authorization = reclaim_authorization(&accepted, sealed, 34);
+        accepted
+            .stage_content_reclaim_intent(authorization)
+            .await
+            .expect("expired lease permits intent");
+        accepted.commit().await.expect("reclaim intent commits");
+
+        let newer = db
+            .open_content_leased(
+                sealed.storage_domain_id(),
+                sealed.content_id(),
+                ContentLeaseOptions::new(
+                    ContentLeaseOwnerId::from_bytes([13; 16]),
+                    Duration::from_secs(60),
+                ),
+            )
+            .await
+            .expect("new lease cancels intent");
+        assert!(newer.lease_id().is_some());
+        assert!(handle.lease_id().is_some());
+        let mut stale = db.transaction(TransactionOptions::default());
+        assert!(matches!(
+            stale.stage_content_reclaim_intent(authorization).await,
+            Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::Superseded { .. },
+            })
+        ));
+    });
+}
+
+#[test]
+fn concurrent_lease_conflicts_with_staged_reclaim_intent() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let sealed = seal_reclaim_content(&db, b"concurrent reclaim bytes").await;
+        consume_reclaim_token(&db, sealed, 43).await;
+        let mut reclaim = db.transaction(TransactionOptions::default());
+        reclaim
+            .stage_content_reclaim_intent(reclaim_authorization(&reclaim, sealed, 35))
+            .await
+            .expect("reclaim intent stages");
+
+        db.open_content_leased(
+            sealed.storage_domain_id(),
+            sealed.content_id(),
+            ContentLeaseOptions::new(
+                ContentLeaseOwnerId::from_bytes([14; 16]),
+                Duration::from_secs(60),
+            ),
+        )
+        .await
+        .expect("concurrent lease commits");
+        assert!(matches!(
+            reclaim.commit().await,
+            Err(Error::Conflict { .. })
+        ));
+    });
+}
+
+#[test]
+fn new_upload_authority_supersedes_reclaim_intent() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let sealed = seal_reclaim_content(&db, b"repeated content bytes").await;
+        consume_reclaim_token(&db, sealed, 45).await;
+        let mut accepted = db.transaction(TransactionOptions::default());
+        let authorization = reclaim_authorization(&accepted, sealed, 38);
+        accepted
+            .stage_content_reclaim_intent(authorization)
+            .await
+            .expect("reclaim intent stages");
+        accepted.commit().await.expect("reclaim intent commits");
+
+        let newer = seal_reclaim_content(&db, b"repeated content bytes").await;
+        assert_eq!(newer.content_id(), sealed.content_id());
+        let mut stale = db.transaction(TransactionOptions::default());
+        assert!(matches!(
+            stale.stage_content_reclaim_intent(authorization).await,
+            Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::Superseded { .. },
+            })
+        ));
+    });
+}
+
+#[test]
+fn malformed_control_and_expired_proof_fail_closed() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let sealed = seal_reclaim_content(&db, b"malformed reclaim bytes").await;
+        consume_reclaim_token(&db, sealed, 44).await;
+        let mut expired = db.transaction(TransactionOptions::default());
+        let expired_authorization = ContentReclaimAuthorization::new(
+            sealed.storage_domain_id(),
+            sealed.content_id(),
+            ContentReclaimProofToken::from_bytes([36; 49]),
+            expired.read_version(),
+            1,
+        );
+        assert!(matches!(
+            expired
+                .stage_content_reclaim_intent(expired_authorization)
+                .await,
+            Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::ProofExpired { .. },
+            })
+        ));
+
+        let token_damaged = seal_reclaim_content(&db, b"malformed token index bytes").await;
+        let mut damage_token = db.transaction(TransactionOptions::default());
+        damage_token
+            .put_bucket(
+                CONTENT_TOKEN_INDEX_BUCKET,
+                content_token_index_key(
+                    token_damaged.storage_domain_id(),
+                    token_damaged.content_id(),
+                    token_damaged.upload_token(),
+                ),
+                b"malformed".to_vec(),
+            )
+            .expect("token-index damage stages");
+        damage_token
+            .commit()
+            .await
+            .expect("token-index damage commits");
+        let mut token_reclaim = db.transaction(TransactionOptions::default());
+        assert!(matches!(
+            token_reclaim
+                .stage_content_reclaim_intent(reclaim_authorization(
+                    &token_reclaim,
+                    token_damaged,
+                    39,
+                ))
+                .await,
+            Err(Error::InvalidFormat { .. })
+        ));
+
+        let mut damage = db.transaction(TransactionOptions::default());
+        damage
+            .put_bucket(
+                CONTENT_CONTROL_BUCKET,
+                content_control_key(sealed.storage_domain_id(), sealed.content_id()),
+                b"malformed".to_vec(),
+            )
+            .expect("damage stages");
+        damage.commit().await.expect("damage commits");
+        let mut reclaim = db.transaction(TransactionOptions::default());
+        assert!(matches!(
+            reclaim
+                .stage_content_reclaim_intent(reclaim_authorization(&reclaim, sealed, 37))
+                .await,
+            Err(Error::InvalidFormat { .. })
+        ));
+    });
 }
 
 #[test]

@@ -5,6 +5,69 @@ use crate::{options::DurabilityMode, types::ReadVersion};
 /// Convenient result alias used by Trine KV APIs.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Physical reason that reclaim intent cannot currently be recorded.
+///
+/// Each variant carries the coordinate a higher-layer worker needs to decide
+/// whether to wait or obtain a new exact proof. These blockers do not mutate
+/// content and never authorize deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentReclaimBlocker {
+    /// The higher-layer proof reached its exclusive wall-clock deadline.
+    ProofExpired {
+        /// Proof deadline as Unix epoch milliseconds.
+        expired_at_unix_ms: u64,
+    },
+    /// Durable physical activity occurred after the proof's stable read point.
+    Superseded {
+        /// Latest protected content-activity commit sequence.
+        activity_at_commit_seq: u64,
+        /// Stable commit sequence verified by the reclaim proof.
+        verified_at_commit_seq: u64,
+    },
+    /// An unexpired upload token can still attach this content.
+    UploadToken {
+        /// Upload-token deadline as Unix epoch milliseconds.
+        expires_at_unix_ms: u64,
+    },
+    /// An unexpired read lease still protects this content.
+    ReadLease {
+        /// Read-lease deadline as Unix epoch milliseconds.
+        expires_at_unix_ms: u64,
+    },
+}
+
+impl fmt::Display for ContentReclaimBlocker {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProofExpired { expired_at_unix_ms } => write!(
+                formatter,
+                "proof expired at Unix millisecond {expired_at_unix_ms}"
+            ),
+            Self::Superseded {
+                activity_at_commit_seq,
+                verified_at_commit_seq,
+            } => write!(
+                formatter,
+                "proof at commit {verified_at_commit_seq} was superseded by physical activity at commit {activity_at_commit_seq}"
+            ),
+            Self::UploadToken { expires_at_unix_ms } => write!(
+                formatter,
+                "upload authority remains until Unix millisecond {expires_at_unix_ms}"
+            ),
+            Self::ReadLease { expires_at_unix_ms } => write!(
+                formatter,
+                "a read lease remains until Unix millisecond {expires_at_unix_ms}"
+            ),
+        }
+    }
+}
+
+impl ContentReclaimBlocker {
+    fn fmt_as_error(self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "content reclaim is blocked: {self}")
+    }
+}
+
 /// Error returned by database, storage, recovery, and transaction operations.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -88,6 +151,11 @@ pub enum Error {
     ContentLeaseExpired {
         /// Lease deadline as Unix epoch milliseconds.
         expired_at_unix_ms: u64,
+    },
+    /// Physical state currently prevents durable reclaim intent.
+    ContentReclaimBlocked {
+        /// Typed blocker and its recovery coordinate.
+        blocker: ContentReclaimBlocker,
     },
     /// No durable upload session exists for the requested identity.
     ContentUploadNotFound {
@@ -224,6 +292,9 @@ pub(crate) enum ErrorSnapshot {
     ContentLeaseExpired {
         expired_at_unix_ms: u64,
     },
+    ContentReclaimBlocked {
+        blocker: ContentReclaimBlocker,
+    },
     ContentUploadNotFound {
         upload_id: String,
     },
@@ -276,6 +347,30 @@ pub(crate) enum ErrorSnapshot {
 }
 
 impl ErrorSnapshot {
+    const fn lease_dead(expired_at_unix_ms: u64) -> Self {
+        Self::ContentLeaseExpired { expired_at_unix_ms }
+    }
+
+    const fn content_reclaim_blocked(blocker: ContentReclaimBlocker) -> Self {
+        Self::ContentReclaimBlocked { blocker }
+    }
+
+    const fn token_dead(expired_at_unix_ms: u64) -> Self {
+        Self::UploadTokenExpired { expired_at_unix_ms }
+    }
+
+    fn upload_missing(upload_id: &str) -> Self {
+        Self::ContentUploadNotFound {
+            upload_id: upload_id.to_owned(),
+        }
+    }
+
+    fn upload_sealed(upload_id: &str) -> Self {
+        Self::ContentUploadSealed {
+            upload_id: upload_id.to_owned(),
+        }
+    }
+
     #[must_use]
     pub(crate) fn capture(error: &Error) -> Self {
         match error {
@@ -329,15 +424,12 @@ impl ErrorSnapshot {
             Error::ContentLeaseNotFound { lease_id } => Self::ContentLeaseNotFound {
                 lease_id: lease_id.clone(),
             },
-            Error::ContentLeaseExpired { expired_at_unix_ms } => Self::ContentLeaseExpired {
-                expired_at_unix_ms: *expired_at_unix_ms,
-            },
-            Error::ContentUploadNotFound { upload_id } => Self::ContentUploadNotFound {
-                upload_id: upload_id.clone(),
-            },
-            Error::ContentUploadSealed { upload_id } => Self::ContentUploadSealed {
-                upload_id: upload_id.clone(),
-            },
+            Error::ContentLeaseExpired {
+                expired_at_unix_ms: expiry,
+            } => Self::lease_dead(*expiry),
+            Error::ContentReclaimBlocked { blocker } => Self::content_reclaim_blocked(*blocker),
+            Error::ContentUploadNotFound { upload_id } => Self::upload_missing(upload_id),
+            Error::ContentUploadSealed { upload_id } => Self::upload_sealed(upload_id),
             Error::ContentUploadConflict {
                 upload_id,
                 expected_revision,
@@ -349,9 +441,9 @@ impl ErrorSnapshot {
             },
             Error::UploadTokenInvalid => Self::UploadTokenInvalid,
             Error::UploadTokenScopeMismatch => Self::UploadTokenScopeMismatch,
-            Error::UploadTokenExpired { expired_at_unix_ms } => Self::UploadTokenExpired {
-                expired_at_unix_ms: *expired_at_unix_ms,
-            },
+            Error::UploadTokenExpired {
+                expired_at_unix_ms: expiry,
+            } => Self::token_dead(*expiry),
             Error::UploadTokenAlreadyConsumed => Self::UploadTokenAlreadyConsumed,
             Error::ContentRangeOutOfBounds { start, length } => Self::ContentRangeOutOfBounds {
                 start: *start,
@@ -420,6 +512,7 @@ impl ErrorSnapshot {
             Self::ContentLeaseExpired { expired_at_unix_ms } => {
                 Error::ContentLeaseExpired { expired_at_unix_ms }
             }
+            Self::ContentReclaimBlocked { blocker } => Error::ContentReclaimBlocked { blocker },
             Self::ContentUploadNotFound { upload_id } => Error::ContentUploadNotFound { upload_id },
             Self::ContentUploadSealed { upload_id } => Error::ContentUploadSealed { upload_id },
             Self::ContentUploadConflict {
@@ -545,12 +638,9 @@ impl fmt::Display for Error {
                 formatter,
                 "content lease expired at Unix millisecond {expired_at_unix_ms}"
             ),
-            Self::ContentUploadNotFound { upload_id } => {
-                write!(formatter, "content upload not found: {upload_id}")
-            }
-            Self::ContentUploadSealed { upload_id } => {
-                write!(formatter, "content upload is already sealed: {upload_id}")
-            }
+            Self::ContentReclaimBlocked { blocker } => blocker.fmt_as_error(formatter),
+            Self::ContentUploadNotFound { upload_id } => fmt_upload_missing(formatter, upload_id),
+            Self::ContentUploadSealed { upload_id } => fmt_upload_sealed(formatter, upload_id),
             Self::ContentUploadConflict {
                 upload_id,
                 expected_revision,
@@ -609,6 +699,14 @@ impl error::Error for Error {
             _ => None,
         }
     }
+}
+
+fn fmt_upload_missing(formatter: &mut fmt::Formatter<'_>, upload_id: &str) -> fmt::Result {
+    write!(formatter, "content upload {upload_id} was not found")
+}
+
+fn fmt_upload_sealed(formatter: &mut fmt::Formatter<'_>, upload_id: &str) -> fmt::Result {
+    write!(formatter, "content upload {upload_id} is already sealed")
 }
 
 impl From<io::Error> for Error {

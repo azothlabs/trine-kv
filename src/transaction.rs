@@ -6,11 +6,16 @@ use std::{
 use crate::{
     bucket::DEFAULT_BUCKET_NAME,
     content::{
-        CONTENT_TOKEN_BUCKET, ContentAttachment, ContentAttachmentScope, ContentChangeId,
-        UploadToken, UploadTokenRecord, upload_token_key,
+        CONTENT_CONTROL_BUCKET, CONTENT_LEASE_BUCKET, CONTENT_TOKEN_BUCKET,
+        CONTENT_TOKEN_INDEX_BUCKET, ContentAttachment, ContentAttachmentScope, ContentChangeId,
+        ContentControlRecord, ContentDescriptor, ContentLeaseId, ContentLeaseRecord,
+        ContentReclaimAuthorization, ContentReclaimIntentStage, ContentTokenIndexRecord,
+        UploadToken, UploadTokenRecord, content_control_key, content_lease_prefix,
+        content_prefix_range, content_token_index_key, content_token_index_prefix,
+        upload_token_key,
     },
     db::Db,
-    error::{Error, Result},
+    error::{ContentReclaimBlocker, Error, Result},
     iterator::Iter,
     options::WriteOptions,
     types::{CommitInfo, KeyRange, ReadVersion, Sequence, Value},
@@ -388,10 +393,35 @@ impl Transaction {
             change_id,
             now_unix_ms,
         )?;
+        let attachment = consumed.attachment();
+        self.stage_content_activity_sync(
+            attachment.scope().storage_domain_id(),
+            attachment.content_id(),
+        )?;
+        self.writes.delete_bucket(
+            CONTENT_TOKEN_INDEX_BUCKET,
+            content_token_index_key(
+                attachment.scope().storage_domain_id(),
+                attachment.content_id(),
+                token,
+            ),
+        )?;
         self.writes
             .put_bucket(CONTENT_TOKEN_BUCKET, key.clone(), consumed.encode())?;
         self.content_token_consumptions.insert(key, change_id);
-        Ok(consumed.attachment())
+        Ok(attachment)
+    }
+
+    pub(crate) fn stage_content_activity_sync(
+        &mut self,
+        storage_domain_id: crate::StorageDomainId,
+        content_id: crate::ContentId,
+    ) -> Result<()> {
+        let key = content_control_key(storage_domain_id, content_id);
+        if let Some(bytes) = self.get_bucket_sync(CONTENT_CONTROL_BUCKET, &key)? {
+            ContentControlRecord::decode(&bytes, storage_domain_id, content_id)?;
+        }
+        self.stage_active_content_control(storage_domain_id, content_id, key)
     }
 
     fn require_consistent_staged_token(
@@ -603,10 +633,308 @@ impl Transaction {
             change_id,
             now_unix_ms,
         )?;
+        let attachment = consumed.attachment();
+        self.stage_content_activity(
+            attachment.scope().storage_domain_id(),
+            attachment.content_id(),
+        )
+        .await?;
+        self.writes.delete_bucket(
+            CONTENT_TOKEN_INDEX_BUCKET,
+            content_token_index_key(
+                attachment.scope().storage_domain_id(),
+                attachment.content_id(),
+                token,
+            ),
+        )?;
         self.writes
             .put_bucket(CONTENT_TOKEN_BUCKET, key.clone(), consumed.encode())?;
         self.content_token_consumptions.insert(key, change_id);
-        Ok(consumed.attachment())
+        Ok(attachment)
+    }
+
+    pub(crate) async fn stage_content_activity(
+        &mut self,
+        storage_domain_id: crate::StorageDomainId,
+        content_id: crate::ContentId,
+    ) -> Result<()> {
+        let key = content_control_key(storage_domain_id, content_id);
+        if let Some(bytes) = self.get_bucket(CONTENT_CONTROL_BUCKET, &key).await? {
+            ContentControlRecord::decode(&bytes, storage_domain_id, content_id)?;
+        }
+        self.stage_active_content_control(storage_domain_id, content_id, key)
+    }
+
+    fn stage_active_content_control(
+        &mut self,
+        storage_domain_id: crate::StorageDomainId,
+        content_id: crate::ContentId,
+        key: Vec<u8>,
+    ) -> Result<()> {
+        let active = ContentControlRecord::active(storage_domain_id, content_id);
+        self.writes.put_bucket_with_commit_sequence(
+            CONTENT_CONTROL_BUCKET,
+            key,
+            &active.encode_prefix(),
+            &[],
+        )
+    }
+
+    /// Checks physical content state and stages durable reclaim intent.
+    ///
+    /// The higher layer must verify logical reachability, liveness, root
+    /// generation, and the opaque proof token in this same transaction before
+    /// calling this method. Trine KV independently validates that the sealed
+    /// descriptor exists, the proof deadline has not passed, no later durable
+    /// physical activity exists, and no unexpired upload authority or read
+    /// lease remains. It then stages one protected per-content intent record.
+    /// None of these steps deletes, relocates, or makes content unreadable.
+    ///
+    /// Upload-token publication or consumption and leased open or renewal all
+    /// write the same per-content control key. A concurrent operation therefore
+    /// either commits first and invalidates this transaction, or conflicts after
+    /// this intent commits and must retry against the newer state.
+    ///
+    /// # Parameters
+    ///
+    /// - `authorization`: exact domain/content identity, opaque proof token,
+    ///   stable verification sequence `S`, and exclusive Unix-millisecond
+    ///   expiry supplied by the verified higher layer.
+    ///
+    /// # Returns
+    ///
+    /// [`ContentReclaimIntentStage::Staged`] means this transaction contains a
+    /// new intent write; the intent is not durable until commit succeeds.
+    /// `Existing` means the exact same intent was already durable and reports
+    /// its acceptance sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ContentReclaimBlocked`] with a typed
+    /// [`ContentReclaimBlocker`] after proof expiry, newer physical activity, or
+    /// while upload or lease authority remains. Returns
+    /// [`Error::ContentNotFound`] for a missing descriptor, and format,
+    /// corruption, bucket, storage, or later commit-conflict errors otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use trine_kv::{
+    ///     ContentAttachmentScope, ContentChangeId, ContentReclaimAuthorization,
+    ///     ContentReclaimIntentStage, ContentReclaimProofToken, ContentUploadOptions, Db,
+    ///     DbOptions, OwnerScopeId, StorageDomainId, TransactionOptions,
+    /// };
+    ///
+    /// async fn example() -> trine_kv::Result<()> {
+    ///     let db = Db::open(DbOptions::memory()).await?;
+    ///     let domain = StorageDomainId::from_bytes([1; 16]);
+    ///     let scope = ContentAttachmentScope::new(
+    ///         domain,
+    ///         OwnerScopeId::from_bytes([2; 16]),
+    ///     );
+    ///     let mut upload = db
+    ///         .begin_content_upload(ContentUploadOptions::new(
+    ///             scope,
+    ///             Duration::from_secs(60),
+    ///         ))
+    ///         .await?;
+    ///     upload.write(b"reclaim example").await?;
+    ///     let sealed = upload.seal().await?;
+    ///     let mut attach = db.transaction(TransactionOptions::default());
+    ///     attach
+    ///         .consume_upload_token(
+    ///             sealed.upload_token(),
+    ///             scope,
+    ///             ContentChangeId::from_bytes([3; 16]),
+    ///         )
+    ///         .await?;
+    ///     attach.commit().await?;
+    ///
+    ///     // A real caller obtains these opaque bytes only after its own exact
+    ///     // logical reachability check at `transaction.read_version()`.
+    ///     let mut transaction = db.transaction(TransactionOptions::default());
+    ///     let authorization = ContentReclaimAuthorization::new(
+    ///         domain,
+    ///         sealed.content_id(),
+    ///         ContentReclaimProofToken::from_bytes([4; 49]),
+    ///         transaction.read_version(),
+    ///         u64::MAX,
+    ///     );
+    ///     assert_eq!(
+    ///         transaction
+    ///             .stage_content_reclaim_intent(authorization)
+    ///             .await?,
+    ///         ContentReclaimIntentStage::Staged,
+    ///     );
+    ///     transaction.commit().await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn stage_content_reclaim_intent(
+        &mut self,
+        authorization: ContentReclaimAuthorization,
+    ) -> Result<ContentReclaimIntentStage> {
+        let now_unix_ms = current_epoch_millis()?;
+        if now_unix_ms >= authorization.expires_at_unix_ms() {
+            return Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::ProofExpired {
+                    expired_at_unix_ms: authorization.expires_at_unix_ms(),
+                },
+            });
+        }
+        if authorization.verified_at().as_u64() == 0
+            || authorization.verified_at().as_u64() > self.read_version().as_u64()
+        {
+            return Err(Error::invalid_options(
+                "content reclaim verification sequence is invalid for this transaction",
+            ));
+        }
+        self.db.bucket(CONTENT_CONTROL_BUCKET).await?;
+        self.db.bucket(CONTENT_TOKEN_INDEX_BUCKET).await?;
+        self.db.bucket(CONTENT_LEASE_BUCKET).await?;
+        let descriptor = self
+            .db
+            .read_content_descriptor(
+                authorization.storage_domain_id(),
+                authorization.content_id(),
+            )
+            .await?
+            .ok_or_else(|| Error::ContentNotFound {
+                storage_domain_id: authorization.storage_domain_id().to_string(),
+                content_id: authorization.content_id().to_string(),
+            })?;
+        ContentDescriptor::decode(
+            &descriptor,
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        )?;
+
+        let control_key = content_control_key(
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        );
+        let control_bytes = self
+            .get_bucket(CONTENT_CONTROL_BUCKET, &control_key)
+            .await?
+            .ok_or_else(|| Error::Corruption {
+                message: "sealed content is missing its physical control record".to_owned(),
+            })?;
+        let control = ContentControlRecord::decode(
+            &control_bytes,
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        )?;
+        let physical_activity = control.physical_activity_commit_seq();
+        if physical_activity > authorization.verified_at().as_u64() {
+            return Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::Superseded {
+                    activity_at_commit_seq: physical_activity,
+                    verified_at_commit_seq: authorization.verified_at().as_u64(),
+                },
+            });
+        }
+
+        self.require_no_active_content_token(authorization, now_unix_ms)
+            .await?;
+        self.require_no_active_content_lease(authorization, now_unix_ms)
+            .await?;
+        if control.matches_authorization(authorization) {
+            let accepted_at = control.accepted_at().ok_or_else(|| Error::Corruption {
+                message: "matching reclaim intent has no acceptance sequence".to_owned(),
+            })?;
+            return Ok(ContentReclaimIntentStage::Existing { accepted_at });
+        }
+
+        let intent = control.reclaim_intent(authorization);
+        self.writes.put_bucket_with_commit_sequence(
+            CONTENT_CONTROL_BUCKET,
+            control_key,
+            &intent.encode_prefix(),
+            &[],
+        )?;
+        Ok(ContentReclaimIntentStage::Staged)
+    }
+
+    async fn require_no_active_content_token(
+        &mut self,
+        authorization: ContentReclaimAuthorization,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        let prefix = content_token_index_prefix(
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        );
+        let range = content_prefix_range(prefix.clone())?;
+        for entry in self.range_bucket(CONTENT_TOKEN_INDEX_BUCKET, range).await? {
+            let entry = entry?;
+            let hash: [u8; 32] = entry
+                .key
+                .get(prefix.len()..)
+                .ok_or_else(|| Error::Corruption {
+                    message: "content token-index key is shorter than its content prefix"
+                        .to_owned(),
+                })?
+                .try_into()
+                .map_err(|_| Error::Corruption {
+                    message: "content token-index key has a malformed hash length".to_owned(),
+                })?;
+            let token = ContentTokenIndexRecord::decode(
+                &entry.value,
+                authorization.storage_domain_id(),
+                authorization.content_id(),
+                hash,
+            )?;
+            if now_unix_ms < token.expires_at_unix_ms() {
+                return Err(Error::ContentReclaimBlocked {
+                    blocker: ContentReclaimBlocker::UploadToken {
+                        expires_at_unix_ms: token.expires_at_unix_ms(),
+                    },
+                });
+            }
+        }
+        Ok(())
+    }
+
+    async fn require_no_active_content_lease(
+        &mut self,
+        authorization: ContentReclaimAuthorization,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        let prefix = content_lease_prefix(
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        );
+        let range = content_prefix_range(prefix.clone())?;
+        for entry in self.range_bucket(CONTENT_LEASE_BUCKET, range).await? {
+            let entry = entry?;
+            let lease_id = ContentLeaseId::from_bytes(
+                entry
+                    .key
+                    .get(prefix.len()..)
+                    .ok_or_else(|| Error::Corruption {
+                        message: "content lease key is shorter than its content prefix".to_owned(),
+                    })?
+                    .try_into()
+                    .map_err(|_| Error::Corruption {
+                        message: "content lease key has a malformed identity length".to_owned(),
+                    })?,
+            )?;
+            let lease = ContentLeaseRecord::decode(
+                &entry.value,
+                authorization.storage_domain_id(),
+                authorization.content_id(),
+                lease_id,
+            )?;
+            if now_unix_ms < lease.expires_at_unix_ms {
+                return Err(Error::ContentReclaimBlocked {
+                    blocker: ContentReclaimBlocker::ReadLease {
+                        expires_at_unix_ms: lease.expires_at_unix_ms,
+                    },
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Commits the staged writes asynchronously after conflict checks.

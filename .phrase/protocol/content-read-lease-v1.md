@@ -81,10 +81,14 @@ treats every well-formed unexpired record as live. Malformed records fail closed
 and block reclamation until repaired. Grace starts only after the barrier and
 recheck succeed; the barrier/generation is revalidated before physical delete.
 
-The current `content_has_active_lease` helper is intentionally internal and is
-only this conservative precheck. It must not be promoted into a final absence
-proof without the barrier above. Lease checks compose with, but do not replace,
-higher-layer reachability proof, quarantine, and grace.
+The protected per-content control state defined by
+`content-reclaim-intent-v1.md` now supplies the first intent barrier. Leased open
+and durable renewal advance that control state in the same transaction as the
+lease write, so they conflict with intent installation or replace older intent
+with newer Active state. The current `content_has_active_lease` helper remains
+only a conservative precheck and is not deletion authority. Final grace,
+unleased-read handling, representation fencing, and physical deletion remain
+outside this protocol.
 
 Physical relocation and reclamation are outside this slice. Their future tests
 must cover a read spanning relocation, expiry races, lease renewal races, and

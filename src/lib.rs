@@ -152,11 +152,12 @@ pub use bucket::{Bucket, BucketName, BucketReader};
 pub use content::{
     ContentAttachment, ContentAttachmentScope, ContentChangeId, ContentHandle,
     ContentHashAlgorithm, ContentId, ContentLeaseId, ContentLeaseOptions, ContentLeaseOwnerId,
+    ContentReclaimAuthorization, ContentReclaimIntentStage, ContentReclaimProofToken,
     ContentStream, ContentUpload, ContentUploadOptions, ContentUploadResume, OwnerScopeId,
     SealedContent, StorageDomainId, UploadId, UploadToken,
 };
 pub use db::{Db, IntoOpenOptions, MaintenanceBudget, MaintenanceOutcome};
-pub use error::{Error, Result};
+pub use error::{ContentReclaimBlocker, Error, Result};
 pub use iterator::{Direction, Iter, LazyIter, LazyKeyValue, LazyValue};
 pub use object_store::{
     ETag, InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta, Precondition, PutIf,

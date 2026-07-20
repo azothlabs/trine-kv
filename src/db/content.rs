@@ -5,11 +5,13 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     content::{
-        CONTENT_LEASE_BUCKET, CONTENT_TOKEN_BUCKET, ContentDescriptor, ContentHandle, ContentId,
-        ContentLease, ContentLeaseId, ContentLeaseOptions, ContentLeaseRecord, ContentUpload,
-        ContentUploadOptions, ContentUploadResume, SealedContent, StorageDomainId, UploadId,
-        UploadSessionState, UploadSessionStatus, UploadToken, UploadTokenRecord, content_lease_key,
-        content_lease_prefix, current_epoch_millis, upload_token_key,
+        CONTENT_CONTROL_BUCKET, CONTENT_LEASE_BUCKET, CONTENT_TOKEN_BUCKET,
+        CONTENT_TOKEN_INDEX_BUCKET, ContentDescriptor, ContentHandle, ContentId, ContentLease,
+        ContentLeaseId, ContentLeaseOptions, ContentLeaseRecord, ContentTokenIndexRecord,
+        ContentUpload, ContentUploadOptions, ContentUploadResume, SealedContent, StorageDomainId,
+        UploadId, UploadSessionState, UploadSessionStatus, UploadToken, UploadTokenRecord,
+        content_lease_key, content_lease_prefix, content_token_index_key, current_epoch_millis,
+        upload_token_key,
     },
     error::{Error, Result},
     options::{DurabilityMode, HostStorageBackend, StorageMode, WriteOptions},
@@ -368,6 +370,9 @@ impl Db {
             content_lease_key(storage_domain_id, content_id, lease_id),
             record.encode(),
         )?;
+        transaction
+            .stage_content_activity(storage_domain_id, content_id)
+            .await?;
         transaction.commit().await?;
         Ok(handle.with_lease(ContentLease::new(
             lease_id,
@@ -425,6 +430,9 @@ impl Db {
             }
             record.expires_at_unix_ms = next_expiry;
             transaction.put_bucket(CONTENT_LEASE_BUCKET, key.clone(), record.encode())?;
+            transaction
+                .stage_content_activity(handle.storage_domain_id(), handle.content_id())
+                .await?;
             match transaction.commit().await {
                 Ok(_) => {
                     lease.publish_expiry(next_expiry);
@@ -607,8 +615,17 @@ impl Db {
         sealed: SealedContent,
     ) -> Result<()> {
         self.bucket(CONTENT_TOKEN_BUCKET).await?;
+        self.bucket(CONTENT_TOKEN_INDEX_BUCKET).await?;
+        self.bucket(CONTENT_CONTROL_BUCKET).await?;
+        self.bucket(CONTENT_LEASE_BUCKET).await?;
         let expected = UploadTokenRecord::available(upload_id, sealed);
         let key = upload_token_key(sealed.upload_token());
+        let index = ContentTokenIndexRecord::for_token(sealed);
+        let index_key = content_token_index_key(
+            sealed.storage_domain_id(),
+            sealed.content_id(),
+            sealed.upload_token(),
+        );
         let mut transaction = self.transaction(TransactionOptions {
             write_options: WriteOptions::new(sealed.durability()),
         });
@@ -619,9 +636,46 @@ impl Db {
                     message: format!("upload {upload_id} token claims changed during seal retry"),
                 });
             }
+            let indexed = transaction
+                .get_bucket(CONTENT_TOKEN_INDEX_BUCKET, &index_key)
+                .await?;
+            if existing.is_available() {
+                let indexed = indexed.ok_or_else(|| Error::Corruption {
+                    message: format!("upload {upload_id} is missing its token-authority index"),
+                })?;
+                ContentTokenIndexRecord::decode(
+                    &indexed,
+                    sealed.storage_domain_id(),
+                    sealed.content_id(),
+                    crate::content::upload_token_hash(sealed.upload_token()),
+                )?;
+            } else if indexed.is_some() {
+                return Err(Error::Corruption {
+                    message: format!("consumed upload {upload_id} retained token authority"),
+                });
+            }
+            let control_key = crate::content::content_control_key(
+                sealed.storage_domain_id(),
+                sealed.content_id(),
+            );
+            let control = transaction
+                .get_bucket(CONTENT_CONTROL_BUCKET, &control_key)
+                .await?
+                .ok_or_else(|| Error::Corruption {
+                    message: format!("sealed upload {upload_id} is missing content control state"),
+                })?;
+            crate::content::ContentControlRecord::decode(
+                &control,
+                sealed.storage_domain_id(),
+                sealed.content_id(),
+            )?;
             return Ok(());
         }
         transaction.put_bucket(CONTENT_TOKEN_BUCKET, key, expected.encode())?;
+        transaction.put_bucket(CONTENT_TOKEN_INDEX_BUCKET, index_key, index.encode())?;
+        transaction
+            .stage_content_activity(sealed.storage_domain_id(), sealed.content_id())
+            .await?;
         transaction.commit().await?;
         Ok(())
     }
