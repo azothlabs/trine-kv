@@ -1,5 +1,33 @@
 # Current Phase
 
+## Consumer-driven Branch metadata symmetry — 2026-07-20
+
+TrineDB's protected logical Branch-root publication needs the physical fork and
+checkpoint established before its own logical record becomes visible. Root
+Branch creation and deletion already had async metadata paths, but nested
+Branch creation and lineage lookup did not. The upper layer also had to decode
+Trine KV's private registry bytes to read lineage asynchronously.
+
+Current slice: add `create_branch_from_async` and `branch_info_async` with the
+same fork, parent, retention, and error semantics as their synchronous peers.
+The async methods use async checkpoint and registry operations throughout, so
+object-storage and browser callers do not cross into a synchronous metadata
+path. A checkpoint-only interrupted create remains invisible and may be retried.
+
+Audit correction: an in-memory existing-name checkpoint write used
+`HashMap::insert` before returning `CheckpointAlreadyExists`, which replaced the
+old pin despite the error. Checkpoint creation now checks existence before
+insertion. Branch creation verifies that an orphan checkpoint pins the exact
+requested fork before publishing a registry entry.
+
+Acceptance result: 17 focused Branch tests pass, including nested lineage and a
+regression proving a mismatched orphan checkpoint neither changes its old pin
+nor publishes a Branch. The complete all-feature suite passes with 477 library
+tests (475 passed, two ignored) and every integration target. Strict Rustdoc, 23
+doctests, locked all-target/all-feature check, Clippy/import, formatting, and
+diff gates pass. This slice changes no registry, checkpoint, WAL, manifest, or
+Branch data format.
+
 ## Consumer-driven content read lease — 2026-07-20
 
 TrineDB's accepted FileHandle contract fixes one immutable content identity but

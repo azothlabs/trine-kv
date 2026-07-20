@@ -1,3 +1,4 @@
+use super::fork_checkpoint;
 use crate::{Db, DbOptions, KeyRange};
 
 fn memory_db() -> Db {
@@ -415,6 +416,39 @@ fn branch_info_exposes_fork_and_parent_without_opening_data() {
     db.create_branch_from("b", "a").expect("create b");
     let b = db.branch_info("b").expect("info").expect("b present");
     assert_eq!(b.parent(), Some("a"), "exposes the parent for nesting");
+}
+
+#[test]
+fn orphan_fork_checkpoint_cannot_be_rebound_to_another_version() {
+    let db = Db::open_sync(DbOptions::memory().with_keep_last_read_versions(64)).expect("open");
+    let old_fork = db.latest_read_version();
+    db.create_checkpoint_at_sync(&fork_checkpoint("dev"), old_fork)
+        .expect("orphan checkpoint creates");
+    db.bucket_sync("data")
+        .expect("bucket")
+        .put_sync(b"advance".to_vec(), b"1".to_vec())
+        .expect("version advances");
+    let new_fork = db.latest_read_version();
+    assert_ne!(old_fork, new_fork);
+
+    let error = db
+        .create_branch("dev", new_fork)
+        .expect_err("a stale orphan checkpoint cannot pin the new fork");
+    assert!(error.to_string().contains("different version"));
+    assert!(
+        db.branch_info("dev").expect("registry reads").is_none(),
+        "checkpoint mismatch must not publish a branch registry entry"
+    );
+
+    db.create_branch("dev", old_fork)
+        .expect("retrying the matching interrupted create succeeds");
+    assert_eq!(
+        db.branch_info("dev")
+            .expect("registry reads")
+            .expect("branch publishes")
+            .fork(),
+        old_fork
+    );
 }
 
 #[test]

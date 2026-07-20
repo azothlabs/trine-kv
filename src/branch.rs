@@ -590,6 +590,40 @@ fn fork_checkpoint(branch: &str) -> String {
     format!("{RESERVED}fork{SEP}{branch}")
 }
 
+fn ensure_fork_checkpoint(db: &Db, branch: &str, from: ReadVersion) -> Result<()> {
+    let checkpoint = fork_checkpoint(branch);
+    match db.create_checkpoint_at_sync(&checkpoint, from) {
+        Ok(()) => Ok(()),
+        Err(Error::CheckpointAlreadyExists { .. }) => {
+            if db.checkpoint_read_version_sync(&checkpoint)? == from {
+                Ok(())
+            } else {
+                Err(Error::invalid_options(
+                    "branch fork checkpoint already pins a different version",
+                ))
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn ensure_fork_checkpoint_async(db: &Db, branch: &str, from: ReadVersion) -> Result<()> {
+    let checkpoint = fork_checkpoint(branch);
+    match db.create_checkpoint_at(&checkpoint, from).await {
+        Ok(()) => Ok(()),
+        Err(Error::CheckpointAlreadyExists { .. }) => {
+            if db.checkpoint_read_version(&checkpoint).await? == from {
+                Ok(())
+            } else {
+                Err(Error::invalid_options(
+                    "branch fork checkpoint already pins a different version",
+                ))
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 impl Db {
     /// Forks an **ephemeral** copy-on-write [`Branch`] from a past `version` — an
     /// `AS OF` read view with an in-memory write overlay that vanishes with the
@@ -644,10 +678,7 @@ impl Db {
         // Pin the fork durably (this also validates `from` is readable). The
         // checkpoint lives in the manifest, so the parent's GC cannot reclaim the
         // history the branch reads through, even after a restart.
-        match self.create_checkpoint_at_sync(&fork_checkpoint(name), from) {
-            Ok(()) | Err(Error::CheckpointAlreadyExists { .. }) => {}
-            Err(error) => return Err(error),
-        }
+        ensure_fork_checkpoint(self, name, from)?;
         persist_registry(
             self,
             name,
@@ -675,13 +706,7 @@ impl Db {
                 "branch already exists with a different fork version",
             ));
         }
-        match self
-            .create_checkpoint_at(&fork_checkpoint(name), from)
-            .await
-        {
-            Ok(()) | Err(Error::CheckpointAlreadyExists { .. }) => {}
-            Err(error) => return Err(error),
-        }
+        ensure_fork_checkpoint_async(self, name, from).await?;
         persist_registry_async(
             self,
             name,
@@ -718,10 +743,7 @@ impl Db {
         // of now. Pinning it keeps the parent's (and its ancestors') history that
         // the chain reads through retained.
         let from = self.latest_read_version();
-        match self.create_checkpoint_at_sync(&fork_checkpoint(name), from) {
-            Ok(()) | Err(Error::CheckpointAlreadyExists { .. }) => {}
-            Err(error) => return Err(error),
-        }
+        ensure_fork_checkpoint(self, name, from)?;
         persist_registry(
             self,
             name,
@@ -731,6 +753,51 @@ impl Db {
                 written_buckets: BTreeSet::new(),
             },
         )
+    }
+
+    /// Async-first form of [`Db::create_branch_from`].
+    ///
+    /// The child forks `parent` at the latest globally committed
+    /// [`ReadVersion`] observed before the checkpoint is created. Its registry
+    /// entry stores that exact fork coordinate and the parent name, so reopening
+    /// walks the same frozen ancestor chain. The parent is not modified.
+    ///
+    /// This form publishes both the durable fork checkpoint and branch registry
+    /// through async metadata APIs. It is therefore required for object-storage
+    /// and browser backends that reject synchronous manifest updates. If the
+    /// checkpoint succeeds but registry publication fails, retrying is safe: the
+    /// conservative checkpoint remains and no named child is visible yet.
+    ///
+    /// # Parameters
+    ///
+    /// - `name`: new durable child-branch name.
+    /// - `parent`: existing durable parent-branch name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidOptions`] when `parent` does not exist or `name`
+    /// is already registered. It also returns retained-history, checkpoint,
+    /// conditional-write, durability, and backend errors from publishing the
+    /// fork metadata. A failed call never publishes a partial registry entry.
+    pub async fn create_branch_from_async(&self, name: &str, parent: &str) -> Result<()> {
+        if self.read_registry_async(parent).await?.is_none() {
+            return Err(Error::invalid_options("parent branch does not exist"));
+        }
+        if self.read_registry_async(name).await?.is_some() {
+            return Err(Error::invalid_options("branch already exists"));
+        }
+        let from = self.latest_read_version();
+        ensure_fork_checkpoint_async(self, name, from).await?;
+        persist_registry_async(
+            self,
+            name,
+            &RegistryEntry {
+                fork: from,
+                parent: Some(parent.to_owned()),
+                written_buckets: BTreeSet::new(),
+            },
+        )
+        .await
     }
 
     /// Opens a durable named branch, re-pinning its fork and assembling its read
@@ -928,6 +995,37 @@ impl Db {
             fork: entry.fork,
             parent: entry.parent,
         }))
+    }
+
+    /// Async-first form of [`Db::branch_info`].
+    ///
+    /// Reads only the durable branch registry; it does not open branch data
+    /// buckets, create a snapshot, or change the fork pin. This is the supported
+    /// lineage lookup for object-storage and browser backends whose registry
+    /// reads use async I/O.
+    ///
+    /// # Parameters
+    ///
+    /// - `name`: durable branch name to resolve.
+    ///
+    /// # Returns
+    ///
+    /// `Some(BranchInfo)` contains the exact global fork coordinate and optional
+    /// parent name. `None` means no registry entry is visible under `name`; it
+    /// does not report checkpoint-only leftovers from an interrupted create.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage and backend read errors, or [`Error::Corruption`] when a
+    /// present registry entry has an invalid format.
+    pub async fn branch_info_async(&self, name: &str) -> Result<Option<BranchInfo>> {
+        Ok(self
+            .read_registry_async(name)
+            .await?
+            .map(|entry| BranchInfo {
+                fork: entry.fork,
+                parent: entry.parent,
+            }))
     }
 
     fn read_registry(&self, name: &str) -> Result<Option<RegistryEntry>> {

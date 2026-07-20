@@ -167,11 +167,12 @@ impl Db {
                 .checkpoints
                 .lock()
                 .map_err(|_| lock_poisoned("checkpoint registry"))?;
-            if checkpoints.insert(name.to_owned(), sequence).is_some() {
+            if checkpoints.contains_key(name) {
                 return Err(Error::CheckpointAlreadyExists {
                     name: name.to_owned(),
                 });
             }
+            checkpoints.insert(name.to_owned(), sequence);
         }
         Ok(())
     }

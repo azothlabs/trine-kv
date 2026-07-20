@@ -16467,3 +16467,47 @@ Negative check:
 - Consume leased open only after higher-layer authorization. Before any content
   deletion is implemented, add the per-content quarantine/fence and concurrent
   open/renew/reclaim tests required by the lease protocol.
+
+## 2026-07-20: async Branch lineage and checkpoint no-overwrite semantics
+
+### Observation
+
+- Nested durable Branch creation and typed lineage lookup had only synchronous
+  public APIs, while the physical checkpoint and registry are async metadata on
+  object-storage/browser backends.
+- TrineDB consequently decoded the private branch registry format for async
+  reads, creating an unnecessary cross-crate storage-format dependency.
+- In-memory `record_checkpoint` inserted the new sequence before returning
+  `CheckpointAlreadyExists`; an error therefore changed the old checkpoint and
+  made interrupted Branch retry capable of pinning the wrong fork.
+
+### Fix
+
+- Added `Db::create_branch_from_async`, using async parent/name lookup,
+  checkpoint creation, and registry publication while preserving the exact
+  latest global fork coordinate and parent link.
+- Added `Db::branch_info_async`, returning the stable `BranchInfo` type without
+  opening data buckets or exposing private registry bytes.
+- Centralized Branch fork-checkpoint establishment for sync and async creation.
+  An existing checkpoint is accepted only when it pins the requested exact
+  `ReadVersion`; otherwise creation fails before registry publication.
+- Changed in-memory checkpoint creation to check for an existing name before
+  insertion. `CheckpointAlreadyExists` is now side-effect free, matching its
+  documented contract and persistent manifest behavior.
+
+### Verification
+
+- All 17 focused Branch tests pass. The new orphan regression creates a pin,
+  advances the database, rejects rebinding that name to the newer fork, proves
+  no registry entry appeared, then successfully retries the original fork.
+- Focused checkpoint tests pass. All-target/all-feature Clippy with wildcard
+  imports denied passes with only the two existing long-function warnings.
+- The complete all-feature suite passes with 477 library tests (475 passed, two
+  ignored) and every integration target. Strict Rustdoc, 23 doctests, locked
+  all-target/all-feature check, formatting, and diff checks pass.
+
+### Recommended next action
+
+- Keep higher layers on typed async lineage APIs. If physical orphan cleanup is
+  later automated, enumerate only checkpoint/registry discrepancies and retain
+  history on uncertainty; do not reinterpret upper-layer logical Branch roots.
