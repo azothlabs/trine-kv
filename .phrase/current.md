@@ -1,5 +1,52 @@
 # Current Phase
 
+## Consumer-driven content read lease — 2026-07-20
+
+TrineDB's accepted FileHandle contract fixes one immutable content identity but
+the current Trine KV `ContentHandle` only caches a descriptor. It carries no
+lease identity or expiry, so future relocation or reclamation would have no
+authoritative way to distinguish an active read from an unreachable object.
+
+Current slice: add a compatible leased-open path without changing existing
+unleased content reads or physical layout. A content lease has an opaque caller
+owner, generated lease identity, explicit Unix-millisecond expiry, and an exact
+`(StorageDomainId, ContentId)` binding. Lease records are durable protected KV
+state keyed for bounded per-content inspection. Handle clones share one lease;
+reads fail closed after expiry; renewal is explicit and cannot revive an expired
+lease. Drop performs no asynchronous I/O and simply allows the durable lease to
+expire.
+
+Out of scope: physical relocation, content reclamation, automatic renewal,
+higher-layer Principal/Policy decisions, background expired-record cleanup, and
+changing the existing `open_content` behavior.
+
+Acceptance gate: leased open returns a verified handle with stable content and
+lease identities; clone shares expiry; valid renewal extends it; wrong identity,
+expired renewal/read, malformed state, and zero/overflow TTL fail with typed
+errors; an internal active-lease probe sees only unexpired exact-content leases;
+memory and persistent reopen tests pass; strict Rustdoc/doctest and the existing
+full gate remain green.
+
+Result: complete. `open_content_leased` publishes a versioned durable record for
+an exact content identity before returning. Handle clones share an atomic local
+deadline; renewal validates owner, content, lease, durable expiry, and bounded
+optimistic conflicts before advancing that deadline. Expired leases cannot be
+revived, unleased handles cannot renew, and malformed records fail closed.
+
+The stable record format and lifecycle are documented in
+`.phrase/protocol/content-read-lease-v1.md`. Its concurrency boundary is
+explicit: exact-prefix inspection is a conservative precheck, not deletion
+authority. Future reclamation must install and revalidate a per-content
+quarantine/fence around lease recheck and grace. Existing `open_content` and
+physical content layout are unchanged.
+
+Memory and native-reopen tests cover leased reads, clone renewal, expiry,
+missing lease, zero TTL, exact active inspection, persistence, and malformed
+state. The all-feature suite passes with 476 library tests (474 passed, two
+ignored) and every integration target. Strict Rustdoc, doctests, locked check,
+all-target/all-feature Clippy with wildcard imports denied, formatting, and diff
+checks pass.
+
 ## Consumer-driven compatible deltas — 2026-07-19
 
 TrineDB's protected logical Version catalog required the exact accepted local

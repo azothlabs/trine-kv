@@ -10,10 +10,12 @@ use std::{
 
 use futures::executor::block_on;
 
+use super::{CONTENT_LEASE_BUCKET, ContentLeaseRecord, content_lease_key};
 use crate::{
-    ContentAttachmentScope, ContentChangeId, ContentId, ContentUploadOptions, ContentUploadResume,
-    Db, DbOptions, ETag, Error, InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta,
-    OwnerScopeId, Precondition, PutIf, StorageDomainId, TransactionOptions, UploadToken,
+    ContentAttachmentScope, ContentChangeId, ContentId, ContentLeaseOptions, ContentLeaseOwnerId,
+    ContentUploadOptions, ContentUploadResume, Db, DbOptions, ETag, Error, InMemoryObjectStore,
+    ObjectClient, ObjectFuture, ObjectMeta, OwnerScopeId, Precondition, PutIf, StorageDomainId,
+    TransactionOptions, UploadToken,
 };
 
 const TEST_CHUNK_BYTES: usize = 64 * 1024;
@@ -44,6 +46,162 @@ fn content_id_portable_bytes_round_trip_and_reject_unknown_algorithms() {
         ContentId::from_bytes(unknown),
         Err(Error::UnsupportedFormat { .. })
     ));
+}
+
+#[test]
+fn leased_content_open_clone_renew_and_expiry_fail_closed() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let mut upload = db
+            .begin_content_upload(test_upload_options())
+            .await
+            .expect("upload begins");
+        upload.write(b"leased bytes").await.expect("bytes write");
+        let sealed = upload.seal().await.expect("upload seals");
+        let owner = ContentLeaseOwnerId::from_bytes([9_u8; 16]);
+        let handle = db
+            .open_content_leased(
+                test_scope().storage_domain_id(),
+                sealed.content_id(),
+                ContentLeaseOptions::new(owner, Duration::from_secs(60)),
+            )
+            .await
+            .expect("leased content opens");
+        let clone = handle.clone();
+        let lease_id = handle.lease_id().expect("lease identity exists");
+        assert_eq!(clone.lease_id(), Some(lease_id));
+        assert_eq!(
+            handle
+                .read_range(0, u64::MAX)
+                .await
+                .expect("leased range reads")
+                .as_ref(),
+            b"leased bytes"
+        );
+        assert!(
+            db.content_has_active_lease(test_scope().storage_domain_id(), sealed.content_id())
+                .await
+                .expect("active lease probes")
+        );
+
+        let before = handle.lease_expires_at_unix_ms().expect("deadline exists");
+        let renewed = clone
+            .renew_lease(Duration::from_secs(120))
+            .await
+            .expect("lease renews");
+        assert!(renewed >= before);
+        assert_eq!(handle.lease_expires_at_unix_ms(), Some(renewed));
+
+        let lease = handle.lease().expect("private lease exists");
+        let expired = ContentLeaseRecord {
+            lease_id,
+            owner_id: owner,
+            storage_domain_id: handle.storage_domain_id(),
+            content_id: handle.content_id(),
+            expires_at_unix_ms: 0,
+        };
+        let mut expire = db.transaction(TransactionOptions::default());
+        expire
+            .put_bucket(
+                CONTENT_LEASE_BUCKET,
+                content_lease_key(handle.storage_domain_id(), handle.content_id(), lease_id),
+                expired.encode(),
+            )
+            .expect("expired record stages");
+        expire.commit().await.expect("expired record commits");
+        lease.publish_expiry(0);
+        assert!(matches!(
+            handle.read_range(0, 1).await,
+            Err(Error::ContentLeaseExpired { .. })
+        ));
+        assert!(matches!(
+            clone.renew_lease(Duration::from_secs(60)).await,
+            Err(Error::ContentLeaseExpired { .. })
+        ));
+        assert!(
+            !db.content_has_active_lease(test_scope().storage_domain_id(), sealed.content_id())
+                .await
+                .expect("expired lease probes inactive")
+        );
+
+        let unleased = db
+            .open_content(test_scope().storage_domain_id(), sealed.content_id())
+            .await
+            .expect("ordinary content opens");
+        assert!(matches!(
+            unleased.renew_lease(Duration::from_secs(1)).await,
+            Err(Error::ContentLeaseNotFound { .. })
+        ));
+        assert!(matches!(
+            db.open_content_leased(
+                test_scope().storage_domain_id(),
+                sealed.content_id(),
+                ContentLeaseOptions::new(owner, Duration::ZERO),
+            )
+            .await,
+            Err(Error::InvalidOptions { .. })
+        ));
+    });
+}
+
+#[test]
+fn durable_content_lease_survives_reopen_and_malformed_state_fails_closed() {
+    let path = temp_db_path("content-lease-native");
+    let (domain, content_id, lease_id) = block_on(async {
+        let db = Db::open(&path).await.expect("native db opens");
+        let mut upload = db
+            .begin_content_upload(test_upload_options())
+            .await
+            .expect("upload begins");
+        upload
+            .write(b"persistent lease")
+            .await
+            .expect("bytes write");
+        let sealed = upload.seal().await.expect("upload seals");
+        let domain = test_scope().storage_domain_id();
+        let handle = db
+            .open_content_leased(
+                domain,
+                sealed.content_id(),
+                ContentLeaseOptions::new(
+                    ContentLeaseOwnerId::from_bytes([10_u8; 16]),
+                    Duration::from_secs(60),
+                ),
+            )
+            .await
+            .expect("leased content opens");
+        (
+            domain,
+            sealed.content_id(),
+            handle.lease_id().expect("lease exists"),
+        )
+    });
+
+    block_on(async {
+        let db = Db::open(&path).await.expect("native db reopens");
+        assert!(
+            db.content_has_active_lease(domain, content_id)
+                .await
+                .expect("durable lease reopens")
+        );
+        let mut damage = db.transaction(TransactionOptions::default());
+        damage
+            .put_bucket(
+                CONTENT_LEASE_BUCKET,
+                content_lease_key(domain, content_id, lease_id),
+                b"malformed".to_vec(),
+            )
+            .expect("damage stages");
+        damage.commit().await.expect("damage commits");
+        assert!(matches!(
+            db.content_has_active_lease(domain, content_id).await,
+            Err(Error::InvalidFormat { .. })
+        ));
+    });
+
+    std::fs::remove_dir_all(path).expect("test database removes");
 }
 
 #[test]

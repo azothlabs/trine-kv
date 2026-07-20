@@ -79,6 +79,16 @@ pub enum Error {
         /// Algorithm-tagged `ContentId` rendered for diagnostics.
         content_id: String,
     },
+    /// No durable content read lease exists for the supplied identity.
+    ContentLeaseNotFound {
+        /// Missing `ContentLeaseId` rendered for diagnostics.
+        lease_id: String,
+    },
+    /// A content read lease reached its wall-clock deadline.
+    ContentLeaseExpired {
+        /// Lease deadline as Unix epoch milliseconds.
+        expired_at_unix_ms: u64,
+    },
     /// No durable upload session exists for the requested identity.
     ContentUploadNotFound {
         /// `UploadId` rendered for diagnostics.
@@ -208,6 +218,12 @@ pub(crate) enum ErrorSnapshot {
         storage_domain_id: String,
         content_id: String,
     },
+    ContentLeaseNotFound {
+        lease_id: String,
+    },
+    ContentLeaseExpired {
+        expired_at_unix_ms: u64,
+    },
     ContentUploadNotFound {
         upload_id: String,
     },
@@ -310,6 +326,12 @@ impl ErrorSnapshot {
                 storage_domain_id: storage_domain_id.clone(),
                 content_id: content_id.clone(),
             },
+            Error::ContentLeaseNotFound { lease_id } => Self::ContentLeaseNotFound {
+                lease_id: lease_id.clone(),
+            },
+            Error::ContentLeaseExpired { expired_at_unix_ms } => Self::ContentLeaseExpired {
+                expired_at_unix_ms: *expired_at_unix_ms,
+            },
             Error::ContentUploadNotFound { upload_id } => Self::ContentUploadNotFound {
                 upload_id: upload_id.clone(),
             },
@@ -394,6 +416,10 @@ impl ErrorSnapshot {
                 storage_domain_id,
                 content_id,
             },
+            Self::ContentLeaseNotFound { lease_id } => Error::ContentLeaseNotFound { lease_id },
+            Self::ContentLeaseExpired { expired_at_unix_ms } => {
+                Error::ContentLeaseExpired { expired_at_unix_ms }
+            }
             Self::ContentUploadNotFound { upload_id } => Error::ContentUploadNotFound { upload_id },
             Self::ContentUploadSealed { upload_id } => Error::ContentUploadSealed { upload_id },
             Self::ContentUploadConflict {
@@ -511,6 +537,13 @@ impl fmt::Display for Error {
             } => write!(
                 formatter,
                 "content not found in storage domain {storage_domain_id}: {content_id}"
+            ),
+            Self::ContentLeaseNotFound { lease_id } => {
+                write!(formatter, "content lease not found: {lease_id}")
+            }
+            Self::ContentLeaseExpired { expired_at_unix_ms } => write!(
+                formatter,
+                "content lease expired at Unix millisecond {expired_at_unix_ms}"
             ),
             Self::ContentUploadNotFound { upload_id } => {
                 write!(formatter, "content upload not found: {upload_id}")

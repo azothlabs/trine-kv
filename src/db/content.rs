@@ -1,17 +1,15 @@
-use std::{
-    path::PathBuf,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use futures::lock::MutexGuard;
 use sha2::{Digest, Sha256};
 
 use crate::{
     content::{
-        CONTENT_TOKEN_BUCKET, ContentDescriptor, ContentHandle, ContentId, ContentUpload,
+        CONTENT_LEASE_BUCKET, CONTENT_TOKEN_BUCKET, ContentDescriptor, ContentHandle, ContentId,
+        ContentLease, ContentLeaseId, ContentLeaseOptions, ContentLeaseRecord, ContentUpload,
         ContentUploadOptions, ContentUploadResume, SealedContent, StorageDomainId, UploadId,
-        UploadSessionState, UploadSessionStatus, UploadToken, UploadTokenRecord, upload_token_key,
+        UploadSessionState, UploadSessionStatus, UploadToken, UploadTokenRecord, content_lease_key,
+        content_lease_prefix, current_epoch_millis, upload_token_key,
     },
     error::{Error, Result},
     options::{DurabilityMode, HostStorageBackend, StorageMode, WriteOptions},
@@ -25,6 +23,8 @@ use crate::{
 use super::Db;
 
 impl Db {
+    const CONTENT_LEASE_COMMIT_ATTEMPTS: usize = 8;
+
     /// Starts a bounded-memory upload for one immutable `ContentObject`.
     ///
     /// The upload is independent of key/value transactions and is not visible
@@ -267,6 +267,210 @@ impl Db {
             })?;
         let descriptor = ContentDescriptor::decode(&bytes, storage_domain_id, content_id)?;
         Ok(ContentHandle::new(self.clone(), descriptor))
+    }
+
+    /// Opens sealed immutable content under a durable short-lived read lease.
+    ///
+    /// The descriptor is validated exactly as in [`Db::open_content`]. Before
+    /// returning, Trine KV publishes a protected lease record bound to the exact
+    /// `(storage_domain_id, content_id)`, a generated [`ContentLeaseId`], the
+    /// opaque owner from `options`, and an explicit Unix-millisecond deadline.
+    /// All clones of the returned [`ContentHandle`] share that lease deadline.
+    /// Dropping them performs no asynchronous cleanup; the record simply becomes
+    /// inactive at expiry.
+    ///
+    /// The owner has no authorization meaning inside Trine KV. A higher layer
+    /// must authorize before this call and before
+    /// [`ContentHandle::renew_lease`]. Existing [`Db::open_content`] remains the
+    /// compatible unleased path and is not safe against future physical
+    /// reclamation.
+    ///
+    /// # Parameters
+    ///
+    /// - `storage_domain_id`: exact physical lifecycle and deduplication domain.
+    /// - `content_id`: immutable original-byte identity.
+    /// - `options`: opaque owner and a lifetime of at least one millisecond.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors from [`Db::open_content`], [`Error::ReadOnly`] when the
+    /// database cannot publish a lease, [`Error::InvalidOptions`] for an invalid
+    /// or overflowing lifetime, or a transaction/storage error when the lease
+    /// record cannot be committed.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use trine_kv::{
+    ///     ContentAttachmentScope, ContentLeaseOptions, ContentLeaseOwnerId,
+    ///     ContentUploadOptions, Db, DbOptions, OwnerScopeId, StorageDomainId,
+    /// };
+    ///
+    /// async fn example() -> trine_kv::Result<()> {
+    ///     let db = Db::open(DbOptions::memory()).await?;
+    ///     let domain = StorageDomainId::from_bytes([1; 16]);
+    ///     let scope = ContentAttachmentScope::new(
+    ///         domain,
+    ///         OwnerScopeId::from_bytes([2; 16]),
+    ///     );
+    ///     let mut upload = db
+    ///         .begin_content_upload(ContentUploadOptions::new(
+    ///             scope,
+    ///             Duration::from_secs(60),
+    ///         ))
+    ///         .await?;
+    ///     upload.write(b"leased bytes").await?;
+    ///     let sealed = upload.seal().await?;
+    ///
+    ///     let handle = db
+    ///         .open_content_leased(
+    ///             domain,
+    ///             sealed.content_id(),
+    ///             ContentLeaseOptions::new(
+    ///                 ContentLeaseOwnerId::from_bytes([3; 16]),
+    ///                 Duration::from_secs(30),
+    ///             ),
+    ///         )
+    ///         .await?;
+    ///     assert_eq!(&*handle.read_range(0, u64::MAX).await?, b"leased bytes");
+    ///     handle.renew_lease(Duration::from_secs(30)).await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn open_content_leased(
+        &self,
+        storage_domain_id: StorageDomainId,
+        content_id: ContentId,
+        options: ContentLeaseOptions,
+    ) -> Result<ContentHandle> {
+        self.ensure_open()?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+        let ttl_ms = options.ttl_ms()?;
+        let handle = self.open_content(storage_domain_id, content_id).await?;
+        let lease_id = ContentLeaseId::generate()?;
+        let expires_at_unix_ms = current_epoch_millis()?
+            .checked_add(ttl_ms)
+            .ok_or_else(|| Error::invalid_options("content lease expiry overflow"))?;
+        let record = ContentLeaseRecord {
+            lease_id,
+            owner_id: options.owner_id(),
+            storage_domain_id,
+            content_id,
+            expires_at_unix_ms,
+        };
+        self.bucket(CONTENT_LEASE_BUCKET).await?;
+        let mut transaction = self.transaction(TransactionOptions::default());
+        transaction.put_bucket(
+            CONTENT_LEASE_BUCKET,
+            content_lease_key(storage_domain_id, content_id, lease_id),
+            record.encode(),
+        )?;
+        transaction.commit().await?;
+        Ok(handle.with_lease(ContentLease::new(
+            lease_id,
+            options.owner_id(),
+            expires_at_unix_ms,
+        )))
+    }
+
+    pub(crate) async fn renew_content_lease(
+        &self,
+        handle: &ContentHandle,
+        ttl: Duration,
+    ) -> Result<u64> {
+        self.ensure_open()?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+        let lease = handle.lease().ok_or_else(|| Error::ContentLeaseNotFound {
+            lease_id: "unleased handle".to_owned(),
+        })?;
+        let ttl_ms = ContentLeaseOptions::new(lease.owner_id(), ttl).ttl_ms()?;
+        let key = content_lease_key(handle.storage_domain_id(), handle.content_id(), lease.id());
+        for _ in 0..Self::CONTENT_LEASE_COMMIT_ATTEMPTS {
+            let mut transaction = self.transaction(TransactionOptions::default());
+            let bytes = transaction
+                .get_bucket(CONTENT_LEASE_BUCKET, &key)
+                .await?
+                .ok_or_else(|| Error::ContentLeaseNotFound {
+                    lease_id: lease.id().to_string(),
+                })?;
+            let mut record = ContentLeaseRecord::decode(
+                &bytes,
+                handle.storage_domain_id(),
+                handle.content_id(),
+                lease.id(),
+            )?;
+            let now_unix_ms = current_epoch_millis()?;
+            if record.owner_id != lease.owner_id() {
+                return Err(Error::Corruption {
+                    message: "content lease owner differs from its open handle".to_owned(),
+                });
+            }
+            if now_unix_ms >= record.expires_at_unix_ms {
+                return Err(Error::ContentLeaseExpired {
+                    expired_at_unix_ms: record.expires_at_unix_ms,
+                });
+            }
+            let requested_expiry = now_unix_ms
+                .checked_add(ttl_ms)
+                .ok_or_else(|| Error::invalid_options("content lease expiry overflow"))?;
+            let next_expiry = record.expires_at_unix_ms.max(requested_expiry);
+            if next_expiry == record.expires_at_unix_ms {
+                lease.publish_expiry(next_expiry);
+                return Ok(next_expiry);
+            }
+            record.expires_at_unix_ms = next_expiry;
+            transaction.put_bucket(CONTENT_LEASE_BUCKET, key.clone(), record.encode())?;
+            match transaction.commit().await {
+                Ok(_) => {
+                    lease.publish_expiry(next_expiry);
+                    return Ok(next_expiry);
+                }
+                Err(Error::Conflict { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::runtime_busy(
+            "content lease renewal did not converge after repeated conflicts",
+        ))
+    }
+
+    // This is an exact conservative precheck for the future physical
+    // reclamation path. It cannot authorize deletion without a per-content
+    // quarantine/fence that prevents a new lease after this scan.
+    #[allow(dead_code)]
+    pub(crate) async fn content_has_active_lease(
+        &self,
+        storage_domain_id: StorageDomainId,
+        content_id: ContentId,
+    ) -> Result<bool> {
+        let now_unix_ms = current_epoch_millis()?;
+        let prefix = content_lease_prefix(storage_domain_id, content_id);
+        let bucket = self.bucket(CONTENT_LEASE_BUCKET).await?;
+        for entry in bucket.prefix(prefix.clone()).await? {
+            let entry = entry?;
+            let lease_bytes = entry
+                .key
+                .get(prefix.len()..)
+                .ok_or_else(|| Error::Corruption {
+                    message: "content lease key is shorter than its content prefix".to_owned(),
+                })?;
+            let lease_id = ContentLeaseId::from_bytes(lease_bytes.try_into().map_err(|_| {
+                Error::Corruption {
+                    message: "content lease key has a malformed identity length".to_owned(),
+                }
+            })?)?;
+            let record =
+                ContentLeaseRecord::decode(&entry.value, storage_domain_id, content_id, lease_id)?;
+            if now_unix_ms < record.expires_at_unix_ms {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub(crate) async fn seal_content_upload_at(
@@ -783,12 +987,4 @@ fn hex_identifier<const N: usize>(bytes: [u8; N]) -> String {
         let _ = write!(value, "{byte:02x}");
     }
     value
-}
-
-fn current_epoch_millis() -> Result<u64> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| Error::Io(std::io::Error::other(error)))?;
-    u64::try_from(duration.as_millis())
-        .map_err(|_| Error::invalid_options("system time milliseconds exceed u64::MAX"))
 }

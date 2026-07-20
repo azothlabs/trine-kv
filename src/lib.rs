@@ -151,8 +151,9 @@ pub use branch::{Branch, BranchInfo, BranchRange};
 pub use bucket::{Bucket, BucketName, BucketReader};
 pub use content::{
     ContentAttachment, ContentAttachmentScope, ContentChangeId, ContentHandle,
-    ContentHashAlgorithm, ContentId, ContentStream, ContentUpload, ContentUploadOptions,
-    ContentUploadResume, OwnerScopeId, SealedContent, StorageDomainId, UploadId, UploadToken,
+    ContentHashAlgorithm, ContentId, ContentLeaseId, ContentLeaseOptions, ContentLeaseOwnerId,
+    ContentStream, ContentUpload, ContentUploadOptions, ContentUploadResume, OwnerScopeId,
+    SealedContent, StorageDomainId, UploadId, UploadToken,
 };
 pub use db::{Db, IntoOpenOptions, MaintenanceBudget, MaintenanceOutcome};
 pub use error::{Error, Result};

@@ -16419,3 +16419,51 @@ Negative check:
 
 - Commit and push the prepared metadata, then require the hosted release-commit
   gates before tagging.
+
+## 2026-07-20: durable exact-content read lease
+
+### Observation
+
+- `ContentHandle` fixed an immutable descriptor but had no read lease identity,
+  owner, or expiry. It could not participate safely in future physical
+  relocation or reclamation.
+- A prefix scan for active leases has a TOCTOU race with a later leased open or
+  renewal. It is useful conservative evidence but cannot by itself authorize
+  deletion.
+
+### Interpretation
+
+- The storage layer should own an opaque short-lived exact-content lease while
+  TrineDB owns Principal and Policy decisions. Drop cannot perform asynchronous
+  cleanup; expiry must be the correctness boundary.
+- Future reclamation needs a per-content quarantine/fence around lease recheck
+  and grace. That mechanism belongs with reclamation, not in this compatible
+  leased-read slice.
+
+### Fix
+
+- Added versioned `ContentLeaseId`, opaque `ContentLeaseOwnerId`, validated TTL
+  options, `open_content_leased`, clone-shared deadlines, explicit renewal, and
+  typed missing/expired errors. Durable records are keyed by exact
+  `(StorageDomainId, ContentId, ContentLeaseId)` and validate key/value identity.
+- Reads check expiry before work and at chunk boundaries. Renewal cannot revive
+  an expired record and publishes durable state before clones observe the new
+  deadline. Existing `open_content` stays compatible and unleased.
+- Recorded the stable format and the mandatory future quarantine/fence in
+  `.phrase/protocol/content-read-lease-v1.md`.
+
+### Verification
+
+- Focused memory and native-reopen tests cover lease identity, verified range,
+  clone renewal, expiry, missing lease, zero TTL, exact active precheck,
+  persistence, and malformed state.
+- `cargo test -q --all-features` passes with 476 library tests (474 passed, two
+  ignored) plus all integration targets. Strict Rustdoc, doctests, locked check,
+  all-target/all-feature Clippy with wildcard imports denied, formatting,
+  explicit-import scan, and diff checks pass.
+
+### Recommended Next Action
+
+- Consume leased open only after higher-layer authorization. Before any content
+  deletion is implemented, add the per-content quarantine/fence and concurrent
+  open/renew/reclaim tests required by the lease protocol.

@@ -6,7 +6,14 @@
 //! and read through verified ranges or a sequential stream. Ordinary key/value
 //! values do not enter this path automatically.
 
-use std::{fmt, mem, sync::Arc, time::Duration};
+use std::{
+    fmt, mem,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use sha2::{Digest, Sha256};
 
@@ -14,6 +21,7 @@ use crate::{Db, DurabilityMode, Error, Result};
 
 const CONTENT_ID_SHA256_TAG: u8 = 1;
 const UPLOAD_TOKEN_VERSION: u8 = 1;
+const CONTENT_LEASE_ID_VERSION: u8 = 1;
 const DESCRIPTOR_MAGIC: &[u8; 8] = b"TRNCNTD2";
 const CHUNK_MAGIC: &[u8; 8] = b"TRNCNTC1";
 const UPLOAD_STATE_MAGIC: &[u8; 8] = b"TRNUPLD2";
@@ -26,6 +34,8 @@ const UPLOAD_STATE_SEALING: u8 = 1;
 const UPLOAD_STATE_SEALED: u8 = 2;
 const MIN_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const CONTENT_LEASE_BUCKET: &str = "\u{1}trine-content-lease\u{1}";
+pub(crate) const CONTENT_LEASE_MAGIC: &[u8; 8] = b"TRNCNLS1";
 
 /// Opaque control-plane identity for one physical content boundary.
 ///
@@ -89,6 +99,128 @@ impl fmt::Debug for OwnerScopeId {
         formatter.write_str("OwnerScopeId(")?;
         write_hex(formatter, &self.0)?;
         formatter.write_str(")")
+    }
+}
+
+/// Opaque higher-layer owner of one short-lived content read lease.
+///
+/// Trine KV persists and compares this identity but assigns it no Principal,
+/// tenant, or Policy meaning. The caller must authorize before opening or
+/// renewing a leased handle.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ContentLeaseOwnerId([u8; 16]);
+
+impl ContentLeaseOwnerId {
+    /// Reconstructs an opaque lease owner from portable bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the opaque owner bytes.
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl fmt::Debug for ContentLeaseOwnerId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ContentLeaseOwnerId(")?;
+        write_hex(formatter, &self.0)?;
+        formatter.write_str(")")
+    }
+}
+
+/// Generated identity of one durable short-lived content read lease.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ContentLeaseId([u8; 16]);
+
+impl ContentLeaseId {
+    pub(crate) fn generate() -> Result<Self> {
+        let mut bytes = [0_u8; 16];
+        getrandom::fill(&mut bytes)
+            .map_err(|error| Error::runtime_busy(format!("content lease entropy: {error}")))?;
+        bytes[0] = CONTENT_LEASE_ID_VERSION;
+        Ok(Self(bytes))
+    }
+
+    /// Decodes the versioned lease identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedFormat`] when the first byte carries an
+    /// unknown identity format.
+    pub fn from_bytes(bytes: [u8; 16]) -> Result<Self> {
+        if bytes[0] != CONTENT_LEASE_ID_VERSION {
+            return Err(Error::UnsupportedFormat {
+                message: format!("unsupported content lease identity version {}", bytes[0]),
+            });
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the versioned portable identity bytes.
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl fmt::Debug for ContentLeaseId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ContentLeaseId(")?;
+        write_hex(formatter, &self.0)?;
+        formatter.write_str(")")
+    }
+}
+
+impl fmt::Display for ContentLeaseId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_hex(formatter, &self.0)
+    }
+}
+
+/// Options for opening a sealed `ContentObject` under a short-lived read lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentLeaseOptions {
+    owner_id: ContentLeaseOwnerId,
+    ttl: Duration,
+}
+
+impl ContentLeaseOptions {
+    /// Creates lease options for an already-authorized opaque owner.
+    ///
+    /// `ttl` is rounded down to whole milliseconds and must be at least one
+    /// millisecond. The deadline is computed during leased-open acquisition,
+    /// immediately before Trine KV stages the durable record.
+    #[must_use]
+    pub const fn new(owner_id: ContentLeaseOwnerId, ttl: Duration) -> Self {
+        Self { owner_id, ttl }
+    }
+
+    /// Returns the opaque higher-layer owner identity.
+    #[must_use]
+    pub const fn owner_id(self) -> ContentLeaseOwnerId {
+        self.owner_id
+    }
+
+    /// Returns the requested lease lifetime.
+    #[must_use]
+    pub const fn ttl(self) -> Duration {
+        self.ttl
+    }
+
+    pub(crate) fn ttl_ms(self) -> Result<u64> {
+        let millis = u64::try_from(self.ttl.as_millis()).map_err(|_| {
+            Error::invalid_options("content lease lifetime milliseconds exceed u64::MAX")
+        })?;
+        if millis == 0 {
+            return Err(Error::invalid_options(
+                "content lease lifetime must be at least one millisecond",
+            ));
+        }
+        Ok(millis)
     }
 }
 
@@ -1020,20 +1152,162 @@ impl ContentUpload {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct ContentLease {
+    id: ContentLeaseId,
+    owner_id: ContentLeaseOwnerId,
+    expires_at_unix_ms: AtomicU64,
+}
+
+impl ContentLease {
+    pub(crate) const fn new(
+        id: ContentLeaseId,
+        owner_id: ContentLeaseOwnerId,
+        expires_at_unix_ms: u64,
+    ) -> Self {
+        Self {
+            id,
+            owner_id,
+            expires_at_unix_ms: AtomicU64::new(expires_at_unix_ms),
+        }
+    }
+
+    pub(crate) const fn id(&self) -> ContentLeaseId {
+        self.id
+    }
+
+    pub(crate) const fn owner_id(&self) -> ContentLeaseOwnerId {
+        self.owner_id
+    }
+
+    pub(crate) fn expires_at_unix_ms(&self) -> u64 {
+        self.expires_at_unix_ms.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn publish_expiry(&self, expires_at_unix_ms: u64) {
+        self.expires_at_unix_ms
+            .store(expires_at_unix_ms, Ordering::Release);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContentLeaseRecord {
+    pub(crate) lease_id: ContentLeaseId,
+    pub(crate) owner_id: ContentLeaseOwnerId,
+    pub(crate) storage_domain_id: StorageDomainId,
+    pub(crate) content_id: ContentId,
+    pub(crate) expires_at_unix_ms: u64,
+}
+
+impl ContentLeaseRecord {
+    pub(crate) fn encode(self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(8 + 16 + 16 + 16 + 33 + 8);
+        bytes.extend_from_slice(CONTENT_LEASE_MAGIC);
+        bytes.extend_from_slice(&self.lease_id.to_bytes());
+        bytes.extend_from_slice(&self.owner_id.to_bytes());
+        bytes.extend_from_slice(&self.storage_domain_id.to_bytes());
+        bytes.extend_from_slice(&self.content_id.to_bytes());
+        bytes.extend_from_slice(&self.expires_at_unix_ms.to_le_bytes());
+        bytes
+    }
+
+    pub(crate) fn decode(
+        bytes: &[u8],
+        storage_domain_id: StorageDomainId,
+        content_id: ContentId,
+        lease_id: ContentLeaseId,
+    ) -> Result<Self> {
+        const RECORD_LEN: usize = 8 + 16 + 16 + 16 + 33 + 8;
+        if bytes.len() != RECORD_LEN || bytes.get(..8) != Some(CONTENT_LEASE_MAGIC) {
+            return Err(Error::InvalidFormat {
+                message: "invalid content lease record header or length".to_owned(),
+            });
+        }
+        let stored_lease_id =
+            ContentLeaseId::from_bytes(array_at::<16>(bytes, 8, "content lease identity")?)?;
+        let owner_id =
+            ContentLeaseOwnerId::from_bytes(array_at::<16>(bytes, 24, "content lease owner")?);
+        let stored_domain =
+            StorageDomainId::from_bytes(array_at::<16>(bytes, 40, "content lease storage domain")?);
+        let stored_content = decode_content_id(bytes, 56, "content lease content identity")?;
+        let expires_at_unix_ms =
+            u64::from_le_bytes(array_at::<8>(bytes, 89, "content lease expiry")?);
+        if stored_lease_id != lease_id
+            || stored_domain != storage_domain_id
+            || stored_content != content_id
+        {
+            return Err(Error::Corruption {
+                message: "content lease record differs from its protected key".to_owned(),
+            });
+        }
+        Ok(Self {
+            lease_id,
+            owner_id,
+            storage_domain_id,
+            content_id,
+            expires_at_unix_ms,
+        })
+    }
+}
+
+pub(crate) fn content_lease_prefix(
+    storage_domain_id: StorageDomainId,
+    content_id: ContentId,
+) -> Vec<u8> {
+    let mut key = Vec::with_capacity(16 + 33);
+    key.extend_from_slice(&storage_domain_id.to_bytes());
+    key.extend_from_slice(&content_id.to_bytes());
+    key
+}
+
+pub(crate) fn content_lease_key(
+    storage_domain_id: StorageDomainId,
+    content_id: ContentId,
+    lease_id: ContentLeaseId,
+) -> Vec<u8> {
+    let mut key = content_lease_prefix(storage_domain_id, content_id);
+    key.extend_from_slice(&lease_id.to_bytes());
+    key
+}
+
+pub(crate) fn current_epoch_millis() -> Result<u64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| Error::Io(std::io::Error::other(error)))?;
+    u64::try_from(duration.as_millis())
+        .map_err(|_| Error::invalid_options("system time milliseconds exceed u64::MAX"))
+}
+
 /// Stable read handle for one sealed immutable `ContentObject`.
 ///
 /// The handle fixes one descriptor when opened. This prototype has no physical
 /// relocation, so the descriptor's upload identity and chunk boundaries remain
-/// stable for the handle lifetime.
+/// stable for the handle lifetime. A handle opened with
+/// [`Db::open_content_leased`](crate::Db::open_content_leased) additionally
+/// carries one durable short-lived read lease shared by all of its clones.
 #[derive(Debug, Clone)]
 pub struct ContentHandle {
     db: Db,
     descriptor: ContentDescriptor,
+    lease: Option<Arc<ContentLease>>,
 }
 
 impl ContentHandle {
     pub(crate) fn new(db: Db, descriptor: ContentDescriptor) -> Self {
-        Self { db, descriptor }
+        Self {
+            db,
+            descriptor,
+            lease: None,
+        }
+    }
+
+    pub(crate) fn with_lease(mut self, lease: ContentLease) -> Self {
+        self.lease = Some(Arc::new(lease));
+        self
+    }
+
+    pub(crate) fn lease(&self) -> Option<&Arc<ContentLease>> {
+        self.lease.as_ref()
     }
 
     /// Returns the immutable content identity fixed by this handle.
@@ -1060,6 +1334,55 @@ impl ContentHandle {
         self.descriptor.length == 0
     }
 
+    /// Returns the durable read lease identity, when this handle was opened
+    /// through [`Db::open_content_leased`](crate::Db::open_content_leased).
+    ///
+    /// Ordinary [`Db::open_content`](crate::Db::open_content) handles return
+    /// `None` and are not protected from future physical reclamation.
+    #[must_use]
+    pub fn lease_id(&self) -> Option<ContentLeaseId> {
+        self.lease.as_deref().map(ContentLease::id)
+    }
+
+    /// Returns the current lease deadline as Unix epoch milliseconds.
+    ///
+    /// All clones share this value. `None` identifies an unleased handle.
+    /// Renewal publishes durable state before this local deadline advances.
+    #[must_use]
+    pub fn lease_expires_at_unix_ms(&self) -> Option<u64> {
+        self.lease.as_deref().map(ContentLease::expires_at_unix_ms)
+    }
+
+    /// Renews this handle's durable read lease for `ttl` from the current time.
+    ///
+    /// The caller must repeat its higher-layer authorization before calling.
+    /// Trine KV validates only the opaque owner and exact content identity. All
+    /// handle clones observe the new deadline after durable publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ContentLeaseNotFound`] for an unleased handle or missing
+    /// durable record, [`Error::ContentLeaseExpired`] once the old deadline is
+    /// reached, [`Error::InvalidOptions`] for a sub-millisecond or overflowing
+    /// lifetime, or a storage/conflict error if renewal cannot publish.
+    pub async fn renew_lease(&self, ttl: Duration) -> Result<u64> {
+        self.db.renew_content_lease(self, ttl).await
+    }
+
+    fn ensure_lease_active(&self) -> Result<()> {
+        let Some(lease) = self.lease.as_deref() else {
+            return Ok(());
+        };
+        let now = current_epoch_millis()?;
+        let expires_at_unix_ms = lease.expires_at_unix_ms();
+        if now >= expires_at_unix_ms {
+            return Err(Error::ContentLeaseExpired {
+                expired_at_unix_ms: expires_at_unix_ms,
+            });
+        }
+        Ok(())
+    }
+
     /// Reads a verified byte range using common half-open range semantics.
     ///
     /// `start > len()` returns [`Error::ContentRangeOutOfBounds`]. A zero-byte
@@ -1073,6 +1396,7 @@ impl ContentHandle {
     /// [`Error::ContentDigestMismatch`] / [`Error::Corruption`] if a chunk is
     /// missing, malformed, or tampered with.
     pub async fn read_range(&self, start: u64, length: u64) -> Result<Arc<[u8]>> {
+        self.ensure_lease_active()?;
         if start > self.descriptor.length {
             return Err(Error::ContentRangeOutOfBounds {
                 start,
@@ -1092,6 +1416,7 @@ impl ContentHandle {
         let chunk_bytes = u64::from(self.descriptor.chunk_bytes);
         let mut position = start;
         while position < end {
+            self.ensure_lease_active()?;
             let chunk_index = position / chunk_bytes;
             let frame = self
                 .db
