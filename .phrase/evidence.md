@@ -16620,3 +16620,54 @@ Negative check:
 - Design the persisted leased-only content-access mode and its reader-drain
   transition. Do not add grace or physical deletion until that transition has
   cross-process native and object-store evidence.
+
+## 2026-07-20: persisted leased-only content-access forward fence
+
+### Observation
+
+- A mode bit in ordinary KV is insufficient because an already-open native or
+  object-store read-only handle can retain an older visible state.
+- Direct content-backend reads are shared across those handles and are already
+  required for descriptor/chunk access.
+- Existing unleased handles have no deadline and survive the new-open barrier.
+
+### Interpretation
+
+- The safe order is backend barrier first, protected commit coordinate second.
+  An interrupted transition may be overly restrictive but must never claim a
+  coordinate before new opens are fenced.
+- Barrier publication and reader drain are distinct lifecycle events.
+
+### Fix
+
+- Added a versioned per-domain barrier identity, access-mode query, irreversible
+  enforcement API, direct backend object record, and protected commit-stamped
+  coordinate.
+- Compatible opens check the backend record each time. Leased opens continue
+  through the internal descriptor path and publish their durable lease before
+  returning.
+- Reclaim intent now blocks compatible and uncoordinated domains with typed
+  outcomes. The coordinate point read participates in optimistic conflict
+  validation.
+- Recorded path, bytes, ordering, recovery, and exclusions in
+  `content-access-barrier-v1.md` and updated the lease/reclaim protocols.
+
+### Verification
+
+- Thirty focused content tests pass, including stale native and unrefreshed
+  object-store readers, interrupted recovery, identity adoption, malformed
+  state, old-handle survival, and leased access after transition.
+- The complete all-feature suite passes with 492 library tests (490 passed, two
+  ignored) plus every integration target.
+- Strict all-target/all-feature Clippy with wildcard imports denied, strict
+  Rustdoc, 26 doctests, formatting, and diff checks pass.
+
+### Remaining blockers
+
+- The barrier does not prove that pre-barrier handles drained. No grace or
+  physical delete is enabled.
+
+### Recommended next action
+
+- Define native reader sessions and the remote/external coordination contract,
+  including read-only credentials, before adding any deletion timing.

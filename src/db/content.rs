@@ -6,13 +6,15 @@ use sha2::{Digest, Sha256};
 use crate::{
     content::{
         CONTENT_CONTROL_BUCKET, CONTENT_LEASE_BUCKET, CONTENT_PHYSICAL_HOLD_BUCKET,
-        CONTENT_TOKEN_BUCKET, CONTENT_TOKEN_INDEX_BUCKET, ContentDescriptor, ContentHandle,
-        ContentId, ContentLease, ContentLeaseId, ContentLeaseOptions, ContentLeaseRecord,
-        ContentPhysicalHold, ContentPhysicalHoldId, ContentPhysicalHoldOptions,
-        ContentPhysicalHoldOwnerId, ContentPhysicalHoldRecord, ContentPhysicalHoldRecordState,
-        ContentTokenIndexRecord, ContentUpload, ContentUploadOptions, ContentUploadResume,
-        SealedContent, StorageDomainId, UploadId, UploadSessionState, UploadSessionStatus,
-        UploadToken, UploadTokenRecord, content_lease_key, content_lease_prefix,
+        CONTENT_TOKEN_BUCKET, CONTENT_TOKEN_INDEX_BUCKET, ContentAccessBarrier,
+        ContentAccessBarrierId, ContentAccessBarrierRecord, ContentAccessCoordinateRecord,
+        ContentAccessMode, ContentDescriptor, ContentHandle, ContentId, ContentLease,
+        ContentLeaseId, ContentLeaseOptions, ContentLeaseRecord, ContentPhysicalHold,
+        ContentPhysicalHoldId, ContentPhysicalHoldOptions, ContentPhysicalHoldOwnerId,
+        ContentPhysicalHoldRecord, ContentPhysicalHoldRecordState, ContentTokenIndexRecord,
+        ContentUpload, ContentUploadOptions, ContentUploadResume, SealedContent, StorageDomainId,
+        UploadId, UploadSessionState, UploadSessionStatus, UploadToken, UploadTokenRecord,
+        content_access_coordinate_key, content_lease_key, content_lease_prefix,
         content_physical_hold_key, content_token_index_key, current_epoch_millis, duration_millis,
         upload_token_key,
     },
@@ -28,6 +30,7 @@ use crate::{
 use super::Db;
 
 impl Db {
+    const CONTENT_ACCESS_COMMIT_ATTEMPTS: usize = 8;
     const CONTENT_LEASE_COMMIT_ATTEMPTS: usize = 8;
     const CONTENT_PHYSICAL_HOLD_COMMIT_ATTEMPTS: usize = 8;
 
@@ -241,6 +244,145 @@ impl Db {
         self.seal_content_upload_at(upload_id, None).await
     }
 
+    /// Returns the persisted content-access mode for one storage domain.
+    ///
+    /// The check reads the content backend directly instead of relying on this
+    /// database handle's KV snapshot. A native or object-store read-only handle
+    /// that was opened before the transition therefore observes the barrier on
+    /// its next call without refreshing its ordinary KV view.
+    ///
+    /// An absent barrier returns [`ContentAccessMode::CompatibleUnleased`]. An
+    /// active barrier returns [`ContentAccessMode::LeasedOnly`]. Malformed or
+    /// identity-mismatched barrier bytes fail closed.
+    pub async fn content_access_mode(
+        &self,
+        storage_domain_id: StorageDomainId,
+    ) -> Result<ContentAccessMode> {
+        self.ensure_open()?;
+        self.ensure_content_backend_supported()?;
+        match self
+            .read_content_access_barrier_record(storage_domain_id)
+            .await?
+        {
+            Some(record) => Ok(ContentAccessMode::LeasedOnly {
+                barrier_id: record.barrier_id,
+            }),
+            None => Ok(ContentAccessMode::CompatibleUnleased),
+        }
+    }
+
+    /// Irreversibly requires durable leases for new content opens in a domain.
+    ///
+    /// Trine first publishes a small barrier through the content backend, where
+    /// already-open stale read-only database handles can observe it directly.
+    /// It then records the same identity and this method's final commit sequence
+    /// in protected KV state. This fail-closed order means an interrupted call
+    /// may reject unleased opens before the coordinate is available, but can
+    /// never publish the coordinate before the barrier is effective. Retrying
+    /// completes an interrupted coordinate publication.
+    ///
+    /// The transition is irreversible. If another identity already established
+    /// the barrier, that existing identity is adopted and returned. The result
+    /// fences new unleased opens; it does not prove that handles opened before
+    /// the barrier have drained, and it does not authorize physical deletion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ReadOnly`] when the handle cannot publish the barrier,
+    /// [`Error::InvalidFormat`] or [`Error::Corruption`] for malformed or
+    /// mismatched protected state, [`Error::RuntimeBusy`] after repeated
+    /// transaction conflicts, or the selected backend's write/durability error.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use trine_kv::{
+    ///     ContentAccessBarrierId, ContentAccessMode, Db, DbOptions, StorageDomainId,
+    /// };
+    ///
+    /// async fn example() -> trine_kv::Result<()> {
+    ///     let db = Db::open(DbOptions::memory()).await?;
+    ///     let domain = StorageDomainId::from_bytes([1; 16]);
+    ///     let barrier = db
+    ///         .enforce_content_leased_only(domain, ContentAccessBarrierId::generate()?)
+    ///         .await?;
+    ///     assert_eq!(
+    ///         db.content_access_mode(domain).await?,
+    ///         ContentAccessMode::LeasedOnly {
+    ///             barrier_id: barrier.barrier_id(),
+    ///         }
+    ///     );
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn enforce_content_leased_only(
+        &self,
+        storage_domain_id: StorageDomainId,
+        requested_id: ContentAccessBarrierId,
+    ) -> Result<ContentAccessBarrier> {
+        self.ensure_open()?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+        self.ensure_content_backend_supported()?;
+        let _access_guard = self.inner.content_access_lock.lock().await;
+        let barrier = if let Some(existing) = self
+            .read_content_access_barrier_record(storage_domain_id)
+            .await?
+        {
+            existing
+        } else {
+            let requested = ContentAccessBarrierRecord {
+                storage_domain_id,
+                barrier_id: requested_id,
+            };
+            self.write_content_access_barrier_record(requested).await?;
+            requested
+        };
+        self.bucket(CONTENT_CONTROL_BUCKET).await?;
+        let key = content_access_coordinate_key(storage_domain_id);
+        for _ in 0..Self::CONTENT_ACCESS_COMMIT_ATTEMPTS {
+            let mut transaction = self.transaction(TransactionOptions::default());
+            if let Some(bytes) = transaction.get_bucket(CONTENT_CONTROL_BUCKET, &key).await? {
+                let coordinate = ContentAccessCoordinateRecord::decode(&bytes, storage_domain_id)?;
+                if coordinate.barrier_id != barrier.barrier_id {
+                    return Err(Error::Corruption {
+                        message: "content access barrier differs from its protected coordinate"
+                            .to_owned(),
+                    });
+                }
+                return Ok(ContentAccessBarrier::new(
+                    storage_domain_id,
+                    coordinate.barrier_id,
+                    coordinate.enforced_at,
+                ));
+            }
+            transaction.put_bucket_with_commit_sequence(
+                CONTENT_CONTROL_BUCKET,
+                key.clone(),
+                &ContentAccessCoordinateRecord::commit_prefix(
+                    storage_domain_id,
+                    barrier.barrier_id,
+                ),
+                &[],
+            )?;
+            match transaction.commit().await {
+                Ok(commit) => {
+                    return Ok(ContentAccessBarrier::new(
+                        storage_domain_id,
+                        barrier.barrier_id,
+                        commit.read_version(),
+                    ));
+                }
+                Err(Error::Conflict { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::runtime_busy(
+            "content access-barrier coordinate did not converge after repeated conflicts",
+        ))
+    }
+
     /// Opens a sealed immutable `ContentObject` by cryptographic identity.
     ///
     /// The descriptor is read and validated once. The resulting handle returns
@@ -249,9 +391,10 @@ impl Db {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ContentNotFound`] when no sealed descriptor exists,
-    /// [`Error::Closed`] for a closed database, or a storage/format/integrity
-    /// error when the descriptor cannot be trusted.
+    /// Returns [`Error::ContentLeaseRequired`] after this storage domain enters
+    /// leased-only mode, [`Error::ContentNotFound`] when no sealed descriptor
+    /// exists, [`Error::Closed`] for a closed database, or a
+    /// storage/format/integrity error when protected state cannot be trusted.
     ///
     /// # Parameters
     ///
@@ -264,6 +407,20 @@ impl Db {
     ) -> Result<ContentHandle> {
         self.ensure_open()?;
         self.ensure_content_backend_supported()?;
+        if let ContentAccessMode::LeasedOnly { barrier_id } =
+            self.content_access_mode(storage_domain_id).await?
+        {
+            return Err(Error::ContentLeaseRequired { barrier_id });
+        }
+        self.open_content_unchecked(storage_domain_id, content_id)
+            .await
+    }
+
+    async fn open_content_unchecked(
+        &self,
+        storage_domain_id: StorageDomainId,
+        content_id: ContentId,
+    ) -> Result<ContentHandle> {
         let bytes = self
             .read_content_descriptor(storage_domain_id, content_id)
             .await?
@@ -299,10 +456,11 @@ impl Db {
     ///
     /// # Errors
     ///
-    /// Returns the errors from [`Db::open_content`], [`Error::ReadOnly`] when the
-    /// database cannot publish a lease, [`Error::InvalidOptions`] for an invalid
-    /// or overflowing lifetime, or a transaction/storage error when the lease
-    /// record cannot be committed.
+    /// Returns [`Error::ContentNotFound`] or descriptor integrity errors as the
+    /// unleased open does, [`Error::ReadOnly`] when the database cannot publish
+    /// a lease, [`Error::InvalidOptions`] for an invalid or overflowing
+    /// lifetime, or a transaction/storage error when the lease record cannot be
+    /// committed. Leased-only mode does not reject this method.
     ///
     /// # Examples
     ///
@@ -355,7 +513,10 @@ impl Db {
             return Err(Error::ReadOnly);
         }
         let ttl_ms = options.ttl_ms()?;
-        let handle = self.open_content(storage_domain_id, content_id).await?;
+        self.ensure_content_backend_supported()?;
+        let handle = self
+            .open_content_unchecked(storage_domain_id, content_id)
+            .await?;
         let lease_id = ContentLeaseId::generate()?;
         let expires_at_unix_ms = current_epoch_millis()?
             .checked_add(ttl_ms)
@@ -1176,6 +1337,35 @@ impl Db {
         self.read_content_object(object).await
     }
 
+    pub(crate) async fn read_content_access_barrier_record(
+        &self,
+        storage_domain_id: StorageDomainId,
+    ) -> Result<Option<ContentAccessBarrierRecord>> {
+        let object = self.content_access_barrier_object(storage_domain_id)?;
+        self.read_content_object(object)
+            .await?
+            .map(|bytes| ContentAccessBarrierRecord::decode(&bytes, storage_domain_id))
+            .transpose()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn write_content_access_barrier_bytes_for_test(
+        &self,
+        storage_domain_id: StorageDomainId,
+        bytes: Arc<[u8]>,
+    ) -> Result<()> {
+        let object = self.content_access_barrier_object(storage_domain_id)?;
+        self.write_content_object(object, bytes).await
+    }
+
+    pub(crate) async fn write_content_access_barrier_record(
+        &self,
+        record: ContentAccessBarrierRecord,
+    ) -> Result<()> {
+        let object = self.content_access_barrier_object(record.storage_domain_id)?;
+        self.write_content_object(object, record.encode()).await
+    }
+
     pub(crate) async fn write_upload_state(&self, state: &UploadSessionState) -> Result<()> {
         let object = self.content_upload_state_object(state.upload_id())?;
         self.write_content_object(object, (*state).encode()?).await
@@ -1276,6 +1466,22 @@ impl Db {
             .join(format!("{}.trined", hex_identifier(content_id.digest())));
         Ok(StorageObjectId::native_file(
             StorageObjectKind::ContentDescriptor,
+            path,
+        ))
+    }
+
+    fn content_access_barrier_object(
+        &self,
+        storage_domain_id: StorageDomainId,
+    ) -> Result<StorageObjectId> {
+        let path = self
+            .content_root()?
+            .join("domains")
+            .join(hex_identifier(storage_domain_id.to_bytes()))
+            .join("access")
+            .join("leased-only.trinebarrier");
+        Ok(StorageObjectId::native_file(
+            StorageObjectKind::ContentAccessBarrier,
             path,
         ))
     }

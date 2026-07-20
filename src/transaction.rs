@@ -7,13 +7,14 @@ use crate::{
     bucket::DEFAULT_BUCKET_NAME,
     content::{
         CONTENT_CONTROL_BUCKET, CONTENT_LEASE_BUCKET, CONTENT_PHYSICAL_HOLD_BUCKET,
-        CONTENT_TOKEN_BUCKET, CONTENT_TOKEN_INDEX_BUCKET, ContentAttachment,
-        ContentAttachmentScope, ContentChangeId, ContentControlRecord, ContentDescriptor,
-        ContentLeaseId, ContentLeaseRecord, ContentPhysicalHoldId, ContentPhysicalHoldRecord,
-        ContentReclaimAuthorization, ContentReclaimIntentStage, ContentTokenIndexRecord,
-        UploadToken, UploadTokenRecord, content_control_key, content_lease_prefix,
-        content_physical_hold_prefix, content_prefix_range, content_token_index_key,
-        content_token_index_prefix, upload_token_key,
+        CONTENT_TOKEN_BUCKET, CONTENT_TOKEN_INDEX_BUCKET, ContentAccessCoordinateRecord,
+        ContentAccessMode, ContentAttachment, ContentAttachmentScope, ContentChangeId,
+        ContentControlRecord, ContentDescriptor, ContentLeaseId, ContentLeaseRecord,
+        ContentPhysicalHoldId, ContentPhysicalHoldRecord, ContentReclaimAuthorization,
+        ContentReclaimIntentStage, ContentTokenIndexRecord, StorageDomainId, UploadToken,
+        UploadTokenRecord, content_access_coordinate_key, content_control_key,
+        content_lease_prefix, content_physical_hold_prefix, content_prefix_range,
+        content_token_index_key, content_token_index_prefix, upload_token_key,
     },
     db::Db,
     error::{ContentReclaimBlocker, Error, Result},
@@ -712,8 +713,10 @@ impl Transaction {
     /// # Errors
     ///
     /// Returns [`Error::ContentReclaimBlocked`] with a typed
-    /// [`ContentReclaimBlocker`] after proof expiry, newer physical activity, or
-    /// while upload or lease authority remains. Returns
+    /// [`ContentReclaimBlocker`] while unleased access is allowed, while a
+    /// leased-only barrier lacks its protected coordinate, after proof expiry,
+    /// newer physical activity, or while upload, lease, or physical-hold
+    /// authority remains. Returns
     /// [`Error::ContentNotFound`] for a missing descriptor, and format,
     /// corruption, bucket, storage, or later commit-conflict errors otherwise.
     ///
@@ -722,9 +725,10 @@ impl Transaction {
     /// ```rust
     /// use std::time::Duration;
     /// use trine_kv::{
-    ///     ContentAttachmentScope, ContentChangeId, ContentReclaimAuthorization,
-    ///     ContentReclaimIntentStage, ContentReclaimProofToken, ContentUploadOptions, Db,
-    ///     DbOptions, OwnerScopeId, StorageDomainId, TransactionOptions,
+    ///     ContentAccessBarrierId, ContentAttachmentScope, ContentChangeId,
+    ///     ContentReclaimAuthorization, ContentReclaimIntentStage, ContentReclaimProofToken,
+    ///     ContentUploadOptions, Db, DbOptions, OwnerScopeId, StorageDomainId,
+    ///     TransactionOptions,
     /// };
     ///
     /// async fn example() -> trine_kv::Result<()> {
@@ -751,6 +755,8 @@ impl Transaction {
     ///         )
     ///         .await?;
     ///     attach.commit().await?;
+    ///     db.enforce_content_leased_only(domain, ContentAccessBarrierId::generate()?)
+    ///         .await?;
     ///
     ///     // A real caller obtains these opaque bytes only after its own exact
     ///     // logical reachability check at `transaction.read_version()`.
@@ -795,6 +801,8 @@ impl Transaction {
         self.db.bucket(CONTENT_TOKEN_INDEX_BUCKET).await?;
         self.db.bucket(CONTENT_LEASE_BUCKET).await?;
         self.db.bucket(CONTENT_PHYSICAL_HOLD_BUCKET).await?;
+        self.require_coordinated_content_access(authorization.storage_domain_id())
+            .await?;
         let descriptor = self
             .db
             .read_content_descriptor(
@@ -858,6 +866,33 @@ impl Transaction {
             &[],
         )?;
         Ok(ContentReclaimIntentStage::Staged)
+    }
+
+    async fn require_coordinated_content_access(
+        &mut self,
+        storage_domain_id: StorageDomainId,
+    ) -> Result<()> {
+        let barrier_id = match self.db.content_access_mode(storage_domain_id).await? {
+            ContentAccessMode::CompatibleUnleased => {
+                return Err(Error::ContentReclaimBlocked {
+                    blocker: ContentReclaimBlocker::UnleasedAccessAllowed,
+                });
+            }
+            ContentAccessMode::LeasedOnly { barrier_id } => barrier_id,
+        };
+        let access_key = content_access_coordinate_key(storage_domain_id);
+        let Some(access_bytes) = self.get_bucket(CONTENT_CONTROL_BUCKET, &access_key).await? else {
+            return Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::LeasedOnlyBarrierUncoordinated { barrier_id },
+            });
+        };
+        let access = ContentAccessCoordinateRecord::decode(&access_bytes, storage_domain_id)?;
+        if access.barrier_id != barrier_id {
+            return Err(Error::Corruption {
+                message: "content access barrier differs from reclaim coordinate".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     async fn require_no_active_content_token(

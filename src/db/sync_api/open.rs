@@ -225,6 +225,7 @@ impl Db {
                 native_storage,
                 content_memory: MemoryStorageBackend::new(),
                 content_seal_lock: futures::lock::Mutex::new(()),
+                content_access_lock: futures::lock::Mutex::new(()),
                 content_upload_locks: std::array::from_fn(|_| futures::lock::Mutex::new(())),
                 object_storage,
                 object_wal_storage,

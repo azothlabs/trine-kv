@@ -81,6 +81,11 @@ treats every well-formed unexpired record as live. Malformed records fail closed
 and block reclamation until repaired. Grace starts only after the barrier and
 recheck succeed; the barrier/generation is revalidated before physical delete.
 
+The irreversible per-domain forward fence is defined by
+`content-access-barrier-v1.md`. It blocks new unleased opens even for stale
+read-only database handles, while leased opens keep joining the exact lease and
+activity records below. It does not prove that pre-barrier handles drained.
+
 The protected per-content control state defined by
 `content-reclaim-intent-v1.md` now supplies the first intent barrier. Leased open
 and durable renewal advance that control state in the same transaction as the

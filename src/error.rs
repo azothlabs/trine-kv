@@ -1,7 +1,7 @@
 use std::{error, fmt, io};
 
 use crate::{
-    content::{ContentPhysicalHoldId, ContentPhysicalHoldKind},
+    content::{ContentAccessBarrierId, ContentPhysicalHoldId, ContentPhysicalHoldKind},
     options::DurabilityMode,
     types::ReadVersion,
 };
@@ -16,6 +16,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// content and never authorize deletion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentReclaimBlocker {
+    /// The storage domain still permits new unleased content handles.
+    UnleasedAccessAllowed,
+    /// The backend barrier is active but its protected commit coordinate is
+    /// not yet visible, usually because publication was interrupted.
+    LeasedOnlyBarrierUncoordinated {
+        /// Durable barrier identity that a writer can resume.
+        barrier_id: ContentAccessBarrierId,
+    },
     /// The higher-layer proof reached its exclusive wall-clock deadline.
     ProofExpired {
         /// Proof deadline as Unix epoch milliseconds.
@@ -52,6 +60,13 @@ pub enum ContentReclaimBlocker {
 impl fmt::Display for ContentReclaimBlocker {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnleasedAccessAllowed => {
+                formatter.write_str("the storage domain still permits unleased content opens")
+            }
+            Self::LeasedOnlyBarrierUncoordinated { barrier_id } => write!(
+                formatter,
+                "leased-only barrier {barrier_id} has no protected commit coordinate"
+            ),
             Self::ProofExpired { expired_at_unix_ms } => write!(
                 formatter,
                 "proof expired at Unix millisecond {expired_at_unix_ms}"
@@ -178,6 +193,11 @@ pub enum Error {
     ContentLeaseExpired {
         /// Lease deadline as Unix epoch milliseconds.
         expired_at_unix_ms: u64,
+    },
+    /// The storage domain requires a durable read lease for new content opens.
+    ContentLeaseRequired {
+        /// Barrier identity that established leased-only access.
+        barrier_id: ContentAccessBarrierId,
     },
     /// No durable physical content hold exists for the supplied identity.
     ContentPhysicalHoldNotFound {
@@ -331,6 +351,9 @@ pub(crate) enum ErrorSnapshot {
     ContentLeaseExpired {
         expired_at_unix_ms: u64,
     },
+    ContentLeaseRequired {
+        barrier_id: ContentAccessBarrierId,
+    },
     ContentPhysicalHoldNotFound {
         hold_id: String,
     },
@@ -408,6 +431,10 @@ impl ErrorSnapshot {
 
     const fn lease_dead(expired_at_unix_ms: u64) -> Self {
         Self::ContentLeaseExpired { expired_at_unix_ms }
+    }
+
+    const fn lease_required(barrier_id: ContentAccessBarrierId) -> Self {
+        Self::ContentLeaseRequired { barrier_id }
     }
 
     fn physical_hold_missing(hold_id: &str) -> Self {
@@ -491,6 +518,7 @@ impl ErrorSnapshot {
             Error::ContentLeaseExpired {
                 expired_at_unix_ms: expiry,
             } => Self::lease_dead(*expiry),
+            Error::ContentLeaseRequired { barrier_id } => Self::lease_required(*barrier_id),
             Error::ContentPhysicalHoldNotFound { hold_id } => Self::physical_hold_missing(hold_id),
             Error::ContentPhysicalHoldExpired { expired_at_unix_ms } => {
                 Self::physical_hold_dead(*expired_at_unix_ms)
@@ -581,6 +609,7 @@ impl ErrorSnapshot {
             Self::ContentLeaseExpired { expired_at_unix_ms } => {
                 Error::ContentLeaseExpired { expired_at_unix_ms }
             }
+            Self::ContentLeaseRequired { barrier_id } => Error::ContentLeaseRequired { barrier_id },
             Self::ContentPhysicalHoldNotFound { hold_id } => {
                 Error::ContentPhysicalHoldNotFound { hold_id }
             }
@@ -708,6 +737,7 @@ impl fmt::Display for Error {
             Self::ContentLeaseExpired { expired_at_unix_ms } => {
                 fmt_lease_expired(formatter, *expired_at_unix_ms)
             }
+            Self::ContentLeaseRequired { barrier_id } => fmt_lease_required(formatter, *barrier_id),
             Self::ContentPhysicalHoldNotFound { hold_id } => fmt_hold_missing(formatter, hold_id),
             Self::ContentPhysicalHoldExpired { expired_at_unix_ms } => {
                 fmt_hold_expired(formatter, *expired_at_unix_ms)
@@ -803,6 +833,16 @@ fn fmt_lease_expired(formatter: &mut fmt::Formatter<'_>, expired_at_unix_ms: u64
     write!(
         formatter,
         "content lease expired at Unix millisecond {expired_at_unix_ms}"
+    )
+}
+
+fn fmt_lease_required(
+    formatter: &mut fmt::Formatter<'_>,
+    barrier_id: ContentAccessBarrierId,
+) -> fmt::Result {
+    write!(
+        formatter,
+        "content access requires a durable read lease after barrier {barrier_id}"
     )
 }
 

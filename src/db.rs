@@ -280,6 +280,8 @@ pub(crate) struct DbInner {
     content_memory: MemoryStorageBackend,
     /// Serializes descriptor publication and same-ContentId deduplication.
     content_seal_lock: futures::lock::Mutex<()>,
+    /// Serializes the irreversible leased-only barrier transition in one writer.
+    content_access_lock: futures::lock::Mutex<()>,
     /// Bounded lock shards serialize state transitions for one `UploadId` without
     /// retaining a lock object for every historical upload.
     content_upload_locks: [futures::lock::Mutex<()>; 256],

@@ -11,8 +11,8 @@ physical deletion.
 The higher layer owns logical reachability, liveness touch, retained-root
 generation, proof digest semantics, and proof expiry. Trine KV owns the sealed
 descriptor, physical activity high-water mark, upload attachment authority,
-read leases, and the durable intent record. Both halves are checked through one
-optimistic Trine KV transaction.
+read leases, leased-only access barrier, and the durable intent record. Both
+halves are checked through one optimistic Trine KV transaction.
 
 Uncertainty retains readable bytes. Malformed or missing protected state blocks
 intent until repaired.
@@ -106,26 +106,32 @@ exact-content hold registry defined by `content-physical-hold-v1.md`.
 transaction's one read sequence:
 
 1. proof deadline is still in the future and `0 < S <= transaction.read_version`;
-2. the sealed descriptor exists and validates against the requested identity;
-3. protected content control exists, decodes, and has physical activity
+2. the direct backend access barrier exists and validates, and its matching
+   protected commit coordinate is visible in the transaction;
+3. the sealed descriptor exists and validates against the requested identity;
+4. protected content control exists, decodes, and has physical activity
    high-water `<= S`;
-4. the exact token-authority range contains no unexpired valid record;
-5. the exact read-lease range contains no unexpired valid record;
-6. the exact physical-hold range contains no active valid record;
-7. the intent write preserves the prior activity high-water and binds the
+5. the exact token-authority range contains no unexpired valid record;
+6. the exact read-lease range contains no unexpired valid record;
+7. the exact physical-hold range contains no active valid record;
+8. the intent write preserves the prior activity high-water and binds the
    opaque token, `S`, expiry, and final acceptance commit sequence.
 
-The point read of control plus the two transaction range reads are part of the
-read set. Later token, activity, or lease publication makes commit return
-`Conflict`; no intent becomes durable. Exact retry returns the original
-acceptance sequence. A different newly verified token may replace an older
-intent while preserving the same prior activity high-water.
+The access-coordinate and content-control point reads plus the three authority
+range reads are part of the read set. Later token, activity, lease, or hold
+publication makes commit return `Conflict`; no intent becomes durable. Exact
+retry returns the original acceptance sequence. A different newly verified
+token may replace an older intent while preserving the same prior activity
+high-water.
 
 ## Current exclusions
 
-- `open_content` remains a compatible unleased read and is explicitly unsafe
-  against future physical deletion. Automated deletion remains disabled while
-  any deployment permits that path; see `content-physical-hold-v1.md`.
+- Compatible `open_content` remains available until the irreversible transition
+  in `content-access-barrier-v1.md`. Intent is now blocked until that barrier
+  and its protected coordinate exist.
+- The access barrier fences new unleased opens but does not prove that older
+  handles drained. Automated deletion remains disabled until that proof or an
+  equivalent external coordination result exists.
 - Grace, a second logical/physical recheck, representation fencing, replica
   deletion, provider-version cleanup, and completion audit are later protocols.
 - Intent alone is never accepted by a deletion worker as deletion authority.
@@ -133,6 +139,7 @@ intent while preserving the same prior activity high-water.
 ## Required evidence
 
 - available token and unexpired lease block intent;
+- compatible or uncoordinated access mode blocks intent with a typed reason;
 - every active physical-hold class blocks intent with typed coordinates;
 - token consumption permits later intent and exact retry is idempotent;
 - leased open racing a staged intent causes one transaction to conflict;

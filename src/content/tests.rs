@@ -13,17 +13,17 @@ use futures::executor::block_on;
 
 use super::{
     CONTENT_CONTROL_BUCKET, CONTENT_LEASE_BUCKET, CONTENT_PHYSICAL_HOLD_BUCKET,
-    CONTENT_TOKEN_INDEX_BUCKET, ContentLeaseRecord, content_control_key, content_lease_key,
-    content_physical_hold_key, content_token_index_key,
+    CONTENT_TOKEN_INDEX_BUCKET, ContentAccessBarrierRecord, ContentLeaseRecord,
+    content_control_key, content_lease_key, content_physical_hold_key, content_token_index_key,
 };
 use crate::{
-    ContentAttachmentScope, ContentChangeId, ContentId, ContentLeaseOptions, ContentLeaseOwnerId,
-    ContentPhysicalHoldId, ContentPhysicalHoldKind, ContentPhysicalHoldOptions,
-    ContentPhysicalHoldOwnerId, ContentReclaimAuthorization, ContentReclaimBlocker,
-    ContentReclaimIntentStage, ContentReclaimProofToken, ContentUploadOptions, ContentUploadResume,
-    Db, DbOptions, ETag, Error, InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta,
-    OwnerScopeId, Precondition, PutIf, SealedContent, StorageDomainId, TransactionOptions,
-    UploadToken,
+    ContentAccessBarrierId, ContentAccessMode, ContentAttachmentScope, ContentChangeId, ContentId,
+    ContentLeaseOptions, ContentLeaseOwnerId, ContentPhysicalHoldId, ContentPhysicalHoldKind,
+    ContentPhysicalHoldOptions, ContentPhysicalHoldOwnerId, ContentReclaimAuthorization,
+    ContentReclaimBlocker, ContentReclaimIntentStage, ContentReclaimProofToken,
+    ContentUploadOptions, ContentUploadResume, Db, DbOptions, ETag, Error, InMemoryObjectStore,
+    ObjectClient, ObjectFuture, ObjectMeta, OwnerScopeId, Precondition, PutIf, SealedContent,
+    StorageDomainId, TransactionOptions, UploadToken,
 };
 
 const TEST_CHUNK_BYTES: usize = 64 * 1024;
@@ -46,13 +46,27 @@ fn test_hold_id(seed: u8) -> ContentPhysicalHoldId {
     ContentPhysicalHoldId::from_bytes(bytes).expect("test physical-hold id decodes")
 }
 
-async fn seal_reclaim_content(db: &Db, bytes: &[u8]) -> SealedContent {
+fn test_access_barrier_id(seed: u8) -> ContentAccessBarrierId {
+    let mut bytes = [seed; 16];
+    bytes[0] = 1;
+    ContentAccessBarrierId::from_bytes(bytes).expect("test access-barrier id decodes")
+}
+
+async fn seal_content_without_access_barrier(db: &Db, bytes: &[u8]) -> SealedContent {
     let mut upload = db
         .begin_content_upload(test_upload_options())
         .await
         .expect("upload begins");
     upload.write(bytes).await.expect("content writes");
     upload.seal().await.expect("content seals")
+}
+
+async fn seal_reclaim_content(db: &Db, bytes: &[u8]) -> SealedContent {
+    let sealed = seal_content_without_access_barrier(db, bytes).await;
+    db.enforce_content_leased_only(sealed.storage_domain_id(), test_access_barrier_id(2))
+        .await
+        .expect("leased-only access is enforced");
+    sealed
 }
 
 async fn consume_reclaim_token(db: &Db, sealed: SealedContent, change: u8) {
@@ -83,6 +97,202 @@ fn reclaim_authorization(
         transaction.read_version(),
         u64::MAX,
     )
+}
+
+#[test]
+fn leased_only_barrier_fences_new_unleased_opens_but_not_old_handles() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let sealed = seal_content_without_access_barrier(&db, b"barrier bytes").await;
+        assert_eq!(
+            db.content_access_mode(sealed.storage_domain_id())
+                .await
+                .expect("compatible mode reads"),
+            ContentAccessMode::CompatibleUnleased
+        );
+        let old = db
+            .open_content(sealed.storage_domain_id(), sealed.content_id())
+            .await
+            .expect("unleased content opens before barrier");
+
+        let barrier = db
+            .enforce_content_leased_only(sealed.storage_domain_id(), test_access_barrier_id(3))
+            .await
+            .expect("leased-only barrier commits");
+        assert!(barrier.enforced_at().as_u64() > 0);
+        assert_eq!(
+            db.content_access_mode(sealed.storage_domain_id())
+                .await
+                .expect("leased-only mode reads"),
+            ContentAccessMode::LeasedOnly {
+                barrier_id: barrier.barrier_id(),
+            }
+        );
+        let repeated = db
+            .enforce_content_leased_only(sealed.storage_domain_id(), test_access_barrier_id(4))
+            .await
+            .expect("existing barrier is adopted");
+        assert_eq!(repeated, barrier);
+        assert!(matches!(
+            db.open_content(sealed.storage_domain_id(), sealed.content_id())
+                .await,
+            Err(Error::ContentLeaseRequired { barrier_id })
+                if barrier_id == barrier.barrier_id()
+        ));
+        assert_eq!(
+            old.read_range(0, u64::MAX)
+                .await
+                .expect("pre-barrier handle still reads")
+                .as_ref(),
+            b"barrier bytes"
+        );
+        let leased = db
+            .open_content_leased(
+                sealed.storage_domain_id(),
+                sealed.content_id(),
+                ContentLeaseOptions::new(
+                    ContentLeaseOwnerId::from_bytes([5; 16]),
+                    Duration::from_secs(60),
+                ),
+            )
+            .await
+            .expect("leased content opens after barrier");
+        assert!(leased.lease_id().is_some());
+    });
+}
+
+#[test]
+fn reclaim_intent_requires_coordinated_leased_only_barrier() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let sealed = seal_content_without_access_barrier(&db, b"access-gated reclaim").await;
+        consume_reclaim_token(&db, sealed, 40).await;
+        let mut compatible = db.transaction(TransactionOptions::default());
+        assert!(matches!(
+            compatible
+                .stage_content_reclaim_intent(reclaim_authorization(&compatible, sealed, 30))
+                .await,
+            Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::UnleasedAccessAllowed,
+            })
+        ));
+
+        let barrier_id = test_access_barrier_id(6);
+        db.write_content_access_barrier_record(ContentAccessBarrierRecord {
+            storage_domain_id: sealed.storage_domain_id(),
+            barrier_id,
+        })
+        .await
+        .expect("backend barrier publishes without coordinate");
+        let mut interrupted = db.transaction(TransactionOptions::default());
+        assert!(matches!(
+            interrupted
+                .stage_content_reclaim_intent(reclaim_authorization(&interrupted, sealed, 31))
+                .await,
+            Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::LeasedOnlyBarrierUncoordinated {
+                    barrier_id: blocked,
+                },
+            }) if blocked == barrier_id
+        ));
+
+        let barrier = db
+            .enforce_content_leased_only(sealed.storage_domain_id(), test_access_barrier_id(7))
+            .await
+            .expect("interrupted barrier coordinate resumes");
+        assert_eq!(barrier.barrier_id(), barrier_id);
+        let mut coordinated = db.transaction(TransactionOptions::default());
+        coordinated
+            .stage_content_reclaim_intent(reclaim_authorization(&coordinated, sealed, 32))
+            .await
+            .expect("coordinated leased-only barrier permits intent");
+    });
+}
+
+#[test]
+fn malformed_access_barrier_fails_closed() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let sealed = seal_content_without_access_barrier(&db, b"malformed access barrier").await;
+        db.write_content_access_barrier_bytes_for_test(
+            sealed.storage_domain_id(),
+            Arc::<[u8]>::from(b"malformed".as_slice()),
+        )
+        .await
+        .expect("malformed barrier publishes for test");
+        assert!(matches!(
+            db.content_access_mode(sealed.storage_domain_id()).await,
+            Err(Error::InvalidFormat { .. })
+        ));
+        assert!(matches!(
+            db.open_content(sealed.storage_domain_id(), sealed.content_id())
+                .await,
+            Err(Error::InvalidFormat { .. })
+        ));
+    });
+}
+
+#[test]
+fn stale_native_read_only_handle_observes_leased_only_barrier_without_refresh() {
+    let path = temp_db_path("content-access-barrier-native-reader");
+    block_on(async {
+        let writer = Db::open(&path).await.expect("native writer opens");
+        let sealed = seal_content_without_access_barrier(&writer, b"native stale reader").await;
+        let reader = Db::open(DbOptions::persistent_read_only(&path))
+            .await
+            .expect("native read-only handle opens before barrier");
+        writer
+            .enforce_content_leased_only(sealed.storage_domain_id(), test_access_barrier_id(8))
+            .await
+            .expect("writer publishes barrier");
+
+        assert!(matches!(
+            reader
+                .open_content(sealed.storage_domain_id(), sealed.content_id())
+                .await,
+            Err(Error::ContentLeaseRequired { .. })
+        ));
+    });
+    std::fs::remove_dir_all(path).expect("test database removes");
+}
+
+#[test]
+fn stale_object_store_reader_observes_leased_only_barrier_without_kv_refresh() {
+    block_on(async {
+        let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+        let writer = Db::open_object_store_at(
+            Arc::clone(&client),
+            "content-access-barrier-object",
+            DbOptions::object_store(),
+        )
+        .await
+        .expect("object-store writer opens");
+        let sealed = seal_content_without_access_barrier(&writer, b"object stale reader").await;
+        let reader = Db::open_object_store_at(
+            Arc::clone(&client),
+            "content-access-barrier-object",
+            DbOptions::object_store().read_only(),
+        )
+        .await
+        .expect("stale object-store reader opens before barrier");
+        writer
+            .enforce_content_leased_only(sealed.storage_domain_id(), test_access_barrier_id(9))
+            .await
+            .expect("object-store barrier publishes");
+
+        assert!(matches!(
+            reader
+                .open_content(sealed.storage_domain_id(), sealed.content_id())
+                .await,
+            Err(Error::ContentLeaseRequired { .. })
+        ));
+    });
 }
 
 #[test]
@@ -1347,7 +1557,11 @@ fn object_store_counts_requests_detects_tampering_and_hides_failed_seal() {
             .await
             .expect("object content opens");
         let after_open = client.counts();
-        assert_eq!(after_open.head - after_seal.head, 1);
+        assert_eq!(
+            after_open.head - after_seal.head,
+            2,
+            "open checks the domain access barrier before the descriptor"
+        );
         assert_eq!(after_open.get_range - after_seal.get_range, 1);
 
         let range = handle

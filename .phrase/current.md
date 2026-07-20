@@ -1,5 +1,42 @@
 # Current Phase
 
+## Consumer-driven persisted leased-only forward fence — 2026-07-20
+
+Trine KV now has one irreversible leased-only access barrier per
+`StorageDomainId`. Compatible `open_content` checks a small record directly in
+the shared content backend before reading a descriptor. That bypasses stale
+ordinary-KV views: already-open native read-only handles and object-store
+readers that have not called `refresh_object_store` observe the barrier on their
+next content open. `open_content_leased` bypasses only this compatibility check
+and still commits its exact durable lease and Active control state before
+returning.
+
+The writer publishes the backend barrier first, then records the same versioned
+identity and final commit sequence in the protected content-control bucket. A
+crash between those writes is restrictive but recoverable: new unleased opens
+fail, reclaim intent returns `LeasedOnlyBarrierUncoordinated`, and retry adopts
+the backend identity and completes the coordinate. A protected coordinate is
+never visible before the backend fence. The API exposes no reversal.
+
+Reclaim-intent staging now requires a valid direct barrier and matching
+coordinate. Compatible mode returns `UnleasedAccessAllowed`; the coordinate
+point read joins the transaction read set. Existing token, lease, physical-hold,
+activity, proof, and descriptor checks remain unchanged.
+
+Safety result: this barrier proves only that no new unleased open linearizes
+after it. A pre-barrier handle remains readable indefinitely, so reader drain,
+grace, and physical deletion remain unimplemented. Native and remote
+deployments need an explicit reader-session or external-coordination proof next.
+
+Acceptance result: 30 focused content tests pass, including native and stale
+object-store read-only visibility, compatible and uncoordinated reclaim
+blockers, interrupted recovery, identity adoption, malformed fail-closed state,
+old-handle survival, and leased access after fencing. The complete all-feature
+suite passes with 492 library tests (490 passed, two ignored) plus every
+integration target. Strict Clippy/import, Rustdoc, 26 doctests, formatting, and
+diff gates pass. Stable ownership, record layouts, ordering, and exclusions are
+in `.phrase/protocol/content-access-barrier-v1.md`.
+
 ## Consumer-driven unified physical content holds — 2026-07-20
 
 Migration, backup, repair, provider, and administrative work now uses one

@@ -110,12 +110,13 @@ read-only instance may lack authority to publish a durable lease or heartbeat.
 No portable local counter, filesystem handle, or object-store request can prove
 that every such handle has drained.
 
-Therefore automated physical deletion must remain disabled in every deployment
-that permits unleased content reads. A future deletion protocol requires an
-explicit persisted lease-only access mode plus a proved reader-drain or external
-coordination transition. Grace alone is not proof because an unleased handle
-has no maximum lifetime. Until that transition exists and is verified,
-uncertainty retains bytes.
+The irreversible leased-only forward fence now exists in
+`content-access-barrier-v1.md`, and reclaim intent requires its protected
+coordinate. It blocks new unleased opens even from stale read-only database
+handles. It does not end handles opened before the barrier: those handles have
+no maximum lifetime. Automated physical deletion therefore remains disabled
+until a proved reader-drain or external-coordination transition covers every
+pre-barrier reader. Grace alone is not that proof; uncertainty retains bytes.
 
 ## Required evidence
 

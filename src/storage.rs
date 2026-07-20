@@ -39,6 +39,7 @@ use crate::stats::PlatformIoClassCounters;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum StorageObjectKind {
     Blob,
+    ContentAccessBarrier,
     ContentChunk,
     ContentDescriptor,
     ContentUpload,
@@ -54,6 +55,7 @@ impl StorageObjectKind {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Blob => "blob",
+            Self::ContentAccessBarrier => "content access barrier",
             Self::ContentChunk => "content chunk",
             Self::ContentDescriptor => "content descriptor",
             Self::ContentUpload => "content upload state",
@@ -71,7 +73,9 @@ pub(crate) fn max_whole_object_read_bytes(kind: StorageObjectKind) -> usize {
     match kind {
         StorageObjectKind::Blob => limits::MAX_WHOLE_BLOB_DECODE_BYTES,
         StorageObjectKind::ContentChunk => 16 * 1024 * 1024 + 128,
-        StorageObjectKind::ContentDescriptor | StorageObjectKind::ContentUpload => 4 * 1024,
+        StorageObjectKind::ContentAccessBarrier
+        | StorageObjectKind::ContentDescriptor
+        | StorageObjectKind::ContentUpload => 4 * 1024,
         StorageObjectKind::Manifest => limits::MAX_MANIFEST_PAYLOAD_BYTES + 14,
         StorageObjectKind::RecoveryReport => limits::MAX_MANIFEST_PAYLOAD_BYTES,
         StorageObjectKind::Table => 14 + limits::MAX_WHOLE_TABLE_DECODE_BYTES,
