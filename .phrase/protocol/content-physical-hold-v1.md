@@ -106,8 +106,10 @@ hide bytes, or authorize representation deletion.
 transaction. Because quarantine v1 has not started deletion, hold acquisition
 or renewal is conservative revival authority: it validates and removes an
 existing quarantine record while returning content control to Active in the
-same transaction. A race either commits entirely before quarantine, commits
-entirely after revival, or conflicts.
+same transaction. If `content-reclaim-grace-v1.md` is also present, the same
+transaction validates and removes the exact grace/quarantine pair. A race
+either commits entirely before quarantine, commits entirely after revival, or
+conflicts.
 
 ## Unleased compatibility boundary
 

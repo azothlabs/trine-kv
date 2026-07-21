@@ -14,12 +14,13 @@ use crate::{
         ContentPhysicalHoldRecord, ContentPhysicalHoldRecordState, ContentQuarantine,
         ContentQuarantineRecord, ContentReaderDrainAttestation, ContentReaderDrainAttestationId,
         ContentReaderDrainAttestationOptions, ContentReaderDrainAttestationRecord,
-        ContentTokenIndexRecord, ContentUpload, ContentUploadOptions, ContentUploadResume,
-        SealedContent, StorageDomainId, UploadId, UploadSessionState, UploadSessionStatus,
-        UploadToken, UploadTokenRecord, content_access_coordinate_key, content_lease_key,
-        content_lease_prefix, content_physical_hold_key, content_quarantine_key,
-        content_reader_drain_attestation_key, content_token_index_key, current_epoch_millis,
-        duration_millis, upload_token_key,
+        ContentReclaimGrace, ContentReclaimGraceRecord, ContentTokenIndexRecord, ContentUpload,
+        ContentUploadOptions, ContentUploadResume, SealedContent, StorageDomainId, UploadId,
+        UploadSessionState, UploadSessionStatus, UploadToken, UploadTokenRecord,
+        content_access_coordinate_key, content_lease_key, content_lease_prefix,
+        content_physical_hold_key, content_quarantine_key, content_reader_drain_attestation_key,
+        content_reclaim_grace_key, content_token_index_key, current_epoch_millis, duration_millis,
+        upload_token_key,
     },
     error::{Error, Result},
     options::{DurabilityMode, HostStorageBackend, StorageMode, WriteOptions},
@@ -592,6 +593,47 @@ impl Db {
             Ok(None) | Err(Error::BucketMissing { .. }) => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    /// Reads the durable reclaim-grace scheduling record for exact content.
+    ///
+    /// `None` means grace has not been started or authoritative activity
+    /// atomically revived the content. A returned deadline is not deletion
+    /// authority: it is based on a host wall-clock observation and this API does
+    /// not claim that elapsed real time survived clock jumps or restart.
+    /// Malformed state or a grace record without its matching quarantine fails
+    /// closed.
+    pub async fn content_reclaim_grace(
+        &self,
+        storage_domain_id: StorageDomainId,
+        content_id: ContentId,
+    ) -> Result<Option<ContentReclaimGrace>> {
+        self.ensure_open()?;
+        self.ensure_content_backend_supported()?;
+        let mut transaction = self.transaction(TransactionOptions::default());
+        let grace_key = content_reclaim_grace_key(storage_domain_id, content_id);
+        let Some(bytes) = transaction
+            .get_bucket(CONTENT_CONTROL_BUCKET, &grace_key)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let grace = ContentReclaimGraceRecord::decode(&bytes, storage_domain_id, content_id)?;
+        let quarantine_key = content_quarantine_key(storage_domain_id, content_id);
+        let quarantine_bytes = transaction
+            .get_bucket(CONTENT_CONTROL_BUCKET, &quarantine_key)
+            .await?
+            .ok_or_else(|| Error::Corruption {
+                message: "content reclaim grace exists without its quarantine fence".to_owned(),
+            })?;
+        let quarantine =
+            ContentQuarantineRecord::decode(&quarantine_bytes, storage_domain_id, content_id)?;
+        if !grace.matches_quarantine(quarantine) {
+            return Err(Error::Corruption {
+                message: "content reclaim grace differs from its quarantine fence".to_owned(),
+            });
+        }
+        Ok(Some(grace.into_public()))
     }
 
     /// Opens a sealed immutable `ContentObject` by cryptographic identity.

@@ -57,6 +57,8 @@ Evidence notes should separate:
   `.phrase/protocol/content-reader-drain-attestation-v1.md`.
 - Crash-safe exact-content quarantine and read fence:
   `.phrase/protocol/content-quarantine-v1.md`.
+- Non-authorizing reclaim-grace scheduling record:
+  `.phrase/protocol/content-reclaim-grace-v1.md`.
 - Guard-aware LSM read and compaction strategy:
   `.phrase/protocol/guard-aware-lsm-strategy.md`.
 - Trine specs, ADRs, tests, and local design notes are the source of truth.

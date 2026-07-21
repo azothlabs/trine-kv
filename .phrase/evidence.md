@@ -16785,3 +16785,56 @@ Negative check:
 - A later protocol must define persisted grace with clock/restart behavior and
   repeat fresh logical, physical, representation, replica, and provider-hold
   checks before deletion.
+
+## 2026-07-21: non-authorizing reclaim-grace scheduling record
+
+### Observation
+
+- A durable worker needs an earliest-time retry coordinate after quarantine,
+  but the host wall clock does not prove elapsed real time across jumps or
+  restart.
+- The wall-clock observation precedes transaction commit, so its requested delay
+  is not a minimum interval measured from durable visibility.
+- `ObjectClient` has key-level idempotent delete, size, and ETag only. It cannot
+  represent provider versions, delete markers, object lock, retention, or legal
+  hold.
+
+### Interpretation
+
+- Store grace as a scheduling record, never as deletion authority. Passing its
+  deadline changes no lifecycle state.
+- Bind it to exact quarantine and repeat every physical check. Token/upload or
+  hold activity must remove grace and quarantine with Active publication in one
+  transaction.
+- Provider/version deletion and trusted time remain later contracts.
+
+### Implementation evidence
+
+- Added a commit-stamped `ContentReclaimGraceRecord`, public audit type, typed
+  staging result, and exact query API. The value binds proof token, quarantine
+  commit, requested delay, wall observation, and derived deadline.
+- `Transaction::stage_content_reclaim_grace` repeats barrier, drain, intent,
+  descriptor, activity, token, lease, hold, and quarantine checks. Exact retry
+  preserves the first record; a different delay fails.
+- Activity validates and deletes the exact grace/quarantine pair before writing
+  Active. A grace record without matching quarantine is corruption; malformed
+  state blocks query and revival.
+- The stable contract is in `content-reclaim-grace-v1.md` and explicitly records
+  the current `ObjectClient` provider-version limit.
+
+### Verification
+
+- Five focused tests pass, covering missing quarantine, exact start/retry,
+  different delay, old-handle readability, provider-hold/upload revival,
+  native reopen, refreshed object-store visibility with zero content deletes,
+  physical race conflict, and malformed-state failure.
+- `cargo test -q --all-features` passes with 507 library tests (505 passed, two
+  ignored) plus every integration target.
+- Strict all-target/all-feature Clippy with wildcard imports denied, strict
+  Rustdoc, 29 doctests, formatting, explicit-import scan, and diff checks pass.
+
+### Safety boundary
+
+- No method consumes deadline passage as authority.
+- No descriptor, chunk, replica, provider version, or physical byte deletion
+  exists.

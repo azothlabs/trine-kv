@@ -92,8 +92,10 @@ lease write, so they conflict with intent installation or replace older intent
 with newer Active state. The current `content_has_active_lease` helper remains
 only a conservative precheck and is not deletion authority. The implemented
 quarantine fence reads this exact range in its transition transaction and new
-leased activity reads the quarantine key in its lease transaction. Final grace,
-representation fencing, and physical deletion remain outside this protocol.
+leased activity reads the quarantine key in its lease transaction. The
+non-authorizing scheduling record is in `content-reclaim-grace-v1.md`; trusted
+clock validation, representation fencing, and physical deletion remain outside
+this protocol.
 
 Migration, backup, repair, provider, and administrative work does not borrow a
 read-lease identity. Those actors use the common durable registry in

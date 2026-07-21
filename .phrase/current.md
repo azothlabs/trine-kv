@@ -1,5 +1,35 @@
 # Current Phase
 
+## Consumer-driven non-authorizing reclaim grace — 2026-07-21
+
+Quarantine closes new leased reads, but a crash-recoverable worker also needs a
+durable earliest-time scheduling coordinate. This slice records the host
+wall-clock observation, requested delay, derived `not_before`, exact quarantine,
+and final commit sequence only after the higher layer and Trine KV repeat all
+logical and physical checks in one optimistic transaction.
+
+This record is deliberately not elapsed-time proof. The observation happens
+before commit, wall clocks can jump, and no local monotonic clock survives
+restart. Passing `not_before` changes no authority and invokes no delete path.
+Upload/token and physical-hold activity removes grace and quarantine while
+returning control to Active atomically; malformed or mismatched state fails
+closed.
+
+Backend boundary receipt: the owned operation is `content_reclaim_grace`.
+Native storage and `ObjectClient` are backends. `ObjectClient` currently exposes
+key delete, size, and ETag but no provider version id, delete marker, object
+lock, retention, or legal hold. Provider-version deletion therefore remains
+outside this slice and outside the current authority boundary.
+
+Stable layout, retry/recovery rules, clock limits, revival semantics, and future
+delete exclusions are in `.phrase/protocol/content-reclaim-grace-v1.md`.
+
+Acceptance result: five focused grace tests pass. The complete all-feature
+suite passes with 507 library tests (505 passed, two ignored) plus every
+integration target. Strict all-target/all-feature Clippy with wildcard imports
+denied, strict Rustdoc, 29 doctests, formatting, explicit-import, and diff gates
+pass.
+
 ## Consumer-driven crash-safe content quarantine — 2026-07-21
 
 Reader drain now has a durable deployment attestation, but intent and

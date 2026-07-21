@@ -15,7 +15,7 @@ use super::{
     CONTENT_CONTROL_BUCKET, CONTENT_LEASE_BUCKET, CONTENT_PHYSICAL_HOLD_BUCKET,
     CONTENT_TOKEN_INDEX_BUCKET, ContentAccessBarrierRecord, ContentLeaseRecord,
     content_control_key, content_lease_key, content_physical_hold_key, content_quarantine_key,
-    content_reader_drain_attestation_key, content_token_index_key,
+    content_reader_drain_attestation_key, content_reclaim_grace_key, content_token_index_key,
 };
 use crate::{
     ContentAccessBarrier, ContentAccessBarrierId, ContentAccessMode, ContentAttachmentScope,
@@ -23,10 +23,11 @@ use crate::{
     ContentPhysicalHoldKind, ContentPhysicalHoldOptions, ContentPhysicalHoldOwnerId,
     ContentQuarantineStage, ContentReaderDrainAttestationId, ContentReaderDrainAttestationOptions,
     ContentReaderDrainCoordinatorId, ContentReaderDrainEvidenceDigest, ContentReaderDrainKind,
-    ContentReclaimAuthorization, ContentReclaimBlocker, ContentReclaimIntentStage,
-    ContentReclaimProofToken, ContentUploadOptions, ContentUploadResume, Db, DbOptions, ETag,
-    Error, InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta, OwnerScopeId, Precondition,
-    PutIf, ReadVersion, SealedContent, StorageDomainId, TransactionOptions, UploadToken,
+    ContentReclaimAuthorization, ContentReclaimBlocker, ContentReclaimGraceStage,
+    ContentReclaimIntentStage, ContentReclaimProofToken, ContentUploadOptions, ContentUploadResume,
+    Db, DbOptions, ETag, Error, InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta,
+    OwnerScopeId, Precondition, PutIf, ReadVersion, SealedContent, StorageDomainId,
+    TransactionOptions, UploadToken,
 };
 
 const TEST_CHUNK_BYTES: usize = 64 * 1024;
@@ -121,6 +122,55 @@ async fn attest_reclaim_reader_drain(db: &Db, domain: StorageDomainId, seed: u8)
     )
     .await
     .expect("reader drain attests");
+}
+
+async fn commit_reclaim_quarantine(
+    db: &Db,
+    sealed: SealedContent,
+    proof_seed: u8,
+) -> (ContentReclaimAuthorization, ReadVersion) {
+    let mut intent = db.transaction(TransactionOptions::default());
+    let authorization = reclaim_authorization(&intent, sealed, proof_seed);
+    intent
+        .stage_content_reclaim_intent(authorization)
+        .await
+        .expect("reclaim intent stages");
+    intent.commit().await.expect("reclaim intent commits");
+    let mut quarantine = db.transaction(TransactionOptions::default());
+    quarantine
+        .stage_content_quarantine(authorization)
+        .await
+        .expect("quarantine stages");
+    let commit = quarantine.commit().await.expect("quarantine commits");
+    (authorization, commit.read_version())
+}
+
+async fn assert_provider_hold_revives_grace(db: &Db, sealed: SealedContent) {
+    let hold = db
+        .acquire_content_physical_hold(
+            sealed.storage_domain_id(),
+            sealed.content_id(),
+            test_hold_id(94),
+            ContentPhysicalHoldOptions::until_released(
+                ContentPhysicalHoldKind::Provider,
+                ContentPhysicalHoldOwnerId::from_bytes([94; 16]),
+            ),
+        )
+        .await
+        .expect("provider hold atomically revives content");
+    assert_eq!(
+        db.content_reclaim_grace(sealed.storage_domain_id(), sealed.content_id())
+            .await
+            .expect("hold-revived grace status reads"),
+        None
+    );
+    assert_eq!(
+        db.content_quarantine(sealed.storage_domain_id(), sealed.content_id())
+            .await
+            .expect("hold-revived quarantine status reads"),
+        None
+    );
+    hold.release().await.expect("provider hold releases");
 }
 
 fn reclaim_authorization(
@@ -908,6 +958,309 @@ fn malformed_quarantine_fails_reads_and_revival_closed() {
             .await,
             Err(Error::InvalidFormat { .. })
         ));
+    });
+}
+
+#[test]
+fn reclaim_grace_requires_quarantine_is_idempotent_and_keeps_bytes() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let bytes = b"reclaim grace retains bytes";
+        let sealed = seal_content_without_access_barrier(&db, bytes).await;
+        let old = db
+            .open_content(sealed.storage_domain_id(), sealed.content_id())
+            .await
+            .expect("pre-barrier handle opens");
+        db.enforce_content_leased_only(sealed.storage_domain_id(), test_access_barrier_id(40))
+            .await
+            .expect("leased-only barrier commits");
+        consume_reclaim_token(&db, sealed, 91).await;
+        attest_reclaim_reader_drain(&db, sealed.storage_domain_id(), 40).await;
+
+        let mut intent = db.transaction(TransactionOptions::default());
+        let authorization = reclaim_authorization(&intent, sealed, 71);
+        intent
+            .stage_content_reclaim_intent(authorization)
+            .await
+            .expect("reclaim intent stages");
+        intent.commit().await.expect("reclaim intent commits");
+        let mut without_quarantine = db.transaction(TransactionOptions::default());
+        assert!(matches!(
+            without_quarantine
+                .stage_content_reclaim_grace(authorization, Duration::from_secs(60))
+                .await,
+            Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::QuarantineRequired,
+            })
+        ));
+
+        let mut quarantine = db.transaction(TransactionOptions::default());
+        quarantine
+            .stage_content_quarantine(authorization)
+            .await
+            .expect("quarantine stages");
+        let quarantine_commit = quarantine.commit().await.expect("quarantine commits");
+        let mut grace = db.transaction(TransactionOptions::default());
+        assert_eq!(
+            grace
+                .stage_content_reclaim_grace(authorization, Duration::from_secs(60))
+                .await
+                .expect("grace stages"),
+            ContentReclaimGraceStage::Staged
+        );
+        let grace_commit = grace.commit().await.expect("grace commits");
+        let record = db
+            .content_reclaim_grace(sealed.storage_domain_id(), sealed.content_id())
+            .await
+            .expect("grace reads")
+            .expect("grace exists");
+        assert_eq!(record.quarantined_at(), quarantine_commit.read_version());
+        assert_eq!(record.started_at(), grace_commit.read_version());
+        assert_eq!(record.requested_duration_ms(), 60_000);
+        assert_eq!(
+            record.not_before_unix_ms(),
+            record.observed_at_unix_ms() + record.requested_duration_ms()
+        );
+        assert_eq!(
+            old.read_range(0, u64::MAX)
+                .await
+                .expect("old handle still reads because grace deletes nothing")
+                .as_ref(),
+            bytes
+        );
+
+        let mut repeated = db.transaction(TransactionOptions::default());
+        assert_eq!(
+            repeated
+                .stage_content_reclaim_grace(authorization, Duration::from_secs(60))
+                .await
+                .expect("grace retry reads existing record"),
+            ContentReclaimGraceStage::Existing {
+                started_at: grace_commit.read_version(),
+            }
+        );
+        let mut different = db.transaction(TransactionOptions::default());
+        assert!(matches!(
+            different
+                .stage_content_reclaim_grace(authorization, Duration::from_secs(61))
+                .await,
+            Err(Error::InvalidOptions { .. })
+        ));
+        assert_provider_hold_revives_grace(&db, sealed).await;
+    });
+}
+
+#[test]
+fn reclaim_grace_survives_reopen_and_upload_activity_revives_content() {
+    let path = temp_db_path("content-reclaim-grace-reopen");
+    let (domain, content_id, recorded) = block_on(async {
+        let db = Db::open(&path).await.expect("native db opens");
+        let bytes = b"durable reclaim grace";
+        let sealed = seal_reclaim_content(&db, bytes).await;
+        consume_reclaim_token(&db, sealed, 92).await;
+        attest_reclaim_reader_drain(&db, sealed.storage_domain_id(), 43).await;
+        let (authorization, _) = commit_reclaim_quarantine(&db, sealed, 72).await;
+        let mut grace = db.transaction(TransactionOptions::default());
+        grace
+            .stage_content_reclaim_grace(authorization, Duration::from_secs(120))
+            .await
+            .expect("native grace stages");
+        grace.commit().await.expect("native grace commits");
+        let record = db
+            .content_reclaim_grace(sealed.storage_domain_id(), sealed.content_id())
+            .await
+            .expect("native grace reads")
+            .expect("native grace exists");
+        (sealed.storage_domain_id(), sealed.content_id(), record)
+    });
+
+    block_on(async {
+        let db = Db::open(&path).await.expect("native db reopens");
+        assert_eq!(
+            db.content_reclaim_grace(domain, content_id)
+                .await
+                .expect("reopened grace reads"),
+            Some(recorded)
+        );
+        let repeated = seal_content_without_access_barrier(&db, b"durable reclaim grace").await;
+        assert_eq!(repeated.content_id(), content_id);
+        assert_eq!(
+            db.content_reclaim_grace(domain, content_id)
+                .await
+                .expect("revived grace status reads"),
+            None
+        );
+        assert_eq!(
+            db.content_quarantine(domain, content_id)
+                .await
+                .expect("revived quarantine status reads"),
+            None
+        );
+    });
+    std::fs::remove_dir_all(path).expect("test database removes");
+}
+
+#[test]
+fn refreshed_object_store_reader_observes_grace_without_content_delete() {
+    block_on(async {
+        let client = Arc::new(MeasuredClient::new());
+        let prefix = "content-reclaim-grace-object";
+        let writer = Db::open_object_store_at(client.clone(), prefix, DbOptions::object_store())
+            .await
+            .expect("object-store writer opens");
+        let reader = Db::open_object_store_at(
+            client.clone(),
+            prefix,
+            DbOptions::object_store().read_only(),
+        )
+        .await
+        .expect("object-store reader opens");
+        let bytes = b"object-store reclaim grace";
+        let sealed = seal_content_without_access_barrier(&writer, bytes).await;
+        consume_reclaim_token(&writer, sealed, 96).await;
+        reader
+            .refresh_object_store()
+            .await
+            .expect("reader refreshes sealed state");
+        let old = reader
+            .open_content(sealed.storage_domain_id(), sealed.content_id())
+            .await
+            .expect("pre-barrier object-store handle opens");
+        writer
+            .enforce_content_leased_only(sealed.storage_domain_id(), test_access_barrier_id(52))
+            .await
+            .expect("object-store barrier commits");
+        attest_reclaim_reader_drain(&writer, sealed.storage_domain_id(), 52).await;
+        let (authorization, _) = commit_reclaim_quarantine(&writer, sealed, 75).await;
+
+        client.reset_counts();
+        let mut grace = writer.transaction(TransactionOptions::default());
+        grace
+            .stage_content_reclaim_grace(authorization, Duration::from_secs(60))
+            .await
+            .expect("object-store grace stages");
+        grace.commit().await.expect("object-store grace commits");
+        assert_eq!(client.counts().content_delete, 0);
+
+        reader
+            .refresh_object_store()
+            .await
+            .expect("reader refreshes grace state");
+        assert_eq!(
+            reader
+                .content_reclaim_grace(sealed.storage_domain_id(), sealed.content_id())
+                .await
+                .expect("refreshed reader sees grace"),
+            writer
+                .content_reclaim_grace(sealed.storage_domain_id(), sealed.content_id())
+                .await
+                .expect("writer sees grace")
+        );
+        assert_eq!(
+            old.read_range(0, u64::MAX)
+                .await
+                .expect("old object-store handle still reads")
+                .as_ref(),
+            bytes
+        );
+    });
+}
+
+#[test]
+fn upload_activity_racing_staged_reclaim_grace_forces_conflict() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let bytes = b"reclaim grace upload race";
+        let sealed = seal_reclaim_content(&db, bytes).await;
+        consume_reclaim_token(&db, sealed, 95).await;
+        attest_reclaim_reader_drain(&db, sealed.storage_domain_id(), 49).await;
+        let (authorization, _) = commit_reclaim_quarantine(&db, sealed, 74).await;
+        let mut grace = db.transaction(TransactionOptions::default());
+        grace
+            .stage_content_reclaim_grace(authorization, Duration::from_secs(60))
+            .await
+            .expect("grace stages before upload activity");
+
+        let repeated = seal_content_without_access_barrier(&db, bytes).await;
+        assert_eq!(repeated.content_id(), sealed.content_id());
+        assert!(matches!(grace.commit().await, Err(Error::Conflict { .. })));
+        assert!(
+            db.content_reclaim_grace(sealed.storage_domain_id(), sealed.content_id())
+                .await
+                .expect("raced grace remains absent")
+                .is_none()
+        );
+        assert!(
+            db.content_quarantine(sealed.storage_domain_id(), sealed.content_id())
+                .await
+                .expect("upload revival removes quarantine")
+                .is_none()
+        );
+    });
+}
+
+#[test]
+fn malformed_reclaim_grace_blocks_query_and_revival() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let bytes = b"malformed reclaim grace";
+        let sealed = seal_reclaim_content(&db, bytes).await;
+        consume_reclaim_token(&db, sealed, 93).await;
+        attest_reclaim_reader_drain(&db, sealed.storage_domain_id(), 46).await;
+        commit_reclaim_quarantine(&db, sealed, 73).await;
+
+        let mut damage = db.transaction(TransactionOptions::default());
+        damage
+            .put_bucket(
+                CONTENT_CONTROL_BUCKET,
+                content_reclaim_grace_key(sealed.storage_domain_id(), sealed.content_id()),
+                b"damaged reclaim grace".to_vec(),
+            )
+            .expect("malformed grace stages");
+        damage.commit().await.expect("malformed grace commits");
+        assert!(matches!(
+            db.content_reclaim_grace(sealed.storage_domain_id(), sealed.content_id())
+                .await,
+            Err(Error::InvalidFormat { .. })
+        ));
+        let mut unsafe_caller = db.transaction(TransactionOptions::default());
+        assert!(matches!(
+            unsafe_caller
+                .stage_content_activity(sealed.storage_domain_id(), sealed.content_id())
+                .await,
+            Err(Error::InvalidFormat { .. })
+        ));
+        unsafe_caller
+            .commit()
+            .await
+            .expect("committing after validation error writes no lifecycle change");
+        assert!(
+            db.content_quarantine(sealed.storage_domain_id(), sealed.content_id())
+                .await
+                .expect("failed revival retained quarantine")
+                .is_some()
+        );
+        let mut upload = db
+            .begin_content_upload(test_upload_options())
+            .await
+            .expect("revival upload begins");
+        upload.write(bytes).await.expect("revival bytes write");
+        assert!(matches!(
+            upload.seal().await,
+            Err(Error::InvalidFormat { .. })
+        ));
+        assert!(
+            db.content_quarantine(sealed.storage_domain_id(), sealed.content_id())
+                .await
+                .expect("quarantine remains readable")
+                .is_some()
+        );
     });
 }
 
@@ -2352,6 +2705,7 @@ struct RequestCounts {
     get_range: usize,
     put: usize,
     head: usize,
+    content_delete: usize,
 }
 
 #[derive(Debug)]
@@ -2361,6 +2715,7 @@ struct MeasuredClient {
     get_range: AtomicUsize,
     put: AtomicUsize,
     head: AtomicUsize,
+    content_delete: AtomicUsize,
     fail_descriptors: AtomicBool,
     fail_open_upload_states: AtomicBool,
     fail_sealing_upload_states: AtomicBool,
@@ -2375,6 +2730,7 @@ impl MeasuredClient {
             get_range: AtomicUsize::new(0),
             put: AtomicUsize::new(0),
             head: AtomicUsize::new(0),
+            content_delete: AtomicUsize::new(0),
             fail_descriptors: AtomicBool::new(false),
             fail_open_upload_states: AtomicBool::new(false),
             fail_sealing_upload_states: AtomicBool::new(false),
@@ -2387,6 +2743,7 @@ impl MeasuredClient {
         self.get_range.store(0, Ordering::Relaxed);
         self.put.store(0, Ordering::Relaxed);
         self.head.store(0, Ordering::Relaxed);
+        self.content_delete.store(0, Ordering::Relaxed);
     }
 
     fn counts(&self) -> RequestCounts {
@@ -2395,6 +2752,7 @@ impl MeasuredClient {
             get_range: self.get_range.load(Ordering::Relaxed),
             put: self.put.load(Ordering::Relaxed),
             head: self.head.load(Ordering::Relaxed),
+            content_delete: self.content_delete.load(Ordering::Relaxed),
         }
     }
 }
@@ -2453,6 +2811,11 @@ impl ObjectClient for MeasuredClient {
     }
 
     fn delete<'op>(&'op self, key: &str) -> ObjectFuture<'op, ()> {
+        if key.contains("/content-v1/")
+            && (key.contains("/descriptors/") || key.contains("/chunks/"))
+        {
+            self.content_delete.fetch_add(1, Ordering::Relaxed);
+        }
         self.inner.delete(key)
     }
 

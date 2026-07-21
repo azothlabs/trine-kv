@@ -134,10 +134,11 @@ high-water.
   durable external-coordination record, but intent does not require or consume
   it because intent remains harmless coordination state rather than deletion
   authority.
-- Grace, a second logical/physical recheck, representation fencing, replica
-  deletion, provider-version cleanup, and completion audit remain later
-  protocols. `content-quarantine-v1.md` now supplies the second transactional
-  recheck and leased-read fence without starting grace or deleting bytes.
+- Representation fencing, replica deletion, provider-version cleanup, and
+  completion audit remain later protocols. `content-quarantine-v1.md` supplies
+  the second transactional recheck and leased-read fence.
+  `content-reclaim-grace-v1.md` adds a non-authorizing wall-clock scheduling
+  record; neither protocol deletes bytes.
 - Intent alone is never accepted by a deletion worker as deletion authority.
 
 ## Required evidence

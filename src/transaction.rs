@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -12,11 +12,12 @@ use crate::{
         ContentControlRecord, ContentDescriptor, ContentLeaseId, ContentLeaseRecord,
         ContentPhysicalHoldId, ContentPhysicalHoldRecord, ContentQuarantineRecord,
         ContentQuarantineStage, ContentReaderDrainAttestationRecord, ContentReclaimAuthorization,
-        ContentReclaimIntentStage, ContentTokenIndexRecord, StorageDomainId, UploadToken,
-        UploadTokenRecord, content_access_coordinate_key, content_control_key,
-        content_lease_prefix, content_physical_hold_prefix, content_prefix_range,
-        content_quarantine_key, content_reader_drain_attestation_key, content_token_index_key,
-        content_token_index_prefix, upload_token_key,
+        ContentReclaimGraceRecord, ContentReclaimGraceStage, ContentReclaimIntentStage,
+        ContentTokenIndexRecord, StorageDomainId, UploadToken, UploadTokenRecord,
+        content_access_coordinate_key, content_control_key, content_lease_prefix,
+        content_physical_hold_prefix, content_prefix_range, content_quarantine_key,
+        content_reader_drain_attestation_key, content_reclaim_grace_key, content_token_index_key,
+        content_token_index_prefix, duration_millis, upload_token_key,
     },
     db::Db,
     error::{ContentReclaimBlocker, Error, Result},
@@ -426,10 +427,29 @@ impl Transaction {
             ContentControlRecord::decode(&bytes, storage_domain_id, content_id)?;
         }
         let quarantine_key = content_quarantine_key(storage_domain_id, content_id);
-        if let Some(bytes) = self.get_bucket_sync(CONTENT_CONTROL_BUCKET, &quarantine_key)? {
-            ContentQuarantineRecord::decode(&bytes, storage_domain_id, content_id)?;
+        let quarantine = self
+            .get_bucket_sync(CONTENT_CONTROL_BUCKET, &quarantine_key)?
+            .map(|bytes| ContentQuarantineRecord::decode(&bytes, storage_domain_id, content_id))
+            .transpose()?;
+        let grace_key = content_reclaim_grace_key(storage_domain_id, content_id);
+        let grace = self
+            .get_bucket_sync(CONTENT_CONTROL_BUCKET, &grace_key)?
+            .map(|bytes| ContentReclaimGraceRecord::decode(&bytes, storage_domain_id, content_id))
+            .transpose()?;
+        if let Some(grace) = grace {
+            if !quarantine.is_some_and(|record| grace.matches_quarantine(record)) {
+                return Err(Error::Corruption {
+                    message: "content reclaim grace differs from its quarantine fence".to_owned(),
+                });
+            }
+        }
+        if quarantine.is_some() {
             self.writes
                 .delete_bucket(CONTENT_CONTROL_BUCKET, quarantine_key)?;
+        }
+        if grace.is_some() {
+            self.writes
+                .delete_bucket(CONTENT_CONTROL_BUCKET, grace_key)?;
         }
         self.stage_active_content_control(storage_domain_id, content_id, key)
     }
@@ -673,13 +693,31 @@ impl Transaction {
             ContentControlRecord::decode(&bytes, storage_domain_id, content_id)?;
         }
         let quarantine_key = content_quarantine_key(storage_domain_id, content_id);
-        if let Some(bytes) = self
+        let quarantine = self
             .get_bucket(CONTENT_CONTROL_BUCKET, &quarantine_key)
             .await?
-        {
-            ContentQuarantineRecord::decode(&bytes, storage_domain_id, content_id)?;
+            .map(|bytes| ContentQuarantineRecord::decode(&bytes, storage_domain_id, content_id))
+            .transpose()?;
+        let grace_key = content_reclaim_grace_key(storage_domain_id, content_id);
+        let grace = self
+            .get_bucket(CONTENT_CONTROL_BUCKET, &grace_key)
+            .await?
+            .map(|bytes| ContentReclaimGraceRecord::decode(&bytes, storage_domain_id, content_id))
+            .transpose()?;
+        if let Some(grace) = grace {
+            if !quarantine.is_some_and(|record| grace.matches_quarantine(record)) {
+                return Err(Error::Corruption {
+                    message: "content reclaim grace differs from its quarantine fence".to_owned(),
+                });
+            }
+        }
+        if quarantine.is_some() {
             self.writes
                 .delete_bucket(CONTENT_CONTROL_BUCKET, quarantine_key)?;
+        }
+        if grace.is_some() {
+            self.writes
+                .delete_bucket(CONTENT_CONTROL_BUCKET, grace_key)?;
         }
         self.stage_active_content_control(storage_domain_id, content_id, key)
     }
@@ -698,6 +736,16 @@ impl Transaction {
                 ContentQuarantineRecord::decode(&bytes, storage_domain_id, content_id)?;
             return Err(Error::ContentQuarantined {
                 quarantined_at: quarantine.quarantined_at,
+            });
+        }
+        let grace_key = content_reclaim_grace_key(storage_domain_id, content_id);
+        if self
+            .get_bucket(CONTENT_CONTROL_BUCKET, &grace_key)
+            .await?
+            .is_some()
+        {
+            return Err(Error::Corruption {
+                message: "content reclaim grace exists without its quarantine fence".to_owned(),
             });
         }
         let key = content_control_key(storage_domain_id, content_id);
@@ -1084,6 +1132,170 @@ impl Transaction {
             &[],
         )?;
         Ok(ContentQuarantineStage::Staged)
+    }
+
+    /// Stages a durable earliest-time scheduling record for quarantined content.
+    ///
+    /// The exact quarantine, reclaim intent, leased-only barrier, reader-drain
+    /// attestation, descriptor, activity, token, lease, and hold state are
+    /// rechecked in this transaction. The higher layer must repeat its logical
+    /// proof and reachability checks in the same transaction before this call.
+    ///
+    /// `observation_delay` must be at least one millisecond and is measured from
+    /// the wall-clock observation made before commit. The resulting Unix
+    /// deadline is a scheduling hint only: it may be closer than that delay when
+    /// the commit becomes durable, does not authorize deletion, and this method
+    /// deletes no descriptor or byte.
+    /// Token/attachment or physical-hold activity removes both grace and
+    /// quarantine while returning content control to Active atomically.
+    ///
+    /// # Returns
+    ///
+    /// [`ContentReclaimGraceStage::Staged`] means the write still needs this
+    /// transaction to commit. `Existing` reports the original commit sequence
+    /// for an exact retry with the same duration while the authorization is
+    /// still unexpired. After expiry, use [`Db::content_reclaim_grace`] to
+    /// recover a commit-before-response result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ContentReclaimBlocked`] when the quarantine or another
+    /// required lifecycle coordinate is absent or stale. Invalid duration,
+    /// deadline overflow, malformed protected state, and commit conflicts fail
+    /// closed.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    /// use trine_kv::{
+    ///     ContentReclaimAuthorization, ContentReclaimGraceStage, Transaction,
+    /// };
+    ///
+    /// async fn stage(
+    ///     transaction: &mut Transaction,
+    ///     authorization: ContentReclaimAuthorization,
+    /// ) -> trine_kv::Result<()> {
+    ///     // The caller has already rechecked logical state in `transaction`.
+    ///     assert_eq!(
+    ///         transaction
+    ///             .stage_content_reclaim_grace(authorization, Duration::from_secs(60))
+    ///             .await?,
+    ///         ContentReclaimGraceStage::Staged,
+    ///     );
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn stage_content_reclaim_grace(
+        &mut self,
+        authorization: ContentReclaimAuthorization,
+        observation_delay: Duration,
+    ) -> Result<ContentReclaimGraceStage> {
+        let requested_duration_ms = duration_millis(observation_delay, "content reclaim grace")?;
+        let observed_at_unix_ms = current_epoch_millis()?;
+        let not_before_unix_ms = observed_at_unix_ms
+            .checked_add(requested_duration_ms)
+            .ok_or_else(|| Error::invalid_options("content reclaim-grace deadline overflow"))?;
+        if observed_at_unix_ms >= authorization.expires_at_unix_ms() {
+            return Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::ProofExpired {
+                    expired_at_unix_ms: authorization.expires_at_unix_ms(),
+                },
+            });
+        }
+        self.db.bucket(CONTENT_CONTROL_BUCKET).await?;
+        self.db.bucket(CONTENT_TOKEN_INDEX_BUCKET).await?;
+        self.db.bucket(CONTENT_LEASE_BUCKET).await?;
+        self.db.bucket(CONTENT_PHYSICAL_HOLD_BUCKET).await?;
+
+        let access = self
+            .require_coordinated_content_access(authorization.storage_domain_id())
+            .await?;
+        let drain = self
+            .require_content_reader_drain_attestation(access)
+            .await?;
+        let accepted_at = self
+            .require_exact_content_reclaim_intent(authorization)
+            .await?;
+        self.require_no_active_content_token(authorization, observed_at_unix_ms)
+            .await?;
+        self.require_no_active_content_lease(authorization, observed_at_unix_ms)
+            .await?;
+        self.require_no_active_content_physical_hold(authorization, observed_at_unix_ms)
+            .await?;
+        let quarantine = self
+            .require_exact_content_quarantine(authorization, accepted_at, access, drain)
+            .await?;
+
+        let key = content_reclaim_grace_key(
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        );
+        if let Some(bytes) = self.get_bucket(CONTENT_CONTROL_BUCKET, &key).await? {
+            let existing = ContentReclaimGraceRecord::decode(
+                &bytes,
+                authorization.storage_domain_id(),
+                authorization.content_id(),
+            )?;
+            if existing.matches_quarantine(quarantine)
+                && existing.requested_duration_ms == requested_duration_ms
+            {
+                return Ok(ContentReclaimGraceStage::Existing {
+                    started_at: existing.started_at,
+                });
+            }
+            return Err(Error::invalid_options(
+                "existing content reclaim grace differs from this request",
+            ));
+        }
+
+        let requested = ContentReclaimGraceRecord::requested(
+            quarantine,
+            requested_duration_ms,
+            observed_at_unix_ms,
+            not_before_unix_ms,
+        );
+        self.writes.put_bucket_with_commit_sequence(
+            CONTENT_CONTROL_BUCKET,
+            key,
+            &requested.encode_prefix(),
+            &[],
+        )?;
+        Ok(ContentReclaimGraceStage::Staged)
+    }
+
+    async fn require_exact_content_quarantine(
+        &mut self,
+        authorization: ContentReclaimAuthorization,
+        intent_accepted_at: crate::ReadVersion,
+        access: ContentAccessCoordinateRecord,
+        drain: ContentReaderDrainAttestationRecord,
+    ) -> Result<ContentQuarantineRecord> {
+        let key = content_quarantine_key(
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        );
+        let Some(bytes) = self.get_bucket(CONTENT_CONTROL_BUCKET, &key).await? else {
+            return Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::QuarantineRequired,
+            });
+        };
+        let quarantine = ContentQuarantineRecord::decode(
+            &bytes,
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        )?;
+        if !quarantine.matches_authorization(authorization)
+            || quarantine.intent_accepted_at != intent_accepted_at
+            || quarantine.barrier_id != access.barrier_id
+            || quarantine.barrier_enforced_at != access.enforced_at
+            || quarantine.drain_attestation_id != drain.attestation_id
+        {
+            return Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::QuarantineRequired,
+            });
+        }
+        Ok(quarantine)
     }
 
     async fn require_exact_content_reclaim_intent(

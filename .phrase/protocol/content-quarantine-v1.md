@@ -142,13 +142,17 @@ the bytes.
 No `Drop` implementation performs cleanup. Quarantine has no expiry or
 best-effort background removal.
 
-## Future sweep boundary
+## Reclaim-grace and future sweep boundary
 
-A future protocol may begin a separately recorded grace phase only after it
-defines clock behavior, minimum duration, provider/version holds, restart
-recovery, and a fresh second logical/physical authorization. It may begin
-physical deletion only after representation and replica preconditions are also
-proved.
+`content-reclaim-grace-v1.md` now defines a separately recorded wall-clock
+scheduling observation after another logical and physical recheck. It retains
+quarantine and deletes nothing. Its deadline is not elapsed-time proof across
+clock jumps or restart and is not deletion authority.
+
+A future final-validation protocol must define a trusted clock contract,
+provider-version behavior, restart recovery, and another fresh logical and
+physical authorization. It may begin physical deletion only after
+representation and replica preconditions are also proved.
 
 This v1 record alone, together with intent and reader-drain attestation, still
 does not permit deleting any byte.

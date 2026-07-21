@@ -32,6 +32,8 @@ pub enum ContentReclaimBlocker {
     },
     /// No exact accepted reclaim intent matches the quarantine request.
     ReclaimIntentRequired,
+    /// No exact durable quarantine matches the reclaim-grace request.
+    QuarantineRequired,
     /// The higher-layer proof reached its exclusive wall-clock deadline.
     ProofExpired {
         /// Proof deadline as Unix epoch milliseconds.
@@ -81,6 +83,9 @@ impl fmt::Display for ContentReclaimBlocker {
             ),
             Self::ReclaimIntentRequired => {
                 formatter.write_str("content quarantine requires the exact accepted reclaim intent")
+            }
+            Self::QuarantineRequired => {
+                formatter.write_str("content reclaim grace requires the exact durable quarantine")
             }
             Self::ProofExpired { expired_at_unix_ms } => write!(
                 formatter,

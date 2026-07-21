@@ -158,9 +158,9 @@ pub use content::{
     ContentReaderDrainAttestation, ContentReaderDrainAttestationId,
     ContentReaderDrainAttestationOptions, ContentReaderDrainCoordinatorId,
     ContentReaderDrainEvidenceDigest, ContentReaderDrainKind, ContentReclaimAuthorization,
-    ContentReclaimIntentStage, ContentReclaimProofToken, ContentStream, ContentUpload,
-    ContentUploadOptions, ContentUploadResume, OwnerScopeId, SealedContent, StorageDomainId,
-    UploadId, UploadToken,
+    ContentReclaimGrace, ContentReclaimGraceStage, ContentReclaimIntentStage,
+    ContentReclaimProofToken, ContentStream, ContentUpload, ContentUploadOptions,
+    ContentUploadResume, OwnerScopeId, SealedContent, StorageDomainId, UploadId, UploadToken,
 };
 pub use db::{Db, IntoOpenOptions, MaintenanceBudget, MaintenanceOutcome};
 pub use error::{ContentReclaimBlocker, Error, Result};
