@@ -1,3 +1,6 @@
+#[cfg(any(test, target_os = "wasi"))]
+use std::collections::BTreeSet;
+
 use super::{
     Arc, BlockingStorageReadBackend, BlockingStorageReadObject, DurabilityMode, Error, File, Mutex,
     MutexGuard, NativeFileBackend, NativeFileObject, NativeFileStorageMetrics, OpenOptions, Path,
@@ -545,20 +548,37 @@ fn list_native_file_directory_entries(
     directory: &StorageDirectoryId,
 ) -> Result<Vec<StorageDirectoryFile>> {
     let mut files = Vec::new();
+    #[cfg(target_os = "wasi")]
+    let mut seen = BTreeSet::new();
     for entry in fs::read_dir(directory.path())? {
         let entry = entry?;
+        let path = entry.path();
+        // Node's WASI Preview 1 `fd_readdir` can restart its cookie and repeat
+        // the already-returned files when this directory also contains a
+        // subdirectory. Stop at the first repeated path: every file before the
+        // restart has already been captured, while continuing would loop
+        // forever. Native directory iterators do not need this host workaround.
+        #[cfg(target_os = "wasi")]
+        if !remember_wasi_directory_entry(&mut seen, &path) {
+            break;
+        }
         let metadata = entry.metadata()?;
         if !metadata.is_file() {
             continue;
         }
         files.push(StorageDirectoryFile::native_file_with_len(
-            entry.path(),
+            path,
             metadata.len(),
         ));
     }
 
     files.sort_unstable();
     Ok(files)
+}
+
+#[cfg(any(test, target_os = "wasi"))]
+fn remember_wasi_directory_entry(seen: &mut BTreeSet<PathBuf>, path: &Path) -> bool {
+    seen.insert(path.to_path_buf())
 }
 
 pub(in crate::storage) fn sync_native_file_directory_after_renames(
@@ -729,5 +749,29 @@ pub(in crate::storage) fn sync_native_file_for_durability(
         DurabilityMode::SyncAll | DurabilityMode::SyncAllStrict => {
             crate::durability::sync_file_for_durability(file, durability)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeSet, path::Path};
+
+    use super::remember_wasi_directory_entry;
+
+    #[test]
+    fn wasi_directory_repeat_is_detected_at_the_first_restarted_path() {
+        let mut seen = BTreeSet::new();
+        assert!(remember_wasi_directory_entry(
+            &mut seen,
+            Path::new("db/trine.wal")
+        ));
+        assert!(remember_wasi_directory_entry(
+            &mut seen,
+            Path::new("db/MANIFEST")
+        ));
+        assert!(!remember_wasi_directory_entry(
+            &mut seen,
+            Path::new("db/trine.wal")
+        ));
     }
 }
