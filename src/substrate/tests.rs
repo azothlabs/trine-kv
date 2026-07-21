@@ -253,6 +253,67 @@ fn object_wal_lane_group_commits_queued_accepts() {
 }
 
 #[test]
+fn object_writer_discards_unconfirmed_wal_tail_before_retrying_sequence() {
+    use crate::object_store::InMemoryObjectStore;
+
+    let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let mut first =
+        poll_ready(ObjectWriterLease::acquire(Arc::clone(&client), "LOCK")).expect("first lease");
+    let first_frame = wal::encode_batch_frame(Sequence::new(1), &[put("first", "one")])
+        .expect("encode first frame");
+    let first_accept = ObjectWalAccept {
+        sequence: Sequence::new(1),
+        frame: first_frame.into(),
+        completion: Arc::new(ObjectWalCompletion::new()),
+    };
+    poll_ready(first.publish_commit_batch(PathBuf::from("db").as_path(), &[first_accept]))
+        .expect("publish first commit");
+
+    let head = first.lease_state();
+    let segment_key = head.current_wal_key.expect("current WAL key");
+    let mut segment = poll_ready(client.get(&segment_key))
+        .expect("read current WAL")
+        .expect("current WAL exists")
+        .to_vec();
+    segment.extend_from_slice(
+        &wal::encode_batch_frame(Sequence::new(2), &[put("retry", "unconfirmed")])
+            .expect("encode unconfirmed tail"),
+    );
+    poll_ready(client.put(&segment_key, Arc::from(segment.as_slice())))
+        .expect("persist WAL before head confirmation");
+    poll_ready(first.release()).expect("release first lease");
+
+    let mut retry =
+        poll_ready(ObjectWriterLease::acquire(Arc::clone(&client), "LOCK")).expect("retry lease");
+    let retry_frame = wal::encode_batch_frame(Sequence::new(2), &[put("retry", "confirmed")])
+        .expect("encode retry frame");
+    let retry_accept = ObjectWalAccept {
+        sequence: Sequence::new(2),
+        frame: retry_frame.into(),
+        completion: Arc::new(ObjectWalCompletion::new()),
+    };
+    poll_ready(retry.publish_commit_batch(PathBuf::from("db").as_path(), &[retry_accept]))
+        .expect("publish retried sequence");
+
+    let retried_head = retry.lease_state();
+    assert_eq!(retried_head.committed_sequence, Sequence::new(2));
+    let retried_key = retried_head.current_wal_key.expect("retried WAL key");
+    let retried_segment = poll_ready(client.get(&retried_key))
+        .expect("read retried WAL")
+        .expect("retried WAL exists");
+    let batches = wal::decode_frames_after(retried_segment.as_ref(), Sequence::ZERO)
+        .expect("retried WAL has increasing sequences");
+    assert_eq!(
+        batches
+            .iter()
+            .map(|batch| batch.sequence)
+            .collect::<Vec<_>>(),
+        vec![Sequence::new(1), Sequence::new(2)]
+    );
+    assert_eq!(batches[1].operations, vec![put("retry", "confirmed")]);
+}
+
+#[test]
 fn object_writer_lease_rejects_live_second_writer_and_takes_expired() {
     use crate::object_store::InMemoryObjectStore;
 

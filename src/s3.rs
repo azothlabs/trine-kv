@@ -630,15 +630,26 @@ mod tests {
         format!("trine-it/{label}/{}-{nonce}", std::process::id())
     }
 
-    fn live_r2_client() -> Option<Arc<dyn ObjectClient>> {
+    fn live_s3_client() -> Option<Arc<dyn ObjectClient>> {
         let Ok(bucket) = std::env::var("TRINE_S3_BUCKET") else {
-            eprintln!("skipping live R2 test: set TRINE_S3_BUCKET (+ AWS_* / AWS_ENDPOINT_URL)");
+            eprintln!(
+                "skipping live S3-compatible test: set TRINE_S3_BUCKET (+ AWS_* / AWS_ENDPOINT_URL)"
+            );
             return None;
         };
         let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "auto".to_owned());
         let endpoint = std::env::var("AWS_ENDPOINT_URL").ok();
+        let allow_http = std::env::var("TRINE_S3_ALLOW_HTTP").is_ok_and(|value| value == "1");
         Some(Arc::new(
-            ObjectStoreClient::s3(bucket, region, endpoint).expect("build R2/S3 client"),
+            ObjectStoreClient::s3_with_options(
+                bucket,
+                region,
+                S3ClientOptions {
+                    endpoint,
+                    allow_http,
+                },
+            )
+            .expect("build R2/S3 client"),
         ))
     }
 
@@ -825,7 +836,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires real S3/R2 credentials; run with --features s3 -- --ignored"]
     async fn s3_live_database_round_trip() {
-        let Some(client) = live_r2_client() else {
+        let Some(client) = live_s3_client() else {
             return;
         };
 
@@ -889,7 +900,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires real R2 credentials; run with --features s3 -- --ignored"]
     async fn s3_live_measurement_and_fault_suite() {
-        let Some(raw_client) = live_r2_client() else {
+        let Some(raw_client) = live_s3_client() else {
             return;
         };
         let metrics = Arc::new(LiveMetrics::default());

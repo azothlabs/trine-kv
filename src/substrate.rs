@@ -884,7 +884,11 @@ impl ObjectWriterLease {
             .ok_or_else(|| Error::Corruption {
                 message: format!("object WAL segment {key} is missing"),
             })?;
-        let bytes = bytes.to_vec();
+        let confirmed_batches = wal::decode_frames_after(bytes.as_ref(), Sequence::ZERO)?
+            .into_iter()
+            .filter(|batch| batch.sequence <= self.state.committed_sequence)
+            .collect::<Vec<_>>();
+        let bytes = wal::encode_batches_after(&confirmed_batches, Sequence::ZERO)?;
         self.cached_wal_segment = Some(CachedWalSegment {
             key,
             bytes: bytes.clone(),
