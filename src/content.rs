@@ -12,7 +12,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use sha2::{Digest, Sha256};
@@ -3233,11 +3233,7 @@ pub(crate) fn content_physical_hold_key(
 }
 
 pub(crate) fn current_epoch_millis() -> Result<u64> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| Error::Io(std::io::Error::other(error)))?;
-    u64::try_from(duration.as_millis())
-        .map_err(|_| Error::invalid_options("system time milliseconds exceed u64::MAX"))
+    crate::platform::now_unix_millis()
 }
 
 pub(crate) fn duration_millis(duration: Duration, name: &str) -> Result<u64> {

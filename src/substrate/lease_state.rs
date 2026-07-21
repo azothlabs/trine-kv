@@ -1,7 +1,7 @@
 use super::{
     Arc, Error, OBJECT_LEASE_MAGIC, OBJECT_LEASE_MAX_BYTES, OBJECT_LEASE_TTL,
     OBJECT_LEASE_V2_HEADER_LEN, OBJECT_LEASE_VERSION, ObjectClient, ObjectLeaseState,
-    ObservedLeaseState, Result, Sequence, SystemTime, UNIX_EPOCH, io,
+    ObservedLeaseState, Result, Sequence,
 };
 #[cfg(not(feature = "s3"))]
 use super::{Context, Future, Poll, Wake, Waker, thread};
@@ -178,11 +178,7 @@ pub(super) fn decode_u64(key: &str, bytes: &[u8], field: &str) -> Result<u64> {
 }
 
 pub(super) fn current_epoch_millis() -> Result<u64> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| Error::Io(io::Error::other(error)))?;
-    u64::try_from(duration.as_millis())
-        .map_err(|_| Error::invalid_options("system time milliseconds exceed u64::MAX"))
+    crate::platform::now_unix_millis()
 }
 
 pub(super) fn object_lease_deadline_ms(now_ms: u64) -> u64 {

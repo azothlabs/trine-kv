@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{collections::BTreeMap, time::Duration};
 
 use crate::{
     bucket::DEFAULT_BUCKET_NAME,
@@ -1553,9 +1550,5 @@ impl Transaction {
 }
 
 fn current_epoch_millis() -> Result<u64> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| Error::Io(std::io::Error::other(error)))?;
-    u64::try_from(duration.as_millis())
-        .map_err(|_| Error::invalid_options("system time milliseconds exceed u64::MAX"))
+    crate::platform::now_unix_millis()
 }

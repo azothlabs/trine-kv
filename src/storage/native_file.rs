@@ -776,6 +776,10 @@ mod browser_persistent_storage {
                 "temporary storage objects must use their owning publish operation",
             )),
             StorageObjectKind::Blob
+            | StorageObjectKind::ContentAccessBarrier
+            | StorageObjectKind::ContentChunk
+            | StorageObjectKind::ContentDescriptor
+            | StorageObjectKind::ContentUpload
             | StorageObjectKind::RecoveryReport
             | StorageObjectKind::Table
             | StorageObjectKind::Wal

@@ -117,6 +117,7 @@ mod mvcc;
 pub mod object_store;
 /// Database, bucket, write, storage, runtime, and durability options.
 pub mod options;
+mod platform;
 mod point_value;
 /// Prefix extraction policies used by prefix filters.
 pub mod prefix;

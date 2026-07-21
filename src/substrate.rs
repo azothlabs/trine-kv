@@ -27,7 +27,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Condvar, Mutex, mpsc},
     thread::{self, JoinHandle},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 #[cfg(not(feature = "s3"))]

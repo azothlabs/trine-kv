@@ -103,7 +103,6 @@ impl Db {
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
-        self.ensure_content_backend_supported()?;
         let options = options.validate()?;
         let upload_id = UploadId::generate()?;
         let upload_token = UploadToken::generate()?;
@@ -181,7 +180,6 @@ impl Db {
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
-        self.ensure_content_backend_supported()?;
         let options = options.validate()?;
         let upload_guard = self.lock_content_upload(upload_id).await;
         let object = self.content_upload_state_object(upload_id)?;
@@ -270,7 +268,6 @@ impl Db {
     /// ```
     pub async fn resume_content_upload(&self, upload_id: UploadId) -> Result<ContentUploadResume> {
         self.ensure_open()?;
-        self.ensure_content_backend_supported()?;
         let upload_guard = self.lock_content_upload(upload_id).await;
         let state = self.require_upload_state(upload_id).await?;
         match state.status() {
@@ -352,7 +349,6 @@ impl Db {
         storage_domain_id: StorageDomainId,
     ) -> Result<ContentAccessMode> {
         self.ensure_open()?;
-        self.ensure_content_backend_supported()?;
         match self
             .read_content_access_barrier_record(storage_domain_id)
             .await?
@@ -417,7 +413,6 @@ impl Db {
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
-        self.ensure_content_backend_supported()?;
         let _access_guard = self.inner.content_access_lock.lock().await;
         let barrier = if let Some(existing) = self
             .read_content_access_barrier_record(storage_domain_id)
@@ -544,7 +539,6 @@ impl Db {
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
-        self.ensure_content_backend_supported()?;
         let Some(direct_barrier) = self
             .read_content_access_barrier_record(barrier.storage_domain_id())
             .await?
@@ -639,7 +633,6 @@ impl Db {
         storage_domain_id: StorageDomainId,
     ) -> Result<Option<ContentReaderDrainAttestation>> {
         self.ensure_open()?;
-        self.ensure_content_backend_supported()?;
         if matches!(
             self.content_access_mode(storage_domain_id).await?,
             ContentAccessMode::CompatibleUnleased
@@ -670,7 +663,6 @@ impl Db {
         content_id: ContentId,
     ) -> Result<Option<ContentQuarantine>> {
         self.ensure_open()?;
-        self.ensure_content_backend_supported()?;
         let mut transaction = self.transaction(TransactionOptions::default());
         let key = content_quarantine_key(storage_domain_id, content_id);
         match transaction.get_bucket(CONTENT_CONTROL_BUCKET, &key).await {
@@ -698,7 +690,6 @@ impl Db {
         content_id: ContentId,
     ) -> Result<Option<ContentReclaimGrace>> {
         self.ensure_open()?;
-        self.ensure_content_backend_supported()?;
         let mut transaction = self.transaction(TransactionOptions::default());
         let grace_key = content_reclaim_grace_key(storage_domain_id, content_id);
         let Some(bytes) = transaction
@@ -748,7 +739,6 @@ impl Db {
         content_id: ContentId,
     ) -> Result<ContentHandle> {
         self.ensure_open()?;
-        self.ensure_content_backend_supported()?;
         if let ContentAccessMode::LeasedOnly { barrier_id } =
             self.content_access_mode(storage_domain_id).await?
         {
@@ -856,7 +846,6 @@ impl Db {
             return Err(Error::ReadOnly);
         }
         let ttl_ms = options.ttl_ms()?;
-        self.ensure_content_backend_supported()?;
         let handle = self
             .open_content_unchecked(storage_domain_id, content_id)
             .await?;
@@ -1040,7 +1029,6 @@ impl Db {
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
-        self.ensure_content_backend_supported()?;
         let descriptor = self
             .read_content_descriptor(storage_domain_id, content_id)
             .await?
@@ -1743,21 +1731,6 @@ impl Db {
         self.inner.content_seal_lock.lock().await
     }
 
-    fn ensure_content_backend_supported(&self) -> Result<()> {
-        match &self.inner.options.storage_mode {
-            StorageMode::InMemory
-            | StorageMode::Persistent { .. }
-            | StorageMode::HostPersistent {
-                backend: HostStorageBackend::Wasi { .. } | HostStorageBackend::ObjectStore,
-            } => Ok(()),
-            StorageMode::HostPersistent {
-                backend: HostStorageBackend::Browser { .. },
-            } => Err(Error::unsupported_backend(
-                "browser content objects are not implemented in this prototype",
-            )),
-        }
-    }
-
     fn content_root(&self) -> Result<PathBuf> {
         let root = match &self.inner.options.storage_mode {
             StorageMode::InMemory => PathBuf::from("__trine_content_v1"),
@@ -1774,12 +1747,8 @@ impl Db {
                 backend: HostStorageBackend::ObjectStore,
             } => self.object_store_db_path().join("content-v1"),
             StorageMode::HostPersistent {
-                backend: HostStorageBackend::Browser { .. },
-            } => {
-                return Err(Error::unsupported_backend(
-                    "browser content objects are not implemented in this prototype",
-                ));
-            }
+                backend: HostStorageBackend::Browser { path },
+            } => path.join(".trine-content-v1"),
         };
         Ok(root)
     }
@@ -1872,9 +1841,20 @@ impl Db {
             }
             StorageMode::HostPersistent {
                 backend: HostStorageBackend::Browser { .. },
-            } => Err(Error::unsupported_backend(
-                "browser content objects are not implemented in this prototype",
-            )),
+            } => {
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                {
+                    self.browser_storage()?
+                        .write_object(object, bytes, durability)
+                        .await
+                }
+                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+                {
+                    Err(Error::unsupported_backend(
+                        "browser content objects require wasm32-unknown-unknown",
+                    ))
+                }
+            }
         }
     }
 
@@ -1891,9 +1871,18 @@ impl Db {
             } => self.object_storage()?.read_object_bytes(object).await,
             StorageMode::HostPersistent {
                 backend: HostStorageBackend::Browser { .. },
-            } => Err(Error::unsupported_backend(
-                "browser content objects are not implemented in this prototype",
-            )),
+            } => {
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                {
+                    self.browser_storage()?.read_object_bytes(object).await
+                }
+                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+                {
+                    Err(Error::unsupported_backend(
+                        "browser content objects require wasm32-unknown-unknown",
+                    ))
+                }
+            }
         }
     }
 
@@ -1910,9 +1899,18 @@ impl Db {
             } => self.object_storage()?.delete_object(object).await,
             StorageMode::HostPersistent {
                 backend: HostStorageBackend::Browser { .. },
-            } => Err(Error::unsupported_backend(
-                "browser content objects are not implemented in this prototype",
-            )),
+            } => {
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                {
+                    self.browser_storage()?.delete_object(object).await
+                }
+                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+                {
+                    Err(Error::unsupported_backend(
+                        "browser content objects require wasm32-unknown-unknown",
+                    ))
+                }
+            }
         }
     }
 
