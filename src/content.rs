@@ -1414,6 +1414,21 @@ impl fmt::Display for ContentId {
 pub struct UploadId([u8; 16]);
 
 impl UploadId {
+    /// Creates a new random upload identity for caller-controlled idempotency.
+    ///
+    /// Generate and persist this identity before starting a transfer when an
+    /// uncertain response must be retried through
+    /// [`Db::begin_content_upload_with_id`](crate::Db::begin_content_upload_with_id).
+    /// The identity is not secret and does not itself authorize content access.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::RuntimeBusy`] when the operating system cannot provide
+    /// cryptographic randomness. No durable state is created by this method.
+    pub fn new() -> Result<Self> {
+        Self::generate()
+    }
+
     pub(crate) fn generate() -> Result<Self> {
         let mut bytes = [0_u8; 16];
         getrandom::fill(&mut bytes)

@@ -121,6 +121,95 @@ impl Db {
         ))
     }
 
+    /// Begins or resumes a durable upload under a caller-supplied [`UploadId`].
+    ///
+    /// This is the idempotent counterpart to [`Db::begin_content_upload`].
+    /// Generate and persist `upload_id` before a remote or otherwise uncertain
+    /// request. The first successful call creates the same bounded-memory
+    /// sequential writer as `begin_content_upload`. An exact retry returns the
+    /// current open writer at its durable original-byte length, or the exact
+    /// prior [`SealedContent`] after sealing.
+    ///
+    /// An upload identity is permanently bound to its first options. Reusing it
+    /// with a different attachment scope, token lifetime, chunk size, expected
+    /// length, or expected `ContentId` fails without changing existing state.
+    /// Concurrent append, seal, or abort operations remain serialized by the
+    /// same upload lock; after the identity/options check this method delegates
+    /// recovery to [`Db::resume_content_upload`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidOptions`] for invalid options or an identity
+    /// already bound to different options, [`Error::Closed`] or
+    /// [`Error::ReadOnly`] when writes are unavailable, and typed backend,
+    /// integrity, or recovery errors. An aborted identity is absent and may be
+    /// started again; callers that require permanent request identity should not
+    /// retry begin after a confirmed abort.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use trine_kv::{
+    ///     ContentAttachmentScope, ContentUploadOptions, ContentUploadResume, Db, DbOptions,
+    ///     OwnerScopeId, StorageDomainId, UploadId,
+    /// };
+    ///
+    /// async fn example() -> trine_kv::Result<()> {
+    ///     let db = Db::open(DbOptions::memory()).await?;
+    ///     let upload_id = UploadId::new()?;
+    ///     let options = ContentUploadOptions::new(
+    ///         ContentAttachmentScope::new(
+    ///             StorageDomainId::from_bytes([1; 16]),
+    ///             OwnerScopeId::from_bytes([2; 16]),
+    ///         ),
+    ///         Duration::from_secs(60),
+    ///     );
+    ///     let first = db.begin_content_upload_with_id(upload_id, options).await?;
+    ///     assert!(matches!(first, ContentUploadResume::Open(_)));
+    ///     let retry = db.begin_content_upload_with_id(upload_id, options).await?;
+    ///     assert!(matches!(retry, ContentUploadResume::Open(_)));
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn begin_content_upload_with_id(
+        &self,
+        upload_id: UploadId,
+        options: ContentUploadOptions,
+    ) -> Result<ContentUploadResume> {
+        self.ensure_open()?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+        self.ensure_content_backend_supported()?;
+        let options = options.validate()?;
+        let upload_guard = self.lock_content_upload(upload_id).await;
+        let object = self.content_upload_state_object(upload_id)?;
+        if let Some(bytes) = self.read_content_object(object).await? {
+            let state = UploadSessionState::decode(&bytes, upload_id)?;
+            if state.options() != options {
+                return Err(Error::invalid_options(format!(
+                    "content upload {upload_id} is already bound to different options"
+                )));
+            }
+            drop(upload_guard);
+            return self.resume_content_upload(upload_id).await;
+        }
+
+        let upload_token = UploadToken::generate()?;
+        let state = UploadSessionState::initial(upload_id, options, upload_token)?;
+        self.write_upload_state(&state).await?;
+        Ok(ContentUploadResume::Open(ContentUpload::new(
+            self.clone(),
+            upload_id,
+            options,
+            Vec::with_capacity(options.chunk_bytes()),
+            0,
+            0,
+            0,
+        )))
+    }
+
     /// Resumes durable upload state by [`UploadId`].
     ///
     /// Open state returns a writer positioned at its durable original-byte

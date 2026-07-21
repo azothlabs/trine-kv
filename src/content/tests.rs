@@ -27,7 +27,7 @@ use crate::{
     ContentReclaimIntentStage, ContentReclaimProofToken, ContentUploadOptions, ContentUploadResume,
     Db, DbOptions, ETag, Error, InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta,
     OwnerScopeId, Precondition, PutIf, ReadVersion, SealedContent, StorageDomainId,
-    TransactionOptions, UploadToken,
+    TransactionOptions, UploadId, UploadToken,
 };
 
 const TEST_CHUNK_BYTES: usize = 64 * 1024;
@@ -42,6 +42,51 @@ fn test_scope() -> ContentAttachmentScope {
 
 fn test_upload_options() -> ContentUploadOptions {
     ContentUploadOptions::new(test_scope(), Duration::from_secs(60 * 60))
+}
+
+#[test]
+fn caller_supplied_upload_id_binds_options_and_recovers_exact_state() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory()).await.expect("open database");
+        let upload_id = UploadId::new().expect("upload identity");
+        let options = test_upload_options().with_expected_length(6);
+
+        let ContentUploadResume::Open(mut first) = db
+            .begin_content_upload_with_id(upload_id, options)
+            .await
+            .expect("first begin")
+        else {
+            panic!("first begin must be open");
+        };
+        first.write(b"abc").await.expect("write prefix");
+        drop(first);
+
+        let different = options.with_expected_length(7);
+        assert!(matches!(
+            db.begin_content_upload_with_id(upload_id, different).await,
+            Err(Error::InvalidOptions { .. })
+        ));
+
+        let ContentUploadResume::Open(mut retry) = db
+            .begin_content_upload_with_id(upload_id, options)
+            .await
+            .expect("exact retry")
+        else {
+            panic!("retry before seal must be open");
+        };
+        assert_eq!(retry.len(), 3);
+        retry.write(b"def").await.expect("write suffix");
+        let sealed = retry.seal().await.expect("seal");
+
+        let ContentUploadResume::Sealed(recovered) = db
+            .begin_content_upload_with_id(upload_id, options)
+            .await
+            .expect("sealed retry")
+        else {
+            panic!("retry after seal must recover sealed result");
+        };
+        assert_eq!(recovered, sealed);
+    });
 }
 
 fn test_hold_id(seed: u8) -> ContentPhysicalHoldId {
