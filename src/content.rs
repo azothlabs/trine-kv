@@ -972,6 +972,8 @@ pub enum ContentPhysicalHoldKind {
     Provider,
     /// An explicit operator or compliance hold remains in force.
     Administrative,
+    /// Durable asynchronous processing still depends on the source bytes.
+    Processing,
 }
 
 impl ContentPhysicalHoldKind {
@@ -982,6 +984,7 @@ impl ContentPhysicalHoldKind {
             Self::Repair => 3,
             Self::Provider => 4,
             Self::Administrative => 5,
+            Self::Processing => 6,
         }
     }
 
@@ -992,6 +995,7 @@ impl ContentPhysicalHoldKind {
             3 => Ok(Self::Repair),
             4 => Ok(Self::Provider),
             5 => Ok(Self::Administrative),
+            6 => Ok(Self::Processing),
             _ => Err(Error::UnsupportedFormat {
                 message: format!("unsupported content physical-hold kind {tag}"),
             }),
@@ -1007,6 +1011,7 @@ impl fmt::Display for ContentPhysicalHoldKind {
             Self::Repair => "repair",
             Self::Provider => "provider",
             Self::Administrative => "administrative",
+            Self::Processing => "processing",
         })
     }
 }

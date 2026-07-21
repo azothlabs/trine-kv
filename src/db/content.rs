@@ -961,7 +961,8 @@ impl Db {
     /// publishes both the hold and newer per-content activity. A reclaim-intent
     /// transaction racing acquisition must conflict; acquisition after intent
     /// returns the content to Active state. Migration, backup, repair, provider,
-    /// and administrative workflows therefore share one physical fence.
+    /// administrative, and asynchronous-processing workflows therefore share
+    /// one physical fence.
     ///
     /// An expiring hold becomes inert at its exclusive Unix-millisecond
     /// deadline and cannot be revived. An until-released hold survives process

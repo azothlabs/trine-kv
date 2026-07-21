@@ -1614,6 +1614,7 @@ fn every_physical_hold_kind_enters_the_same_reclaim_fence() {
             ContentPhysicalHoldKind::Repair,
             ContentPhysicalHoldKind::Provider,
             ContentPhysicalHoldKind::Administrative,
+            ContentPhysicalHoldKind::Processing,
         ]
         .into_iter()
         .enumerate()
