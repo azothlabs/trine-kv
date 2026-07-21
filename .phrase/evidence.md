@@ -16671,3 +16671,67 @@ Negative check:
 
 - Define native reader sessions and the remote/external coordination contract,
   including read-only credentials, before adding any deletion timing.
+
+## 2026-07-21: deployment-coordinated reader-drain attestation
+
+### Observation
+
+- Native read-only database instances do not hold the writer `LOCK`, and an
+  unleased `ContentHandle` can survive its opening database handle. The existing
+  native lease cannot prove reader drain.
+- Object-store read-only clients may lack write credentials, while direct
+  long-lived S3/R2 credentials can bypass a service coordinator. Trine KV
+  cannot discover or revoke those sessions or credentials.
+- The leased-only barrier proves only the linearization boundary for new
+  unleased opens. Elapsed time cannot bound a pre-barrier handle.
+
+### Interpretation
+
+- The current honest boundary is a durable trusted-coordinator attestation,
+  not an automatic storage proof. Native process exit, remote session drain,
+  and credential-epoch retirement remain deployment facts retained outside
+  Trine KV.
+- A new domain should establish the barrier before admitting its first read.
+  Existing native or remote domains require explicit process or credential
+  coordination; uncontrolled direct credentials block attestation.
+- Intent is harmless coordination state, so adding the attestation must not
+  silently change intent into deletion authority.
+
+### Implementation evidence
+
+- Added versioned attestation and coordinator identities, a domain-separated
+  SHA-256 evidence commitment, three typed deployment claims, exact options,
+  and a public durable result with barrier and commit coordinates.
+- `Db::attest_content_reader_drain` accepts only the typed coordinated barrier,
+  rechecks the direct backend barrier and protected coordinate, and publishes
+  one immutable record with the final transaction sequence. Exact retry returns
+  the original record; different claims and malformed state fail closed.
+- `Db::content_reader_drain_attestation` exposes the protected audit record.
+  Native reopen and refreshed object-store read-only visibility are covered.
+- The protocol explicitly requires process-set restart or credential-epoch
+  retirement and rejects writer-lock, timeout, gateway-only, or unrevoked
+  direct-bucket assumptions.
+
+### Safety boundary
+
+- A focused test proves an old handle still reads after a caller records an
+  attestation. Trine KV therefore never claims the record verified external
+  truth.
+- No grace, second sweep check, representation transition, replica deletion,
+  or physical byte deletion exists.
+
+### Verification
+
+- Three focused reader-drain tests and the refreshed object-store reader test
+  pass, covering exact retry, conflicting claims, compatible mode, missing and
+  malformed state, old-handle survival, native reopen, and remote visibility.
+- `cargo test -q --all-features` passes with 496 library tests (494 passed, two
+  ignored) plus all integration targets.
+- Strict all-target/all-feature Clippy with wildcard imports denied, strict
+  Rustdoc, 27 doctests, formatting, explicit-import scan, and diff checks pass.
+
+### Recommended next action
+
+- Make the future sweep require the exact barrier-bound attestation and then
+  design crash-safe quarantine plus the second logical/physical recheck. Do not
+  start deletion until provider-hold and failure-injection evidence is green.

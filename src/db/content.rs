@@ -11,12 +11,14 @@ use crate::{
         ContentAccessMode, ContentDescriptor, ContentHandle, ContentId, ContentLease,
         ContentLeaseId, ContentLeaseOptions, ContentLeaseRecord, ContentPhysicalHold,
         ContentPhysicalHoldId, ContentPhysicalHoldOptions, ContentPhysicalHoldOwnerId,
-        ContentPhysicalHoldRecord, ContentPhysicalHoldRecordState, ContentTokenIndexRecord,
-        ContentUpload, ContentUploadOptions, ContentUploadResume, SealedContent, StorageDomainId,
-        UploadId, UploadSessionState, UploadSessionStatus, UploadToken, UploadTokenRecord,
+        ContentPhysicalHoldRecord, ContentPhysicalHoldRecordState, ContentReaderDrainAttestation,
+        ContentReaderDrainAttestationId, ContentReaderDrainAttestationOptions,
+        ContentReaderDrainAttestationRecord, ContentTokenIndexRecord, ContentUpload,
+        ContentUploadOptions, ContentUploadResume, SealedContent, StorageDomainId, UploadId,
+        UploadSessionState, UploadSessionStatus, UploadToken, UploadTokenRecord,
         content_access_coordinate_key, content_lease_key, content_lease_prefix,
-        content_physical_hold_key, content_token_index_key, current_epoch_millis, duration_millis,
-        upload_token_key,
+        content_physical_hold_key, content_reader_drain_attestation_key, content_token_index_key,
+        current_epoch_millis, duration_millis, upload_token_key,
     },
     error::{Error, Result},
     options::{DurabilityMode, HostStorageBackend, StorageMode, WriteOptions},
@@ -381,6 +383,188 @@ impl Db {
         Err(Error::runtime_busy(
             "content access-barrier coordinate did not converge after repeated conflicts",
         ))
+    }
+
+    /// Records a trusted deployment coordinator's pre-barrier reader-drain claim.
+    ///
+    /// `barrier` must be the durable value returned by
+    /// [`Db::enforce_content_leased_only`]. Trine KV verifies its direct backend
+    /// record and protected commit coordinate before atomically binding the
+    /// attestation to that exact barrier. A retry with the same attestation id
+    /// and options returns the original record and commit coordinate.
+    ///
+    /// This method does not inspect process supervisors, remote request streams,
+    /// credential issuers, or object-store credentials. The trusted caller must
+    /// retain the evidence committed by `options` and must not call this method
+    /// until the selected [`ContentReaderDrainKind`](crate::ContentReaderDrainKind)
+    /// is actually true. In particular, elapsed time alone is not reader-drain
+    /// evidence. The returned record does not start grace or authorize physical
+    /// deletion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ReadOnly`] for a read-only database, `InvalidOptions`
+    /// when `barrier` does not name the active direct barrier or when an existing
+    /// attestation has different exact claims, `Corruption` when protected
+    /// barrier coordinates disagree, `RuntimeBusy` after repeated optimistic
+    /// conflicts, or a storage/durability error.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use trine_kv::{
+    ///     ContentAccessBarrierId, ContentReaderDrainAttestationId,
+    ///     ContentReaderDrainAttestationOptions, ContentReaderDrainCoordinatorId,
+    ///     ContentReaderDrainEvidenceDigest, ContentReaderDrainKind, Db, DbOptions,
+    ///     StorageDomainId,
+    /// };
+    ///
+    /// async fn example() -> trine_kv::Result<()> {
+    ///     let db = Db::open(DbOptions::memory()).await?;
+    ///     let domain = StorageDomainId::from_bytes([1; 16]);
+    ///     let barrier = db
+    ///         .enforce_content_leased_only(domain, ContentAccessBarrierId::generate()?)
+    ///         .await?;
+    ///     // The host establishes and retains these canonical evidence bytes
+    ///     // before it makes the trusted assertion.
+    ///     let options = ContentReaderDrainAttestationOptions::new(
+    ///         ContentReaderDrainKind::DomainBootstrap,
+    ///         ContentReaderDrainCoordinatorId::from_bytes([2; 16]),
+    ///         ContentReaderDrainEvidenceDigest::for_bytes(b"domain unused before barrier"),
+    ///     );
+    ///     let attestation = db
+    ///         .attest_content_reader_drain(
+    ///             barrier,
+    ///             ContentReaderDrainAttestationId::generate()?,
+    ///             options,
+    ///         )
+    ///         .await?;
+    ///     assert_eq!(attestation.barrier_id(), barrier.barrier_id());
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn attest_content_reader_drain(
+        &self,
+        barrier: ContentAccessBarrier,
+        attestation_id: ContentReaderDrainAttestationId,
+        options: ContentReaderDrainAttestationOptions,
+    ) -> Result<ContentReaderDrainAttestation> {
+        self.ensure_open()?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+        self.ensure_content_backend_supported()?;
+        let Some(direct_barrier) = self
+            .read_content_access_barrier_record(barrier.storage_domain_id())
+            .await?
+        else {
+            return Err(Error::invalid_options(
+                "reader-drain attestation requires an active leased-only barrier",
+            ));
+        };
+        if direct_barrier.barrier_id != barrier.barrier_id() {
+            return Err(Error::invalid_options(
+                "reader-drain attestation barrier differs from the active backend barrier",
+            ));
+        }
+
+        self.bucket(CONTENT_CONTROL_BUCKET).await?;
+        let access_key = content_access_coordinate_key(barrier.storage_domain_id());
+        let attestation_key = content_reader_drain_attestation_key(barrier.storage_domain_id());
+        for _ in 0..Self::CONTENT_ACCESS_COMMIT_ATTEMPTS {
+            let mut transaction = self.transaction(TransactionOptions::default());
+            let access_bytes = transaction
+                .get_bucket(CONTENT_CONTROL_BUCKET, &access_key)
+                .await?
+                .ok_or_else(|| Error::Corruption {
+                    message: "reader-drain attestation barrier has no protected coordinate"
+                        .to_owned(),
+                })?;
+            let access =
+                ContentAccessCoordinateRecord::decode(&access_bytes, barrier.storage_domain_id())?;
+            if access.barrier_id != barrier.barrier_id()
+                || access.enforced_at != barrier.enforced_at()
+            {
+                return Err(Error::Corruption {
+                    message: "reader-drain attestation barrier coordinates disagree".to_owned(),
+                });
+            }
+            if let Some(bytes) = transaction
+                .get_bucket(CONTENT_CONTROL_BUCKET, &attestation_key)
+                .await?
+            {
+                let existing = ContentReaderDrainAttestationRecord::decode(
+                    &bytes,
+                    barrier.storage_domain_id(),
+                )?;
+                if existing.matches_request(barrier, attestation_id, options) {
+                    return Ok(existing.into_public());
+                }
+                return Err(Error::invalid_options(format!(
+                    "reader-drain attestation differs from existing identity {}",
+                    existing.attestation_id
+                )));
+            }
+            let requested = ContentReaderDrainAttestationRecord {
+                storage_domain_id: barrier.storage_domain_id(),
+                barrier_id: barrier.barrier_id(),
+                attestation_id,
+                options,
+                barrier_enforced_at: barrier.enforced_at(),
+                attested_at: crate::ReadVersion::from_u64(0),
+            };
+            transaction.put_bucket_with_commit_sequence(
+                CONTENT_CONTROL_BUCKET,
+                attestation_key.clone(),
+                &requested.encode_prefix(),
+                &[],
+            )?;
+            match transaction.commit().await {
+                Ok(commit) => {
+                    return Ok(ContentReaderDrainAttestationRecord {
+                        attested_at: commit.read_version(),
+                        ..requested
+                    }
+                    .into_public());
+                }
+                Err(Error::Conflict { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::runtime_busy(
+            "content reader-drain attestation did not converge after repeated conflicts",
+        ))
+    }
+
+    /// Reads the durable reader-drain attestation for one storage domain.
+    ///
+    /// `None` means no trusted coordinator claim has been recorded. The result
+    /// is audit and future lifecycle input only: callers must still validate the
+    /// active barrier and every content-specific reclaim condition before any
+    /// future sweep. Read-only object-store handles may need their ordinary KV
+    /// view refreshed before this protected record becomes visible.
+    pub async fn content_reader_drain_attestation(
+        &self,
+        storage_domain_id: StorageDomainId,
+    ) -> Result<Option<ContentReaderDrainAttestation>> {
+        self.ensure_open()?;
+        self.ensure_content_backend_supported()?;
+        if matches!(
+            self.content_access_mode(storage_domain_id).await?,
+            ContentAccessMode::CompatibleUnleased
+        ) {
+            return Ok(None);
+        }
+        let mut transaction = self.transaction(TransactionOptions::default());
+        let key = content_reader_drain_attestation_key(storage_domain_id);
+        transaction
+            .get_bucket(CONTENT_CONTROL_BUCKET, &key)
+            .await?
+            .map(|bytes| {
+                ContentReaderDrainAttestationRecord::decode(&bytes, storage_domain_id)
+                    .map(ContentReaderDrainAttestationRecord::into_public)
+            })
+            .transpose()
     }
 
     /// Opens a sealed immutable `ContentObject` by cryptographic identity.

@@ -130,8 +130,10 @@ high-water.
   in `content-access-barrier-v1.md`. Intent is now blocked until that barrier
   and its protected coordinate exist.
 - The access barrier fences new unleased opens but does not prove that older
-  handles drained. Automated deletion remains disabled until that proof or an
-  equivalent external coordination result exists.
+  handles drained. `content-reader-drain-attestation-v1.md` now defines the
+  durable external-coordination record, but intent does not require or consume
+  it because intent remains harmless coordination state rather than deletion
+  authority.
 - Grace, a second logical/physical recheck, representation fencing, replica
   deletion, provider-version cleanup, and completion audit are later protocols.
 - Intent alone is never accepted by a deletion worker as deletion authority.

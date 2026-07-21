@@ -154,9 +154,12 @@ pub use content::{
     ContentAttachmentScope, ContentChangeId, ContentHandle, ContentHashAlgorithm, ContentId,
     ContentLeaseId, ContentLeaseOptions, ContentLeaseOwnerId, ContentPhysicalHold,
     ContentPhysicalHoldId, ContentPhysicalHoldKind, ContentPhysicalHoldOptions,
-    ContentPhysicalHoldOwnerId, ContentReclaimAuthorization, ContentReclaimIntentStage,
-    ContentReclaimProofToken, ContentStream, ContentUpload, ContentUploadOptions,
-    ContentUploadResume, OwnerScopeId, SealedContent, StorageDomainId, UploadId, UploadToken,
+    ContentPhysicalHoldOwnerId, ContentReaderDrainAttestation, ContentReaderDrainAttestationId,
+    ContentReaderDrainAttestationOptions, ContentReaderDrainCoordinatorId,
+    ContentReaderDrainEvidenceDigest, ContentReaderDrainKind, ContentReclaimAuthorization,
+    ContentReclaimIntentStage, ContentReclaimProofToken, ContentStream, ContentUpload,
+    ContentUploadOptions, ContentUploadResume, OwnerScopeId, SealedContent, StorageDomainId,
+    UploadId, UploadToken,
 };
 pub use db::{Db, IntoOpenOptions, MaintenanceBudget, MaintenanceOutcome};
 pub use error::{ContentReclaimBlocker, Error, Result};

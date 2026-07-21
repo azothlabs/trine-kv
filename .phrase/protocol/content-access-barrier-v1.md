@@ -109,9 +109,10 @@ needed for recovery.
 
 Intent still does not prove drain. Existing unleased `ContentHandle` values are
 allowed to finish indefinitely. Automated physical deletion remains disabled
-until a separate protocol supplies evidence that every pre-barrier reader
-session has ended, or an external coordinator supplies an equivalent
-deployment-specific proof.
+until `content-reader-drain-attestation-v1.md` records a trusted coordinator's
+deployment-specific evidence and the later sweep protocol independently checks
+every remaining logical and physical prerequisite. The attestation record is
+itself an external claim, not a mechanism that closes old handles.
 
 ## Required evidence
 

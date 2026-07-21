@@ -53,6 +53,8 @@ Evidence notes should separate:
   `.phrase/protocol/content-read-lease-v1.md`.
 - Irreversible per-domain leased-only access barriers:
   `.phrase/protocol/content-access-barrier-v1.md`.
+- Deployment-coordinated pre-barrier reader-drain attestations:
+  `.phrase/protocol/content-reader-drain-attestation-v1.md`.
 - Guard-aware LSM read and compaction strategy:
   `.phrase/protocol/guard-aware-lsm-strategy.md`.
 - Trine specs, ADRs, tests, and local design notes are the source of truth.

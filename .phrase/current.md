@@ -1,5 +1,43 @@
 # Current Phase
 
+## Consumer-driven reader-drain attestation boundary — 2026-07-21
+
+The leased-only barrier closes new unleased opens but cannot observe native
+read-only processes, old `ContentHandle` values, remote request streams, or
+direct object-store credentials. The native writer `LOCK` is not reader
+coordination, and a timeout is not proof for an unbounded handle.
+
+This slice adds one permanent, barrier-bound
+`ContentReaderDrainAttestation` per `StorageDomainId`. A trusted deployment
+coordinator selects `DomainBootstrap`, `NativeProcessSetRestarted`, or
+`RemoteCredentialEpochRetired`, supplies an opaque coordinator identity and an
+algorithm-tagged digest of externally retained evidence, and keeps a
+caller-generated id for exact retry. Trine KV verifies the direct barrier and
+protected coordinate, persists the exact claim with its final commit sequence,
+and rejects conflicting replacement or malformed state.
+
+This is deliberately an attestation, not an internal drain proof. A focused
+test records a claim while retaining an old handle and proves that handle still
+reads. Native evidence therefore requires every capable old process to exit;
+remote evidence requires every old session and bypass credential, including
+direct S3/R2 credentials, to end or be revoked. Bootstrap before first read is
+the preferred new-domain path.
+
+Reclaim intent remains unchanged because it does not hide or delete bytes. A
+future sweep must freshly require the matching attestation plus exact logical
+absence, no token/lease/activity/hold blocker, quarantine, grace, and
+representation-specific checks. No grace or physical deletion is implemented.
+
+The stable byte layout, trust boundary, native/remote evidence requirements,
+and future sweep gate are in
+`.phrase/protocol/content-reader-drain-attestation-v1.md`.
+
+Acceptance result: three focused reader-drain tests plus the object-store
+visibility test pass. The complete all-feature suite passes with 496 library
+tests (494 passed, two ignored) plus every integration target. Strict
+all-target/all-feature Clippy with wildcard imports denied, strict Rustdoc, 27
+doctests, formatting, and diff checks pass.
+
 ## Consumer-driven persisted leased-only forward fence — 2026-07-20
 
 Trine KV now has one irreversible leased-only access barrier per
