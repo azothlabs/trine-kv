@@ -24,6 +24,14 @@ pub enum ContentReclaimBlocker {
         /// Durable barrier identity that a writer can resume.
         barrier_id: ContentAccessBarrierId,
     },
+    /// The leased-only barrier has no trusted pre-barrier reader-drain
+    /// attestation, so quarantine cannot begin.
+    ReaderDrainNotAttested {
+        /// Barrier identity that still needs a matching attestation.
+        barrier_id: ContentAccessBarrierId,
+    },
+    /// No exact accepted reclaim intent matches the quarantine request.
+    ReclaimIntentRequired,
     /// The higher-layer proof reached its exclusive wall-clock deadline.
     ProofExpired {
         /// Proof deadline as Unix epoch milliseconds.
@@ -67,6 +75,13 @@ impl fmt::Display for ContentReclaimBlocker {
                 formatter,
                 "leased-only barrier {barrier_id} has no protected commit coordinate"
             ),
+            Self::ReaderDrainNotAttested { barrier_id } => write!(
+                formatter,
+                "leased-only barrier {barrier_id} has no reader-drain attestation"
+            ),
+            Self::ReclaimIntentRequired => {
+                formatter.write_str("content quarantine requires the exact accepted reclaim intent")
+            }
             Self::ProofExpired { expired_at_unix_ms } => write!(
                 formatter,
                 "proof expired at Unix millisecond {expired_at_unix_ms}"
@@ -198,6 +213,11 @@ pub enum Error {
     ContentLeaseRequired {
         /// Barrier identity that established leased-only access.
         barrier_id: ContentAccessBarrierId,
+    },
+    /// New leased reads are fenced by durable content quarantine.
+    ContentQuarantined {
+        /// Commit sequence that established quarantine.
+        quarantined_at: ReadVersion,
     },
     /// No durable physical content hold exists for the supplied identity.
     ContentPhysicalHoldNotFound {
@@ -354,6 +374,9 @@ pub(crate) enum ErrorSnapshot {
     ContentLeaseRequired {
         barrier_id: ContentAccessBarrierId,
     },
+    ContentQuarantined {
+        quarantined_at: ReadVersion,
+    },
     ContentPhysicalHoldNotFound {
         hold_id: String,
     },
@@ -416,6 +439,22 @@ pub(crate) enum ErrorSnapshot {
 }
 
 impl ErrorSnapshot {
+    fn io(message: String) -> Self {
+        Self::Io { message }
+    }
+
+    fn corruption(message: &str) -> Self {
+        Self::Corruption {
+            message: message.to_owned(),
+        }
+    }
+
+    fn invalid_format(message: &str) -> Self {
+        Self::InvalidFormat {
+            message: message.to_owned(),
+        }
+    }
+
     fn content_missing(storage_domain_id: &str, content_id: &str) -> Self {
         Self::ContentNotFound {
             storage_domain_id: storage_domain_id.to_owned(),
@@ -435,6 +474,10 @@ impl ErrorSnapshot {
 
     const fn lease_required(barrier_id: ContentAccessBarrierId) -> Self {
         Self::ContentLeaseRequired { barrier_id }
+    }
+
+    const fn content_quarantined(quarantined_at: ReadVersion) -> Self {
+        Self::ContentQuarantined { quarantined_at }
     }
 
     fn physical_hold_missing(hold_id: &str) -> Self {
@@ -470,15 +513,9 @@ impl ErrorSnapshot {
     #[must_use]
     pub(crate) fn capture(error: &Error) -> Self {
         match error {
-            Error::Io(error) => Self::Io {
-                message: error.to_string(),
-            },
-            Error::Corruption { message } => Self::Corruption {
-                message: message.clone(),
-            },
-            Error::InvalidFormat { message } => Self::InvalidFormat {
-                message: message.clone(),
-            },
+            Error::Io(error) => Self::io(error.to_string()),
+            Error::Corruption { message } => Self::corruption(message),
+            Error::InvalidFormat { message } => Self::invalid_format(message),
             Error::UnsupportedFormat { message } => Self::UnsupportedFormat {
                 message: message.clone(),
             },
@@ -519,6 +556,9 @@ impl ErrorSnapshot {
                 expired_at_unix_ms: expiry,
             } => Self::lease_dead(*expiry),
             Error::ContentLeaseRequired { barrier_id } => Self::lease_required(*barrier_id),
+            Error::ContentQuarantined { quarantined_at } => {
+                Self::content_quarantined(*quarantined_at)
+            }
             Error::ContentPhysicalHoldNotFound { hold_id } => Self::physical_hold_missing(hold_id),
             Error::ContentPhysicalHoldExpired { expired_at_unix_ms } => {
                 Self::physical_hold_dead(*expired_at_unix_ms)
@@ -610,6 +650,9 @@ impl ErrorSnapshot {
                 Error::ContentLeaseExpired { expired_at_unix_ms }
             }
             Self::ContentLeaseRequired { barrier_id } => Error::ContentLeaseRequired { barrier_id },
+            Self::ContentQuarantined { quarantined_at } => {
+                Error::ContentQuarantined { quarantined_at }
+            }
             Self::ContentPhysicalHoldNotFound { hold_id } => {
                 Error::ContentPhysicalHoldNotFound { hold_id }
             }
@@ -698,9 +741,7 @@ impl fmt::Display for Error {
             Self::Io(error) => write!(formatter, "io error: {error}"),
             Self::Corruption { message } => write!(formatter, "corruption: {message}"),
             Self::InvalidFormat { message } => write!(formatter, "invalid format: {message}"),
-            Self::UnsupportedFormat { message } => {
-                write!(formatter, "unsupported format: {message}")
-            }
+            Self::UnsupportedFormat { message } => fmt_unsupported_format(formatter, message),
             Self::CodecUnavailable { codec } => write!(formatter, "codec unavailable: {codec}"),
             Self::Conflict { message } => write!(formatter, "transaction conflict: {message}"),
             Self::Fenced {
@@ -738,6 +779,9 @@ impl fmt::Display for Error {
                 fmt_lease_expired(formatter, *expired_at_unix_ms)
             }
             Self::ContentLeaseRequired { barrier_id } => fmt_lease_required(formatter, *barrier_id),
+            Self::ContentQuarantined { quarantined_at } => {
+                fmt_content_quarantined(formatter, *quarantined_at)
+            }
             Self::ContentPhysicalHoldNotFound { hold_id } => fmt_hold_missing(formatter, hold_id),
             Self::ContentPhysicalHoldExpired { expired_at_unix_ms } => {
                 fmt_hold_expired(formatter, *expired_at_unix_ms)
@@ -783,9 +827,7 @@ impl fmt::Display for Error {
             Self::BucketMissing { name } => write!(formatter, "bucket is missing: {name}"),
             Self::InvalidOptions { message } => write!(formatter, "invalid options: {message}"),
             Self::Unsupported { feature } => write!(formatter, "unsupported feature: {feature}"),
-            Self::UnsupportedBackend { feature } => {
-                write!(formatter, "unsupported storage backend feature: {feature}")
-            }
+            Self::UnsupportedBackend { feature } => fmt_unsupported_backend(formatter, feature),
             Self::UnsupportedDurability { requested } => {
                 write!(
                     formatter,
@@ -808,6 +850,25 @@ impl error::Error for Error {
 
 fn fmt_upload_missing(formatter: &mut fmt::Formatter<'_>, upload_id: &str) -> fmt::Result {
     write!(formatter, "content upload {upload_id} was not found")
+}
+
+fn fmt_unsupported_format(formatter: &mut fmt::Formatter<'_>, message: &str) -> fmt::Result {
+    write!(formatter, "unsupported format: {message}")
+}
+
+fn fmt_unsupported_backend(formatter: &mut fmt::Formatter<'_>, feature: &str) -> fmt::Result {
+    write!(formatter, "unsupported storage backend feature: {feature}")
+}
+
+fn fmt_content_quarantined(
+    formatter: &mut fmt::Formatter<'_>,
+    quarantined_at: ReadVersion,
+) -> fmt::Result {
+    write!(
+        formatter,
+        "content was quarantined at commit {}",
+        quarantined_at.as_u64()
+    )
 }
 
 fn fmt_upload_sealed(formatter: &mut fmt::Formatter<'_>, upload_id: &str) -> fmt::Result {

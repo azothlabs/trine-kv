@@ -10,11 +10,13 @@ use crate::{
         CONTENT_TOKEN_BUCKET, CONTENT_TOKEN_INDEX_BUCKET, ContentAccessCoordinateRecord,
         ContentAccessMode, ContentAttachment, ContentAttachmentScope, ContentChangeId,
         ContentControlRecord, ContentDescriptor, ContentLeaseId, ContentLeaseRecord,
-        ContentPhysicalHoldId, ContentPhysicalHoldRecord, ContentReclaimAuthorization,
+        ContentPhysicalHoldId, ContentPhysicalHoldRecord, ContentQuarantineRecord,
+        ContentQuarantineStage, ContentReaderDrainAttestationRecord, ContentReclaimAuthorization,
         ContentReclaimIntentStage, ContentTokenIndexRecord, StorageDomainId, UploadToken,
         UploadTokenRecord, content_access_coordinate_key, content_control_key,
         content_lease_prefix, content_physical_hold_prefix, content_prefix_range,
-        content_token_index_key, content_token_index_prefix, upload_token_key,
+        content_quarantine_key, content_reader_drain_attestation_key, content_token_index_key,
+        content_token_index_prefix, upload_token_key,
     },
     db::Db,
     error::{ContentReclaimBlocker, Error, Result},
@@ -423,6 +425,12 @@ impl Transaction {
         if let Some(bytes) = self.get_bucket_sync(CONTENT_CONTROL_BUCKET, &key)? {
             ContentControlRecord::decode(&bytes, storage_domain_id, content_id)?;
         }
+        let quarantine_key = content_quarantine_key(storage_domain_id, content_id);
+        if let Some(bytes) = self.get_bucket_sync(CONTENT_CONTROL_BUCKET, &quarantine_key)? {
+            ContentQuarantineRecord::decode(&bytes, storage_domain_id, content_id)?;
+            self.writes
+                .delete_bucket(CONTENT_CONTROL_BUCKET, quarantine_key)?;
+        }
         self.stage_active_content_control(storage_domain_id, content_id, key)
     }
 
@@ -664,6 +672,38 @@ impl Transaction {
         if let Some(bytes) = self.get_bucket(CONTENT_CONTROL_BUCKET, &key).await? {
             ContentControlRecord::decode(&bytes, storage_domain_id, content_id)?;
         }
+        let quarantine_key = content_quarantine_key(storage_domain_id, content_id);
+        if let Some(bytes) = self
+            .get_bucket(CONTENT_CONTROL_BUCKET, &quarantine_key)
+            .await?
+        {
+            ContentQuarantineRecord::decode(&bytes, storage_domain_id, content_id)?;
+            self.writes
+                .delete_bucket(CONTENT_CONTROL_BUCKET, quarantine_key)?;
+        }
+        self.stage_active_content_control(storage_domain_id, content_id, key)
+    }
+
+    pub(crate) async fn stage_content_read_activity(
+        &mut self,
+        storage_domain_id: crate::StorageDomainId,
+        content_id: crate::ContentId,
+    ) -> Result<()> {
+        let quarantine_key = content_quarantine_key(storage_domain_id, content_id);
+        if let Some(bytes) = self
+            .get_bucket(CONTENT_CONTROL_BUCKET, &quarantine_key)
+            .await?
+        {
+            let quarantine =
+                ContentQuarantineRecord::decode(&bytes, storage_domain_id, content_id)?;
+            return Err(Error::ContentQuarantined {
+                quarantined_at: quarantine.quarantined_at,
+            });
+        }
+        let key = content_control_key(storage_domain_id, content_id);
+        if let Some(bytes) = self.get_bucket(CONTENT_CONTROL_BUCKET, &key).await? {
+            ContentControlRecord::decode(&bytes, storage_domain_id, content_id)?;
+        }
         self.stage_active_content_control(storage_domain_id, content_id, key)
     }
 
@@ -868,10 +908,244 @@ impl Transaction {
         Ok(ContentReclaimIntentStage::Staged)
     }
 
+    /// Rechecks accepted reclaim state and stages a durable content quarantine.
+    ///
+    /// The higher layer must revalidate its exact logical proof, liveness, and
+    /// retained-root generation in this same transaction before calling this
+    /// method. Trine KV then requires the exact accepted reclaim intent, the
+    /// matching leased-only barrier and reader-drain attestation, a valid
+    /// descriptor, and fresh absence of upload authority, read leases, and
+    /// physical holds. Every read joins the optimistic conflict set.
+    ///
+    /// A committed quarantine blocks new leased opens but leaves the descriptor
+    /// and every content byte intact. Attachment/token or physical-hold activity
+    /// may atomically remove quarantine and return control to Active. This method
+    /// does not start a grace timer and does not authorize or perform deletion.
+    ///
+    /// # Returns
+    ///
+    /// [`ContentQuarantineStage::Staged`] means the quarantine write is staged
+    /// but not durable until this transaction commits. `Existing` reports the
+    /// commit coordinate of an exact already-durable quarantine.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ContentReclaimBlocked`] with a typed blocker when the
+    /// barrier is absent or uncoordinated, reader drain is not attested, the
+    /// exact intent is missing, the proof expired or was superseded, or active
+    /// token, lease, or hold authority remains. Missing/malformed protected
+    /// records, descriptor errors, and later commit conflicts fail closed.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    /// use trine_kv::{
+    ///     ContentAccessBarrierId, ContentAttachmentScope, ContentChangeId,
+    ///     ContentQuarantineStage, ContentReaderDrainAttestationId,
+    ///     ContentReaderDrainAttestationOptions, ContentReaderDrainCoordinatorId,
+    ///     ContentReaderDrainEvidenceDigest, ContentReaderDrainKind,
+    ///     ContentReclaimAuthorization, ContentReclaimProofToken, ContentUploadOptions, Db,
+    ///     DbOptions, OwnerScopeId, StorageDomainId, TransactionOptions,
+    /// };
+    ///
+    /// async fn example() -> trine_kv::Result<()> {
+    ///     let db = Db::open(DbOptions::memory()).await?;
+    ///     let domain = StorageDomainId::from_bytes([1; 16]);
+    ///     let scope = ContentAttachmentScope::new(domain, OwnerScopeId::from_bytes([2; 16]));
+    ///     let mut upload = db
+    ///         .begin_content_upload(ContentUploadOptions::new(
+    ///             scope,
+    ///             Duration::from_secs(60),
+    ///         ))
+    ///         .await?;
+    ///     upload.write(b"quarantine example").await?;
+    ///     let sealed = upload.seal().await?;
+    ///     let mut attach = db.transaction(TransactionOptions::default());
+    ///     attach
+    ///         .consume_upload_token(
+    ///             sealed.upload_token(),
+    ///             scope,
+    ///             ContentChangeId::from_bytes([3; 16]),
+    ///         )
+    ///         .await?;
+    ///     attach.commit().await?;
+    ///     let barrier = db
+    ///         .enforce_content_leased_only(domain, ContentAccessBarrierId::generate()?)
+    ///         .await?;
+    ///     db.attest_content_reader_drain(
+    ///         barrier,
+    ///         ContentReaderDrainAttestationId::generate()?,
+    ///         ContentReaderDrainAttestationOptions::new(
+    ///             ContentReaderDrainKind::DomainBootstrap,
+    ///             ContentReaderDrainCoordinatorId::from_bytes([4; 16]),
+    ///             ContentReaderDrainEvidenceDigest::for_bytes(b"retained deployment evidence"),
+    ///         ),
+    ///     )
+    ///     .await?;
+    ///
+    ///     // A real higher layer supplies this only after exact logical absence.
+    ///     let mut intent = db.transaction(TransactionOptions::default());
+    ///     let authorization = ContentReclaimAuthorization::new(
+    ///         domain,
+    ///         sealed.content_id(),
+    ///         ContentReclaimProofToken::from_bytes([5; 49]),
+    ///         intent.read_version(),
+    ///         u64::MAX,
+    ///     );
+    ///     intent.stage_content_reclaim_intent(authorization).await?;
+    ///     intent.commit().await?;
+    ///
+    ///     // The higher layer repeats its logical checks in this transaction.
+    ///     let mut quarantine = db.transaction(TransactionOptions::default());
+    ///     assert_eq!(
+    ///         quarantine.stage_content_quarantine(authorization).await?,
+    ///         ContentQuarantineStage::Staged,
+    ///     );
+    ///     quarantine.commit().await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn stage_content_quarantine(
+        &mut self,
+        authorization: ContentReclaimAuthorization,
+    ) -> Result<ContentQuarantineStage> {
+        let now_unix_ms = current_epoch_millis()?;
+        if now_unix_ms >= authorization.expires_at_unix_ms() {
+            return Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::ProofExpired {
+                    expired_at_unix_ms: authorization.expires_at_unix_ms(),
+                },
+            });
+        }
+        if authorization.verified_at().as_u64() == 0
+            || authorization.verified_at().as_u64() > self.read_version().as_u64()
+        {
+            return Err(Error::invalid_options(
+                "content quarantine verification sequence is invalid for this transaction",
+            ));
+        }
+        self.db.bucket(CONTENT_CONTROL_BUCKET).await?;
+        self.db.bucket(CONTENT_TOKEN_INDEX_BUCKET).await?;
+        self.db.bucket(CONTENT_LEASE_BUCKET).await?;
+        self.db.bucket(CONTENT_PHYSICAL_HOLD_BUCKET).await?;
+
+        let access = self
+            .require_coordinated_content_access(authorization.storage_domain_id())
+            .await?;
+        let drain = self
+            .require_content_reader_drain_attestation(access)
+            .await?;
+        let intent_accepted_at = self
+            .require_exact_content_reclaim_intent(authorization)
+            .await?;
+
+        self.require_no_active_content_token(authorization, now_unix_ms)
+            .await?;
+        self.require_no_active_content_lease(authorization, now_unix_ms)
+            .await?;
+        self.require_no_active_content_physical_hold(authorization, now_unix_ms)
+            .await?;
+
+        let quarantine_key = content_quarantine_key(
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        );
+        if let Some(bytes) = self
+            .get_bucket(CONTENT_CONTROL_BUCKET, &quarantine_key)
+            .await?
+        {
+            let existing = ContentQuarantineRecord::decode(
+                &bytes,
+                authorization.storage_domain_id(),
+                authorization.content_id(),
+            )?;
+            if existing.matches_authorization(authorization)
+                && existing.intent_accepted_at == intent_accepted_at
+                && existing.barrier_id == access.barrier_id
+                && existing.barrier_enforced_at == access.enforced_at
+                && existing.drain_attestation_id == drain.attestation_id
+            {
+                return Ok(ContentQuarantineStage::Existing {
+                    quarantined_at: existing.quarantined_at,
+                });
+            }
+            return Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::ReclaimIntentRequired,
+            });
+        }
+
+        let requested =
+            ContentQuarantineRecord::requested(authorization, intent_accepted_at, access, drain);
+        self.writes.put_bucket_with_commit_sequence(
+            CONTENT_CONTROL_BUCKET,
+            quarantine_key,
+            &requested.encode_prefix(),
+            &[],
+        )?;
+        Ok(ContentQuarantineStage::Staged)
+    }
+
+    async fn require_exact_content_reclaim_intent(
+        &mut self,
+        authorization: ContentReclaimAuthorization,
+    ) -> Result<crate::ReadVersion> {
+        let descriptor = self
+            .db
+            .read_content_descriptor(
+                authorization.storage_domain_id(),
+                authorization.content_id(),
+            )
+            .await?
+            .ok_or_else(|| Error::ContentNotFound {
+                storage_domain_id: authorization.storage_domain_id().to_string(),
+                content_id: authorization.content_id().to_string(),
+            })?;
+        ContentDescriptor::decode(
+            &descriptor,
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        )?;
+
+        let key = content_control_key(
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        );
+        let bytes = self
+            .get_bucket(CONTENT_CONTROL_BUCKET, &key)
+            .await?
+            .ok_or_else(|| Error::Corruption {
+                message: "sealed content is missing its physical control record".to_owned(),
+            })?;
+        let control = ContentControlRecord::decode(
+            &bytes,
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        )?;
+        if !control.matches_authorization(authorization) {
+            return Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::ReclaimIntentRequired,
+            });
+        }
+        let accepted_at = control.accepted_at().ok_or_else(|| Error::Corruption {
+            message: "matching reclaim intent has no acceptance sequence".to_owned(),
+        })?;
+        let physical_activity = control.physical_activity_commit_seq();
+        if physical_activity > authorization.verified_at().as_u64() {
+            return Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::Superseded {
+                    activity_at_commit_seq: physical_activity,
+                    verified_at_commit_seq: authorization.verified_at().as_u64(),
+                },
+            });
+        }
+        Ok(accepted_at)
+    }
+
     async fn require_coordinated_content_access(
         &mut self,
         storage_domain_id: StorageDomainId,
-    ) -> Result<()> {
+    ) -> Result<ContentAccessCoordinateRecord> {
         let barrier_id = match self.db.content_access_mode(storage_domain_id).await? {
             ContentAccessMode::CompatibleUnleased => {
                 return Err(Error::ContentReclaimBlocked {
@@ -892,7 +1166,30 @@ impl Transaction {
                 message: "content access barrier differs from reclaim coordinate".to_owned(),
             });
         }
-        Ok(())
+        Ok(access)
+    }
+
+    async fn require_content_reader_drain_attestation(
+        &mut self,
+        access: ContentAccessCoordinateRecord,
+    ) -> Result<ContentReaderDrainAttestationRecord> {
+        let key = content_reader_drain_attestation_key(access.storage_domain_id);
+        let Some(bytes) = self.get_bucket(CONTENT_CONTROL_BUCKET, &key).await? else {
+            return Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::ReaderDrainNotAttested {
+                    barrier_id: access.barrier_id,
+                },
+            });
+        };
+        let drain = ContentReaderDrainAttestationRecord::decode(&bytes, access.storage_domain_id)?;
+        if drain.barrier_id != access.barrier_id || drain.barrier_enforced_at != access.enforced_at
+        {
+            return Err(Error::Corruption {
+                message: "reader-drain attestation differs from the active barrier coordinate"
+                    .to_owned(),
+            });
+        }
+        Ok(drain)
     }
 
     async fn require_no_active_content_token(

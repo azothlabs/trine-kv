@@ -16735,3 +16735,53 @@ Negative check:
 - Make the future sweep require the exact barrier-bound attestation and then
   design crash-safe quarantine plus the second logical/physical recheck. Do not
   start deletion until provider-hold and failure-injection evidence is green.
+
+## 2026-07-21: crash-safe exact-content quarantine
+
+### Observation
+
+- Intent, barrier, and drain attestation did not close the race in which a new
+  leased open committed after the last lease scan.
+- The final transition must freshly read descriptor, activity, token, lease,
+  and hold state in the same optimistic transaction as its durable fence.
+
+### Interpretation
+
+- Keep accepted intent in the content-control record and use a separate exact
+  quarantine key. This preserves proof provenance while allowing token/hold
+  activity to remove quarantine and publish Active atomically before deletion.
+- Leased reads are not revival authority. They must fail against a durable
+  quarantine, while concurrent pre-commit leased activity must conflict.
+- Quarantine records no grace and grants no delete authority.
+
+### Implementation evidence
+
+- Added the commit-stamped `ContentQuarantineRecord`, public audit coordinate,
+  typed staging result, and query API. The record binds proof, intent, barrier,
+  and reader-drain identities and validates every protected coordinate.
+- `Transaction::stage_content_quarantine` repeats exact physical checks and
+  returns typed blockers for missing drain, missing exact intent, superseded
+  activity, token, lease, and hold state.
+- Leased open/renewal uses a read-specific activity path that rejects
+  quarantine. General token/attachment and physical-hold activity validates
+  and deletes quarantine while writing Active in the same transaction.
+- Native reopen retains the fence; malformed records block query, reads, and
+  revival. Stable semantics are in `content-quarantine-v1.md`.
+
+### Verification
+
+- Six focused tests pass, covering missing drain/intent, first transition,
+  leased read fence, exact retry, upload/hold revival, leased-open race
+  conflict, native reopen, and malformed-state failure.
+- `cargo test -q --all-features` passes with 502 library tests (500 passed, two
+  ignored) plus all integration targets.
+- Strict all-target/all-feature Clippy with wildcard imports denied, strict
+  Rustdoc, 28 doctests, formatting, explicit-import scan, and diff checks pass.
+
+### Safety boundary
+
+- No grace timer, representation mutation, replica/provider deletion, delete
+  worker, or physical byte deletion exists.
+- A later protocol must define persisted grace with clock/restart behavior and
+  repeat fresh logical, physical, representation, replica, and provider-hold
+  checks before deletion.

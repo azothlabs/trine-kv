@@ -102,6 +102,13 @@ hold-range read observed Active; a retry decodes but ignores Released.
 Intent remains coordination state only. This protocol does not start grace,
 hide bytes, or authorize representation deletion.
 
+`content-quarantine-v1.md` repeats the exact hold-range check in its transition
+transaction. Because quarantine v1 has not started deletion, hold acquisition
+or renewal is conservative revival authority: it validates and removes an
+existing quarantine record while returning content control to Active in the
+same transaction. A race either commits entirely before quarantine, commits
+entirely after revival, or conflicts.
+
 ## Unleased compatibility boundary
 
 This hold registry does not make compatible `open_content` handles observable
@@ -114,9 +121,11 @@ The irreversible leased-only forward fence now exists in
 `content-access-barrier-v1.md`, and reclaim intent requires its protected
 coordinate. It blocks new unleased opens even from stale read-only database
 handles. It does not end handles opened before the barrier: those handles have
-no maximum lifetime. Automated physical deletion therefore remains disabled
-until a proved reader-drain or external-coordination transition covers every
-pre-barrier reader. Grace alone is not that proof; uncertainty retains bytes.
+no maximum lifetime. The barrier-bound trusted-coordinator attestation in
+`content-reader-drain-attestation-v1.md` records that external deployment fact,
+and the quarantine transition requires the exact matching record. The
+attestation is not self-verifying, quarantine records no grace, and neither
+starts physical deletion. Uncertainty retains bytes.
 
 ## Required evidence
 

@@ -11,14 +11,15 @@ use crate::{
         ContentAccessMode, ContentDescriptor, ContentHandle, ContentId, ContentLease,
         ContentLeaseId, ContentLeaseOptions, ContentLeaseRecord, ContentPhysicalHold,
         ContentPhysicalHoldId, ContentPhysicalHoldOptions, ContentPhysicalHoldOwnerId,
-        ContentPhysicalHoldRecord, ContentPhysicalHoldRecordState, ContentReaderDrainAttestation,
-        ContentReaderDrainAttestationId, ContentReaderDrainAttestationOptions,
-        ContentReaderDrainAttestationRecord, ContentTokenIndexRecord, ContentUpload,
-        ContentUploadOptions, ContentUploadResume, SealedContent, StorageDomainId, UploadId,
-        UploadSessionState, UploadSessionStatus, UploadToken, UploadTokenRecord,
-        content_access_coordinate_key, content_lease_key, content_lease_prefix,
-        content_physical_hold_key, content_reader_drain_attestation_key, content_token_index_key,
-        current_epoch_millis, duration_millis, upload_token_key,
+        ContentPhysicalHoldRecord, ContentPhysicalHoldRecordState, ContentQuarantine,
+        ContentQuarantineRecord, ContentReaderDrainAttestation, ContentReaderDrainAttestationId,
+        ContentReaderDrainAttestationOptions, ContentReaderDrainAttestationRecord,
+        ContentTokenIndexRecord, ContentUpload, ContentUploadOptions, ContentUploadResume,
+        SealedContent, StorageDomainId, UploadId, UploadSessionState, UploadSessionStatus,
+        UploadToken, UploadTokenRecord, content_access_coordinate_key, content_lease_key,
+        content_lease_prefix, content_physical_hold_key, content_quarantine_key,
+        content_reader_drain_attestation_key, content_token_index_key, current_epoch_millis,
+        duration_millis, upload_token_key,
     },
     error::{Error, Result},
     options::{DurabilityMode, HostStorageBackend, StorageMode, WriteOptions},
@@ -567,6 +568,32 @@ impl Db {
             .transpose()
     }
 
+    /// Reads the durable quarantine state for one exact content identity.
+    ///
+    /// `None` means the content is not currently quarantined. Attachment/token
+    /// or physical-hold activity may remove a previous quarantine and return the
+    /// content to Active state. A returned record is a read fence and recovery
+    /// coordinate only; it does not start grace or authorize byte deletion.
+    pub async fn content_quarantine(
+        &self,
+        storage_domain_id: StorageDomainId,
+        content_id: ContentId,
+    ) -> Result<Option<ContentQuarantine>> {
+        self.ensure_open()?;
+        self.ensure_content_backend_supported()?;
+        let mut transaction = self.transaction(TransactionOptions::default());
+        let key = content_quarantine_key(storage_domain_id, content_id);
+        match transaction.get_bucket(CONTENT_CONTROL_BUCKET, &key).await {
+            Ok(Some(bytes)) => {
+                ContentQuarantineRecord::decode(&bytes, storage_domain_id, content_id)
+                    .map(ContentQuarantineRecord::into_public)
+                    .map(Some)
+            }
+            Ok(None) | Err(Error::BucketMissing { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Opens a sealed immutable `ContentObject` by cryptographic identity.
     ///
     /// The descriptor is read and validated once. The resulting handle returns
@@ -643,8 +670,9 @@ impl Db {
     /// Returns [`Error::ContentNotFound`] or descriptor integrity errors as the
     /// unleased open does, [`Error::ReadOnly`] when the database cannot publish
     /// a lease, [`Error::InvalidOptions`] for an invalid or overflowing
-    /// lifetime, or a transaction/storage error when the lease record cannot be
-    /// committed. Leased-only mode does not reject this method.
+    /// lifetime, [`Error::ContentQuarantined`] when the exact content has entered
+    /// durable quarantine, or a transaction/storage error when the lease record
+    /// cannot be committed. Leased-only mode itself does not reject this method.
     ///
     /// # Examples
     ///
@@ -720,7 +748,7 @@ impl Db {
             record.encode(),
         )?;
         transaction
-            .stage_content_activity(storage_domain_id, content_id)
+            .stage_content_read_activity(storage_domain_id, content_id)
             .await?;
         transaction.commit().await?;
         Ok(handle.with_lease(ContentLease::new(
@@ -780,7 +808,7 @@ impl Db {
             record.expires_at_unix_ms = next_expiry;
             transaction.put_bucket(CONTENT_LEASE_BUCKET, key.clone(), record.encode())?;
             transaction
-                .stage_content_activity(handle.storage_domain_id(), handle.content_id())
+                .stage_content_read_activity(handle.storage_domain_id(), handle.content_id())
                 .await?;
             match transaction.commit().await {
                 Ok(_) => {

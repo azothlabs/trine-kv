@@ -164,7 +164,10 @@ emptiness by listing object-store keys or waiting for a grace duration.
 
 This protocol does not change `Transaction::stage_content_reclaim_intent`:
 intent remains harmless coordination state and may be recorded before external
-drain is attested. A future sweep must independently and freshly require:
+drain is attested. `content-quarantine-v1.md` now consumes the matching
+attestation during a second transactional logical/physical recheck and blocks
+new leased reads without deleting bytes. A future sweep must still independently
+and freshly require:
 
 - the direct leased-only barrier and matching protected coordinate;
 - a valid attestation bound to that exact barrier;

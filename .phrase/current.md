@@ -1,5 +1,37 @@
 # Current Phase
 
+## Consumer-driven crash-safe content quarantine — 2026-07-21
+
+Reader drain now has a durable deployment attestation, but intent and
+attestation alone still allowed a new leased read to appear after the last lease
+scan. This slice adds one exact-content quarantine record that is staged only
+after the higher layer repeats its logical proof/liveness/root-generation checks
+in the same optimistic transaction as Trine KV's barrier, attestation,
+descriptor, activity, token, lease, and physical-hold rechecks.
+
+A committed quarantine blocks new leased opens and renewal with
+`ContentQuarantined { quarantined_at }`. It keeps the descriptor and all bytes
+intact. Token/attachment or migration/backup/repair/provider/administrative hold
+activity validates and removes quarantine while returning control to Active in
+one transaction; a leased read is not revival authority. Concurrent logical or
+physical activity either blocks the transition or makes its commit conflict.
+
+The record binds the accepted proof, intent sequence, leased-only barrier, and
+reader-drain attestation, and carries its final commit sequence. Exact retry is
+idempotent; native reopen retains the fence; malformed state fails closed.
+
+This slice records no grace deadline and invokes no physical deletion. Future
+grace/sweep work must obtain a fresh logical proof and repeat every physical
+check, then separately prove representation, replica, provider-hold, clock, and
+crash behavior. Stable layout and transition semantics are in
+`.phrase/protocol/content-quarantine-v1.md`.
+
+Acceptance result: six focused quarantine tests pass. The complete all-feature
+suite passes with 502 library tests (500 passed, two ignored) plus every
+integration target. Strict all-target/all-feature Clippy with wildcard imports
+denied, strict Rustdoc, 28 doctests, formatting, explicit-import, and diff gates
+pass.
+
 ## Consumer-driven reader-drain attestation boundary — 2026-07-21
 
 The leased-only barrier closes new unleased opens but cannot observe native

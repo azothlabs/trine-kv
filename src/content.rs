@@ -53,6 +53,7 @@ const CONTENT_ACCESS_BARRIER_MAGIC: &[u8; 8] = b"TRNCABR1";
 const CONTENT_ACCESS_COORDINATE_MAGIC: &[u8; 8] = b"TRNCACO1";
 const CONTENT_READER_DRAIN_ATTESTATION_MAGIC: &[u8; 8] = b"TRNCRDA1";
 const CONTENT_READER_DRAIN_EVIDENCE_DOMAIN: &[u8] = b"trine-content-reader-drain-evidence-v1";
+const CONTENT_QUARANTINE_MAGIC: &[u8; 8] = b"TRNCQRT1";
 
 /// Opaque control-plane identity for one physical content boundary.
 ///
@@ -607,6 +608,108 @@ pub enum ContentReclaimIntentStage {
         /// Commit sequence that durably accepted the existing intent.
         accepted_at: crate::ReadVersion,
     },
+}
+
+/// Result of staging a crash-safe content quarantine in an optimistic transaction.
+///
+/// Quarantine blocks new leased reads through Trine KV but keeps every byte and
+/// descriptor intact. It does not start grace and does not authorize physical
+/// deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentQuarantineStage {
+    /// This transaction staged a new quarantine record.
+    Staged,
+    /// The exact same quarantine was already durable.
+    Existing {
+        /// Commit sequence that durably established quarantine.
+        quarantined_at: crate::ReadVersion,
+    },
+}
+
+/// Durable, exact-content quarantine coordinate.
+///
+/// The record binds one accepted reclaim intent, the leased-only barrier, and
+/// the trusted reader-drain attestation used by the transition. Quarantine
+/// prevents new leased opens but retains the descriptor and all content bytes.
+/// Attachment authority or a physical hold may atomically return the content to
+/// Active state before any future deletion protocol begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentQuarantine {
+    storage_domain_id: StorageDomainId,
+    content_id: ContentId,
+    proof_token: ContentReclaimProofToken,
+    verified_at: crate::ReadVersion,
+    proof_expires_at_unix_ms: u64,
+    intent_accepted_at: crate::ReadVersion,
+    barrier_id: ContentAccessBarrierId,
+    barrier_enforced_at: crate::ReadVersion,
+    drain_attestation_id: ContentReaderDrainAttestationId,
+    quarantined_at: crate::ReadVersion,
+}
+
+impl ContentQuarantine {
+    /// Returns the physical lifecycle domain.
+    #[must_use]
+    pub const fn storage_domain_id(self) -> StorageDomainId {
+        self.storage_domain_id
+    }
+
+    /// Returns the exact immutable content identity.
+    #[must_use]
+    pub const fn content_id(self) -> ContentId {
+        self.content_id
+    }
+
+    /// Returns the opaque higher-layer proof token accepted by the intent.
+    #[must_use]
+    pub const fn proof_token(self) -> ContentReclaimProofToken {
+        self.proof_token
+    }
+
+    /// Returns the logical proof's stable verification coordinate.
+    #[must_use]
+    pub const fn verified_at(self) -> crate::ReadVersion {
+        self.verified_at
+    }
+
+    /// Returns the logical proof's exclusive Unix-millisecond deadline.
+    ///
+    /// Expiry does not remove an already durable quarantine. A future sweep
+    /// still needs a fresh logical proof and all physical checks.
+    #[must_use]
+    pub const fn proof_expires_at_unix_ms(self) -> u64 {
+        self.proof_expires_at_unix_ms
+    }
+
+    /// Returns the commit sequence that accepted the matching reclaim intent.
+    #[must_use]
+    pub const fn intent_accepted_at(self) -> crate::ReadVersion {
+        self.intent_accepted_at
+    }
+
+    /// Returns the irreversible leased-only barrier identity.
+    #[must_use]
+    pub const fn barrier_id(self) -> ContentAccessBarrierId {
+        self.barrier_id
+    }
+
+    /// Returns the commit sequence that completed the leased-only barrier.
+    #[must_use]
+    pub const fn barrier_enforced_at(self) -> crate::ReadVersion {
+        self.barrier_enforced_at
+    }
+
+    /// Returns the trusted coordinator attestation bound to the transition.
+    #[must_use]
+    pub const fn drain_attestation_id(self) -> ContentReaderDrainAttestationId {
+        self.drain_attestation_id
+    }
+
+    /// Returns the commit sequence that established quarantine.
+    #[must_use]
+    pub const fn quarantined_at(self) -> crate::ReadVersion {
+        self.quarantined_at
+    }
 }
 
 /// Opaque authenticated owner scope supplied by the database layer.
@@ -1985,6 +2088,179 @@ pub(crate) fn content_reader_drain_attestation_key(storage_domain_id: StorageDom
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContentQuarantineRecord {
+    pub(crate) storage_domain_id: StorageDomainId,
+    pub(crate) content_id: ContentId,
+    pub(crate) proof_token: ContentReclaimProofToken,
+    pub(crate) verified_at: crate::ReadVersion,
+    pub(crate) proof_expires_at_unix_ms: u64,
+    pub(crate) intent_accepted_at: crate::ReadVersion,
+    pub(crate) barrier_id: ContentAccessBarrierId,
+    pub(crate) barrier_enforced_at: crate::ReadVersion,
+    pub(crate) drain_attestation_id: ContentReaderDrainAttestationId,
+    pub(crate) quarantined_at: crate::ReadVersion,
+}
+
+impl ContentQuarantineRecord {
+    pub(crate) fn requested(
+        authorization: ContentReclaimAuthorization,
+        intent_accepted_at: crate::ReadVersion,
+        access: ContentAccessCoordinateRecord,
+        drain: ContentReaderDrainAttestationRecord,
+    ) -> Self {
+        Self {
+            storage_domain_id: authorization.storage_domain_id(),
+            content_id: authorization.content_id(),
+            proof_token: authorization.proof_token(),
+            verified_at: authorization.verified_at(),
+            proof_expires_at_unix_ms: authorization.expires_at_unix_ms(),
+            intent_accepted_at,
+            barrier_id: access.barrier_id,
+            barrier_enforced_at: access.enforced_at,
+            drain_attestation_id: drain.attestation_id,
+            quarantined_at: crate::ReadVersion::from_u64(0),
+        }
+    }
+
+    pub(crate) fn encode_prefix(self) -> Vec<u8> {
+        const PREFIX_LEN: usize = 8 + 16 + 33 + 49 + 8 + 8 + 8 + 16 + 8 + 16;
+        let mut bytes = Vec::with_capacity(PREFIX_LEN);
+        bytes.extend_from_slice(CONTENT_QUARANTINE_MAGIC);
+        bytes.extend_from_slice(&self.storage_domain_id.to_bytes());
+        bytes.extend_from_slice(&self.content_id.to_bytes());
+        bytes.extend_from_slice(&self.proof_token.to_bytes());
+        bytes.extend_from_slice(&self.verified_at.as_u64().to_be_bytes());
+        bytes.extend_from_slice(&self.proof_expires_at_unix_ms.to_le_bytes());
+        bytes.extend_from_slice(&self.intent_accepted_at.as_u64().to_be_bytes());
+        bytes.extend_from_slice(&self.barrier_id.to_bytes());
+        bytes.extend_from_slice(&self.barrier_enforced_at.as_u64().to_be_bytes());
+        bytes.extend_from_slice(&self.drain_attestation_id.to_bytes());
+        bytes
+    }
+
+    pub(crate) fn decode(
+        bytes: &[u8],
+        storage_domain_id: StorageDomainId,
+        content_id: ContentId,
+    ) -> Result<Self> {
+        const RECORD_LEN: usize = 8 + 16 + 33 + 49 + 8 + 8 + 8 + 16 + 8 + 16 + 8;
+        if bytes.len() != RECORD_LEN || bytes.get(..8) != Some(CONTENT_QUARANTINE_MAGIC) {
+            return Err(Error::InvalidFormat {
+                message: "invalid content quarantine header or length".to_owned(),
+            });
+        }
+        let stored_domain = StorageDomainId::from_bytes(array_at::<16>(
+            bytes,
+            8,
+            "content quarantine storage domain",
+        )?);
+        let stored_content = decode_content_id(bytes, 24, "content quarantine identity")?;
+        let proof_token = ContentReclaimProofToken::from_bytes(array_at::<49>(
+            bytes,
+            57,
+            "content quarantine proof token",
+        )?);
+        let verified_at = crate::ReadVersion::from_u64(u64::from_be_bytes(array_at::<8>(
+            bytes,
+            106,
+            "content quarantine verified sequence",
+        )?));
+        let proof_expires_at_unix_ms = u64::from_le_bytes(array_at::<8>(
+            bytes,
+            114,
+            "content quarantine proof expiry",
+        )?);
+        let intent_accepted_at = crate::ReadVersion::from_u64(u64::from_be_bytes(array_at::<8>(
+            bytes,
+            122,
+            "content quarantine intent sequence",
+        )?));
+        let barrier_id = ContentAccessBarrierId::from_bytes(array_at::<16>(
+            bytes,
+            130,
+            "content quarantine barrier identity",
+        )?)?;
+        let barrier_enforced_at = crate::ReadVersion::from_u64(u64::from_be_bytes(array_at::<8>(
+            bytes,
+            146,
+            "content quarantine barrier sequence",
+        )?));
+        let drain_attestation_id = ContentReaderDrainAttestationId::from_bytes(array_at::<16>(
+            bytes,
+            154,
+            "content quarantine drain attestation identity",
+        )?)?;
+        let quarantined_at = crate::ReadVersion::from_u64(u64::from_be_bytes(array_at::<8>(
+            bytes,
+            170,
+            "content quarantine sequence",
+        )?));
+        if stored_domain != storage_domain_id || stored_content != content_id {
+            return Err(Error::Corruption {
+                message: "content quarantine record differs from its protected key".to_owned(),
+            });
+        }
+        if verified_at.as_u64() == 0
+            || proof_expires_at_unix_ms == 0
+            || intent_accepted_at.as_u64() == 0
+            || barrier_enforced_at.as_u64() == 0
+            || quarantined_at.as_u64() < intent_accepted_at.as_u64()
+            || intent_accepted_at.as_u64() < barrier_enforced_at.as_u64()
+        {
+            return Err(Error::Corruption {
+                message: "content quarantine has invalid protected coordinates".to_owned(),
+            });
+        }
+        Ok(Self {
+            storage_domain_id,
+            content_id,
+            proof_token,
+            verified_at,
+            proof_expires_at_unix_ms,
+            intent_accepted_at,
+            barrier_id,
+            barrier_enforced_at,
+            drain_attestation_id,
+            quarantined_at,
+        })
+    }
+
+    pub(crate) fn matches_authorization(self, authorization: ContentReclaimAuthorization) -> bool {
+        self.storage_domain_id == authorization.storage_domain_id()
+            && self.content_id == authorization.content_id()
+            && self.proof_token == authorization.proof_token()
+            && self.verified_at == authorization.verified_at()
+            && self.proof_expires_at_unix_ms == authorization.expires_at_unix_ms()
+    }
+
+    pub(crate) const fn into_public(self) -> ContentQuarantine {
+        ContentQuarantine {
+            storage_domain_id: self.storage_domain_id,
+            content_id: self.content_id,
+            proof_token: self.proof_token,
+            verified_at: self.verified_at,
+            proof_expires_at_unix_ms: self.proof_expires_at_unix_ms,
+            intent_accepted_at: self.intent_accepted_at,
+            barrier_id: self.barrier_id,
+            barrier_enforced_at: self.barrier_enforced_at,
+            drain_attestation_id: self.drain_attestation_id,
+            quarantined_at: self.quarantined_at,
+        }
+    }
+}
+
+pub(crate) fn content_quarantine_key(
+    storage_domain_id: StorageDomainId,
+    content_id: ContentId,
+) -> Vec<u8> {
+    let mut key = Vec::with_capacity(11 + 16 + 33);
+    key.extend_from_slice(b"quarantine:");
+    key.extend_from_slice(&storage_domain_id.to_bytes());
+    key.extend_from_slice(&content_id.to_bytes());
+    key
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContentControlState {
     Active,
     ReclaimIntent {
@@ -2940,7 +3216,8 @@ impl ContentHandle {
     /// Returns [`Error::ContentLeaseNotFound`] for an unleased handle or missing
     /// durable record, [`Error::ContentLeaseExpired`] once the old deadline is
     /// reached, [`Error::InvalidOptions`] for a sub-millisecond or overflowing
-    /// lifetime, or a storage/conflict error if renewal cannot publish.
+    /// lifetime, [`Error::ContentQuarantined`] if quarantine won the race after
+    /// the lease expired, or a storage/conflict error if renewal cannot publish.
     pub async fn renew_lease(&self, ttl: Duration) -> Result<u64> {
         self.db.renew_content_lease(self, ttl).await
     }

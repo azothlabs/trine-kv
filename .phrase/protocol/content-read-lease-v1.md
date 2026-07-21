@@ -74,12 +74,11 @@ not a correctness requirement.
 An exact-prefix scan is a conservative precheck, not deletion authority. A new
 leased open or renewal can race immediately after an ordinary scan. Before
 removing or making unavailable any representation of one
-`(StorageDomainId, ContentId)`, the future reclamation path must first establish
-a per-content quarantine/fence that makes later open and renewal fail or join a
-newer generation. It then rechecks the exact lease prefix under that barrier and
-treats every well-formed unexpired record as live. Malformed records fail closed
-and block reclamation until repaired. Grace starts only after the barrier and
-recheck succeed; the barrier/generation is revalidated before physical delete.
+`(StorageDomainId, ContentId)`, `content-quarantine-v1.md` establishes a durable
+per-content fence that makes later open and renewal fail. Its transition
+rechecks the exact lease prefix and treats every well-formed unexpired record as
+live. Malformed records fail closed. Quarantine does not start grace; a later
+protocol must define and revalidate grace before any physical delete.
 
 The irreversible per-domain forward fence is defined by
 `content-access-barrier-v1.md`. It blocks new unleased opens even for stale
@@ -91,9 +90,10 @@ The protected per-content control state defined by
 and durable renewal advance that control state in the same transaction as the
 lease write, so they conflict with intent installation or replace older intent
 with newer Active state. The current `content_has_active_lease` helper remains
-only a conservative precheck and is not deletion authority. Final grace,
-unleased-read handling, representation fencing, and physical deletion remain
-outside this protocol.
+only a conservative precheck and is not deletion authority. The implemented
+quarantine fence reads this exact range in its transition transaction and new
+leased activity reads the quarantine key in its lease transaction. Final grace,
+representation fencing, and physical deletion remain outside this protocol.
 
 Migration, backup, repair, provider, and administrative work does not borrow a
 read-lease identity. Those actors use the common durable registry in

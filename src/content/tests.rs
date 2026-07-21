@@ -14,14 +14,14 @@ use futures::executor::block_on;
 use super::{
     CONTENT_CONTROL_BUCKET, CONTENT_LEASE_BUCKET, CONTENT_PHYSICAL_HOLD_BUCKET,
     CONTENT_TOKEN_INDEX_BUCKET, ContentAccessBarrierRecord, ContentLeaseRecord,
-    content_control_key, content_lease_key, content_physical_hold_key,
+    content_control_key, content_lease_key, content_physical_hold_key, content_quarantine_key,
     content_reader_drain_attestation_key, content_token_index_key,
 };
 use crate::{
     ContentAccessBarrier, ContentAccessBarrierId, ContentAccessMode, ContentAttachmentScope,
     ContentChangeId, ContentId, ContentLeaseOptions, ContentLeaseOwnerId, ContentPhysicalHoldId,
     ContentPhysicalHoldKind, ContentPhysicalHoldOptions, ContentPhysicalHoldOwnerId,
-    ContentReaderDrainAttestationId, ContentReaderDrainAttestationOptions,
+    ContentQuarantineStage, ContentReaderDrainAttestationId, ContentReaderDrainAttestationOptions,
     ContentReaderDrainCoordinatorId, ContentReaderDrainEvidenceDigest, ContentReaderDrainKind,
     ContentReclaimAuthorization, ContentReclaimBlocker, ContentReclaimIntentStage,
     ContentReclaimProofToken, ContentUploadOptions, ContentUploadResume, Db, DbOptions, ETag,
@@ -104,6 +104,23 @@ async fn consume_reclaim_token(db: &Db, sealed: SealedContent, change: u8) {
         .commit()
         .await
         .expect("upload token consumption commits");
+}
+
+async fn attest_reclaim_reader_drain(db: &Db, domain: StorageDomainId, seed: u8) {
+    let barrier = db
+        .enforce_content_leased_only(domain, test_access_barrier_id(seed))
+        .await
+        .expect("leased-only barrier coordinate reads");
+    db.attest_content_reader_drain(
+        barrier,
+        test_reader_drain_attestation_id(seed.saturating_add(1)),
+        test_reader_drain_options(
+            ContentReaderDrainKind::DomainBootstrap,
+            seed.saturating_add(2),
+        ),
+    )
+    .await
+    .expect("reader drain attests");
 }
 
 fn reclaim_authorization(
@@ -567,6 +584,331 @@ fn reclaim_intent_checks_token_and_is_durable_and_idempotent() {
         ));
     });
     std::fs::remove_dir_all(path).expect("test database removes");
+}
+
+#[test]
+fn quarantine_requires_drain_and_exact_intent() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let sealed = seal_reclaim_content(&db, b"quarantine state bytes").await;
+        consume_reclaim_token(&db, sealed, 71).await;
+
+        let mut without_drain = db.transaction(TransactionOptions::default());
+        let first_authorization = reclaim_authorization(&without_drain, sealed, 61);
+        assert!(matches!(
+            without_drain
+                .stage_content_quarantine(first_authorization)
+                .await,
+            Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::ReaderDrainNotAttested { .. },
+            })
+        ));
+
+        attest_reclaim_reader_drain(&db, sealed.storage_domain_id(), 31).await;
+        let mut without_intent = db.transaction(TransactionOptions::default());
+        assert!(matches!(
+            without_intent
+                .stage_content_quarantine(reclaim_authorization(&without_intent, sealed, 62))
+                .await,
+            Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::ReclaimIntentRequired,
+            })
+        ));
+    });
+}
+
+#[test]
+fn quarantine_blocks_reads_is_idempotent_and_can_revive() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let sealed = seal_reclaim_content(&db, b"quarantine state bytes").await;
+        consume_reclaim_token(&db, sealed, 71).await;
+        attest_reclaim_reader_drain(&db, sealed.storage_domain_id(), 31).await;
+        let mut intent = db.transaction(TransactionOptions::default());
+        let authorization = reclaim_authorization(&intent, sealed, 63);
+        intent
+            .stage_content_reclaim_intent(authorization)
+            .await
+            .expect("reclaim intent stages");
+        intent.commit().await.expect("reclaim intent commits");
+
+        let mut quarantine = db.transaction(TransactionOptions::default());
+        assert_eq!(
+            quarantine
+                .stage_content_quarantine(authorization)
+                .await
+                .expect("quarantine stages"),
+            ContentQuarantineStage::Staged
+        );
+        let commit = quarantine.commit().await.expect("quarantine commits");
+        let record = db
+            .content_quarantine(sealed.storage_domain_id(), sealed.content_id())
+            .await
+            .expect("quarantine reads")
+            .expect("quarantine is durable");
+        assert_eq!(record.quarantined_at(), commit.read_version());
+        assert_eq!(record.proof_token(), authorization.proof_token());
+        assert_eq!(record.verified_at(), authorization.verified_at());
+        assert!(matches!(
+            db.open_content_leased(
+                sealed.storage_domain_id(),
+                sealed.content_id(),
+                ContentLeaseOptions::new(
+                    ContentLeaseOwnerId::from_bytes([72; 16]),
+                    Duration::from_secs(60),
+                ),
+            )
+            .await,
+            Err(Error::ContentQuarantined { quarantined_at })
+                if quarantined_at == commit.read_version()
+        ));
+
+        let mut repeated = db.transaction(TransactionOptions::default());
+        assert_eq!(
+            repeated
+                .stage_content_quarantine(authorization)
+                .await
+                .expect("quarantine retry reads durable state"),
+            ContentQuarantineStage::Existing {
+                quarantined_at: commit.read_version(),
+            }
+        );
+
+        let hold = db
+            .acquire_content_physical_hold(
+                sealed.storage_domain_id(),
+                sealed.content_id(),
+                test_hold_id(73),
+                ContentPhysicalHoldOptions::until_released(
+                    ContentPhysicalHoldKind::Repair,
+                    ContentPhysicalHoldOwnerId::from_bytes([73; 16]),
+                ),
+            )
+            .await
+            .expect("repair hold returns quarantined content to active");
+        assert_eq!(
+            db.content_quarantine(sealed.storage_domain_id(), sealed.content_id())
+                .await
+                .expect("revived quarantine status reads"),
+            None
+        );
+        db.open_content_leased(
+            sealed.storage_domain_id(),
+            sealed.content_id(),
+            ContentLeaseOptions::new(
+                ContentLeaseOwnerId::from_bytes([74; 16]),
+                Duration::from_secs(60),
+            ),
+        )
+        .await
+        .expect("leased read succeeds after revival");
+        hold.release().await.expect("repair hold releases");
+    });
+}
+
+#[test]
+fn new_upload_authority_atomically_revives_quarantined_content() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let bytes = b"quarantine token revival";
+        let sealed = seal_reclaim_content(&db, bytes).await;
+        consume_reclaim_token(&db, sealed, 75).await;
+        attest_reclaim_reader_drain(&db, sealed.storage_domain_id(), 35).await;
+
+        let mut intent = db.transaction(TransactionOptions::default());
+        let authorization = reclaim_authorization(&intent, sealed, 65);
+        intent
+            .stage_content_reclaim_intent(authorization)
+            .await
+            .expect("reclaim intent stages");
+        intent.commit().await.expect("reclaim intent commits");
+        let mut quarantine = db.transaction(TransactionOptions::default());
+        assert_eq!(
+            quarantine
+                .stage_content_quarantine(authorization)
+                .await
+                .expect("quarantine stages"),
+            ContentQuarantineStage::Staged
+        );
+        quarantine.commit().await.expect("quarantine commits");
+
+        let repeated_content = seal_content_without_access_barrier(&db, bytes).await;
+        assert_eq!(repeated_content.content_id(), sealed.content_id());
+        assert_eq!(
+            db.content_quarantine(sealed.storage_domain_id(), sealed.content_id())
+                .await
+                .expect("revived quarantine status reads"),
+            None
+        );
+        let mut stale_retry = db.transaction(TransactionOptions::default());
+        assert!(matches!(
+            stale_retry.stage_content_quarantine(authorization).await,
+            Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::ReclaimIntentRequired,
+            })
+        ));
+    });
+}
+
+#[test]
+fn leased_open_racing_staged_quarantine_forces_transaction_conflict() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let sealed = seal_reclaim_content(&db, b"quarantine lease race").await;
+        consume_reclaim_token(&db, sealed, 75).await;
+        attest_reclaim_reader_drain(&db, sealed.storage_domain_id(), 34).await;
+        let mut intent = db.transaction(TransactionOptions::default());
+        let authorization = reclaim_authorization(&intent, sealed, 64);
+        intent
+            .stage_content_reclaim_intent(authorization)
+            .await
+            .expect("reclaim intent stages");
+        intent.commit().await.expect("reclaim intent commits");
+
+        let mut quarantine = db.transaction(TransactionOptions::default());
+        quarantine
+            .stage_content_quarantine(authorization)
+            .await
+            .expect("quarantine stages before lease");
+        db.open_content_leased(
+            sealed.storage_domain_id(),
+            sealed.content_id(),
+            ContentLeaseOptions::new(
+                ContentLeaseOwnerId::from_bytes([76; 16]),
+                Duration::from_secs(60),
+            ),
+        )
+        .await
+        .expect("concurrent leased open commits first");
+        assert!(matches!(
+            quarantine.commit().await,
+            Err(Error::Conflict { .. })
+        ));
+        assert_eq!(
+            db.content_quarantine(sealed.storage_domain_id(), sealed.content_id())
+                .await
+                .expect("failed quarantine remains absent"),
+            None
+        );
+    });
+}
+
+#[test]
+fn quarantine_survives_native_reopen_and_keeps_leased_reads_fenced() {
+    let path = temp_db_path("content-quarantine-native-reopen");
+    let (domain, content_id, quarantined_at) = block_on(async {
+        let db = Db::open(&path).await.expect("native writer opens");
+        let sealed = seal_reclaim_content(&db, b"durable quarantine bytes").await;
+        consume_reclaim_token(&db, sealed, 77).await;
+        attest_reclaim_reader_drain(&db, sealed.storage_domain_id(), 37).await;
+        let mut intent = db.transaction(TransactionOptions::default());
+        let authorization = reclaim_authorization(&intent, sealed, 65);
+        intent
+            .stage_content_reclaim_intent(authorization)
+            .await
+            .expect("native reclaim intent stages");
+        intent
+            .commit()
+            .await
+            .expect("native reclaim intent commits");
+        let mut quarantine = db.transaction(TransactionOptions::default());
+        quarantine
+            .stage_content_quarantine(authorization)
+            .await
+            .expect("native quarantine stages");
+        let commit = quarantine
+            .commit()
+            .await
+            .expect("native quarantine commits");
+        (
+            sealed.storage_domain_id(),
+            sealed.content_id(),
+            commit.read_version(),
+        )
+    });
+
+    block_on(async {
+        let reopened = Db::open(&path).await.expect("native writer reopens");
+        let quarantine = reopened
+            .content_quarantine(domain, content_id)
+            .await
+            .expect("reopened quarantine reads")
+            .expect("reopened quarantine exists");
+        assert_eq!(quarantine.quarantined_at(), quarantined_at);
+        assert!(matches!(
+            reopened
+                .open_content_leased(
+                    domain,
+                    content_id,
+                    ContentLeaseOptions::new(
+                        ContentLeaseOwnerId::from_bytes([78; 16]),
+                        Duration::from_secs(60),
+                    ),
+                )
+                .await,
+            Err(Error::ContentQuarantined { quarantined_at: blocked })
+                if blocked == quarantined_at
+        ));
+    });
+    std::fs::remove_dir_all(path).expect("test database removes");
+}
+
+#[test]
+fn malformed_quarantine_fails_reads_and_revival_closed() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let sealed = seal_reclaim_content(&db, b"malformed quarantine bytes").await;
+        let mut damage = db.transaction(TransactionOptions::default());
+        damage
+            .put_bucket(
+                CONTENT_CONTROL_BUCKET,
+                content_quarantine_key(sealed.storage_domain_id(), sealed.content_id()),
+                b"malformed".to_vec(),
+            )
+            .expect("malformed quarantine stages");
+        damage.commit().await.expect("malformed quarantine commits");
+
+        assert!(matches!(
+            db.content_quarantine(sealed.storage_domain_id(), sealed.content_id())
+                .await,
+            Err(Error::InvalidFormat { .. })
+        ));
+        assert!(matches!(
+            db.open_content_leased(
+                sealed.storage_domain_id(),
+                sealed.content_id(),
+                ContentLeaseOptions::new(
+                    ContentLeaseOwnerId::from_bytes([79; 16]),
+                    Duration::from_secs(60),
+                ),
+            )
+            .await,
+            Err(Error::InvalidFormat { .. })
+        ));
+        assert!(matches!(
+            db.acquire_content_physical_hold(
+                sealed.storage_domain_id(),
+                sealed.content_id(),
+                test_hold_id(80),
+                ContentPhysicalHoldOptions::until_released(
+                    ContentPhysicalHoldKind::Administrative,
+                    ContentPhysicalHoldOwnerId::from_bytes([80; 16]),
+                ),
+            )
+            .await,
+            Err(Error::InvalidFormat { .. })
+        ));
+    });
 }
 
 #[test]

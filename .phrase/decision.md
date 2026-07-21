@@ -55,6 +55,8 @@ Evidence notes should separate:
   `.phrase/protocol/content-access-barrier-v1.md`.
 - Deployment-coordinated pre-barrier reader-drain attestations:
   `.phrase/protocol/content-reader-drain-attestation-v1.md`.
+- Crash-safe exact-content quarantine and read fence:
+  `.phrase/protocol/content-quarantine-v1.md`.
 - Guard-aware LSM read and compaction strategy:
   `.phrase/protocol/guard-aware-lsm-strategy.md`.
 - Trine specs, ADRs, tests, and local design notes are the source of truth.
