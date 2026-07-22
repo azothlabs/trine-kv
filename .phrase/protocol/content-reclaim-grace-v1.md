@@ -23,11 +23,14 @@ Trine KV then freshly requires:
 
 - an unexpired proof valid for the transaction read sequence;
 - the coordinated leased-only barrier and matching reader-drain attestation;
-- the exact accepted reclaim intent;
+- an original reclaim intent that still exactly binds the continuously durable
+  quarantine;
 - a valid sealed descriptor and no newer physical activity;
 - no unexpired upload-token authority, read lease, or physical hold;
-- the exact durable quarantine bound to that proof, intent, barrier, and drain
-  attestation.
+- the exact durable quarantine bound to that original intent, barrier, and
+  drain attestation;
+- either the original quarantine proof, or a fresh higher-layer proof whose
+  stable verification coordinate is at or after `quarantined_at`.
 
 Every protected read joins optimistic conflict validation. A concurrent logical
 touch, token, lease, hold, or revival prevents the grace record from committing.
@@ -66,11 +69,18 @@ overflow, or ordering mismatch fail closed.
 
 Starting grace requires a delay of at least one millisecond. The wall-clock
 observation and deadline are staged with the record; commit-before-response is
-recovered through `Db::content_reclaim_grace`. While the authorization remains
-unexpired, an exact retry with the same quarantine and requested delay returns
-the original commit sequence. After expiry, the query API is the recovery path.
-A different delay or quarantine is rejected rather than silently rewriting
-history.
+recovered through `Db::content_reclaim_grace`. An exact retry with the same
+quarantine and requested delay returns the original commit sequence.
+
+If quarantine committed but grace did not, expiry of the original short-lived
+proof must not strand the lifecycle. The higher layer issues a fresh exact proof
+after re-reading current logical state. In the grace transaction, Trine KV
+validates that the original intent and quarantine have remained continuously
+bound, that the new proof is no older than quarantine, and that every physical
+precondition still holds. Grace remains bound to the original quarantine token
+and commit coordinate; neither record is rewritten and no second read-fence
+interval is created. A different delay or quarantine is rejected rather than
+silently rewriting history.
 
 Native reopen and refreshed object-store state preserve the record. There is no
 best-effort cleanup and `Drop` performs no asynchronous work.
@@ -95,16 +105,19 @@ the entire grace interval.
 - S3/R2 adapter success therefore cannot yet prove that every provider version
   was removed or retained as intended.
 
-A future final-validation protocol must name its trusted clock contract and
-provider/version capabilities, obtain a fresh logical proof, repeat every
-physical check, and record a separately recoverable deletion state. Until then,
-deadline passage changes no authority.
+`content-reclaim-sweep-v1.md` defines that later final-validation protocol for
+the qualified native filesystem backend. It adds explicit trusted
+clock/restart evidence, a fresh logical proof, repeated physical checks, and a
+separately recoverable deletion state. Deadline passage by itself still changes
+no authority, and unsupported backends retain bytes.
 
 ## Required evidence
 
 - missing or mismatched quarantine blocks grace;
 - logical activity after staging makes commit conflict;
 - exact retry returns the original record and different delay fails;
+- a fresh proof starts grace after quarantine committed without grace, while
+  preserving the original quarantine identity and commit coordinate;
 - native reopen preserves the record;
 - refreshed object-store state exposes the same record without deleting any
   content descriptor or chunk;

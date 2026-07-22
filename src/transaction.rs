@@ -9,12 +9,14 @@ use crate::{
         ContentControlRecord, ContentDescriptor, ContentLeaseId, ContentLeaseRecord,
         ContentPhysicalHoldId, ContentPhysicalHoldRecord, ContentQuarantineRecord,
         ContentQuarantineStage, ContentReaderDrainAttestationRecord, ContentReclaimAuthorization,
-        ContentReclaimGraceRecord, ContentReclaimGraceStage, ContentReclaimIntentStage,
-        ContentTokenIndexRecord, StorageDomainId, UploadToken, UploadTokenRecord,
-        content_access_coordinate_key, content_control_key, content_lease_prefix,
-        content_physical_hold_prefix, content_prefix_range, content_quarantine_key,
-        content_reader_drain_attestation_key, content_reclaim_grace_key, content_token_index_key,
-        content_token_index_prefix, duration_millis, upload_token_key,
+        ContentReclaimClockAttestation, ContentReclaimGraceRecord, ContentReclaimGraceStage,
+        ContentReclaimIntentStage, ContentReclaimSweepRecord, ContentReclaimSweepRecordState,
+        ContentReclaimSweepStage, ContentTokenIndexRecord, StorageDomainId, UploadToken,
+        UploadTokenRecord, content_access_coordinate_key, content_control_key,
+        content_lease_prefix, content_physical_hold_prefix, content_prefix_range,
+        content_quarantine_key, content_reader_drain_attestation_key, content_reclaim_grace_key,
+        content_reclaim_sweep_key, content_token_index_key, content_token_index_prefix,
+        duration_millis, upload_token_key,
     },
     db::Db,
     error::{ContentReclaimBlocker, Error, Result},
@@ -419,6 +421,23 @@ impl Transaction {
         storage_domain_id: crate::StorageDomainId,
         content_id: crate::ContentId,
     ) -> Result<()> {
+        let sweep_key = content_reclaim_sweep_key(storage_domain_id, content_id);
+        if let Some(bytes) = self.get_bucket_sync(CONTENT_CONTROL_BUCKET, &sweep_key)? {
+            let sweep = ContentReclaimSweepRecord::decode(&bytes, storage_domain_id, content_id)?;
+            match sweep.state {
+                ContentReclaimSweepRecordState::Prepared => {
+                    return Err(Error::ContentReclaimBlocked {
+                        blocker: ContentReclaimBlocker::SweepPrepared {
+                            prepared_at_commit_seq: sweep.prepared_at.as_u64(),
+                        },
+                    });
+                }
+                ContentReclaimSweepRecordState::Reclaimed => {
+                    self.writes
+                        .delete_bucket(CONTENT_CONTROL_BUCKET, sweep_key)?;
+                }
+            }
+        }
         let key = content_control_key(storage_domain_id, content_id);
         if let Some(bytes) = self.get_bucket_sync(CONTENT_CONTROL_BUCKET, &key)? {
             ContentControlRecord::decode(&bytes, storage_domain_id, content_id)?;
@@ -685,6 +704,23 @@ impl Transaction {
         storage_domain_id: crate::StorageDomainId,
         content_id: crate::ContentId,
     ) -> Result<()> {
+        let sweep_key = content_reclaim_sweep_key(storage_domain_id, content_id);
+        if let Some(bytes) = self.get_bucket(CONTENT_CONTROL_BUCKET, &sweep_key).await? {
+            let sweep = ContentReclaimSweepRecord::decode(&bytes, storage_domain_id, content_id)?;
+            match sweep.state {
+                ContentReclaimSweepRecordState::Prepared => {
+                    return Err(Error::ContentReclaimBlocked {
+                        blocker: ContentReclaimBlocker::SweepPrepared {
+                            prepared_at_commit_seq: sweep.prepared_at.as_u64(),
+                        },
+                    });
+                }
+                ContentReclaimSweepRecordState::Reclaimed => {
+                    self.writes
+                        .delete_bucket(CONTENT_CONTROL_BUCKET, sweep_key)?;
+                }
+            }
+        }
         let key = content_control_key(storage_domain_id, content_id);
         if let Some(bytes) = self.get_bucket(CONTENT_CONTROL_BUCKET, &key).await? {
             ContentControlRecord::decode(&bytes, storage_domain_id, content_id)?;
@@ -724,6 +760,21 @@ impl Transaction {
         storage_domain_id: crate::StorageDomainId,
         content_id: crate::ContentId,
     ) -> Result<()> {
+        let sweep_key = content_reclaim_sweep_key(storage_domain_id, content_id);
+        if let Some(bytes) = self.get_bucket(CONTENT_CONTROL_BUCKET, &sweep_key).await? {
+            let sweep = ContentReclaimSweepRecord::decode(&bytes, storage_domain_id, content_id)?;
+            return match sweep.state {
+                ContentReclaimSweepRecordState::Prepared => Err(Error::ContentReclaimBlocked {
+                    blocker: ContentReclaimBlocker::SweepPrepared {
+                        prepared_at_commit_seq: sweep.prepared_at.as_u64(),
+                    },
+                }),
+                ContentReclaimSweepRecordState::Reclaimed => Err(Error::ContentNotFound {
+                    storage_domain_id: storage_domain_id.to_string(),
+                    content_id: content_id.to_string(),
+                }),
+            };
+        }
         let quarantine_key = content_quarantine_key(storage_domain_id, content_id);
         if let Some(bytes) = self
             .get_bucket(CONTENT_CONTROL_BUCKET, &quarantine_key)
@@ -1133,10 +1184,14 @@ impl Transaction {
 
     /// Stages a durable earliest-time scheduling record for quarantined content.
     ///
-    /// The exact quarantine, reclaim intent, leased-only barrier, reader-drain
-    /// attestation, descriptor, activity, token, lease, and hold state are
-    /// rechecked in this transaction. The higher layer must repeat its logical
-    /// proof and reachability checks in the same transaction before this call.
+    /// The continuous quarantine, its original reclaim intent, leased-only
+    /// barrier, reader-drain attestation, descriptor, activity, token, lease,
+    /// and hold state are rechecked in this transaction. The higher layer must
+    /// repeat its logical proof and reachability checks in the same transaction
+    /// before this call. The authorization may be the original quarantine proof
+    /// or a fresh proof verified at or after the durable quarantine coordinate;
+    /// the latter recovers a quarantine-committed/grace-not-committed restart
+    /// after the original short-lived proof expired.
     ///
     /// `observation_delay` must be at least one millisecond and is measured from
     /// the wall-clock observation made before commit. The resulting Unix
@@ -1150,9 +1205,10 @@ impl Transaction {
     ///
     /// [`ContentReclaimGraceStage::Staged`] means the write still needs this
     /// transaction to commit. `Existing` reports the original commit sequence
-    /// for an exact retry with the same duration while the authorization is
-    /// still unexpired. After expiry, use [`Db::content_reclaim_grace`] to
-    /// recover a commit-before-response result.
+    /// for a retry with the same duration. After a possible lost response, use
+    /// [`Db::content_reclaim_grace`] to discover the committed result; if no
+    /// grace exists, a fresh higher-layer proof may safely retry this method
+    /// while the original quarantine remains continuously durable.
     ///
     /// # Errors
     ///
@@ -1200,6 +1256,13 @@ impl Transaction {
                 },
             });
         }
+        if authorization.verified_at().as_u64() == 0
+            || authorization.verified_at().as_u64() > self.read_version().as_u64()
+        {
+            return Err(Error::invalid_options(
+                "content reclaim-grace verification sequence is invalid for this transaction",
+            ));
+        }
         self.db.bucket(CONTENT_CONTROL_BUCKET).await?;
         self.db.bucket(CONTENT_TOKEN_INDEX_BUCKET).await?;
         self.db.bucket(CONTENT_LEASE_BUCKET).await?;
@@ -1211,9 +1274,6 @@ impl Transaction {
         let drain = self
             .require_content_reader_drain_attestation(access)
             .await?;
-        let accepted_at = self
-            .require_exact_content_reclaim_intent(authorization)
-            .await?;
         self.require_no_active_content_token(authorization, observed_at_unix_ms)
             .await?;
         self.require_no_active_content_lease(authorization, observed_at_unix_ms)
@@ -1221,7 +1281,7 @@ impl Transaction {
         self.require_no_active_content_physical_hold(authorization, observed_at_unix_ms)
             .await?;
         let quarantine = self
-            .require_exact_content_quarantine(authorization, accepted_at, access, drain)
+            .require_continuous_content_quarantine_for_grace(authorization, access, drain)
             .await?;
 
         let key = content_reclaim_grace_key(
@@ -1261,35 +1321,291 @@ impl Transaction {
         Ok(ContentReclaimGraceStage::Staged)
     }
 
-    async fn require_exact_content_quarantine(
+    /// Stages the irreversible, crash-resumable physical sweep fence.
+    ///
+    /// The higher layer must repeat its fresh exact logical-absence proof in
+    /// this same transaction. `authorization.verified_at()` must be at or after
+    /// the durable grace start. Trine KV then rechecks the exact leased-only,
+    /// drain, quarantine, grace, clock-attestation, descriptor, activity,
+    /// token, lease, hold, and enabled-backend coordinates before recording a
+    /// Prepared manifest. This method deletes no bytes; after commit, call
+    /// [`Db::resume_content_reclaim_sweep`](crate::Db::resume_content_reclaim_sweep).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedBackend`] while reclamation is disabled or
+    /// for an unqualified backend. Stale/expired proof, missing lifecycle
+    /// state, active authority, malformed records, and optimistic conflicts all
+    /// fail closed.
+    #[allow(clippy::too_many_lines)] // The final gate intentionally keeps every protected recheck visible.
+    pub async fn stage_content_reclaim_sweep(
         &mut self,
         authorization: ContentReclaimAuthorization,
-        intent_accepted_at: crate::ReadVersion,
-        access: ContentAccessCoordinateRecord,
-        drain: ContentReaderDrainAttestationRecord,
-    ) -> Result<ContentQuarantineRecord> {
-        let key = content_quarantine_key(
+        clock_attestation: ContentReclaimClockAttestation,
+    ) -> Result<ContentReclaimSweepStage> {
+        self.db.ensure_content_reclamation_supported()?;
+        let now_unix_ms = crate::content::current_epoch_millis()?;
+        if now_unix_ms >= authorization.expires_at_unix_ms() {
+            return Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::ProofExpired {
+                    expired_at_unix_ms: authorization.expires_at_unix_ms(),
+                },
+            });
+        }
+        if authorization.verified_at().as_u64() == 0
+            || authorization.verified_at().as_u64() > self.read_version().as_u64()
+        {
+            return Err(Error::invalid_options(
+                "content reclaim-sweep verification sequence is invalid for this transaction",
+            ));
+        }
+        if clock_attestation.storage_domain_id() != authorization.storage_domain_id()
+            || clock_attestation.content_id() != authorization.content_id()
+        {
+            return Err(Error::invalid_options(
+                "content reclaim-clock attestation names different content",
+            ));
+        }
+
+        self.db.bucket(CONTENT_CONTROL_BUCKET).await?;
+        self.db.bucket(CONTENT_TOKEN_INDEX_BUCKET).await?;
+        self.db.bucket(CONTENT_LEASE_BUCKET).await?;
+        self.db.bucket(CONTENT_PHYSICAL_HOLD_BUCKET).await?;
+
+        let access = self
+            .require_coordinated_content_access(authorization.storage_domain_id())
+            .await?;
+        let drain = self
+            .require_content_reader_drain_attestation(access)
+            .await?;
+        let quarantine_key = content_quarantine_key(
             authorization.storage_domain_id(),
             authorization.content_id(),
         );
-        let Some(bytes) = self.get_bucket(CONTENT_CONTROL_BUCKET, &key).await? else {
+        let quarantine_bytes = self
+            .get_bucket(CONTENT_CONTROL_BUCKET, &quarantine_key)
+            .await?
+            .ok_or(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::QuarantineRequired,
+            })?;
+        let quarantine = ContentQuarantineRecord::decode(
+            &quarantine_bytes,
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        )?;
+        if quarantine.barrier_id != access.barrier_id
+            || quarantine.barrier_enforced_at != access.enforced_at
+            || quarantine.drain_attestation_id != drain.attestation_id
+        {
+            return Err(Error::Corruption {
+                message: "content reclaim-sweep quarantine differs from access coordinates"
+                    .to_owned(),
+            });
+        }
+        let grace_key = content_reclaim_grace_key(
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        );
+        let grace_bytes = self
+            .get_bucket(CONTENT_CONTROL_BUCKET, &grace_key)
+            .await?
+            .ok_or(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::QuarantineRequired,
+            })?;
+        let grace = ContentReclaimGraceRecord::decode(
+            &grace_bytes,
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        )?;
+        if !grace.matches_quarantine(quarantine) {
+            return Err(Error::Corruption {
+                message: "content reclaim-sweep grace differs from quarantine".to_owned(),
+            });
+        }
+        if authorization.verified_at().as_u64() < grace.started_at.as_u64() {
+            return Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::Superseded {
+                    activity_at_commit_seq: grace.started_at.as_u64(),
+                    verified_at_commit_seq: authorization.verified_at().as_u64(),
+                },
+            });
+        }
+        if clock_attestation.grace_started_at() != grace.started_at
+            || clock_attestation.observed_at_unix_ms() < grace.not_before_unix_ms
+        {
+            return Err(Error::invalid_options(
+                "content reclaim-clock attestation is not bound to completed grace",
+            ));
+        }
+
+        let descriptor_bytes = self
+            .db
+            .read_content_descriptor(
+                authorization.storage_domain_id(),
+                authorization.content_id(),
+            )
+            .await?
+            .ok_or_else(|| Error::ContentNotFound {
+                storage_domain_id: authorization.storage_domain_id().to_string(),
+                content_id: authorization.content_id().to_string(),
+            })?;
+        let descriptor = ContentDescriptor::decode(
+            &descriptor_bytes,
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        )?;
+        let control_key = content_control_key(
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        );
+        let control_bytes = self
+            .get_bucket(CONTENT_CONTROL_BUCKET, &control_key)
+            .await?
+            .ok_or_else(|| Error::Corruption {
+                message: "reclaim-sweep content is missing physical control state".to_owned(),
+            })?;
+        let control = ContentControlRecord::decode(
+            &control_bytes,
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        )?;
+        let physical_activity = control.physical_activity_commit_seq();
+        if physical_activity > authorization.verified_at().as_u64() {
+            return Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::Superseded {
+                    activity_at_commit_seq: physical_activity,
+                    verified_at_commit_seq: authorization.verified_at().as_u64(),
+                },
+            });
+        }
+        self.require_no_active_content_token(authorization, now_unix_ms)
+            .await?;
+        self.require_no_active_content_lease(authorization, now_unix_ms)
+            .await?;
+        self.require_no_active_content_physical_hold(authorization, now_unix_ms)
+            .await?;
+
+        let sweep_key = content_reclaim_sweep_key(
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        );
+        if let Some(bytes) = self.get_bucket(CONTENT_CONTROL_BUCKET, &sweep_key).await? {
+            let existing = ContentReclaimSweepRecord::decode(
+                &bytes,
+                authorization.storage_domain_id(),
+                authorization.content_id(),
+            )?;
+            if existing.matches_request(authorization, clock_attestation) {
+                return Ok(ContentReclaimSweepStage::Existing {
+                    prepared_at: existing.prepared_at,
+                });
+            }
+            return Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::SweepPrepared {
+                    prepared_at_commit_seq: existing.prepared_at.as_u64(),
+                },
+            });
+        }
+        let requested = ContentReclaimSweepRecord::prepared(
+            authorization,
+            quarantine,
+            grace,
+            clock_attestation,
+            descriptor,
+        );
+        self.writes.put_bucket_with_commit_sequence(
+            CONTENT_CONTROL_BUCKET,
+            sweep_key,
+            &requested.encode_prefix(),
+            &[],
+        )?;
+        Ok(ContentReclaimSweepStage::Staged)
+    }
+
+    async fn require_continuous_content_quarantine_for_grace(
+        &mut self,
+        authorization: ContentReclaimAuthorization,
+        access: ContentAccessCoordinateRecord,
+        drain: ContentReaderDrainAttestationRecord,
+    ) -> Result<ContentQuarantineRecord> {
+        let descriptor = self
+            .db
+            .read_content_descriptor(
+                authorization.storage_domain_id(),
+                authorization.content_id(),
+            )
+            .await?
+            .ok_or_else(|| Error::ContentNotFound {
+                storage_domain_id: authorization.storage_domain_id().to_string(),
+                content_id: authorization.content_id().to_string(),
+            })?;
+        ContentDescriptor::decode(
+            &descriptor,
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        )?;
+
+        let control_key = content_control_key(
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        );
+        let control_bytes = self
+            .get_bucket(CONTENT_CONTROL_BUCKET, &control_key)
+            .await?
+            .ok_or_else(|| Error::Corruption {
+                message: "sealed content is missing its physical control record".to_owned(),
+            })?;
+        let control = ContentControlRecord::decode(
+            &control_bytes,
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        )?;
+
+        let quarantine_key = content_quarantine_key(
+            authorization.storage_domain_id(),
+            authorization.content_id(),
+        );
+        let Some(quarantine_bytes) = self
+            .get_bucket(CONTENT_CONTROL_BUCKET, &quarantine_key)
+            .await?
+        else {
             return Err(Error::ContentReclaimBlocked {
                 blocker: ContentReclaimBlocker::QuarantineRequired,
             });
         };
         let quarantine = ContentQuarantineRecord::decode(
-            &bytes,
+            &quarantine_bytes,
             authorization.storage_domain_id(),
             authorization.content_id(),
         )?;
-        if !quarantine.matches_authorization(authorization)
-            || quarantine.intent_accepted_at != intent_accepted_at
+        if !control.matches_quarantine(quarantine)
             || quarantine.barrier_id != access.barrier_id
             || quarantine.barrier_enforced_at != access.enforced_at
             || quarantine.drain_attestation_id != drain.attestation_id
         {
             return Err(Error::ContentReclaimBlocked {
                 blocker: ContentReclaimBlocker::QuarantineRequired,
+            });
+        }
+
+        let exact_original = quarantine.matches_authorization(authorization);
+        if !exact_original
+            && authorization.verified_at().as_u64() < quarantine.quarantined_at.as_u64()
+        {
+            return Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::Superseded {
+                    activity_at_commit_seq: quarantine.quarantined_at.as_u64(),
+                    verified_at_commit_seq: authorization.verified_at().as_u64(),
+                },
+            });
+        }
+        let physical_activity = control.physical_activity_commit_seq();
+        if physical_activity > authorization.verified_at().as_u64() {
+            return Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::Superseded {
+                    activity_at_commit_seq: physical_activity,
+                    verified_at_commit_seq: authorization.verified_at().as_u64(),
+                },
             });
         }
         Ok(quarantine)

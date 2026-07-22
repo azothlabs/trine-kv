@@ -38,6 +38,26 @@ pub enum HostStorageBackend {
     ObjectStore,
 }
 
+/// Explicit capability for irreversible `ContentObject` byte reclamation.
+///
+/// The default is [`Disabled`](Self::Disabled). Enabling this option does not
+/// bypass logical proof, leased-only, reader-drain, quarantine, grace, clock,
+/// token, lease, hold, or crash-recovery checks. It only permits the final
+/// sweep protocol to run on a backend whose deletion semantics have been
+/// independently qualified.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ContentReclamationMode {
+    /// Retain descriptors and chunks even when all pre-delete checks pass.
+    #[default]
+    Disabled,
+    /// Permit the v1 sweep on the qualified native filesystem backend.
+    ///
+    /// Browser and object-store databases reject the sweep explicitly. This
+    /// variant does not claim provider-version, delete-marker, object-lock,
+    /// retention, or legal-hold support.
+    QualifiedNativeFilesystem,
+}
+
 impl HostStorageBackend {
     pub(crate) const fn as_str(&self) -> &'static str {
         match self {
@@ -278,6 +298,11 @@ pub struct DbOptions {
     pub create_if_missing: bool,
     /// Open without allowing writes or maintenance that mutates storage.
     pub read_only: bool,
+    /// Capability controlling irreversible content-byte reclamation.
+    ///
+    /// This is disabled by default. See [`ContentReclamationMode`] for the
+    /// backend boundary and the checks that remain mandatory when enabled.
+    pub content_reclamation: ContentReclamationMode,
     /// Options used by the built-in default bucket.
     ///
     /// Persistent reopens must supply the same options used when the bucket was
@@ -547,6 +572,18 @@ impl DbOptions {
         self
     }
 
+    /// Enables or disables irreversible content-byte reclamation.
+    ///
+    /// [`ContentReclamationMode::QualifiedNativeFilesystem`] permits only native
+    /// filesystem sweeps. It does not start background deletion and does
+    /// not weaken any lifecycle proof; callers must explicitly stage and run a
+    /// final sweep for each exact content identity.
+    #[must_use]
+    pub const fn with_content_reclamation(mut self, mode: ContentReclamationMode) -> Self {
+        self.content_reclamation = mode;
+        self
+    }
+
     /// Sets how many recent read versions remain available without an active
     /// [`crate::Snapshot`] or named checkpoint pin.
     ///
@@ -630,6 +667,7 @@ impl Default for DbOptions {
             storage_mode: StorageMode::InMemory,
             create_if_missing: true,
             read_only: false,
+            content_reclamation: ContentReclamationMode::Disabled,
             default_bucket_options: BucketOptions::default(),
             durability: DurabilityMode::Buffered,
             write_buffer_bytes: Self::DEFAULT_WRITE_BUFFER_BYTES,

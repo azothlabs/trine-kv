@@ -159,9 +159,12 @@ pub use content::{
     ContentReaderDrainAttestation, ContentReaderDrainAttestationId,
     ContentReaderDrainAttestationOptions, ContentReaderDrainCoordinatorId,
     ContentReaderDrainEvidenceDigest, ContentReaderDrainKind, ContentReclaimAuthorization,
-    ContentReclaimGrace, ContentReclaimGraceStage, ContentReclaimIntentStage,
-    ContentReclaimProofToken, ContentStream, ContentUpload, ContentUploadOptions,
-    ContentUploadResume, OwnerScopeId, SealedContent, StorageDomainId, UploadId, UploadToken,
+    ContentReclaimClockAttestation, ContentReclaimClockAttestationId,
+    ContentReclaimClockCoordinatorId, ContentReclaimClockEvidenceDigest, ContentReclaimGrace,
+    ContentReclaimGraceStage, ContentReclaimIntentStage, ContentReclaimProofToken,
+    ContentReclaimSweep, ContentReclaimSweepStage, ContentStream, ContentUpload,
+    ContentUploadOptions, ContentUploadResume, OwnerScopeId, SealedContent, StorageDomainId,
+    UploadId, UploadToken,
 };
 pub use db::{Db, IntoOpenOptions, MaintenanceBudget, MaintenanceOutcome};
 pub use error::{ContentReclaimBlocker, Error, Result};
@@ -171,10 +174,10 @@ pub use object_store::{
     verify_object_client_contract,
 };
 pub use options::{
-    BlobGcRatio, BlobLevelMergePolicy, BucketOptions, CompressionProfile, DbOptions,
-    DurabilityMode, FailOnCorruptionPolicy, FilterDepthCurve, FilterPolicy, HostStorageBackend,
-    IndexSearchPolicy, ObjectClientTrustMode, PrefixFilterPolicy, StorageMode, WalShardPolicy,
-    WriteOptions,
+    BlobGcRatio, BlobLevelMergePolicy, BucketOptions, CompressionProfile, ContentReclamationMode,
+    DbOptions, DurabilityMode, FailOnCorruptionPolicy, FilterDepthCurve, FilterPolicy,
+    HostStorageBackend, IndexSearchPolicy, ObjectClientTrustMode, PrefixFilterPolicy, StorageMode,
+    WalShardPolicy, WriteOptions,
 };
 pub use point_value::PointValue;
 pub use prefix::PrefixExtractor;

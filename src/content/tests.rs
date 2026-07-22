@@ -11,11 +11,17 @@ use std::{
 
 use futures::executor::block_on;
 
+use crate::storage::{
+    StorageObjectKind,
+    fault_injection::{StorageFaultGuard, StorageFaultPoint},
+};
+
 use super::{
     CONTENT_CONTROL_BUCKET, CONTENT_LEASE_BUCKET, CONTENT_PHYSICAL_HOLD_BUCKET,
     CONTENT_TOKEN_INDEX_BUCKET, ContentAccessBarrierRecord, ContentLeaseRecord,
     content_control_key, content_lease_key, content_physical_hold_key, content_quarantine_key,
-    content_reader_drain_attestation_key, content_reclaim_grace_key, content_token_index_key,
+    content_reader_drain_attestation_key, content_reclaim_grace_key, content_reclaim_sweep_key,
+    content_token_index_key,
 };
 use crate::{
     ContentAccessBarrier, ContentAccessBarrierId, ContentAccessMode, ContentAttachmentScope,
@@ -23,15 +29,42 @@ use crate::{
     ContentPhysicalHoldKind, ContentPhysicalHoldOptions, ContentPhysicalHoldOwnerId,
     ContentQuarantineStage, ContentReaderDrainAttestationId, ContentReaderDrainAttestationOptions,
     ContentReaderDrainCoordinatorId, ContentReaderDrainEvidenceDigest, ContentReaderDrainKind,
-    ContentReclaimAuthorization, ContentReclaimBlocker, ContentReclaimGraceStage,
-    ContentReclaimIntentStage, ContentReclaimProofToken, ContentUploadOptions, ContentUploadResume,
-    Db, DbOptions, ETag, Error, InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta,
-    OwnerScopeId, Precondition, PutIf, ReadVersion, SealedContent, StorageDomainId,
-    TransactionOptions, UploadId, UploadToken,
+    ContentReclaimAuthorization, ContentReclaimBlocker, ContentReclaimClockAttestation,
+    ContentReclaimClockAttestationId, ContentReclaimClockCoordinatorId,
+    ContentReclaimClockEvidenceDigest, ContentReclaimGraceStage, ContentReclaimIntentStage,
+    ContentReclaimProofToken, ContentReclaimSweepStage, ContentReclamationMode,
+    ContentUploadOptions, ContentUploadResume, Db, DbOptions, ETag, Error, HostStorageBackend,
+    InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta, OwnerScopeId, Precondition, PutIf,
+    ReadVersion, SealedContent, StorageDomainId, StorageMode, TransactionOptions, UploadId,
+    UploadToken,
 };
 
 const TEST_CHUNK_BYTES: usize = 64 * 1024;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn physical_content_reclamation_is_disabled_by_default() {
+    assert_eq!(
+        DbOptions::memory().content_reclamation,
+        ContentReclamationMode::Disabled
+    );
+}
+
+#[test]
+fn wasi_storage_mode_does_not_alias_the_qualified_native_backend() {
+    let options = DbOptions::wasi_persistent("wasi-content-reclaim-disabled")
+        .with_content_reclamation(ContentReclamationMode::QualifiedNativeFilesystem);
+    assert!(matches!(
+        options.storage_mode,
+        StorageMode::HostPersistent {
+            backend: HostStorageBackend::Wasi { .. },
+        }
+    ));
+    assert_eq!(
+        options.content_reclamation,
+        ContentReclamationMode::QualifiedNativeFilesystem
+    );
+}
 
 fn test_scope() -> ContentAttachmentScope {
     ContentAttachmentScope::new(
@@ -106,6 +139,13 @@ fn test_reader_drain_attestation_id(seed: u8) -> ContentReaderDrainAttestationId
     bytes[0] = 1;
     ContentReaderDrainAttestationId::from_bytes(bytes)
         .expect("test reader-drain attestation id decodes")
+}
+
+fn test_reclaim_clock_attestation_id(seed: u8) -> ContentReclaimClockAttestationId {
+    let mut bytes = [seed; 16];
+    bytes[0] = 1;
+    ContentReclaimClockAttestationId::from_bytes(bytes)
+        .expect("test reclaim-clock attestation id decodes")
 }
 
 fn test_reader_drain_options(
@@ -1098,6 +1138,69 @@ fn reclaim_grace_requires_quarantine_is_idempotent_and_keeps_bytes() {
 }
 
 #[test]
+fn fresh_proof_recovers_quarantine_committed_before_grace() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let sealed = seal_content_without_access_barrier(
+            &db,
+            b"fresh proof recovers continuously quarantined content",
+        )
+        .await;
+        db.enforce_content_leased_only(sealed.storage_domain_id(), test_access_barrier_id(42))
+            .await
+            .expect("leased-only barrier commits");
+        consume_reclaim_token(&db, sealed, 92).await;
+        attest_reclaim_reader_drain(&db, sealed.storage_domain_id(), 42).await;
+
+        let (original, quarantined_at) = commit_reclaim_quarantine(&db, sealed, 78).await;
+        let durable_quarantine = db
+            .content_quarantine(sealed.storage_domain_id(), sealed.content_id())
+            .await
+            .expect("quarantine reads")
+            .expect("quarantine is durable");
+        assert_eq!(durable_quarantine.quarantined_at(), quarantined_at);
+
+        let mut future = db.transaction(TransactionOptions::default());
+        let future_authorization = ContentReclaimAuthorization::new(
+            sealed.storage_domain_id(),
+            sealed.content_id(),
+            ContentReclaimProofToken::from_bytes([80; 49]),
+            ReadVersion::from_u64(future.read_version().as_u64().saturating_add(1)),
+            u64::MAX,
+        );
+        assert!(matches!(
+            future
+                .stage_content_reclaim_grace(future_authorization, Duration::from_secs(60),)
+                .await,
+            Err(Error::InvalidOptions { .. })
+        ));
+
+        let mut recovery = db.transaction(TransactionOptions::default());
+        let fresh = reclaim_authorization(&recovery, sealed, 79);
+        assert_ne!(fresh.proof_token(), original.proof_token());
+        assert!(fresh.verified_at().as_u64() >= quarantined_at.as_u64());
+        assert_eq!(
+            recovery
+                .stage_content_reclaim_grace(fresh, Duration::from_secs(60))
+                .await
+                .expect("fresh proof stages grace over continuous quarantine"),
+            ContentReclaimGraceStage::Staged
+        );
+        let committed = recovery.commit().await.expect("recovered grace commits");
+        let grace = db
+            .content_reclaim_grace(sealed.storage_domain_id(), sealed.content_id())
+            .await
+            .expect("recovered grace reads")
+            .expect("recovered grace exists");
+        assert_eq!(grace.quarantined_at(), quarantined_at);
+        assert_eq!(grace.proof_token(), original.proof_token());
+        assert_eq!(grace.started_at(), committed.read_version());
+    });
+}
+
+#[test]
 fn reclaim_grace_survives_reopen_and_upload_activity_revives_content() {
     let path = temp_db_path("content-reclaim-grace-reopen");
     let (domain, content_id, recorded) = block_on(async {
@@ -1148,13 +1251,194 @@ fn reclaim_grace_survives_reopen_and_upload_activity_revives_content() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // One reopen/fault/re-upload lifecycle must stay ordered.
+fn qualified_filesystem_sweep_reclaims_after_reopen_and_allows_later_reupload() {
+    let path = temp_db_path("content-reclaim-sweep-native-reopen");
+    let options = || {
+        DbOptions::new(&path)
+            .with_content_reclamation(ContentReclamationMode::QualifiedNativeFilesystem)
+    };
+    let bytes = b"durable physical reclaim bytes";
+    let (sealed, prepared_at) = block_on(async {
+        let db = Db::open(options()).await.expect("native db opens");
+        let sealed = seal_reclaim_content(&db, bytes).await;
+        consume_reclaim_token(&db, sealed, 97).await;
+        attest_reclaim_reader_drain(&db, sealed.storage_domain_id(), 55).await;
+        let (authorization, _) = commit_reclaim_quarantine(&db, sealed, 76).await;
+        let mut grace_tx = db.transaction(TransactionOptions::default());
+        grace_tx
+            .stage_content_reclaim_grace(authorization, Duration::from_millis(1))
+            .await
+            .expect("grace stages");
+        grace_tx.commit().await.expect("grace commits");
+        let grace = db
+            .content_reclaim_grace(sealed.storage_domain_id(), sealed.content_id())
+            .await
+            .expect("grace reads")
+            .expect("grace is durable");
+        assert!(matches!(
+            ContentReclaimClockAttestation::new(
+                grace,
+                test_reclaim_clock_attestation_id(54),
+                ContentReclaimClockCoordinatorId::from_bytes([55; 16]),
+                ContentReclaimClockEvidenceDigest::for_bytes(b"premature clock claim"),
+                grace.not_before_unix_ms() - 1,
+            ),
+            Err(Error::InvalidOptions { .. })
+        ));
+        let clock = ContentReclaimClockAttestation::new(
+            grace,
+            test_reclaim_clock_attestation_id(56),
+            ContentReclaimClockCoordinatorId::from_bytes([57; 16]),
+            ContentReclaimClockEvidenceDigest::for_bytes(b"trusted restart and monotonic evidence"),
+            grace.not_before_unix_ms(),
+        )
+        .expect("trusted clock claim binds grace");
+        let mut prepare = db.transaction(TransactionOptions::default());
+        let fresh = reclaim_authorization(&prepare, sealed, 77);
+        assert_eq!(
+            prepare
+                .stage_content_reclaim_sweep(fresh, clock)
+                .await
+                .expect("final sweep stages"),
+            ContentReclaimSweepStage::Staged
+        );
+        let commit = prepare.commit().await.expect("Prepared sweep commits");
+        let sweep = db
+            .content_reclaim_sweep(sealed.storage_domain_id(), sealed.content_id())
+            .await
+            .expect("Prepared sweep reads")
+            .expect("Prepared sweep exists");
+        assert_eq!(sweep.prepared_at(), commit.read_version());
+        assert_eq!(sweep.reclaimed_at(), None);
+        assert!(matches!(
+            db.open_content_leased(
+                sealed.storage_domain_id(),
+                sealed.content_id(),
+                ContentLeaseOptions::new(
+                    ContentLeaseOwnerId::from_bytes([58; 16]),
+                    Duration::from_secs(60),
+                ),
+            )
+            .await,
+            Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::SweepPrepared { .. },
+            })
+        ));
+        assert!(matches!(
+            db.acquire_content_physical_hold(
+                sealed.storage_domain_id(),
+                sealed.content_id(),
+                test_hold_id(61),
+                ContentPhysicalHoldOptions::until_released(
+                    ContentPhysicalHoldKind::Backup,
+                    ContentPhysicalHoldOwnerId::from_bytes([61; 16]),
+                ),
+            )
+            .await,
+            Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::SweepPrepared { .. },
+            })
+        ));
+        db.close().await.expect("native db closes");
+        (sealed, commit.read_version())
+    });
+
+    block_on(async {
+        let db = Db::open(options()).await.expect("native db reopens");
+        let prepared = db
+            .content_reclaim_sweep(sealed.storage_domain_id(), sealed.content_id())
+            .await
+            .expect("Prepared sweep survives reopen")
+            .expect("Prepared sweep remains");
+        assert_eq!(prepared.prepared_at(), prepared_at);
+        let descriptor_fault = StorageFaultGuard::install(
+            &path,
+            StorageFaultPoint::ObjectDelete,
+            Some(StorageObjectKind::ContentDescriptor),
+            1,
+        );
+        assert!(matches!(
+            db.resume_content_reclaim_sweep(sealed.storage_domain_id(), sealed.content_id())
+                .await,
+            Err(Error::Io(_))
+        ));
+        assert!(
+            db.content_reclaim_sweep(sealed.storage_domain_id(), sealed.content_id())
+                .await
+                .expect("failed delete keeps sweep readable")
+                .is_some_and(|sweep| sweep.reclaimed_at().is_none())
+        );
+        drop(descriptor_fault);
+        db.close().await.expect("failed sweep db closes");
+    });
+
+    block_on(async {
+        let db = Db::open(options())
+            .await
+            .expect("native db reopens after delete fault");
+        let reclaimed = db
+            .resume_content_reclaim_sweep(sealed.storage_domain_id(), sealed.content_id())
+            .await
+            .expect("filesystem sweep resumes and completes");
+        assert!(reclaimed.reclaimed_at().is_some());
+        assert!(matches!(
+            db.open_content_leased(
+                sealed.storage_domain_id(),
+                sealed.content_id(),
+                ContentLeaseOptions::new(
+                    ContentLeaseOwnerId::from_bytes([59; 16]),
+                    Duration::from_secs(60),
+                ),
+            )
+            .await,
+            Err(Error::ContentNotFound { .. })
+        ));
+        let replacement = seal_content_without_access_barrier(&db, bytes).await;
+        assert_eq!(replacement.content_id(), sealed.content_id());
+        assert_eq!(
+            db.content_reclaim_sweep(sealed.storage_domain_id(), sealed.content_id())
+                .await
+                .expect("replacement clears tombstone"),
+            None
+        );
+        let handle = db
+            .open_content_leased(
+                replacement.storage_domain_id(),
+                replacement.content_id(),
+                ContentLeaseOptions::new(
+                    ContentLeaseOwnerId::from_bytes([60; 16]),
+                    Duration::from_secs(60),
+                ),
+            )
+            .await
+            .expect("replacement opens under a lease");
+        assert_eq!(
+            handle
+                .read_range(0, u64::MAX)
+                .await
+                .expect("replacement bytes read")
+                .as_ref(),
+            bytes
+        );
+        db.close().await.expect("replacement db closes");
+    });
+    std::fs::remove_dir_all(path).expect("test database removes");
+}
+
+#[test]
 fn refreshed_object_store_reader_observes_grace_without_content_delete() {
     block_on(async {
         let client = Arc::new(MeasuredClient::new());
         let prefix = "content-reclaim-grace-object";
-        let writer = Db::open_object_store_at(client.clone(), prefix, DbOptions::object_store())
-            .await
-            .expect("object-store writer opens");
+        let writer = Db::open_object_store_at(
+            client.clone(),
+            prefix,
+            DbOptions::object_store()
+                .with_content_reclamation(ContentReclamationMode::QualifiedNativeFilesystem),
+        )
+        .await
+        .expect("object-store writer opens");
         let reader = Db::open_object_store_at(
             client.clone(),
             prefix,
@@ -1187,6 +1471,27 @@ fn refreshed_object_store_reader_observes_grace_without_content_delete() {
             .await
             .expect("object-store grace stages");
         grace.commit().await.expect("object-store grace commits");
+        assert_eq!(client.counts().content_delete, 0);
+
+        let grace_record = writer
+            .content_reclaim_grace(sealed.storage_domain_id(), sealed.content_id())
+            .await
+            .expect("object-store grace reads")
+            .expect("object-store grace exists");
+        let clock = ContentReclaimClockAttestation::new(
+            grace_record,
+            test_reclaim_clock_attestation_id(61),
+            ContentReclaimClockCoordinatorId::from_bytes([62; 16]),
+            ContentReclaimClockEvidenceDigest::for_bytes(b"object store must stay fail closed"),
+            grace_record.not_before_unix_ms(),
+        )
+        .expect("clock claim is well formed");
+        let mut unsupported = writer.transaction(TransactionOptions::default());
+        let fresh = reclaim_authorization(&unsupported, sealed, 78);
+        assert!(matches!(
+            unsupported.stage_content_reclaim_sweep(fresh, clock).await,
+            Err(Error::UnsupportedBackend { .. })
+        ));
         assert_eq!(client.counts().content_delete, 0);
 
         reader
@@ -1306,6 +1611,42 @@ fn malformed_reclaim_grace_blocks_query_and_revival() {
                 .expect("quarantine remains readable")
                 .is_some()
         );
+    });
+}
+
+#[test]
+fn malformed_reclaim_sweep_blocks_query_and_authoritative_activity() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let sealed = seal_content_without_access_barrier(&db, b"malformed reclaim sweep").await;
+        let mut damage = db.transaction(TransactionOptions::default());
+        damage
+            .put_bucket(
+                CONTENT_CONTROL_BUCKET,
+                content_reclaim_sweep_key(sealed.storage_domain_id(), sealed.content_id()),
+                b"damaged reclaim sweep".to_vec(),
+            )
+            .expect("malformed sweep stages");
+        damage.commit().await.expect("malformed sweep commits");
+
+        assert!(matches!(
+            db.content_reclaim_sweep(sealed.storage_domain_id(), sealed.content_id())
+                .await,
+            Err(Error::InvalidFormat { .. })
+        ));
+        let mut activity = db.transaction(TransactionOptions::default());
+        assert!(matches!(
+            activity
+                .stage_content_activity(sealed.storage_domain_id(), sealed.content_id())
+                .await,
+            Err(Error::InvalidFormat { .. })
+        ));
+        activity
+            .commit()
+            .await
+            .expect("failed validation stages no lifecycle writes");
     });
 }
 

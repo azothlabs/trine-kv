@@ -58,7 +58,14 @@ Evidence notes should separate:
 - Crash-safe exact-content quarantine and read fence:
   `.phrase/protocol/content-quarantine-v1.md`.
 - Non-authorizing reclaim-grace scheduling record:
-  `.phrase/protocol/content-reclaim-grace-v1.md`.
+  `.phrase/protocol/content-reclaim-grace-v1.md`. A continuously durable
+  quarantine may start grace with a fresh post-quarantine logical proof after
+  its original short-lived proof expires; the original intent/quarantine chain
+  is validated and preserved rather than rewritten.
+- Default-off, per-backend physical content sweep:
+  `.phrase/protocol/content-reclaim-sweep-v1.md`. V1 enables only the
+  independently qualified native filesystem backend; unsupported or uncertain
+  backends retain bytes.
 - Guard-aware LSM read and compaction strategy:
   `.phrase/protocol/guard-aware-lsm-strategy.md`.
 - Trine specs, ADRs, tests, and local design notes are the source of truth.

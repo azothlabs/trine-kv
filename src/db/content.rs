@@ -14,16 +14,19 @@ use crate::{
         ContentPhysicalHoldRecord, ContentPhysicalHoldRecordState, ContentQuarantine,
         ContentQuarantineRecord, ContentReaderDrainAttestation, ContentReaderDrainAttestationId,
         ContentReaderDrainAttestationOptions, ContentReaderDrainAttestationRecord,
-        ContentReclaimGrace, ContentReclaimGraceRecord, ContentTokenIndexRecord, ContentUpload,
-        ContentUploadOptions, ContentUploadResume, SealedContent, StorageDomainId, UploadId,
-        UploadSessionState, UploadSessionStatus, UploadToken, UploadTokenRecord,
-        content_access_coordinate_key, content_lease_key, content_lease_prefix,
-        content_physical_hold_key, content_quarantine_key, content_reader_drain_attestation_key,
-        content_reclaim_grace_key, content_token_index_key, current_epoch_millis, duration_millis,
-        upload_token_key,
+        ContentReclaimGrace, ContentReclaimGraceRecord, ContentReclaimSweep,
+        ContentReclaimSweepRecord, ContentReclaimSweepRecordState, ContentTokenIndexRecord,
+        ContentUpload, ContentUploadOptions, ContentUploadResume, SealedContent, StorageDomainId,
+        UploadId, UploadSessionState, UploadSessionStatus, UploadToken, UploadTokenRecord,
+        content_access_coordinate_key, content_control_key, content_lease_key,
+        content_lease_prefix, content_physical_hold_key, content_quarantine_key,
+        content_reader_drain_attestation_key, content_reclaim_grace_key, content_reclaim_sweep_key,
+        content_token_index_key, current_epoch_millis, duration_millis, upload_token_key,
     },
     error::{Error, Result},
-    options::{DurabilityMode, HostStorageBackend, StorageMode, WriteOptions},
+    options::{
+        ContentReclamationMode, DurabilityMode, HostStorageBackend, StorageMode, WriteOptions,
+    },
     storage::{
         StorageObjectDeleteBackend, StorageObjectId, StorageObjectKind, StorageObjectReadBackend,
         StorageObjectWriteBackend,
@@ -716,6 +719,147 @@ impl Db {
         Ok(Some(grace.into_public()))
     }
 
+    /// Reads durable physical-reclamation progress for exact content.
+    ///
+    /// `None` means no final sweep has been prepared. A value whose
+    /// [`ContentReclaimSweep::reclaimed_at`] is `None` must be resumed from its
+    /// protected manifest; it must not be revived or replaced in place.
+    pub async fn content_reclaim_sweep(
+        &self,
+        storage_domain_id: StorageDomainId,
+        content_id: ContentId,
+    ) -> Result<Option<ContentReclaimSweep>> {
+        self.ensure_open()?;
+        let mut transaction = self.transaction(TransactionOptions::default());
+        let key = content_reclaim_sweep_key(storage_domain_id, content_id);
+        match transaction.get_bucket(CONTENT_CONTROL_BUCKET, &key).await {
+            Ok(Some(bytes)) => {
+                ContentReclaimSweepRecord::decode(&bytes, storage_domain_id, content_id)
+                    .map(ContentReclaimSweepRecord::into_public)
+                    .map(Some)
+            }
+            Ok(None) | Err(Error::BucketMissing { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Resumes one Prepared filesystem sweep and records durable completion.
+    ///
+    /// Chunks are deleted before the descriptor. Every delete is idempotent;
+    /// any error leaves the Prepared manifest intact so an explicit retry after
+    /// repair or reopen continues the same work. The final transaction changes
+    /// the record to Reclaimed only after all object deletions succeed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedBackend`] when reclamation is disabled or
+    /// the database does not use the qualified native filesystem backend,
+    /// [`Error::ReadOnly`] for a read-only handle, [`Error::ContentNotFound`]
+    /// when no sweep exists, or a storage/conflict/corruption error. Errors
+    /// never authorize skipping a remaining object.
+    pub async fn resume_content_reclaim_sweep(
+        &self,
+        storage_domain_id: StorageDomainId,
+        content_id: ContentId,
+    ) -> Result<ContentReclaimSweep> {
+        self.ensure_open()?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+        self.ensure_content_reclamation_supported()?;
+        self.bucket(CONTENT_CONTROL_BUCKET).await?;
+        let key = content_reclaim_sweep_key(storage_domain_id, content_id);
+        let mut inspect = self.transaction(TransactionOptions::default());
+        let bytes = inspect
+            .get_bucket(CONTENT_CONTROL_BUCKET, &key)
+            .await?
+            .ok_or_else(|| Error::ContentNotFound {
+                storage_domain_id: storage_domain_id.to_string(),
+                content_id: content_id.to_string(),
+            })?;
+        let sweep = ContentReclaimSweepRecord::decode(&bytes, storage_domain_id, content_id)?;
+        if sweep.state == ContentReclaimSweepRecordState::Reclaimed {
+            return Ok(sweep.into_public());
+        }
+
+        for index in 0..sweep.chunk_count {
+            self.delete_content_chunk(sweep.upload_id, index).await?;
+        }
+        self.delete_content_descriptor(storage_domain_id, content_id)
+            .await?;
+
+        let mut complete = self.transaction(TransactionOptions::default());
+        let current_bytes = complete
+            .get_bucket(CONTENT_CONTROL_BUCKET, &key)
+            .await?
+            .ok_or_else(|| Error::Corruption {
+                message: "Prepared content sweep disappeared before completion".to_owned(),
+            })?;
+        let current =
+            ContentReclaimSweepRecord::decode(&current_bytes, storage_domain_id, content_id)?;
+        if current != sweep {
+            return Err(Error::Corruption {
+                message: "Prepared content sweep changed during physical deletion".to_owned(),
+            });
+        }
+        complete.delete_bucket(
+            CONTENT_CONTROL_BUCKET,
+            content_control_key(storage_domain_id, content_id),
+        )?;
+        complete.delete_bucket(
+            CONTENT_CONTROL_BUCKET,
+            content_quarantine_key(storage_domain_id, content_id),
+        )?;
+        complete.delete_bucket(
+            CONTENT_CONTROL_BUCKET,
+            content_reclaim_grace_key(storage_domain_id, content_id),
+        )?;
+        let reclaimed = sweep.reclaimed();
+        complete.put_bucket_with_commit_sequence(
+            CONTENT_CONTROL_BUCKET,
+            key,
+            &reclaimed.encode_prefix(),
+            &[],
+        )?;
+        let commit = complete.commit().await?;
+        Ok(ContentReclaimSweepRecord {
+            reclaimed_at: commit.read_version(),
+            ..reclaimed
+        }
+        .into_public())
+    }
+
+    pub(crate) fn ensure_content_reclamation_supported(&self) -> Result<()> {
+        if self.inner.options.content_reclamation
+            != ContentReclamationMode::QualifiedNativeFilesystem
+        {
+            return Err(Error::unsupported_backend(
+                "physical content reclamation is disabled for this database",
+            ));
+        }
+        match &self.inner.options.storage_mode {
+            StorageMode::Persistent { .. } => Ok(()),
+            StorageMode::InMemory => Err(Error::unsupported_backend(
+                "physical content reclamation requires persistent filesystem storage",
+            )),
+            StorageMode::HostPersistent {
+                backend: HostStorageBackend::Browser { .. },
+            } => Err(Error::unsupported_backend(
+                "browser content reclamation is not qualified",
+            )),
+            StorageMode::HostPersistent {
+                backend: HostStorageBackend::ObjectStore,
+            } => Err(Error::unsupported_backend(
+                "object-store content reclamation requires provider-version and retention capabilities",
+            )),
+            StorageMode::HostPersistent {
+                backend: HostStorageBackend::Wasi { .. },
+            } => Err(Error::unsupported_backend(
+                "WASI content reclamation requires independent host delete and directory-durability evidence",
+            )),
+        }
+    }
+
     /// Opens a sealed immutable `ContentObject` by cryptographic identity.
     ///
     /// The descriptor is read and validated once. The resulting handle returns
@@ -1336,6 +1480,18 @@ impl Db {
             state.require_open_revision(expected_revision)?;
         }
         if let UploadSessionStatus::Sealed(sealed) = state.status() {
+            let descriptor = self
+                .read_content_descriptor(sealed.storage_domain_id(), sealed.content_id())
+                .await?
+                .ok_or_else(|| Error::ContentNotFound {
+                    storage_domain_id: sealed.storage_domain_id().to_string(),
+                    content_id: sealed.content_id().to_string(),
+                })?;
+            ContentDescriptor::decode(
+                &descriptor,
+                sealed.storage_domain_id(),
+                sealed.content_id(),
+            )?;
             return Ok(sealed);
         }
         let (sealing_state, sealed, reused) = self.prepare_upload_seal(&state).await?;
@@ -1427,6 +1583,11 @@ impl Db {
                     }
                     existing.upload_id() != upload_id
                 } else {
+                    self.require_content_descriptor_publication_allowed(
+                        storage_domain_id,
+                        content_id,
+                    )
+                    .await?;
                     self.write_content_descriptor(
                         storage_domain_id,
                         content_id,
@@ -1517,6 +1678,25 @@ impl Db {
             .stage_content_activity(sealed.storage_domain_id(), sealed.content_id())
             .await?;
         transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn require_content_descriptor_publication_allowed(
+        &self,
+        storage_domain_id: StorageDomainId,
+        content_id: ContentId,
+    ) -> Result<()> {
+        if let Some(sweep) = self
+            .content_reclaim_sweep(storage_domain_id, content_id)
+            .await?
+            && sweep.reclaimed_at().is_none()
+        {
+            return Err(Error::ContentReclaimBlocked {
+                blocker: crate::ContentReclaimBlocker::SweepPrepared {
+                    prepared_at_commit_seq: sweep.prepared_at().as_u64(),
+                },
+            });
+        }
         Ok(())
     }
 
@@ -1667,6 +1847,15 @@ impl Db {
     ) -> Result<Option<Arc<[u8]>>> {
         let object = self.content_descriptor_object(storage_domain_id, content_id)?;
         self.read_content_object(object).await
+    }
+
+    async fn delete_content_descriptor(
+        &self,
+        storage_domain_id: StorageDomainId,
+        content_id: ContentId,
+    ) -> Result<()> {
+        let object = self.content_descriptor_object(storage_domain_id, content_id)?;
+        self.delete_content_object(object).await
     }
 
     pub(crate) async fn read_content_access_barrier_record(
@@ -1893,7 +2082,12 @@ impl Db {
             StorageMode::Persistent { .. }
             | StorageMode::HostPersistent {
                 backend: HostStorageBackend::Wasi { .. },
-            } => self.inner.native_storage.delete_object(object).await,
+            } => {
+                self.inner
+                    .native_storage
+                    .delete_object_durable(object, self.content_durability())
+                    .await
+            }
             StorageMode::HostPersistent {
                 backend: HostStorageBackend::ObjectStore,
             } => self.object_storage()?.delete_object(object).await,

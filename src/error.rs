@@ -34,6 +34,12 @@ pub enum ContentReclaimBlocker {
     ReclaimIntentRequired,
     /// No exact durable quarantine matches the reclaim-grace request.
     QuarantineRequired,
+    /// A final sweep is already Prepared and authoritative activity can no
+    /// longer revive the old descriptor or bytes.
+    SweepPrepared {
+        /// Commit sequence that established the irreversible worker fence.
+        prepared_at_commit_seq: u64,
+    },
     /// The higher-layer proof reached its exclusive wall-clock deadline.
     ProofExpired {
         /// Proof deadline as Unix epoch milliseconds.
@@ -87,6 +93,12 @@ impl fmt::Display for ContentReclaimBlocker {
             Self::QuarantineRequired => {
                 formatter.write_str("content reclaim grace requires the exact durable quarantine")
             }
+            Self::SweepPrepared {
+                prepared_at_commit_seq,
+            } => write!(
+                formatter,
+                "content physical sweep was prepared at commit {prepared_at_commit_seq}"
+            ),
             Self::ProofExpired { expired_at_unix_ms } => write!(
                 formatter,
                 "proof expired at Unix millisecond {expired_at_unix_ms}"

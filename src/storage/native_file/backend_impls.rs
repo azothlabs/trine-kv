@@ -16,7 +16,9 @@ use super::{
     delete_native_file_object, list_native_file_directory_files, list_native_file_objects,
     publish_manifest_to_native_file, read_current_manifest_from_native_file,
     read_native_file_object_bytes, record_timed_storage_future, record_timed_storage_result,
-    rewrite_native_file_wal, sync_native_file_directory_after_renames, write_native_file_object,
+    requires_parent_dir_sync_after_rename, rewrite_native_file_wal,
+    sync_native_file_directory_after_renames, sync_native_file_parent_directory_after_rename,
+    write_native_file_object,
 };
 #[cfg(feature = "platform-io")]
 use super::{
@@ -663,6 +665,24 @@ impl BlockingStorageObjectDeleteBackend for NativeFileBackend {
             StorageOperation::DeleteObject,
             || delete_native_file_object(&object),
         )
+    }
+}
+
+impl NativeFileBackend {
+    pub(crate) async fn delete_object_durable(
+        &self,
+        object: StorageObjectId,
+        durability: DurabilityMode,
+    ) -> Result<()> {
+        let path = object.path().to_path_buf();
+        self.delete_object(object).await?;
+        if requires_parent_dir_sync_after_rename(durability) {
+            self.run_owned_storage_task(StorageOperation::SyncDirectoryAfterRenames, move || {
+                sync_native_file_parent_directory_after_rename(&path)
+            })
+            .await?;
+        }
+        Ok(())
     }
 }
 

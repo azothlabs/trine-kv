@@ -16838,3 +16838,79 @@ Negative check:
 - No method consumes deadline passage as authority.
 - No descriptor, chunk, replica, provider version, or physical byte deletion
   exists.
+
+## 2026-07-22: native content-reclaim sweep v1
+
+### Observation
+
+- Final deletion needs a fresh post-grace logical proof, an explicit trusted
+  clock/restart claim, repeated physical checks, and durable progress. Grace
+  passage alone remains non-authorizing.
+- Native deletion can be tested through actual files, injected object-delete
+  failure, directory sync, close/reopen, and byte re-upload. WASI and provider
+  backends do not yet have equivalent evidence.
+
+### Implementation evidence
+
+- Added default-off `ContentReclamationMode`; only
+  `QualifiedNativeFilesystem` passes the v1 backend gate.
+- Added clock-attestation identities, coordinator/evidence values, exact grace
+  binding, and the durable Prepared/Reclaimed sweep manifest.
+- Final transactional staging rechecks barrier, drain, quarantine, grace,
+  descriptor, activity, token, lease, hold, proof freshness, clock evidence,
+  and backend capability.
+- Prepared blocks revival. The native worker deletes chunks before descriptor,
+  syncs parent directories for the selected durability, and commits Reclaimed
+  only after every object delete succeeds. A later identical upload may clear
+  the tombstone after new descriptor bytes exist.
+
+### Verification
+
+- The partial-delete test removes chunks, injects descriptor-delete failure,
+  proves Prepared survives, closes/reopens, resumes, proves old bytes absent,
+  and verifies identical-content re-upload/read.
+- Object-store staging is rejected with zero content deletes. WASI remains a
+  distinct disabled storage mode and the wasm32-wasip1 build passes.
+- All-feature regression passes 512/514 library tests with two ignored, all
+  integration targets, and 30 doctests. All-feature check, strict Rustdoc,
+  focused Clippy with wildcard imports denied, formatting, and diff gates pass.
+
+### Safety boundary
+
+- Memory, WASI, browser, and object-store deletion remain disabled.
+- Ordinary provider key deletion is not treated as version/retention cleanup.
+- The higher layer still owns exact logical reachability and maintenance-runner
+  orchestration; uncertainty retains Prepared state and remaining bytes.
+
+## 2026-07-22: continuous-quarantine recovery for bounded maintenance
+
+### Observation
+
+- A quarantine is durable beyond its original proof expiry, but grace staging
+  previously required the exact original authorization. A process exit after
+  quarantine commit and before grace commit could therefore strand the state.
+
+### Implementation evidence
+
+- Grace staging now validates the original control intent against the durable
+  quarantine independently from the current higher-layer authorization.
+- The current authorization may differ only when its verification sequence is
+  at or after `quarantined_at`. Descriptor, barrier, drain, activity, token,
+  lease, and hold checks remain in the same optimistic transaction.
+- The grace record continues to bind the original quarantine proof token and
+  commit coordinate; neither intent nor quarantine is rewritten.
+
+### Verification
+
+- A focused test commits quarantine, supplies a different fresh proof at a
+  later read coordinate, commits grace, and confirms the original quarantine
+  identity is retained.
+- All-feature regression passes 513/515 library tests with two ignored, every
+  integration target, and 30 doctests. Strict Rustdoc, all-target/all-feature
+  Clippy with wildcard imports denied, formatting, diff checks, and
+  `wasm32-wasip1` compilation pass.
+
+### Safety boundary
+
+- Fresh logical proof is recovery input, not reader-drain or clock authority.
+- Unsupported backends remain unable to stage or resume physical deletion.
