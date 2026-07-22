@@ -16914,3 +16914,58 @@ Negative check:
 
 - Fresh logical proof is recovery input, not reader-drain or clock authority.
 - Unsupported backends remain unable to stage or resume physical deletion.
+
+## 2026-07-22: qualified object-store content reclamation
+
+### Observation
+
+- `ObjectMeta` previously discarded provider version identity, so a successful
+  key-only DELETE could not distinguish permanent removal from a delete marker
+  or retained historical bytes.
+- Generic S3-compatible data-plane calls cannot prove every provider lock,
+  retention, legal-hold, backup, replication, or restore rule. That boundary
+  requires retained host evidence in addition to live path probes.
+
+### Implementation evidence
+
+- Added algorithm-tagged provider-evidence digests, host attestations, and an
+  async qualification capability bound internally to the exact database prefix.
+  Qualification probes both protected content path families with conditional
+  create/overwrite, provider-version rejection, idempotent delete, and immediate
+  HEAD, GET, and LIST absence.
+- The S3 adapter now retains opaque provider version identity. Prepared sweep v2
+  stores backend and evidence identity; a missing, changed, or wrong-prefix
+  capability rejects stage or resume before deletion.
+- Actual cloud reclamation performs a pre-delete version check and a post-delete
+  HEAD, GET, and LIST absence check for every chunk and descriptor. Any error or
+  ambiguous observation leaves Prepared state. Chunk-before-descriptor order is
+  unchanged.
+- Added a public qualification doctest, an operational runbook, the v2 protocol,
+  and changelog coverage. V1 is retained only as a superseded design record;
+  there is no deployed unfinished-sweep migration requirement.
+
+### Verification
+
+- Deterministic tests reject visible provider versions, sticky successful
+  deletes, prefix reuse, and changed evidence. The full object-store lifecycle
+  proves Prepared close/reopen, injected descriptor-delete failure, retry, final
+  object absence, and no revival through a leased open.
+- MinIO passed the final isolated qualification and full lifecycle in 1.44
+  seconds after its control plane reported an unversioned bucket and unsupported
+  locking.
+- Real R2 passed the same lifecycle through Infisical dev credentials in 55.14
+  seconds. Those credentials expose only the data plane; the host evidence
+  requirement therefore remains active for R2 bucket-lock configuration.
+- All-feature regression passed 515/518 library tests with three intentional
+  ignores plus every integration target. Strict Rustdoc, 31 doctests,
+  all-target/all-feature Clippy with wildcard imports denied, formatting, and
+  diff checks pass.
+
+### Safety boundary
+
+- Versioned buckets, delete-marker traversal, historical-version cleanup,
+  provider-policy bypass, browser, WASI, and implicit endpoint qualification
+  remain unsupported.
+- The host must stop sweep workers and rotate evidence before changing provider
+  configuration or namespace ownership. Existing Prepared state intentionally
+  rejects a different digest.

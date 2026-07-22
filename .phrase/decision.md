@@ -63,9 +63,14 @@ Evidence notes should separate:
   its original short-lived proof expires; the original intent/quarantine chain
   is validated and preserved rather than rewritten.
 - Default-off, per-backend physical content sweep:
-  `.phrase/protocol/content-reclaim-sweep-v1.md`. V1 enables only the
-  independently qualified native filesystem backend; unsupported or uncertain
-  backends retain bytes.
+  `.phrase/protocol/content-reclaim-sweep-v2.md`. V2 preserves the independently
+  qualified native filesystem backend and additionally permits an unversioned
+  object-store namespace only after explicit external provider evidence and a
+  live path-specific qualification probe. The capability binds the exact
+  database prefix; Prepared records bind its evidence digest; every actual
+  object delete rejects visible provider versions and requires HEAD, GET, and
+  LIST absence. Versioned, locked, mismatched, unverified, WASI, browser, and
+  memory modes fail closed.
 - Guard-aware LSM read and compaction strategy:
   `.phrase/protocol/guard-aware-lsm-strategy.md`.
 - Trine specs, ADRs, tests, and local design notes are the source of truth.

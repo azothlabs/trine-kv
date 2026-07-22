@@ -2,6 +2,25 @@
 
 All public crate releases use Semantic Versioning.
 
+## Unreleased
+
+### Added
+
+- Added explicit object-store content-reclamation qualification. A host-retained
+  provider-evidence digest and live probes of both protected content path
+  families produce a capability scoped to one database prefix.
+- Object metadata now retains the provider's opaque version identity so
+  versioned and delete-marker behavior can fail closed.
+
+### Changed
+
+- Prepared content sweeps use the `TRNCRSW2` protected record, bind the backend
+  and provider-evidence digest, and require the same qualification after reopen.
+  There is no migration from an unfinished `TRNCRSW1` sweep.
+- Qualified cloud deletion checks for a provider version before DELETE and
+  requires immediate HEAD, GET, and LIST absence afterward. Any uncertainty
+  leaves the sweep Prepared for retry.
+
 ## 0.5.13 - 2026-07-18
 
 Browser Worker persistence and release-maintenance patch. This release remains

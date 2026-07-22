@@ -15,11 +15,11 @@ use crate::{
         ContentQuarantineRecord, ContentReaderDrainAttestation, ContentReaderDrainAttestationId,
         ContentReaderDrainAttestationOptions, ContentReaderDrainAttestationRecord,
         ContentReclaimGrace, ContentReclaimGraceRecord, ContentReclaimSweep,
-        ContentReclaimSweepRecord, ContentReclaimSweepRecordState, ContentTokenIndexRecord,
-        ContentUpload, ContentUploadOptions, ContentUploadResume, SealedContent, StorageDomainId,
-        UploadId, UploadSessionState, UploadSessionStatus, UploadToken, UploadTokenRecord,
-        content_access_coordinate_key, content_control_key, content_lease_key,
-        content_lease_prefix, content_physical_hold_key, content_quarantine_key,
+        ContentReclaimSweepBackend, ContentReclaimSweepRecord, ContentReclaimSweepRecordState,
+        ContentTokenIndexRecord, ContentUpload, ContentUploadOptions, ContentUploadResume,
+        SealedContent, StorageDomainId, UploadId, UploadSessionState, UploadSessionStatus,
+        UploadToken, UploadTokenRecord, content_access_coordinate_key, content_control_key,
+        content_lease_key, content_lease_prefix, content_physical_hold_key, content_quarantine_key,
         content_reader_drain_attestation_key, content_reclaim_grace_key, content_reclaim_sweep_key,
         content_token_index_key, current_epoch_millis, duration_millis, upload_token_key,
     },
@@ -778,6 +778,7 @@ impl Db {
                 content_id: content_id.to_string(),
             })?;
         let sweep = ContentReclaimSweepRecord::decode(&bytes, storage_domain_id, content_id)?;
+        self.ensure_content_reclaim_sweep_backend(sweep.backend)?;
         if sweep.state == ContentReclaimSweepRecordState::Reclaimed {
             return Ok(sweep.into_public());
         }
@@ -830,34 +831,59 @@ impl Db {
     }
 
     pub(crate) fn ensure_content_reclamation_supported(&self) -> Result<()> {
-        if self.inner.options.content_reclamation
-            != ContentReclamationMode::QualifiedNativeFilesystem
-        {
-            return Err(Error::unsupported_backend(
+        self.content_reclaim_sweep_backend().map(|_| ())
+    }
+
+    pub(crate) fn content_reclaim_sweep_backend(&self) -> Result<ContentReclaimSweepBackend> {
+        match (
+            self.inner.options.content_reclamation,
+            &self.inner.options.storage_mode,
+        ) {
+            (ContentReclamationMode::QualifiedNativeFilesystem, StorageMode::Persistent { .. }) => {
+                Ok(ContentReclaimSweepBackend::NativeFilesystem)
+            }
+            (
+                ContentReclamationMode::QualifiedObjectStore(qualification),
+                StorageMode::HostPersistent {
+                    backend: HostStorageBackend::ObjectStore,
+                },
+            ) => {
+                if !qualification.matches_prefix(self.object_store_db_path()) {
+                    return Err(Error::unsupported_backend(
+                        "object-store reclamation qualification names a different database prefix",
+                    ));
+                }
+                Ok(ContentReclaimSweepBackend::ObjectStore {
+                    evidence_digest: qualification.evidence_digest(),
+                })
+            }
+            (ContentReclamationMode::Disabled, _) => Err(Error::unsupported_backend(
                 "physical content reclamation is disabled for this database",
+            )),
+            (ContentReclamationMode::QualifiedNativeFilesystem, _) => {
+                Err(Error::unsupported_backend(
+                    "native filesystem reclamation qualification does not match this backend",
+                ))
+            }
+            (ContentReclamationMode::QualifiedObjectStore(_), _) => {
+                Err(Error::unsupported_backend(
+                    "object-store reclamation qualification does not match this backend",
+                ))
+            }
+        }
+    }
+
+    fn ensure_content_reclaim_sweep_backend(
+        &self,
+        prepared_backend: ContentReclaimSweepBackend,
+    ) -> Result<()> {
+        let configured = self.content_reclaim_sweep_backend()?;
+        if configured != prepared_backend {
+            return Err(Error::unsupported_backend(
+                "Prepared content sweep provider evidence differs from the current qualification",
             ));
         }
-        match &self.inner.options.storage_mode {
-            StorageMode::Persistent { .. } => Ok(()),
-            StorageMode::InMemory => Err(Error::unsupported_backend(
-                "physical content reclamation requires persistent filesystem storage",
-            )),
-            StorageMode::HostPersistent {
-                backend: HostStorageBackend::Browser { .. },
-            } => Err(Error::unsupported_backend(
-                "browser content reclamation is not qualified",
-            )),
-            StorageMode::HostPersistent {
-                backend: HostStorageBackend::ObjectStore,
-            } => Err(Error::unsupported_backend(
-                "object-store content reclamation requires provider-version and retention capabilities",
-            )),
-            StorageMode::HostPersistent {
-                backend: HostStorageBackend::Wasi { .. },
-            } => Err(Error::unsupported_backend(
-                "WASI content reclamation requires independent host delete and directory-durability evidence",
-            )),
-        }
+        Ok(())
     }
 
     /// Opens a sealed immutable `ContentObject` by cryptographic identity.
@@ -2090,7 +2116,11 @@ impl Db {
             }
             StorageMode::HostPersistent {
                 backend: HostStorageBackend::ObjectStore,
-            } => self.object_storage()?.delete_object(object).await,
+            } => {
+                self.object_storage()?
+                    .delete_unversioned_object_verified(object)
+                    .await
+            }
             StorageMode::HostPersistent {
                 backend: HostStorageBackend::Browser { .. },
             } => {

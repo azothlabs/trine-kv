@@ -37,6 +37,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use sha2::{Digest, Sha256};
+
 use crate::error::{Error, Result};
 use crate::options::DurabilityMode;
 use crate::storage::{
@@ -77,6 +79,134 @@ impl ETag {
     }
 }
 
+/// Provider identity for one stored object version.
+///
+/// This is distinct from an [`ETag`]. Version-enabled S3-compatible stores can
+/// retain old bytes after a key-only delete and return a version identifier for
+/// the current object. Trine exposes that fact so irreversible reclamation can
+/// reject versioned namespaces instead of mistaking a delete marker for byte
+/// removal.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ObjectVersion(Arc<str>);
+
+impl ObjectVersion {
+    /// Wraps the provider's opaque object-version identifier.
+    #[must_use]
+    pub fn new(version: impl Into<Arc<str>>) -> Self {
+        Self(version.into())
+    }
+
+    /// Returns the provider's opaque object-version identifier.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+const OBJECT_RECLAMATION_EVIDENCE_SHA256_TAG: u8 = 1;
+
+/// Digest of host-retained evidence for one object-store reclamation contract.
+///
+/// The source evidence should identify the provider, bucket, exact Trine key
+/// prefix, configuration revision, and the control-plane observations proving
+/// that the prefix is exclusively owned by Trine, unversioned, and not covered
+/// by bucket locks, retention rules, legal holds, or restore-on-delete
+/// automation. Do not hash credentials or other secrets into this value.
+///
+/// Trine persists this digest in every Prepared cloud sweep. Reopening with a
+/// different qualification therefore retains bytes rather than continuing an
+/// irreversible operation under changed evidence.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ObjectStoreReclamationEvidenceDigest([u8; 33]);
+
+impl ObjectStoreReclamationEvidenceDigest {
+    /// Hashes a canonical, non-secret evidence document with SHA-256.
+    #[must_use]
+    pub fn for_bytes(evidence: &[u8]) -> Self {
+        let digest = Sha256::digest(evidence);
+        let mut bytes = [0_u8; 33];
+        bytes[0] = OBJECT_RECLAMATION_EVIDENCE_SHA256_TAG;
+        bytes[1..].copy_from_slice(&digest);
+        Self(bytes)
+    }
+
+    /// Reconstructs a digest from its portable algorithm-tagged bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidFormat`] when the algorithm tag is unknown.
+    pub fn from_bytes(bytes: [u8; 33]) -> Result<Self> {
+        if bytes[0] != OBJECT_RECLAMATION_EVIDENCE_SHA256_TAG {
+            return Err(Error::InvalidFormat {
+                message: "unknown object-store reclamation evidence digest".to_owned(),
+            });
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Returns the portable algorithm-tagged bytes.
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 33] {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for ObjectStoreReclamationEvidenceDigest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ObjectStoreReclamationEvidenceDigest(..)")
+    }
+}
+
+/// Host assertion that a specific object namespace is eligible for a live
+/// reclamation qualification probe.
+///
+/// Constructing this value does not enable deletion. It records the digest of
+/// independently retained control-plane evidence. Call
+/// [`qualify_object_store_reclamation`] with the exact client and database
+/// prefix to perform the mandatory data-plane probe and obtain the capability
+/// accepted by [`ContentReclamationMode`](crate::ContentReclamationMode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectStoreReclamationAttestation {
+    evidence_digest: ObjectStoreReclamationEvidenceDigest,
+}
+
+impl ObjectStoreReclamationAttestation {
+    /// Binds independently retained provider evidence to a later live probe.
+    #[must_use]
+    pub const fn new(evidence_digest: ObjectStoreReclamationEvidenceDigest) -> Self {
+        Self { evidence_digest }
+    }
+
+    /// Returns the digest of the external provider evidence.
+    #[must_use]
+    pub const fn evidence_digest(self) -> ObjectStoreReclamationEvidenceDigest {
+        self.evidence_digest
+    }
+}
+
+/// Verified capability for unversioned object-store reclamation.
+///
+/// Values can be obtained only from [`qualify_object_store_reclamation`]. The
+/// capability is scoped by the external evidence digest and must be supplied
+/// again when reopening a database with a Prepared cloud sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QualifiedObjectStoreReclamation {
+    evidence_digest: ObjectStoreReclamationEvidenceDigest,
+    namespace_digest: [u8; 32],
+}
+
+impl QualifiedObjectStoreReclamation {
+    /// Returns the provider-evidence digest bound to this qualification.
+    #[must_use]
+    pub const fn evidence_digest(self) -> ObjectStoreReclamationEvidenceDigest {
+        self.evidence_digest
+    }
+
+    pub(crate) fn matches_prefix(self, prefix: &Path) -> bool {
+        self.namespace_digest == object_store_reclamation_namespace_digest(prefix)
+    }
+}
+
 /// Precondition for a conditional write ([`ObjectClient::put_if`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Precondition {
@@ -114,6 +244,12 @@ pub struct ObjectMeta {
     pub size: u64,
     /// Current entity tag.
     pub etag: ETag,
+    /// Opaque provider version, or `None` for an unversioned object.
+    ///
+    /// A cloud reclamation probe rejects any observed version, including a
+    /// provider's `null` version marker, because key-only deletion cannot prove
+    /// that historical bytes are gone.
+    pub version: Option<ObjectVersion>,
 }
 
 /// A flat key/value object store: keys are strings, values are immutable byte
@@ -247,6 +383,226 @@ pub async fn verify_object_client_contract(
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), _) | (Ok(()), Err(error)) => Err(error),
     }
+}
+
+/// Qualifies one exact object-store namespace for irreversible content-byte
+/// reclamation.
+///
+/// The caller must first retain control-plane evidence identified by
+/// `attestation`: the exact `prefix` is exclusively owned by this Trine
+/// database, provider versioning and delete markers are disabled, no bucket
+/// lock, retention rule, legal hold, backup restore, replication target, or
+/// lifecycle process can preserve or recreate deleted keys, and configuration
+/// changes invalidate the evidence before another sweep is resumed.
+///
+/// The live probe creates temporary objects in both content-deletion path
+/// families (`content-v1/chunks` and `content-v1/domains`), overwrites each with
+/// a compare-and-swap, confirms that no observation reports a provider version,
+/// deletes each key, and requires immediate absence through `HEAD`, `GET`, and
+/// `LIST`. It repeats each delete to verify idempotency. This costs four writes,
+/// four deletes, and several metadata/read requests. Every successful path is
+/// absent before the function returns; a failing path gets a best-effort cleanup.
+///
+/// # Safety boundary
+///
+/// Data-plane requests cannot enumerate every provider control-plane policy.
+/// The live probe supplements but does not replace the external evidence. In
+/// particular, a false assertion about hidden historical versions can leave the
+/// tiny probe object as an unreachable provider version. Never call this
+/// function before checking the provider configuration.
+///
+/// # Parameters
+///
+/// - `client`: the same object client later passed to the database open call.
+/// - `prefix`: the exact database key prefix, not merely the bucket root.
+/// - `attestation`: digest of stable, independently retained provider evidence.
+///
+/// # Errors
+///
+/// Returns the provider error when the probe cannot read, write, list, or
+/// delete. Returns [`Error::Corruption`] when versions are visible, deletion is
+/// not immediately observable, listing disagrees with same-key reads, or the
+/// adapter violates compare-and-swap behavior. No qualification is returned on
+/// uncertainty.
+///
+/// # Example
+///
+/// ```
+/// use std::sync::Arc;
+/// use trine_kv::{
+///     ContentReclamationMode, DbOptions, InMemoryObjectStore, ObjectClient,
+///     ObjectStoreReclamationAttestation, ObjectStoreReclamationEvidenceDigest,
+///     qualify_object_store_reclamation,
+/// };
+///
+/// # fn main() -> trine_kv::Result<()> {
+/// let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+/// let evidence = ObjectStoreReclamationEvidenceDigest::for_bytes(
+///     b"provider=test;bucket=example;prefix=database-a;versioning=disabled",
+/// );
+/// let qualification = futures::executor::block_on(qualify_object_store_reclamation(
+///     client,
+///     "database-a",
+///     ObjectStoreReclamationAttestation::new(evidence),
+/// ))?;
+/// let options = DbOptions::object_store().with_content_reclamation(
+///     ContentReclamationMode::QualifiedObjectStore(qualification),
+/// );
+/// // Pass `options` and the same client/prefix contract to the database open call.
+/// # let _ = options;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn qualify_object_store_reclamation(
+    client: Arc<dyn ObjectClient>,
+    prefix: impl Into<String>,
+    attestation: ObjectStoreReclamationAttestation,
+) -> Result<QualifiedObjectStoreReclamation> {
+    let prefix = prefix.into();
+    for (path, role) in [
+        ("content-v1/chunks", "reclamation-chunk"),
+        ("content-v1/domains", "reclamation-descriptor"),
+    ] {
+        let root = Path::new(&prefix).join(path);
+        let key = object_client_contract_probe_key_for_role(&root, role)?;
+        if let Err(error) = verify_object_store_reclamation_at_key(&client, &key).await {
+            let _ = client.delete(&key).await;
+            return Err(error);
+        }
+    }
+    Ok(QualifiedObjectStoreReclamation {
+        evidence_digest: attestation.evidence_digest,
+        namespace_digest: object_store_reclamation_namespace_digest(Path::new(&prefix)),
+    })
+}
+
+fn object_store_reclamation_namespace_digest(prefix: &Path) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"trine-object-store-reclamation-namespace-v1");
+    hasher.update([0]);
+    hasher.update(prefix.to_string_lossy().as_bytes());
+    hasher.finalize().into()
+}
+
+async fn verify_object_store_reclamation_at_key(
+    client: &Arc<dyn ObjectClient>,
+    key: &str,
+) -> Result<()> {
+    let first = Arc::<[u8]>::from(b"trine-object-reclamation:first".as_slice());
+    let second = Arc::<[u8]>::from(b"trine-object-reclamation:second".as_slice());
+    let first_etag = match client
+        .put_if(key, Arc::clone(&first), Precondition::IfNoneMatch)
+        .await?
+    {
+        PutIf::Stored { etag } => etag,
+        PutIf::PreconditionFailed { .. } => {
+            return Err(Error::Corruption {
+                message: format!("object reclamation probe key {key} unexpectedly exists"),
+            });
+        }
+    };
+    verify_unversioned_object(client, key, &first, &first_etag, "create").await?;
+
+    let second_etag = match client
+        .put_if(
+            key,
+            Arc::clone(&second),
+            Precondition::IfMatch(first_etag.clone()),
+        )
+        .await?
+    {
+        PutIf::Stored { etag } => etag,
+        PutIf::PreconditionFailed { current } => {
+            return Err(Error::Corruption {
+                message: format!(
+                    "object reclamation probe for {key} lost its overwrite fence: {current:?}"
+                ),
+            });
+        }
+    };
+    if second_etag == first_etag {
+        return Err(Error::Corruption {
+            message: format!("object reclamation probe for {key} reused an ETag after overwrite"),
+        });
+    }
+    verify_unversioned_object(client, key, &second, &second_etag, "overwrite").await?;
+
+    client.delete(key).await?;
+    verify_object_store_reclamation_absent(client, key).await?;
+    client.delete(key).await?;
+    verify_object_store_reclamation_absent(client, key).await
+}
+
+async fn verify_unversioned_object(
+    client: &Arc<dyn ObjectClient>,
+    key: &str,
+    expected: &Arc<[u8]>,
+    expected_etag: &ETag,
+    operation: &str,
+) -> Result<()> {
+    let head = client.head(key).await?.ok_or_else(|| Error::Corruption {
+        message: format!("object reclamation probe for {key} lost head after {operation}"),
+    })?;
+    if let Some(version) = &head.version {
+        return Err(Error::Corruption {
+            message: format!(
+                "object reclamation probe for {key} observed provider version {} after {operation}",
+                version.as_str()
+            ),
+        });
+    }
+    if &head.etag != expected_etag || head.size != expected.len() as u64 {
+        return Err(Error::Corruption {
+            message: format!(
+                "object reclamation probe for {key} observed stale metadata after {operation}"
+            ),
+        });
+    }
+    let bytes = client.get(key).await?.ok_or_else(|| Error::Corruption {
+        message: format!("object reclamation probe for {key} lost bytes after {operation}"),
+    })?;
+    if bytes.as_ref() != expected.as_ref() {
+        return Err(Error::Corruption {
+            message: format!(
+                "object reclamation probe for {key} observed stale bytes after {operation}"
+            ),
+        });
+    }
+    let list_prefix = Path::new(key)
+        .parent()
+        .map_or_else(String::new, |parent| parent.to_string_lossy().into_owned());
+    let listed = client.list(&list_prefix).await?;
+    let mut exact = listed.iter().filter(|meta| meta.key == key);
+    if exact.next().is_none_or(|meta| meta.version.is_some()) || exact.next().is_some() {
+        return Err(Error::Corruption {
+            message: format!(
+                "object reclamation probe for {key} observed inconsistent listing after {operation}: {listed:?}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+async fn verify_object_store_reclamation_absent(
+    client: &Arc<dyn ObjectClient>,
+    key: &str,
+) -> Result<()> {
+    let list_prefix = Path::new(key)
+        .parent()
+        .map_or_else(String::new, |parent| parent.to_string_lossy().into_owned());
+    if client.head(key).await?.is_some()
+        || client.get(key).await?.is_some()
+        || client
+            .list(&list_prefix)
+            .await?
+            .iter()
+            .any(|meta| meta.key == key)
+    {
+        return Err(Error::Corruption {
+            message: format!("object reclamation probe for {key} remained observable after delete"),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) async fn verify_object_client_contract_for_open(
@@ -475,6 +831,7 @@ impl InMemoryObjectStore {
                 key: key.clone(),
                 size: object.bytes.len() as u64,
                 etag: object.etag.clone(),
+                version: None,
             })
             .collect())
     }
@@ -484,6 +841,7 @@ impl InMemoryObjectStore {
             key: key.to_owned(),
             size: object.bytes.len() as u64,
             etag: object.etag.clone(),
+            version: None,
         }))
     }
 
@@ -631,6 +989,24 @@ impl ObjectStoreBackend {
 
     fn object_key(object: &StorageObjectId) -> String {
         object.path().to_string_lossy().into_owned()
+    }
+
+    pub(crate) async fn delete_unversioned_object_verified(
+        &self,
+        object: StorageObjectId,
+    ) -> Result<()> {
+        let key = Self::object_key(&object);
+        if let Some(meta) = self.client.head(&key).await? {
+            if meta.version.is_some() {
+                return Err(Error::unsupported_backend(
+                    "object-store content key has a provider version",
+                ));
+            }
+        } else {
+            return Ok(());
+        }
+        self.client.delete(&key).await?;
+        verify_object_store_reclamation_absent(&self.client, &key).await
     }
 }
 
@@ -813,8 +1189,23 @@ async fn read_object_bytes_by_meta(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::path::Path;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    use super::{
+        ETag, InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta, ObjectStoreBackend,
+        ObjectStoreReclamationAttestation, ObjectStoreReclamationEvidenceDigest, ObjectVersion,
+        Precondition, PutIf, qualify_object_store_reclamation,
+    };
+    use crate::error::{Error, Result};
+    use crate::options::DurabilityMode;
+    use crate::storage::{
+        StorageObjectDeleteBackend, StorageObjectId, StorageObjectListBackend,
+        StorageObjectReadBackend, StorageObjectWriteBackend, StorageReadBackend, StorageReadObject,
+    };
 
     fn bytes(data: &[u8]) -> Arc<[u8]> {
         Arc::from(data)
@@ -880,6 +1271,7 @@ mod tests {
                     key,
                     size: u64::MAX,
                     etag: ETag::new("oversized"),
+                    version: None,
                 }))
             })
         }
@@ -935,6 +1327,7 @@ mod tests {
                     key,
                     size: 5,
                     etag: ETag::new("short-range"),
+                    version: None,
                 }))
             })
         }
@@ -946,6 +1339,88 @@ mod tests {
             _precondition: Precondition,
         ) -> ObjectFuture<'op, PutIf> {
             Box::pin(async move { Err(Error::invalid_options("unexpected put_if")) })
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReclamationProbeClient {
+        inner: InMemoryObjectStore,
+        report_version: bool,
+        retain_on_delete: bool,
+    }
+
+    impl ReclamationProbeClient {
+        fn new(report_version: bool, retain_on_delete: bool) -> Self {
+            Self {
+                inner: InMemoryObjectStore::new(),
+                report_version,
+                retain_on_delete,
+            }
+        }
+
+        fn decorate_meta(&self, mut meta: ObjectMeta) -> ObjectMeta {
+            if self.report_version {
+                meta.version = Some(ObjectVersion::new("provider-version-1"));
+            }
+            meta
+        }
+    }
+
+    impl ObjectClient for ReclamationProbeClient {
+        fn get<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<Arc<[u8]>>> {
+            self.inner.get(key)
+        }
+
+        fn get_range<'op>(
+            &'op self,
+            key: &str,
+            offset: u64,
+            len: u64,
+        ) -> ObjectFuture<'op, Arc<[u8]>> {
+            self.inner.get_range(key, offset, len)
+        }
+
+        fn put<'op>(&'op self, key: &str, bytes: Arc<[u8]>) -> ObjectFuture<'op, ETag> {
+            self.inner.put(key, bytes)
+        }
+
+        fn delete<'op>(&'op self, key: &str) -> ObjectFuture<'op, ()> {
+            if self.retain_on_delete {
+                Box::pin(async { Ok(()) })
+            } else {
+                self.inner.delete(key)
+            }
+        }
+
+        fn list<'op>(&'op self, prefix: &str) -> ObjectFuture<'op, Vec<ObjectMeta>> {
+            let prefix = prefix.to_owned();
+            Box::pin(async move {
+                self.inner.list(&prefix).await.map(|metas| {
+                    metas
+                        .into_iter()
+                        .map(|meta| self.decorate_meta(meta))
+                        .collect()
+                })
+            })
+        }
+
+        fn head<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<ObjectMeta>> {
+            let key = key.to_owned();
+            Box::pin(async move {
+                self.inner
+                    .head(&key)
+                    .await
+                    .map(|meta| meta.map(|meta| self.decorate_meta(meta)))
+            })
+        }
+
+        fn put_if<'op>(
+            &'op self,
+            key: &str,
+            bytes: Arc<[u8]>,
+            precondition: Precondition,
+        ) -> ObjectFuture<'op, PutIf> {
+            self.inner.put_if(key, bytes, precondition)
         }
     }
 
@@ -963,6 +1438,46 @@ mod tests {
             block_on(store.get("k")).unwrap().as_deref(),
             Some(b"world".as_slice())
         );
+    }
+
+    #[test]
+    fn reclamation_qualification_requires_unversioned_observable_delete() {
+        let evidence = ObjectStoreReclamationAttestation::new(
+            ObjectStoreReclamationEvidenceDigest::for_bytes(b"test provider evidence"),
+        );
+        let qualified_client: Arc<dyn ObjectClient> =
+            Arc::new(ReclamationProbeClient::new(false, false));
+        let qualification = block_on(Box::pin(qualify_object_store_reclamation(
+            Arc::clone(&qualified_client),
+            "qualified-prefix",
+            evidence,
+        )))
+        .expect("unversioned strong delete qualifies");
+        assert_eq!(qualification.evidence_digest(), evidence.evidence_digest());
+        assert!(qualification.matches_prefix(Path::new("qualified-prefix")));
+        assert!(!qualification.matches_prefix(Path::new("different-prefix")));
+
+        let versioned_client: Arc<dyn ObjectClient> =
+            Arc::new(ReclamationProbeClient::new(true, false));
+        assert!(matches!(
+            block_on(Box::pin(qualify_object_store_reclamation(
+                versioned_client,
+                "versioned-prefix",
+                evidence,
+            ))),
+            Err(Error::Corruption { .. })
+        ));
+
+        let sticky_client: Arc<dyn ObjectClient> =
+            Arc::new(ReclamationProbeClient::new(false, true));
+        assert!(matches!(
+            block_on(Box::pin(qualify_object_store_reclamation(
+                sticky_client,
+                "sticky-prefix",
+                evidence,
+            ))),
+            Err(Error::Corruption { .. })
+        ));
     }
 
     #[test]

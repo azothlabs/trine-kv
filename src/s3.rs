@@ -21,7 +21,9 @@ use object_store::{
 };
 
 use crate::error::{Error, Result};
-use crate::object_store::{ETag, ObjectClient, ObjectFuture, ObjectMeta, Precondition, PutIf};
+use crate::object_store::{
+    ETag, ObjectClient, ObjectFuture, ObjectMeta, ObjectVersion, Precondition, PutIf,
+};
 
 /// Adapts any [`object_store::ObjectStore`] to trine's [`ObjectClient`].
 #[derive(Clone)]
@@ -229,6 +231,7 @@ impl ObjectClient for ObjectStoreClient {
                     key: meta.location.as_ref().to_owned(),
                     size: meta.size,
                     etag: ETag::new(meta.e_tag.unwrap_or_default()),
+                    version: meta.version.map(ObjectVersion::new),
                 })
                 .collect())
         })
@@ -247,6 +250,7 @@ impl ObjectClient for ObjectStoreClient {
                         key: meta.location.as_ref().to_owned(),
                         size: meta.size,
                         etag,
+                        version: meta.version.map(ObjectVersion::new),
                     }))
                 }
                 Err(OsError::NotFound { .. }) => Ok(None),
@@ -297,12 +301,14 @@ impl ObjectClient for ObjectStoreClient {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::BTreeMap;
-    use std::sync::{Barrier, Mutex};
+    use std::sync::{Arc, Barrier, Mutex};
     use std::time::{Duration, Instant};
 
+    use super::{ObjectStoreClient, S3ClientOptions};
     use crate::Db;
+    use crate::error::{Error, Result};
+    use crate::object_store::{ETag, ObjectClient, ObjectFuture, ObjectMeta, Precondition, PutIf};
     use crate::options::DbOptions;
 
     fn memory_client() -> ObjectStoreClient {

@@ -17,7 +17,7 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use crate::{Db, DurabilityMode, Error, Result};
+use crate::{Db, DurabilityMode, Error, ObjectStoreReclamationEvidenceDigest, Result};
 
 const CONTENT_ID_SHA256_TAG: u8 = 1;
 const UPLOAD_TOKEN_VERSION: u8 = 1;
@@ -57,7 +57,7 @@ const CONTENT_READER_DRAIN_ATTESTATION_MAGIC: &[u8; 8] = b"TRNCRDA1";
 const CONTENT_READER_DRAIN_EVIDENCE_DOMAIN: &[u8] = b"trine-content-reader-drain-evidence-v1";
 const CONTENT_QUARANTINE_MAGIC: &[u8; 8] = b"TRNCQRT1";
 const CONTENT_RECLAIM_GRACE_MAGIC: &[u8; 8] = b"TRNCRGR1";
-const CONTENT_RECLAIM_SWEEP_MAGIC: &[u8; 8] = b"TRNCRSW1";
+const CONTENT_RECLAIM_SWEEP_MAGIC: &[u8; 8] = b"TRNCRSW2";
 const CONTENT_RECLAIM_CLOCK_EVIDENCE_DOMAIN: &[u8] = b"trine-content-reclaim-clock-evidence-v1";
 const CONTENT_RECLAIM_SWEEP_PREPARED: u8 = 0;
 const CONTENT_RECLAIM_SWEEP_RECLAIMED: u8 = 1;
@@ -973,8 +973,21 @@ pub struct ContentReclaimClockAttestation {
 pub struct ContentReclaimSweep {
     storage_domain_id: StorageDomainId,
     content_id: ContentId,
+    backend: ContentReclaimSweepBackend,
     prepared_at: crate::ReadVersion,
     reclaimed_at: Option<crate::ReadVersion>,
+}
+
+/// Backend evidence durably bound to a physical content sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentReclaimSweepBackend {
+    /// Independently qualified native filesystem deletion.
+    NativeFilesystem,
+    /// Qualified unversioned object-store deletion.
+    ObjectStore {
+        /// Digest of the external provider evidence used for qualification.
+        evidence_digest: ObjectStoreReclamationEvidenceDigest,
+    },
 }
 
 impl ContentReclaimSweep {
@@ -988,6 +1001,12 @@ impl ContentReclaimSweep {
     #[must_use]
     pub const fn content_id(self) -> ContentId {
         self.content_id
+    }
+
+    /// Returns the backend and provider evidence fixed at Prepared.
+    #[must_use]
+    pub const fn backend(self) -> ContentReclaimSweepBackend {
+        self.backend
     }
 
     /// Returns the commit sequence that established the irreversible fence.
@@ -2824,6 +2843,7 @@ pub(crate) struct ContentReclaimSweepRecord {
     pub(crate) clock_attestation: ContentReclaimClockAttestation,
     pub(crate) upload_id: UploadId,
     pub(crate) chunk_count: u64,
+    pub(crate) backend: ContentReclaimSweepBackend,
     pub(crate) state: ContentReclaimSweepRecordState,
     pub(crate) prepared_at: crate::ReadVersion,
     pub(crate) reclaimed_at: crate::ReadVersion,
@@ -2836,6 +2856,7 @@ impl ContentReclaimSweepRecord {
         grace: ContentReclaimGraceRecord,
         clock_attestation: ContentReclaimClockAttestation,
         descriptor: ContentDescriptor,
+        backend: ContentReclaimSweepBackend,
     ) -> Self {
         Self {
             storage_domain_id: authorization.storage_domain_id(),
@@ -2851,6 +2872,7 @@ impl ContentReclaimSweepRecord {
             clock_attestation,
             upload_id: descriptor.upload_id(),
             chunk_count: descriptor.chunk_count(),
+            backend,
             state: ContentReclaimSweepRecordState::Prepared,
             prepared_at: crate::ReadVersion::from_u64(0),
             reclaimed_at: crate::ReadVersion::from_u64(0),
@@ -2866,8 +2888,7 @@ impl ContentReclaimSweepRecord {
     }
 
     pub(crate) fn encode_prefix(self) -> Vec<u8> {
-        const PREFIX_LEN: usize =
-            8 + 1 + 16 + 33 + 49 + 8 + 8 + 8 + 8 + 16 + 8 + 16 + 16 + 16 + 33 + 8 + 16 + 8 + 8;
+        const PREFIX_LEN: usize = 318;
         let mut bytes = Vec::with_capacity(PREFIX_LEN);
         bytes.extend_from_slice(CONTENT_RECLAIM_SWEEP_MAGIC);
         bytes.push(match self.state {
@@ -2890,6 +2911,16 @@ impl ContentReclaimSweepRecord {
         bytes.extend_from_slice(&self.clock_attestation.observed_at_unix_ms().to_le_bytes());
         bytes.extend_from_slice(&self.upload_id.bytes());
         bytes.extend_from_slice(&self.chunk_count.to_le_bytes());
+        match self.backend {
+            ContentReclaimSweepBackend::NativeFilesystem => {
+                bytes.push(0);
+                bytes.extend_from_slice(&[0_u8; 33]);
+            }
+            ContentReclaimSweepBackend::ObjectStore { evidence_digest } => {
+                bytes.push(1);
+                bytes.extend_from_slice(&evidence_digest.to_bytes());
+            }
+        }
         bytes.extend_from_slice(&self.prepared_at.as_u64().to_be_bytes());
         bytes
     }
@@ -2900,8 +2931,7 @@ impl ContentReclaimSweepRecord {
         storage_domain_id: StorageDomainId,
         content_id: ContentId,
     ) -> Result<Self> {
-        const RECORD_LEN: usize =
-            8 + 1 + 16 + 33 + 49 + 8 + 8 + 8 + 8 + 16 + 8 + 16 + 16 + 16 + 33 + 8 + 16 + 8 + 8 + 8;
+        const RECORD_LEN: usize = 326;
         if bytes.len() != RECORD_LEN || bytes.get(..8) != Some(CONTENT_RECLAIM_SWEEP_MAGIC) {
             return Err(Error::InvalidFormat {
                 message: "invalid content reclaim-sweep header or length".to_owned(),
@@ -2988,14 +3018,31 @@ impl ContentReclaimSweepRecord {
             268,
             "content reclaim-sweep chunk count",
         )?);
+        let backend = match bytes[276] {
+            0 if bytes[277..310].iter().all(|byte| *byte == 0) => {
+                ContentReclaimSweepBackend::NativeFilesystem
+            }
+            1 => ContentReclaimSweepBackend::ObjectStore {
+                evidence_digest: ObjectStoreReclamationEvidenceDigest::from_bytes(array_at::<33>(
+                    bytes,
+                    277,
+                    "content reclaim-sweep provider evidence",
+                )?)?,
+            },
+            _ => {
+                return Err(Error::Corruption {
+                    message: "content reclaim-sweep has invalid backend evidence".to_owned(),
+                });
+            }
+        };
         let stored_prepared_at = crate::ReadVersion::from_u64(u64::from_be_bytes(array_at::<8>(
             bytes,
-            276,
+            310,
             "content reclaim-sweep prepared sequence",
         )?));
         let state_commit_at = crate::ReadVersion::from_u64(u64::from_be_bytes(array_at::<8>(
             bytes,
-            284,
+            318,
             "content reclaim-sweep state sequence",
         )?));
         let (state, prepared_at, reclaimed_at) = match bytes[8] {
@@ -3055,6 +3102,7 @@ impl ContentReclaimSweepRecord {
             clock_attestation,
             upload_id,
             chunk_count,
+            backend,
             state,
             prepared_at,
             reclaimed_at,
@@ -3065,6 +3113,7 @@ impl ContentReclaimSweepRecord {
         self,
         authorization: ContentReclaimAuthorization,
         clock_attestation: ContentReclaimClockAttestation,
+        backend: ContentReclaimSweepBackend,
     ) -> bool {
         self.state == ContentReclaimSweepRecordState::Prepared
             && self.storage_domain_id == authorization.storage_domain_id()
@@ -3073,12 +3122,14 @@ impl ContentReclaimSweepRecord {
             && self.verified_at == authorization.verified_at()
             && self.proof_expires_at_unix_ms == authorization.expires_at_unix_ms()
             && self.clock_attestation == clock_attestation
+            && self.backend == backend
     }
 
     pub(crate) const fn into_public(self) -> ContentReclaimSweep {
         ContentReclaimSweep {
             storage_domain_id: self.storage_domain_id,
             content_id: self.content_id,
+            backend: self.backend,
             prepared_at: self.prepared_at,
             reclaimed_at: match self.state {
                 ContentReclaimSweepRecordState::Prepared => None,

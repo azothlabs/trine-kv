@@ -100,13 +100,17 @@ the entire grace interval.
 - Clock rollback delays a later attempt but does not corrupt the record.
 - Clock advancement, NTP steps, VM resume, and restart downtime are not proved
   by this record.
-- `ObjectClient` currently exposes key delete, size, and ETag, but no provider
-  version id, delete marker, object lock, retention deadline, or legal hold.
-- S3/R2 adapter success therefore cannot yet prove that every provider version
-  was removed or retained as intended.
+- `ObjectClient` now exposes provider version identity, and sweep v2 rejects any
+  object-store qualification probe that observes one. It still cannot enumerate
+  provider control-plane locks, retention, legal holds, backup, or replication;
+  those remain host-retained external evidence.
+- S3-compatible DELETE success is never sufficient by itself. Qualification
+  probes protected path families, and the worker checks immediate absence after
+  each content-object delete.
 
-`content-reclaim-sweep-v1.md` defines that later final-validation protocol for
-the qualified native filesystem backend. It adds explicit trusted
+`content-reclaim-sweep-v2.md` defines that later final-validation protocol for
+qualified native and explicitly qualified unversioned object-store backends. It
+adds explicit trusted
 clock/restart evidence, a fresh logical proof, repeated physical checks, and a
 separately recoverable deletion state. Deadline passage by itself still changes
 no authority, and unsupported backends retain bytes.

@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use crate::{codec::CodecId, limits, prefix::PrefixExtractor, runtime::RuntimeOptions};
+use crate::{
+    codec::CodecId, limits, object_store::QualifiedObjectStoreReclamation, prefix::PrefixExtractor,
+    runtime::RuntimeOptions,
+};
 
 /// Storage location and host backend selected for a database.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,10 +55,17 @@ pub enum ContentReclamationMode {
     Disabled,
     /// Permit the v1 sweep on the qualified native filesystem backend.
     ///
-    /// Browser and object-store databases reject the sweep explicitly. This
-    /// variant does not claim provider-version, delete-marker, object-lock,
-    /// retention, or legal-hold support.
+    /// Browser and object-store databases reject this variant explicitly. It
+    /// does not claim provider-version, delete-marker, object-lock, retention,
+    /// or legal-hold support.
     QualifiedNativeFilesystem,
+    /// Permit sweeps for the exact object-store provider evidence that passed
+    /// [`crate::qualify_object_store_reclamation`].
+    ///
+    /// The qualification is not transferable to another bucket, key prefix,
+    /// provider configuration revision, or client. Prepared sweeps persist its
+    /// evidence digest and refuse to resume after a mismatch.
+    QualifiedObjectStore(QualifiedObjectStoreReclamation),
 }
 
 impl HostStorageBackend {
@@ -575,9 +585,11 @@ impl DbOptions {
     /// Enables or disables irreversible content-byte reclamation.
     ///
     /// [`ContentReclamationMode::QualifiedNativeFilesystem`] permits only native
-    /// filesystem sweeps. It does not start background deletion and does
-    /// not weaken any lifecycle proof; callers must explicitly stage and run a
-    /// final sweep for each exact content identity.
+    /// filesystem sweeps. [`ContentReclamationMode::QualifiedObjectStore`]
+    /// requires the capability returned by
+    /// [`crate::qualify_object_store_reclamation`]. Neither mode starts
+    /// background deletion or weakens lifecycle proof; callers must explicitly
+    /// stage and run a final sweep for each exact content identity.
     #[must_use]
     pub const fn with_content_reclamation(mut self, mode: ContentReclamationMode) -> Self {
         self.content_reclamation = mode;

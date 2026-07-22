@@ -1343,7 +1343,7 @@ impl Transaction {
         authorization: ContentReclaimAuthorization,
         clock_attestation: ContentReclaimClockAttestation,
     ) -> Result<ContentReclaimSweepStage> {
-        self.db.ensure_content_reclamation_supported()?;
+        let sweep_backend = self.db.content_reclaim_sweep_backend()?;
         let now_unix_ms = crate::content::current_epoch_millis()?;
         if now_unix_ms >= authorization.expires_at_unix_ms() {
             return Err(Error::ContentReclaimBlocked {
@@ -1495,7 +1495,7 @@ impl Transaction {
                 authorization.storage_domain_id(),
                 authorization.content_id(),
             )?;
-            if existing.matches_request(authorization, clock_attestation) {
+            if existing.matches_request(authorization, clock_attestation, sweep_backend) {
                 return Ok(ContentReclaimSweepStage::Existing {
                     prepared_at: existing.prepared_at,
                 });
@@ -1512,6 +1512,7 @@ impl Transaction {
             grace,
             clock_attestation,
             descriptor,
+            sweep_backend,
         );
         self.writes.put_bucket_with_commit_sequence(
             CONTENT_CONTROL_BUCKET,

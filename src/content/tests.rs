@@ -34,9 +34,10 @@ use crate::{
     ContentReclaimClockEvidenceDigest, ContentReclaimGraceStage, ContentReclaimIntentStage,
     ContentReclaimProofToken, ContentReclaimSweepStage, ContentReclamationMode,
     ContentUploadOptions, ContentUploadResume, Db, DbOptions, ETag, Error, HostStorageBackend,
-    InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta, OwnerScopeId, Precondition, PutIf,
+    InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta, ObjectStoreReclamationAttestation,
+    ObjectStoreReclamationEvidenceDigest, ObjectVersion, OwnerScopeId, Precondition, PutIf,
     ReadVersion, SealedContent, StorageDomainId, StorageMode, TransactionOptions, UploadId,
-    UploadToken,
+    UploadToken, qualify_object_store_reclamation,
 };
 
 const TEST_CHUNK_BYTES: usize = 64 * 1024;
@@ -1424,6 +1425,300 @@ fn qualified_filesystem_sweep_reclaims_after_reopen_and_allows_later_reupload() 
         db.close().await.expect("replacement db closes");
     });
     std::fs::remove_dir_all(path).expect("test database removes");
+}
+
+#[cfg(not(feature = "s3"))]
+#[test]
+fn qualified_object_store_sweep_binds_evidence_and_recovers_partial_delete() {
+    block_on(qualified_object_store_sweep_impl());
+}
+
+#[cfg(feature = "s3")]
+#[tokio::test(flavor = "multi_thread")]
+async fn qualified_object_store_sweep_binds_evidence_and_recovers_partial_delete() {
+    qualified_object_store_sweep_impl().await;
+}
+
+#[allow(clippy::too_many_lines)] // Provider evidence, reopen, fault, and retry form one safety proof.
+async fn qualified_object_store_sweep_impl() {
+    let prefix = "content-reclaim-sweep-object";
+    let client = Arc::new(MeasuredClient::new());
+    let probe_client: Arc<dyn ObjectClient> = client.clone();
+    let evidence = ObjectStoreReclamationEvidenceDigest::for_bytes(
+        b"test unversioned unlocked exclusive namespace revision 1",
+    );
+    let qualification = qualify_object_store_reclamation(
+        Arc::clone(&probe_client),
+        prefix,
+        ObjectStoreReclamationAttestation::new(evidence),
+    )
+    .await
+    .expect("object-store delete contract qualifies");
+    let options = || {
+        DbOptions::object_store()
+            .with_content_reclamation(ContentReclamationMode::QualifiedObjectStore(qualification))
+    };
+
+    let db = Db::open_object_store_at(client.clone(), prefix, options())
+        .await
+        .expect("qualified object database opens");
+    let sealed = seal_reclaim_content(&db, b"qualified object reclaim bytes").await;
+    consume_reclaim_token(&db, sealed, 111).await;
+    attest_reclaim_reader_drain(&db, sealed.storage_domain_id(), 112).await;
+    let (authorization, _) = commit_reclaim_quarantine(&db, sealed, 113).await;
+    let mut grace_tx = db.transaction(TransactionOptions::default());
+    grace_tx
+        .stage_content_reclaim_grace(authorization, Duration::from_millis(1))
+        .await
+        .expect("object grace stages");
+    grace_tx.commit().await.expect("object grace commits");
+    let grace = db
+        .content_reclaim_grace(sealed.storage_domain_id(), sealed.content_id())
+        .await
+        .expect("object grace reads")
+        .expect("object grace exists");
+    let clock = ContentReclaimClockAttestation::new(
+        grace,
+        test_reclaim_clock_attestation_id(114),
+        ContentReclaimClockCoordinatorId::from_bytes([115; 16]),
+        ContentReclaimClockEvidenceDigest::for_bytes(b"object clock evidence"),
+        grace.not_before_unix_ms(),
+    )
+    .expect("object clock binds grace");
+    let mut prepare = db.transaction(TransactionOptions::default());
+    let fresh = reclaim_authorization(&prepare, sealed, 116);
+    assert_eq!(
+        prepare
+            .stage_content_reclaim_sweep(fresh, clock)
+            .await
+            .expect("object sweep stages"),
+        ContentReclaimSweepStage::Staged
+    );
+    prepare.commit().await.expect("object Prepared commits");
+    let prepared = db
+        .content_reclaim_sweep(sealed.storage_domain_id(), sealed.content_id())
+        .await
+        .expect("object Prepared reads")
+        .expect("object Prepared exists");
+    assert!(prepared.reclaimed_at().is_none());
+    db.close().await.expect("object database closes");
+    drop(db);
+
+    let changed = qualify_object_store_reclamation(
+        Arc::clone(&probe_client),
+        prefix,
+        ObjectStoreReclamationAttestation::new(ObjectStoreReclamationEvidenceDigest::for_bytes(
+            b"test unversioned unlocked exclusive namespace revision 2",
+        )),
+    )
+    .await
+    .expect("changed evidence independently probes");
+    let mismatched = Db::open_object_store_at(
+        client.clone(),
+        prefix,
+        DbOptions::object_store()
+            .with_content_reclamation(ContentReclamationMode::QualifiedObjectStore(changed)),
+    )
+    .await
+    .expect("database opens with changed runtime evidence");
+    assert!(matches!(
+        mismatched
+            .resume_content_reclaim_sweep(sealed.storage_domain_id(), sealed.content_id())
+            .await,
+        Err(Error::UnsupportedBackend { .. })
+    ));
+    mismatched
+        .close()
+        .await
+        .expect("mismatched database closes");
+    drop(mismatched);
+
+    let resumed = Db::open_object_store_at(client.clone(), prefix, options())
+        .await
+        .expect("database reopens with original evidence");
+    client
+        .report_provider_version
+        .store(true, Ordering::Release);
+    assert!(matches!(
+        resumed
+            .resume_content_reclaim_sweep(sealed.storage_domain_id(), sealed.content_id())
+            .await,
+        Err(Error::UnsupportedBackend { .. })
+    ));
+    client
+        .report_provider_version
+        .store(false, Ordering::Release);
+    client
+        .fail_content_descriptor_delete_once
+        .store(true, Ordering::Release);
+    assert!(matches!(
+        resumed
+            .resume_content_reclaim_sweep(sealed.storage_domain_id(), sealed.content_id())
+            .await,
+        Err(Error::Io(_))
+    ));
+    assert!(
+        resumed
+            .content_reclaim_sweep(sealed.storage_domain_id(), sealed.content_id())
+            .await
+            .expect("failed object sweep remains readable")
+            .is_some_and(|sweep| sweep.reclaimed_at().is_none())
+    );
+    let reclaimed = resumed
+        .resume_content_reclaim_sweep(sealed.storage_domain_id(), sealed.content_id())
+        .await
+        .expect("object sweep resumes after injected delete failure");
+    assert!(reclaimed.reclaimed_at().is_some());
+    resumed.close().await.expect("reclaimed database closes");
+    drop(resumed);
+    assert!(
+        client
+            .list(prefix)
+            .await
+            .expect("reclaimed object prefix lists")
+            .iter()
+            .all(|meta| {
+                !meta.key.contains("/content-v1/chunks/") && !meta.key.contains("/descriptors/")
+            })
+    );
+    drop(probe_client);
+    drop(client);
+}
+
+#[cfg(feature = "s3")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires audited S3-compatible credentials and makes billable requests"]
+#[allow(clippy::too_many_lines)] // Full provider qualification and reclaim lifecycle stays auditable.
+async fn s3_live_qualified_content_reclamation() {
+    use crate::s3::{ObjectStoreClient, S3ClientOptions};
+
+    let Ok(bucket) = std::env::var("TRINE_S3_BUCKET") else {
+        eprintln!("skipping live reclamation: TRINE_S3_BUCKET is not set");
+        return;
+    };
+    let Ok(evidence) = std::env::var("TRINE_S3_RECLAMATION_EVIDENCE") else {
+        eprintln!(
+            "skipping live reclamation: set TRINE_S3_RECLAMATION_EVIDENCE only after auditing the exact provider namespace"
+        );
+        return;
+    };
+    let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "auto".to_owned());
+    let endpoint = std::env::var("AWS_ENDPOINT_URL").ok();
+    let allow_http = std::env::var("TRINE_S3_ALLOW_HTTP").is_ok_and(|value| value == "1");
+    let client: Arc<dyn ObjectClient> = Arc::new(
+        ObjectStoreClient::s3_with_options(
+            bucket,
+            region,
+            S3ClientOptions {
+                endpoint,
+                allow_http,
+            },
+        )
+        .expect("live S3-compatible client builds"),
+    );
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    let prefix = format!("trine-kv-it/content-reclaim/{}-{nonce}", std::process::id());
+    let qualification = qualify_object_store_reclamation(
+        Arc::clone(&client),
+        &prefix,
+        ObjectStoreReclamationAttestation::new(ObjectStoreReclamationEvidenceDigest::for_bytes(
+            evidence.as_bytes(),
+        )),
+    )
+    .await
+    .expect("live provider reclamation contract qualifies");
+    let options = || {
+        DbOptions::object_store()
+            .with_content_reclamation(ContentReclamationMode::QualifiedObjectStore(qualification))
+    };
+
+    let db = Db::open_object_store_at(Arc::clone(&client), &prefix, options())
+        .await
+        .expect("live qualified database opens");
+    let sealed = seal_reclaim_content(&db, b"live provider physical reclaim bytes").await;
+    consume_reclaim_token(&db, sealed, 121).await;
+    attest_reclaim_reader_drain(&db, sealed.storage_domain_id(), 122).await;
+    let (authorization, _) = commit_reclaim_quarantine(&db, sealed, 123).await;
+    let mut grace_tx = db.transaction(TransactionOptions::default());
+    grace_tx
+        .stage_content_reclaim_grace(authorization, Duration::from_millis(1))
+        .await
+        .expect("live provider grace stages");
+    grace_tx
+        .commit()
+        .await
+        .expect("live provider grace commits");
+    let grace = db
+        .content_reclaim_grace(sealed.storage_domain_id(), sealed.content_id())
+        .await
+        .expect("live provider grace reads")
+        .expect("live provider grace exists");
+    let clock = ContentReclaimClockAttestation::new(
+        grace,
+        test_reclaim_clock_attestation_id(124),
+        ContentReclaimClockCoordinatorId::from_bytes([125; 16]),
+        ContentReclaimClockEvidenceDigest::for_bytes(b"live provider monotonic clock evidence"),
+        grace.not_before_unix_ms(),
+    )
+    .expect("live provider clock binds grace");
+    let mut prepare = db.transaction(TransactionOptions::default());
+    let fresh = reclaim_authorization(&prepare, sealed, 126);
+    assert_eq!(
+        prepare
+            .stage_content_reclaim_sweep(fresh, clock)
+            .await
+            .expect("live provider sweep stages"),
+        ContentReclaimSweepStage::Staged
+    );
+    prepare
+        .commit()
+        .await
+        .expect("live provider Prepared commits");
+    db.close().await.expect("live provider closes at Prepared");
+
+    let reopened = Db::open_object_store_at(Arc::clone(&client), &prefix, options())
+        .await
+        .expect("live provider reopens at Prepared");
+    let reclaimed = reopened
+        .resume_content_reclaim_sweep(sealed.storage_domain_id(), sealed.content_id())
+        .await
+        .expect("live provider sweep resumes");
+    assert!(reclaimed.reclaimed_at().is_some());
+    assert!(matches!(
+        reopened
+            .open_content_leased(
+                sealed.storage_domain_id(),
+                sealed.content_id(),
+                ContentLeaseOptions::new(
+                    ContentLeaseOwnerId::from_bytes([127; 16]),
+                    Duration::from_secs(60),
+                ),
+            )
+            .await,
+        Err(Error::ContentNotFound { .. })
+    ));
+    reopened
+        .close()
+        .await
+        .expect("live provider database closes");
+
+    let remaining = client.list(&prefix).await.expect("live prefix lists");
+    assert!(
+        remaining.iter().all(|meta| {
+            !meta.key.contains("/content-v1/chunks/")
+                && !meta.key.contains("/content-v1/descriptors/")
+        }),
+        "reclaimed content bytes remain in the provider namespace"
+    );
+    for meta in remaining {
+        client
+            .delete(&meta.key)
+            .await
+            .expect("live fixture object deletes");
+    }
 }
 
 #[test]
@@ -3107,6 +3402,8 @@ struct MeasuredClient {
     fail_open_upload_states: AtomicBool,
     fail_sealing_upload_states: AtomicBool,
     fail_sealed_upload_states: AtomicBool,
+    fail_content_descriptor_delete_once: AtomicBool,
+    report_provider_version: AtomicBool,
 }
 
 impl MeasuredClient {
@@ -3122,6 +3419,8 @@ impl MeasuredClient {
             fail_open_upload_states: AtomicBool::new(false),
             fail_sealing_upload_states: AtomicBool::new(false),
             fail_sealed_upload_states: AtomicBool::new(false),
+            fail_content_descriptor_delete_once: AtomicBool::new(false),
+            report_provider_version: AtomicBool::new(false),
         }
     }
 
@@ -3203,6 +3502,18 @@ impl ObjectClient for MeasuredClient {
         {
             self.content_delete.fetch_add(1, Ordering::Relaxed);
         }
+        if key.contains("/content-v1/")
+            && key.contains("/descriptors/")
+            && self
+                .fail_content_descriptor_delete_once
+                .swap(false, Ordering::AcqRel)
+        {
+            return Box::pin(async move {
+                Err(Error::Io(io::Error::other(
+                    "injected object content descriptor delete failure",
+                )))
+            });
+        }
         self.inner.delete(key)
     }
 
@@ -3212,7 +3523,17 @@ impl ObjectClient for MeasuredClient {
 
     fn head<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<ObjectMeta>> {
         self.head.fetch_add(1, Ordering::Relaxed);
-        self.inner.head(key)
+        let key = key.to_owned();
+        Box::pin(async move {
+            self.inner.head(&key).await.map(|meta| {
+                meta.map(|mut meta| {
+                    if self.report_provider_version.load(Ordering::Acquire) {
+                        meta.version = Some(ObjectVersion::new("provider-version-after-prepare"));
+                    }
+                    meta
+                })
+            })
+        })
     }
 
     fn put_if<'op>(

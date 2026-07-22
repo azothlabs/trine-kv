@@ -4763,3 +4763,18 @@ soak harness.
 - Storage format, MVCC, WAL, manifest, SSTable, blob, compaction-policy, public
   API, durability-contract, provider-adapter, publishing, tagging, or pushing
   changes.
+
+### Consumer-selected slice: Qualified object-store content reclamation
+
+**Status**: Complete for TrineDB Phase 23.
+
+**Goal**: extend the default-off crash-resumable content sweep to one exact,
+explicitly qualified unversioned S3-compatible database prefix.
+
+**Acceptance Gate**: provider versions and sticky deletes fail closed; external
+evidence and exact prefix are bound to Prepared state; every actual deletion
+requires HEAD, GET, and LIST absence; MinIO and real R2 full lifecycles pass.
+
+**Major Out Of Scope**: version traversal, delete-marker cleanup, bypassing
+provider retention or locks, implicit endpoint qualification, browser/WASI
+reclamation, and background deletion.

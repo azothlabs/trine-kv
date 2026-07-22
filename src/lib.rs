@@ -162,15 +162,17 @@ pub use content::{
     ContentReclaimClockAttestation, ContentReclaimClockAttestationId,
     ContentReclaimClockCoordinatorId, ContentReclaimClockEvidenceDigest, ContentReclaimGrace,
     ContentReclaimGraceStage, ContentReclaimIntentStage, ContentReclaimProofToken,
-    ContentReclaimSweep, ContentReclaimSweepStage, ContentStream, ContentUpload,
-    ContentUploadOptions, ContentUploadResume, OwnerScopeId, SealedContent, StorageDomainId,
-    UploadId, UploadToken,
+    ContentReclaimSweep, ContentReclaimSweepBackend, ContentReclaimSweepStage, ContentStream,
+    ContentUpload, ContentUploadOptions, ContentUploadResume, OwnerScopeId, SealedContent,
+    StorageDomainId, UploadId, UploadToken,
 };
 pub use db::{Db, IntoOpenOptions, MaintenanceBudget, MaintenanceOutcome};
 pub use error::{ContentReclaimBlocker, Error, Result};
 pub use iterator::{Direction, Iter, LazyIter, LazyKeyValue, LazyValue};
 pub use object_store::{
-    ETag, InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta, Precondition, PutIf,
+    ETag, InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta,
+    ObjectStoreReclamationAttestation, ObjectStoreReclamationEvidenceDigest, ObjectVersion,
+    Precondition, PutIf, QualifiedObjectStoreReclamation, qualify_object_store_reclamation,
     verify_object_client_contract,
 };
 pub use options::{
