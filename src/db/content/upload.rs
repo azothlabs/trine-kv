@@ -164,15 +164,15 @@ impl Db {
         let current = self
             .read_content_physical_quota(&mut transaction, storage_domain_id)
             .await?;
-        if let Some(limit) = limit {
-            if current.accounted_bytes() > limit {
-                return Err(Error::ContentPhysicalQuotaExceeded {
-                    limit,
-                    unique_content_bytes: current.unique_content_bytes(),
-                    upload_reserved_bytes: current.upload_reserved_bytes(),
-                    requested_bytes: 0,
-                });
-            }
+        if let Some(limit) = limit
+            && current.accounted_bytes() > limit
+        {
+            return Err(Error::ContentPhysicalQuotaExceeded {
+                limit,
+                unique_content_bytes: current.unique_content_bytes(),
+                upload_reserved_bytes: current.upload_reserved_bytes(),
+                requested_bytes: 0,
+            });
         }
         let next = current.with_limit(limit);
         transaction.put_internal_bucket(
@@ -776,14 +776,13 @@ impl Db {
         if let Some(sweep) = self
             .content_reclaim_sweep(storage_domain_id, content_id)
             .await?
+            && sweep.reclaimed_at().is_none()
         {
-            if sweep.reclaimed_at().is_none() {
-                return Err(Error::ContentReclaimBlocked {
-                    blocker: crate::ContentReclaimBlocker::SweepPrepared {
-                        prepared_at_commit_seq: sweep.prepared_at().as_u64(),
-                    },
-                });
-            }
+            return Err(Error::ContentReclaimBlocked {
+                blocker: crate::ContentReclaimBlocker::SweepPrepared {
+                    prepared_at_commit_seq: sweep.prepared_at().as_u64(),
+                },
+            });
         }
         Ok(())
     }

@@ -144,7 +144,6 @@ mod table;
 pub mod transaction;
 /// Core key, value, range, read-version, and commit types.
 pub mod types;
-mod version;
 mod wal;
 /// Atomic write batch types.
 pub mod write_batch;

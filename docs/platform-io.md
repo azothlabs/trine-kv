@@ -25,14 +25,14 @@ Enable the portable baseline:
 
 ```toml
 [dependencies]
-trine-kv = { version = "0.5", features = ["platform-io"] }
+trine-kv = { version = "0.6", features = ["platform-io"] }
 ```
 
 Enable native-first platform I/O:
 
 ```toml
 [dependencies]
-trine-kv = { version = "0.5", features = ["platform-io-native"] }
+trine-kv = { version = "0.6", features = ["platform-io-native"] }
 ```
 
 The feature only makes the driver available. Select it for a database with

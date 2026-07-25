@@ -1,51 +1,49 @@
 # Current Phase
 
-## Full-code audit root-cause remediation
+## Rust 1.95 toolchain contract
 
 **Status:** Complete.
 
+### Goal
+
+- Make Rust 1.95 the real minimum compiler across package metadata, local
+  development, CI, publishing, production evidence, release docs, and the
+  dependency graph.
+- Move to the `0.6` release line because an MSRV increase is a compatibility
+  break for Rust 1.85 users.
+
 ### Implemented boundary
 
-- Commit and lifecycle invariants: strict same-sequence range tombstone table
-  dropping, bucket write admission/drain fencing, post-WAL fail-closed handling,
-  object-store sequence/WAL handoff ordering, stale read-only bucket refresh,
-  branch-cycle detection, and create/delete intent reconciliation.
-- Object durability: lease v3 epoch plus random owner nonce, exact
-  read-after-error reconciliation, idempotent manifest edits, PUT-response ETag
-  ownership, immutable WAL content identity, and segment/chain/replay/list
-  bounds.
-- Read and memory bounds: async indexed blob range reads, exact blob properties,
-  linear hash-index coverage validation, one-handle optional reads, exact global
-  block-cache capacity, and backend-neutral table byte statistics.
-- Liveness and atomicity: panic-to-completion worker behavior, wake-outside-lock,
-  terminal WAL lane failure, bounded write-backpressure waiting, browser
-  close-commit publication, and content seal/reclaim serialization.
-- Engineering gates: immutable action SHAs, workflow input isolation and strict
-  SemVer, benchmark-input validation, docs-drift hardening, and patched
-  object-store/XML dependencies.
+- Pin the repository toolchain and immutable GitHub Actions reference to Rust
+  1.95.0.
+- Remove the separate Rust 1.88 wasm-bindgen installation path.
+- Upgrade native platform-I/O dependencies to compio 0.19 and remove the
+  transitive unmaintained `paste` macro.
+- Update active dependency examples, release policy, changelog, and drift
+  checks.
+- Run the full Rust 1.95 verification gate and record evidence.
 
-### Verification evidence
+### Discovery result
 
-- Full all-target/all-feature test gate passes: 552 library tests with three
-  intentional provider-live ignores, every integration target, examples, and
-  benchmark target.
-- Strict all-target/all-feature Clippy, Rustdoc warnings, 31 doctests, formatting,
-  diff checks, documentation drift, and seven Python script tests pass.
+- Compio 0.19.1 requires both the `MaybeUninit` slice API and `cfg_select!`;
+  Rust 1.95 is the first stable toolchain satisfying the full dependency graph.
+- The official 0.19 dependency family replaces `paste` with maintained macros,
+  so no private fork or compiler escape hatch is required.
+
+### Acceptance gate
+
+- Rust 1.95 native all-target/all-feature tests, strict Clippy, Rustdoc,
+  doctests, eight examples, forced-exit recovery, mixed-load recovery, and six
+  destructive fault tests pass.
 - `wasm32-wasip1` strict compilation and seven persistence tests pass.
-  `wasm32-unknown-unknown` all-feature check/Clippy and 20 Chrome persistence,
-  dedicated-worker, and shared-worker tests pass.
-- Six destructive storage fault tests pass serially. `cargo audit` reports zero
-  vulnerabilities after `quinn-proto` 0.11.15; the only allowed warning is
-  compio's transitive unmaintained `paste` macro.
-
-### Remaining upstream boundary
-
-- Removing `paste` requires compio 0.19, whose `compio-buf` uses a standard
-  library API unavailable on Trine's Rust 1.85 MSRV without declaring the higher
-  requirement. Retain the audited compio 0.14 graph until upstream restores
-  MSRV compatibility or Trine deliberately changes its MSRV.
+  Browser all-feature check/Clippy and 20 Chrome OPFS/Worker tests pass.
+- Package content verification, `cargo package --locked`, and
+  `cargo publish --dry-run --locked` pass for `trine-kv 0.6.0`.
+- The freshly updated RustSec database reports zero vulnerabilities and zero
+  warnings; `paste` is absent from the dependency graph.
+- Seven script tests, documentation drift, formatting, and diff checks pass.
 
 ### Out of scope
 
-- Publishing, tagging, committing, pushing, multi-primary object writers,
-  versioned-object deletion, and new public features.
+- Rust beyond 1.95, private dependency forks, publishing, tagging, committing,
+  pushing, storage-format changes, and new public features.

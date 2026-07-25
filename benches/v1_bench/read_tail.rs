@@ -184,11 +184,10 @@ pub(super) fn push_scan_waste_row(
     let hidden = after
         .scan_tombstone_hidden_keys
         .saturating_sub(before.scan_tombstone_hidden_keys);
-    let ratio_x1000 = if user == 0 {
-        0
-    } else {
-        internal.saturating_mul(1_000) / user
-    };
+    let ratio_x1000 = internal
+        .saturating_mul(1_000)
+        .checked_div(user)
+        .unwrap_or(0);
 
     let base = labelled(label, phase);
     results.push(BenchResult::diagnostic(labelled(base, "user keys"), user));
@@ -269,17 +268,15 @@ pub(super) fn push_group_commit_diagnostic(
         .persist
         .requests
         .saturating_sub(before.storage_operations.persist.requests);
-    let ops_per_sec = if elapsed == 0 {
-        0
-    } else {
-        commits.saturating_mul(1_000_000) / elapsed
-    };
+    let ops_per_sec = commits
+        .saturating_mul(1_000_000)
+        .checked_div(elapsed)
+        .unwrap_or(0);
     // Commits served per fsync, scaled by 1000; >1000 means group commit batched.
-    let commits_per_persist_x1000 = if persists == 0 {
-        0
-    } else {
-        commits.saturating_mul(1_000) / persists
-    };
+    let commits_per_persist_x1000 = commits
+        .saturating_mul(1_000)
+        .checked_div(persists)
+        .unwrap_or(0);
 
     results.push(BenchResult::diagnostic(
         labelled(base, "total commits"),

@@ -4,6 +4,14 @@ All public crate releases use Semantic Versioning.
 
 ## Unreleased
 
+No unreleased changes.
+
+## 0.6.0 - 2026-07-25
+
+Toolchain and audit-hardening release. This release keeps the v1 public API and
+storage contracts while raising the minimum supported Rust version from 1.85
+to 1.95, which starts a new pre-`1.0` minor line.
+
 ### Added
 
 - Added explicit object-store content-reclamation qualification. A host-retained
@@ -14,12 +22,30 @@ All public crate releases use Semantic Versioning.
 
 ### Changed
 
+- The crate, repository toolchain, CI, publishing, production-evidence
+  workflows, documentation, and examples now use Rust 1.95 and the `0.6`
+  release line consistently.
+- Native platform I/O now uses the compio 0.19 dependency family, removing the
+  transitive unmaintained `paste` macro.
+- The wasm-bindgen CLI is installed by the same Rust 1.95 toolchain used to
+  compile and test Trine; the auxiliary Rust 1.88 installation is removed.
+- Source and test code now satisfy the Rust 1.95 strict Clippy gate, including
+  let-chain, saturating arithmetic, derived-default, and integer-multiple
+  idioms; unused scaffold-only version and WAL header types were removed.
 - Prepared content sweeps use the `TRNCRSW2` protected record, bind the backend
   and provider-evidence digest, and require the same qualification after reopen.
   There is no migration from an unfinished `TRNCRSW1` sweep.
 - Qualified cloud deletion checks for a provider version before DELETE and
   requires immediate HEAD, GET, and LIST absence afterward. Any uncertainty
   leaves the sweep Prepared for retry.
+
+### Fixed
+
+- Commit ordering, bucket deletion, object-store lease/CAS/WAL fencing,
+  recovery bounds, worker completion, browser publication, blob range reads,
+  cache capacity, table validation/statistics, dependency advisories, and
+  release-automation findings from the full-code audit are resolved at their
+  owning invariants.
 
 ## 0.5.13 - 2026-07-18
 

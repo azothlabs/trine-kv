@@ -88,15 +88,6 @@ const BOUND_EXCLUDED: u8 = 2;
 const MIN_WAL_OPERATION_BYTES: usize = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WalRecordHeader {
-    pub commit_sequence: Sequence,
-    pub operation_count: u32,
-    pub payload_len: u32,
-    pub header_checksum: u32,
-    pub payload_checksum: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalBatch {
     pub sequence: Sequence,
     pub operations: Vec<BatchOperation>,
@@ -835,10 +826,10 @@ impl Drop for WalFrontDoorLane {
         #[cfg(not(target_os = "wasi"))]
         {
             drop(self.sender.take());
-            if let Ok(mut worker) = self.worker.lock() {
-                if let Some(handle) = worker.take() {
-                    let _ = handle.join();
-                }
+            if let Ok(mut worker) = self.worker.lock()
+                && let Some(handle) = worker.take()
+            {
+                let _ = handle.join();
             }
         }
     }

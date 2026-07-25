@@ -141,22 +141,22 @@ impl StorageReadObject for NativeFileObject {
             );
         }
 
-        if let Some(runtime) = self.runtime.clone() {
-            if runtime.capabilities().blocking_adapter() {
-                let object = self.object.clone();
-                self.metrics.record_blocking_adapter_task();
-                return record_timed_storage_future(
-                    Arc::clone(&self.metrics),
-                    StorageOperation::ReadExactAtOwned,
-                    Box::pin(async move {
-                        BlockingAdapterIoDriver::new(runtime)
-                            .submit_read_exact_at_owned(move || {
-                                read_exact_at_native_file_owned(&object, offset, len)
-                            })?
-                            .await
-                    }),
-                );
-            }
+        if let Some(runtime) = self.runtime.clone()
+            && runtime.capabilities().blocking_adapter()
+        {
+            let object = self.object.clone();
+            self.metrics.record_blocking_adapter_task();
+            return record_timed_storage_future(
+                Arc::clone(&self.metrics),
+                StorageOperation::ReadExactAtOwned,
+                Box::pin(async move {
+                    BlockingAdapterIoDriver::new(runtime)
+                        .submit_read_exact_at_owned(move || {
+                            read_exact_at_native_file_owned(&object, offset, len)
+                        })?
+                        .await
+                }),
+            );
         }
         self.metrics.record_inline_task();
         record_timed_storage_future(
@@ -312,32 +312,32 @@ impl StorageAppendObject for NativeFileAppendObject {
             );
         }
 
-        if let Some(runtime) = self.runtime.clone() {
-            if runtime.capabilities().blocking_adapter() {
-                let object = self.object.clone();
-                let file = match self.file_handle() {
-                    Ok(file) => file,
-                    Err(error) => return Box::pin(async move { Err(error) }),
-                };
-                self.metrics.record_blocking_adapter_task();
-                return record_timed_storage_future(
-                    Arc::clone(&self.metrics),
-                    StorageOperation::Append,
-                    Box::pin(async move {
-                        BlockingAdapterIoDriver::new(runtime)
-                            .submit_append(move || {
-                                let mut file = lock_native_append_file(file.as_ref(), &object)?;
-                                append_native_file_object(
-                                    &mut file,
-                                    &object,
-                                    bytes.as_ref(),
-                                    durability,
-                                )
-                            })?
-                            .await
-                    }),
-                );
-            }
+        if let Some(runtime) = self.runtime.clone()
+            && runtime.capabilities().blocking_adapter()
+        {
+            let object = self.object.clone();
+            let file = match self.file_handle() {
+                Ok(file) => file,
+                Err(error) => return Box::pin(async move { Err(error) }),
+            };
+            self.metrics.record_blocking_adapter_task();
+            return record_timed_storage_future(
+                Arc::clone(&self.metrics),
+                StorageOperation::Append,
+                Box::pin(async move {
+                    BlockingAdapterIoDriver::new(runtime)
+                        .submit_append(move || {
+                            let mut file = lock_native_append_file(file.as_ref(), &object)?;
+                            append_native_file_object(
+                                &mut file,
+                                &object,
+                                bytes.as_ref(),
+                                durability,
+                            )
+                        })?
+                        .await
+                }),
+            );
         }
 
         self.metrics.record_inline_task();
@@ -359,27 +359,27 @@ impl StorageAppendObject for NativeFileAppendObject {
             );
         }
 
-        if let Some(runtime) = self.runtime.clone() {
-            if runtime.capabilities().blocking_adapter() {
-                let object = self.object.clone();
-                let file = match self.file_handle() {
-                    Ok(file) => file,
-                    Err(error) => return Box::pin(async move { Err(error) }),
-                };
-                self.metrics.record_blocking_adapter_task();
-                return record_timed_storage_future(
-                    Arc::clone(&self.metrics),
-                    StorageOperation::Persist,
-                    Box::pin(async move {
-                        BlockingAdapterIoDriver::new(runtime)
-                            .submit_sync(move || {
-                                let mut file = lock_native_append_file(file.as_ref(), &object)?;
-                                persist_native_append_file(&mut file, &object, durability)
-                            })?
-                            .await
-                    }),
-                );
-            }
+        if let Some(runtime) = self.runtime.clone()
+            && runtime.capabilities().blocking_adapter()
+        {
+            let object = self.object.clone();
+            let file = match self.file_handle() {
+                Ok(file) => file,
+                Err(error) => return Box::pin(async move { Err(error) }),
+            };
+            self.metrics.record_blocking_adapter_task();
+            return record_timed_storage_future(
+                Arc::clone(&self.metrics),
+                StorageOperation::Persist,
+                Box::pin(async move {
+                    BlockingAdapterIoDriver::new(runtime)
+                        .submit_sync(move || {
+                            let mut file = lock_native_append_file(file.as_ref(), &object)?;
+                            persist_native_append_file(&mut file, &object, durability)
+                        })?
+                        .await
+                }),
+            );
         }
 
         self.metrics.record_inline_task();
@@ -447,10 +447,8 @@ impl Drop for NativeFileWriterLease {
     fn drop(&mut self) {
         let should_clear = fs::read_to_string(self.object.path())
             .is_ok_and(|contents| contents.as_str() == self.owner.as_str());
-        if should_clear {
-            if let Some(file) = self.file.as_mut() {
-                let _ = clear_native_file_writer_lease_owner(file);
-            }
+        if should_clear && let Some(file) = self.file.as_mut() {
+            let _ = clear_native_file_writer_lease_owner(file);
         }
         #[cfg(target_os = "wasi")]
         {

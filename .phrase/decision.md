@@ -80,6 +80,14 @@ Evidence notes should separate:
 - Public crate versions use Semantic Versioning. Before `1.0.0`, breaking
   public API or storage-contract changes should increment the minor version;
   compatible fixes should increment the patch version.
+- Raising the minimum supported Rust version is a compatibility change and
+  increments the minor version before `1.0.0`. Trine `0.6.x` has a Rust 1.95
+  floor, and `Cargo.toml`, `rust-toolchain.toml`, CI, publishing, and production
+  evidence must keep that floor aligned.
+- Native platform I/O uses the compio 0.19 dependency family on the Rust 1.95
+  line. Rust 1.95 stabilizes the `cfg_select!` macro used by
+  `compio-executor`; do not weaken this dependency contract through
+  `RUSTC_BOOTSTRAP` or a private vendored fork.
 - Do not change MVCC, WAL, SSTable, manifest, compaction, transaction,
   prefix-filter, compression, or search-policy behavior without updating the
   protocol spec or adding a follow-up ADR.

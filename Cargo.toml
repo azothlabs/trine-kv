@@ -1,8 +1,8 @@
 [package]
 name = "trine-kv"
-version = "0.5.13"
+version = "0.6.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 description = "Embedded LSM MVCC key-value database."
 readme = "README.md"
@@ -96,10 +96,10 @@ wasm-bindgen-test = "0.3.55"
 # Cross-platform advisory file locks for native writer leases. The lock is bound
 # to the open LOCK file handle so crash recovery is handled by the OS.
 fs4 = { version = "0.13.1", default-features = false, features = ["sync"] }
-compio = { version = "0.14.0", default-features = false, features = ["runtime"], optional = true }
-compio-driver = { version = "0.7.1", default-features = false, features = ["io-uring"], optional = true }
-compio-fs = { version = "0.7.0", default-features = false, features = ["io-uring"], optional = true }
-compio-runtime = { version = "0.7.0", default-features = false, features = ["io-uring"], optional = true }
+compio = { version = "0.19.1", default-features = false, features = ["fs", "io-uring"], optional = true }
+compio-driver = { version = "0.12.4", default-features = false, features = ["io-uring"], optional = true }
+compio-fs = { version = "0.12.0", default-features = false, optional = true }
+compio-runtime = { version = "0.12.3", default-features = false, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = { version = "0.6.2", optional = true }

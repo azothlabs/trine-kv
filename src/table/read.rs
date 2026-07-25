@@ -46,10 +46,10 @@ impl Table {
     }
 
     pub(crate) fn range_tombstones(&self) -> Result<Arc<RangeTombstoneIndex<TableRangeTombstone>>> {
-        if let Ok(guard) = self.range_tombstones.read() {
-            if let Some(tombstones) = guard.as_ref() {
-                return Ok(Arc::clone(tombstones));
-            }
+        if let Ok(guard) = self.range_tombstones.read()
+            && let Some(tombstones) = guard.as_ref()
+        {
+            return Ok(Arc::clone(tombstones));
         }
 
         let tombstones = RangeTombstoneIndex::new(self.load_range_tombstones()?);
@@ -67,10 +67,10 @@ impl Table {
     pub(crate) async fn range_tombstones_async(
         &self,
     ) -> Result<Arc<RangeTombstoneIndex<TableRangeTombstone>>> {
-        if let Ok(guard) = self.range_tombstones.read() {
-            if let Some(tombstones) = guard.as_ref() {
-                return Ok(Arc::clone(tombstones));
-            }
+        if let Ok(guard) = self.range_tombstones.read()
+            && let Some(tombstones) = guard.as_ref()
+        {
+            return Ok(Arc::clone(tombstones));
         }
 
         let tombstones = RangeTombstoneIndex::new(self.load_range_tombstones_async().await?);

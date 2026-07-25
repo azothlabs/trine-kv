@@ -11,6 +11,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECKOUT_ACTION_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+RUST_VERSION = "1.95"
+RUST_TOOLCHAIN_CHANNEL = "1.95.0"
+RUST_TOOLCHAIN_ACTION_SHA = "f133eefe930d61f0d9371efd474daf0125ed3dd1"
 
 
 def require_snippets(path: str, snippets: tuple[str, ...]) -> list[str]:
@@ -48,6 +51,31 @@ def check_dependency_versions() -> list[str]:
         errors.append(
             f"docs/release.md: current release line must be `{expected_minor}.x`"
         )
+    if manifest["package"].get("rust-version") != RUST_VERSION:
+        errors.append(
+            "Cargo.toml: package rust-version must match the audited "
+            f"Rust {RUST_VERSION} MSRV"
+        )
+
+    toolchain = tomllib.loads(
+        (ROOT / "rust-toolchain.toml").read_text(encoding="utf-8")
+    )["toolchain"]
+    if toolchain.get("channel") != RUST_TOOLCHAIN_CHANNEL:
+        errors.append(
+            "rust-toolchain.toml: channel must match the audited "
+            f"Rust {RUST_TOOLCHAIN_CHANNEL} toolchain"
+        )
+    if set(toolchain.get("components", [])) != {"clippy", "rustfmt"}:
+        errors.append(
+            "rust-toolchain.toml: components must contain exactly clippy and rustfmt"
+        )
+    if set(toolchain.get("targets", [])) != {
+        "wasm32-unknown-unknown",
+        "wasm32-wasip1",
+    }:
+        errors.append(
+            "rust-toolchain.toml: targets must contain both supported WASM targets"
+        )
     return errors
 
 
@@ -82,6 +110,15 @@ def check_checkout_action_versions() -> list[str]:
                 errors.append(
                     f"{workflow.relative_to(ROOT)}: actions/checkout uses {reference}; "
                     f"expected audited v7 commit {CHECKOUT_ACTION_SHA}"
+                )
+            if (
+                action == "dtolnay/rust-toolchain"
+                and reference != RUST_TOOLCHAIN_ACTION_SHA
+            ):
+                errors.append(
+                    f"{workflow.relative_to(ROOT)}: dtolnay/rust-toolchain uses "
+                    f"{reference}; expected audited Rust {RUST_TOOLCHAIN_CHANNEL} "
+                    f"commit {RUST_TOOLCHAIN_ACTION_SHA}"
                 )
     return errors
 
@@ -128,8 +165,7 @@ def check_release_contract() -> list[str]:
         'RUSTFLAGS="-D warnings" cargo check --target wasm32-wasip1 --lib --all-features',
     )
     wasm_runner_install = (
-        "rustup toolchain install 1.88.0 --profile minimal",
-        f"cargo +1.88.0 install wasm-bindgen-cli --version {wasm_bindgen_version} --locked",
+        f"cargo install wasm-bindgen-cli --version {wasm_bindgen_version} --locked",
     )
     browser_runner_environment = ('WASM_BINDGEN_TEST_NO_ORIGIN_ISOLATION: "1"',)
     package_exclusions = (
@@ -146,7 +182,7 @@ def check_release_contract() -> list[str]:
     errors.extend(
         require_snippets(
             "docs/release.md",
-            (f"wasm-bindgen-cli {wasm_bindgen_version}", "Rust 1.88", "Rust 1.85"),
+            (f"wasm-bindgen-cli {wasm_bindgen_version}", f"Rust {RUST_VERSION}"),
         )
     )
     errors.extend(require_snippets("docs/release.md", wasi_warning_gate))

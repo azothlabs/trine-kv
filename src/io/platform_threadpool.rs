@@ -135,10 +135,8 @@ pub(super) fn write_temp_rename(
     create_parent: bool,
     sync_parent_after_rename: bool,
 ) -> Result<()> {
-    if create_parent {
-        if let Some(parent) = tmp_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+    if create_parent && let Some(parent) = tmp_path.parent() {
+        fs::create_dir_all(parent)?;
     }
 
     {

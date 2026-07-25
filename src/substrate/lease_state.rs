@@ -216,10 +216,7 @@ pub(super) fn current_epoch_millis() -> Result<u64> {
 }
 
 pub(super) fn object_lease_deadline_ms(now_ms: u64) -> u64 {
-    let ttl_ms = match u64::try_from(OBJECT_LEASE_TTL.as_millis()) {
-        Ok(value) => value,
-        Err(_) => u64::MAX,
-    };
+    let ttl_ms = u64::try_from(OBJECT_LEASE_TTL.as_millis()).unwrap_or(u64::MAX);
     now_ms.saturating_add(ttl_ms)
 }
 

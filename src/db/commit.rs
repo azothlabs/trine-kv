@@ -401,13 +401,12 @@ impl Db {
             accept_wal,
         } = sequenced;
 
-        if accept_wal {
-            if let Err(error) =
+        if accept_wal
+            && let Err(error) =
                 self.accept_wal_front_door(slot.sequence(), &prepared.wal_operations, durability)
-            {
-                self.inner.commit_tracker.mark_skipped(slot)?;
-                return Err(error);
-            }
+        {
+            self.inner.commit_tracker.mark_skipped(slot)?;
+            return Err(error);
         }
 
         Ok(DurableSequencedWrite::new(prepared, slot))
@@ -480,14 +479,13 @@ impl Db {
             accept_wal,
         } = sequenced;
 
-        if accept_wal {
-            if let Err(error) = self
+        if accept_wal
+            && let Err(error) = self
                 .accept_wal_front_door_async(slot.sequence(), &prepared.wal_operations, durability)
                 .await
-            {
-                self.inner.commit_tracker.mark_skipped(slot)?;
-                return Err(error);
-            }
+        {
+            self.inner.commit_tracker.mark_skipped(slot)?;
+            return Err(error);
         }
 
         Ok(DurableSequencedWrite::new(prepared, slot))

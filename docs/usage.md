@@ -31,11 +31,12 @@ index in sync.
 
 ## Add The Crate
 
-Published releases use Semantic Versioning. For the `0.5` release line:
+Published releases use Semantic Versioning. The `0.6` release line requires
+Rust 1.95 or newer:
 
 ```toml
 [dependencies]
-trine-kv = "0.5"
+trine-kv = "0.6"
 ```
 
 For local development from this repository:
@@ -55,7 +56,7 @@ stack:
 
 ```toml
 [dependencies]
-trine-kv = { version = "0.5", features = ["platform-io"] }
+trine-kv = { version = "0.6", features = ["platform-io"] }
 ```
 
 Enable native platform I/O when you want Trine to prefer audited native async
@@ -64,7 +65,7 @@ yet have native support:
 
 ```toml
 [dependencies]
-trine-kv = { version = "0.5", features = ["platform-io-native"] }
+trine-kv = { version = "0.6", features = ["platform-io-native"] }
 ```
 
 The feature makes the platform driver available. A database uses it only after

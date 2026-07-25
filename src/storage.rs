@@ -1024,15 +1024,15 @@ impl NativeFileBackend {
     where
         T: Send + 'static,
     {
-        if let Some(runtime) = self.runtime.clone() {
-            if runtime.capabilities().blocking_adapter() {
-                self.metrics.record_blocking_adapter_task();
-                return record_timed_storage_future(
-                    Arc::clone(&self.metrics),
-                    operation,
-                    Box::pin(async move { runtime.spawn_blocking_result(task)?.await }),
-                );
-            }
+        if let Some(runtime) = self.runtime.clone()
+            && runtime.capabilities().blocking_adapter()
+        {
+            self.metrics.record_blocking_adapter_task();
+            return record_timed_storage_future(
+                Arc::clone(&self.metrics),
+                operation,
+                Box::pin(async move { runtime.spawn_blocking_result(task)?.await }),
+            );
         }
 
         self.metrics.record_inline_task();

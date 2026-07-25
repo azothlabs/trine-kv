@@ -571,10 +571,7 @@ impl ContentHandle {
         if length == 0 || start == self.descriptor.length() {
             return Ok(Arc::from([]));
         }
-        let end = start
-            .checked_add(length)
-            .unwrap_or(u64::MAX)
-            .min(self.descriptor.length());
+        let end = start.saturating_add(length).min(self.descriptor.length());
         let result_len = usize::try_from(end - start)
             .map_err(|_| Error::invalid_options("requested content range exceeds usize"))?;
         let mut result = Vec::with_capacity(result_len);

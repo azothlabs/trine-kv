@@ -91,7 +91,7 @@ fn test_scope() -> ContentAttachmentScope {
 }
 
 fn test_upload_options() -> ContentUploadOptions {
-    ContentUploadOptions::new(test_scope(), Duration::from_secs(60 * 60))
+    ContentUploadOptions::new(test_scope(), Duration::from_hours(1))
 }
 
 #[test]
@@ -794,7 +794,7 @@ fn leased_only_barrier_fences_new_unleased_opens_but_not_old_handles() {
                 sealed.content_id(),
                 ContentLeaseOptions::new(
                     ContentLeaseOwnerId::from_bytes([5; 16]),
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                 ),
             )
             .await
@@ -1261,7 +1261,7 @@ fn quarantine_blocks_reads_is_idempotent_and_can_revive() {
                 sealed.content_id(),
                 ContentLeaseOptions::new(
                     ContentLeaseOwnerId::from_bytes([72; 16]),
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                 ),
             )
             .await,
@@ -1303,7 +1303,7 @@ fn quarantine_blocks_reads_is_idempotent_and_can_revive() {
             sealed.content_id(),
             ContentLeaseOptions::new(
                 ContentLeaseOwnerId::from_bytes([74; 16]),
-                Duration::from_secs(60),
+                Duration::from_mins(1),
             ),
         )
         .await
@@ -1385,7 +1385,7 @@ fn leased_open_racing_staged_quarantine_forces_transaction_conflict() {
             sealed.content_id(),
             ContentLeaseOptions::new(
                 ContentLeaseOwnerId::from_bytes([76; 16]),
-                Duration::from_secs(60),
+                Duration::from_mins(1),
             ),
         )
         .await
@@ -1452,7 +1452,7 @@ fn quarantine_survives_native_reopen_and_keeps_leased_reads_fenced() {
                     content_id,
                     ContentLeaseOptions::new(
                         ContentLeaseOwnerId::from_bytes([78; 16]),
-                        Duration::from_secs(60),
+                        Duration::from_mins(1),
                     ),
                 )
                 .await,
@@ -1491,7 +1491,7 @@ fn malformed_quarantine_fails_reads_and_revival_closed() {
                 sealed.content_id(),
                 ContentLeaseOptions::new(
                     ContentLeaseOwnerId::from_bytes([79; 16]),
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                 ),
             )
             .await,
@@ -1541,7 +1541,7 @@ fn reclaim_grace_requires_quarantine_is_idempotent_and_keeps_bytes() {
         let mut without_quarantine = db.transaction(TransactionOptions::default());
         assert!(matches!(
             without_quarantine
-                .stage_content_reclaim_grace(authorization, Duration::from_secs(60))
+                .stage_content_reclaim_grace(authorization, Duration::from_mins(1))
                 .await,
             Err(Error::ContentReclaimBlocked {
                 blocker: ContentReclaimBlocker::QuarantineRequired,
@@ -1557,7 +1557,7 @@ fn reclaim_grace_requires_quarantine_is_idempotent_and_keeps_bytes() {
         let mut grace = db.transaction(TransactionOptions::default());
         assert_eq!(
             grace
-                .stage_content_reclaim_grace(authorization, Duration::from_secs(60))
+                .stage_content_reclaim_grace(authorization, Duration::from_mins(1))
                 .await
                 .expect("grace stages"),
             ContentReclaimGraceStage::Staged
@@ -1586,7 +1586,7 @@ fn reclaim_grace_requires_quarantine_is_idempotent_and_keeps_bytes() {
         let mut repeated = db.transaction(TransactionOptions::default());
         assert_eq!(
             repeated
-                .stage_content_reclaim_grace(authorization, Duration::from_secs(60))
+                .stage_content_reclaim_grace(authorization, Duration::from_mins(1))
                 .await
                 .expect("grace retry reads existing record"),
             ContentReclaimGraceStage::Existing {
@@ -1639,7 +1639,7 @@ fn fresh_proof_recovers_quarantine_committed_before_grace() {
         );
         assert!(matches!(
             future
-                .stage_content_reclaim_grace(future_authorization, Duration::from_secs(60),)
+                .stage_content_reclaim_grace(future_authorization, Duration::from_mins(1),)
                 .await,
             Err(Error::InvalidOptions { .. })
         ));
@@ -1650,7 +1650,7 @@ fn fresh_proof_recovers_quarantine_committed_before_grace() {
         assert!(fresh.verified_at().as_u64() >= quarantined_at.as_u64());
         assert_eq!(
             recovery
-                .stage_content_reclaim_grace(fresh, Duration::from_secs(60))
+                .stage_content_reclaim_grace(fresh, Duration::from_mins(1))
                 .await
                 .expect("fresh proof stages grace over continuous quarantine"),
             ContentReclaimGraceStage::Staged
@@ -1679,7 +1679,7 @@ fn reclaim_grace_survives_reopen_and_upload_activity_revives_content() {
         let (authorization, _) = commit_reclaim_quarantine(&db, sealed, 72).await;
         let mut grace = db.transaction(TransactionOptions::default());
         grace
-            .stage_content_reclaim_grace(authorization, Duration::from_secs(120))
+            .stage_content_reclaim_grace(authorization, Duration::from_mins(2))
             .await
             .expect("native grace stages");
         grace.commit().await.expect("native grace commits");
@@ -1799,7 +1799,7 @@ fn qualified_filesystem_sweep_reclaims_after_reopen_and_allows_later_reupload() 
                 sealed.content_id(),
                 ContentLeaseOptions::new(
                     ContentLeaseOwnerId::from_bytes([58; 16]),
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                 ),
             )
             .await,
@@ -1888,7 +1888,7 @@ fn qualified_filesystem_sweep_reclaims_after_reopen_and_allows_later_reupload() 
                 sealed.content_id(),
                 ContentLeaseOptions::new(
                     ContentLeaseOwnerId::from_bytes([59; 16]),
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                 ),
             )
             .await,
@@ -1922,7 +1922,7 @@ fn qualified_filesystem_sweep_reclaims_after_reopen_and_allows_later_reupload() 
                 replacement.content_id(),
                 ContentLeaseOptions::new(
                     ContentLeaseOwnerId::from_bytes([60; 16]),
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                 ),
             )
             .await
@@ -2317,7 +2317,7 @@ async fn s3_live_qualified_content_reclamation() {
                 sealed.content_id(),
                 ContentLeaseOptions::new(
                     ContentLeaseOwnerId::from_bytes([127; 16]),
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                 ),
             )
             .await,
@@ -2385,7 +2385,7 @@ fn refreshed_object_store_reader_observes_grace_without_content_delete() {
         client.reset_counts();
         let mut grace = writer.transaction(TransactionOptions::default());
         grace
-            .stage_content_reclaim_grace(authorization, Duration::from_secs(60))
+            .stage_content_reclaim_grace(authorization, Duration::from_mins(1))
             .await
             .expect("object-store grace stages");
         grace.commit().await.expect("object-store grace commits");
@@ -2449,7 +2449,7 @@ fn upload_activity_racing_staged_reclaim_grace_forces_conflict() {
         let (authorization, _) = commit_reclaim_quarantine(&db, sealed, 74).await;
         let mut grace = db.transaction(TransactionOptions::default());
         grace
-            .stage_content_reclaim_grace(authorization, Duration::from_secs(60))
+            .stage_content_reclaim_grace(authorization, Duration::from_mins(1))
             .await
             .expect("grace stages before upload activity");
 
@@ -2612,7 +2612,7 @@ fn reclaim_intent_is_blocked_by_lease_and_later_lease_supersedes_it() {
                 sealed.content_id(),
                 ContentLeaseOptions::new(
                     ContentLeaseOwnerId::from_bytes([13; 16]),
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                 ),
             )
             .await
@@ -2648,7 +2648,7 @@ fn concurrent_lease_conflicts_with_staged_reclaim_intent() {
             sealed.content_id(),
             ContentLeaseOptions::new(
                 ContentLeaseOwnerId::from_bytes([14; 16]),
-                Duration::from_secs(60),
+                Duration::from_mins(1),
             ),
         )
         .await
@@ -2845,7 +2845,7 @@ fn physical_hold_blocks_intent_release_allows_it_and_later_hold_supersedes() {
                 ContentPhysicalHoldOptions::expiring(
                     ContentPhysicalHoldKind::Migration,
                     owner,
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                 ),
             )
             .await
@@ -2938,7 +2938,7 @@ fn concurrent_physical_hold_conflicts_with_staged_reclaim_intent() {
             ContentPhysicalHoldOptions::expiring(
                 ContentPhysicalHoldKind::Repair,
                 ContentPhysicalHoldOwnerId::from_bytes([18; 16]),
-                Duration::from_secs(60),
+                Duration::from_mins(1),
             ),
         )
         .await
@@ -2968,14 +2968,14 @@ fn physical_hold_renewal_expiry_and_owner_checks_fail_closed() {
                 ContentPhysicalHoldOptions::expiring(
                     ContentPhysicalHoldKind::Provider,
                     owner,
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                 ),
             )
             .await
             .expect("provider hold acquires");
         let before = hold.expires_at_unix_ms().expect("expiry exists");
         let renewed = hold
-            .renew(Duration::from_secs(120))
+            .renew(Duration::from_mins(2))
             .await
             .expect("provider hold renews");
         assert!(renewed >= before);
@@ -3006,7 +3006,7 @@ fn physical_hold_renewal_expiry_and_owner_checks_fail_closed() {
             .expect("short provider hold acquires");
         thread::sleep(Duration::from_millis(10));
         assert!(matches!(
-            short.renew(Duration::from_secs(60)).await,
+            short.renew(Duration::from_mins(1)).await,
             Err(Error::ContentPhysicalHoldExpired { .. })
         ));
         assert!(matches!(
@@ -3017,7 +3017,7 @@ fn physical_hold_renewal_expiry_and_owner_checks_fail_closed() {
                 ContentPhysicalHoldOptions::expiring(
                     ContentPhysicalHoldKind::Provider,
                     owner,
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                 ),
             )
             .await,
@@ -3232,7 +3232,7 @@ fn leased_content_open_clone_renew_and_expiry_fail_closed() {
             .open_content_leased(
                 test_scope().storage_domain_id(),
                 sealed.content_id(),
-                ContentLeaseOptions::new(owner, Duration::from_secs(60)),
+                ContentLeaseOptions::new(owner, Duration::from_mins(1)),
             )
             .await
             .expect("leased content opens");
@@ -3255,7 +3255,7 @@ fn leased_content_open_clone_renew_and_expiry_fail_closed() {
 
         let before = handle.lease_expires_at_unix_ms().expect("deadline exists");
         let renewed = clone
-            .renew_lease(Duration::from_secs(120))
+            .renew_lease(Duration::from_mins(2))
             .await
             .expect("lease renews");
         assert!(renewed >= before);
@@ -3284,7 +3284,7 @@ fn leased_content_open_clone_renew_and_expiry_fail_closed() {
             Err(Error::ContentLeaseExpired { .. })
         ));
         assert!(matches!(
-            clone.renew_lease(Duration::from_secs(60)).await,
+            clone.renew_lease(Duration::from_mins(1)).await,
             Err(Error::ContentLeaseExpired { .. })
         ));
         assert!(
@@ -3334,7 +3334,7 @@ fn durable_content_lease_survives_reopen_and_malformed_state_fails_closed() {
                 sealed.content_id(),
                 ContentLeaseOptions::new(
                     ContentLeaseOwnerId::from_bytes([10_u8; 16]),
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                 ),
             )
             .await

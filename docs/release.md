@@ -13,11 +13,17 @@ Trine KV crate versions use Semantic Versioning:
   corrections.
 
 Before `1.0.0`, the crate still uses SemVer-formatted versions. Breaking public
-API or storage-contract changes should increment the minor version, and patch
-releases should stay compatible with the same minor line.
+API, storage-contract, or minimum-supported-Rust-version changes should
+increment the minor version, and patch releases should stay compatible with the
+same minor line.
 
-The current crate minor release line is `0.5.x`. The v1 engine protocol
+The current crate minor release line is `0.6.x`. The v1 engine protocol
 remains documented separately in `.phrase/protocol/trine-kv-v1-spec.md`.
+
+Trine KV `0.6.x` requires Rust 1.95 or newer. `Cargo.toml`,
+`rust-toolchain.toml`, CI, publishing, and production-evidence workflows all
+use that same floor. The workflows pin the Rust 1.95.0 toolchain action by
+immutable commit SHA.
 
 ## Package Contents
 
@@ -118,11 +124,10 @@ The package list should not include `.github/`, `.phrase/`, `.rust-skills/`,
 - `cargo package --locked`
 
 The browser runner stays at `wasm-bindgen-cli 0.2.122` to match the crate's
-locked `wasm-bindgen` version. Its packaged lockfile currently requires Rust
-1.88 through the `time` dependency, so CI uses Rust 1.88 only to install that
-tool; all Trine compilation and tests continue to use the declared Rust 1.85
-MSRV. The WASI library check treats rustc warnings as errors so target-only cfg
-drift cannot pass silently.
+locked `wasm-bindgen` version. Rust 1.95 installs that tool and runs all Trine
+compilation and tests, so the workflow has no hidden auxiliary compiler. The
+WASI library check treats rustc warnings as errors so target-only cfg drift
+cannot pass silently.
 
 The `Windows Platform I/O` and `macOS Platform I/O` jobs additionally check,
 test, and run both platform I/O feature modes on their named operating systems.

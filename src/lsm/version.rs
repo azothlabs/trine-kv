@@ -292,10 +292,11 @@ impl LsmVersion {
                         })
                         .cloned(),
                 );
-            } else if let Some(table) = level.table_for_key(key) {
-                if table.may_have_range_tombstones() && table.key_bounds_may_contain_key(key) {
-                    tables.push(Arc::clone(table));
-                }
+            } else if let Some(table) = level.table_for_key(key)
+                && table.may_have_range_tombstones()
+                && table.key_bounds_may_contain_key(key)
+            {
+                tables.push(Arc::clone(table));
             }
         }
         tables

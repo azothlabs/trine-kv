@@ -124,18 +124,19 @@ dropped.
 
 ## Install and Features
 
-Most native applications can start without feature flags:
+Trine KV `0.6.x` requires Rust 1.95 or newer. Most native applications can
+start without feature flags:
 
 ```toml
 [dependencies]
-trine-kv = "0.5"
+trine-kv = "0.6"
 ```
 
 Enable `platform-io` for Trine's bounded portable async file-I/O thread pool:
 
 ```toml
 [dependencies]
-trine-kv = { version = "0.5", features = ["platform-io"] }
+trine-kv = { version = "0.6", features = ["platform-io"] }
 ```
 
 Enable `platform-io-native` for audited native async operations with the same
@@ -143,7 +144,7 @@ thread-pool fallback for unsupported operation rows:
 
 ```toml
 [dependencies]
-trine-kv = { version = "0.5", features = ["platform-io-native"] }
+trine-kv = { version = "0.6", features = ["platform-io-native"] }
 ```
 
 Select platform I/O for a database explicitly:

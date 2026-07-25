@@ -254,11 +254,11 @@ impl ContentUpload {
             let take = available.min(bytes.len());
             self.buffer.extend_from_slice(&bytes[..take]);
             bytes = &bytes[take..];
-            if self.buffer.len() == self.options.chunk_bytes() {
-                if let Err(error) = self.flush_full_chunk().await {
-                    self.failed = true;
-                    return Err(error);
-                }
+            if self.buffer.len() == self.options.chunk_bytes()
+                && let Err(error) = self.flush_full_chunk().await
+            {
+                self.failed = true;
+                return Err(error);
             }
         }
 

@@ -589,10 +589,7 @@ pub(super) fn storage_object_file_bytes(
 }
 
 pub(super) fn usize_to_u64_saturating(value: usize) -> u64 {
-    match u64::try_from(value) {
-        Ok(value) => value,
-        Err(_) => u64::MAX,
-    }
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 pub(super) fn referenced_table_file_ids(manifest: &ManifestState) -> BTreeSet<table::TableId> {

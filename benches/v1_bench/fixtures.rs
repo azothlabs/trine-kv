@@ -323,10 +323,10 @@ pub(super) fn seed_index(seed: u64, len: usize) -> usize {
 }
 
 pub(super) fn cleanup_dir(dir: &Path) {
-    if let Err(error) = fs::remove_dir_all(dir) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            eprintln!("failed to remove {}: {error}", dir.display());
-        }
+    if let Err(error) = fs::remove_dir_all(dir)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("failed to remove {}: {error}", dir.display());
     }
 }
 

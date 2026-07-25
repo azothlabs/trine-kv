@@ -628,9 +628,8 @@ fn open_branch_rejects_a_corrupt_lineage_cycle() {
             .expect("install corrupt lineage");
     }
 
-    let error = match db.open_branch("a") {
-        Ok(_) => panic!("lineage cycle must fail closed"),
-        Err(error) => error,
+    let Err(error) = db.open_branch("a") else {
+        panic!("lineage cycle must fail closed");
     };
     assert!(
         matches!(error, Error::Corruption { ref message } if message.contains("cycle")),

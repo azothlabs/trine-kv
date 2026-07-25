@@ -58,14 +58,14 @@ pub(crate) fn write_large_values_with_backend_with_durability(
 
     let mut blob_records = Vec::new();
     for (internal_key, value) in records {
-        if let Some(ValueRef::Inline(bytes)) = value {
-            if bytes.len() >= threshold {
-                blob_records.push(BlobRecord {
-                    internal_key: internal_key.clone(),
-                    value: bytes.clone(),
-                    compression,
-                });
-            }
+        if let Some(ValueRef::Inline(bytes)) = value
+            && bytes.len() >= threshold
+        {
+            blob_records.push(BlobRecord {
+                internal_key: internal_key.clone(),
+                value: bytes.clone(),
+                compression,
+            });
         }
     }
 
@@ -129,14 +129,14 @@ where
 
     let mut blob_records = Vec::new();
     for (internal_key, value) in records {
-        if let Some(ValueRef::Inline(bytes)) = value {
-            if bytes.len() >= threshold {
-                blob_records.push(BlobRecord {
-                    internal_key: internal_key.clone(),
-                    value: bytes.clone(),
-                    compression,
-                });
-            }
+        if let Some(ValueRef::Inline(bytes)) = value
+            && bytes.len() >= threshold
+        {
+            blob_records.push(BlobRecord {
+                internal_key: internal_key.clone(),
+                value: bytes.clone(),
+                compression,
+            });
         }
     }
 

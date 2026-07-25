@@ -213,7 +213,7 @@ impl<'run> ModelRun<'run> {
     }
 
     fn assert_periodic_checks(&mut self, step: usize) {
-        if step % 17 == 0 {
+        if step.is_multiple_of(17) {
             assert_random_get(
                 self.bucket,
                 self.model,
@@ -223,7 +223,7 @@ impl<'run> ModelRun<'run> {
                 &self.history,
             );
         }
-        if step % 41 == 0 {
+        if step.is_multiple_of(41) {
             assert_range(self.bucket, self.model);
         }
     }

@@ -4801,6 +4801,36 @@ the engine rather than one isolated feature.
   decoder, multi-primary object writers, provider retention bypass, publishing,
   tagging, committing, or pushing changes.
 
+### Phase 193: Rust 1.95 Toolchain Contract
+
+**Status**: Complete
+
+**Goal**: Raise the real compiler floor to Rust 1.95 and keep package metadata,
+local tooling, CI, publishing, production evidence, dependencies, and release
+documentation on one enforceable toolchain contract.
+
+**Entry Condition**: The audit's remaining compio dependency boundary requires
+standard-library APIs stabilized after Rust 1.85, and the user authorizes a
+minor-version MSRV change.
+
+**Acceptance Gate**:
+
+- `Cargo.toml`, `rust-toolchain.toml`, all workflows, and release docs agree on
+  Rust 1.95.
+- The crate version and active dependency examples move to the `0.6` release
+  line.
+- The native platform-I/O dependency family uses the newest upstream line that
+  removes the remaining unmaintained macro dependency.
+- Native all-feature tests, strict Clippy, Rustdoc/doctests, supported WASM
+  checks/tests, packaging, security audit, script tests, formatting, and diff
+  checks pass on Rust 1.95.
+
+**Major Out Of Scope**:
+
+- Raising the floor beyond Rust 1.95, using unstable compiler escape hatches,
+  private dependency forks, storage-format changes, publishing, tagging,
+  committing, or pushing.
+
 ### Consumer-selected slice: Qualified object-store content reclamation
 
 **Status**: Complete for TrineDB Phase 23.

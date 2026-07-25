@@ -677,12 +677,11 @@ impl Iterator for BranchRange {
             // (first in source order) wins.
             let mut chosen: Option<Option<Value>> = None;
             for source in &mut self.sources {
-                if source.key() == Some(key.as_slice()) {
-                    if let Some(Ok((_, value))) = source.take() {
-                        if chosen.is_none() {
-                            chosen = Some(value);
-                        }
-                    }
+                if source.key() == Some(key.as_slice())
+                    && let Some(Ok((_, value))) = source.take()
+                    && chosen.is_none()
+                {
+                    chosen = Some(value);
                 }
             }
             // A present value is emitted; a tombstone (or nothing) skips the key.

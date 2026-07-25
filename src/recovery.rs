@@ -806,10 +806,10 @@ fn unreferenced_storage_files_from_directory_files(
             continue;
         }
 
-        if let Some(blob_id) = blob::blob_file_id_from_path(path)? {
-            if !referenced_blob_ids.contains(&blob_id) {
-                files.push(storage_file_name(&blob::blob_path(db_path, blob_id))?);
-            }
+        if let Some(blob_id) = blob::blob_file_id_from_path(path)?
+            && !referenced_blob_ids.contains(&blob_id)
+        {
+            files.push(storage_file_name(&blob::blob_path(db_path, blob_id))?);
         }
     }
 

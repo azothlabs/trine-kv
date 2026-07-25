@@ -252,10 +252,7 @@ pub(in crate::table) fn usize_to_u64(value: usize, field: &'static str) -> Resul
 }
 
 pub(in crate::table) fn usize_to_u64_saturating(value: usize) -> u64 {
-    match u64::try_from(value) {
-        Ok(value) => value,
-        Err(_) => u64::MAX,
-    }
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 pub(in crate::table) fn u32_to_usize(value: u32) -> usize {

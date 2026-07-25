@@ -17026,3 +17026,64 @@ Negative check:
 - Object storage remains single-writer. Versioned-object cleanup and provider
   retention/lock bypass remain unsupported.
 - The user-owned untracked `.infisical.json` was not modified.
+
+## 2026-07-25: Rust 1.95 toolchain contract passed
+
+### Observation
+
+- Rust 1.93 satisfied compio's `MaybeUninit` slice requirement but not
+  `compio-executor 0.1.3`, whose `cfg_select!` use stabilizes in Rust 1.95.
+  After the intermediate 1.93 verification, the user selected Rust 1.95 so the
+  dependency graph could move fully to compio 0.19 without a private fork.
+- Rust 1.93's strict Clippy gate added 52 mechanical diagnostics across library,
+  test, and benchmark targets. Rust 1.95 added 33 more: standard-library
+  control-flow idioms plus readable minute/hour `Duration` constructors in
+  tests.
+- Compio 0.19.1 uses maintained `pastey`; the unmaintained `paste 1.0.15`
+  dependency present through compio 0.14 and 0.18 is absent.
+
+### Implementation evidence
+
+- Raised `trine-kv` to `0.6.0` and `rust-version` to `1.95`; added a repository
+  `rust-toolchain.toml` pinned to 1.95.0 with rustfmt, Clippy, browser WASM, and
+  WASI targets.
+- Pinned every CI, publish, and production-evidence Rust action to the immutable
+  1.95.0 branch commit and removed the auxiliary Rust 1.88 wasm-bindgen install.
+- Upgraded native platform I/O from compio 0.14 to compio 0.19.1,
+  compio-driver 0.12.4, compio-fs 0.12.0, and compio-runtime 0.12.3.
+- Updated the `0.6` dependency examples, release policy, changelog, and
+  documentation-drift guard. The guard now rejects drift among Cargo's
+  `rust-version`, the repository toolchain, supported WASM targets, and the
+  audited GitHub Actions commit.
+- Updated source, tests, and benchmarks to Rust 1.95's strict Clippy idioms and
+  removed the unused `VersionSet` and `WalRecordHeader` scaffold types.
+
+### Verification
+
+- `rustc 1.95.0` and Cargo 1.95.0 ran the complete gate.
+- Strict all-target/all-feature Clippy, 552 passing library tests with three
+  intentional provider-live ignores, every integration/example/benchmark
+  target, Rustdoc, and 31 doctests pass.
+- Eight release examples, six destructive storage tests, forced-process-exit
+  recovery, and concurrent mixed-load reopen evidence pass.
+- `wasm32-wasip1` strict compilation and seven persistence tests pass.
+  `wasm32-unknown-unknown` all-feature check/Clippy and 20 Chrome
+  OPFS/DedicatedWorker/SharedWorker tests pass.
+- Package contents contain 154 consumer files with repository-only trees
+  excluded. `cargo package --locked` and `cargo publish --dry-run --locked`
+  verify `trine-kv 0.6.0`.
+- Seven Python script tests, documentation drift, formatting, and diff checks
+  pass.
+- `cargo audit` successfully fetched the current RustSec database with 1,169
+  advisories and reports zero vulnerabilities and zero warnings across 297
+  dependencies. `cargo tree --all-features -i paste` confirms that `paste` is
+  absent.
+
+### Safety boundary
+
+- Rust 1.95 is now a real consumer compatibility floor; older compilers fail
+  through Cargo metadata rather than encountering undeclared transitive
+  requirements.
+- No `RUSTC_BOOTSTRAP`, private dependency fork, or unstable toolchain is used.
+- No publish, tag, commit, or push was performed. The user-owned untracked
+  `.infisical.json` remains untouched.

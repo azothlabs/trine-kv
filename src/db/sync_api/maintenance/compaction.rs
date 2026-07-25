@@ -116,12 +116,11 @@ impl Db {
         let obsolete_blob_ids =
             self.obsolete_blob_ids_for_compaction(&compaction_inputs, &written_tables)?;
 
-        if !written_table_ids.is_empty() {
-            if let Err(error) = self.sync_filesystem_directory_after_renames(db_path) {
-                let _ =
-                    remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
-                return Err(error);
-            }
+        if !written_table_ids.is_empty()
+            && let Err(error) = self.sync_filesystem_directory_after_renames(db_path)
+        {
+            let _ = remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
+            return Err(error);
         }
 
         let _publish = self.inner.publish_barrier.enter()?;
@@ -235,13 +234,13 @@ impl Db {
         let obsolete_blob_ids =
             self.obsolete_blob_ids_for_compaction(&compaction_inputs, &written_tables)?;
 
-        if !written_table_ids.is_empty() {
-            if let Err(error) = self.sync_compaction_directory_host_async(db_path).await {
-                let _ = self
-                    .remove_storage_files_host_async(db_path, &written_table_ids)
-                    .await;
-                return Err(error);
-            }
+        if !written_table_ids.is_empty()
+            && let Err(error) = self.sync_compaction_directory_host_async(db_path).await
+        {
+            let _ = self
+                .remove_storage_files_host_async(db_path, &written_table_ids)
+                .await;
+            return Err(error);
         }
 
         if let Err(error) = self.validate_compacted_tables(&written_tables) {

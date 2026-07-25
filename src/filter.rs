@@ -274,10 +274,7 @@ fn bloom_hash(seed: u64, item: &[u8]) -> u64 {
 }
 
 fn usize_to_u64_saturating(value: usize) -> u64 {
-    match u64::try_from(value) {
-        Ok(value) => value,
-        Err(_) => u64::MAX,
-    }
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

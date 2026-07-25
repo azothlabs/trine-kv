@@ -33,7 +33,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@8641a17e25bf5b40c118d48fe0f81e8655731839 # 1.85.0
+        uses: dtolnay/rust-toolchain@f133eefe930d61f0d9371efd474daf0125ed3dd1 # 1.95.0
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown, wasm32-wasip1
@@ -88,9 +88,7 @@ jobs:
         run: cargo clippy --target wasm32-unknown-unknown --lib --all-features -- -D warnings
 
       - name: Install wasm-bindgen test runner
-        run: |
-          rustup toolchain install 1.88.0 --profile minimal
-          cargo +1.88.0 install wasm-bindgen-cli --version 0.2.122 --locked
+        run: cargo install wasm-bindgen-cli --version 0.2.122 --locked
 
       - name: Install Chrome
         uses: browser-actions/setup-chrome@c785b87e244131f27c9f19c1a33e2ead956ab7ce # v1.7.3

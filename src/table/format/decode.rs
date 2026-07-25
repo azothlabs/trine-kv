@@ -623,16 +623,15 @@ pub(in crate::table) fn validate_table_filters_for_key(
         });
     }
 
-    if let Some(filter) = prefix_filter {
-        if filter
+    if let Some(filter) = prefix_filter
+        && filter
             .extractor()
             .extract(user_key)
             .is_some_and(|prefix| !filter.may_contain_prefix(prefix))
-        {
-            return Err(Error::Corruption {
-                message: "table prefix filter misses a table prefix".to_owned(),
-            });
-        }
+    {
+        return Err(Error::Corruption {
+            message: "table prefix filter misses a table prefix".to_owned(),
+        });
     }
 
     Ok(())
@@ -658,16 +657,15 @@ pub(in crate::table) fn validate_data_block_filters(
             });
         }
 
-        if let Some(filter) = &entry.prefix_filter {
-            if filter
+        if let Some(filter) = &entry.prefix_filter
+            && filter
                 .extractor()
                 .extract(user_key)
                 .is_some_and(|prefix| !filter.may_contain_prefix(prefix))
-            {
-                return Err(Error::Corruption {
-                    message: "data block prefix filter misses a block prefix".to_owned(),
-                });
-            }
+        {
+            return Err(Error::Corruption {
+                message: "data block prefix filter misses a block prefix".to_owned(),
+            });
         }
     }
 
@@ -690,16 +688,15 @@ pub(in crate::table) fn validate_decoded_data_block_filters(
             });
         }
 
-        if let Some(filter) = &entry.prefix_filter {
-            if filter
+        if let Some(filter) = &entry.prefix_filter
+            && filter
                 .extractor()
                 .extract(record.user_key)
                 .is_some_and(|prefix| !filter.may_contain_prefix(prefix))
-            {
-                return Err(Error::Corruption {
-                    message: "data block prefix filter misses a block prefix".to_owned(),
-                });
-            }
+        {
+            return Err(Error::Corruption {
+                message: "data block prefix filter misses a block prefix".to_owned(),
+            });
         }
     }
 

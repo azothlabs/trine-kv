@@ -6,9 +6,10 @@ use crate::{
 };
 
 /// Storage location and host backend selected for a database.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum StorageMode {
     /// Keep all data in memory and discard it when the handle closes.
+    #[default]
     InMemory,
     /// Store data in a native filesystem directory.
     Persistent {
@@ -150,12 +151,6 @@ impl StorageMode {
                 backend: HostStorageBackend::ObjectStore
             }
         )
-    }
-}
-
-impl Default for StorageMode {
-    fn default() -> Self {
-        Self::InMemory
     }
 }
 

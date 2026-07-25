@@ -379,10 +379,10 @@ impl LazyScan {
     }
 
     fn next_lazy(&mut self) -> Option<Result<LazyKeyValue>> {
-        if !self.source_heap_initialized {
-            if let Err(error) = self.initialize_source_heap() {
-                return Some(Err(error));
-            }
+        if !self.source_heap_initialized
+            && let Err(error) = self.initialize_source_heap()
+        {
+            return Some(Err(error));
         }
 
         loop {

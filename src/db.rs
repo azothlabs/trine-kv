@@ -434,15 +434,12 @@ impl CommitTracker {
     }
 
     fn open_slot_count(&self) -> usize {
-        self.slots
-            .lock()
-            .map(|slots| {
-                slots
-                    .values()
-                    .filter(|state| **state == CommitSlotState::Open)
-                    .count()
-            })
-            .unwrap_or(0)
+        self.slots.lock().map_or(0, |slots| {
+            slots
+                .values()
+                .filter(|state| **state == CommitSlotState::Open)
+                .count()
+        })
     }
 
     fn skipped_slot_count(&self) -> u64 {

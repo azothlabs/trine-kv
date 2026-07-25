@@ -86,10 +86,7 @@ pub(crate) struct BlockCache {
 
 impl BlockCache {
     pub(crate) fn new(capacity_bytes: usize) -> Self {
-        let capacity_bytes = match u64::try_from(capacity_bytes) {
-            Ok(value) => value,
-            Err(_) => u64::MAX,
-        };
+        let capacity_bytes = u64::try_from(capacity_bytes).unwrap_or(u64::MAX);
         let shards = (0..BLOCK_CACHE_SHARD_COUNT)
             .map(|_| RwLock::new(BlockCacheState::default()))
             .collect();
@@ -204,16 +201,16 @@ impl BlockCache {
         // is harmless and keeps file I/O out of the lock.
         let shard_index = block_cache_shard_index(key);
         let shard = &self.shards[shard_index];
-        if let Ok(state) = shard.read() {
-            if let Some(entry) = state.entries.get(&key) {
-                let value = entry.value.clone();
-                drop(state);
-                if let Ok(mut state) = shard.try_write() {
-                    state.promote(key);
-                }
-                self.hits.increment();
-                return Ok(value);
+        if let Ok(state) = shard.read()
+            && let Some(entry) = state.entries.get(&key)
+        {
+            let value = entry.value.clone();
+            drop(state);
+            if let Ok(mut state) = shard.try_write() {
+                state.promote(key);
             }
+            self.hits.increment();
+            return Ok(value);
         }
 
         let (loaded, loaded_bytes) = load()?;
@@ -258,16 +255,16 @@ impl BlockCache {
 
         let shard_index = block_cache_shard_index(key);
         let shard = &self.shards[shard_index];
-        if let Ok(state) = shard.read() {
-            if let Some(entry) = state.entries.get(&key) {
-                let value = entry.value.clone();
-                drop(state);
-                if let Ok(mut state) = shard.try_write() {
-                    state.promote(key);
-                }
-                self.hits.increment();
-                return Ok(value);
+        if let Ok(state) = shard.read()
+            && let Some(entry) = state.entries.get(&key)
+        {
+            let value = entry.value.clone();
+            drop(state);
+            if let Ok(mut state) = shard.try_write() {
+                state.promote(key);
             }
+            self.hits.increment();
+            return Ok(value);
         }
 
         let (loaded, loaded_bytes) = load().await?;
@@ -372,10 +369,7 @@ fn block_cache_shard_index(key: BlockCacheKey) -> usize {
 }
 
 fn usize_to_u64_saturating(value: usize) -> u64 {
-    match u64::try_from(value) {
-        Ok(value) => value,
-        Err(_) => u64::MAX,
-    }
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 #[derive(Debug, Default)]

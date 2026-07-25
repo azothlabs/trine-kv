@@ -486,10 +486,10 @@ impl Drop for ObjectWalLane {
         if let Ok(mut sender) = self.sender.lock() {
             sender.take();
         }
-        if let Ok(mut worker) = self.worker.lock() {
-            if let Some(worker) = worker.take() {
-                let _ = worker.join();
-            }
+        if let Ok(mut worker) = self.worker.lock()
+            && let Some(worker) = worker.take()
+        {
+            let _ = worker.join();
         }
     }
 }

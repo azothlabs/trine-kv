@@ -245,14 +245,13 @@ pub(super) fn persist_wal_lane_batch(
         writer.persist(durability)?;
         state.persisted_level = Some(durability);
     }
-    if let Some(sequence) = confirm_sequence {
-        if state
+    if let Some(sequence) = confirm_sequence
+        && state
             .confirmed_sequence
             .is_none_or(|confirmed| sequence > confirmed)
-        {
-            write_confirmed_wal_marker_with_backend(backend, path, sequence, durability)?;
-            state.confirmed_sequence = Some(sequence);
-        }
+    {
+        write_confirmed_wal_marker_with_backend(backend, path, sequence, durability)?;
+        state.confirmed_sequence = Some(sequence);
     }
     Ok(())
 }
@@ -299,11 +298,11 @@ pub(super) fn persist_wal_lane(
     persisted_level: &mut Option<DurabilityMode>,
     durability: DurabilityMode,
 ) -> Result<()> {
-    if let Some(writer) = writer.as_mut() {
-        if wal_lane_needs_persist(*persisted_level, durability) {
-            writer.persist(durability)?;
-            *persisted_level = Some(durability);
-        }
+    if let Some(writer) = writer.as_mut()
+        && wal_lane_needs_persist(*persisted_level, durability)
+    {
+        writer.persist(durability)?;
+        *persisted_level = Some(durability);
     }
     Ok(())
 }

@@ -521,12 +521,12 @@ impl Transaction {
             .get_internal_bucket_sync(CONTENT_CONTROL_BUCKET, &grace_key)?
             .map(|bytes| ContentReclaimGraceRecord::decode(&bytes, storage_domain_id, content_id))
             .transpose()?;
-        if let Some(grace) = grace {
-            if !quarantine.is_some_and(|record| grace.matches_quarantine(record)) {
-                return Err(Error::Corruption {
-                    message: "content reclaim grace differs from its quarantine fence".to_owned(),
-                });
-            }
+        if let Some(grace) = grace
+            && !quarantine.is_some_and(|record| grace.matches_quarantine(record))
+        {
+            return Err(Error::Corruption {
+                message: "content reclaim grace differs from its quarantine fence".to_owned(),
+            });
         }
         if quarantine.is_some() {
             self.writes
@@ -850,12 +850,12 @@ impl Transaction {
             .await?
             .map(|bytes| ContentReclaimGraceRecord::decode(&bytes, storage_domain_id, content_id))
             .transpose()?;
-        if let Some(grace) = grace {
-            if !quarantine.is_some_and(|record| grace.matches_quarantine(record)) {
-                return Err(Error::Corruption {
-                    message: "content reclaim grace differs from its quarantine fence".to_owned(),
-                });
-            }
+        if let Some(grace) = grace
+            && !quarantine.is_some_and(|record| grace.matches_quarantine(record))
+        {
+            return Err(Error::Corruption {
+                message: "content reclaim grace differs from its quarantine fence".to_owned(),
+            });
         }
         if quarantine.is_some() {
             self.writes

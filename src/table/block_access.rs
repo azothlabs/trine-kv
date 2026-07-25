@@ -123,10 +123,10 @@ impl Table {
         partition_index: usize,
         block_cache: Option<&BlockCache>,
     ) -> Result<Arc<Vec<TableDataBlock>>> {
-        if let Ok(guard) = self.index_partition_cache.read() {
-            if let Some(partition) = guard.get(&partition_index) {
-                return Ok(Arc::clone(partition));
-            }
+        if let Ok(guard) = self.index_partition_cache.read()
+            && let Some(partition) = guard.get(&partition_index)
+        {
+            return Ok(Arc::clone(partition));
         }
 
         let Some(path) = &self.path else {
@@ -182,10 +182,10 @@ impl Table {
         partition_index: usize,
         block_cache: Option<&BlockCache>,
     ) -> Result<Arc<Vec<TableDataBlock>>> {
-        if let Ok(guard) = self.index_partition_cache.read() {
-            if let Some(partition) = guard.get(&partition_index) {
-                return Ok(Arc::clone(partition));
-            }
+        if let Ok(guard) = self.index_partition_cache.read()
+            && let Some(partition) = guard.get(&partition_index)
+        {
+            return Ok(Arc::clone(partition));
         }
 
         let partition = if should_pin_read_metadata(self.properties.level) {

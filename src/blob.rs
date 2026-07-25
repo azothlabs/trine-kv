@@ -125,7 +125,7 @@ impl ValueRef {
 
 #[must_use]
 pub fn blob_path(db_path: &Path, file_id: u64) -> PathBuf {
-    db_path.join(format!("blob-{file_id:020}.{BLOB_FILE_EXTENSION}",))
+    db_path.join(format!("blob-{file_id:020}.{BLOB_FILE_EXTENSION}"))
 }
 
 #[path = "blob/codec.rs"]
