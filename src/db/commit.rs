@@ -518,7 +518,7 @@ impl Db {
         {
             Ok(request_flush) => request_flush,
             Err(error) => {
-                self.inner.maintenance.record_error(&Error::Corruption {
+                self.inner.maintenance.record_error(Error::Corruption {
                     message: format!("post-commit memtable freeze failed: {error}"),
                 });
                 false
@@ -542,17 +542,17 @@ impl Db {
             return Err(error);
         }
 
-        let error = Error::Corruption {
-            message: format!(
-                "commit {} failed after partially publishing in-memory state: {error}; \
-                 database handle closed; reopen persistent databases to replay WAL",
-                slot.sequence().get()
-            ),
-        };
+        let message = format!(
+            "commit {} failed after partially publishing in-memory state: {error}; \
+             database handle closed; reopen persistent databases to replay WAL",
+            slot.sequence().get()
+        );
         self.inner.closed.store(true, Ordering::Release);
-        self.inner.maintenance.record_error(&error);
+        self.inner.maintenance.record_error(Error::Corruption {
+            message: message.clone(),
+        });
         self.inner.maintenance.shutdown();
-        Err(error)
+        Err(Error::Corruption { message })
     }
 
     fn preaccept_wal_front_door_if_ready(

@@ -66,8 +66,8 @@ jobs:
 
       - name: Check WASM targets
         run: |
-          cargo check --target wasm32-unknown-unknown --lib
-          RUSTFLAGS="-D warnings" cargo check --target wasm32-wasip1 --lib
+          cargo check --target wasm32-unknown-unknown --lib --all-features
+          RUSTFLAGS="-D warnings" cargo check --target wasm32-wasip1 --lib --all-features
 
       - name: Install Wasmtime
         uses: bytecodealliance/actions/wasmtime/setup@v1
@@ -78,7 +78,7 @@ jobs:
           CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime run --dir .
 
       - name: Lint browser target
-        run: cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings
+        run: cargo clippy --target wasm32-unknown-unknown --lib --all-features -- -D warnings
 
       - name: Install wasm-bindgen test runner
         run: |

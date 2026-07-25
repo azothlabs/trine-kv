@@ -55,10 +55,26 @@ pub enum ContentReclamationMode {
     Disabled,
     /// Permit the v1 sweep on the qualified native filesystem backend.
     ///
-    /// Browser and object-store databases reject this variant explicitly. It
+    /// Browser, WASI and object-store databases reject this variant explicitly. It
     /// does not claim provider-version, delete-marker, object-lock, retention,
     /// or legal-hold support.
     QualifiedNativeFilesystem,
+    /// Permit the v1 sweep on a WASI preopened filesystem whose host lifecycle
+    /// has been independently qualified.
+    ///
+    /// The caller must retain evidence that every pre-barrier WASI instance was
+    /// stopped, the preopened directory provides durable unlink semantics, and
+    /// the replacement instance observes those deletions after reopen. This is
+    /// a distinct capability and never aliases native-filesystem qualification.
+    QualifiedWasiFilesystem,
+    /// Permit the v1 sweep in browser origin-private storage after the
+    /// deployment has independently qualified its worker/session boundary.
+    ///
+    /// The caller must coordinate old workers and tabs, supply the ordinary
+    /// reader-drain and clock attestations, and retain close/reopen evidence for
+    /// OPFS deletion. This capability does not authorize memory, native, WASI,
+    /// or object-store deletion.
+    QualifiedBrowserStorage,
     /// Permit sweeps for the exact object-store provider evidence that passed
     /// [`crate::qualify_object_store_reclamation`].
     ///
@@ -177,6 +193,26 @@ pub enum DurabilityMode {
 }
 
 impl DurabilityMode {
+    /// Returns whether this result is at least as strong as `required`.
+    ///
+    /// The ordering is `Buffered < Flush < SyncData < SyncAll <
+    /// SyncAllStrict`. A backend may reject a requested mode separately; this
+    /// comparison only evaluates two already defined durability levels.
+    #[must_use]
+    pub const fn satisfies(self, required: Self) -> bool {
+        self.strength() >= required.strength()
+    }
+
+    const fn strength(self) -> u8 {
+        match self {
+            Self::Buffered => 0,
+            Self::Flush => 1,
+            Self::SyncData => 2,
+            Self::SyncAll => 3,
+            Self::SyncAllStrict => 4,
+        }
+    }
+
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Buffered => "buffered",
@@ -584,10 +620,9 @@ impl DbOptions {
 
     /// Enables or disables irreversible content-byte reclamation.
     ///
-    /// [`ContentReclamationMode::QualifiedNativeFilesystem`] permits only native
-    /// filesystem sweeps. [`ContentReclamationMode::QualifiedObjectStore`]
-    /// requires the capability returned by
-    /// [`crate::qualify_object_store_reclamation`]. Neither mode starts
+    /// Each `Qualified*` variant permits only its exact backend. Object stores
+    /// additionally require the capability returned by
+    /// [`crate::qualify_object_store_reclamation`]. No mode starts
     /// background deletion or weakens lifecycle proof; callers must explicitly
     /// stage and run a final sweep for each exact content identity.
     #[must_use]

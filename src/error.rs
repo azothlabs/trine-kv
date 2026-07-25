@@ -272,6 +272,17 @@ pub enum Error {
         /// Current durable revision.
         actual_revision: u64,
     },
+    /// A content upload reservation would exceed its storage-domain limit.
+    ContentPhysicalQuotaExceeded {
+        /// Inclusive configured original-byte limit.
+        limit: u64,
+        /// Unique sealed original bytes already accounted.
+        unique_content_bytes: u64,
+        /// Unfinished-upload bytes already reserved.
+        upload_reserved_bytes: u64,
+        /// Additional bytes requested by this transition.
+        requested_bytes: u64,
+    },
     /// No issued attachment authority matches the supplied bearer token.
     UploadTokenInvalid,
     /// The authenticated domain or owner does not match the token claims.
@@ -340,382 +351,6 @@ pub enum Error {
     },
 }
 
-#[derive(Debug, Clone)]
-pub(crate) enum ErrorSnapshot {
-    Io {
-        message: String,
-    },
-    Corruption {
-        message: String,
-    },
-    InvalidFormat {
-        message: String,
-    },
-    UnsupportedFormat {
-        message: String,
-    },
-    CodecUnavailable {
-        codec: String,
-    },
-    Conflict {
-        message: String,
-    },
-    Fenced {
-        held_epoch: u64,
-        current_epoch: u64,
-    },
-    ReadVersionTooNew {
-        requested: ReadVersion,
-        latest: ReadVersion,
-    },
-    ReadVersionExpired {
-        requested: ReadVersion,
-        oldest_retained: ReadVersion,
-    },
-    CheckpointAlreadyExists {
-        name: String,
-    },
-    CheckpointNotFound {
-        name: String,
-    },
-    ContentNotFound {
-        storage_domain_id: String,
-        content_id: String,
-    },
-    ContentLeaseNotFound {
-        lease_id: String,
-    },
-    ContentLeaseExpired {
-        expired_at_unix_ms: u64,
-    },
-    ContentLeaseRequired {
-        barrier_id: ContentAccessBarrierId,
-    },
-    ContentQuarantined {
-        quarantined_at: ReadVersion,
-    },
-    ContentPhysicalHoldNotFound {
-        hold_id: String,
-    },
-    ContentPhysicalHoldExpired {
-        expired_at_unix_ms: u64,
-    },
-    ContentPhysicalHoldOwnerMismatch,
-    ContentReclaimBlocked {
-        blocker: ContentReclaimBlocker,
-    },
-    ContentUploadNotFound {
-        upload_id: String,
-    },
-    ContentUploadSealed {
-        upload_id: String,
-    },
-    ContentUploadConflict {
-        upload_id: String,
-        expected_revision: u64,
-        actual_revision: u64,
-    },
-    UploadTokenInvalid,
-    UploadTokenScopeMismatch,
-    UploadTokenExpired {
-        expired_at_unix_ms: u64,
-    },
-    UploadTokenAlreadyConsumed,
-    ContentRangeOutOfBounds {
-        start: u64,
-        length: u64,
-    },
-    ContentDigestMismatch {
-        expected: String,
-        actual: String,
-    },
-    ContentLengthMismatch {
-        expected: u64,
-        actual: u64,
-    },
-    ReadOnly,
-    Closed,
-    RuntimeBusy {
-        message: String,
-    },
-    BucketMissing {
-        name: String,
-    },
-    InvalidOptions {
-        message: String,
-    },
-    Unsupported {
-        feature: &'static str,
-    },
-    UnsupportedBackend {
-        feature: &'static str,
-    },
-    UnsupportedDurability {
-        requested: DurabilityMode,
-    },
-}
-
-impl ErrorSnapshot {
-    fn io(message: String) -> Self {
-        Self::Io { message }
-    }
-
-    fn corruption(message: &str) -> Self {
-        Self::Corruption {
-            message: message.to_owned(),
-        }
-    }
-
-    fn invalid_format(message: &str) -> Self {
-        Self::InvalidFormat {
-            message: message.to_owned(),
-        }
-    }
-
-    fn content_missing(storage_domain_id: &str, content_id: &str) -> Self {
-        Self::ContentNotFound {
-            storage_domain_id: storage_domain_id.to_owned(),
-            content_id: content_id.to_owned(),
-        }
-    }
-
-    fn lease_missing(lease_id: &str) -> Self {
-        Self::ContentLeaseNotFound {
-            lease_id: lease_id.to_owned(),
-        }
-    }
-
-    const fn lease_dead(expired_at_unix_ms: u64) -> Self {
-        Self::ContentLeaseExpired { expired_at_unix_ms }
-    }
-
-    const fn lease_required(barrier_id: ContentAccessBarrierId) -> Self {
-        Self::ContentLeaseRequired { barrier_id }
-    }
-
-    const fn content_quarantined(quarantined_at: ReadVersion) -> Self {
-        Self::ContentQuarantined { quarantined_at }
-    }
-
-    fn physical_hold_missing(hold_id: &str) -> Self {
-        Self::ContentPhysicalHoldNotFound {
-            hold_id: hold_id.to_owned(),
-        }
-    }
-
-    const fn physical_hold_dead(expired_at_unix_ms: u64) -> Self {
-        Self::ContentPhysicalHoldExpired { expired_at_unix_ms }
-    }
-
-    const fn content_reclaim_blocked(blocker: ContentReclaimBlocker) -> Self {
-        Self::ContentReclaimBlocked { blocker }
-    }
-
-    const fn token_dead(expired_at_unix_ms: u64) -> Self {
-        Self::UploadTokenExpired { expired_at_unix_ms }
-    }
-
-    fn upload_missing(upload_id: &str) -> Self {
-        Self::ContentUploadNotFound {
-            upload_id: upload_id.to_owned(),
-        }
-    }
-
-    fn upload_sealed(upload_id: &str) -> Self {
-        Self::ContentUploadSealed {
-            upload_id: upload_id.to_owned(),
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn capture(error: &Error) -> Self {
-        match error {
-            Error::Io(error) => Self::io(error.to_string()),
-            Error::Corruption { message } => Self::corruption(message),
-            Error::InvalidFormat { message } => Self::invalid_format(message),
-            Error::UnsupportedFormat { message } => Self::UnsupportedFormat {
-                message: message.clone(),
-            },
-            Error::CodecUnavailable { codec } => Self::CodecUnavailable {
-                codec: codec.clone(),
-            },
-            Error::Conflict { message } => Self::Conflict {
-                message: message.clone(),
-            },
-            Error::Fenced {
-                held_epoch,
-                current_epoch,
-            } => Self::Fenced {
-                held_epoch: *held_epoch,
-                current_epoch: *current_epoch,
-            },
-            Error::ReadVersionTooNew { requested, latest } => Self::ReadVersionTooNew {
-                requested: *requested,
-                latest: *latest,
-            },
-            Error::ReadVersionExpired {
-                requested,
-                oldest_retained,
-            } => Self::ReadVersionExpired {
-                requested: *requested,
-                oldest_retained: *oldest_retained,
-            },
-            Error::CheckpointAlreadyExists { name } => {
-                Self::CheckpointAlreadyExists { name: name.clone() }
-            }
-            Error::CheckpointNotFound { name } => Self::CheckpointNotFound { name: name.clone() },
-            Error::ContentNotFound {
-                storage_domain_id,
-                content_id,
-            } => Self::content_missing(storage_domain_id, content_id),
-            Error::ContentLeaseNotFound { lease_id } => Self::lease_missing(lease_id),
-            Error::ContentLeaseExpired {
-                expired_at_unix_ms: expiry,
-            } => Self::lease_dead(*expiry),
-            Error::ContentLeaseRequired { barrier_id } => Self::lease_required(*barrier_id),
-            Error::ContentQuarantined { quarantined_at } => {
-                Self::content_quarantined(*quarantined_at)
-            }
-            Error::ContentPhysicalHoldNotFound { hold_id } => Self::physical_hold_missing(hold_id),
-            Error::ContentPhysicalHoldExpired { expired_at_unix_ms } => {
-                Self::physical_hold_dead(*expired_at_unix_ms)
-            }
-            Error::ContentPhysicalHoldOwnerMismatch => Self::ContentPhysicalHoldOwnerMismatch,
-            Error::ContentReclaimBlocked { blocker } => Self::content_reclaim_blocked(*blocker),
-            Error::ContentUploadNotFound { upload_id } => Self::upload_missing(upload_id),
-            Error::ContentUploadSealed { upload_id } => Self::upload_sealed(upload_id),
-            Error::ContentUploadConflict {
-                upload_id,
-                expected_revision,
-                actual_revision,
-            } => Self::ContentUploadConflict {
-                upload_id: upload_id.clone(),
-                expected_revision: *expected_revision,
-                actual_revision: *actual_revision,
-            },
-            Error::UploadTokenInvalid => Self::UploadTokenInvalid,
-            Error::UploadTokenScopeMismatch => Self::UploadTokenScopeMismatch,
-            Error::UploadTokenExpired {
-                expired_at_unix_ms: expiry,
-            } => Self::token_dead(*expiry),
-            Error::UploadTokenAlreadyConsumed => Self::UploadTokenAlreadyConsumed,
-            Error::ContentRangeOutOfBounds { start, length } => Self::ContentRangeOutOfBounds {
-                start: *start,
-                length: *length,
-            },
-            Error::ContentDigestMismatch { expected, actual } => Self::ContentDigestMismatch {
-                expected: expected.clone(),
-                actual: actual.clone(),
-            },
-            Error::ContentLengthMismatch { expected, actual } => Self::ContentLengthMismatch {
-                expected: *expected,
-                actual: *actual,
-            },
-            Error::ReadOnly => Self::ReadOnly,
-            Error::Closed => Self::Closed,
-            Error::RuntimeBusy { message } => Self::RuntimeBusy {
-                message: message.clone(),
-            },
-            Error::BucketMissing { name } => Self::BucketMissing { name: name.clone() },
-            Error::InvalidOptions { message } => Self::InvalidOptions {
-                message: message.clone(),
-            },
-            Error::Unsupported { feature } => Self::Unsupported { feature },
-            Error::UnsupportedBackend { feature } => Self::UnsupportedBackend { feature },
-            Error::UnsupportedDurability { requested } => Self::UnsupportedDurability {
-                requested: *requested,
-            },
-        }
-    }
-
-    pub(crate) fn into_error(self) -> Error {
-        match self {
-            Self::Io { message } => Error::Io(io::Error::other(message)),
-            Self::Corruption { message } => Error::Corruption { message },
-            Self::InvalidFormat { message } => Error::InvalidFormat { message },
-            Self::UnsupportedFormat { message } => Error::UnsupportedFormat { message },
-            Self::CodecUnavailable { codec } => Error::CodecUnavailable { codec },
-            Self::Conflict { message } => Error::Conflict { message },
-            Self::Fenced {
-                held_epoch,
-                current_epoch,
-            } => Error::Fenced {
-                held_epoch,
-                current_epoch,
-            },
-            Self::ReadVersionTooNew { requested, latest } => {
-                Error::ReadVersionTooNew { requested, latest }
-            }
-            Self::ReadVersionExpired {
-                requested,
-                oldest_retained,
-            } => Error::ReadVersionExpired {
-                requested,
-                oldest_retained,
-            },
-            Self::CheckpointAlreadyExists { name } => Error::CheckpointAlreadyExists { name },
-            Self::CheckpointNotFound { name } => Error::CheckpointNotFound { name },
-            Self::ContentNotFound {
-                storage_domain_id,
-                content_id,
-            } => Error::ContentNotFound {
-                storage_domain_id,
-                content_id,
-            },
-            Self::ContentLeaseNotFound { lease_id } => Error::ContentLeaseNotFound { lease_id },
-            Self::ContentLeaseExpired { expired_at_unix_ms } => {
-                Error::ContentLeaseExpired { expired_at_unix_ms }
-            }
-            Self::ContentLeaseRequired { barrier_id } => Error::ContentLeaseRequired { barrier_id },
-            Self::ContentQuarantined { quarantined_at } => {
-                Error::ContentQuarantined { quarantined_at }
-            }
-            Self::ContentPhysicalHoldNotFound { hold_id } => {
-                Error::ContentPhysicalHoldNotFound { hold_id }
-            }
-            Self::ContentPhysicalHoldExpired { expired_at_unix_ms } => {
-                Error::ContentPhysicalHoldExpired { expired_at_unix_ms }
-            }
-            Self::ContentPhysicalHoldOwnerMismatch => Error::ContentPhysicalHoldOwnerMismatch,
-            Self::ContentReclaimBlocked { blocker } => Error::ContentReclaimBlocked { blocker },
-            Self::ContentUploadNotFound { upload_id } => Error::ContentUploadNotFound { upload_id },
-            Self::ContentUploadSealed { upload_id } => Error::ContentUploadSealed { upload_id },
-            Self::ContentUploadConflict {
-                upload_id,
-                expected_revision,
-                actual_revision,
-            } => Error::ContentUploadConflict {
-                upload_id,
-                expected_revision,
-                actual_revision,
-            },
-            Self::UploadTokenInvalid => Error::UploadTokenInvalid,
-            Self::UploadTokenScopeMismatch => Error::UploadTokenScopeMismatch,
-            Self::UploadTokenExpired { expired_at_unix_ms } => {
-                Error::UploadTokenExpired { expired_at_unix_ms }
-            }
-            Self::UploadTokenAlreadyConsumed => Error::UploadTokenAlreadyConsumed,
-            Self::ContentRangeOutOfBounds { start, length } => {
-                Error::ContentRangeOutOfBounds { start, length }
-            }
-            Self::ContentDigestMismatch { expected, actual } => {
-                Error::ContentDigestMismatch { expected, actual }
-            }
-            Self::ContentLengthMismatch { expected, actual } => {
-                Error::ContentLengthMismatch { expected, actual }
-            }
-            Self::ReadOnly => Error::ReadOnly,
-            Self::Closed => Error::Closed,
-            Self::RuntimeBusy { message } => Error::RuntimeBusy { message },
-            Self::BucketMissing { name } => Error::BucketMissing { name },
-            Self::InvalidOptions { message } => Error::InvalidOptions { message },
-            Self::Unsupported { feature } => Error::Unsupported { feature },
-            Self::UnsupportedBackend { feature } => Error::UnsupportedBackend { feature },
-            Self::UnsupportedDurability { requested } => Error::UnsupportedDurability { requested },
-        }
-    }
-}
-
 impl Error {
     /// Creates an unsupported-feature error.
     #[must_use]
@@ -764,25 +399,14 @@ impl fmt::Display for Error {
             Self::Fenced {
                 held_epoch,
                 current_epoch,
-            } => write!(
-                formatter,
-                "writer fenced: held epoch {held_epoch} but manifest is at epoch {current_epoch}"
-            ),
-            Self::ReadVersionTooNew { requested, latest } => write!(
-                formatter,
-                "read version {} is newer than latest read version {}",
-                requested.as_u64(),
-                latest.as_u64()
-            ),
+            } => fmt_fenced(formatter, *held_epoch, *current_epoch),
+            Self::ReadVersionTooNew { requested, latest } => {
+                fmt_read_version_too_new(formatter, *requested, *latest)
+            }
             Self::ReadVersionExpired {
                 requested,
                 oldest_retained,
-            } => write!(
-                formatter,
-                "read version {} is older than oldest retained read version {}",
-                requested.as_u64(),
-                oldest_retained.as_u64()
-            ),
+            } => fmt_read_version_expired(formatter, *requested, *oldest_retained),
             Self::CheckpointAlreadyExists { name } => {
                 write!(formatter, "checkpoint already exists: {name}")
             }
@@ -815,6 +439,15 @@ impl fmt::Display for Error {
                 formatter,
                 "content upload {upload_id} revision conflict: caller has {expected_revision}, durable state is {actual_revision}"
             ),
+            Self::ContentPhysicalQuotaExceeded {
+                limit,
+                unique_content_bytes,
+                upload_reserved_bytes,
+                requested_bytes,
+            } => write!(
+                formatter,
+                "content physical quota exceeded: limit {limit}, unique {unique_content_bytes}, reserved {upload_reserved_bytes}, requested {requested_bytes}"
+            ),
             Self::UploadTokenInvalid => formatter.write_str("upload token is invalid"),
             Self::UploadTokenScopeMismatch => {
                 formatter.write_str("upload token scope does not match the authenticated scope")
@@ -846,11 +479,7 @@ impl fmt::Display for Error {
             Self::Unsupported { feature } => write!(formatter, "unsupported feature: {feature}"),
             Self::UnsupportedBackend { feature } => fmt_unsupported_backend(formatter, feature),
             Self::UnsupportedDurability { requested } => {
-                write!(
-                    formatter,
-                    "unsupported durability mode: {}",
-                    requested.as_str()
-                )
+                fmt_unsupported_durability(formatter, *requested)
             }
         }
     }
@@ -863,6 +492,54 @@ impl error::Error for Error {
             _ => None,
         }
     }
+}
+
+fn fmt_fenced(
+    formatter: &mut fmt::Formatter<'_>,
+    held_epoch: u64,
+    current_epoch: u64,
+) -> fmt::Result {
+    write!(
+        formatter,
+        "writer fenced: held epoch {held_epoch} but manifest is at epoch {current_epoch}"
+    )
+}
+
+fn fmt_read_version_too_new(
+    formatter: &mut fmt::Formatter<'_>,
+    requested: ReadVersion,
+    latest: ReadVersion,
+) -> fmt::Result {
+    write!(
+        formatter,
+        "read version {} is newer than latest read version {}",
+        requested.as_u64(),
+        latest.as_u64()
+    )
+}
+
+fn fmt_read_version_expired(
+    formatter: &mut fmt::Formatter<'_>,
+    requested: ReadVersion,
+    oldest_retained: ReadVersion,
+) -> fmt::Result {
+    write!(
+        formatter,
+        "read version {} is older than oldest retained read version {}",
+        requested.as_u64(),
+        oldest_retained.as_u64()
+    )
+}
+
+fn fmt_unsupported_durability(
+    formatter: &mut fmt::Formatter<'_>,
+    requested: DurabilityMode,
+) -> fmt::Result {
+    write!(
+        formatter,
+        "unsupported durability mode: {}",
+        requested.as_str()
+    )
 }
 
 fn fmt_upload_missing(formatter: &mut fmt::Formatter<'_>, upload_id: &str) -> fmt::Result {

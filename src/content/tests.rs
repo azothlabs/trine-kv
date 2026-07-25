@@ -67,6 +67,22 @@ fn wasi_storage_mode_does_not_alias_the_qualified_native_backend() {
     );
 }
 
+#[test]
+fn wasi_and_browser_reclamation_use_distinct_qualifications() {
+    let wasi = DbOptions::wasi_persistent("wasi-content-reclaim-qualified")
+        .with_content_reclamation(ContentReclamationMode::QualifiedWasiFilesystem);
+    assert_eq!(
+        wasi.content_reclamation,
+        ContentReclamationMode::QualifiedWasiFilesystem
+    );
+    let browser = DbOptions::browser_persistent()
+        .with_content_reclamation(ContentReclamationMode::QualifiedBrowserStorage);
+    assert_eq!(
+        browser.content_reclamation,
+        ContentReclamationMode::QualifiedBrowserStorage
+    );
+}
+
 fn test_scope() -> ContentAttachmentScope {
     ContentAttachmentScope::new(
         StorageDomainId::from_bytes([3_u8; 16]),
@@ -121,6 +137,306 @@ fn caller_supplied_upload_id_binds_options_and_recovers_exact_state() {
         };
         assert_eq!(recovered, sealed);
     });
+}
+
+#[test]
+fn physical_quota_reserves_streams_reconciles_and_releases() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory()).await.expect("open database");
+        let domain = test_scope().storage_domain_id();
+        let configured = db
+            .set_content_physical_quota(domain, Some(8))
+            .await
+            .expect("physical quota configures");
+        assert_eq!(configured.accounted_bytes(), 0);
+        assert_eq!(configured.remaining(), Some(8));
+
+        let upload_id = UploadId::new().expect("known upload identity");
+        let ContentUploadResume::Open(known) = db
+            .begin_content_upload_with_id(upload_id, test_upload_options().with_expected_length(6))
+            .await
+            .expect("known upload reserves")
+        else {
+            panic!("new known upload is open");
+        };
+        assert_eq!(
+            db.content_physical_quota(domain)
+                .await
+                .expect("known reservation reads")
+                .upload_reserved_bytes(),
+            6
+        );
+        assert!(matches!(
+            db.begin_content_upload(test_upload_options().with_expected_length(3))
+                .await,
+            Err(Error::ContentPhysicalQuotaExceeded {
+                limit: 8,
+                requested_bytes: 3,
+                ..
+            })
+        ));
+        known.abort().await.expect("known reservation aborts");
+        assert_eq!(
+            db.content_physical_quota(domain)
+                .await
+                .expect("released reservation reads")
+                .accounted_bytes(),
+            0
+        );
+
+        let mut streamed = db
+            .begin_content_upload(test_upload_options())
+            .await
+            .expect("unknown upload begins");
+        streamed
+            .write(b"abcde")
+            .await
+            .expect("stream reserves bytes");
+        assert_eq!(
+            db.content_physical_quota(domain)
+                .await
+                .expect("stream reservation reads")
+                .upload_reserved_bytes(),
+            5
+        );
+        assert!(matches!(
+            streamed.write(b"wxyz").await,
+            Err(Error::ContentPhysicalQuotaExceeded {
+                limit: 8,
+                requested_bytes: 4,
+                ..
+            })
+        ));
+        let sealed = streamed.seal().await.expect("stream seals");
+        assert_eq!(sealed.len(), 5);
+        let reconciled = db
+            .content_physical_quota(domain)
+            .await
+            .expect("sealed accounting reads");
+        assert_eq!(reconciled.unique_content_bytes(), 5);
+        assert_eq!(reconciled.upload_reserved_bytes(), 0);
+        assert_eq!(reconciled.remaining(), Some(3));
+        assert!(matches!(
+            db.set_content_physical_quota(domain, Some(4)).await,
+            Err(Error::ContentPhysicalQuotaExceeded {
+                limit: 4,
+                requested_bytes: 0,
+                ..
+            })
+        ));
+    });
+}
+
+#[test]
+fn expected_upload_length_is_a_pre_write_physical_quota_boundary() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory()).await.expect("open database");
+        let domain = test_scope().storage_domain_id();
+        db.set_content_physical_quota(domain, Some(1))
+            .await
+            .expect("physical quota configures");
+
+        let mut upload = db
+            .begin_content_upload(test_upload_options().with_expected_length(1))
+            .await
+            .expect("expected upload reserves");
+        assert!(matches!(
+            upload.write(b"too large").await,
+            Err(Error::ContentLengthMismatch {
+                expected: 1,
+                actual: 9
+            })
+        ));
+        assert_eq!(upload.len(), 0);
+        assert_eq!(upload.buffered_bytes(), 0);
+        let quota = db
+            .content_physical_quota(domain)
+            .await
+            .expect("rejected write leaves accounting readable");
+        assert_eq!(quota.upload_reserved_bytes(), 1);
+        assert_eq!(quota.accounted_bytes(), 1);
+
+        upload
+            .write(b"x")
+            .await
+            .expect("writer remains usable at the declared boundary");
+        let sealed = upload.seal().await.expect("bounded upload seals");
+        assert_eq!(sealed.len(), 1);
+        let quota = db
+            .content_physical_quota(domain)
+            .await
+            .expect("sealed accounting reads");
+        assert_eq!(quota.unique_content_bytes(), 1);
+        assert_eq!(quota.upload_reserved_bytes(), 0);
+    });
+}
+
+#[test]
+fn physical_quota_concurrent_reservations_do_not_overcommit() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory()).await.expect("open database");
+        let domain = test_scope().storage_domain_id();
+        db.set_content_physical_quota(domain, Some(10))
+            .await
+            .expect("physical quota configures");
+        let options = test_upload_options().with_expected_length(6);
+        let (first, second) = futures::join!(
+            db.begin_content_upload(options),
+            db.begin_content_upload(options)
+        );
+        let successes = usize::from(first.is_ok()) + usize::from(second.is_ok());
+        let rejections = usize::from(matches!(
+            &first,
+            Err(Error::ContentPhysicalQuotaExceeded { .. } | Error::Conflict { .. })
+        )) + usize::from(matches!(
+            &second,
+            Err(Error::ContentPhysicalQuotaExceeded { .. } | Error::Conflict { .. })
+        ));
+        assert_eq!((successes, rejections), (1, 1));
+        assert_eq!(
+            db.content_physical_quota(domain)
+                .await
+                .expect("concurrent accounting reads")
+                .upload_reserved_bytes(),
+            6
+        );
+        if let Ok(upload) = first {
+            upload.abort().await.expect("first winner aborts");
+        }
+        if let Ok(upload) = second {
+            upload.abort().await.expect("second winner aborts");
+        }
+        assert_eq!(
+            db.content_physical_quota(domain)
+                .await
+                .expect("released concurrent accounting reads")
+                .accounted_bytes(),
+            0
+        );
+    });
+}
+
+#[test]
+fn physical_quota_reservation_survives_reopen_and_resume() {
+    let path = temp_db_path("content-physical-quota-reopen");
+    let upload_id = UploadId::new().expect("upload identity generates");
+    block_on(async {
+        let db = Db::open(DbOptions::new(&path))
+            .await
+            .expect("database opens");
+        let domain = test_scope().storage_domain_id();
+        db.set_content_physical_quota(domain, Some(32))
+            .await
+            .expect("physical quota configures");
+        let ContentUploadResume::Open(mut upload) = db
+            .begin_content_upload_with_id(upload_id, test_upload_options())
+            .await
+            .expect("unknown upload begins")
+        else {
+            panic!("new upload is open");
+        };
+        upload.write(b"durable").await.expect("prefix writes");
+        drop(upload);
+        assert_eq!(
+            db.content_physical_quota(domain)
+                .await
+                .expect("reservation reads")
+                .upload_reserved_bytes(),
+            7
+        );
+        db.close().await.expect("database closes");
+    });
+    block_on(async {
+        let db = Db::open(DbOptions::new(&path))
+            .await
+            .expect("database reopens");
+        let domain = test_scope().storage_domain_id();
+        assert_eq!(
+            db.content_physical_quota(domain)
+                .await
+                .expect("reopened reservation reads")
+                .upload_reserved_bytes(),
+            7
+        );
+        let ContentUploadResume::Open(upload) = db
+            .resume_content_upload(upload_id)
+            .await
+            .expect("upload resumes")
+        else {
+            panic!("resumed upload is open");
+        };
+        assert_eq!(upload.len(), 7);
+        upload.abort().await.expect("resumed upload aborts");
+        assert_eq!(
+            db.content_physical_quota(domain)
+                .await
+                .expect("reopened release reads")
+                .accounted_bytes(),
+            0
+        );
+        db.close().await.expect("database closes after release");
+    });
+    std::fs::remove_dir_all(path).expect("test database removes");
+}
+
+#[test]
+fn aborting_upload_retains_quota_until_chunk_cleanup_recovers() {
+    let path = temp_db_path("content-physical-quota-abort-recovery");
+    let upload_id = UploadId::new().expect("upload identity generates");
+    block_on(async {
+        let db = Db::open(DbOptions::new(&path))
+            .await
+            .expect("database opens");
+        let domain = test_scope().storage_domain_id();
+        db.set_content_physical_quota(domain, Some(32))
+            .await
+            .expect("physical quota configures");
+        let ContentUploadResume::Open(mut upload) = db
+            .begin_content_upload_with_id(upload_id, test_upload_options())
+            .await
+            .expect("upload begins")
+        else {
+            panic!("new upload is open");
+        };
+        upload
+            .write(b"durable")
+            .await
+            .expect("partial chunk writes");
+        let delete_fault = StorageFaultGuard::install(
+            &path,
+            StorageFaultPoint::ObjectDelete,
+            Some(StorageObjectKind::ContentChunk),
+            1,
+        );
+        assert!(matches!(upload.abort().await, Err(Error::Io(_))));
+        assert_eq!(
+            db.content_physical_quota(domain)
+                .await
+                .expect("failed abort accounting reads")
+                .upload_reserved_bytes(),
+            7
+        );
+        drop(delete_fault);
+        db.close().await.expect("database closes");
+    });
+    block_on(async {
+        let db = Db::open(DbOptions::new(&path))
+            .await
+            .expect("database reopens");
+        assert!(matches!(
+            db.resume_content_upload(upload_id).await,
+            Err(Error::ContentUploadNotFound { .. })
+        ));
+        assert_eq!(
+            db.content_physical_quota(test_scope().storage_domain_id())
+                .await
+                .expect("recovered abort accounting reads")
+                .accounted_bytes(),
+            0
+        );
+        db.close().await.expect("database closes after recovery");
+    });
+    std::fs::remove_dir_all(path).expect("test database removes");
 }
 
 fn test_hold_id(seed: u8) -> ContentPhysicalHoldId {
@@ -1395,8 +1711,22 @@ fn qualified_filesystem_sweep_reclaims_after_reopen_and_allows_later_reupload() 
             .await,
             Err(Error::ContentNotFound { .. })
         ));
+        assert_eq!(
+            db.content_physical_quota(sealed.storage_domain_id())
+                .await
+                .expect("reclaimed physical accounting reads")
+                .unique_content_bytes(),
+            0
+        );
         let replacement = seal_content_without_access_barrier(&db, bytes).await;
         assert_eq!(replacement.content_id(), sealed.content_id());
+        assert_eq!(
+            db.content_physical_quota(sealed.storage_domain_id())
+                .await
+                .expect("replacement physical accounting reads")
+                .unique_content_bytes(),
+            bytes.len() as u64
+        );
         assert_eq!(
             db.content_reclaim_sweep(sealed.storage_domain_id(), sealed.content_id())
                 .await
@@ -1425,6 +1755,114 @@ fn qualified_filesystem_sweep_reclaims_after_reopen_and_allows_later_reupload() 
         db.close().await.expect("replacement db closes");
     });
     std::fs::remove_dir_all(path).expect("test database removes");
+}
+
+#[cfg(target_os = "wasi")]
+#[test]
+fn qualified_wasi_sweep_reclaims_after_process_reopen() {
+    let path = PathBuf::from(format!(
+        "wasi-content-reclaim-{}",
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let options = || {
+        DbOptions::wasi_persistent(&path)
+            .with_content_reclamation(ContentReclamationMode::QualifiedWasiFilesystem)
+    };
+    let sealed = block_on(async {
+        let db = Db::open(options()).await.expect("WASI database opens");
+        let sealed = seal_content_without_access_barrier(&db, b"WASI physical reclamation").await;
+        let old = db
+            .open_content(sealed.storage_domain_id(), sealed.content_id())
+            .await
+            .expect("pre-barrier WASI handle opens");
+        db.enforce_content_leased_only(sealed.storage_domain_id(), test_access_barrier_id(130))
+            .await
+            .expect("WASI leased-only barrier commits");
+        assert_eq!(
+            old.read_range(0, u64::MAX)
+                .await
+                .expect("pre-barrier WASI handle remains valid")
+                .as_ref(),
+            b"WASI physical reclamation"
+        );
+        drop(old);
+        consume_reclaim_token(&db, sealed, 131).await;
+        let barrier = db
+            .enforce_content_leased_only(sealed.storage_domain_id(), test_access_barrier_id(130))
+            .await
+            .expect("WASI barrier coordinate reads");
+        db.attest_content_reader_drain(
+            barrier,
+            test_reader_drain_attestation_id(131),
+            test_reader_drain_options(ContentReaderDrainKind::NativeProcessSetRestarted, 132),
+        )
+        .await
+        .expect("WASI process-set drain attests");
+        let (authorization, _) = commit_reclaim_quarantine(&db, sealed, 133).await;
+        let mut grace_tx = db.transaction(TransactionOptions::default());
+        grace_tx
+            .stage_content_reclaim_grace(authorization, Duration::from_millis(1))
+            .await
+            .expect("WASI grace stages");
+        grace_tx.commit().await.expect("WASI grace commits");
+        let grace = db
+            .content_reclaim_grace(sealed.storage_domain_id(), sealed.content_id())
+            .await
+            .expect("WASI grace reads")
+            .expect("WASI grace exists");
+        let clock = ContentReclaimClockAttestation::new(
+            grace,
+            test_reclaim_clock_attestation_id(134),
+            ContentReclaimClockCoordinatorId::from_bytes([135; 16]),
+            ContentReclaimClockEvidenceDigest::for_bytes(b"WASI restart clock evidence"),
+            grace.not_before_unix_ms(),
+        )
+        .expect("WASI clock binds grace");
+        let mut prepare = db.transaction(TransactionOptions::default());
+        let fresh = reclaim_authorization(&prepare, sealed, 136);
+        assert_eq!(
+            prepare
+                .stage_content_reclaim_sweep(fresh, clock)
+                .await
+                .expect("WASI sweep stages"),
+            ContentReclaimSweepStage::Staged
+        );
+        prepare.commit().await.expect("WASI Prepared commits");
+        db.close().await.expect("WASI database closes at Prepared");
+        sealed
+    });
+
+    block_on(async {
+        let reopened = Db::open(options())
+            .await
+            .expect("WASI database reopens at Prepared");
+        let sweep = reopened
+            .resume_content_reclaim_sweep(sealed.storage_domain_id(), sealed.content_id())
+            .await
+            .expect("WASI sweep resumes");
+        assert!(sweep.reclaimed_at().is_some());
+        assert!(matches!(
+            reopened
+                .open_content_leased(
+                    sealed.storage_domain_id(),
+                    sealed.content_id(),
+                    ContentLeaseOptions::new(
+                        ContentLeaseOwnerId::from_bytes([137; 16]),
+                        Duration::from_secs(60),
+                    ),
+                )
+                .await,
+            Err(Error::ContentNotFound { .. })
+        ));
+        reopened
+            .close()
+            .await
+            .expect("reclaimed WASI database closes");
+    });
+    // wasm32-wasip1's std directory removal may report DirectoryNotEmpty for
+    // nested host-preopened paths even after every database handle closes. The
+    // test namespace is unique and the host harness owns final fixture cleanup.
+    let _ = std::fs::remove_dir_all(path);
 }
 
 #[cfg(not(feature = "s3"))]
@@ -2251,6 +2689,7 @@ fn every_physical_hold_kind_enters_the_same_reclaim_fence() {
             ContentPhysicalHoldKind::Provider,
             ContentPhysicalHoldKind::Administrative,
             ContentPhysicalHoldKind::Processing,
+            ContentPhysicalHoldKind::Offline,
         ]
         .into_iter()
         .enumerate()
@@ -2766,18 +3205,27 @@ fn memory_content_ranges_stream_and_expectations_fail_closed() {
             .await
             .expect("mismatch upload begins");
         let mismatch_id = mismatch.upload_id();
-        mismatch.write(b"two").await.expect("mismatch bytes write");
         assert!(matches!(
-            mismatch.seal().await,
+            mismatch.write(b"two").await,
             Err(Error::ContentLengthMismatch {
                 expected: 1,
                 actual: 3
             })
         ));
-        assert!(matches!(
-            db.resume_content_upload(mismatch_id).await,
-            Err(Error::ContentUploadNotFound { .. })
-        ));
+        assert_eq!(mismatch.len(), 0);
+        let resumed = db
+            .resume_content_upload(mismatch_id)
+            .await
+            .expect("rejected write leaves resumable upload state")
+            .into_open()
+            .expect("rejected write leaves the upload open");
+        assert_eq!(resumed.len(), 0);
+        drop(resumed);
+        mismatch
+            .write(b"x")
+            .await
+            .expect("valid replacement byte writes");
+        mismatch.seal().await.expect("exact-length upload seals");
     });
 }
 
@@ -3145,8 +3593,8 @@ fn object_store_counts_requests_detects_tampering_and_hides_failed_seal() {
         let sealed = upload.seal().await.expect("object upload seals");
         let after_seal = client.counts();
         assert_eq!(
-            after_seal.put, 9,
-            "begin/progress, chunks, descriptor, sealing, token WAL, and sealed state"
+            after_seal.put, 11,
+            "begin/progress, physical reservation, chunks, descriptor, sealing, token WAL, physical finalize, and sealed state"
         );
 
         let handle = db

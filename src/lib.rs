@@ -126,9 +126,9 @@ mod range_tombstone;
 pub mod recovery;
 /// Runtime selection, capabilities, and cancellation support.
 pub mod runtime;
-/// Real object-storage `ObjectClient` (S3 and compatible) via the `object_store`
-/// crate. Enabled by the `s3` feature.
-#[cfg(feature = "s3")]
+/// Real native object-storage `ObjectClient` (S3 and compatible) via the
+/// `object_store` crate. Enabled by the `s3` feature on non-WASM targets.
+#[cfg(all(feature = "s3", not(target_family = "wasm")))]
 pub mod s3;
 /// Search policy helpers for table indexes.
 pub mod search;
@@ -155,7 +155,7 @@ pub use content::{
     ContentAttachmentScope, ContentChangeId, ContentHandle, ContentHashAlgorithm, ContentId,
     ContentLeaseId, ContentLeaseOptions, ContentLeaseOwnerId, ContentPhysicalHold,
     ContentPhysicalHoldId, ContentPhysicalHoldKind, ContentPhysicalHoldOptions,
-    ContentPhysicalHoldOwnerId, ContentQuarantine, ContentQuarantineStage,
+    ContentPhysicalHoldOwnerId, ContentPhysicalQuota, ContentQuarantine, ContentQuarantineStage,
     ContentReaderDrainAttestation, ContentReaderDrainAttestationId,
     ContentReaderDrainAttestationOptions, ContentReaderDrainCoordinatorId,
     ContentReaderDrainEvidenceDigest, ContentReaderDrainKind, ContentReclaimAuthorization,

@@ -10,7 +10,7 @@ use super::open_helpers::{
     list_persistent_directory_files_async, lock_poisoned, object_store_committed_wal_batches,
     object_store_wal_paths_after_replay_floor, persistent_path_from_options,
     referenced_blob_file_ids_from_manifest, referenced_table_file_ids, remove_storage_files,
-    repair_safe_temporary_files_for_open,
+    remove_storage_files_async, repair_safe_temporary_files_for_open,
     repair_safe_temporary_files_for_open_from_directory_files_async,
     run_persistent_recovery_checks, run_persistent_recovery_checks_from_directory_files_async,
     should_rewrite_blob_indexes_for_compaction, sync_storage_directory_after_renames,
@@ -20,8 +20,7 @@ use super::open_helpers::{
 };
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use super::open_helpers::{
-    background_worker_loop, delete_storage_object_async, remove_storage_files_async,
-    sync_storage_directory_after_renames_async,
+    background_worker_loop, delete_storage_object_async, sync_storage_directory_after_renames_async,
 };
 use super::{
     Arc, AsyncPointReadIo, AtomicBool, AtomicU64, AtomicUsize,

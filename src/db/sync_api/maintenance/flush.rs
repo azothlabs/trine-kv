@@ -1,10 +1,11 @@
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use super::NamedCompactionOutput;
 use super::{
     Arc, BatchOperation, BucketOptions, Db, Error, KeyRange, LsmTree, MaintenanceBudget,
     MaintenanceOutcome, NamedFlushInput, Path, Result, Sequence, Table, WritePressure,
-    lock_poisoned, remove_storage_files, table, usize_to_u64_saturating,
+    lock_poisoned, remove_storage_files, remove_storage_files_async, table,
+    usize_to_u64_saturating,
 };
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-use super::{NamedCompactionOutput, remove_storage_files_async};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::DurabilityMode;
 
@@ -396,8 +397,7 @@ impl Db {
         self.l0_pressure_exceeded()
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    pub(in crate::db) async fn run_flush_once_with_budget_native_async(
+    pub(in crate::db) async fn run_flush_once_with_budget_host_async(
         &self,
         db_path: &Path,
         freeze_active: bool,
@@ -420,7 +420,7 @@ impl Db {
         let (flush_inputs, budget_exhausted) = self.collect_flush_inputs_with_budget(budget)?;
         let flush_count = flush_inputs.len();
         let should_compact = self
-            .write_flush_inputs_native_async(db_path, &flush_inputs)
+            .write_flush_inputs_host_async(db_path, &flush_inputs)
             .await?;
         let outcome = MaintenanceOutcome {
             flushes: flush_count,
@@ -433,8 +433,7 @@ impl Db {
         Ok((should_compact, outcome))
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    pub(in crate::db) async fn write_flush_inputs_native_async(
+    pub(in crate::db) async fn write_flush_inputs_host_async(
         &self,
         db_path: &Path,
         flush_inputs: &[NamedFlushInput],
@@ -448,7 +447,14 @@ impl Db {
             .map(|input| input.input.freeze_sequence)
             .max()
             .expect("non-empty flush input list has a max sequence");
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let storage = self.inner.native_storage.clone();
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let storage = self.browser_storage()?;
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let durability = self.filesystem_publish_durability();
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let durability = DurabilityMode::Flush;
         let mut written_tables = Vec::with_capacity(flush_inputs.len());
         let mut written_table_ids = Vec::with_capacity(flush_inputs.len());
 
@@ -463,7 +469,7 @@ impl Db {
                 &input.input.table_options,
                 &input.input.point_records,
                 &input.input.range_tombstones,
-                self.filesystem_publish_durability(),
+                durability,
             )
             .await
             {
@@ -476,6 +482,7 @@ impl Db {
             written_tables.push((input.bucket.clone(), Arc::new(table)));
         }
 
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         if let Err(error) = self
             .sync_filesystem_directory_after_renames_async(db_path)
             .await
@@ -492,10 +499,15 @@ impl Db {
             }
         };
 
-        if let Err(error) = self
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let publish_result = self
             .publish_flushed_tables_native_async(&written_tables, flush_sequence)
-            .await
-        {
+            .await;
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let publish_result = self
+            .publish_flushed_tables_browser_async(&written_tables, flush_sequence)
+            .await;
+        if let Err(error) = publish_result {
             if !self.closed_after_durable_publish_error() {
                 let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
             }
@@ -504,7 +516,11 @@ impl Db {
 
         Self::install_flushed_tables(flush_inputs, written_tables)
             .map_err(|error| self.close_after_durable_publish_error("flush", &error))?;
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         self.rewrite_wal_after_replay_floor_async(flush_sequence)
+            .await?;
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        self.rewrite_wal_after_replay_floor_browser_async(db_path, flush_sequence)
             .await?;
         self.l0_pressure_exceeded()
     }
@@ -576,106 +592,6 @@ impl Db {
         };
         prepared.publish_async().await?;
         self.install_prepared_manifest_after_durable_publish("compaction", manifest, prepared)
-    }
-
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    pub(in crate::db) async fn run_flush_once_with_budget_browser_async(
-        &self,
-        db_path: &Path,
-        freeze_active: bool,
-        budget: MaintenanceBudget,
-    ) -> Result<(bool, MaintenanceOutcome)> {
-        let Some(_flush_guard) = self.inner.maintenance.try_start_flush() else {
-            return Ok((false, MaintenanceOutcome::busy_outcome()));
-        };
-
-        if freeze_active {
-            let _memtable_publish = self
-                .inner
-                .memtable_publish_lock
-                .lock()
-                .map_err(|_| lock_poisoned("memtable publish lock"))?;
-            let _publish = self.inner.publish_barrier.enter()?;
-            self.freeze_all_active_memtables(self.last_committed_sequence())?;
-        }
-
-        let (flush_inputs, budget_exhausted) = self.collect_flush_inputs_with_budget(budget)?;
-        let flush_count = flush_inputs.len();
-        let should_compact = self
-            .write_flush_inputs_browser_async(db_path, &flush_inputs)
-            .await?;
-        let outcome = MaintenanceOutcome {
-            flushes: flush_count,
-            budget_exhausted: budget_exhausted && flush_count != 0,
-            ..MaintenanceOutcome::default()
-        };
-        if outcome.budget_exhausted {
-            self.record_maintenance_budget_exhaustion();
-        }
-        Ok((should_compact, outcome))
-    }
-
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    pub(in crate::db) async fn write_flush_inputs_browser_async(
-        &self,
-        db_path: &Path,
-        flush_inputs: &[NamedFlushInput],
-    ) -> Result<bool> {
-        if flush_inputs.is_empty() {
-            return Ok(false);
-        }
-
-        let flush_sequence = flush_inputs
-            .iter()
-            .map(|input| input.input.freeze_sequence)
-            .max()
-            .expect("non-empty flush input list has a max sequence");
-        let storage = self.browser_storage()?;
-        let mut written_tables = Vec::with_capacity(flush_inputs.len());
-        let mut written_table_ids = Vec::with_capacity(flush_inputs.len());
-
-        for input in flush_inputs {
-            let table_path = table::table_path(db_path, input.input.table_id);
-            written_table_ids.push(input.input.table_id);
-            let table = match table::write_table_with_backend_async(
-                &storage,
-                &table_path,
-                input.input.table_id,
-                input.input.table_level,
-                &input.input.table_options,
-                &input.input.point_records,
-                &input.input.range_tombstones,
-                DurabilityMode::Flush,
-            )
-            .await
-            {
-                Ok(table) => table,
-                Err(error) => {
-                    let _ = self
-                        .remove_storage_files_browser_async(db_path, &written_table_ids)
-                        .await;
-                    return Err(error);
-                }
-            };
-            written_tables.push((input.bucket.clone(), Arc::new(table)));
-        }
-
-        if let Err(error) = self
-            .publish_flushed_tables_browser_async(&written_tables, flush_sequence)
-            .await
-        {
-            if !self.closed_after_durable_publish_error() {
-                let _ = self
-                    .remove_storage_files_browser_async(db_path, &written_table_ids)
-                    .await;
-            }
-            return Err(error);
-        }
-        Self::install_flushed_tables(flush_inputs, written_tables)
-            .map_err(|error| self.close_after_durable_publish_error("flush", &error))?;
-        self.rewrite_wal_after_replay_floor_browser_async(db_path, flush_sequence)
-            .await?;
-        self.l0_pressure_exceeded()
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]

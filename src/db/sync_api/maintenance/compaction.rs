@@ -1,14 +1,25 @@
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-use super::remove_storage_files_async;
 use super::{
     Arc, BlobLevelMergePolicy, CompactionReservation, Db, Error, KeyRange, LsmCompactionOutput,
-    MaintenanceBudget, MaintenanceOutcome, NamedCompactionInput, NamedCompactionOutput, Path,
-    PendingCompactionOutputs, Result, Sequence, compaction_options, compaction_trigger_stat_deltas,
-    is_level_layout_compaction_error, lock_poisoned, remove_storage_files,
-    should_rewrite_blob_indexes_for_compaction, table,
+    MaintenanceBudget, MaintenanceCompactionGuard, MaintenanceOutcome, NamedCompactionInput,
+    NamedCompactionOutput, Path, PendingCompactionOutputs, Result, Sequence, compaction_options,
+    compaction_trigger_stat_deltas, is_level_layout_compaction_error, lock_poisoned,
+    remove_storage_files, remove_storage_files_async, should_rewrite_blob_indexes_for_compaction,
+    table,
 };
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::DurabilityMode;
+
+struct PreparedCompactionRun {
+    oldest_active_snapshot: Sequence,
+    inputs: Vec<NamedCompactionInput>,
+    guard: MaintenanceCompactionGuard,
+    budget_exhausted: bool,
+}
+
+enum CompactionRunPreparation {
+    Ready(PreparedCompactionRun),
+    Outcome(MaintenanceOutcome),
+}
 
 impl Db {
     pub(in crate::db) fn collect_compaction_inputs(
@@ -78,40 +89,15 @@ impl Db {
         local_l0_compaction: bool,
         budget: MaintenanceBudget,
     ) -> Result<MaintenanceOutcome> {
-        let oldest_active_snapshot = self.oldest_retained_sequence();
-        let compaction_inputs =
-            self.collect_compaction_inputs(range, oldest_active_snapshot, local_l0_compaction)?;
-        if compaction_inputs.is_empty() {
-            return Ok(MaintenanceOutcome::default());
-        }
-
-        let reservations = compaction_inputs
-            .iter()
-            .map(|input| CompactionReservation {
-                bucket: input.bucket.clone(),
-                range: input.input.compaction_range.clone(),
-            })
-            .collect::<Vec<_>>();
-        let Some(compaction_guard) = self.inner.maintenance.reserve_compactions(reservations)
-        else {
-            return Ok(MaintenanceOutcome::busy_outcome());
+        let PreparedCompactionRun {
+            oldest_active_snapshot,
+            inputs: compaction_inputs,
+            guard: compaction_guard,
+            budget_exhausted,
+        } = match self.prepare_compaction_run(range, local_l0_compaction, budget)? {
+            CompactionRunPreparation::Ready(run) => run,
+            CompactionRunPreparation::Outcome(outcome) => return Ok(outcome),
         };
-        let mut compaction_inputs = compaction_inputs
-            .into_iter()
-            .filter(|input| compaction_guard.contains(&input.bucket, &input.input.compaction_range))
-            .collect::<Vec<_>>();
-        if compaction_inputs.is_empty() {
-            return Ok(MaintenanceOutcome::busy_outcome());
-        }
-        let limit = budget.compaction_input_limit();
-        let budget_exhausted = compaction_inputs.len() > limit;
-        compaction_inputs.truncate(limit);
-        if compaction_inputs.is_empty() {
-            return Ok(MaintenanceOutcome::default());
-        }
-        if !Self::compaction_inputs_are_current(&compaction_inputs)? {
-            return Ok(MaintenanceOutcome::busy_outcome());
-        }
 
         let PendingCompactionOutputs {
             outputs: written_tables,
@@ -179,7 +165,6 @@ impl Db {
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    #[allow(clippy::too_many_lines)]
     pub(in crate::db) async fn run_compaction_barrier_native_async(
         &self,
         db_path: &Path,
@@ -189,7 +174,7 @@ impl Db {
         loop {
             self.take_background_maintenance_error()?;
             let outcome = self
-                .run_compaction_once_with_budget_native_async(
+                .run_compaction_once_with_budget_host_async(
                     db_path,
                     range,
                     local_l0_compaction,
@@ -209,60 +194,34 @@ impl Db {
         }
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    #[allow(clippy::too_many_lines)]
-    pub(in crate::db) async fn run_compaction_once_with_budget_native_async(
+    pub(in crate::db) async fn run_compaction_once_with_budget_host_async(
         &self,
         db_path: &Path,
         range: &KeyRange,
         local_l0_compaction: bool,
         budget: MaintenanceBudget,
     ) -> Result<MaintenanceOutcome> {
-        let oldest_active_snapshot = self.oldest_retained_sequence();
-        let compaction_inputs =
-            self.collect_compaction_inputs(range, oldest_active_snapshot, local_l0_compaction)?;
-        if compaction_inputs.is_empty() {
-            return Ok(MaintenanceOutcome::default());
-        }
-
-        let reservations = compaction_inputs
-            .iter()
-            .map(|input| CompactionReservation {
-                bucket: input.bucket.clone(),
-                range: input.input.compaction_range.clone(),
-            })
-            .collect::<Vec<_>>();
-        let Some(compaction_guard) = self.inner.maintenance.reserve_compactions(reservations)
-        else {
-            return Ok(MaintenanceOutcome::busy_outcome());
+        let PreparedCompactionRun {
+            oldest_active_snapshot,
+            inputs: compaction_inputs,
+            guard: compaction_guard,
+            budget_exhausted,
+        } = match self.prepare_compaction_run(range, local_l0_compaction, budget)? {
+            CompactionRunPreparation::Ready(run) => run,
+            CompactionRunPreparation::Outcome(outcome) => return Ok(outcome),
         };
-        let mut compaction_inputs = compaction_inputs
-            .into_iter()
-            .filter(|input| compaction_guard.contains(&input.bucket, &input.input.compaction_range))
-            .collect::<Vec<_>>();
-        if compaction_inputs.is_empty() {
-            return Ok(MaintenanceOutcome::busy_outcome());
-        }
-        let limit = budget.compaction_input_limit();
-        let budget_exhausted = compaction_inputs.len() > limit;
-        compaction_inputs.truncate(limit);
-        if compaction_inputs.is_empty() {
-            return Ok(MaintenanceOutcome::default());
-        }
-        if !Self::compaction_inputs_are_current(&compaction_inputs)? {
-            return Ok(MaintenanceOutcome::busy_outcome());
-        }
 
-        let PendingCompactionOutputs {
-            outputs: written_tables,
-            written_table_ids,
-        } = self
-            .build_compaction_outputs_native_async(
+        let pending_outputs = self
+            .build_compaction_outputs_host_async(
                 db_path,
                 oldest_active_snapshot,
                 &compaction_inputs,
             )
             .await?;
+        let PendingCompactionOutputs {
+            outputs: written_tables,
+            written_table_ids,
+        } = pending_outputs;
 
         let output_tables = written_tables
             .iter()
@@ -276,19 +235,19 @@ impl Db {
         let obsolete_blob_ids =
             self.obsolete_blob_ids_for_compaction(&compaction_inputs, &written_tables)?;
 
-        let storage = self.inner.native_storage.clone();
         if !written_table_ids.is_empty() {
-            if let Err(error) = self
-                .sync_filesystem_directory_after_renames_async(db_path)
-                .await
-            {
-                let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+            if let Err(error) = self.sync_compaction_directory_host_async(db_path).await {
+                let _ = self
+                    .remove_storage_files_host_async(db_path, &written_table_ids)
+                    .await;
                 return Err(error);
             }
         }
 
         if let Err(error) = self.validate_compacted_tables(&written_tables) {
-            let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+            let _ = self
+                .remove_storage_files_host_async(db_path, &written_table_ids)
+                .await;
             if is_level_layout_compaction_error(&error) {
                 return Ok(MaintenanceOutcome::default());
             }
@@ -297,133 +256,20 @@ impl Db {
         let _publish_activity = match self.inner.publish_barrier.begin_activity() {
             Ok(activity) => activity,
             Err(error) => {
-                let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+                let _ = self
+                    .remove_storage_files_host_async(db_path, &written_table_ids)
+                    .await;
                 return Err(error);
             }
         };
 
-        if let Err(error) = self
-            .publish_compacted_tables_native_async(&written_tables, &obsolete_blob_ids)
-            .await
-        {
-            if !self.closed_after_durable_publish_error() {
-                let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
-            }
-            return Err(error);
-        }
-
-        let obsolete_tables = self
-            .install_compacted_tables(written_tables)
-            .map_err(|error| self.close_after_durable_publish_error("compaction", &error))?;
-        self.record_compaction_stats_from_tables(
-            compaction_inputs.len(),
-            &input_tables,
-            &output_tables,
-            &trigger_stats,
-        );
-        self.retire_obsolete_table_files_native_async(db_path, obsolete_tables)
-            .await?;
-        self.delete_pending_obsolete_blob_files_native_async(db_path)
-            .await?;
-        drop(compaction_guard);
-        if self.inner.options.blob_gc_enabled {
-            self.run_blob_gc_once_native_async(db_path).await?;
-        }
-
-        let outcome = MaintenanceOutcome {
-            compactions: compaction_inputs.len(),
-            budget_exhausted,
-            ..MaintenanceOutcome::default()
-        };
-        if outcome.budget_exhausted {
-            self.record_maintenance_budget_exhaustion();
-        }
-        Ok(outcome)
-    }
-
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    #[allow(clippy::too_many_lines)]
-    pub(in crate::db) async fn run_compaction_once_with_budget_browser_async(
-        &self,
-        db_path: &Path,
-        range: &KeyRange,
-        local_l0_compaction: bool,
-        budget: MaintenanceBudget,
-    ) -> Result<MaintenanceOutcome> {
-        let oldest_active_snapshot = self.oldest_retained_sequence();
-        let compaction_inputs =
-            self.collect_compaction_inputs(range, oldest_active_snapshot, local_l0_compaction)?;
-        if compaction_inputs.is_empty() {
-            return Ok(MaintenanceOutcome::default());
-        }
-
-        let reservations = compaction_inputs
-            .iter()
-            .map(|input| CompactionReservation {
-                bucket: input.bucket.clone(),
-                range: input.input.compaction_range.clone(),
-            })
-            .collect::<Vec<_>>();
-        let Some(compaction_guard) = self.inner.maintenance.reserve_compactions(reservations)
-        else {
-            return Ok(MaintenanceOutcome::busy_outcome());
-        };
-        let mut compaction_inputs = compaction_inputs
-            .into_iter()
-            .filter(|input| compaction_guard.contains(&input.bucket, &input.input.compaction_range))
-            .collect::<Vec<_>>();
-        if compaction_inputs.is_empty() {
-            return Ok(MaintenanceOutcome::busy_outcome());
-        }
-        let limit = budget.compaction_input_limit();
-        let budget_exhausted = compaction_inputs.len() > limit;
-        compaction_inputs.truncate(limit);
-        if compaction_inputs.is_empty() {
-            return Ok(MaintenanceOutcome::default());
-        }
-        if !Self::compaction_inputs_are_current(&compaction_inputs)? {
-            return Ok(MaintenanceOutcome::busy_outcome());
-        }
-
-        let PendingCompactionOutputs {
-            outputs: written_tables,
-            written_table_ids,
-        } = self
-            .build_compaction_outputs_browser_async(
-                db_path,
-                oldest_active_snapshot,
-                &compaction_inputs,
-            )
-            .await?;
-
-        let output_tables = written_tables
-            .iter()
-            .flat_map(|output| output.output.tables.iter().cloned())
-            .collect::<Vec<_>>();
-        let input_tables = compaction_inputs
-            .iter()
-            .flat_map(|input| input.input.input_tables.iter().cloned())
-            .collect::<Vec<_>>();
-        let trigger_stats = compaction_trigger_stat_deltas(&compaction_inputs, &written_tables);
-        let obsolete_blob_ids =
-            self.obsolete_blob_ids_for_compaction(&compaction_inputs, &written_tables)?;
-
-        if let Err(error) = self.validate_compacted_tables(&written_tables) {
-            let _ = self
-                .remove_storage_files_browser_async(db_path, &written_table_ids)
-                .await;
-            if is_level_layout_compaction_error(&error) {
-                return Ok(MaintenanceOutcome::default());
-            }
-            return Err(error);
-        }
-        if let Err(error) = self
-            .publish_compacted_tables_browser_async(&written_tables, &obsolete_blob_ids)
-            .await
-        {
+        let publish_result = self
+            .publish_compacted_tables_host_async(&written_tables, &obsolete_blob_ids)
+            .await;
+        if let Err(error) = publish_result {
             if !self.closed_after_durable_publish_error() {
                 let _ = self
-                    .remove_storage_files_browser_async(db_path, &written_table_ids)
+                    .remove_storage_files_host_async(db_path, &written_table_ids)
                     .await;
             }
             return Err(error);
@@ -439,18 +285,16 @@ impl Db {
             &output_tables,
             &trigger_stats,
         );
-        // Browser Drop cannot perform asynchronous OPFS deletion, so release
-        // the plan's input-table references before the awaited cleanup pass.
-        // Actual readers still defer deletion through their own table handles.
+        // Release plan-held table references before asynchronous retirement.
         drop(input_tables);
         drop(compaction_inputs);
-        self.retire_obsolete_table_files_browser_async(db_path, obsolete_tables)
+        self.retire_obsolete_table_files_host_async(db_path, obsolete_tables)
             .await?;
-        self.delete_pending_obsolete_blob_files_browser_async(db_path)
+        self.delete_pending_obsolete_blob_files_host_async(db_path)
             .await?;
         drop(compaction_guard);
         if self.inner.options.blob_gc_enabled {
-            self.run_blob_gc_once_browser_async(db_path).await?;
+            self.run_blob_gc_once_host_async(db_path).await?;
         }
 
         let outcome = MaintenanceOutcome {
@@ -462,6 +306,145 @@ impl Db {
             self.record_maintenance_budget_exhaustion();
         }
         Ok(outcome)
+    }
+
+    fn prepare_compaction_run(
+        &self,
+        range: &KeyRange,
+        local_l0_compaction: bool,
+        budget: MaintenanceBudget,
+    ) -> Result<CompactionRunPreparation> {
+        let oldest_active_snapshot = self.oldest_retained_sequence();
+        let inputs =
+            self.collect_compaction_inputs(range, oldest_active_snapshot, local_l0_compaction)?;
+        if inputs.is_empty() {
+            return Ok(CompactionRunPreparation::Outcome(
+                MaintenanceOutcome::default(),
+            ));
+        }
+        let reservations = inputs
+            .iter()
+            .map(|input| CompactionReservation {
+                bucket: input.bucket.clone(),
+                range: input.input.compaction_range.clone(),
+            })
+            .collect::<Vec<_>>();
+        let Some(guard) = self.inner.maintenance.reserve_compactions(reservations) else {
+            return Ok(CompactionRunPreparation::Outcome(
+                MaintenanceOutcome::busy_outcome(),
+            ));
+        };
+        let mut inputs = inputs
+            .into_iter()
+            .filter(|input| guard.contains(&input.bucket, &input.input.compaction_range))
+            .collect::<Vec<_>>();
+        if inputs.is_empty() {
+            return Ok(CompactionRunPreparation::Outcome(
+                MaintenanceOutcome::busy_outcome(),
+            ));
+        }
+        let limit = budget.compaction_input_limit();
+        let budget_exhausted = inputs.len() > limit;
+        inputs.truncate(limit);
+        if !Self::compaction_inputs_are_current(&inputs)? {
+            return Ok(CompactionRunPreparation::Outcome(
+                MaintenanceOutcome::busy_outcome(),
+            ));
+        }
+        Ok(CompactionRunPreparation::Ready(PreparedCompactionRun {
+            oldest_active_snapshot,
+            inputs,
+            guard,
+            budget_exhausted,
+        }))
+    }
+
+    async fn build_compaction_outputs_host_async(
+        &self,
+        db_path: &Path,
+        oldest_active_snapshot: Sequence,
+        inputs: &[NamedCompactionInput],
+    ) -> Result<PendingCompactionOutputs> {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        return self
+            .build_compaction_outputs_native_async(db_path, oldest_active_snapshot, inputs)
+            .await;
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        return self
+            .build_compaction_outputs_browser_async(db_path, oldest_active_snapshot, inputs)
+            .await;
+    }
+
+    pub(in crate::db) async fn remove_storage_files_host_async(
+        &self,
+        db_path: &Path,
+        table_ids: &[table::TableId],
+    ) -> Result<()> {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let storage = self.inner.native_storage.clone();
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let storage = self.browser_storage()?;
+        remove_storage_files_async(&storage, db_path, table_ids).await
+    }
+
+    pub(in crate::db) async fn sync_compaction_directory_host_async(
+        &self,
+        db_path: &Path,
+    ) -> Result<()> {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        return self
+            .sync_filesystem_directory_after_renames_async(db_path)
+            .await;
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            let _ = db_path;
+            futures::future::ready(Ok(())).await
+        }
+    }
+
+    pub(in crate::db) async fn publish_compacted_tables_host_async(
+        &self,
+        outputs: &[NamedCompactionOutput],
+        obsolete_blob_ids: &[u64],
+    ) -> Result<()> {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        return self
+            .publish_compacted_tables_native_async(outputs, obsolete_blob_ids)
+            .await;
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        return self
+            .publish_compacted_tables_browser_async(outputs, obsolete_blob_ids)
+            .await;
+    }
+
+    pub(in crate::db) async fn retire_obsolete_table_files_host_async(
+        &self,
+        db_path: &Path,
+        obsolete_tables: Vec<Arc<crate::table::Table>>,
+    ) -> Result<()> {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        return self
+            .retire_obsolete_table_files_native_async(db_path, obsolete_tables)
+            .await;
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        return self
+            .retire_obsolete_table_files_browser_async(db_path, obsolete_tables)
+            .await;
+    }
+
+    pub(in crate::db) async fn delete_pending_obsolete_blob_files_host_async(
+        &self,
+        db_path: &Path,
+    ) -> Result<()> {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let _ = self
+            .delete_pending_obsolete_blob_files_native_async(db_path)
+            .await?;
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let _ = self
+            .delete_pending_obsolete_blob_files_browser_async(db_path)
+            .await?;
+        Ok(())
     }
 
     pub(in crate::db) fn build_compaction_outputs(
@@ -698,9 +681,7 @@ impl Db {
             ) {
                 Ok(payloads) => payloads,
                 Err(error) => {
-                    let _ = self
-                        .remove_storage_files_browser_async(db_path, &written_table_ids)
-                        .await;
+                    let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
                     return Err(error);
                 }
             };
@@ -716,9 +697,7 @@ impl Db {
                 next_table_id = if let Some(table_id) = next_table_id.next() {
                     table_id
                 } else {
-                    let _ = self
-                        .remove_storage_files_browser_async(db_path, &written_table_ids)
-                        .await;
+                    let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
                     return Err(Error::Corruption {
                         message: "table id counter overflow".to_owned(),
                     });
@@ -740,9 +719,8 @@ impl Db {
                 {
                     Ok(table) => table,
                     Err(error) => {
-                        let _ = self
-                            .remove_storage_files_browser_async(db_path, &written_table_ids)
-                            .await;
+                        let _ =
+                            remove_storage_files_async(&storage, db_path, &written_table_ids).await;
                         return Err(error);
                     }
                 };

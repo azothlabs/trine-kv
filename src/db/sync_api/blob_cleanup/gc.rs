@@ -1,5 +1,3 @@
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-use super::remove_storage_files_async;
 use super::{
     Arc, BTreeSet, BlobGcCandidate, BlobGcRewritePlan, BlobGcRewriteRecord, BlobGcRewriteTable,
     CompactionReservation, Db, Error, KeyRange, LsmCompactionOutput, MaintenanceCompactionGuard,
@@ -9,6 +7,38 @@ use super::{
 };
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::DurabilityMode;
+
+struct BlobGcRunMetadata {
+    input_bytes: u64,
+    discarded_bytes: u64,
+    obsolete_blob_ids: Vec<u64>,
+    written_table_ids: Vec<table::TableId>,
+}
+
+fn blob_gc_run_metadata(plan: &BlobGcRewritePlan) -> BlobGcRunMetadata {
+    let input_bytes = plan.candidates.iter().fold(0_u64, |bytes, candidate| {
+        bytes.saturating_add(candidate.total_bytes)
+    });
+    let discarded_bytes = plan.candidates.iter().fold(0_u64, |bytes, candidate| {
+        bytes.saturating_add(candidate.total_bytes.saturating_sub(candidate.live_bytes))
+    });
+    let obsolete_blob_ids = plan
+        .candidates
+        .iter()
+        .map(|candidate| candidate.file_id)
+        .collect();
+    let written_table_ids = plan
+        .tables
+        .iter()
+        .map(|table| table.output_table_id)
+        .collect();
+    BlobGcRunMetadata {
+        input_bytes,
+        discarded_bytes,
+        obsolete_blob_ids,
+        written_table_ids,
+    }
+}
 
 impl Db {
     pub(in crate::db) fn run_blob_gc_once_locked(&self, db_path: &Path) -> Result<()> {
@@ -22,17 +52,12 @@ impl Db {
             return Ok(());
         }
 
-        let input_bytes = plan.candidates.iter().fold(0_u64, |bytes, candidate| {
-            bytes.saturating_add(candidate.total_bytes)
-        });
-        let discarded_bytes = plan.candidates.iter().fold(0_u64, |bytes, candidate| {
-            bytes.saturating_add(candidate.total_bytes.saturating_sub(candidate.live_bytes))
-        });
-        let obsolete_blob_ids = plan
-            .candidates
-            .iter()
-            .map(|candidate| candidate.file_id)
-            .collect::<Vec<_>>();
+        let BlobGcRunMetadata {
+            input_bytes,
+            discarded_bytes,
+            obsolete_blob_ids,
+            written_table_ids,
+        } = blob_gc_run_metadata(&plan);
 
         let header = blob::BlobFileHeader::new(
             plan.new_blob_file_id,
@@ -42,11 +67,6 @@ impl Db {
         );
         let blob_records = blob_gc_blob_records(&plan.records);
 
-        let written_table_ids = plan
-            .tables
-            .iter()
-            .map(|table| table.output_table_id)
-            .collect::<Vec<_>>();
         let indexes = match blob::write_blob_file_with_backend_with_durability(
             &self.inner.native_storage,
             db_path,
@@ -100,26 +120,12 @@ impl Db {
             .install_compacted_tables(outputs)
             .map_err(|error| self.close_after_durable_publish_error("blob GC", &error))?;
         self.retire_obsolete_table_files(db_path, obsolete_tables)?;
-        self.inner.blob_gc_runs.fetch_add(1, Ordering::AcqRel);
-        self.inner
-            .blob_gc_input_bytes
-            .fetch_add(input_bytes, Ordering::AcqRel);
-        self.inner
-            .blob_gc_output_bytes
-            .fetch_add(output_bytes, Ordering::AcqRel);
-        self.inner
-            .blob_gc_discarded_bytes
-            .fetch_add(discarded_bytes, Ordering::AcqRel);
+        self.record_blob_gc_stats(input_bytes, output_bytes, discarded_bytes);
         self.delete_pending_obsolete_blob_files(db_path)
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    #[allow(clippy::too_many_lines)]
-    pub(in crate::db) async fn run_blob_gc_once_native_async(&self, db_path: &Path) -> Result<()> {
-        let Some(plan) = self
-            .build_blob_gc_rewrite_plan_native_async(db_path)
-            .await?
-        else {
+    pub(in crate::db) async fn run_blob_gc_once_host_async(&self, db_path: &Path) -> Result<()> {
+        let Some(plan) = self.build_blob_gc_rewrite_plan_host_async(db_path).await? else {
             return Ok(());
         };
         let Some(_rewrite_guard) = self.reserve_blob_gc_rewrite(&plan.tables) else {
@@ -129,17 +135,12 @@ impl Db {
             return Ok(());
         }
 
-        let input_bytes = plan.candidates.iter().fold(0_u64, |bytes, candidate| {
-            bytes.saturating_add(candidate.total_bytes)
-        });
-        let discarded_bytes = plan.candidates.iter().fold(0_u64, |bytes, candidate| {
-            bytes.saturating_add(candidate.total_bytes.saturating_sub(candidate.live_bytes))
-        });
-        let obsolete_blob_ids = plan
-            .candidates
-            .iter()
-            .map(|candidate| candidate.file_id)
-            .collect::<Vec<_>>();
+        let BlobGcRunMetadata {
+            input_bytes,
+            discarded_bytes,
+            obsolete_blob_ids,
+            written_table_ids,
+        } = blob_gc_run_metadata(&plan);
 
         let header = blob::BlobFileHeader::new(
             plan.new_blob_file_id,
@@ -148,25 +149,29 @@ impl Db {
             crate::codec::CodecId::None,
         );
         let blob_records = blob_gc_blob_records(&plan.records);
-        let written_table_ids = plan
-            .tables
-            .iter()
-            .map(|table| table.output_table_id)
-            .collect::<Vec<_>>();
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let storage = self.inner.native_storage.clone();
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let storage = self.browser_storage()?;
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let durability = self.filesystem_publish_durability();
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let durability = DurabilityMode::Flush;
         let indexes = match blob::write_blob_file_with_backend_async(
             &storage,
             db_path,
             plan.new_blob_file_id,
             header,
             &blob_records,
-            self.filesystem_publish_durability(),
+            durability,
         )
         .await
         {
             Ok(indexes) => indexes,
             Err(error) => {
-                let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+                let _ = self
+                    .remove_storage_files_host_async(db_path, &written_table_ids)
+                    .await;
                 return Err(error);
             }
         };
@@ -175,35 +180,40 @@ impl Db {
         let output_bytes = match apply_blob_gc_indexes(&mut tables, plan.records, indexes) {
             Ok(output_bytes) => output_bytes,
             Err(error) => {
-                let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+                let _ = self
+                    .remove_storage_files_host_async(db_path, &written_table_ids)
+                    .await;
                 return Err(error);
             }
         };
-        let outputs = match self
-            .write_blob_gc_replacement_tables_native_async(db_path, tables)
-            .await
-        {
+        let replacement_result = self
+            .write_blob_gc_replacement_tables_host_async(db_path, tables)
+            .await;
+        let outputs = match replacement_result {
             Ok(outputs) => outputs,
             Err(error) => {
-                let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+                let _ = self
+                    .remove_storage_files_host_async(db_path, &written_table_ids)
+                    .await;
                 return Err(error);
             }
         };
 
-        if let Err(error) = self
-            .sync_filesystem_directory_after_renames_async(db_path)
-            .await
-        {
-            let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+        if let Err(error) = self.sync_compaction_directory_host_async(db_path).await {
+            let _ = self
+                .remove_storage_files_host_async(db_path, &written_table_ids)
+                .await;
             return Err(error);
         }
 
-        if let Err(error) = self
-            .publish_compacted_tables_native_async(&outputs, &obsolete_blob_ids)
-            .await
-        {
+        let publish_result = self
+            .publish_compacted_tables_host_async(&outputs, &obsolete_blob_ids)
+            .await;
+        if let Err(error) = publish_result {
             if !self.closed_after_durable_publish_error() {
-                let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
+                let _ = self
+                    .remove_storage_files_host_async(db_path, &written_table_ids)
+                    .await;
             }
             return Err(error);
         }
@@ -211,124 +221,39 @@ impl Db {
         let obsolete_tables = self
             .install_compacted_tables(outputs)
             .map_err(|error| self.close_after_durable_publish_error("blob GC", &error))?;
-        self.retire_obsolete_table_files_native_async(db_path, obsolete_tables)
+        self.retire_obsolete_table_files_host_async(db_path, obsolete_tables)
             .await?;
-        self.inner.blob_gc_runs.fetch_add(1, Ordering::AcqRel);
-        self.inner
-            .blob_gc_input_bytes
-            .fetch_add(input_bytes, Ordering::AcqRel);
-        self.inner
-            .blob_gc_output_bytes
-            .fetch_add(output_bytes, Ordering::AcqRel);
-        self.inner
-            .blob_gc_discarded_bytes
-            .fetch_add(discarded_bytes, Ordering::AcqRel);
-        let _ = self
-            .delete_pending_obsolete_blob_files_native_async(db_path)
-            .await?;
-        Ok(())
+        self.record_blob_gc_stats(input_bytes, output_bytes, discarded_bytes);
+        self.delete_pending_obsolete_blob_files_host_async(db_path)
+            .await
     }
 
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    #[allow(clippy::too_many_lines)]
-    pub(in crate::db) async fn run_blob_gc_once_browser_async(&self, db_path: &Path) -> Result<()> {
-        let Some(plan) = self
-            .build_blob_gc_rewrite_plan_browser_async(db_path)
-            .await?
-        else {
-            return Ok(());
-        };
-        let Some(_rewrite_guard) = self.reserve_blob_gc_rewrite(&plan.tables) else {
-            return Ok(());
-        };
-        if !self.blob_gc_rewrite_inputs_are_current(&plan.tables)? {
-            return Ok(());
-        }
+    async fn build_blob_gc_rewrite_plan_host_async(
+        &self,
+        db_path: &Path,
+    ) -> Result<Option<BlobGcRewritePlan>> {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        return self.build_blob_gc_rewrite_plan_native_async(db_path).await;
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        return self.build_blob_gc_rewrite_plan_browser_async(db_path).await;
+    }
 
-        let input_bytes = plan.candidates.iter().fold(0_u64, |bytes, candidate| {
-            bytes.saturating_add(candidate.total_bytes)
-        });
-        let discarded_bytes = plan.candidates.iter().fold(0_u64, |bytes, candidate| {
-            bytes.saturating_add(candidate.total_bytes.saturating_sub(candidate.live_bytes))
-        });
-        let obsolete_blob_ids = plan
-            .candidates
-            .iter()
-            .map(|candidate| candidate.file_id)
-            .collect::<Vec<_>>();
-
-        let header = blob::BlobFileHeader::new(
-            plan.new_blob_file_id,
-            self.last_committed_sequence(),
-            1,
-            crate::codec::CodecId::None,
-        );
-        let blob_records = blob_gc_blob_records(&plan.records);
-        let written_table_ids = plan
-            .tables
-            .iter()
-            .map(|table| table.output_table_id)
-            .collect::<Vec<_>>();
-        let storage = self.browser_storage()?;
-        let indexes = match blob::write_blob_file_with_backend_async(
-            &storage,
-            db_path,
-            plan.new_blob_file_id,
-            header,
-            &blob_records,
-            DurabilityMode::Flush,
-        )
-        .await
-        {
-            Ok(indexes) => indexes,
-            Err(error) => {
-                let _ = self
-                    .remove_storage_files_browser_async(db_path, &written_table_ids)
-                    .await;
-                return Err(error);
-            }
-        };
-
-        let mut tables = plan.tables;
-        let output_bytes = match apply_blob_gc_indexes(&mut tables, plan.records, indexes) {
-            Ok(output_bytes) => output_bytes,
-            Err(error) => {
-                let _ = self
-                    .remove_storage_files_browser_async(db_path, &written_table_ids)
-                    .await;
-                return Err(error);
-            }
-        };
-        let outputs = match self
+    async fn write_blob_gc_replacement_tables_host_async(
+        &self,
+        db_path: &Path,
+        tables: Vec<BlobGcRewriteTable>,
+    ) -> Result<Vec<NamedCompactionOutput>> {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        return self
+            .write_blob_gc_replacement_tables_native_async(db_path, tables)
+            .await;
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        return self
             .write_blob_gc_replacement_tables_browser_async(db_path, tables)
-            .await
-        {
-            Ok(outputs) => outputs,
-            Err(error) => {
-                let _ = self
-                    .remove_storage_files_browser_async(db_path, &written_table_ids)
-                    .await;
-                return Err(error);
-            }
-        };
+            .await;
+    }
 
-        if let Err(error) = self
-            .publish_compacted_tables_browser_async(&outputs, &obsolete_blob_ids)
-            .await
-        {
-            if !self.closed_after_durable_publish_error() {
-                let _ = self
-                    .remove_storage_files_browser_async(db_path, &written_table_ids)
-                    .await;
-            }
-            return Err(error);
-        }
-
-        let obsolete_tables = self
-            .install_compacted_tables(outputs)
-            .map_err(|error| self.close_after_durable_publish_error("blob GC", &error))?;
-        self.retire_obsolete_table_files_browser_async(db_path, obsolete_tables)
-            .await?;
+    fn record_blob_gc_stats(&self, input_bytes: u64, output_bytes: u64, discarded_bytes: u64) {
         self.inner.blob_gc_runs.fetch_add(1, Ordering::AcqRel);
         self.inner
             .blob_gc_input_bytes
@@ -339,10 +264,6 @@ impl Db {
         self.inner
             .blob_gc_discarded_bytes
             .fetch_add(discarded_bytes, Ordering::AcqRel);
-        let _ = self
-            .delete_pending_obsolete_blob_files_browser_async(db_path)
-            .await?;
-        Ok(())
     }
 
     pub(in crate::db) fn build_blob_gc_rewrite_plan(

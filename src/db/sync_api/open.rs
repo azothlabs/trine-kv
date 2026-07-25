@@ -1,5 +1,3 @@
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-use super::super::open_helpers::run_persistent_recovery_checks_async;
 use super::{
     Arc, AtomicBool, AtomicU64, AtomicUsize, BTreeMap, BlobReadMetrics, CancellationToken,
     CommitTracker, DEFAULT_BUCKET_NAME, Db, DbInner, DbOptions, DurabilityMode,
@@ -20,6 +18,8 @@ use super::{
     runtime, validate_common_options, validate_options, verify_object_client_contract_for_open,
     wal,
 };
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use crate::db::open_helpers::run_persistent_recovery_checks_async;
 use crate::storage::MemoryStorageBackend;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::{
@@ -29,6 +29,7 @@ use crate::{
     },
     wal::BrowserWalFrontDoor,
 };
+use std::collections::hash_map::RandomState;
 #[derive(Debug)]
 struct DbInnerParts {
     options: DbOptions,
@@ -226,6 +227,8 @@ impl Db {
                 content_memory: MemoryStorageBackend::new(),
                 content_seal_lock: futures::lock::Mutex::new(()),
                 content_access_lock: futures::lock::Mutex::new(()),
+                content_lock_hasher: RandomState::new(),
+                content_quota_locks: std::array::from_fn(|_| futures::lock::Mutex::new(())),
                 content_upload_locks: std::array::from_fn(|_| futures::lock::Mutex::new(())),
                 object_storage,
                 object_wal_storage,

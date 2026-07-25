@@ -3,7 +3,7 @@ use super::{
     OBJECT_LEASE_V2_HEADER_LEN, OBJECT_LEASE_VERSION, ObjectClient, ObjectLeaseState,
     ObservedLeaseState, Result, Sequence,
 };
-#[cfg(not(feature = "s3"))]
+#[cfg(not(all(feature = "s3", not(target_family = "wasm"))))]
 use super::{Context, Future, Poll, Wake, Waker, thread};
 
 pub(super) async fn read_lease_state(
@@ -195,12 +195,12 @@ pub(super) fn lock_poisoned_error(lock_name: &'static str) -> Error {
     }
 }
 
-#[cfg(not(feature = "s3"))]
+#[cfg(not(all(feature = "s3", not(target_family = "wasm"))))]
 pub(super) struct SubstrateThreadWake {
     thread: thread::Thread,
 }
 
-#[cfg(not(feature = "s3"))]
+#[cfg(not(all(feature = "s3", not(target_family = "wasm"))))]
 impl Wake for SubstrateThreadWake {
     fn wake(self: Arc<Self>) {
         self.thread.unpark();
@@ -211,7 +211,7 @@ impl Wake for SubstrateThreadWake {
     }
 }
 
-#[cfg(not(feature = "s3"))]
+#[cfg(not(all(feature = "s3", not(target_family = "wasm"))))]
 pub(super) fn block_on_substrate_future<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
     let waker = Waker::from(Arc::new(SubstrateThreadWake {
         thread: thread::current(),

@@ -30,7 +30,7 @@ use std::{
     time::Duration,
 };
 
-#[cfg(not(feature = "s3"))]
+#[cfg(not(all(feature = "s3", not(target_family = "wasm"))))]
 use std::task::{Context, Poll, Wake, Waker};
 
 use crate::error::{Error, Result};
@@ -518,18 +518,18 @@ impl ObjectWalCompletion {
 }
 
 enum ObjectWalFutureDriver {
-    #[cfg(feature = "s3")]
+    #[cfg(all(feature = "s3", not(target_family = "wasm")))]
     TokioHandle(tokio::runtime::Handle),
-    #[cfg(feature = "s3")]
+    #[cfg(all(feature = "s3", not(target_family = "wasm")))]
     OwnedTokio(tokio::runtime::Runtime),
-    #[cfg(not(feature = "s3"))]
+    #[cfg(not(all(feature = "s3", not(target_family = "wasm"))))]
     Inline,
 }
 
 impl ObjectWalFutureDriver {
     #[allow(clippy::unnecessary_wraps)]
     fn new() -> Result<Self> {
-        #[cfg(feature = "s3")]
+        #[cfg(all(feature = "s3", not(target_family = "wasm")))]
         {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 return Ok(Self::TokioHandle(handle));
@@ -541,7 +541,7 @@ impl ObjectWalFutureDriver {
                 .map_err(Error::Io)?;
             Ok(Self::OwnedTokio(runtime))
         }
-        #[cfg(not(feature = "s3"))]
+        #[cfg(not(all(feature = "s3", not(target_family = "wasm"))))]
         {
             Ok(Self::Inline)
         }
@@ -549,11 +549,11 @@ impl ObjectWalFutureDriver {
 
     fn block_on<T>(&self, future: impl Future<Output = Result<T>>) -> Result<T> {
         match self {
-            #[cfg(feature = "s3")]
+            #[cfg(all(feature = "s3", not(target_family = "wasm")))]
             Self::TokioHandle(handle) => handle.block_on(future),
-            #[cfg(feature = "s3")]
+            #[cfg(all(feature = "s3", not(target_family = "wasm")))]
             Self::OwnedTokio(runtime) => runtime.block_on(future),
-            #[cfg(not(feature = "s3"))]
+            #[cfg(not(all(feature = "s3", not(target_family = "wasm"))))]
             Self::Inline => block_on_substrate_future(future),
         }
     }
@@ -1177,7 +1177,7 @@ struct ObservedLeaseState {
 }
 
 mod lease_state;
-#[cfg(not(feature = "s3"))]
+#[cfg(not(all(feature = "s3", not(target_family = "wasm"))))]
 use lease_state::block_on_substrate_future;
 use lease_state::{
     current_epoch_millis, encode_lease_state, lock_poisoned_error, object_lease_deadline_ms,

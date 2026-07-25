@@ -30,7 +30,7 @@ const CONTENT_RECLAIM_CLOCK_EVIDENCE_SHA256_TAG: u8 = 1;
 const CONTENT_PHYSICAL_HOLD_ID_VERSION: u8 = 1;
 const DESCRIPTOR_MAGIC: &[u8; 8] = b"TRNCNTD2";
 const CHUNK_MAGIC: &[u8; 8] = b"TRNCNTC1";
-const UPLOAD_STATE_MAGIC: &[u8; 8] = b"TRNUPLD2";
+const UPLOAD_STATE_MAGIC: &[u8; 8] = b"TRNUPLD3";
 const DESCRIPTOR_LEN: usize = 8 + 16 + 1 + 32 + 16 + 8 + 4 + 8;
 const CHUNK_HEADER_LEN: usize = 8 + 16 + 8 + 4 + 32;
 const UPLOAD_STATE_LEN: usize =
@@ -38,6 +38,7 @@ const UPLOAD_STATE_LEN: usize =
 const UPLOAD_STATE_OPEN: u8 = 0;
 const UPLOAD_STATE_SEALING: u8 = 1;
 const UPLOAD_STATE_SEALED: u8 = 2;
+const UPLOAD_STATE_ABORTING: u8 = 3;
 const MIN_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const CONTENT_LEASE_BUCKET: &str = "\u{1}trine-content-lease\u{1}";
@@ -61,6 +62,12 @@ const CONTENT_RECLAIM_SWEEP_MAGIC: &[u8; 8] = b"TRNCRSW2";
 const CONTENT_RECLAIM_CLOCK_EVIDENCE_DOMAIN: &[u8] = b"trine-content-reclaim-clock-evidence-v1";
 const CONTENT_RECLAIM_SWEEP_PREPARED: u8 = 0;
 const CONTENT_RECLAIM_SWEEP_RECLAIMED: u8 = 1;
+pub(crate) const CONTENT_PHYSICAL_QUOTA_MAGIC: &[u8; 8] = b"TRNCPQO1";
+pub(crate) const CONTENT_PHYSICAL_RESERVATION_MAGIC: &[u8; 8] = b"TRNCPQR1";
+pub(crate) const CONTENT_PHYSICAL_ACCOUNT_MAGIC: &[u8; 8] = b"TRNCPQA1";
+const CONTENT_PHYSICAL_QUOTA_KEY: u8 = b'Q';
+const CONTENT_PHYSICAL_RESERVATION_KEY: u8 = b'U';
+const CONTENT_PHYSICAL_ACCOUNT_KEY: u8 = b'A';
 
 /// Opaque control-plane identity for one physical content boundary.
 ///
@@ -96,6 +103,267 @@ impl fmt::Display for StorageDomainId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write_hex(formatter, &self.0)
     }
+}
+
+/// Durable physical content-byte accounting for one storage domain.
+///
+/// `unique_content_bytes` counts original bytes for sealed unique
+/// `ContentObject`s. `upload_reserved_bytes` counts conservative reservations
+/// for open or sealing uploads. Framing, encryption, provider-version and
+/// replica overhead are not included in this v1 counter and must be budgeted by
+/// the deployment separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentPhysicalQuota {
+    storage_domain_id: StorageDomainId,
+    unique_content_bytes: u64,
+    upload_reserved_bytes: u64,
+    limit: Option<u64>,
+}
+
+impl ContentPhysicalQuota {
+    pub(crate) const fn new(
+        storage_domain_id: StorageDomainId,
+        unique_content_bytes: u64,
+        upload_reserved_bytes: u64,
+        limit: Option<u64>,
+    ) -> Self {
+        Self {
+            storage_domain_id,
+            unique_content_bytes,
+            upload_reserved_bytes,
+            limit,
+        }
+    }
+
+    /// Returns the physical deduplication and accounting boundary.
+    #[must_use]
+    pub const fn storage_domain_id(self) -> StorageDomainId {
+        self.storage_domain_id
+    }
+
+    /// Returns original bytes held by unique sealed content descriptors.
+    #[must_use]
+    pub const fn unique_content_bytes(self) -> u64 {
+        self.unique_content_bytes
+    }
+
+    /// Returns bytes conservatively reserved by unfinished uploads.
+    #[must_use]
+    pub const fn upload_reserved_bytes(self) -> u64 {
+        self.upload_reserved_bytes
+    }
+
+    /// Returns the sum checked against the configured limit.
+    #[must_use]
+    pub const fn accounted_bytes(self) -> u64 {
+        self.unique_content_bytes
+            .saturating_add(self.upload_reserved_bytes)
+    }
+
+    /// Returns the inclusive original-byte limit, or `None` when disabled.
+    #[must_use]
+    pub const fn limit(self) -> Option<u64> {
+        self.limit
+    }
+
+    /// Returns remaining capacity when a limit is configured.
+    #[must_use]
+    pub const fn remaining(self) -> Option<u64> {
+        match self.limit {
+            Some(limit) => Some(limit.saturating_sub(self.accounted_bytes())),
+            None => None,
+        }
+    }
+
+    pub(crate) fn with_limit(self, limit: Option<u64>) -> Self {
+        Self { limit, ..self }
+    }
+
+    pub(crate) fn with_counts(self, unique: u64, reserved: u64) -> Self {
+        Self {
+            unique_content_bytes: unique,
+            upload_reserved_bytes: reserved,
+            ..self
+        }
+    }
+
+    pub(crate) fn encode(self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(49);
+        bytes.extend_from_slice(CONTENT_PHYSICAL_QUOTA_MAGIC);
+        bytes.extend_from_slice(&self.storage_domain_id.to_bytes());
+        bytes.extend_from_slice(&self.unique_content_bytes.to_be_bytes());
+        bytes.extend_from_slice(&self.upload_reserved_bytes.to_be_bytes());
+        if let Some(limit) = self.limit {
+            bytes.push(1);
+            bytes.extend_from_slice(&limit.to_be_bytes());
+        } else {
+            bytes.push(0);
+            bytes.extend_from_slice(&0_u64.to_be_bytes());
+        }
+        bytes
+    }
+
+    pub(crate) fn decode(bytes: &[u8], storage_domain_id: StorageDomainId) -> Result<Self> {
+        if bytes.len() != 49 || bytes.get(..8) != Some(CONTENT_PHYSICAL_QUOTA_MAGIC) {
+            return Err(Error::InvalidFormat {
+                message: "invalid content physical quota record".to_owned(),
+            });
+        }
+        let stored =
+            StorageDomainId::from_bytes(array_at::<16>(bytes, 8, "physical quota storage domain")?);
+        if stored != storage_domain_id {
+            return Err(Error::InvalidFormat {
+                message: "content physical quota identity differs from its key".to_owned(),
+            });
+        }
+        let unique_content_bytes =
+            u64::from_be_bytes(array_at::<8>(bytes, 24, "physical quota unique bytes")?);
+        let upload_reserved_bytes =
+            u64::from_be_bytes(array_at::<8>(bytes, 32, "physical quota reserved bytes")?);
+        let limit_value = u64::from_be_bytes(array_at::<8>(bytes, 41, "physical quota limit")?);
+        let limit = match bytes[40] {
+            0 if limit_value == 0 => None,
+            1 => Some(limit_value),
+            _ => {
+                return Err(Error::InvalidFormat {
+                    message: "invalid content physical quota limit option".to_owned(),
+                });
+            }
+        };
+        unique_content_bytes
+            .checked_add(upload_reserved_bytes)
+            .ok_or_else(|| Error::InvalidFormat {
+                message: "content physical quota counters overflow".to_owned(),
+            })?;
+        Ok(Self::new(
+            storage_domain_id,
+            unique_content_bytes,
+            upload_reserved_bytes,
+            limit,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContentPhysicalReservationRecord {
+    pub(crate) upload_id: UploadId,
+    pub(crate) storage_domain_id: StorageDomainId,
+    pub(crate) reserved_bytes: u64,
+}
+
+impl ContentPhysicalReservationRecord {
+    pub(crate) fn encode(self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(48);
+        bytes.extend_from_slice(CONTENT_PHYSICAL_RESERVATION_MAGIC);
+        bytes.extend_from_slice(&self.upload_id.to_bytes());
+        bytes.extend_from_slice(&self.storage_domain_id.to_bytes());
+        bytes.extend_from_slice(&self.reserved_bytes.to_be_bytes());
+        bytes
+    }
+
+    pub(crate) fn decode(bytes: &[u8], upload_id: UploadId) -> Result<Self> {
+        if bytes.len() != 48 || bytes.get(..8) != Some(CONTENT_PHYSICAL_RESERVATION_MAGIC) {
+            return Err(Error::InvalidFormat {
+                message: "invalid content physical reservation record".to_owned(),
+            });
+        }
+        let stored_upload =
+            UploadId::from_bytes(array_at::<16>(bytes, 8, "physical reservation upload id")?);
+        if stored_upload != upload_id {
+            return Err(Error::InvalidFormat {
+                message: "content physical reservation identity differs from its key".to_owned(),
+            });
+        }
+        Ok(Self {
+            upload_id,
+            storage_domain_id: StorageDomainId::from_bytes(array_at::<16>(
+                bytes,
+                24,
+                "physical reservation storage domain",
+            )?),
+            reserved_bytes: u64::from_be_bytes(array_at::<8>(
+                bytes,
+                40,
+                "physical reservation bytes",
+            )?),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContentPhysicalAccountRecord {
+    pub(crate) storage_domain_id: StorageDomainId,
+    pub(crate) content_id: ContentId,
+    pub(crate) original_bytes: u64,
+}
+
+impl ContentPhysicalAccountRecord {
+    pub(crate) fn encode(self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(65);
+        bytes.extend_from_slice(CONTENT_PHYSICAL_ACCOUNT_MAGIC);
+        bytes.extend_from_slice(&self.storage_domain_id.to_bytes());
+        bytes.extend_from_slice(&self.content_id.to_bytes());
+        bytes.extend_from_slice(&self.original_bytes.to_be_bytes());
+        bytes
+    }
+
+    pub(crate) fn decode(
+        bytes: &[u8],
+        storage_domain_id: StorageDomainId,
+        content_id: ContentId,
+    ) -> Result<Self> {
+        if bytes.len() != 65 || bytes.get(..8) != Some(CONTENT_PHYSICAL_ACCOUNT_MAGIC) {
+            return Err(Error::InvalidFormat {
+                message: "invalid content physical account record".to_owned(),
+            });
+        }
+        let stored_domain = StorageDomainId::from_bytes(array_at::<16>(
+            bytes,
+            8,
+            "physical account storage domain",
+        )?);
+        let stored_content =
+            ContentId::from_bytes(array_at::<33>(bytes, 24, "physical account content id")?)?;
+        if stored_domain != storage_domain_id || stored_content != content_id {
+            return Err(Error::InvalidFormat {
+                message: "content physical account identity differs from its key".to_owned(),
+            });
+        }
+        Ok(Self {
+            storage_domain_id,
+            content_id,
+            original_bytes: u64::from_be_bytes(array_at::<8>(
+                bytes,
+                57,
+                "physical account original bytes",
+            )?),
+        })
+    }
+}
+
+pub(crate) fn content_physical_quota_key(storage_domain_id: StorageDomainId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(17);
+    key.push(CONTENT_PHYSICAL_QUOTA_KEY);
+    key.extend_from_slice(&storage_domain_id.to_bytes());
+    key
+}
+
+pub(crate) fn content_physical_reservation_key(upload_id: UploadId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(17);
+    key.push(CONTENT_PHYSICAL_RESERVATION_KEY);
+    key.extend_from_slice(&upload_id.to_bytes());
+    key
+}
+
+pub(crate) fn content_physical_account_key(
+    storage_domain_id: StorageDomainId,
+    content_id: ContentId,
+) -> Vec<u8> {
+    let mut key = Vec::with_capacity(50);
+    key.push(CONTENT_PHYSICAL_ACCOUNT_KEY);
+    key.extend_from_slice(&storage_domain_id.to_bytes());
+    key.extend_from_slice(&content_id.to_bytes());
+    key
 }
 
 /// Versioned identity of one irreversible leased-only content-access barrier.
@@ -983,6 +1251,10 @@ pub struct ContentReclaimSweep {
 pub enum ContentReclaimSweepBackend {
     /// Independently qualified native filesystem deletion.
     NativeFilesystem,
+    /// Independently qualified WASI preopened-filesystem deletion.
+    WasiFilesystem,
+    /// Independently qualified browser origin-private filesystem deletion.
+    BrowserStorage,
     /// Qualified unversioned object-store deletion.
     ObjectStore {
         /// Digest of the external provider evidence used for qualification.
@@ -1272,6 +1544,8 @@ pub enum ContentPhysicalHoldKind {
     Administrative,
     /// Durable asynchronous processing still depends on the source bytes.
     Processing,
+    /// A verified device-local offline cache entry must remain readable.
+    Offline,
 }
 
 impl ContentPhysicalHoldKind {
@@ -1283,6 +1557,7 @@ impl ContentPhysicalHoldKind {
             Self::Provider => 4,
             Self::Administrative => 5,
             Self::Processing => 6,
+            Self::Offline => 7,
         }
     }
 
@@ -1294,6 +1569,7 @@ impl ContentPhysicalHoldKind {
             4 => Ok(Self::Provider),
             5 => Ok(Self::Administrative),
             6 => Ok(Self::Processing),
+            7 => Ok(Self::Offline),
             _ => Err(Error::UnsupportedFormat {
                 message: format!("unsupported content physical-hold kind {tag}"),
             }),
@@ -1310,6 +1586,7 @@ impl fmt::Display for ContentPhysicalHoldKind {
             Self::Provider => "provider",
             Self::Administrative => "administrative",
             Self::Processing => "processing",
+            Self::Offline => "offline",
         })
     }
 }
@@ -1756,10 +2033,6 @@ impl UploadId {
     #[must_use]
     pub const fn to_bytes(self) -> [u8; 16] {
         self.0
-    }
-
-    pub(crate) const fn lock_shard(self) -> usize {
-        self.0[0] as usize
     }
 }
 
@@ -2920,6 +3193,14 @@ impl ContentReclaimSweepRecord {
                 bytes.push(1);
                 bytes.extend_from_slice(&evidence_digest.to_bytes());
             }
+            ContentReclaimSweepBackend::WasiFilesystem => {
+                bytes.push(2);
+                bytes.extend_from_slice(&[0_u8; 33]);
+            }
+            ContentReclaimSweepBackend::BrowserStorage => {
+                bytes.push(3);
+                bytes.extend_from_slice(&[0_u8; 33]);
+            }
         }
         bytes.extend_from_slice(&self.prepared_at.as_u64().to_be_bytes());
         bytes
@@ -3029,6 +3310,12 @@ impl ContentReclaimSweepRecord {
                     "content reclaim-sweep provider evidence",
                 )?)?,
             },
+            2 if bytes[277..310].iter().all(|byte| *byte == 0) => {
+                ContentReclaimSweepBackend::WasiFilesystem
+            }
+            3 if bytes[277..310].iter().all(|byte| *byte == 0) => {
+                ContentReclaimSweepBackend::BrowserStorage
+            }
             _ => {
                 return Err(Error::Corruption {
                     message: "content reclaim-sweep has invalid backend evidence".to_owned(),
@@ -3512,10 +3799,22 @@ impl ContentUpload {
 
         let incoming = u64::try_from(bytes.len())
             .map_err(|_| Error::invalid_options("content write length exceeds u64"))?;
-        self.length = self
+        let next_length = self
             .length
             .checked_add(incoming)
             .ok_or_else(|| Error::invalid_options("content length overflow"))?;
+        if let Some(expected) = self.options.expected_length
+            && next_length > expected
+        {
+            return Err(Error::ContentLengthMismatch {
+                expected,
+                actual: next_length,
+            });
+        }
+        let desired_reservation = self.options.expected_length.unwrap_or(next_length);
+        db.reserve_content_upload_bytes(&durable, desired_reservation)
+            .await?;
+        self.length = next_length;
 
         while !bytes.is_empty() {
             let available = self.options.chunk_bytes - self.buffer.len();
@@ -4290,6 +4589,7 @@ pub(crate) enum UploadSessionStatus {
     Open,
     Sealing(SealedContent),
     Sealed(SealedContent),
+    Aborting,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4376,6 +4676,22 @@ impl UploadSessionState {
         })
     }
 
+    pub(crate) fn into_aborting(self) -> Result<Self> {
+        if self.status != UploadSessionStatus::Open {
+            return Err(Error::InvalidFormat {
+                message: "only an open content upload can enter aborting state".to_owned(),
+            });
+        }
+        Ok(Self {
+            revision: self
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_options("content upload revision overflow"))?,
+            status: UploadSessionStatus::Aborting,
+            ..self
+        })
+    }
+
     pub(crate) const fn upload_id(self) -> UploadId {
         self.upload_id
     }
@@ -4419,6 +4735,9 @@ impl UploadSessionState {
                     upload_id: self.upload_id.to_string(),
                 })
             }
+            UploadSessionStatus::Aborting => Err(Error::ContentUploadNotFound {
+                upload_id: self.upload_id.to_string(),
+            }),
             UploadSessionStatus::Open if self.revision == expected_revision => Ok(()),
             UploadSessionStatus::Open => Err(Error::ContentUploadConflict {
                 upload_id: self.upload_id.to_string(),
@@ -4435,6 +4754,7 @@ impl UploadSessionState {
             UploadSessionStatus::Open => UPLOAD_STATE_OPEN,
             UploadSessionStatus::Sealing(_) => UPLOAD_STATE_SEALING,
             UploadSessionStatus::Sealed(_) => UPLOAD_STATE_SEALED,
+            UploadSessionStatus::Aborting => UPLOAD_STATE_ABORTING,
         });
         bytes.extend_from_slice(&self.upload_id.bytes());
         bytes.extend_from_slice(&self.revision.to_le_bytes());
@@ -4451,7 +4771,7 @@ impl UploadSessionState {
         bytes.extend_from_slice(&self.upload_token.secret());
         bytes.extend_from_slice(&self.options.token_ttl_ms()?.to_le_bytes());
         match self.status {
-            UploadSessionStatus::Open => {
+            UploadSessionStatus::Open | UploadSessionStatus::Aborting => {
                 bytes.extend_from_slice(&0_u64.to_le_bytes());
                 bytes.push(0);
                 bytes.extend_from_slice(&[0_u8; 33]);
@@ -4510,7 +4830,7 @@ impl UploadSessionState {
             u64::from_le_bytes(array_at::<8>(bytes, 172, "content upload token expiry")?);
         let durability = decode_durability(bytes[180])?;
         let sealed_id = match status_tag {
-            UPLOAD_STATE_OPEN => None,
+            UPLOAD_STATE_OPEN | UPLOAD_STATE_ABORTING => None,
             UPLOAD_STATE_SEALING | UPLOAD_STATE_SEALED => {
                 Some(decode_content_id(bytes, 181, "sealed content identity")?)
             }
@@ -4528,21 +4848,30 @@ impl UploadSessionState {
             expected_content_id,
         }
         .validate()?;
-        let status = sealed_id.map_or(UploadSessionStatus::Open, |content_id| {
-            let sealed = SealedContent {
-                attachment_scope: options.attachment_scope,
-                content_id,
-                length,
-                upload_token,
-                token_expires_at_unix_ms,
-                durability,
-            };
-            if status_tag == UPLOAD_STATE_SEALING {
-                UploadSessionStatus::Sealing(sealed)
-            } else {
-                UploadSessionStatus::Sealed(sealed)
-            }
-        });
+        let status = sealed_id.map_or_else(
+            || {
+                if status_tag == UPLOAD_STATE_ABORTING {
+                    UploadSessionStatus::Aborting
+                } else {
+                    UploadSessionStatus::Open
+                }
+            },
+            |content_id| {
+                let sealed = SealedContent {
+                    attachment_scope: options.attachment_scope,
+                    content_id,
+                    length,
+                    upload_token,
+                    token_expires_at_unix_ms,
+                    durability,
+                };
+                if status_tag == UPLOAD_STATE_SEALING {
+                    UploadSessionStatus::Sealing(sealed)
+                } else {
+                    UploadSessionStatus::Sealed(sealed)
+                }
+            },
+        );
         let state = Self {
             upload_id,
             revision,
@@ -4590,7 +4919,7 @@ impl UploadSessionState {
             });
         }
         match self.status {
-            UploadSessionStatus::Open => {}
+            UploadSessionStatus::Open | UploadSessionStatus::Aborting => {}
             UploadSessionStatus::Sealing(sealed) | UploadSessionStatus::Sealed(sealed) => {
                 if sealed.length != self.length
                     || sealed.attachment_scope != self.options.attachment_scope

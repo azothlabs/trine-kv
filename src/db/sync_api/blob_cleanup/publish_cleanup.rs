@@ -18,16 +18,16 @@ impl Db {
         operation: &'static str,
         error: &Error,
     ) -> Error {
-        let error = Error::Corruption {
-            message: format!(
-                "{operation} published durable state but failed to update local state: {error}; \
-                 database handle closed; reopen persistent databases to recover"
-            ),
-        };
+        let message = format!(
+            "{operation} published durable state but failed to update local state: {error}; \
+             database handle closed; reopen persistent databases to recover"
+        );
         self.inner.closed.store(true, Ordering::Release);
-        self.inner.maintenance.record_error(&error);
+        self.inner.maintenance.record_error(Error::Corruption {
+            message: message.clone(),
+        });
         self.inner.maintenance.shutdown();
-        error
+        Error::Corruption { message }
     }
 
     pub(in crate::db) fn closed_after_durable_publish_error(&self) -> bool {
@@ -633,31 +633,6 @@ impl Db {
         }
         self.requeue_obsolete_tables(remaining)?;
         result
-    }
-
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    pub(in crate::db) async fn remove_storage_files_browser_async(
-        &self,
-        db_path: &Path,
-        table_ids: &[table::TableId],
-    ) -> Result<()> {
-        let storage = self.browser_storage()?;
-        for table_id in table_ids {
-            storage
-                .delete_object(StorageObjectId::native_file(
-                    StorageObjectKind::Table,
-                    table::table_path(db_path, *table_id),
-                ))
-                .await?;
-            storage
-                .delete_object(StorageObjectId::native_file(
-                    StorageObjectKind::Blob,
-                    blob::blob_path(db_path, table_id.get()),
-                ))
-                .await?;
-        }
-
-        Ok(())
     }
 
     pub(in crate::db) fn l0_pressure_exceeded(&self) -> Result<bool> {

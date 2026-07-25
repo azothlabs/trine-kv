@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, hash_map::RandomState},
     io,
     path::{Path, PathBuf},
     sync::{
@@ -18,7 +18,7 @@ use crate::{
     blob::{self, ValueRef},
     bucket::{Bucket, BucketName, BucketReader, DEFAULT_BUCKET_NAME},
     cache, compaction,
-    error::{Error, ErrorSnapshot, Result},
+    error::{Error, Result},
     iterator::{Direction, Iter, LazyIter, ScanSelector, ScanSourceInput},
     lsm::{
         AsyncPointReadIo, CompactionInput as LsmCompactionInput,
@@ -282,6 +282,10 @@ pub(crate) struct DbInner {
     content_seal_lock: futures::lock::Mutex<()>,
     /// Serializes the irreversible leased-only barrier transition in one writer.
     content_access_lock: futures::lock::Mutex<()>,
+    /// Per-database keyed hash state for bounded content lock sharding.
+    content_lock_hasher: RandomState,
+    /// Serializes physical-quota counter transitions per `StorageDomain` shard.
+    content_quota_locks: [futures::lock::Mutex<()>; 256],
     /// Bounded lock shards serialize state transitions for one `UploadId` without
     /// retaining a lock object for every historical upload.
     content_upload_locks: [futures::lock::Mutex<()>; 256],
@@ -764,7 +768,7 @@ struct MaintenanceState {
     active_compactions: Vec<CompactionReservation>,
     progress: u64,
     shutdown: bool,
-    last_error: Option<ErrorSnapshot>,
+    last_error: Option<Error>,
 }
 
 #[derive(Debug)]
@@ -941,9 +945,9 @@ impl MaintenanceCoordinator {
     }
 
     #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
-    fn record_error(&self, error: &Error) {
+    fn record_error(&self, error: Error) {
         if let Ok(mut state) = self.state.lock() {
-            state.last_error = Some(ErrorSnapshot::capture(error));
+            state.last_error = Some(error);
             state.progress = state.progress.saturating_add(1);
             self.wake.notify_all();
         }
@@ -954,7 +958,6 @@ impl MaintenanceCoordinator {
             .lock()
             .ok()
             .and_then(|mut state| state.last_error.take())
-            .map(ErrorSnapshot::into_error)
     }
 
     fn shutdown(&self) {

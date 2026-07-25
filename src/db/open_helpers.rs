@@ -205,7 +205,7 @@ pub(super) fn background_worker_loop(
         match db.run_background_maintenance(request) {
             Ok(()) => record_maintenance_success(maintenance),
             Err(Error::Closed) => break,
-            Err(error) => maintenance.record_error(&error),
+            Err(error) => maintenance.record_error(error),
         }
     }
 }
@@ -1026,9 +1026,8 @@ pub(super) fn delete_storage_object(
     backend.delete_object_blocking(StorageObjectId::native_file(kind, path))
 }
 
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
 pub(super) async fn delete_storage_object_async(
-    backend: &NativeFileBackend,
+    backend: &impl StorageObjectDeleteBackend,
     kind: StorageObjectKind,
     path: &Path,
 ) -> Result<()> {
@@ -1094,9 +1093,8 @@ pub(super) fn remove_storage_files(
     remove_blob_files(backend, db_path, table_ids)
 }
 
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
 pub(super) async fn remove_storage_files_async(
-    backend: &NativeFileBackend,
+    backend: &impl StorageObjectDeleteBackend,
     db_path: &Path,
     table_ids: &[table::TableId],
 ) -> Result<()> {

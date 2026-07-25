@@ -6,7 +6,7 @@ use crate::{HostStorageBackend, StorageMode};
 #[test]
 fn maintenance_success_does_not_clear_unreported_error() {
     let coordinator = MaintenanceCoordinator::new();
-    coordinator.record_error(&Error::Corruption {
+    coordinator.record_error(Error::Corruption {
         message: "publish failed".to_string(),
     });
 
@@ -22,7 +22,7 @@ fn maintenance_success_does_not_clear_unreported_error() {
 #[test]
 fn maintenance_error_preserves_runtime_busy_category() {
     let coordinator = MaintenanceCoordinator::new();
-    coordinator.record_error(&Error::runtime_busy("flush already active"));
+    coordinator.record_error(Error::runtime_busy("flush already active"));
 
     let error = coordinator
         .take_error()
@@ -33,7 +33,7 @@ fn maintenance_error_preserves_runtime_busy_category() {
 #[test]
 fn maintenance_error_preserves_structured_fencing_fields() {
     let coordinator = MaintenanceCoordinator::new();
-    coordinator.record_error(&Error::Fenced {
+    coordinator.record_error(Error::Fenced {
         held_epoch: 7,
         current_epoch: 8,
     });
@@ -48,6 +48,24 @@ fn maintenance_error_preserves_structured_fencing_fields() {
             current_epoch: 8
         }
     ));
+}
+
+#[test]
+fn maintenance_error_preserves_io_error_kind() {
+    let coordinator = MaintenanceCoordinator::new();
+    coordinator.record_error(Error::Io(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "maintenance write denied",
+    )));
+
+    let error = coordinator
+        .take_error()
+        .expect("unreported background error remains visible");
+    let Error::Io(error) = error else {
+        panic!("expected the original I/O error");
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(error.to_string(), "maintenance write denied");
 }
 
 #[test]

@@ -831,7 +831,7 @@ impl Db {
             };
             let db_path = path.to_path_buf();
             return self
-                .run_compaction_once_with_budget_native_async(&db_path, &range, false, budget)
+                .run_compaction_once_with_budget_host_async(&db_path, &range, false, budget)
                 .await;
         }
 
@@ -907,7 +907,7 @@ impl Db {
 
             if self.has_immutable_memtables()? {
                 let (flush_should_compact, flush_outcome) = self
-                    .run_flush_once_with_budget_native_async(&db_path, false, budget)
+                    .run_flush_once_with_budget_host_async(&db_path, false, budget)
                     .await?;
                 should_compact |= flush_should_compact;
                 outcome.add_assign(flush_outcome);
@@ -915,7 +915,7 @@ impl Db {
 
             if should_compact {
                 let compaction_outcome = self
-                    .run_compaction_once_with_budget_native_async(
+                    .run_compaction_once_with_budget_host_async(
                         &db_path,
                         &KeyRange::all(),
                         true,

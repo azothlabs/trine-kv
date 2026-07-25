@@ -193,11 +193,13 @@ impl NativeFilePlatformIoOperationMetrics {
             PlatformIoOperation::AppendObjectOpen => &self.append_open,
             PlatformIoOperation::Append => &self.append,
             PlatformIoOperation::Persist => &self.persist,
+            #[cfg(any(unix, windows))]
             PlatformIoOperation::WalRewrite => &self.wal_rewrite,
             PlatformIoOperation::ObjectDelete => &self.delete,
             PlatformIoOperation::DirectoryCreate => &self.directory_create,
             PlatformIoOperation::DirectorySync => &self.directory_sync,
             PlatformIoOperation::DirectoryListing => &self.directory_listing,
+            #[cfg(any(unix, windows))]
             PlatformIoOperation::WriterLeaseAcquire => &self.writer_lease,
         }
     }

@@ -1,13 +1,20 @@
 #![cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 
-use std::io;
+use std::{io, time::Duration};
 
 use opfs::{
     CreateWritableOptions, DirectoryHandle as _, FileHandle as _, GetDirectoryHandleOptions,
     GetFileHandleOptions, WritableFileStream as _, persistent::DirectoryHandle,
 };
 use trine_kv::{
-    BucketOptions, Db, DbOptions, Error, FailOnCorruptionPolicy, KeyRange,
+    BucketOptions, ContentAccessBarrierId, ContentAttachmentScope, ContentChangeId,
+    ContentLeaseOptions, ContentLeaseOwnerId, ContentReaderDrainAttestationId,
+    ContentReaderDrainAttestationOptions, ContentReaderDrainCoordinatorId,
+    ContentReaderDrainEvidenceDigest, ContentReaderDrainKind, ContentReclaimAuthorization,
+    ContentReclaimClockAttestation, ContentReclaimClockAttestationId,
+    ContentReclaimClockCoordinatorId, ContentReclaimClockEvidenceDigest, ContentReclaimProofToken,
+    ContentReclaimSweepStage, ContentReclamationMode, ContentUploadOptions, Db, DbOptions, Error,
+    FailOnCorruptionPolicy, KeyRange, OwnerScopeId, StorageDomainId, TransactionOptions,
     browser::{browser_persistent_storage_granted, browser_storage_estimate},
 };
 use wasm_bindgen::JsCast;
@@ -19,6 +26,12 @@ wasm_bindgen_test_configure!(run_in_browser);
 
 const OVERSIZED_MANIFEST_BYTES: usize = 65 * 1024 * 1024;
 const WAL_REWRITE_TMP_FILE_NAME: &str = "trine.wal.tmp";
+
+fn lifecycle_id(seed: u8) -> [u8; 16] {
+    let mut bytes = [seed; 16];
+    bytes[0] = 1;
+    bytes
+}
 
 fn test_namespace(name: &str) -> String {
     let millis = js_sys::Date::now().to_string().replace('.', "-");
@@ -75,6 +88,165 @@ async fn test_opfs_root() -> DirectoryHandle {
         .dyn_into::<FileSystemDirectoryHandle>()
         .expect("browser OPFS root is a directory handle");
     DirectoryHandle::from(root)
+}
+
+#[wasm_bindgen_test]
+async fn browser_reclamation_requires_drain_then_resumes_after_reopen() {
+    let namespace = test_namespace("content-reclaim");
+    let options = || {
+        DbOptions::browser_persistent_at(&namespace)
+            .with_content_reclamation(ContentReclamationMode::QualifiedBrowserStorage)
+    };
+    let domain = StorageDomainId::from_bytes([81; 16]);
+    let scope = ContentAttachmentScope::new(domain, OwnerScopeId::from_bytes([82; 16]));
+    let db = Db::open(options()).await.expect("browser database opens");
+    let mut upload = db
+        .begin_content_upload(ContentUploadOptions::new(scope, Duration::from_secs(60)))
+        .await
+        .expect("browser content upload begins");
+    upload
+        .write(b"browser physical reclamation")
+        .await
+        .expect("browser content writes");
+    let sealed = upload.seal().await.expect("browser content seals");
+    let old = db
+        .open_content(domain, sealed.content_id())
+        .await
+        .expect("pre-barrier browser handle opens");
+    let barrier = db
+        .enforce_content_leased_only(
+            domain,
+            ContentAccessBarrierId::from_bytes(lifecycle_id(83)).expect("barrier id"),
+        )
+        .await
+        .expect("browser barrier commits");
+    assert!(matches!(
+        db.open_content(domain, sealed.content_id()).await,
+        Err(Error::ContentLeaseRequired { .. })
+    ));
+    assert_eq!(
+        old.read_range(0, u64::MAX)
+            .await
+            .expect("pre-barrier handle remains valid")
+            .as_ref(),
+        b"browser physical reclamation"
+    );
+    drop(old);
+
+    db.attest_content_reader_drain(
+        barrier,
+        ContentReaderDrainAttestationId::from_bytes(lifecycle_id(84))
+            .expect("drain attestation id"),
+        ContentReaderDrainAttestationOptions::new(
+            ContentReaderDrainKind::RemoteCredentialEpochRetired,
+            ContentReaderDrainCoordinatorId::from_bytes([85; 16]),
+            ContentReaderDrainEvidenceDigest::for_bytes(b"browser workers and tabs retired"),
+        ),
+    )
+    .await
+    .expect("browser reader drain attests");
+    let mut consume = db.transaction(TransactionOptions::default());
+    consume
+        .consume_upload_token(
+            sealed.upload_token(),
+            scope,
+            ContentChangeId::from_bytes([86; 16]),
+        )
+        .await
+        .expect("browser upload token stages");
+    consume.commit().await.expect("browser token commits");
+
+    let mut intent = db.transaction(TransactionOptions::default());
+    let authorization = ContentReclaimAuthorization::new(
+        domain,
+        sealed.content_id(),
+        ContentReclaimProofToken::from_bytes([87; 49]),
+        intent.read_version(),
+        u64::MAX,
+    );
+    intent
+        .stage_content_reclaim_intent(authorization)
+        .await
+        .expect("browser reclaim intent stages");
+    intent
+        .commit()
+        .await
+        .expect("browser reclaim intent commits");
+    let mut quarantine = db.transaction(TransactionOptions::default());
+    quarantine
+        .stage_content_quarantine(authorization)
+        .await
+        .expect("browser quarantine stages");
+    quarantine
+        .commit()
+        .await
+        .expect("browser quarantine commits");
+    let mut grace = db.transaction(TransactionOptions::default());
+    grace
+        .stage_content_reclaim_grace(authorization, Duration::from_millis(1))
+        .await
+        .expect("browser grace stages");
+    grace.commit().await.expect("browser grace commits");
+    let grace = db
+        .content_reclaim_grace(domain, sealed.content_id())
+        .await
+        .expect("browser grace reads")
+        .expect("browser grace exists");
+    let clock = ContentReclaimClockAttestation::new(
+        grace,
+        ContentReclaimClockAttestationId::from_bytes(lifecycle_id(88))
+            .expect("clock attestation id"),
+        ContentReclaimClockCoordinatorId::from_bytes([89; 16]),
+        ContentReclaimClockEvidenceDigest::for_bytes(b"browser restart clock evidence"),
+        grace.not_before_unix_ms(),
+    )
+    .expect("browser clock binds grace");
+    let mut prepare = db.transaction(TransactionOptions::default());
+    let fresh = ContentReclaimAuthorization::new(
+        domain,
+        sealed.content_id(),
+        ContentReclaimProofToken::from_bytes([90; 49]),
+        prepare.read_version(),
+        u64::MAX,
+    );
+    assert_eq!(
+        prepare
+            .stage_content_reclaim_sweep(fresh, clock)
+            .await
+            .expect("browser sweep stages"),
+        ContentReclaimSweepStage::Staged
+    );
+    prepare.commit().await.expect("browser Prepared commits");
+    db.close()
+        .await
+        .expect("browser database closes at Prepared");
+    drop(db);
+
+    let reopened = Db::open(options())
+        .await
+        .expect("browser database reopens at Prepared");
+    let sweep = reopened
+        .resume_content_reclaim_sweep(domain, sealed.content_id())
+        .await
+        .expect("browser sweep resumes");
+    assert!(sweep.reclaimed_at().is_some());
+    assert!(matches!(
+        reopened
+            .open_content_leased(
+                domain,
+                sealed.content_id(),
+                ContentLeaseOptions::new(
+                    ContentLeaseOwnerId::from_bytes([91; 16]),
+                    Duration::from_secs(60),
+                ),
+            )
+            .await,
+        Err(Error::ContentNotFound { .. })
+    ));
+    reopened
+        .close()
+        .await
+        .expect("reclaimed browser database closes");
 }
 
 #[wasm_bindgen_test]

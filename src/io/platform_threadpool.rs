@@ -227,14 +227,6 @@ pub(super) fn acquire_writer_lease(path: &Path, owner: &[u8]) -> Result<File> {
     Ok(file)
 }
 
-#[cfg(any(
-    not(any(unix, windows)),
-    all(target_arch = "wasm32", target_os = "unknown")
-))]
-pub(super) fn acquire_writer_lease(_path: &Path, _owner: &[u8]) -> Result<File> {
-    Err(Error::unsupported_backend("platform I/O writer lease"))
-}
-
 fn persist_file(file: &File, durability: DurabilityMode) -> Result<()> {
     crate::durability::sync_file_for_durability(file, durability)
 }

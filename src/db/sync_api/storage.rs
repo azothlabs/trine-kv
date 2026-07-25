@@ -856,7 +856,7 @@ impl Db {
         while self.has_immutable_memtables_at_or_below(target_sequence)? {
             self.take_background_maintenance_error()?;
             let (flush_should_compact, outcome) = self
-                .run_flush_once_with_budget_native_async(
+                .run_flush_once_with_budget_host_async(
                     &db_path,
                     false,
                     MaintenanceBudget::unbounded(),
@@ -1097,7 +1097,7 @@ impl Db {
         while self.has_immutable_memtables_at_or_below(target_sequence)? {
             self.take_background_maintenance_error()?;
             let (flush_should_compact, outcome) = self
-                .run_flush_once_with_budget_browser_async(
+                .run_flush_once_with_budget_host_async(
                     db_path,
                     false,
                     MaintenanceBudget::unbounded(),
@@ -1119,7 +1119,7 @@ impl Db {
             || self.foreground_l0_overlap_pressure_exceeded()?
         {
             let outcome = self
-                .run_compaction_once_with_budget_browser_async(
+                .run_compaction_once_with_budget_host_async(
                     db_path,
                     &KeyRange::all(),
                     true,
@@ -1150,7 +1150,7 @@ impl Db {
         }
 
         let outcome = self
-            .run_compaction_once_with_budget_browser_async(
+            .run_compaction_once_with_budget_host_async(
                 self.browser_db_path()?,
                 &range,
                 false,
@@ -1177,7 +1177,7 @@ impl Db {
             return Err(Error::ReadOnly);
         }
 
-        self.run_compaction_once_with_budget_browser_async(
+        self.run_compaction_once_with_budget_host_async(
             self.browser_db_path()?,
             &range,
             false,
@@ -1203,7 +1203,7 @@ impl Db {
 
         if self.has_immutable_memtables()? {
             let (flush_should_compact, flush_outcome) = self
-                .run_flush_once_with_budget_browser_async(db_path, false, budget)
+                .run_flush_once_with_budget_host_async(db_path, false, budget)
                 .await?;
             should_compact |= flush_should_compact;
             outcome.add_assign(flush_outcome);
@@ -1211,12 +1211,7 @@ impl Db {
 
         if should_compact {
             let compaction_outcome = self
-                .run_compaction_once_with_budget_browser_async(
-                    db_path,
-                    &KeyRange::all(),
-                    true,
-                    budget,
-                )
+                .run_compaction_once_with_budget_host_async(db_path, &KeyRange::all(), true, budget)
                 .await?;
             outcome.add_assign(compaction_outcome);
         }

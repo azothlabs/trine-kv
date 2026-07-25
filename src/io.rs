@@ -6,6 +6,8 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
+#[cfg(all(feature = "platform-io", any(unix, windows)))]
+use std::fs::File;
 #[cfg(all(
     feature = "platform-io",
     feature = "platform-io-native",
@@ -13,7 +15,7 @@ use std::{
 ))]
 use std::sync::mpsc;
 #[cfg(feature = "platform-io")]
-use std::{fs::File, path::PathBuf, thread};
+use std::{path::PathBuf, thread};
 
 use crate::{
     error::{Error, Result},
@@ -81,11 +83,13 @@ pub(crate) enum PlatformIoOperation {
     AppendObjectOpen,
     Append,
     Persist,
+    #[cfg(any(unix, windows))]
     WalRewrite,
     ObjectDelete,
     DirectoryCreate,
     DirectorySync,
     DirectoryListing,
+    #[cfg(any(unix, windows))]
     WriterLeaseAcquire,
 }
 
@@ -119,11 +123,13 @@ impl PlatformIoBackendMatrix {
             PlatformIoOperation::AppendObjectOpen => self.append_object_open,
             PlatformIoOperation::Append => self.append,
             PlatformIoOperation::Persist => self.persist,
+            #[cfg(any(unix, windows))]
             PlatformIoOperation::WalRewrite => self.wal_rewrite,
             PlatformIoOperation::ObjectDelete => self.object_delete,
             PlatformIoOperation::DirectoryCreate => self.directory_create,
             PlatformIoOperation::DirectorySync => self.directory_sync,
             PlatformIoOperation::DirectoryListing => self.directory_listing,
+            #[cfg(any(unix, windows))]
             PlatformIoOperation::WriterLeaseAcquire => self.writer_lease_acquire,
         }
     }
@@ -476,6 +482,7 @@ enum PlatformIoTask {
         path: PathBuf,
         completion: IoCompletion<Vec<PathBuf>>,
     },
+    #[cfg(any(unix, windows))]
     AcquireWriterLease {
         path: PathBuf,
         owner: Arc<[u8]>,
@@ -640,7 +647,7 @@ impl PlatformIoDriver {
         Ok(waiter)
     }
 
-    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
+    #[cfg(any(unix, windows))]
     pub(crate) fn submit_acquire_writer_lease_path(
         &self,
         path: PathBuf,
@@ -752,6 +759,7 @@ impl PlatformIoTask {
             Self::CreateDirAll { .. } => PlatformIoOperation::DirectoryCreate,
             Self::SyncDir { .. } => PlatformIoOperation::DirectorySync,
             Self::ListFilePaths { .. } => PlatformIoOperation::DirectoryListing,
+            #[cfg(any(unix, windows))]
             Self::AcquireWriterLease { .. } => PlatformIoOperation::WriterLeaseAcquire,
         }
     }
@@ -839,6 +847,7 @@ impl PlatformIoTask {
             Self::ListFilePaths { path, completion } => {
                 complete_platform_io(&completion, platform_threadpool::list_file_paths(path));
             }
+            #[cfg(any(unix, windows))]
             Self::AcquireWriterLease {
                 path,
                 owner,
@@ -937,6 +946,7 @@ impl PlatformIoTask {
             Self::ListFilePaths { path, completion } => {
                 complete_platform_io(&completion, platform_backend::list_file_paths(path).await);
             }
+            #[cfg(any(unix, windows))]
             Self::AcquireWriterLease {
                 path,
                 owner,
@@ -972,6 +982,7 @@ impl PlatformIoTask {
             | Self::SyncDir { completion, .. } => {
                 complete_platform_io(&completion, Err(error()));
             }
+            #[cfg(any(unix, windows))]
             Self::AcquireWriterLease { completion, .. } => {
                 complete_platform_io(&completion, Err(error()));
             }
