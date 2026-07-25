@@ -17087,3 +17087,24 @@ Negative check:
 - No `RUSTC_BOOTSTRAP`, private dependency fork, or unstable toolchain is used.
 - The verified implementation was committed as `ef096cf`; no publish or tag was
   performed. The user-owned untracked `.infisical.json` remains untouched.
+
+## 2026-07-25: Rust 1.95 Linux Clippy cfg branch passed
+
+### Observation
+
+- The first hosted Linux lint after the Rust 1.95 upgrade found one nested
+  `create_parent`/`tmp_path.parent()` condition in the non-macOS compio
+  temporary-write branch.
+- Local macOS all-feature Clippy could not see that statement because the
+  enclosing function selects a separate macOS implementation at compile time.
+
+### Implementation and verification
+
+- Collapsed the non-macOS condition into the same Rust 1.95 let-chain shape
+  already used by the macOS branch; storage behavior and error propagation are
+  unchanged.
+- Local macOS all-target/all-feature strict Clippy passes.
+- Rust 1.95 `aarch64-unknown-linux-gnu` strict Clippy passes for the
+  `platform-io-native` library path.
+- The official `rust:1.95-bookworm` Linux container passes the hosted CI command
+  `cargo clippy --all-targets --all-features -- -D warnings`.

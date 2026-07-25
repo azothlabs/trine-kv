@@ -199,12 +199,10 @@ pub(super) async fn write_temp_rename(
     {
         use compio::io::AsyncWriteAtExt;
 
-        if create_parent {
-            if let Some(parent) = tmp_path.parent() {
-                compio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(Error::Io)?;
-            }
+        if create_parent && let Some(parent) = tmp_path.parent() {
+            compio::fs::create_dir_all(parent)
+                .await
+                .map_err(Error::Io)?;
         }
 
         let mut file = compio::fs::File::create(&tmp_path)
