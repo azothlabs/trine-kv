@@ -17085,5 +17085,5 @@ Negative check:
   through Cargo metadata rather than encountering undeclared transitive
   requirements.
 - No `RUSTC_BOOTSTRAP`, private dependency fork, or unstable toolchain is used.
-- No publish, tag, commit, or push was performed. The user-owned untracked
-  `.infisical.json` remains untouched.
+- The verified implementation was committed as `ef096cf`; no publish or tag was
+  performed. The user-owned untracked `.infisical.json` remains untouched.

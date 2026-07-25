@@ -4219,7 +4219,7 @@ boundary across native durability and platform-io paths.
 
 ### Phase 171: 0.4.0 Release Metadata And Tag
 
-**Status**: In Progress
+**Status**: Complete
 
 **Goal**: Align crate metadata and user-facing docs for the platform I/O
 release, then create the local Git tag used by GitHub release automation.

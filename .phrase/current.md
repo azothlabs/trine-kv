@@ -45,5 +45,5 @@
 
 ### Out of scope
 
-- Rust beyond 1.95, private dependency forks, publishing, tagging, committing,
-  pushing, storage-format changes, and new public features.
+- Rust beyond 1.95, private dependency forks, publishing, tagging,
+  storage-format changes, and new public features.
