@@ -48,6 +48,42 @@ use crate::storage::{
     ensure_whole_object_read_len,
 };
 
+pub(crate) fn canonical_object_prefix(value: &str) -> Result<String> {
+    if value.as_bytes().contains(&0) {
+        return Err(Error::invalid_options(
+            "object-store prefix cannot contain a NUL byte",
+        ));
+    }
+    let absolute = value.starts_with(['/', '\\']);
+    let mut components = Vec::new();
+    for component in value.split(['/', '\\']) {
+        match component {
+            "" | "." => {}
+            ".." => {
+                return Err(Error::invalid_options(
+                    "object-store prefix cannot contain a parent component",
+                ));
+            }
+            component => components.push(component),
+        }
+    }
+    let joined = components.join("/");
+    if absolute && !joined.is_empty() {
+        Ok(format!("/{joined}"))
+    } else if absolute {
+        Ok("/".to_owned())
+    } else {
+        Ok(joined)
+    }
+}
+
+pub(crate) fn canonical_object_key(path: &Path) -> Result<String> {
+    let value = path.to_str().ok_or_else(|| {
+        Error::invalid_options("object-store keys must contain valid UTF-8 components")
+    })?;
+    canonical_object_prefix(value)
+}
+
 /// Boxed future returned by [`ObjectClient`] methods. Mirrors the storage
 /// layer's `StorageFuture`: object stores are used through `dyn`, so the async
 /// methods return a boxed future rather than `async fn`. The `Send` bound is
@@ -207,7 +243,8 @@ impl QualifiedObjectStoreReclamation {
     }
 
     pub(crate) fn matches_prefix(&self, prefix: &Path) -> bool {
-        self.namespace_digest == object_store_reclamation_namespace_digest(prefix)
+        object_store_reclamation_namespace_digest(prefix)
+            .is_ok_and(|digest| self.namespace_digest == digest)
     }
 
     pub(crate) fn matches_client(&self, client: &Arc<dyn ObjectClient>) -> bool {
@@ -486,7 +523,7 @@ pub async fn qualify_object_store_reclamation(
     prefix: impl Into<String>,
     attestation: ObjectStoreReclamationAttestation,
 ) -> Result<QualifiedObjectStoreReclamation> {
-    let prefix = prefix.into();
+    let prefix = canonical_object_prefix(&prefix.into())?;
     for (path, role) in [
         ("content-v1/chunks", "reclamation-chunk"),
         ("content-v1/domains", "reclamation-descriptor"),
@@ -500,17 +537,17 @@ pub async fn qualify_object_store_reclamation(
     }
     Ok(QualifiedObjectStoreReclamation {
         evidence_digest: attestation.evidence_digest,
-        namespace_digest: object_store_reclamation_namespace_digest(Path::new(&prefix)),
+        namespace_digest: object_store_reclamation_namespace_digest(Path::new(&prefix))?,
         client,
     })
 }
 
-fn object_store_reclamation_namespace_digest(prefix: &Path) -> [u8; 32] {
+fn object_store_reclamation_namespace_digest(prefix: &Path) -> Result<[u8; 32]> {
     let mut hasher = Sha256::new();
     hasher.update(b"trine-object-store-reclamation-namespace-v1");
     hasher.update([0]);
-    hasher.update(prefix.to_string_lossy().as_bytes());
-    hasher.finalize().into()
+    hasher.update(canonical_object_key(prefix)?.as_bytes());
+    Ok(hasher.finalize().into())
 }
 
 async fn verify_object_store_reclamation_at_key(
@@ -597,10 +634,8 @@ async fn verify_unversioned_object(
             ),
         });
     }
-    let list_prefix = Path::new(key)
-        .parent()
-        .map_or_else(String::new, |parent| parent.to_string_lossy().into_owned());
-    let listed = client.list(&list_prefix).await?;
+    let list_prefix = key.rsplit_once('/').map_or("", |(parent, _)| parent);
+    let listed = client.list(list_prefix).await?;
     let mut exact = listed.iter().filter(|meta| meta.key == key);
     if exact.next().is_none_or(|meta| meta.version.is_some()) || exact.next().is_some() {
         return Err(Error::Corruption {
@@ -616,13 +651,11 @@ async fn verify_object_store_reclamation_absent(
     client: &Arc<dyn ObjectClient>,
     key: &str,
 ) -> Result<()> {
-    let list_prefix = Path::new(key)
-        .parent()
-        .map_or_else(String::new, |parent| parent.to_string_lossy().into_owned());
+    let list_prefix = key.rsplit_once('/').map_or("", |(parent, _)| parent);
     if client.head(key).await?.is_some()
         || client.get(key).await?.is_some()
         || client
-            .list(&list_prefix)
+            .list(list_prefix)
             .await?
             .iter()
             .any(|meta| meta.key == key)
@@ -763,13 +796,10 @@ fn object_client_contract_probe_key_for_role(db_path: &Path, role: &str) -> Resu
             message: format!("system clock is before UNIX_EPOCH: {error}"),
         })?;
     let counter = OBJECT_CLIENT_CONTRACT_PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    Ok(db_path
-        .join(format!(
-            ".trine-object-client-contract-{role}-{}-{counter}",
-            now.as_nanos()
-        ))
-        .to_string_lossy()
-        .into_owned())
+    canonical_object_key(&db_path.join(format!(
+        ".trine-object-client-contract-{role}-{}-{counter}",
+        now.as_nanos()
+    )))
 }
 
 /// One stored object: its bytes and current `ETag`.
@@ -1016,15 +1046,15 @@ impl ObjectStoreBackend {
         Arc::clone(&self.client)
     }
 
-    fn object_key(object: &StorageObjectId) -> String {
-        object.path().to_string_lossy().into_owned()
+    fn object_key(object: &StorageObjectId) -> Result<String> {
+        canonical_object_key(object.path())
     }
 
     pub(crate) async fn delete_unversioned_object_verified(
         &self,
         object: StorageObjectId,
     ) -> Result<()> {
-        let key = Self::object_key(&object);
+        let key = Self::object_key(&object)?;
         match self.client.head(&key).await? {
             Some(meta) if meta.version.is_some() => {
                 return Err(Error::unsupported_backend(
@@ -1095,7 +1125,7 @@ impl StorageReadBackend for ObjectStoreBackend {
 
     fn open_read(&self, object: StorageObjectId) -> StorageReadFuture<'_, Self::ReadObject> {
         Box::pin(async move {
-            let key = Self::object_key(&object);
+            let key = Self::object_key(&object)?;
             let meta = self
                 .client
                 .head(&key)
@@ -1113,7 +1143,7 @@ impl StorageReadBackend for ObjectStoreBackend {
 impl StorageObjectReadBackend for ObjectStoreBackend {
     fn read_object_bytes(&self, object: StorageObjectId) -> StorageFuture<'_, Option<Arc<[u8]>>> {
         Box::pin(async move {
-            let key = Self::object_key(&object);
+            let key = Self::object_key(&object)?;
             let Some(meta) = self.client.head(&key).await? else {
                 return Ok(None);
             };
@@ -1134,7 +1164,8 @@ impl StorageObjectWriteBackend for ObjectStoreBackend {
         // A PUT is durable once the store acknowledges it, so durability hints do
         // not apply (there is no separate flush/fsync step).
         Box::pin(async move {
-            self.client.put(&Self::object_key(&object), bytes).await?;
+            let key = Self::object_key(&object)?;
+            self.client.put(&key, bytes).await?;
             Ok(())
         })
     }
@@ -1142,7 +1173,10 @@ impl StorageObjectWriteBackend for ObjectStoreBackend {
 
 impl StorageObjectDeleteBackend for ObjectStoreBackend {
     fn delete_object(&self, object: StorageObjectId) -> StorageFuture<'_, ()> {
-        Box::pin(async move { self.client.delete(&Self::object_key(&object)).await })
+        Box::pin(async move {
+            let key = Self::object_key(&object)?;
+            self.client.delete(&key).await
+        })
     }
 }
 
@@ -1152,23 +1186,28 @@ impl StorageObjectListBackend for ObjectStoreBackend {
         request: StorageObjectListRequest,
     ) -> StorageFuture<'_, Vec<StorageObjectId>> {
         Box::pin(async move {
-            let root = request.root().to_path_buf();
             let kind = request.kind();
             let extension = request.file_extension();
             // Prefix-list under the database root, then keep only the direct
             // children matching the requested extension — mirroring the
             // filesystem backend's non-recursive, extension-filtered listing.
-            let prefix = root.to_string_lossy().into_owned();
-            let mut objects: Vec<StorageObjectId> = self
-                .client
-                .list(&prefix)
-                .await?
-                .into_iter()
-                .map(|meta| PathBuf::from(meta.key))
-                .filter(|path| path.parent() == Some(root.as_path()))
-                .filter(|path| path_matches_extension(path, extension))
-                .map(|path| StorageObjectId::native_file(kind, path))
-                .collect();
+            let prefix = canonical_object_key(request.root())?;
+            let root = PathBuf::from(&prefix);
+            let listed = self.client.list(&prefix).await?;
+            let mut objects = Vec::new();
+            for meta in listed {
+                let canonical = canonical_object_prefix(&meta.key)?;
+                if canonical != meta.key {
+                    return Err(Error::Corruption {
+                        message: format!("object store returned non-canonical key {:?}", meta.key),
+                    });
+                }
+                let path = PathBuf::from(canonical);
+                if path.parent() == Some(root.as_path()) && path_matches_extension(&path, extension)
+                {
+                    objects.push(StorageObjectId::native_file(kind, path));
+                }
+            }
             objects.sort_unstable();
             Ok(objects)
         })
@@ -1228,7 +1267,8 @@ mod tests {
     use super::{
         ETag, InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta, ObjectStoreBackend,
         ObjectStoreReclamationAttestation, ObjectStoreReclamationEvidenceDigest, ObjectVersion,
-        Precondition, PutIf, qualify_object_store_reclamation,
+        Precondition, PutIf, canonical_object_key, canonical_object_prefix,
+        qualify_object_store_reclamation,
     };
     use crate::error::{Error, Result};
     use crate::options::DurabilityMode;
@@ -1239,6 +1279,31 @@ mod tests {
 
     fn bytes(data: &[u8]) -> Arc<[u8]> {
         Arc::from(data)
+    }
+
+    #[test]
+    fn object_keys_have_one_cross_platform_canonical_form() {
+        assert_eq!(
+            canonical_object_prefix(r"tenant\db//./tables").expect("Windows separators normalize"),
+            "tenant/db/tables"
+        );
+        assert_eq!(
+            canonical_object_prefix("/tenant/db/tables").expect("Unix separators normalize"),
+            "/tenant/db/tables"
+        );
+        assert_eq!(
+            canonical_object_key(Path::new(r"\tenant\db\MANIFEST"))
+                .expect("absolute Windows-style key normalizes"),
+            "/tenant/db/MANIFEST"
+        );
+        assert!(matches!(
+            canonical_object_prefix("tenant/../other"),
+            Err(Error::InvalidOptions { .. })
+        ));
+        assert!(matches!(
+            canonical_object_prefix("tenant/\0/other"),
+            Err(Error::InvalidOptions { .. })
+        ));
     }
 
     /// Drives an [`ObjectFuture`] to completion. The in-memory store never

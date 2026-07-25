@@ -6,8 +6,8 @@ use super::{
     DEFAULT_BUCKET_NAME, Db, DbInner, DbOptions, DbStats, DurabilityMode, Error,
     FailOnCorruptionPolicy, FilterPolicy, HostStorageBackend, LsmCompactionInput,
     LsmCompactionOutput, LsmCompactionTablePayload, LsmTree, MaintenanceCoordinator, ManifestState,
-    ManifestStore, Mutex, NamedCompactionOutput, NativeFileBackend, ObjectLeaseState, Ordering,
-    Path, PathBuf, PrefixFilterPolicy, Result, Sequence, SnapshotTracker, StorageCapability,
+    ManifestStore, Mutex, NamedCompactionOutput, NativeFileBackend, Ordering, Path,
+    PrefixFilterPolicy, Result, Sequence, SnapshotTracker, StorageCapability,
     StorageDirectoryCreateBackend, StorageDirectoryFile, StorageDirectoryId,
     StorageDirectoryListBackend, StorageDirectorySyncBackend, StorageManifestReadBackend,
     StorageMode, StorageObjectDeleteBackend, StorageObjectId, StorageObjectKind,
@@ -26,27 +26,6 @@ pub(super) fn validate_options(options: &DbOptions) -> Result<()> {
         ));
     }
     validate_common_options(options)
-}
-
-pub(super) fn object_store_wal_paths_after_replay_floor(
-    state: &ObjectLeaseState,
-    replay_floor: Sequence,
-) -> Result<Vec<PathBuf>> {
-    if state.committed_sequence <= replay_floor {
-        return Ok(Vec::new());
-    }
-
-    state
-        .current_wal_key
-        .as_ref()
-        .map(|key| vec![PathBuf::from(key)])
-        .ok_or_else(|| Error::Corruption {
-            message: format!(
-                "object-store WAL head reached sequence {} beyond replay floor {} without a WAL segment",
-                state.committed_sequence.get(),
-                replay_floor.get()
-            ),
-        })
 }
 
 pub(super) fn object_store_committed_wal_batches(
@@ -178,7 +157,27 @@ pub(super) fn validate_checkpoint_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(Error::invalid_options("checkpoint name cannot be empty"));
     }
+    if name.starts_with(crate::bucket::INTERNAL_BUCKET_PREFIX) {
+        return Err(Error::invalid_options(
+            "checkpoint name uses Trine's reserved internal namespace",
+        ));
+    }
+    if name.len() > 1_024 {
+        return Err(Error::invalid_options(
+            "checkpoint name exceeds the 1024-byte limit",
+        ));
+    }
     Ok(())
+}
+
+pub(super) fn require_internal_checkpoint_name(name: &str) -> Result<()> {
+    if name.starts_with(crate::bucket::INTERNAL_BUCKET_PREFIX) {
+        Ok(())
+    } else {
+        Err(Error::Corruption {
+            message: format!("internal checkpoint name {name:?} is outside the reserved namespace"),
+        })
+    }
 }
 
 #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]

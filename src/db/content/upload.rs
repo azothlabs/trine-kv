@@ -1,16 +1,138 @@
 use super::{
     CONTENT_CONTROL_BUCKET, CONTENT_LEASE_BUCKET, CONTENT_TOKEN_BUCKET, CONTENT_TOKEN_INDEX_BUCKET,
     ContentDescriptor, ContentId, ContentPhysicalAccountRecord, ContentPhysicalQuota,
-    ContentPhysicalReservationRecord, ContentTokenIndexRecord, ContentUpload, ContentUploadOptions,
-    ContentUploadResume, Db, DurabilityMode, Error, Result, SealedContent, Sha256, StorageDomainId,
-    TransactionOptions, UploadId, UploadSessionState, UploadSessionStatus, UploadToken,
-    UploadTokenRecord, WriteOptions, content_physical_account_key, content_physical_quota_key,
-    content_physical_reservation_key, content_token_index_key, current_epoch_millis,
-    initial_upload_reservation, upload_token_key,
+    ContentPhysicalReservationRecord, ContentTokenIndexRecord, ContentUpload, ContentUploadInfo,
+    ContentUploadMaintenanceReport, ContentUploadOptions, ContentUploadResume, Db, DurabilityMode,
+    Error, Result, SealedContent, Sha256, StorageDomainId, TransactionOptions, UploadId,
+    UploadSessionState, UploadSessionStatus, UploadToken, UploadTokenRecord, WriteOptions,
+    content_physical_account_key, content_physical_quota_key, content_physical_reservation_key,
+    content_token_index_key, current_epoch_millis, initial_upload_reservation, upload_token_key,
 };
 use sha2::Digest;
 
 impl Db {
+    /// Lists every durable upload state known to this database.
+    ///
+    /// The result is ordered by [`UploadId`]. It includes open, sealing,
+    /// sealed, and aborting states so an operator can distinguish resumable
+    /// work from retained idempotency records. Listing is read-only and does
+    /// not reserve quota, resume sealing, or delete chunks.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage, listing, decoding, and integrity errors. A malformed
+    /// state fails the complete listing instead of being silently skipped.
+    pub async fn list_content_uploads(&self) -> Result<Vec<ContentUploadInfo>> {
+        self.ensure_open()?;
+        self.list_upload_states().await.map(|states| {
+            states
+                .into_iter()
+                .map(UploadSessionState::maintenance_info)
+                .collect()
+        })
+    }
+
+    /// Removes open or aborting uploads whose last durable update precedes
+    /// `inactive_before_unix_ms`.
+    ///
+    /// Each candidate is locked and reread before cleanup. A concurrent append,
+    /// seal, resume, or abort therefore either updates the timestamp or changes
+    /// lifecycle and prevents stale cleanup. Successful cleanup deletes chunks,
+    /// releases the exact upload reservation, and removes the state object.
+    /// Sealing and sealed states are never discarded by this method.
+    ///
+    /// # Parameters
+    ///
+    /// - `inactive_before_unix_ms`: exclusive Unix-millisecond cutoff. A state
+    ///   updated exactly at the cutoff is retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns read-only, storage, quota-accounting, decoding, or cleanup
+    /// errors. The pass is idempotent; retrying continues from durable state.
+    pub async fn reap_inactive_content_uploads(
+        &self,
+        inactive_before_unix_ms: u64,
+    ) -> Result<ContentUploadMaintenanceReport> {
+        self.ensure_open()?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+        let candidates = self.list_upload_states().await?;
+        let mut report = ContentUploadMaintenanceReport::default();
+        for candidate in candidates {
+            report.scanned = report.scanned.saturating_add(1);
+            if candidate.updated_at_unix_ms() >= inactive_before_unix_ms {
+                continue;
+            }
+
+            let upload_id = candidate.upload_id();
+            let _upload = self.lock_content_upload(upload_id).await;
+            let current = match self.require_upload_state(upload_id).await {
+                Ok(state) => state,
+                Err(Error::ContentUploadNotFound { .. }) => continue,
+                Err(error) => return Err(error),
+            };
+            if current.updated_at_unix_ms() >= inactive_before_unix_ms {
+                continue;
+            }
+            if matches!(
+                current.status(),
+                UploadSessionStatus::Open | UploadSessionStatus::Aborting
+            ) {
+                self.discard_open_upload(&current).await?;
+                report.aborted = report.aborted.saturating_add(1);
+            }
+        }
+        Ok(report)
+    }
+
+    /// Removes sealed upload state older than an exclusive cutoff.
+    ///
+    /// This only removes the upload-idempotency record. The immutable content
+    /// descriptor, chunks selected by that descriptor, attachment token, and
+    /// quota accounting remain unchanged. After pruning, retrying seal or resume
+    /// by the old `UploadId` returns [`Error::ContentUploadNotFound`].
+    ///
+    /// Sealing records are retained because they may still need crash recovery.
+    /// # Errors
+    ///
+    /// Returns read-only, storage, listing, decoding, or deletion errors. Every
+    /// successful deletion is final even if a later candidate fails; retrying
+    /// the same cutoff is safe.
+    pub async fn prune_sealed_content_uploads(
+        &self,
+        sealed_before_unix_ms: u64,
+    ) -> Result<ContentUploadMaintenanceReport> {
+        self.ensure_open()?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+        let candidates = self.list_upload_states().await?;
+        let mut report = ContentUploadMaintenanceReport::default();
+        for candidate in candidates {
+            report.scanned = report.scanned.saturating_add(1);
+            if candidate.updated_at_unix_ms() >= sealed_before_unix_ms {
+                continue;
+            }
+
+            let upload_id = candidate.upload_id();
+            let _upload = self.lock_content_upload(upload_id).await;
+            let current = match self.require_upload_state(upload_id).await {
+                Ok(state) => state,
+                Err(Error::ContentUploadNotFound { .. }) => continue,
+                Err(error) => return Err(error),
+            };
+            if current.updated_at_unix_ms() < sealed_before_unix_ms
+                && matches!(current.status(), UploadSessionStatus::Sealed(_))
+            {
+                self.delete_upload_state(upload_id).await?;
+                report.pruned_sealed = report.pruned_sealed.saturating_add(1);
+            }
+        }
+        Ok(report)
+    }
+
     pub(super) const CONTENT_ACCESS_COMMIT_ATTEMPTS: usize = 8;
     pub(super) const CONTENT_LEASE_COMMIT_ATTEMPTS: usize = 8;
     pub(super) const CONTENT_PHYSICAL_HOLD_COMMIT_ATTEMPTS: usize = 8;
@@ -36,7 +158,7 @@ impl Db {
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
-        self.bucket(CONTENT_CONTROL_BUCKET).await?;
+        self.internal_bucket(CONTENT_CONTROL_BUCKET).await?;
         let _quota = self.lock_content_quota(storage_domain_id).await;
         let mut transaction = self.transaction(TransactionOptions::default());
         let current = self
@@ -53,7 +175,7 @@ impl Db {
             }
         }
         let next = current.with_limit(limit);
-        transaction.put_bucket(
+        transaction.put_internal_bucket(
             CONTENT_CONTROL_BUCKET,
             content_physical_quota_key(storage_domain_id),
             next.encode(),
@@ -75,7 +197,7 @@ impl Db {
         storage_domain_id: StorageDomainId,
     ) -> Result<ContentPhysicalQuota> {
         self.ensure_open()?;
-        self.bucket(CONTENT_CONTROL_BUCKET).await?;
+        self.internal_bucket(CONTENT_CONTROL_BUCKET).await?;
         let mut transaction = self.transaction(TransactionOptions::default());
         self.read_content_physical_quota(&mut transaction, storage_domain_id)
             .await
@@ -577,10 +699,10 @@ impl Db {
         upload_id: UploadId,
         sealed: SealedContent,
     ) -> Result<()> {
-        self.bucket(CONTENT_TOKEN_BUCKET).await?;
-        self.bucket(CONTENT_TOKEN_INDEX_BUCKET).await?;
-        self.bucket(CONTENT_CONTROL_BUCKET).await?;
-        self.bucket(CONTENT_LEASE_BUCKET).await?;
+        self.internal_bucket(CONTENT_TOKEN_BUCKET).await?;
+        self.internal_bucket(CONTENT_TOKEN_INDEX_BUCKET).await?;
+        self.internal_bucket(CONTENT_CONTROL_BUCKET).await?;
+        self.internal_bucket(CONTENT_LEASE_BUCKET).await?;
         let expected = UploadTokenRecord::available(upload_id, sealed);
         let key = upload_token_key(sealed.upload_token());
         let index = ContentTokenIndexRecord::for_token(sealed);
@@ -592,7 +714,10 @@ impl Db {
         let mut transaction = self.transaction(TransactionOptions {
             write_options: WriteOptions::new(sealed.durability()),
         });
-        if let Some(bytes) = transaction.get_bucket(CONTENT_TOKEN_BUCKET, &key).await? {
+        if let Some(bytes) = transaction
+            .get_internal_bucket(CONTENT_TOKEN_BUCKET, &key)
+            .await?
+        {
             let existing = UploadTokenRecord::decode(&bytes, sealed.upload_token())?;
             if existing.attachment() != expected.attachment() {
                 return Err(Error::Corruption {
@@ -600,7 +725,7 @@ impl Db {
                 });
             }
             let indexed = transaction
-                .get_bucket(CONTENT_TOKEN_INDEX_BUCKET, &index_key)
+                .get_internal_bucket(CONTENT_TOKEN_INDEX_BUCKET, &index_key)
                 .await?;
             if existing.is_available() {
                 let indexed = indexed.ok_or_else(|| Error::Corruption {
@@ -622,7 +747,7 @@ impl Db {
                 sealed.content_id(),
             );
             let control = transaction
-                .get_bucket(CONTENT_CONTROL_BUCKET, &control_key)
+                .get_internal_bucket(CONTENT_CONTROL_BUCKET, &control_key)
                 .await?
                 .ok_or_else(|| Error::Corruption {
                     message: format!("sealed upload {upload_id} is missing content control state"),
@@ -634,8 +759,8 @@ impl Db {
             )?;
             return Ok(());
         }
-        transaction.put_bucket(CONTENT_TOKEN_BUCKET, key, expected.encode())?;
-        transaction.put_bucket(CONTENT_TOKEN_INDEX_BUCKET, index_key, index.encode())?;
+        transaction.put_internal_bucket(CONTENT_TOKEN_BUCKET, key, expected.encode())?;
+        transaction.put_internal_bucket(CONTENT_TOKEN_INDEX_BUCKET, index_key, index.encode())?;
         transaction
             .stage_content_activity(sealed.storage_domain_id(), sealed.content_id())
             .await?;
@@ -787,7 +912,7 @@ impl Db {
         storage_domain_id: StorageDomainId,
     ) -> Result<ContentPhysicalQuota> {
         transaction
-            .get_bucket(
+            .get_internal_bucket(
                 CONTENT_CONTROL_BUCKET,
                 &content_physical_quota_key(storage_domain_id),
             )
@@ -804,13 +929,13 @@ impl Db {
         state: &UploadSessionState,
         desired_reservation: u64,
     ) -> Result<()> {
-        self.bucket(CONTENT_CONTROL_BUCKET).await?;
+        self.internal_bucket(CONTENT_CONTROL_BUCKET).await?;
         let storage_domain_id = state.options().attachment_scope().storage_domain_id();
         let _quota = self.lock_content_quota(storage_domain_id).await;
         let reservation_key = content_physical_reservation_key(state.upload_id());
         let mut transaction = self.transaction(TransactionOptions::default());
         let existing = transaction
-            .get_bucket(CONTENT_CONTROL_BUCKET, &reservation_key)
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &reservation_key)
             .await?
             .map(|bytes| ContentPhysicalReservationRecord::decode(&bytes, state.upload_id()))
             .transpose()?;
@@ -848,12 +973,12 @@ impl Db {
             });
         }
         let next_quota = quota.with_counts(quota.unique_content_bytes(), reserved);
-        transaction.put_bucket(
+        transaction.put_internal_bucket(
             CONTENT_CONTROL_BUCKET,
             content_physical_quota_key(storage_domain_id),
             next_quota.encode(),
         )?;
-        transaction.put_bucket(
+        transaction.put_internal_bucket(
             CONTENT_CONTROL_BUCKET,
             reservation_key,
             ContentPhysicalReservationRecord {
@@ -872,12 +997,12 @@ impl Db {
         storage_domain_id: StorageDomainId,
         upload_id: UploadId,
     ) -> Result<()> {
-        self.bucket(CONTENT_CONTROL_BUCKET).await?;
+        self.internal_bucket(CONTENT_CONTROL_BUCKET).await?;
         let _quota = self.lock_content_quota(storage_domain_id).await;
         let reservation_key = content_physical_reservation_key(upload_id);
         let mut transaction = self.transaction(TransactionOptions::default());
         let Some(bytes) = transaction
-            .get_bucket(CONTENT_CONTROL_BUCKET, &reservation_key)
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &reservation_key)
             .await?
         else {
             return Ok(());
@@ -897,14 +1022,14 @@ impl Db {
             .ok_or_else(|| Error::Corruption {
                 message: "content physical reservation exceeds its domain counter".to_owned(),
             })?;
-        transaction.put_bucket(
+        transaction.put_internal_bucket(
             CONTENT_CONTROL_BUCKET,
             content_physical_quota_key(reservation.storage_domain_id),
             quota
                 .with_counts(quota.unique_content_bytes(), reserved)
                 .encode(),
         )?;
-        transaction.delete_bucket(CONTENT_CONTROL_BUCKET, reservation_key)?;
+        transaction.delete_internal_bucket(CONTENT_CONTROL_BUCKET, reservation_key)?;
         transaction.commit().await?;
         Ok(())
     }
@@ -914,14 +1039,14 @@ impl Db {
         state: &UploadSessionState,
         sealed: SealedContent,
     ) -> Result<()> {
-        self.bucket(CONTENT_CONTROL_BUCKET).await?;
+        self.internal_bucket(CONTENT_CONTROL_BUCKET).await?;
         let storage_domain_id = sealed.storage_domain_id();
         let _quota = self.lock_content_quota(storage_domain_id).await;
         let reservation_key = content_physical_reservation_key(state.upload_id());
         let account_key = content_physical_account_key(storage_domain_id, sealed.content_id());
         let mut transaction = self.transaction(TransactionOptions::default());
         let account = transaction
-            .get_bucket(CONTENT_CONTROL_BUCKET, &account_key)
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &account_key)
             .await?
             .map(|bytes| {
                 ContentPhysicalAccountRecord::decode(&bytes, storage_domain_id, sealed.content_id())
@@ -933,7 +1058,7 @@ impl Db {
             });
         }
         let Some(reservation_bytes) = transaction
-            .get_bucket(CONTENT_CONTROL_BUCKET, &reservation_key)
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &reservation_key)
             .await?
         else {
             if account.is_some() {
@@ -984,13 +1109,13 @@ impl Db {
                 requested_bytes: 0,
             });
         }
-        transaction.put_bucket(
+        transaction.put_internal_bucket(
             CONTENT_CONTROL_BUCKET,
             content_physical_quota_key(storage_domain_id),
             quota.with_counts(unique, reserved).encode(),
         )?;
         if account.is_none() {
-            transaction.put_bucket(
+            transaction.put_internal_bucket(
                 CONTENT_CONTROL_BUCKET,
                 account_key,
                 ContentPhysicalAccountRecord {
@@ -1001,7 +1126,7 @@ impl Db {
                 .encode(),
             )?;
         }
-        transaction.delete_bucket(CONTENT_CONTROL_BUCKET, reservation_key)?;
+        transaction.delete_internal_bucket(CONTENT_CONTROL_BUCKET, reservation_key)?;
         transaction.commit().await?;
         Ok(())
     }
@@ -1014,7 +1139,7 @@ impl Db {
     ) -> Result<()> {
         let account_key = content_physical_account_key(storage_domain_id, content_id);
         let Some(bytes) = transaction
-            .get_bucket(CONTENT_CONTROL_BUCKET, &account_key)
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &account_key)
             .await?
         else {
             return Err(Error::Corruption {
@@ -1031,14 +1156,14 @@ impl Db {
             .ok_or_else(|| Error::Corruption {
                 message: "reclaimed content exceeds physical unique-byte counter".to_owned(),
             })?;
-        transaction.put_bucket(
+        transaction.put_internal_bucket(
             CONTENT_CONTROL_BUCKET,
             content_physical_quota_key(storage_domain_id),
             quota
                 .with_counts(unique, quota.upload_reserved_bytes())
                 .encode(),
         )?;
-        transaction.delete_bucket(CONTENT_CONTROL_BUCKET, account_key)?;
+        transaction.delete_internal_bucket(CONTENT_CONTROL_BUCKET, account_key)?;
         Ok(())
     }
 

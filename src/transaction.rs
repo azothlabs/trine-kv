@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use crate::{
-    bucket::DEFAULT_BUCKET_NAME,
+    bucket::{DEFAULT_BUCKET_NAME, require_internal_bucket, validate_user_named_bucket},
     content::{
         CONTENT_CONTROL_BUCKET, CONTENT_LEASE_BUCKET, CONTENT_PHYSICAL_HOLD_BUCKET,
         CONTENT_TOKEN_BUCKET, CONTENT_TOKEN_INDEX_BUCKET, ContentAccessCoordinateRecord,
@@ -35,6 +35,12 @@ use crate::{
 pub struct TransactionOptions {
     /// Write options used when the transaction commits.
     pub write_options: WriteOptions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InactiveAuthorityPolicy {
+    Retain,
+    Prune,
 }
 
 /// Optimistic transaction over one read snapshot and a staged write batch.
@@ -136,7 +142,7 @@ impl Transaction {
     /// fails if a later committed write or delete touches the key, or if a later
     /// range delete covers it.
     pub fn get_sync(&mut self, key: &[u8]) -> Result<Option<Value>> {
-        self.get_bucket_sync(DEFAULT_BUCKET_NAME, key)
+        self.get_bucket_sync_unchecked(DEFAULT_BUCKET_NAME.to_owned(), key)
     }
 
     /// Reads a named-bucket key and tracks it for commit conflict checks.
@@ -151,6 +157,21 @@ impl Transaction {
         key: &[u8],
     ) -> Result<Option<Value>> {
         let bucket = bucket.into();
+        validate_user_named_bucket(&bucket)?;
+        self.get_bucket_sync_unchecked(bucket, key)
+    }
+
+    pub(crate) fn get_internal_bucket_sync(
+        &mut self,
+        bucket: impl Into<String>,
+        key: &[u8],
+    ) -> Result<Option<Value>> {
+        let bucket = bucket.into();
+        require_internal_bucket(&bucket)?;
+        self.get_bucket_sync_unchecked(bucket, key)
+    }
+
+    fn get_bucket_sync_unchecked(&mut self, bucket: String, key: &[u8]) -> Result<Option<Value>> {
         let value = self.db.get_at_sequence(&bucket, key, self.read_sequence)?;
         // Record the exact user key read at the transaction's read sequence.
         // Commit validation rejects the transaction if a later committed point
@@ -172,7 +193,7 @@ impl Transaction {
     /// Commit fails if a later committed point mutation falls inside the range
     /// or if a later range delete overlaps it.
     pub fn read_range_sync(&mut self, range: KeyRange) -> Result<()> {
-        self.read_range_bucket_sync(DEFAULT_BUCKET_NAME, range)
+        self.read_range_bucket_sync_unchecked(DEFAULT_BUCKET_NAME.to_owned(), range)
     }
 
     /// Reads a named-bucket range and tracks it for commit conflict checks.
@@ -181,8 +202,13 @@ impl Transaction {
         bucket: impl Into<String>,
         range: KeyRange,
     ) -> Result<()> {
-        self.db.ensure_open()?;
         let bucket = bucket.into();
+        validate_user_named_bucket(&bucket)?;
+        self.read_range_bucket_sync_unchecked(bucket, range)
+    }
+
+    fn read_range_bucket_sync_unchecked(&mut self, bucket: String, range: KeyRange) -> Result<()> {
+        self.db.ensure_open()?;
         let iter = self.db.range_at_sequence(
             &bucket,
             &range,
@@ -205,7 +231,7 @@ impl Transaction {
     /// Reads the default-bucket range and returns its cursor, tracking the
     /// range for commit conflict checks.
     pub fn range_sync(&mut self, range: KeyRange) -> Result<Iter> {
-        self.range_bucket_sync(DEFAULT_BUCKET_NAME, range)
+        self.range_bucket_sync_unchecked(DEFAULT_BUCKET_NAME.to_owned(), range)
     }
 
     /// Reads a named-bucket range and returns its cursor, tracking the range for
@@ -223,8 +249,23 @@ impl Transaction {
         bucket: impl Into<String>,
         range: KeyRange,
     ) -> Result<Iter> {
-        self.db.ensure_open()?;
         let bucket = bucket.into();
+        validate_user_named_bucket(&bucket)?;
+        self.range_bucket_sync_unchecked(bucket, range)
+    }
+
+    pub(crate) fn range_internal_bucket_sync(
+        &mut self,
+        bucket: impl Into<String>,
+        range: KeyRange,
+    ) -> Result<Iter> {
+        let bucket = bucket.into();
+        require_internal_bucket(&bucket)?;
+        self.range_bucket_sync_unchecked(bucket, range)
+    }
+
+    fn range_bucket_sync_unchecked(&mut self, bucket: String, range: KeyRange) -> Result<Iter> {
+        self.db.ensure_open()?;
         let iter = self.db.range_at_sequence(
             &bucket,
             &range,
@@ -252,6 +293,15 @@ impl Transaction {
         value: impl Into<Value>,
     ) -> Result<()> {
         self.writes.put_bucket(bucket, key, value)
+    }
+
+    pub(crate) fn put_internal_bucket(
+        &mut self,
+        bucket: impl Into<String>,
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Value>,
+    ) -> Result<()> {
+        self.writes.put_internal_bucket(bucket, key, value)
     }
 
     /// Stages a named-bucket value containing this transaction's final commit
@@ -321,6 +371,17 @@ impl Transaction {
             .put_bucket_with_commit_sequence(bucket, key, prefix, suffix)
     }
 
+    pub(crate) fn put_internal_bucket_with_commit_sequence(
+        &mut self,
+        bucket: impl Into<String>,
+        key: impl Into<Vec<u8>>,
+        prefix: &[u8],
+        suffix: &[u8],
+    ) -> Result<()> {
+        self.writes
+            .put_internal_bucket_with_commit_sequence(bucket, key, prefix, suffix)
+    }
+
     /// Stages a point delete for the default bucket.
     pub fn delete(&mut self, key: impl Into<Vec<u8>>) {
         self.writes.delete(key);
@@ -333,6 +394,14 @@ impl Transaction {
         key: impl Into<Vec<u8>>,
     ) -> Result<()> {
         self.writes.delete_bucket(bucket, key)
+    }
+
+    pub(crate) fn delete_internal_bucket(
+        &mut self,
+        bucket: impl Into<String>,
+        key: impl Into<Vec<u8>>,
+    ) -> Result<()> {
+        self.writes.delete_internal_bucket(bucket, key)
     }
 
     /// Stages a range delete for the default bucket.
@@ -385,7 +454,7 @@ impl Transaction {
     ) -> Result<ContentAttachment> {
         let key = upload_token_key(token);
         self.require_consistent_staged_token(&key, change_id)?;
-        let bytes = match self.get_bucket_sync(CONTENT_TOKEN_BUCKET, &key) {
+        let bytes = match self.get_internal_bucket_sync(CONTENT_TOKEN_BUCKET, &key) {
             Ok(Some(bytes)) => bytes,
             Ok(None) | Err(Error::BucketMissing { .. }) => {
                 return Err(Error::UploadTokenInvalid);
@@ -402,7 +471,7 @@ impl Transaction {
             attachment.scope().storage_domain_id(),
             attachment.content_id(),
         )?;
-        self.writes.delete_bucket(
+        self.writes.delete_internal_bucket(
             CONTENT_TOKEN_INDEX_BUCKET,
             content_token_index_key(
                 attachment.scope().storage_domain_id(),
@@ -411,7 +480,7 @@ impl Transaction {
             ),
         )?;
         self.writes
-            .put_bucket(CONTENT_TOKEN_BUCKET, key.clone(), consumed.encode())?;
+            .put_internal_bucket(CONTENT_TOKEN_BUCKET, key.clone(), consumed.encode())?;
         self.content_token_consumptions.insert(key, change_id);
         Ok(attachment)
     }
@@ -422,7 +491,7 @@ impl Transaction {
         content_id: crate::ContentId,
     ) -> Result<()> {
         let sweep_key = content_reclaim_sweep_key(storage_domain_id, content_id);
-        if let Some(bytes) = self.get_bucket_sync(CONTENT_CONTROL_BUCKET, &sweep_key)? {
+        if let Some(bytes) = self.get_internal_bucket_sync(CONTENT_CONTROL_BUCKET, &sweep_key)? {
             let sweep = ContentReclaimSweepRecord::decode(&bytes, storage_domain_id, content_id)?;
             match sweep.state {
                 ContentReclaimSweepRecordState::Prepared => {
@@ -434,22 +503,22 @@ impl Transaction {
                 }
                 ContentReclaimSweepRecordState::Reclaimed => {
                     self.writes
-                        .delete_bucket(CONTENT_CONTROL_BUCKET, sweep_key)?;
+                        .delete_internal_bucket(CONTENT_CONTROL_BUCKET, sweep_key)?;
                 }
             }
         }
         let key = content_control_key(storage_domain_id, content_id);
-        if let Some(bytes) = self.get_bucket_sync(CONTENT_CONTROL_BUCKET, &key)? {
+        if let Some(bytes) = self.get_internal_bucket_sync(CONTENT_CONTROL_BUCKET, &key)? {
             ContentControlRecord::decode(&bytes, storage_domain_id, content_id)?;
         }
         let quarantine_key = content_quarantine_key(storage_domain_id, content_id);
         let quarantine = self
-            .get_bucket_sync(CONTENT_CONTROL_BUCKET, &quarantine_key)?
+            .get_internal_bucket_sync(CONTENT_CONTROL_BUCKET, &quarantine_key)?
             .map(|bytes| ContentQuarantineRecord::decode(&bytes, storage_domain_id, content_id))
             .transpose()?;
         let grace_key = content_reclaim_grace_key(storage_domain_id, content_id);
         let grace = self
-            .get_bucket_sync(CONTENT_CONTROL_BUCKET, &grace_key)?
+            .get_internal_bucket_sync(CONTENT_CONTROL_BUCKET, &grace_key)?
             .map(|bytes| ContentReclaimGraceRecord::decode(&bytes, storage_domain_id, content_id))
             .transpose()?;
         if let Some(grace) = grace {
@@ -461,11 +530,11 @@ impl Transaction {
         }
         if quarantine.is_some() {
             self.writes
-                .delete_bucket(CONTENT_CONTROL_BUCKET, quarantine_key)?;
+                .delete_internal_bucket(CONTENT_CONTROL_BUCKET, quarantine_key)?;
         }
         if grace.is_some() {
             self.writes
-                .delete_bucket(CONTENT_CONTROL_BUCKET, grace_key)?;
+                .delete_internal_bucket(CONTENT_CONTROL_BUCKET, grace_key)?;
         }
         self.stage_active_content_control(storage_domain_id, content_id, key)
     }
@@ -522,7 +591,8 @@ impl Transaction {
 impl Transaction {
     /// Reads a default-bucket key and tracks it for commit conflict checks.
     pub async fn get(&mut self, key: &[u8]) -> Result<Option<Value>> {
-        self.get_bucket(DEFAULT_BUCKET_NAME, key).await
+        self.get_bucket_unchecked(DEFAULT_BUCKET_NAME.to_owned(), key)
+            .await
     }
 
     /// Reads a named-bucket key and tracks it for commit conflict checks.
@@ -532,6 +602,21 @@ impl Transaction {
         key: &[u8],
     ) -> Result<Option<Value>> {
         let bucket = bucket.into();
+        validate_user_named_bucket(&bucket)?;
+        self.get_bucket_unchecked(bucket, key).await
+    }
+
+    pub(crate) async fn get_internal_bucket(
+        &mut self,
+        bucket: impl Into<String>,
+        key: &[u8],
+    ) -> Result<Option<Value>> {
+        let bucket = bucket.into();
+        require_internal_bucket(&bucket)?;
+        self.get_bucket_unchecked(bucket, key).await
+    }
+
+    async fn get_bucket_unchecked(&mut self, bucket: String, key: &[u8]) -> Result<Option<Value>> {
         let value = self
             .db
             .get_at_sequence_async(&bucket, key, self.read_sequence)
@@ -546,7 +631,8 @@ impl Transaction {
 
     /// Reads a default-bucket range and tracks it for commit conflict checks.
     pub async fn read_range(&mut self, range: KeyRange) -> Result<()> {
-        self.read_range_bucket(DEFAULT_BUCKET_NAME, range).await
+        self.read_range_bucket_unchecked(DEFAULT_BUCKET_NAME.to_owned(), range)
+            .await
     }
 
     /// Reads a named-bucket range and tracks it for commit conflict checks.
@@ -555,8 +641,13 @@ impl Transaction {
         bucket: impl Into<String>,
         range: KeyRange,
     ) -> Result<()> {
-        self.db.ensure_open()?;
         let bucket = bucket.into();
+        validate_user_named_bucket(&bucket)?;
+        self.read_range_bucket_unchecked(bucket, range).await
+    }
+
+    async fn read_range_bucket_unchecked(&mut self, bucket: String, range: KeyRange) -> Result<()> {
+        self.db.ensure_open()?;
         let mut iter = self
             .db
             .range_at_sequence_async(
@@ -575,7 +666,8 @@ impl Transaction {
     /// Reads the default-bucket range and returns its cursor, tracking the
     /// range for commit conflict checks.
     pub async fn range(&mut self, range: KeyRange) -> Result<Iter> {
-        self.range_bucket(DEFAULT_BUCKET_NAME, range).await
+        self.range_bucket_unchecked(DEFAULT_BUCKET_NAME.to_owned(), range)
+            .await
     }
 
     /// Reads a named-bucket range and returns its cursor, tracking the range for
@@ -586,8 +678,23 @@ impl Transaction {
         bucket: impl Into<String>,
         range: KeyRange,
     ) -> Result<Iter> {
-        self.db.ensure_open()?;
         let bucket = bucket.into();
+        validate_user_named_bucket(&bucket)?;
+        self.range_bucket_unchecked(bucket, range).await
+    }
+
+    pub(crate) async fn range_internal_bucket(
+        &mut self,
+        bucket: impl Into<String>,
+        range: KeyRange,
+    ) -> Result<Iter> {
+        let bucket = bucket.into();
+        require_internal_bucket(&bucket)?;
+        self.range_bucket_unchecked(bucket, range).await
+    }
+
+    async fn range_bucket_unchecked(&mut self, bucket: String, range: KeyRange) -> Result<Iter> {
+        self.db.ensure_open()?;
         let iter = self
             .db
             .range_at_sequence_async(
@@ -667,7 +774,7 @@ impl Transaction {
     ) -> Result<ContentAttachment> {
         let key = upload_token_key(token);
         self.require_consistent_staged_token(&key, change_id)?;
-        let bytes = match self.get_bucket(CONTENT_TOKEN_BUCKET, &key).await {
+        let bytes = match self.get_internal_bucket(CONTENT_TOKEN_BUCKET, &key).await {
             Ok(Some(bytes)) => bytes,
             Ok(None) | Err(Error::BucketMissing { .. }) => {
                 return Err(Error::UploadTokenInvalid);
@@ -685,7 +792,7 @@ impl Transaction {
             attachment.content_id(),
         )
         .await?;
-        self.writes.delete_bucket(
+        self.writes.delete_internal_bucket(
             CONTENT_TOKEN_INDEX_BUCKET,
             content_token_index_key(
                 attachment.scope().storage_domain_id(),
@@ -694,7 +801,7 @@ impl Transaction {
             ),
         )?;
         self.writes
-            .put_bucket(CONTENT_TOKEN_BUCKET, key.clone(), consumed.encode())?;
+            .put_internal_bucket(CONTENT_TOKEN_BUCKET, key.clone(), consumed.encode())?;
         self.content_token_consumptions.insert(key, change_id);
         Ok(attachment)
     }
@@ -705,7 +812,10 @@ impl Transaction {
         content_id: crate::ContentId,
     ) -> Result<()> {
         let sweep_key = content_reclaim_sweep_key(storage_domain_id, content_id);
-        if let Some(bytes) = self.get_bucket(CONTENT_CONTROL_BUCKET, &sweep_key).await? {
+        if let Some(bytes) = self
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &sweep_key)
+            .await?
+        {
             let sweep = ContentReclaimSweepRecord::decode(&bytes, storage_domain_id, content_id)?;
             match sweep.state {
                 ContentReclaimSweepRecordState::Prepared => {
@@ -717,23 +827,26 @@ impl Transaction {
                 }
                 ContentReclaimSweepRecordState::Reclaimed => {
                     self.writes
-                        .delete_bucket(CONTENT_CONTROL_BUCKET, sweep_key)?;
+                        .delete_internal_bucket(CONTENT_CONTROL_BUCKET, sweep_key)?;
                 }
             }
         }
         let key = content_control_key(storage_domain_id, content_id);
-        if let Some(bytes) = self.get_bucket(CONTENT_CONTROL_BUCKET, &key).await? {
+        if let Some(bytes) = self
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &key)
+            .await?
+        {
             ContentControlRecord::decode(&bytes, storage_domain_id, content_id)?;
         }
         let quarantine_key = content_quarantine_key(storage_domain_id, content_id);
         let quarantine = self
-            .get_bucket(CONTENT_CONTROL_BUCKET, &quarantine_key)
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &quarantine_key)
             .await?
             .map(|bytes| ContentQuarantineRecord::decode(&bytes, storage_domain_id, content_id))
             .transpose()?;
         let grace_key = content_reclaim_grace_key(storage_domain_id, content_id);
         let grace = self
-            .get_bucket(CONTENT_CONTROL_BUCKET, &grace_key)
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &grace_key)
             .await?
             .map(|bytes| ContentReclaimGraceRecord::decode(&bytes, storage_domain_id, content_id))
             .transpose()?;
@@ -746,11 +859,11 @@ impl Transaction {
         }
         if quarantine.is_some() {
             self.writes
-                .delete_bucket(CONTENT_CONTROL_BUCKET, quarantine_key)?;
+                .delete_internal_bucket(CONTENT_CONTROL_BUCKET, quarantine_key)?;
         }
         if grace.is_some() {
             self.writes
-                .delete_bucket(CONTENT_CONTROL_BUCKET, grace_key)?;
+                .delete_internal_bucket(CONTENT_CONTROL_BUCKET, grace_key)?;
         }
         self.stage_active_content_control(storage_domain_id, content_id, key)
     }
@@ -761,7 +874,10 @@ impl Transaction {
         content_id: crate::ContentId,
     ) -> Result<()> {
         let sweep_key = content_reclaim_sweep_key(storage_domain_id, content_id);
-        if let Some(bytes) = self.get_bucket(CONTENT_CONTROL_BUCKET, &sweep_key).await? {
+        if let Some(bytes) = self
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &sweep_key)
+            .await?
+        {
             let sweep = ContentReclaimSweepRecord::decode(&bytes, storage_domain_id, content_id)?;
             return match sweep.state {
                 ContentReclaimSweepRecordState::Prepared => Err(Error::ContentReclaimBlocked {
@@ -777,7 +893,7 @@ impl Transaction {
         }
         let quarantine_key = content_quarantine_key(storage_domain_id, content_id);
         if let Some(bytes) = self
-            .get_bucket(CONTENT_CONTROL_BUCKET, &quarantine_key)
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &quarantine_key)
             .await?
         {
             let quarantine =
@@ -788,7 +904,7 @@ impl Transaction {
         }
         let grace_key = content_reclaim_grace_key(storage_domain_id, content_id);
         if self
-            .get_bucket(CONTENT_CONTROL_BUCKET, &grace_key)
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &grace_key)
             .await?
             .is_some()
         {
@@ -797,7 +913,10 @@ impl Transaction {
             });
         }
         let key = content_control_key(storage_domain_id, content_id);
-        if let Some(bytes) = self.get_bucket(CONTENT_CONTROL_BUCKET, &key).await? {
+        if let Some(bytes) = self
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &key)
+            .await?
+        {
             ContentControlRecord::decode(&bytes, storage_domain_id, content_id)?;
         }
         self.stage_active_content_control(storage_domain_id, content_id, key)
@@ -810,7 +929,7 @@ impl Transaction {
         key: Vec<u8>,
     ) -> Result<()> {
         let active = ContentControlRecord::active(storage_domain_id, content_id);
-        self.writes.put_bucket_with_commit_sequence(
+        self.writes.put_internal_bucket_with_commit_sequence(
             CONTENT_CONTROL_BUCKET,
             key,
             &active.encode_prefix(),
@@ -933,10 +1052,12 @@ impl Transaction {
                 "content reclaim verification sequence is invalid for this transaction",
             ));
         }
-        self.db.bucket(CONTENT_CONTROL_BUCKET).await?;
-        self.db.bucket(CONTENT_TOKEN_INDEX_BUCKET).await?;
-        self.db.bucket(CONTENT_LEASE_BUCKET).await?;
-        self.db.bucket(CONTENT_PHYSICAL_HOLD_BUCKET).await?;
+        self.db.internal_bucket(CONTENT_CONTROL_BUCKET).await?;
+        self.db.internal_bucket(CONTENT_TOKEN_INDEX_BUCKET).await?;
+        self.db.internal_bucket(CONTENT_LEASE_BUCKET).await?;
+        self.db
+            .internal_bucket(CONTENT_PHYSICAL_HOLD_BUCKET)
+            .await?;
         self.require_coordinated_content_access(authorization.storage_domain_id())
             .await?;
         let descriptor = self
@@ -961,7 +1082,7 @@ impl Transaction {
             authorization.content_id(),
         );
         let control_bytes = self
-            .get_bucket(CONTENT_CONTROL_BUCKET, &control_key)
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &control_key)
             .await?
             .ok_or_else(|| Error::Corruption {
                 message: "sealed content is missing its physical control record".to_owned(),
@@ -981,12 +1102,24 @@ impl Transaction {
             });
         }
 
-        self.require_no_active_content_token(authorization, now_unix_ms)
-            .await?;
-        self.require_no_active_content_lease(authorization, now_unix_ms)
-            .await?;
-        self.require_no_active_content_physical_hold(authorization, now_unix_ms)
-            .await?;
+        self.require_no_active_content_token(
+            authorization,
+            now_unix_ms,
+            InactiveAuthorityPolicy::Retain,
+        )
+        .await?;
+        self.require_no_active_content_lease(
+            authorization,
+            now_unix_ms,
+            InactiveAuthorityPolicy::Retain,
+        )
+        .await?;
+        self.require_no_active_content_physical_hold(
+            authorization,
+            now_unix_ms,
+            InactiveAuthorityPolicy::Retain,
+        )
+        .await?;
         if control.matches_authorization(authorization) {
             let accepted_at = control.accepted_at().ok_or_else(|| Error::Corruption {
                 message: "matching reclaim intent has no acceptance sequence".to_owned(),
@@ -995,7 +1128,7 @@ impl Transaction {
         }
 
         let intent = control.reclaim_intent(authorization);
-        self.writes.put_bucket_with_commit_sequence(
+        self.writes.put_internal_bucket_with_commit_sequence(
             CONTENT_CONTROL_BUCKET,
             control_key,
             &intent.encode_prefix(),
@@ -1121,10 +1254,12 @@ impl Transaction {
                 "content quarantine verification sequence is invalid for this transaction",
             ));
         }
-        self.db.bucket(CONTENT_CONTROL_BUCKET).await?;
-        self.db.bucket(CONTENT_TOKEN_INDEX_BUCKET).await?;
-        self.db.bucket(CONTENT_LEASE_BUCKET).await?;
-        self.db.bucket(CONTENT_PHYSICAL_HOLD_BUCKET).await?;
+        self.db.internal_bucket(CONTENT_CONTROL_BUCKET).await?;
+        self.db.internal_bucket(CONTENT_TOKEN_INDEX_BUCKET).await?;
+        self.db.internal_bucket(CONTENT_LEASE_BUCKET).await?;
+        self.db
+            .internal_bucket(CONTENT_PHYSICAL_HOLD_BUCKET)
+            .await?;
 
         let access = self
             .require_coordinated_content_access(authorization.storage_domain_id())
@@ -1136,19 +1271,31 @@ impl Transaction {
             .require_exact_content_reclaim_intent(authorization)
             .await?;
 
-        self.require_no_active_content_token(authorization, now_unix_ms)
-            .await?;
-        self.require_no_active_content_lease(authorization, now_unix_ms)
-            .await?;
-        self.require_no_active_content_physical_hold(authorization, now_unix_ms)
-            .await?;
+        self.require_no_active_content_token(
+            authorization,
+            now_unix_ms,
+            InactiveAuthorityPolicy::Retain,
+        )
+        .await?;
+        self.require_no_active_content_lease(
+            authorization,
+            now_unix_ms,
+            InactiveAuthorityPolicy::Retain,
+        )
+        .await?;
+        self.require_no_active_content_physical_hold(
+            authorization,
+            now_unix_ms,
+            InactiveAuthorityPolicy::Retain,
+        )
+        .await?;
 
         let quarantine_key = content_quarantine_key(
             authorization.storage_domain_id(),
             authorization.content_id(),
         );
         if let Some(bytes) = self
-            .get_bucket(CONTENT_CONTROL_BUCKET, &quarantine_key)
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &quarantine_key)
             .await?
         {
             let existing = ContentQuarantineRecord::decode(
@@ -1173,7 +1320,7 @@ impl Transaction {
 
         let requested =
             ContentQuarantineRecord::requested(authorization, intent_accepted_at, access, drain);
-        self.writes.put_bucket_with_commit_sequence(
+        self.writes.put_internal_bucket_with_commit_sequence(
             CONTENT_CONTROL_BUCKET,
             quarantine_key,
             &requested.encode_prefix(),
@@ -1263,10 +1410,12 @@ impl Transaction {
                 "content reclaim-grace verification sequence is invalid for this transaction",
             ));
         }
-        self.db.bucket(CONTENT_CONTROL_BUCKET).await?;
-        self.db.bucket(CONTENT_TOKEN_INDEX_BUCKET).await?;
-        self.db.bucket(CONTENT_LEASE_BUCKET).await?;
-        self.db.bucket(CONTENT_PHYSICAL_HOLD_BUCKET).await?;
+        self.db.internal_bucket(CONTENT_CONTROL_BUCKET).await?;
+        self.db.internal_bucket(CONTENT_TOKEN_INDEX_BUCKET).await?;
+        self.db.internal_bucket(CONTENT_LEASE_BUCKET).await?;
+        self.db
+            .internal_bucket(CONTENT_PHYSICAL_HOLD_BUCKET)
+            .await?;
 
         let access = self
             .require_coordinated_content_access(authorization.storage_domain_id())
@@ -1274,12 +1423,24 @@ impl Transaction {
         let drain = self
             .require_content_reader_drain_attestation(access)
             .await?;
-        self.require_no_active_content_token(authorization, observed_at_unix_ms)
-            .await?;
-        self.require_no_active_content_lease(authorization, observed_at_unix_ms)
-            .await?;
-        self.require_no_active_content_physical_hold(authorization, observed_at_unix_ms)
-            .await?;
+        self.require_no_active_content_token(
+            authorization,
+            observed_at_unix_ms,
+            InactiveAuthorityPolicy::Retain,
+        )
+        .await?;
+        self.require_no_active_content_lease(
+            authorization,
+            observed_at_unix_ms,
+            InactiveAuthorityPolicy::Retain,
+        )
+        .await?;
+        self.require_no_active_content_physical_hold(
+            authorization,
+            observed_at_unix_ms,
+            InactiveAuthorityPolicy::Retain,
+        )
+        .await?;
         let quarantine = self
             .require_continuous_content_quarantine_for_grace(authorization, access, drain)
             .await?;
@@ -1288,7 +1449,10 @@ impl Transaction {
             authorization.storage_domain_id(),
             authorization.content_id(),
         );
-        if let Some(bytes) = self.get_bucket(CONTENT_CONTROL_BUCKET, &key).await? {
+        if let Some(bytes) = self
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &key)
+            .await?
+        {
             let existing = ContentReclaimGraceRecord::decode(
                 &bytes,
                 authorization.storage_domain_id(),
@@ -1312,7 +1476,7 @@ impl Transaction {
             observed_at_unix_ms,
             not_before_unix_ms,
         );
-        self.writes.put_bucket_with_commit_sequence(
+        self.writes.put_internal_bucket_with_commit_sequence(
             CONTENT_CONTROL_BUCKET,
             key,
             &requested.encode_prefix(),
@@ -1344,7 +1508,7 @@ impl Transaction {
         clock_attestation: ContentReclaimClockAttestation,
     ) -> Result<ContentReclaimSweepStage> {
         let sweep_backend = self.db.content_reclaim_sweep_backend()?;
-        let now_unix_ms = crate::content::current_epoch_millis()?;
+        let now_unix_ms = clock_attestation.observed_at_unix_ms();
         if now_unix_ms >= authorization.expires_at_unix_ms() {
             return Err(Error::ContentReclaimBlocked {
                 blocker: ContentReclaimBlocker::ProofExpired {
@@ -1367,10 +1531,12 @@ impl Transaction {
             ));
         }
 
-        self.db.bucket(CONTENT_CONTROL_BUCKET).await?;
-        self.db.bucket(CONTENT_TOKEN_INDEX_BUCKET).await?;
-        self.db.bucket(CONTENT_LEASE_BUCKET).await?;
-        self.db.bucket(CONTENT_PHYSICAL_HOLD_BUCKET).await?;
+        self.db.internal_bucket(CONTENT_CONTROL_BUCKET).await?;
+        self.db.internal_bucket(CONTENT_TOKEN_INDEX_BUCKET).await?;
+        self.db.internal_bucket(CONTENT_LEASE_BUCKET).await?;
+        self.db
+            .internal_bucket(CONTENT_PHYSICAL_HOLD_BUCKET)
+            .await?;
 
         let access = self
             .require_coordinated_content_access(authorization.storage_domain_id())
@@ -1383,7 +1549,7 @@ impl Transaction {
             authorization.content_id(),
         );
         let quarantine_bytes = self
-            .get_bucket(CONTENT_CONTROL_BUCKET, &quarantine_key)
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &quarantine_key)
             .await?
             .ok_or(Error::ContentReclaimBlocked {
                 blocker: ContentReclaimBlocker::QuarantineRequired,
@@ -1407,7 +1573,7 @@ impl Transaction {
             authorization.content_id(),
         );
         let grace_bytes = self
-            .get_bucket(CONTENT_CONTROL_BUCKET, &grace_key)
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &grace_key)
             .await?
             .ok_or(Error::ContentReclaimBlocked {
                 blocker: ContentReclaimBlocker::QuarantineRequired,
@@ -1459,7 +1625,7 @@ impl Transaction {
             authorization.content_id(),
         );
         let control_bytes = self
-            .get_bucket(CONTENT_CONTROL_BUCKET, &control_key)
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &control_key)
             .await?
             .ok_or_else(|| Error::Corruption {
                 message: "reclaim-sweep content is missing physical control state".to_owned(),
@@ -1478,18 +1644,33 @@ impl Transaction {
                 },
             });
         }
-        self.require_no_active_content_token(authorization, now_unix_ms)
-            .await?;
-        self.require_no_active_content_lease(authorization, now_unix_ms)
-            .await?;
-        self.require_no_active_content_physical_hold(authorization, now_unix_ms)
-            .await?;
+        self.require_no_active_content_token(
+            authorization,
+            now_unix_ms,
+            InactiveAuthorityPolicy::Prune,
+        )
+        .await?;
+        self.require_no_active_content_lease(
+            authorization,
+            now_unix_ms,
+            InactiveAuthorityPolicy::Prune,
+        )
+        .await?;
+        self.require_no_active_content_physical_hold(
+            authorization,
+            now_unix_ms,
+            InactiveAuthorityPolicy::Prune,
+        )
+        .await?;
 
         let sweep_key = content_reclaim_sweep_key(
             authorization.storage_domain_id(),
             authorization.content_id(),
         );
-        if let Some(bytes) = self.get_bucket(CONTENT_CONTROL_BUCKET, &sweep_key).await? {
+        if let Some(bytes) = self
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &sweep_key)
+            .await?
+        {
             let existing = ContentReclaimSweepRecord::decode(
                 &bytes,
                 authorization.storage_domain_id(),
@@ -1514,7 +1695,7 @@ impl Transaction {
             descriptor,
             sweep_backend,
         );
-        self.writes.put_bucket_with_commit_sequence(
+        self.writes.put_internal_bucket_with_commit_sequence(
             CONTENT_CONTROL_BUCKET,
             sweep_key,
             &requested.encode_prefix(),
@@ -1551,7 +1732,7 @@ impl Transaction {
             authorization.content_id(),
         );
         let control_bytes = self
-            .get_bucket(CONTENT_CONTROL_BUCKET, &control_key)
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &control_key)
             .await?
             .ok_or_else(|| Error::Corruption {
                 message: "sealed content is missing its physical control record".to_owned(),
@@ -1567,7 +1748,7 @@ impl Transaction {
             authorization.content_id(),
         );
         let Some(quarantine_bytes) = self
-            .get_bucket(CONTENT_CONTROL_BUCKET, &quarantine_key)
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &quarantine_key)
             .await?
         else {
             return Err(Error::ContentReclaimBlocked {
@@ -1638,7 +1819,7 @@ impl Transaction {
             authorization.content_id(),
         );
         let bytes = self
-            .get_bucket(CONTENT_CONTROL_BUCKET, &key)
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &key)
             .await?
             .ok_or_else(|| Error::Corruption {
                 message: "sealed content is missing its physical control record".to_owned(),
@@ -1681,7 +1862,10 @@ impl Transaction {
             ContentAccessMode::LeasedOnly { barrier_id } => barrier_id,
         };
         let access_key = content_access_coordinate_key(storage_domain_id);
-        let Some(access_bytes) = self.get_bucket(CONTENT_CONTROL_BUCKET, &access_key).await? else {
+        let Some(access_bytes) = self
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &access_key)
+            .await?
+        else {
             return Err(Error::ContentReclaimBlocked {
                 blocker: ContentReclaimBlocker::LeasedOnlyBarrierUncoordinated { barrier_id },
             });
@@ -1700,7 +1884,10 @@ impl Transaction {
         access: ContentAccessCoordinateRecord,
     ) -> Result<ContentReaderDrainAttestationRecord> {
         let key = content_reader_drain_attestation_key(access.storage_domain_id);
-        let Some(bytes) = self.get_bucket(CONTENT_CONTROL_BUCKET, &key).await? else {
+        let Some(bytes) = self
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &key)
+            .await?
+        else {
             return Err(Error::ContentReclaimBlocked {
                 blocker: ContentReclaimBlocker::ReaderDrainNotAttested {
                     barrier_id: access.barrier_id,
@@ -1722,13 +1909,18 @@ impl Transaction {
         &mut self,
         authorization: ContentReclaimAuthorization,
         now_unix_ms: u64,
+        inactive_policy: InactiveAuthorityPolicy,
     ) -> Result<()> {
         let prefix = content_token_index_prefix(
             authorization.storage_domain_id(),
             authorization.content_id(),
         );
         let range = content_prefix_range(prefix.clone())?;
-        for entry in self.range_bucket(CONTENT_TOKEN_INDEX_BUCKET, range).await? {
+        let mut expired = Vec::new();
+        for entry in self
+            .range_internal_bucket(CONTENT_TOKEN_INDEX_BUCKET, range)
+            .await?
+        {
             let entry = entry?;
             let hash: [u8; 32] = entry
                 .key
@@ -1754,6 +1946,13 @@ impl Transaction {
                     },
                 });
             }
+            expired.push((entry.key, hash));
+        }
+        if inactive_policy == InactiveAuthorityPolicy::Prune {
+            for (key, hash) in expired {
+                self.delete_internal_bucket(CONTENT_TOKEN_INDEX_BUCKET, key)?;
+                self.delete_internal_bucket(CONTENT_TOKEN_BUCKET, hash.to_vec())?;
+            }
         }
         Ok(())
     }
@@ -1762,13 +1961,18 @@ impl Transaction {
         &mut self,
         authorization: ContentReclaimAuthorization,
         now_unix_ms: u64,
+        inactive_policy: InactiveAuthorityPolicy,
     ) -> Result<()> {
         let prefix = content_lease_prefix(
             authorization.storage_domain_id(),
             authorization.content_id(),
         );
         let range = content_prefix_range(prefix.clone())?;
-        for entry in self.range_bucket(CONTENT_LEASE_BUCKET, range).await? {
+        let mut expired = Vec::new();
+        for entry in self
+            .range_internal_bucket(CONTENT_LEASE_BUCKET, range)
+            .await?
+        {
             let entry = entry?;
             let lease_id = ContentLeaseId::from_bytes(
                 entry
@@ -1795,6 +1999,12 @@ impl Transaction {
                     },
                 });
             }
+            expired.push(entry.key);
+        }
+        if inactive_policy == InactiveAuthorityPolicy::Prune {
+            for key in expired {
+                self.delete_internal_bucket(CONTENT_LEASE_BUCKET, key)?;
+            }
         }
         Ok(())
     }
@@ -1803,14 +2013,16 @@ impl Transaction {
         &mut self,
         authorization: ContentReclaimAuthorization,
         now_unix_ms: u64,
+        inactive_policy: InactiveAuthorityPolicy,
     ) -> Result<()> {
         let prefix = content_physical_hold_prefix(
             authorization.storage_domain_id(),
             authorization.content_id(),
         );
         let range = content_prefix_range(prefix.clone())?;
+        let mut inactive = Vec::new();
         for entry in self
-            .range_bucket(CONTENT_PHYSICAL_HOLD_BUCKET, range)
+            .range_internal_bucket(CONTENT_PHYSICAL_HOLD_BUCKET, range)
             .await?
         {
             let entry = entry?;
@@ -1843,6 +2055,12 @@ impl Transaction {
                             .then_some(hold.expires_at_unix_ms),
                     },
                 });
+            }
+            inactive.push(entry.key);
+        }
+        if inactive_policy == InactiveAuthorityPolicy::Prune {
+            for key in inactive {
+                self.delete_internal_bucket(CONTENT_PHYSICAL_HOLD_BUCKET, key)?;
             }
         }
         Ok(())

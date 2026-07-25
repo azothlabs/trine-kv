@@ -6,7 +6,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use futures::executor::block_on;
@@ -33,11 +33,11 @@ use crate::{
     ContentReclaimClockAttestationId, ContentReclaimClockCoordinatorId,
     ContentReclaimClockEvidenceDigest, ContentReclaimGraceStage, ContentReclaimIntentStage,
     ContentReclaimProofToken, ContentReclaimSweepStage, ContentReclamationMode,
-    ContentUploadOptions, ContentUploadResume, Db, DbOptions, ETag, Error, HostStorageBackend,
-    InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta, ObjectStoreReclamationAttestation,
-    ObjectStoreReclamationEvidenceDigest, ObjectVersion, OwnerScopeId, Precondition, PutIf,
-    ReadVersion, SealedContent, StorageDomainId, StorageMode, TransactionOptions, UploadId,
-    UploadToken, qualify_object_store_reclamation,
+    ContentUploadOptions, ContentUploadResume, ContentUploadState, Db, DbOptions, ETag, Error,
+    HostStorageBackend, InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta,
+    ObjectStoreReclamationAttestation, ObjectStoreReclamationEvidenceDigest, ObjectVersion,
+    OwnerScopeId, Precondition, PutIf, ReadVersion, SealedContent, StorageDomainId, StorageMode,
+    TransactionOptions, UploadId, UploadToken, qualify_object_store_reclamation,
 };
 
 const TEST_CHUNK_BYTES: usize = 64 * 1024;
@@ -192,6 +192,100 @@ fn caller_supplied_upload_id_binds_options_and_recovers_exact_state() {
             panic!("retry after seal must recover sealed result");
         };
         assert_eq!(recovered, sealed);
+    });
+}
+
+#[test]
+fn upload_maintenance_reclaims_orphans_and_prunes_only_sealed_idempotency_state() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory()).await.expect("open database");
+        let domain = test_scope().storage_domain_id();
+        let abandoned_id = UploadId::new().expect("abandoned upload identity");
+        let ContentUploadResume::Open(mut abandoned) = db
+            .begin_content_upload_with_id(
+                abandoned_id,
+                test_upload_options().with_expected_length(6),
+            )
+            .await
+            .expect("abandoned upload begins")
+        else {
+            panic!("new upload is open");
+        };
+        abandoned
+            .write(b"abc")
+            .await
+            .expect("partial bytes persist");
+        drop(abandoned);
+
+        let listed = db.list_content_uploads().await.expect("uploads list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].upload_id(), abandoned_id);
+        assert_eq!(listed[0].state(), ContentUploadState::Open);
+        assert_eq!(listed[0].len(), 3);
+        assert!(listed[0].updated_at_unix_ms() > 0);
+        assert_eq!(
+            db.content_physical_quota(domain)
+                .await
+                .expect("reserved quota reads")
+                .upload_reserved_bytes(),
+            6
+        );
+
+        let reaped = db
+            .reap_inactive_content_uploads(u64::MAX)
+            .await
+            .expect("inactive upload is reaped");
+        assert_eq!(reaped.scanned(), 1);
+        assert_eq!(reaped.aborted(), 1);
+        assert!(
+            db.list_content_uploads()
+                .await
+                .expect("uploads relist")
+                .is_empty()
+        );
+        assert_eq!(
+            db.content_physical_quota(domain)
+                .await
+                .expect("released quota reads")
+                .upload_reserved_bytes(),
+            0
+        );
+        assert!(matches!(
+            db.resume_content_upload(abandoned_id).await,
+            Err(Error::ContentUploadNotFound { .. })
+        ));
+
+        let sealed_id = UploadId::new().expect("sealed upload identity");
+        let ContentUploadResume::Open(mut upload) = db
+            .begin_content_upload_with_id(sealed_id, test_upload_options().with_expected_length(3))
+            .await
+            .expect("sealed upload begins")
+        else {
+            panic!("new upload is open");
+        };
+        upload.write(b"xyz").await.expect("sealed bytes write");
+        let sealed = upload.seal().await.expect("upload seals");
+        let pruned = db
+            .prune_sealed_content_uploads(u64::MAX)
+            .await
+            .expect("sealed state prunes");
+        assert_eq!(pruned.pruned_sealed(), 1);
+        assert!(matches!(
+            db.resume_content_upload(sealed_id).await,
+            Err(Error::ContentUploadNotFound { .. })
+        ));
+        let content = db
+            .open_content(domain, sealed.content_id())
+            .await
+            .expect("content remains after idempotency state prune");
+        assert_eq!(
+            content
+                .read_range(0, 3)
+                .await
+                .expect("content reads")
+                .as_ref(),
+            b"xyz"
+        );
     });
 }
 
@@ -807,7 +901,7 @@ fn reader_drain_attestation_requires_an_active_exact_barrier_and_fails_closed() 
             .expect("leased-only barrier commits");
         let mut damage = db.transaction(TransactionOptions::default());
         damage
-            .put_bucket(
+            .put_internal_bucket(
                 CONTENT_CONTROL_BUCKET,
                 content_reader_drain_attestation_key(domain),
                 b"malformed".to_vec(),
@@ -1378,7 +1472,7 @@ fn malformed_quarantine_fails_reads_and_revival_closed() {
         let sealed = seal_reclaim_content(&db, b"malformed quarantine bytes").await;
         let mut damage = db.transaction(TransactionOptions::default());
         damage
-            .put_bucket(
+            .put_internal_bucket(
                 CONTENT_CONTROL_BUCKET,
                 content_quarantine_key(sealed.storage_domain_id(), sealed.content_id()),
                 b"malformed".to_vec(),
@@ -1668,6 +1762,21 @@ fn qualified_filesystem_sweep_reclaims_after_reopen_and_allows_later_reupload() 
         )
         .expect("trusted clock claim binds grace");
         let mut prepare = db.transaction(TransactionOptions::default());
+        let expired_at_trusted_observation = ContentReclaimAuthorization::new(
+            sealed.storage_domain_id(),
+            sealed.content_id(),
+            ContentReclaimProofToken::from_bytes([78; 49]),
+            prepare.read_version(),
+            clock.observed_at_unix_ms(),
+        );
+        assert!(matches!(
+            prepare
+                .stage_content_reclaim_sweep(expired_at_trusted_observation, clock)
+                .await,
+            Err(Error::ContentReclaimBlocked {
+                blocker: ContentReclaimBlocker::ProofExpired { .. },
+            })
+        ));
         let fresh = reclaim_authorization(&prepare, sealed, 77);
         assert_eq!(
             prepare
@@ -2376,7 +2485,7 @@ fn malformed_reclaim_grace_blocks_query_and_revival() {
 
         let mut damage = db.transaction(TransactionOptions::default());
         damage
-            .put_bucket(
+            .put_internal_bucket(
                 CONTENT_CONTROL_BUCKET,
                 content_reclaim_grace_key(sealed.storage_domain_id(), sealed.content_id()),
                 b"damaged reclaim grace".to_vec(),
@@ -2432,7 +2541,7 @@ fn malformed_reclaim_sweep_blocks_query_and_authoritative_activity() {
         let sealed = seal_content_without_access_barrier(&db, b"malformed reclaim sweep").await;
         let mut damage = db.transaction(TransactionOptions::default());
         damage
-            .put_bucket(
+            .put_internal_bucket(
                 CONTENT_CONTROL_BUCKET,
                 content_reclaim_sweep_key(sealed.storage_domain_id(), sealed.content_id()),
                 b"damaged reclaim sweep".to_vec(),
@@ -2607,7 +2716,7 @@ fn malformed_control_and_expired_proof_fail_closed() {
         let token_damaged = seal_reclaim_content(&db, b"malformed token index bytes").await;
         let mut damage_token = db.transaction(TransactionOptions::default());
         damage_token
-            .put_bucket(
+            .put_internal_bucket(
                 CONTENT_TOKEN_INDEX_BUCKET,
                 content_token_index_key(
                     token_damaged.storage_domain_id(),
@@ -2635,7 +2744,7 @@ fn malformed_control_and_expired_proof_fail_closed() {
 
         let mut damage = db.transaction(TransactionOptions::default());
         damage
-            .put_bucket(
+            .put_internal_bucket(
                 CONTENT_CONTROL_BUCKET,
                 content_control_key(sealed.storage_domain_id(), sealed.content_id()),
                 b"malformed".to_vec(),
@@ -2971,7 +3080,7 @@ fn physical_hold_survives_native_reopen_and_malformed_state_blocks_intent() {
         let db = Db::open(&path).await.expect("native writable db reopens");
         let mut damage = db.transaction(TransactionOptions::default());
         damage
-            .put_bucket(
+            .put_internal_bucket(
                 CONTENT_PHYSICAL_HOLD_BUCKET,
                 content_physical_hold_key(
                     sealed.storage_domain_id(),
@@ -2992,6 +3101,102 @@ fn physical_hold_survives_native_reopen_and_malformed_state_blocks_intent() {
     });
 
     std::fs::remove_dir_all(path).expect("test database removes");
+}
+
+#[test]
+fn lifecycle_vacuum_removes_expired_authority_and_preserves_active_indefinite_holds() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let mut upload = db
+            .begin_content_upload(ContentUploadOptions::new(
+                test_scope(),
+                Duration::from_millis(2),
+            ))
+            .await
+            .expect("short-token upload begins");
+        upload.write(b"vacuum").await.expect("content writes");
+        let sealed = upload.seal().await.expect("content seals");
+        let lease = db
+            .open_content_leased(
+                sealed.storage_domain_id(),
+                sealed.content_id(),
+                ContentLeaseOptions::new(
+                    ContentLeaseOwnerId::from_bytes([71; 16]),
+                    Duration::from_millis(2),
+                ),
+            )
+            .await
+            .expect("short lease opens");
+        let expiring = db
+            .acquire_content_physical_hold(
+                sealed.storage_domain_id(),
+                sealed.content_id(),
+                test_hold_id(71),
+                ContentPhysicalHoldOptions::expiring(
+                    ContentPhysicalHoldKind::Repair,
+                    ContentPhysicalHoldOwnerId::from_bytes([72; 16]),
+                    Duration::from_millis(2),
+                ),
+            )
+            .await
+            .expect("short hold acquires");
+        let indefinite_owner = ContentPhysicalHoldOwnerId::from_bytes([73; 16]);
+        let indefinite = db
+            .acquire_content_physical_hold(
+                sealed.storage_domain_id(),
+                sealed.content_id(),
+                test_hold_id(72),
+                ContentPhysicalHoldOptions::until_released(
+                    ContentPhysicalHoldKind::Administrative,
+                    indefinite_owner,
+                ),
+            )
+            .await
+            .expect("indefinite hold acquires");
+
+        thread::sleep(Duration::from_millis(10));
+        let cutoff = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_millis(),
+        )
+        .expect("current time fits u64");
+        let report = db
+            .vacuum_content_lifecycle(cutoff)
+            .await
+            .expect("lifecycle vacuum commits");
+        assert_eq!(report.scanned(), 4);
+        assert_eq!(report.expired_tokens_removed(), 1);
+        assert_eq!(report.expired_leases_removed(), 1);
+        assert_eq!(report.inactive_holds_removed(), 1);
+        assert!(
+            !db.content_has_active_lease(sealed.storage_domain_id(), sealed.content_id())
+                .await
+                .expect("lease index reads")
+        );
+        assert!(matches!(
+            db.resume_content_physical_hold(
+                expiring.storage_domain_id(),
+                expiring.content_id(),
+                expiring.id(),
+                expiring.owner_id(),
+            )
+            .await,
+            Err(Error::ContentPhysicalHoldNotFound { .. })
+        ));
+        db.resume_content_physical_hold(
+            indefinite.storage_domain_id(),
+            indefinite.content_id(),
+            indefinite.id(),
+            indefinite_owner,
+        )
+        .await
+        .expect("active indefinite hold remains");
+        drop(lease);
+    });
 }
 
 #[test]
@@ -3066,7 +3271,7 @@ fn leased_content_open_clone_renew_and_expiry_fail_closed() {
         };
         let mut expire = db.transaction(TransactionOptions::default());
         expire
-            .put_bucket(
+            .put_internal_bucket(
                 CONTENT_LEASE_BUCKET,
                 content_lease_key(handle.storage_domain_id(), handle.content_id(), lease_id),
                 expired.encode(),
@@ -3150,7 +3355,7 @@ fn durable_content_lease_survives_reopen_and_malformed_state_fails_closed() {
         );
         let mut damage = db.transaction(TransactionOptions::default());
         damage
-            .put_bucket(
+            .put_internal_bucket(
                 CONTENT_LEASE_BUCKET,
                 content_lease_key(domain, content_id, lease_id),
                 b"malformed".to_vec(),
@@ -3669,8 +3874,12 @@ fn object_store_counts_requests_detects_tampering_and_hides_failed_seal() {
         let sealed = upload.seal().await.expect("object upload seals");
         let after_seal = client.counts();
         assert_eq!(
-            after_seal.put, 12,
-            "begin, initial zero reservation, progress/reservation, chunks, descriptor, sealing, token WAL, physical finalize, and sealed state"
+            after_seal.put, 8,
+            "content state, chunks, descriptor, and upload state use ordinary immutable writes"
+        );
+        assert_eq!(
+            after_seal.put_if, 12,
+            "six database commits each create one immutable WAL segment and CAS the durable head"
         );
 
         let handle = db
@@ -3910,6 +4119,7 @@ struct RequestCounts {
     get: usize,
     get_range: usize,
     put: usize,
+    put_if: usize,
     head: usize,
     content_delete: usize,
 }
@@ -3920,6 +4130,7 @@ struct MeasuredClient {
     get: AtomicUsize,
     get_range: AtomicUsize,
     put: AtomicUsize,
+    put_if: AtomicUsize,
     head: AtomicUsize,
     content_delete: AtomicUsize,
     fail_descriptors: AtomicBool,
@@ -3937,6 +4148,7 @@ impl MeasuredClient {
             get: AtomicUsize::new(0),
             get_range: AtomicUsize::new(0),
             put: AtomicUsize::new(0),
+            put_if: AtomicUsize::new(0),
             head: AtomicUsize::new(0),
             content_delete: AtomicUsize::new(0),
             fail_descriptors: AtomicBool::new(false),
@@ -3952,6 +4164,7 @@ impl MeasuredClient {
         self.get.store(0, Ordering::Relaxed);
         self.get_range.store(0, Ordering::Relaxed);
         self.put.store(0, Ordering::Relaxed);
+        self.put_if.store(0, Ordering::Relaxed);
         self.head.store(0, Ordering::Relaxed);
         self.content_delete.store(0, Ordering::Relaxed);
     }
@@ -3961,6 +4174,7 @@ impl MeasuredClient {
             get: self.get.load(Ordering::Relaxed),
             get_range: self.get_range.load(Ordering::Relaxed),
             put: self.put.load(Ordering::Relaxed),
+            put_if: self.put_if.load(Ordering::Relaxed),
             head: self.head.load(Ordering::Relaxed),
             content_delete: self.content_delete.load(Ordering::Relaxed),
         }
@@ -4066,6 +4280,7 @@ impl ObjectClient for MeasuredClient {
         bytes: Arc<[u8]>,
         precondition: Precondition,
     ) -> ObjectFuture<'op, PutIf> {
+        self.put_if.fetch_add(1, Ordering::Relaxed);
         self.inner.put_if(key, bytes, precondition)
     }
 }

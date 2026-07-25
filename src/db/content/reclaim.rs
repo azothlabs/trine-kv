@@ -105,11 +105,14 @@ impl Db {
             self.write_content_access_barrier_record(requested).await?;
             requested
         };
-        self.bucket(CONTENT_CONTROL_BUCKET).await?;
+        self.internal_bucket(CONTENT_CONTROL_BUCKET).await?;
         let key = content_access_coordinate_key(storage_domain_id);
         for _ in 0..Self::CONTENT_ACCESS_COMMIT_ATTEMPTS {
             let mut transaction = self.transaction(TransactionOptions::default());
-            if let Some(bytes) = transaction.get_bucket(CONTENT_CONTROL_BUCKET, &key).await? {
+            if let Some(bytes) = transaction
+                .get_internal_bucket(CONTENT_CONTROL_BUCKET, &key)
+                .await?
+            {
                 let coordinate = ContentAccessCoordinateRecord::decode(&bytes, storage_domain_id)?;
                 if coordinate.barrier_id != barrier.barrier_id {
                     return Err(Error::Corruption {
@@ -123,7 +126,7 @@ impl Db {
                     coordinate.enforced_at,
                 ));
             }
-            transaction.put_bucket_with_commit_sequence(
+            transaction.put_internal_bucket_with_commit_sequence(
                 CONTENT_CONTROL_BUCKET,
                 key.clone(),
                 &ContentAccessCoordinateRecord::commit_prefix(
@@ -231,13 +234,13 @@ impl Db {
             ));
         }
 
-        self.bucket(CONTENT_CONTROL_BUCKET).await?;
+        self.internal_bucket(CONTENT_CONTROL_BUCKET).await?;
         let access_key = content_access_coordinate_key(barrier.storage_domain_id());
         let attestation_key = content_reader_drain_attestation_key(barrier.storage_domain_id());
         for _ in 0..Self::CONTENT_ACCESS_COMMIT_ATTEMPTS {
             let mut transaction = self.transaction(TransactionOptions::default());
             let access_bytes = transaction
-                .get_bucket(CONTENT_CONTROL_BUCKET, &access_key)
+                .get_internal_bucket(CONTENT_CONTROL_BUCKET, &access_key)
                 .await?
                 .ok_or_else(|| Error::Corruption {
                     message: "reader-drain attestation barrier has no protected coordinate"
@@ -253,7 +256,7 @@ impl Db {
                 });
             }
             if let Some(bytes) = transaction
-                .get_bucket(CONTENT_CONTROL_BUCKET, &attestation_key)
+                .get_internal_bucket(CONTENT_CONTROL_BUCKET, &attestation_key)
                 .await?
             {
                 let existing = ContentReaderDrainAttestationRecord::decode(
@@ -276,7 +279,7 @@ impl Db {
                 barrier_enforced_at: barrier.enforced_at(),
                 attested_at: crate::ReadVersion::from_u64(0),
             };
-            transaction.put_bucket_with_commit_sequence(
+            transaction.put_internal_bucket_with_commit_sequence(
                 CONTENT_CONTROL_BUCKET,
                 attestation_key.clone(),
                 &requested.encode_prefix(),
@@ -320,7 +323,7 @@ impl Db {
         let mut transaction = self.transaction(TransactionOptions::default());
         let key = content_reader_drain_attestation_key(storage_domain_id);
         transaction
-            .get_bucket(CONTENT_CONTROL_BUCKET, &key)
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &key)
             .await?
             .map(|bytes| {
                 ContentReaderDrainAttestationRecord::decode(&bytes, storage_domain_id)
@@ -343,7 +346,10 @@ impl Db {
         self.ensure_open()?;
         let mut transaction = self.transaction(TransactionOptions::default());
         let key = content_quarantine_key(storage_domain_id, content_id);
-        match transaction.get_bucket(CONTENT_CONTROL_BUCKET, &key).await {
+        match transaction
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &key)
+            .await
+        {
             Ok(Some(bytes)) => {
                 ContentQuarantineRecord::decode(&bytes, storage_domain_id, content_id)
                     .map(ContentQuarantineRecord::into_public)
@@ -371,7 +377,7 @@ impl Db {
         let mut transaction = self.transaction(TransactionOptions::default());
         let grace_key = content_reclaim_grace_key(storage_domain_id, content_id);
         let Some(bytes) = transaction
-            .get_bucket(CONTENT_CONTROL_BUCKET, &grace_key)
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &grace_key)
             .await?
         else {
             return Ok(None);
@@ -379,7 +385,7 @@ impl Db {
         let grace = ContentReclaimGraceRecord::decode(&bytes, storage_domain_id, content_id)?;
         let quarantine_key = content_quarantine_key(storage_domain_id, content_id);
         let quarantine_bytes = transaction
-            .get_bucket(CONTENT_CONTROL_BUCKET, &quarantine_key)
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &quarantine_key)
             .await?
             .ok_or_else(|| Error::Corruption {
                 message: "content reclaim grace exists without its quarantine fence".to_owned(),
@@ -407,7 +413,10 @@ impl Db {
         self.ensure_open()?;
         let mut transaction = self.transaction(TransactionOptions::default());
         let key = content_reclaim_sweep_key(storage_domain_id, content_id);
-        match transaction.get_bucket(CONTENT_CONTROL_BUCKET, &key).await {
+        match transaction
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &key)
+            .await
+        {
             Ok(Some(bytes)) => {
                 ContentReclaimSweepRecord::decode(&bytes, storage_domain_id, content_id)
                     .map(ContentReclaimSweepRecord::into_public)
@@ -442,11 +451,11 @@ impl Db {
             return Err(Error::ReadOnly);
         }
         self.ensure_content_reclamation_supported()?;
-        self.bucket(CONTENT_CONTROL_BUCKET).await?;
+        self.internal_bucket(CONTENT_CONTROL_BUCKET).await?;
         let key = content_reclaim_sweep_key(storage_domain_id, content_id);
         let mut inspect = self.transaction(TransactionOptions::default());
         let bytes = inspect
-            .get_bucket(CONTENT_CONTROL_BUCKET, &key)
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &key)
             .await?
             .ok_or_else(|| Error::ContentNotFound {
                 storage_domain_id: storage_domain_id.to_string(),
@@ -467,7 +476,7 @@ impl Db {
         let _quota = self.lock_content_quota(storage_domain_id).await;
         let mut complete = self.transaction(TransactionOptions::default());
         let current_bytes = complete
-            .get_bucket(CONTENT_CONTROL_BUCKET, &key)
+            .get_internal_bucket(CONTENT_CONTROL_BUCKET, &key)
             .await?
             .ok_or_else(|| Error::Corruption {
                 message: "Prepared content sweep disappeared before completion".to_owned(),
@@ -482,20 +491,20 @@ impl Db {
         }
         self.stage_reclaimed_content_quota(&mut complete, storage_domain_id, content_id)
             .await?;
-        complete.delete_bucket(
+        complete.delete_internal_bucket(
             CONTENT_CONTROL_BUCKET,
             content_control_key(storage_domain_id, content_id),
         )?;
-        complete.delete_bucket(
+        complete.delete_internal_bucket(
             CONTENT_CONTROL_BUCKET,
             content_quarantine_key(storage_domain_id, content_id),
         )?;
-        complete.delete_bucket(
+        complete.delete_internal_bucket(
             CONTENT_CONTROL_BUCKET,
             content_reclaim_grace_key(storage_domain_id, content_id),
         )?;
         let reclaimed = sweep.reclaimed();
-        complete.put_bucket_with_commit_sequence(
+        complete.put_internal_bucket_with_commit_sequence(
             CONTENT_CONTROL_BUCKET,
             key.clone(),
             &reclaimed.encode_prefix(),
@@ -506,7 +515,7 @@ impl Db {
             Err(Error::Conflict { message }) => {
                 let mut inspect = self.transaction(TransactionOptions::default());
                 let current_bytes = inspect
-                    .get_bucket(CONTENT_CONTROL_BUCKET, &key)
+                    .get_internal_bucket(CONTENT_CONTROL_BUCKET, &key)
                     .await?
                     .ok_or_else(|| Error::Corruption {
                         message: "content reclaim sweep disappeared after a completion conflict"

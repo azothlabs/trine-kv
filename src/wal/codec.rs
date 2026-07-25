@@ -67,9 +67,19 @@ pub(super) fn object_wal_sequence_from_path(path: &Path) -> Result<Option<Sequen
     } else {
         return Ok(None);
     };
-    let Some(sequence) = sequence.strip_suffix(OBJECT_WAL_FILE_SUFFIX) else {
+    let Some(sequence_and_identity) = sequence.strip_suffix(OBJECT_WAL_FILE_SUFFIX) else {
         return Ok(None);
     };
+    let Some((sequence, identity)) = sequence_and_identity.split_once('-') else {
+        return Err(Error::Corruption {
+            message: format!("object WAL file name lacks a content identity: {file_name}"),
+        });
+    };
+    if identity.len() != 64 || !identity.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::Corruption {
+            message: format!("malformed object WAL file name: {file_name}"),
+        });
+    }
     if sequence.len() != OBJECT_WAL_SEQUENCE_DIGITS
         || !sequence.bytes().all(|byte| byte.is_ascii_digit())
     {

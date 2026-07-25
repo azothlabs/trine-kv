@@ -26,10 +26,88 @@ fn put(key: &str, value: &str) -> BatchOperation {
     }
 }
 
+#[test]
+fn object_wal_segments_require_chain_header() {
+    assert!(matches!(
+        decode_object_wal_segment("db/wal", b"raw WAL frames"),
+        Err(Error::Corruption { .. })
+    ));
+}
+
 struct CountingObjectClient {
     inner: Arc<dyn ObjectClient>,
     puts: AtomicUsize,
     put_ifs: AtomicUsize,
+}
+
+struct AppliedThenErroredClient {
+    inner: Arc<dyn ObjectClient>,
+    fail_put_if_call: usize,
+    put_if_calls: AtomicUsize,
+}
+
+impl std::fmt::Debug for AppliedThenErroredClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AppliedThenErroredClient")
+            .field("fail_put_if_call", &self.fail_put_if_call)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AppliedThenErroredClient {
+    fn new(inner: Arc<dyn ObjectClient>, fail_put_if_call: usize) -> Self {
+        Self {
+            inner,
+            fail_put_if_call,
+            put_if_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl ObjectClient for AppliedThenErroredClient {
+    fn get<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<Arc<[u8]>>> {
+        self.inner.get(key)
+    }
+
+    fn get_range<'op>(&'op self, key: &str, offset: u64, len: u64) -> ObjectFuture<'op, Arc<[u8]>> {
+        self.inner.get_range(key, offset, len)
+    }
+
+    fn put<'op>(&'op self, key: &str, bytes: Arc<[u8]>) -> ObjectFuture<'op, ETag> {
+        self.inner.put(key, bytes)
+    }
+
+    fn delete<'op>(&'op self, key: &str) -> ObjectFuture<'op, ()> {
+        self.inner.delete(key)
+    }
+
+    fn list<'op>(&'op self, prefix: &str) -> ObjectFuture<'op, Vec<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn head<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<ObjectMeta>> {
+        self.inner.head(key)
+    }
+
+    fn put_if<'op>(
+        &'op self,
+        key: &str,
+        bytes: Arc<[u8]>,
+        precondition: Precondition,
+    ) -> ObjectFuture<'op, PutIf> {
+        let call = self.put_if_calls.fetch_add(1, Ordering::AcqRel) + 1;
+        let applied = self.inner.put_if(key, bytes, precondition);
+        Box::pin(async move {
+            let outcome = applied.await?;
+            if call == self.fail_put_if_call && matches!(outcome, PutIf::Stored { .. }) {
+                return Err(Error::Io(std::io::Error::other(
+                    "injected response loss after conditional write applied",
+                )));
+            }
+            Ok(outcome)
+        })
+    }
 }
 
 impl std::fmt::Debug for CountingObjectClient {
@@ -192,6 +270,98 @@ fn object_store_substrate_publishes_remote_wal_head() {
 }
 
 #[test]
+fn object_wal_reconciles_applied_writes_after_response_loss() {
+    use crate::object_store::InMemoryObjectStore;
+
+    // Conditional writes are: lease acquisition, immutable segment creation,
+    // then WAL-head publication. Each can be durably applied even when the
+    // client receives an I/O error instead of the success response.
+    for fail_put_if_call in 1..=3 {
+        let client: Arc<dyn ObjectClient> = Arc::new(AppliedThenErroredClient::new(
+            Arc::new(InMemoryObjectStore::new()),
+            fail_put_if_call,
+        ));
+        let mut lease = poll_ready(ObjectWriterLease::acquire(Arc::clone(&client), "LOCK"))
+            .expect("lease acquisition reconciles an applied response loss");
+        let frame =
+            wal::encode_batch_frame(Sequence::new(1), &[put("k", "v")]).expect("encode WAL frame");
+        let accept = ObjectWalAccept {
+            sequence: Sequence::new(1),
+            frame: frame.into(),
+            completion: Arc::new(ObjectWalCompletion::new()),
+        };
+        poll_ready(lease.publish_commit_batch(PathBuf::from("db").as_path(), &[accept]))
+            .expect("WAL publication reconciles an applied response loss");
+        let state = lease.lease_state();
+        assert_eq!(state.committed_sequence, Sequence::new(1));
+        let batches = poll_ready(object_store_wal_batches_after_replay_floor(
+            Arc::clone(&client),
+            PathBuf::from("db").as_path(),
+            &state,
+            Sequence::ZERO,
+        ))
+        .expect("reconciled WAL chain reads");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].operations, vec![put("k", "v")]);
+    }
+}
+
+#[test]
+fn object_wal_chain_rejects_cross_database_keys_and_sequence_holes() {
+    use crate::object_store::InMemoryObjectStore;
+
+    let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let cross_database = ObjectLeaseState {
+        epoch: 1,
+        committed_sequence: Sequence::new(1),
+        current_wal_key: Some(
+            "other/trine.wal.epoch-00000000000000000001.commit-00000000000000000001.trinewal"
+                .to_owned(),
+        ),
+        lease_expires_at_ms: u64::MAX,
+    };
+    let error = poll_ready(object_store_wal_batches_after_replay_floor(
+        Arc::clone(&client),
+        PathBuf::from("db").as_path(),
+        &cross_database,
+        Sequence::ZERO,
+    ))
+    .expect_err("WAL predecessor cannot escape the database root");
+    assert!(matches!(error, Error::Corruption { .. }));
+
+    let frame =
+        wal::encode_batch_frame(Sequence::new(2), &[put("k", "v")]).expect("encode hole frame");
+    let segment = encode_object_wal_segment(None, &frame).expect("encode hole segment");
+    let identity = object_wal_segment_identity(&segment);
+    let key = canonical_object_key(&wal::object_wal_commit_path(
+        PathBuf::from("db").as_path(),
+        1,
+        Sequence::new(2),
+        &identity,
+    ))
+    .expect("canonical WAL key");
+    assert!(matches!(
+        poll_ready(client.put_if(&key, Arc::from(segment), Precondition::IfNoneMatch))
+            .expect("store malformed chain"),
+        PutIf::Stored { .. }
+    ));
+    let hole = ObjectLeaseState {
+        epoch: 1,
+        committed_sequence: Sequence::new(2),
+        current_wal_key: Some(key),
+        lease_expires_at_ms: u64::MAX,
+    };
+    let error = poll_ready(object_store_wal_batches_after_replay_floor(
+        client,
+        PathBuf::from("db").as_path(),
+        &hole,
+        Sequence::ZERO,
+    ))
+    .expect_err("WAL chain cannot skip an acknowledged sequence");
+    assert!(matches!(error, Error::Corruption { .. }));
+}
+
+#[test]
 fn object_wal_lane_group_commits_queued_accepts() {
     use crate::object_store::InMemoryObjectStore;
 
@@ -233,27 +403,28 @@ fn object_wal_lane_group_commits_queued_accepts() {
         .expect("read lease")
         .expect("lease exists");
     assert_eq!(head.committed_sequence, Sequence::new(COMMITS as u64));
-    let segment_key = head.current_wal_key.expect("segment key");
-    let segment = poll_ready(client.get(&segment_key))
-        .expect("read WAL segment")
-        .expect("segment exists");
-    let batches = wal::decode_frames_after(segment.as_ref(), Sequence::ZERO)
-        .expect("decode grouped WAL segment");
+    let batches = poll_ready(object_store_wal_batches_after_replay_floor(
+        Arc::clone(&client),
+        PathBuf::from("db").as_path(),
+        &head,
+        Sequence::ZERO,
+    ))
+    .expect("decode grouped WAL chain");
     assert_eq!(batches.len(), COMMITS);
     assert_eq!(
         counted.puts(),
-        1,
-        "all accepts should share one segment PUT"
+        0,
+        "immutable segments must never use overwrite PUT"
     );
     assert_eq!(
         counted.put_ifs(),
-        2,
-        "lease acquire and grouped head publish should each use one CAS"
+        3,
+        "lease acquire, one grouped segment, and grouped head publish use CAS"
     );
 }
 
 #[test]
-fn object_writer_discards_unconfirmed_wal_tail_before_retrying_sequence() {
+fn object_writer_ignores_orphan_segment_before_retrying_sequence() {
     use crate::object_store::InMemoryObjectStore;
 
     let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
@@ -271,16 +442,23 @@ fn object_writer_discards_unconfirmed_wal_tail_before_retrying_sequence() {
 
     let head = first.lease_state();
     let segment_key = head.current_wal_key.expect("current WAL key");
-    let mut segment = poll_ready(client.get(&segment_key))
-        .expect("read current WAL")
-        .expect("current WAL exists")
-        .to_vec();
-    segment.extend_from_slice(
-        &wal::encode_batch_frame(Sequence::new(2), &[put("retry", "unconfirmed")])
-            .expect("encode unconfirmed tail"),
-    );
-    poll_ready(client.put(&segment_key, Arc::from(segment.as_slice())))
-        .expect("persist WAL before head confirmation");
+    let orphan_frame = wal::encode_batch_frame(Sequence::new(2), &[put("retry", "unconfirmed")])
+        .expect("encode unconfirmed frame");
+    let orphan = encode_object_wal_segment(Some(&segment_key), &orphan_frame)
+        .expect("encode orphan segment");
+    let orphan_identity = object_wal_segment_identity(&orphan);
+    let orphan_key = canonical_object_key(&wal::object_wal_commit_path(
+        PathBuf::from("db").as_path(),
+        first.epoch(),
+        Sequence::new(2),
+        &orphan_identity,
+    ))
+    .expect("canonical orphan key");
+    assert!(matches!(
+        poll_ready(client.put_if(&orphan_key, Arc::from(orphan), Precondition::IfNoneMatch,))
+            .expect("persist WAL before head confirmation"),
+        PutIf::Stored { .. }
+    ));
     poll_ready(first.release()).expect("release first lease");
 
     let mut retry =
@@ -297,12 +475,18 @@ fn object_writer_discards_unconfirmed_wal_tail_before_retrying_sequence() {
 
     let retried_head = retry.lease_state();
     assert_eq!(retried_head.committed_sequence, Sequence::new(2));
-    let retried_key = retried_head.current_wal_key.expect("retried WAL key");
-    let retried_segment = poll_ready(client.get(&retried_key))
-        .expect("read retried WAL")
-        .expect("retried WAL exists");
-    let batches = wal::decode_frames_after(retried_segment.as_ref(), Sequence::ZERO)
-        .expect("retried WAL has increasing sequences");
+    let retried_key = retried_head
+        .current_wal_key
+        .clone()
+        .expect("retried WAL key");
+    assert_ne!(retried_key, orphan_key);
+    let batches = poll_ready(object_store_wal_batches_after_replay_floor(
+        Arc::clone(&client),
+        PathBuf::from("db").as_path(),
+        &retried_head,
+        Sequence::ZERO,
+    ))
+    .expect("retried WAL has increasing sequences");
     assert_eq!(
         batches
             .iter()

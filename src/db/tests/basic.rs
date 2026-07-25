@@ -1,4 +1,50 @@
 use super::*;
+use crate::{TransactionOptions, WriteBatch};
+
+#[test]
+fn public_bucket_apis_reject_the_internal_namespace() {
+    let db = Db::open_sync(DbOptions::memory()).expect("open memory database");
+    let reserved = format!("{}test", crate::bucket::INTERNAL_BUCKET_PREFIX);
+
+    assert!(matches!(
+        db.bucket_sync(reserved.as_str()),
+        Err(Error::InvalidOptions { .. })
+    ));
+    assert!(matches!(
+        db.drop_bucket_sync(reserved.as_str()),
+        Err(Error::InvalidOptions { .. })
+    ));
+    assert!(matches!(
+        db.create_checkpoint_sync(reserved.as_str()),
+        Err(Error::InvalidOptions { .. })
+    ));
+
+    let mut batch = WriteBatch::new();
+    assert!(matches!(
+        batch.put_bucket(&reserved, b"k", b"v".to_vec()),
+        Err(Error::InvalidOptions { .. })
+    ));
+
+    let mut transaction = db.transaction(TransactionOptions::default());
+    assert!(matches!(
+        transaction.get_bucket_sync(&reserved, b"k"),
+        Err(Error::InvalidOptions { .. })
+    ));
+    assert!(matches!(
+        transaction.put_bucket(&reserved, b"k", b"v".to_vec()),
+        Err(Error::InvalidOptions { .. })
+    ));
+    assert!(matches!(
+        transaction.delete_bucket(&reserved, b"k"),
+        Err(Error::InvalidOptions { .. })
+    ));
+
+    let mut branch = db.branch_from_latest().expect("ephemeral branch opens");
+    assert!(matches!(
+        branch.put(reserved.as_str(), b"k", b"v".to_vec()),
+        Err(Error::InvalidOptions { .. })
+    ));
+}
 
 #[test]
 fn object_store_prefix_isolates_databases_in_one_bucket() {
@@ -225,7 +271,7 @@ fn object_store_buffered_write_requires_flush_to_recover() {
 }
 
 #[test]
-fn object_store_wal_head_points_to_segment_not_per_commit_index() {
+fn object_store_wal_head_points_to_an_immutable_segment_chain() {
     use crate::object_store::{InMemoryObjectStore, ObjectClient};
 
     let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
@@ -241,20 +287,31 @@ fn object_store_wal_head_points_to_segment_not_per_commit_index() {
     let state = block_on_test_future(ObjectWriterLease::read_current(Arc::clone(&client), "LOCK"))
         .expect("read WAL head")
         .expect("WAL head exists");
-    let segment_key = state.current_wal_key.expect("segment key");
-    let segment = block_on_test_future(client.get(&segment_key))
-        .expect("read WAL segment")
-        .expect("segment exists");
-    let batches =
-        crate::wal::decode_frames_after(segment.as_ref(), Sequence::ZERO).expect("decode WAL");
+    let batches = block_on_test_future(
+        crate::substrate::object_store_wal_batches_after_replay_floor(
+            Arc::clone(&client),
+            std::path::Path::new(""),
+            &state,
+            Sequence::ZERO,
+        ),
+    )
+    .expect("decode WAL chain");
     assert_eq!(batches.len(), 3);
     assert_eq!(state.committed_sequence, Sequence::new(3));
     let objects = block_on_test_future(client.list("")).expect("list objects");
     let wal_objects = objects
         .iter()
         .filter(|meta| crate::is_wal_object_key(&meta.key))
-        .count();
-    assert_eq!(wal_objects, 1, "stable WAL segment should be overwritten");
+        .collect::<Vec<_>>();
+    assert_eq!(
+        wal_objects.len(),
+        3,
+        "each acknowledged commit has one immutable WAL segment"
+    );
+    assert!(
+        wal_objects.iter().all(|meta| meta.size < 1_024),
+        "new commits must not copy the complete preceding WAL history"
+    );
 
     block_on_test_future(db.flush()).expect("flush");
     let state = block_on_test_future(ObjectWriterLease::read_current(client, "LOCK"))
@@ -348,7 +405,7 @@ fn object_store_recovery_rejects_truncated_confirmed_wal_segment() {
     let error = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
         .expect_err("truncated confirmed WAL segment must fail closed");
     assert!(
-        matches!(error, Error::Corruption { ref message } if message.contains("ended before confirmed head")),
+        matches!(error, Error::Corruption { ref message } if message.contains("below committed head")),
         "expected missing confirmed WAL corruption, got {error:?}"
     );
 }

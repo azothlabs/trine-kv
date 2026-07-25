@@ -1,10 +1,12 @@
 use super::{
-    CONTENT_LEASE_BUCKET, CONTENT_PHYSICAL_HOLD_BUCKET, ContentAccessMode, ContentDescriptor,
-    ContentHandle, ContentId, ContentLease, ContentLeaseId, ContentLeaseOptions,
-    ContentLeaseRecord, ContentPhysicalHold, ContentPhysicalHoldId, ContentPhysicalHoldOptions,
-    ContentPhysicalHoldOwnerId, ContentPhysicalHoldRecord, ContentPhysicalHoldRecordState, Db,
-    Duration, Error, Result, StorageDomainId, TransactionOptions, content_lease_key,
-    content_lease_prefix, content_physical_hold_key, current_epoch_millis, duration_millis,
+    CONTENT_LEASE_BUCKET, CONTENT_PHYSICAL_HOLD_BUCKET, CONTENT_TOKEN_BUCKET,
+    CONTENT_TOKEN_INDEX_BUCKET, ContentAccessMode, ContentDescriptor, ContentHandle, ContentId,
+    ContentLease, ContentLeaseId, ContentLeaseOptions, ContentLeaseRecord,
+    ContentLifecycleMaintenanceReport, ContentPhysicalHold, ContentPhysicalHoldId,
+    ContentPhysicalHoldOptions, ContentPhysicalHoldOwnerId, ContentPhysicalHoldRecord,
+    ContentPhysicalHoldRecordState, ContentTokenIndexRecord, Db, Duration, Error, KeyRange, Result,
+    StorageDomainId, TransactionOptions, content_lease_key, content_lease_prefix,
+    content_physical_hold_key, current_epoch_millis, duration_millis,
 };
 
 impl Db {
@@ -152,9 +154,9 @@ impl Db {
             content_id,
             expires_at_unix_ms,
         };
-        self.bucket(CONTENT_LEASE_BUCKET).await?;
+        self.internal_bucket(CONTENT_LEASE_BUCKET).await?;
         let mut transaction = self.transaction(TransactionOptions::default());
-        transaction.put_bucket(
+        transaction.put_internal_bucket(
             CONTENT_LEASE_BUCKET,
             content_lease_key(storage_domain_id, content_id, lease_id),
             record.encode(),
@@ -187,7 +189,7 @@ impl Db {
         for _ in 0..Self::CONTENT_LEASE_COMMIT_ATTEMPTS {
             let mut transaction = self.transaction(TransactionOptions::default());
             let bytes = transaction
-                .get_bucket(CONTENT_LEASE_BUCKET, &key)
+                .get_internal_bucket(CONTENT_LEASE_BUCKET, &key)
                 .await?
                 .ok_or_else(|| Error::ContentLeaseNotFound {
                     lease_id: lease.id().to_string(),
@@ -218,7 +220,7 @@ impl Db {
                 return Ok(next_expiry);
             }
             record.expires_at_unix_ms = next_expiry;
-            transaction.put_bucket(CONTENT_LEASE_BUCKET, key.clone(), record.encode())?;
+            transaction.put_internal_bucket(CONTENT_LEASE_BUCKET, key.clone(), record.encode())?;
             transaction
                 .stage_content_read_activity(handle.storage_domain_id(), handle.content_id())
                 .await?;
@@ -339,12 +341,12 @@ impl Db {
             expires_at_unix_ms: options.expires_at_unix_ms(now_unix_ms)?,
             state: ContentPhysicalHoldRecordState::Active,
         };
-        self.bucket(CONTENT_PHYSICAL_HOLD_BUCKET).await?;
+        self.internal_bucket(CONTENT_PHYSICAL_HOLD_BUCKET).await?;
         let key = content_physical_hold_key(storage_domain_id, content_id, hold_id);
         for _ in 0..Self::CONTENT_PHYSICAL_HOLD_COMMIT_ATTEMPTS {
             let mut transaction = self.transaction(TransactionOptions::default());
             if let Some(bytes) = transaction
-                .get_bucket(CONTENT_PHYSICAL_HOLD_BUCKET, &key)
+                .get_internal_bucket(CONTENT_PHYSICAL_HOLD_BUCKET, &key)
                 .await?
             {
                 let existing = ContentPhysicalHoldRecord::decode(
@@ -379,7 +381,7 @@ impl Db {
                     Err(error) => return Err(error),
                 }
             }
-            transaction.put_bucket(
+            transaction.put_internal_bucket(
                 CONTENT_PHYSICAL_HOLD_BUCKET,
                 key.clone(),
                 requested.encode(),
@@ -419,7 +421,7 @@ impl Db {
         owner_id: ContentPhysicalHoldOwnerId,
     ) -> Result<ContentPhysicalHold> {
         self.ensure_open()?;
-        let bucket = self.bucket(CONTENT_PHYSICAL_HOLD_BUCKET).await?;
+        let bucket = self.internal_bucket(CONTENT_PHYSICAL_HOLD_BUCKET).await?;
         let key = content_physical_hold_key(storage_domain_id, content_id, hold_id);
         let bytes = bucket
             .get(&key)
@@ -469,7 +471,7 @@ impl Db {
         for _ in 0..Self::CONTENT_PHYSICAL_HOLD_COMMIT_ATTEMPTS {
             let mut transaction = self.transaction(TransactionOptions::default());
             let bytes = transaction
-                .get_bucket(CONTENT_PHYSICAL_HOLD_BUCKET, &key)
+                .get_internal_bucket(CONTENT_PHYSICAL_HOLD_BUCKET, &key)
                 .await?
                 .ok_or_else(|| Error::ContentPhysicalHoldNotFound {
                     hold_id: hold.id().to_string(),
@@ -508,7 +510,11 @@ impl Db {
                 return Ok(next_expiry);
             }
             record.expires_at_unix_ms = next_expiry;
-            transaction.put_bucket(CONTENT_PHYSICAL_HOLD_BUCKET, key.clone(), record.encode())?;
+            transaction.put_internal_bucket(
+                CONTENT_PHYSICAL_HOLD_BUCKET,
+                key.clone(),
+                record.encode(),
+            )?;
             transaction
                 .stage_content_activity(hold.storage_domain_id(), hold.content_id())
                 .await?;
@@ -541,7 +547,7 @@ impl Db {
         for _ in 0..Self::CONTENT_PHYSICAL_HOLD_COMMIT_ATTEMPTS {
             let mut transaction = self.transaction(TransactionOptions::default());
             let Some(bytes) = transaction
-                .get_bucket(CONTENT_PHYSICAL_HOLD_BUCKET, &key)
+                .get_internal_bucket(CONTENT_PHYSICAL_HOLD_BUCKET, &key)
                 .await?
             else {
                 hold.publish_released();
@@ -560,7 +566,7 @@ impl Db {
                 hold.publish_released();
                 return Ok(());
             }
-            transaction.put_bucket(
+            transaction.put_internal_bucket(
                 CONTENT_PHYSICAL_HOLD_BUCKET,
                 key.clone(),
                 record.released().encode(),
@@ -579,6 +585,118 @@ impl Db {
         ))
     }
 
+    /// Removes expired content authority records in one optimistic transaction.
+    ///
+    /// `expired_before_unix_ms` is an exclusive, caller-established time
+    /// boundary. Trine does not substitute its host wall clock for this
+    /// maintenance decision. Token indexes and their primary token records,
+    /// expired read leases, released holds, and expired finite holds are
+    /// removed together. Active finite holds at or after the cutoff and
+    /// until-released holds are retained.
+    ///
+    /// Concurrent renewal, token consumption, hold acquisition, or hold
+    /// release conflicts with the scans and causes the transaction to fail
+    /// without publishing a partial cleanup. Retrying with the same cutoff is
+    /// safe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ReadOnly`] for a read-only database, a conflict when
+    /// authority changed after the maintenance snapshot, or storage and
+    /// corruption errors. Malformed records fail closed and are not skipped.
+    pub async fn vacuum_content_lifecycle(
+        &self,
+        expired_before_unix_ms: u64,
+    ) -> Result<ContentLifecycleMaintenanceReport> {
+        self.ensure_open()?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+        self.internal_bucket(CONTENT_TOKEN_BUCKET).await?;
+        self.internal_bucket(CONTENT_TOKEN_INDEX_BUCKET).await?;
+        self.internal_bucket(CONTENT_LEASE_BUCKET).await?;
+        self.internal_bucket(CONTENT_PHYSICAL_HOLD_BUCKET).await?;
+
+        let mut transaction = self.transaction(TransactionOptions::default());
+        let mut report = ContentLifecycleMaintenanceReport::default();
+
+        let mut token_rows = transaction
+            .range_internal_bucket(CONTENT_TOKEN_INDEX_BUCKET, KeyRange::all())
+            .await?;
+        let mut tokens = Vec::new();
+        while let Some(row) = token_rows.next().await? {
+            tokens.push(row);
+        }
+        drop(token_rows);
+        for row in tokens {
+            report.scanned = report.scanned.saturating_add(1);
+            let (storage_domain_id, content_id, token_hash) =
+                decode_content_authority_key::<32>(&row.key, "token index")?;
+            let record = ContentTokenIndexRecord::decode(
+                &row.value,
+                storage_domain_id,
+                content_id,
+                token_hash,
+            )?;
+            if record.expires_at_unix_ms() < expired_before_unix_ms {
+                transaction.delete_internal_bucket(CONTENT_TOKEN_INDEX_BUCKET, row.key)?;
+                transaction.delete_internal_bucket(CONTENT_TOKEN_BUCKET, token_hash.to_vec())?;
+                report.expired_tokens_removed = report.expired_tokens_removed.saturating_add(1);
+            }
+        }
+
+        let mut lease_rows = transaction
+            .range_internal_bucket(CONTENT_LEASE_BUCKET, KeyRange::all())
+            .await?;
+        let mut leases = Vec::new();
+        while let Some(row) = lease_rows.next().await? {
+            leases.push(row);
+        }
+        drop(lease_rows);
+        for row in leases {
+            report.scanned = report.scanned.saturating_add(1);
+            let (storage_domain_id, content_id, lease_bytes) =
+                decode_content_authority_key::<16>(&row.key, "lease")?;
+            let lease_id = ContentLeaseId::from_bytes(lease_bytes)?;
+            let record =
+                ContentLeaseRecord::decode(&row.value, storage_domain_id, content_id, lease_id)?;
+            if record.expires_at_unix_ms < expired_before_unix_ms {
+                transaction.delete_internal_bucket(CONTENT_LEASE_BUCKET, row.key)?;
+                report.expired_leases_removed = report.expired_leases_removed.saturating_add(1);
+            }
+        }
+
+        let mut hold_rows = transaction
+            .range_internal_bucket(CONTENT_PHYSICAL_HOLD_BUCKET, KeyRange::all())
+            .await?;
+        let mut holds = Vec::new();
+        while let Some(row) = hold_rows.next().await? {
+            holds.push(row);
+        }
+        drop(hold_rows);
+        for row in holds {
+            report.scanned = report.scanned.saturating_add(1);
+            let (storage_domain_id, content_id, hold_bytes) =
+                decode_content_authority_key::<16>(&row.key, "physical hold")?;
+            let hold_id = ContentPhysicalHoldId::from_bytes(hold_bytes)?;
+            let record = ContentPhysicalHoldRecord::decode(
+                &row.value,
+                storage_domain_id,
+                content_id,
+                hold_id,
+            )?;
+            let expired = record.expires_at_unix_ms != 0
+                && record.expires_at_unix_ms < expired_before_unix_ms;
+            if record.is_released() || expired {
+                transaction.delete_internal_bucket(CONTENT_PHYSICAL_HOLD_BUCKET, row.key)?;
+                report.inactive_holds_removed = report.inactive_holds_removed.saturating_add(1);
+            }
+        }
+
+        transaction.commit().await?;
+        Ok(report)
+    }
+
     // This is an exact conservative precheck for the future physical
     // reclamation path. It cannot authorize deletion without a per-content
     // quarantine/fence that prevents a new lease after this scan.
@@ -590,7 +708,7 @@ impl Db {
     ) -> Result<bool> {
         let now_unix_ms = current_epoch_millis()?;
         let prefix = content_lease_prefix(storage_domain_id, content_id);
-        let bucket = self.bucket(CONTENT_LEASE_BUCKET).await?;
+        let bucket = self.internal_bucket(CONTENT_LEASE_BUCKET).await?;
         for entry in bucket.prefix(prefix.clone()).await? {
             let entry = entry?;
             let lease_bytes = entry
@@ -612,4 +730,30 @@ impl Db {
         }
         Ok(false)
     }
+}
+
+fn decode_content_authority_key<const TAIL: usize>(
+    key: &[u8],
+    kind: &str,
+) -> Result<(StorageDomainId, ContentId, [u8; TAIL])> {
+    const PREFIX_LEN: usize = 16 + 33;
+    if key.len() != PREFIX_LEN + TAIL {
+        return Err(Error::Corruption {
+            message: format!("content {kind} key has malformed length"),
+        });
+    }
+    let storage_domain_id = StorageDomainId::from_bytes(
+        key[..16]
+            .try_into()
+            .expect("checked content authority domain length"),
+    );
+    let content_id = ContentId::from_bytes(
+        key[16..PREFIX_LEN]
+            .try_into()
+            .expect("checked content authority identity length"),
+    )?;
+    let tail = key[PREFIX_LEN..]
+        .try_into()
+        .expect("checked content authority key tail length");
+    Ok((storage_domain_id, content_id, tail))
 }

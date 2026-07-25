@@ -30,11 +30,12 @@ const CONTENT_RECLAIM_CLOCK_EVIDENCE_SHA256_TAG: u8 = 1;
 const CONTENT_PHYSICAL_HOLD_ID_VERSION: u8 = 1;
 const DESCRIPTOR_MAGIC: &[u8; 8] = b"TRNCNTD2";
 const CHUNK_MAGIC: &[u8; 8] = b"TRNCNTC1";
-const UPLOAD_STATE_MAGIC: &[u8; 8] = b"TRNUPLD3";
+const UPLOAD_STATE_MAGIC: &[u8; 8] = b"TRNUPLD4";
 const DESCRIPTOR_LEN: usize = 8 + 16 + 1 + 32 + 16 + 8 + 4 + 8;
 const CHUNK_HEADER_LEN: usize = 8 + 16 + 8 + 4 + 32;
-const UPLOAD_STATE_LEN: usize =
+const UPLOAD_STATE_UPDATED_AT_OFFSET: usize =
     8 + 1 + 16 + 8 + 4 + 8 + 8 + 4 + 1 + 8 + 1 + 33 + 16 + 16 + 32 + 8 + 8 + 1 + 33;
+const UPLOAD_STATE_LEN: usize = UPLOAD_STATE_UPDATED_AT_OFFSET + 8;
 const UPLOAD_STATE_OPEN: u8 = 0;
 const UPLOAD_STATE_SEALING: u8 = 1;
 const UPLOAD_STATE_SEALED: u8 = 2;

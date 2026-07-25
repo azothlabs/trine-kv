@@ -1,8 +1,8 @@
 use super::{
     BTreeMap, Db, DbOptions, DbStats, Error, FilterStats, LevelFilterStats, LevelStats, Ordering,
     Path, ReadVersion, Result, Sequence, Snapshot, Transaction, TransactionOptions,
-    add_obsolete_blob_stats, lock_poisoned, shutdown_background_workers, table, table_file_bytes,
-    validate_checkpoint_name,
+    add_obsolete_blob_stats, lock_poisoned, require_internal_checkpoint_name,
+    shutdown_background_workers, table, table_file_bytes, validate_checkpoint_name,
 };
 
 impl Db {
@@ -78,15 +78,16 @@ impl Db {
     ///
     /// # Parameters
     ///
-    /// - `name`: non-empty checkpoint name. Names are database-local and must
-    ///   be unique until deleted.
+    /// - `name`: non-empty checkpoint name of at most 1024 UTF-8 bytes. Names
+    ///   are database-local, must avoid Trine's internal namespace, and must be
+    ///   unique until deleted.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Closed`] if the handle is closed, [`Error::ReadOnly`] if
     /// the handle cannot mutate metadata, [`Error::InvalidOptions`] for an
-    /// empty name, or [`Error::CheckpointAlreadyExists`] when `name` already
-    /// exists.
+    /// invalid or reserved name, or [`Error::CheckpointAlreadyExists`] when
+    /// `name` already exists.
     pub fn create_checkpoint_sync(&self, name: &str) -> Result<ReadVersion> {
         self.ensure_open()?;
         validate_checkpoint_name(name)?;
@@ -107,13 +108,26 @@ impl Db {
     /// # Errors
     ///
     /// Returns [`Error::Closed`] if the handle is closed, [`Error::ReadOnly`] if
-    /// the handle cannot mutate metadata, [`Error::InvalidOptions`] for an empty
-    /// name, [`Error::CheckpointAlreadyExists`] when `name` already exists, or a
-    /// read-version error if `version` is newer than the latest committed version
-    /// or older than the retained-history floor.
+    /// the handle cannot mutate metadata, [`Error::InvalidOptions`] for an
+    /// invalid or reserved name, [`Error::CheckpointAlreadyExists`] when `name`
+    /// already exists, or a read-version error if `version` is newer than the
+    /// latest committed version or older than the retained-history floor.
     pub fn create_checkpoint_at_sync(&self, name: &str, version: ReadVersion) -> Result<()> {
-        self.ensure_open()?;
         validate_checkpoint_name(name)?;
+        self.create_checkpoint_at_sync_unchecked(name, version)
+    }
+
+    pub(crate) fn create_internal_checkpoint_at_sync(
+        &self,
+        name: &str,
+        version: ReadVersion,
+    ) -> Result<()> {
+        require_internal_checkpoint_name(name)?;
+        self.create_checkpoint_at_sync_unchecked(name, version)
+    }
+
+    fn create_checkpoint_at_sync_unchecked(&self, name: &str, version: ReadVersion) -> Result<()> {
+        self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
@@ -131,8 +145,21 @@ impl Db {
     /// Same validation and persistence errors as
     /// [`Db::create_checkpoint_at_sync`].
     pub async fn create_checkpoint_at(&self, name: &str, version: ReadVersion) -> Result<()> {
-        self.ensure_open()?;
         validate_checkpoint_name(name)?;
+        self.create_checkpoint_at_unchecked(name, version).await
+    }
+
+    pub(crate) async fn create_internal_checkpoint_at(
+        &self,
+        name: &str,
+        version: ReadVersion,
+    ) -> Result<()> {
+        require_internal_checkpoint_name(name)?;
+        self.create_checkpoint_at_unchecked(name, version).await
+    }
+
+    async fn create_checkpoint_at_unchecked(&self, name: &str, version: ReadVersion) -> Result<()> {
+        self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
@@ -146,10 +173,10 @@ impl Db {
 
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         if self.inner.options.storage_mode.is_browser_persistent() {
-            return self.create_checkpoint_at_sync(name, version);
+            return self.create_checkpoint_at_sync_unchecked(name, version);
         }
 
-        self.create_checkpoint_at_sync(name, version)
+        self.create_checkpoint_at_sync_unchecked(name, version)
     }
 
     /// Records a checkpoint pinning `sequence`, in the manifest (persistent) or
@@ -193,11 +220,20 @@ impl Db {
     /// # Errors
     ///
     /// Returns [`Error::Closed`], [`Error::ReadOnly`],
-    /// [`Error::InvalidOptions`] for an empty name, or
+    /// [`Error::InvalidOptions`] for an invalid or reserved name, or
     /// [`Error::CheckpointNotFound`] if no checkpoint with that name exists.
     pub fn delete_checkpoint_sync(&self, name: &str) -> Result<()> {
-        self.ensure_open()?;
         validate_checkpoint_name(name)?;
+        self.delete_checkpoint_sync_unchecked(name)
+    }
+
+    pub(crate) fn delete_internal_checkpoint_sync(&self, name: &str) -> Result<()> {
+        require_internal_checkpoint_name(name)?;
+        self.delete_checkpoint_sync_unchecked(name)
+    }
+
+    fn delete_checkpoint_sync_unchecked(&self, name: &str) -> Result<()> {
+        self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
@@ -235,11 +271,21 @@ impl Db {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Closed`], [`Error::InvalidOptions`] for an empty name,
-    /// or [`Error::CheckpointNotFound`] when the checkpoint does not exist.
+    /// Returns [`Error::Closed`], [`Error::InvalidOptions`] for an invalid or
+    /// reserved name, or [`Error::CheckpointNotFound`] when the checkpoint does
+    /// not exist.
     pub fn checkpoint_read_version_sync(&self, name: &str) -> Result<ReadVersion> {
-        self.ensure_open()?;
         validate_checkpoint_name(name)?;
+        self.checkpoint_read_version_sync_unchecked(name)
+    }
+
+    pub(crate) fn internal_checkpoint_read_version_sync(&self, name: &str) -> Result<ReadVersion> {
+        require_internal_checkpoint_name(name)?;
+        self.checkpoint_read_version_sync_unchecked(name)
+    }
+
+    fn checkpoint_read_version_sync_unchecked(&self, name: &str) -> Result<ReadVersion> {
+        self.ensure_open()?;
         let sequence = if let Some(manifest) = &self.inner.manifest {
             manifest
                 .lock()

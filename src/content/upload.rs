@@ -3,9 +3,10 @@ use super::{
     ContentUploadOptions, DESCRIPTOR_LEN, DESCRIPTOR_MAGIC, Db, Digest, DurabilityMode, Duration,
     Error, MAX_CHUNK_BYTES, MIN_CHUNK_BYTES, OwnerScopeId, Result, SealedContent, Sha256,
     StorageDomainId, UPLOAD_STATE_ABORTING, UPLOAD_STATE_LEN, UPLOAD_STATE_MAGIC,
-    UPLOAD_STATE_OPEN, UPLOAD_STATE_SEALED, UPLOAD_STATE_SEALING, UploadId, UploadToken, array_at,
-    decode_content_id, decode_durability, decode_optional_content_id, decode_optional_u64,
-    digest_string, encode_durability, encode_optional_content_id, encode_optional_u64, fmt, mem,
+    UPLOAD_STATE_OPEN, UPLOAD_STATE_SEALED, UPLOAD_STATE_SEALING, UPLOAD_STATE_UPDATED_AT_OFFSET,
+    UploadId, UploadToken, array_at, current_epoch_millis, decode_content_id, decode_durability,
+    decode_optional_content_id, decode_optional_u64, digest_string, encode_durability,
+    encode_optional_content_id, encode_optional_u64, fmt, mem,
 };
 
 /// Result of resuming durable state for an [`UploadId`].
@@ -19,6 +20,88 @@ pub enum ContentUploadResume {
     Open(ContentUpload),
     /// The upload was already sealed; this is the idempotent prior result.
     Sealed(SealedContent),
+}
+
+/// Durable lifecycle visible to content-upload maintenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentUploadState {
+    /// The upload can still accept bytes.
+    Open,
+    /// Descriptor publication started and must be resumed rather than discarded.
+    Sealing,
+    /// The upload completed; its state remains only for idempotent retries.
+    Sealed,
+    /// Abort cleanup started and can be resumed.
+    Aborting,
+}
+
+/// One durable upload discovered by the maintenance index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentUploadInfo {
+    upload_id: UploadId,
+    state: ContentUploadState,
+    updated_at_unix_ms: u64,
+    length: u64,
+}
+
+impl ContentUploadInfo {
+    /// Returns the stable upload identity used by resume, abort, and seal APIs.
+    #[must_use]
+    pub const fn upload_id(self) -> UploadId {
+        self.upload_id
+    }
+
+    /// Returns the durable lifecycle observed while listing.
+    #[must_use]
+    pub const fn state(self) -> ContentUploadState {
+        self.state
+    }
+
+    /// Returns the last durable update time in Unix milliseconds.
+    #[must_use]
+    pub const fn updated_at_unix_ms(self) -> u64 {
+        self.updated_at_unix_ms
+    }
+
+    /// Returns the durable original-byte length.
+    #[must_use]
+    pub const fn len(self) -> u64 {
+        self.length
+    }
+
+    /// Returns whether the durable original-byte length is zero.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.length == 0
+    }
+}
+
+/// Counts returned after one idempotent upload-maintenance pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContentUploadMaintenanceReport {
+    pub(crate) scanned: u64,
+    pub(crate) aborted: u64,
+    pub(crate) pruned_sealed: u64,
+}
+
+impl ContentUploadMaintenanceReport {
+    /// Returns the number of durable upload states inspected.
+    #[must_use]
+    pub const fn scanned(self) -> u64 {
+        self.scanned
+    }
+
+    /// Returns the number of inactive open or aborting uploads fully removed.
+    #[must_use]
+    pub const fn aborted(self) -> u64 {
+        self.aborted
+    }
+
+    /// Returns the number of sealed idempotency states removed.
+    #[must_use]
+    pub const fn pruned_sealed(self) -> u64 {
+        self.pruned_sealed
+    }
 }
 
 impl ContentUploadResume {
@@ -297,6 +380,7 @@ pub(crate) struct UploadSessionState {
     partial_len: u32,
     upload_token: UploadToken,
     status: UploadSessionStatus,
+    updated_at_unix_ms: u64,
 }
 
 impl UploadSessionState {
@@ -326,6 +410,7 @@ impl UploadSessionState {
             partial_len,
             upload_token,
             status: UploadSessionStatus::Open,
+            updated_at_unix_ms: current_epoch_millis()?,
         };
         state.validate()?;
         Ok(state)
@@ -419,6 +504,32 @@ impl UploadSessionState {
         self.upload_token
     }
 
+    pub(crate) const fn updated_at_unix_ms(self) -> u64 {
+        self.updated_at_unix_ms
+    }
+
+    pub(crate) const fn with_updated_at_unix_ms(self, updated_at_unix_ms: u64) -> Self {
+        Self {
+            updated_at_unix_ms,
+            ..self
+        }
+    }
+
+    pub(crate) const fn maintenance_info(self) -> ContentUploadInfo {
+        let state = match self.status {
+            UploadSessionStatus::Open => ContentUploadState::Open,
+            UploadSessionStatus::Sealing(_) => ContentUploadState::Sealing,
+            UploadSessionStatus::Sealed(_) => ContentUploadState::Sealed,
+            UploadSessionStatus::Aborting => ContentUploadState::Aborting,
+        };
+        ContentUploadInfo {
+            upload_id: self.upload_id,
+            state,
+            updated_at_unix_ms: self.updated_at_unix_ms,
+            length: self.length,
+        }
+    }
+
     pub(crate) const fn chunk_count(self) -> u64 {
         self.complete_chunks + if self.partial_len == 0 { 0 } else { 1 }
     }
@@ -477,6 +588,7 @@ impl UploadSessionState {
                 sealed.content_id.encode_into(&mut bytes);
             }
         }
+        bytes.extend_from_slice(&self.updated_at_unix_ms.to_le_bytes());
         debug_assert_eq!(bytes.len(), UPLOAD_STATE_LEN);
         Ok(Arc::from(bytes))
     }
@@ -524,17 +636,6 @@ impl UploadSessionState {
         let token_expires_at_unix_ms =
             u64::from_le_bytes(array_at::<8>(bytes, 172, "content upload token expiry")?);
         let durability = decode_durability(bytes[180])?;
-        let sealed_id = match status_tag {
-            UPLOAD_STATE_OPEN | UPLOAD_STATE_ABORTING => None,
-            UPLOAD_STATE_SEALING | UPLOAD_STATE_SEALED => {
-                Some(decode_content_id(bytes, 181, "sealed content identity")?)
-            }
-            _ => {
-                return Err(Error::UnsupportedFormat {
-                    message: format!("unsupported content upload state tag {status_tag}"),
-                });
-            }
-        };
         let options = ContentUploadOptions {
             attachment_scope: ContentAttachmentScope::new(storage_domain_id, owner_scope_id),
             token_ttl: Duration::from_millis(token_ttl_ms),
@@ -543,30 +644,20 @@ impl UploadSessionState {
             expected_content_id,
         }
         .validate()?;
-        let status = sealed_id.map_or_else(
-            || {
-                if status_tag == UPLOAD_STATE_ABORTING {
-                    UploadSessionStatus::Aborting
-                } else {
-                    UploadSessionStatus::Open
-                }
-            },
-            |content_id| {
-                let sealed = SealedContent {
-                    attachment_scope: options.attachment_scope,
-                    content_id,
-                    length,
-                    upload_token,
-                    token_expires_at_unix_ms,
-                    durability,
-                };
-                if status_tag == UPLOAD_STATE_SEALING {
-                    UploadSessionStatus::Sealing(sealed)
-                } else {
-                    UploadSessionStatus::Sealed(sealed)
-                }
-            },
-        );
+        let status = decode_upload_session_status(
+            bytes,
+            status_tag,
+            options,
+            length,
+            upload_token,
+            token_expires_at_unix_ms,
+            durability,
+        )?;
+        let updated_at_unix_ms = u64::from_le_bytes(array_at::<8>(
+            bytes,
+            UPLOAD_STATE_UPDATED_AT_OFFSET,
+            "content upload update time",
+        )?);
         let state = Self {
             upload_id,
             revision,
@@ -576,12 +667,18 @@ impl UploadSessionState {
             partial_len,
             upload_token,
             status,
+            updated_at_unix_ms,
         };
         state.validate()?;
         Ok(state)
     }
 
     fn validate(self) -> Result<()> {
+        if self.updated_at_unix_ms == 0 {
+            return Err(Error::InvalidFormat {
+                message: "content upload update time cannot be zero".to_owned(),
+            });
+        }
         let chunk_bytes =
             u64::try_from(self.options.chunk_bytes).map_err(|_| Error::InvalidFormat {
                 message: "content upload chunk size exceeds u64".to_owned(),
@@ -628,6 +725,39 @@ impl UploadSessionState {
             }
         }
         Ok(())
+    }
+}
+
+fn decode_upload_session_status(
+    bytes: &[u8],
+    status_tag: u8,
+    options: ContentUploadOptions,
+    length: u64,
+    upload_token: UploadToken,
+    token_expires_at_unix_ms: u64,
+    durability: DurabilityMode,
+) -> Result<UploadSessionStatus> {
+    match status_tag {
+        UPLOAD_STATE_OPEN => Ok(UploadSessionStatus::Open),
+        UPLOAD_STATE_ABORTING => Ok(UploadSessionStatus::Aborting),
+        UPLOAD_STATE_SEALING | UPLOAD_STATE_SEALED => {
+            let sealed = SealedContent {
+                attachment_scope: options.attachment_scope,
+                content_id: decode_content_id(bytes, 181, "sealed content identity")?,
+                length,
+                upload_token,
+                token_expires_at_unix_ms,
+                durability,
+            };
+            if status_tag == UPLOAD_STATE_SEALING {
+                Ok(UploadSessionStatus::Sealing(sealed))
+            } else {
+                Ok(UploadSessionStatus::Sealed(sealed))
+            }
+        }
+        _ => Err(Error::UnsupportedFormat {
+            message: format!("unsupported content upload state tag {status_tag}"),
+        }),
     }
 }
 

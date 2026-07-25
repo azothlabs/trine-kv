@@ -5,6 +5,41 @@ use super::{
     Result, Sha256, StorageDomainId, array_at, decode_chunk, decode_content_id, fmt,
 };
 
+/// Result of one content-authority cleanup transaction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContentLifecycleMaintenanceReport {
+    pub(crate) scanned: u64,
+    pub(crate) expired_tokens_removed: u64,
+    pub(crate) expired_leases_removed: u64,
+    pub(crate) inactive_holds_removed: u64,
+}
+
+impl ContentLifecycleMaintenanceReport {
+    /// Returns the number of token, lease, and hold records inspected.
+    #[must_use]
+    pub const fn scanned(self) -> u64 {
+        self.scanned
+    }
+
+    /// Returns expired upload-token authority records removed.
+    #[must_use]
+    pub const fn expired_tokens_removed(self) -> u64 {
+        self.expired_tokens_removed
+    }
+
+    /// Returns expired read-lease records removed.
+    #[must_use]
+    pub const fn expired_leases_removed(self) -> u64 {
+        self.expired_leases_removed
+    }
+
+    /// Returns released or expired physical-hold records removed.
+    #[must_use]
+    pub const fn inactive_holds_removed(self) -> u64 {
+        self.inactive_holds_removed
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ContentLease {
     id: ContentLeaseId,

@@ -154,18 +154,19 @@ pub use bucket::{Bucket, BucketName, BucketReader};
 pub use content::{
     ContentAccessBarrier, ContentAccessBarrierId, ContentAccessMode, ContentAttachment,
     ContentAttachmentScope, ContentChangeId, ContentHandle, ContentHashAlgorithm, ContentId,
-    ContentLeaseId, ContentLeaseOptions, ContentLeaseOwnerId, ContentPhysicalHold,
-    ContentPhysicalHoldId, ContentPhysicalHoldKind, ContentPhysicalHoldOptions,
-    ContentPhysicalHoldOwnerId, ContentPhysicalQuota, ContentQuarantine, ContentQuarantineStage,
-    ContentReaderDrainAttestation, ContentReaderDrainAttestationId,
-    ContentReaderDrainAttestationOptions, ContentReaderDrainCoordinatorId,
-    ContentReaderDrainEvidenceDigest, ContentReaderDrainKind, ContentReclaimAuthorization,
-    ContentReclaimClockAttestation, ContentReclaimClockAttestationId,
+    ContentLeaseId, ContentLeaseOptions, ContentLeaseOwnerId, ContentLifecycleMaintenanceReport,
+    ContentPhysicalHold, ContentPhysicalHoldId, ContentPhysicalHoldKind,
+    ContentPhysicalHoldOptions, ContentPhysicalHoldOwnerId, ContentPhysicalQuota,
+    ContentQuarantine, ContentQuarantineStage, ContentReaderDrainAttestation,
+    ContentReaderDrainAttestationId, ContentReaderDrainAttestationOptions,
+    ContentReaderDrainCoordinatorId, ContentReaderDrainEvidenceDigest, ContentReaderDrainKind,
+    ContentReclaimAuthorization, ContentReclaimClockAttestation, ContentReclaimClockAttestationId,
     ContentReclaimClockCoordinatorId, ContentReclaimClockEvidenceDigest, ContentReclaimGrace,
     ContentReclaimGraceStage, ContentReclaimIntentStage, ContentReclaimProofToken,
     ContentReclaimSweep, ContentReclaimSweepBackend, ContentReclaimSweepStage, ContentStream,
-    ContentUpload, ContentUploadOptions, ContentUploadResume, OwnerScopeId, SealedContent,
-    StorageDomainId, UploadId, UploadToken,
+    ContentUpload, ContentUploadInfo, ContentUploadMaintenanceReport, ContentUploadOptions,
+    ContentUploadResume, ContentUploadState, OwnerScopeId, SealedContent, StorageDomainId,
+    UploadId, UploadToken,
 };
 pub use db::{Db, IntoOpenOptions, MaintenanceBudget, MaintenanceOutcome};
 pub use error::{ContentReclaimBlocker, Error, Result};

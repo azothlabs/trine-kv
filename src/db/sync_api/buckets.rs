@@ -3,6 +3,7 @@ use super::{
     HostStorageBackend, Iter, KeyRange, LazyIter, LsmTree, Result, Snapshot, StorageMode, Value,
     WriteOptions, lock_poisoned, validate_bucket_options,
 };
+use crate::bucket::{require_internal_bucket, validate_user_named_bucket};
 
 impl Db {
     /// Returns a handle for the built-in default bucket.
@@ -23,9 +24,9 @@ impl Db {
     /// Returns an existing named bucket or creates it with default
     /// `BucketOptions`.
     ///
-    /// The built-in default bucket is reserved for direct `Db` helpers and
-    /// `Db::default_bucket_sync`; using `"default"` as a named bucket returns an
-    /// error.
+    /// Names must be non-empty and at most 1024 UTF-8 bytes. The built-in
+    /// default bucket and Trine's control-character-prefixed internal namespace
+    /// are reserved; use `Db::default_bucket_sync` for the default bucket.
     pub fn bucket_sync(&self, name: impl Into<BucketName>) -> Result<Bucket> {
         self.bucket_with_options_sync(name, BucketOptions::default())
     }
@@ -35,23 +36,29 @@ impl Db {
     /// Bucket options are fixed after creation. Calling this for an existing
     /// named bucket with different options returns an error. The built-in
     /// default bucket is configured through `DbOptions::default_bucket_options`.
+    /// Name validation is the same as [`Db::bucket_sync`].
     pub fn bucket_with_options_sync(
         &self,
         name: impl Into<BucketName>,
         options: BucketOptions,
     ) -> Result<Bucket> {
-        self.ensure_open()?;
-
         let name = name.into();
-        if name.as_str().is_empty() {
-            return Err(Error::invalid_options("bucket name cannot be empty"));
-        }
-        if name.as_str() == DEFAULT_BUCKET_NAME {
-            return Err(Error::invalid_options(
-                "default bucket is accessed through Db helpers",
-            ));
-        }
+        validate_user_named_bucket(name.as_str())?;
+        self.bucket_with_options_sync_unchecked(name, options)
+    }
 
+    pub(crate) fn internal_bucket_sync(&self, name: impl Into<BucketName>) -> Result<Bucket> {
+        let name = name.into();
+        require_internal_bucket(name.as_str())?;
+        self.bucket_with_options_sync_unchecked(name, BucketOptions::default())
+    }
+
+    fn bucket_with_options_sync_unchecked(
+        &self,
+        name: BucketName,
+        options: BucketOptions,
+    ) -> Result<Bucket> {
+        self.ensure_open()?;
         validate_bucket_options(&options)?;
 
         if let Some(existing_state) = self.bucket_state_if_exists(name.as_str())? {
@@ -125,17 +132,23 @@ impl Db {
     /// # Errors
     ///
     /// Returns [`Error::Closed`] if the handle is closed, [`Error::ReadOnly`] if
-    /// read-only, [`Error::InvalidOptions`] for the default bucket or a bucket
-    /// that does not exist, or [`Error::UnsupportedBackend`] on an unsupported
-    /// backend.
+    /// read-only, [`Error::InvalidOptions`] for an invalid/reserved name or a
+    /// bucket that does not exist, or [`Error::UnsupportedBackend`] on an
+    /// unsupported backend.
     pub fn drop_bucket_sync(&self, name: impl Into<BucketName>) -> Result<()> {
-        self.ensure_open()?;
         let name = name.into();
-        if name.as_str() == DEFAULT_BUCKET_NAME {
-            return Err(Error::invalid_options(
-                "the default bucket cannot be dropped",
-            ));
-        }
+        validate_user_named_bucket(name.as_str())?;
+        self.drop_bucket_sync_unchecked(&name)
+    }
+
+    pub(crate) fn drop_internal_bucket_sync(&self, name: impl Into<BucketName>) -> Result<()> {
+        let name = name.into();
+        require_internal_bucket(name.as_str())?;
+        self.drop_bucket_sync_unchecked(&name)
+    }
+
+    fn drop_bucket_sync_unchecked(&self, name: &BucketName) -> Result<()> {
+        self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
@@ -213,16 +226,22 @@ impl Db {
     /// # Errors
     ///
     /// Returns [`Error::Closed`] if the handle is closed, [`Error::ReadOnly`] if
-    /// read-only, [`Error::InvalidOptions`] for the default bucket or a missing
-    /// bucket, or a storage/`ObjectClient` error from the manifest CAS.
+    /// read-only, [`Error::InvalidOptions`] for an invalid/reserved name or a
+    /// missing bucket, or a storage/`ObjectClient` error from the manifest CAS.
     pub async fn drop_bucket(&self, name: impl Into<BucketName>) -> Result<()> {
-        self.ensure_open()?;
         let name = name.into();
-        if name.as_str() == DEFAULT_BUCKET_NAME {
-            return Err(Error::invalid_options(
-                "the default bucket cannot be dropped",
-            ));
-        }
+        validate_user_named_bucket(name.as_str())?;
+        self.drop_bucket_unchecked(name).await
+    }
+
+    pub(crate) async fn drop_internal_bucket(&self, name: impl Into<BucketName>) -> Result<()> {
+        let name = name.into();
+        require_internal_bucket(name.as_str())?;
+        self.drop_bucket_unchecked(name).await
+    }
+
+    async fn drop_bucket_unchecked(&self, name: BucketName) -> Result<()> {
+        self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
@@ -302,7 +321,7 @@ impl Db {
             return Ok(());
         }
         // In-memory / native / WASI: the synchronous path is correct from here.
-        self.drop_bucket_sync(name)
+        self.drop_bucket_sync_unchecked(&name)
     }
 
     pub(in crate::db) async fn bucket_with_options_object_store_async(
@@ -311,14 +330,6 @@ impl Db {
         options: BucketOptions,
     ) -> Result<Bucket> {
         self.ensure_open()?;
-        if name.as_str().is_empty() {
-            return Err(Error::invalid_options("bucket name cannot be empty"));
-        }
-        if name.as_str() == DEFAULT_BUCKET_NAME {
-            return Err(Error::invalid_options(
-                "default bucket is accessed through Db helpers",
-            ));
-        }
         validate_bucket_options(&options)?;
 
         if let Some(existing_state) = self.bucket_state_if_exists(name.as_str())? {
@@ -373,16 +384,6 @@ impl Db {
         options: BucketOptions,
     ) -> Result<Bucket> {
         self.ensure_open()?;
-
-        if name.as_str().is_empty() {
-            return Err(Error::invalid_options("bucket name cannot be empty"));
-        }
-        if name.as_str() == DEFAULT_BUCKET_NAME {
-            return Err(Error::invalid_options(
-                "default bucket is accessed through Db helpers",
-            ));
-        }
-
         validate_bucket_options(&options)?;
 
         if let Some(existing_state) = self.bucket_state_if_exists(name.as_str())? {

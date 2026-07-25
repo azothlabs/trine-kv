@@ -22,6 +22,7 @@
 //! fencing token.
 
 use std::{
+    collections::HashSet,
     future::Future,
     io,
     path::PathBuf,
@@ -30,11 +31,13 @@ use std::{
     time::Duration,
 };
 
+use sha2::{Digest, Sha256};
+
 #[cfg(not(all(feature = "s3", not(target_family = "wasm"))))]
 use std::task::{Context, Poll, Wake, Waker};
 
 use crate::error::{Error, Result};
-use crate::object_store::{ETag, ObjectClient, Precondition, PutIf};
+use crate::object_store::{ETag, ObjectClient, Precondition, PutIf, canonical_object_key};
 use crate::options::DurabilityMode;
 use crate::recovery::ProcessLock;
 use crate::types::Sequence;
@@ -49,6 +52,8 @@ const OBJECT_LEASE_MAGIC: u32 = 0x5452_4c53;
 const OBJECT_LEASE_VERSION: u16 = 2;
 const OBJECT_LEASE_V2_HEADER_LEN: usize = 34;
 const OBJECT_LEASE_MAX_BYTES: u64 = 64 * 1024;
+const OBJECT_WAL_SEGMENT_MAGIC: &[u8; 8] = b"TRNOWAL1";
+const OBJECT_WAL_SEGMENT_HEADER_LEN: usize = 12;
 
 /// Backend-specific runtime durability operations (WAL lifecycle + writer
 /// lease) that the commit / flush / close paths drive.
@@ -645,26 +650,25 @@ fn complete_object_wal_accepts(
     mut accepts: Vec<ObjectWalAccept>,
 ) {
     accepts.sort_by_key(|accept| accept.sequence);
-    let Some(mut expected) = lease
-        .state
-        .committed_sequence
-        .get()
-        .checked_add(1)
-        .map(Sequence::new)
-    else {
-        let message = "object WAL group commit cannot advance past u64::MAX".to_owned();
+    if let Err(error) = future_driver.block_on(lease.refresh_current()) {
+        let message = error.to_string();
+        let mut accepts = accepts.into_iter();
+        if let Some(first) = accepts.next() {
+            first.completion.complete(Err(error));
+        }
         for accept in accepts {
-            accept.completion.complete(Err(Error::Corruption {
-                message: message.clone(),
-            }));
+            accept.completion.complete(Err(Error::runtime_busy(format!(
+                "object WAL refresh failed before grouped commit: {message}"
+            ))));
         }
         return;
-    };
+    }
+    let mut previous = lease.state.committed_sequence;
     for accept in &accepts {
-        if accept.sequence != expected {
+        if accept.sequence <= previous {
             let message = format!(
-                "object WAL group commit received non-contiguous sequence: expected {}, got {}",
-                expected.get(),
+                "object WAL group commit received non-increasing sequence after {}: got {}",
+                previous.get(),
                 accept.sequence.get()
             );
             for accept in accepts {
@@ -674,16 +678,7 @@ fn complete_object_wal_accepts(
             }
             return;
         }
-        let Some(next) = expected.get().checked_add(1).map(Sequence::new) else {
-            let message = "object WAL group commit cannot advance past u64::MAX".to_owned();
-            for accept in accepts {
-                accept.completion.complete(Err(Error::Corruption {
-                    message: message.clone(),
-                }));
-            }
-            return;
-        };
-        expected = next;
+        previous = accept.sequence;
     }
     let result = future_driver.block_on(lease.publish_commit_batch(db_path, &accepts));
     match result {
@@ -720,13 +715,6 @@ pub(crate) struct ObjectWriterLease {
     key: String,
     etag: ETag,
     state: ObjectLeaseState,
-    cached_wal_segment: Option<CachedWalSegment>,
-}
-
-#[derive(Debug, Clone)]
-struct CachedWalSegment {
-    key: String,
-    bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -803,21 +791,33 @@ impl ObjectWriterLease {
                     (state, Precondition::IfMatch(meta.etag))
                 }
             };
-            match client
+            let publish = client
                 .put_if(&key, encode_lease_state(next_state.clone())?, precondition)
-                .await?
-            {
-                PutIf::Stored { etag } => {
+                .await;
+            match publish {
+                Ok(PutIf::Stored { etag }) => {
                     return Ok(Self {
                         client,
                         key,
                         etag,
                         state: next_state,
-                        cached_wal_segment: None,
                     });
                 }
                 // Lost the CAS to a concurrent acquirer; re-read and try again.
-                PutIf::PreconditionFailed { .. } => {}
+                Ok(PutIf::PreconditionFailed { .. }) => {}
+                Err(error) => {
+                    if let Ok(Some(current)) = read_lease_state(&client, &key).await
+                        && current.state == next_state
+                    {
+                        return Ok(Self {
+                            client,
+                            key,
+                            etag: current.etag,
+                            state: current.state,
+                        });
+                    }
+                    return Err(error);
+                }
             }
         }
     }
@@ -854,49 +854,67 @@ impl ObjectWriterLease {
         let Some(last) = accepts.last() else {
             return Ok(());
         };
-        let wal_key = wal::object_wal_commit_path(db_path, self.state.epoch, Sequence::ZERO)
-            .to_string_lossy()
-            .into_owned();
-        let mut segment = self.load_cached_wal_segment().await?;
+        let total_bytes = accepts
+            .iter()
+            .try_fold(0usize, |total, accept| {
+                total.checked_add(accept.frame.len())
+            })
+            .ok_or_else(|| Error::invalid_options("object WAL group size overflow"))?;
+        let mut frames = Vec::with_capacity(total_bytes);
+        let mut expected = self
+            .state
+            .committed_sequence
+            .get()
+            .checked_add(1)
+            .map(Sequence::new)
+            .ok_or_else(|| Error::Corruption {
+                message: "object WAL cannot advance past u64::MAX".to_owned(),
+            })?;
         for accept in accepts {
-            segment.extend_from_slice(&accept.frame);
-        }
-        self.client
-            .put(&wal_key, Arc::from(segment.as_slice()))
-            .await?;
-        self.publish_commit_head(last.sequence, wal_key, segment)
-            .await
-    }
-
-    async fn load_cached_wal_segment(&mut self) -> Result<Vec<u8>> {
-        let Some(key) = self.state.current_wal_key.clone() else {
-            return Ok(Vec::new());
-        };
-        if let Some(cached) = &self.cached_wal_segment {
-            if cached.key == key {
-                return Ok(cached.bytes.clone());
+            while expected < accept.sequence {
+                frames.extend_from_slice(&wal::encode_batch_frame(expected, &[])?);
+                expected = expected
+                    .get()
+                    .checked_add(1)
+                    .map(Sequence::new)
+                    .ok_or_else(|| Error::Corruption {
+                        message: "object WAL skipped sequence overflow".to_owned(),
+                    })?;
+            }
+            frames.extend_from_slice(&accept.frame);
+            if expected != accept.sequence {
+                return Err(Error::Corruption {
+                    message: format!(
+                        "object WAL expected sequence {}, got {}",
+                        expected.get(),
+                        accept.sequence.get()
+                    ),
+                });
+            }
+            if accept.sequence != last.sequence {
+                expected = accept
+                    .sequence
+                    .get()
+                    .checked_add(1)
+                    .map(Sequence::new)
+                    .ok_or_else(|| Error::Corruption {
+                        message: "object WAL group sequence overflow".to_owned(),
+                    })?;
             }
         }
-        let bytes = self
-            .client
-            .get(&key)
-            .await?
-            .ok_or_else(|| Error::Corruption {
-                message: format!("object WAL segment {key} is missing"),
-            })?;
-        let confirmed_batches = wal::decode_frames_after(bytes.as_ref(), Sequence::ZERO)?
-            .into_iter()
-            .filter(|batch| batch.sequence <= self.state.committed_sequence)
-            .collect::<Vec<_>>();
-        let bytes = wal::encode_batches_after(&confirmed_batches, Sequence::ZERO)?;
-        self.cached_wal_segment = Some(CachedWalSegment {
-            key,
-            bytes: bytes.clone(),
-        });
-        Ok(bytes)
+        let segment = encode_object_wal_segment(self.state.current_wal_key.as_deref(), &frames)?;
+        let identity = object_wal_segment_identity(&segment);
+        let wal_key = canonical_object_key(&wal::object_wal_commit_path(
+            db_path,
+            self.state.epoch,
+            last.sequence,
+            &identity,
+        ))?;
+        put_immutable_object(&self.client, &wal_key, Arc::from(segment)).await?;
+        self.publish_commit_head(last.sequence, wal_key).await
     }
 
-    async fn ensure_current(&self) -> Result<()> {
+    async fn refresh_current(&mut self) -> Result<()> {
         let Some(current) = read_lease_state(&self.client, &self.key).await? else {
             return Err(Error::Fenced {
                 held_epoch: self.state.epoch,
@@ -917,28 +935,30 @@ impl ObjectWriterLease {
                 ),
             });
         }
+        self.etag = current.etag;
+        self.state = current.state;
         Ok(())
     }
 
     async fn renew(&mut self) -> Result<()> {
-        self.ensure_current().await?;
+        self.refresh_current().await?;
         let mut next = self.state.clone();
         next.lease_expires_at_ms = object_lease_deadline_ms(current_epoch_millis()?);
-        match self
+        let publish = self
             .client
             .put_if(
                 &self.key,
                 encode_lease_state(next.clone())?,
                 Precondition::IfMatch(self.etag.clone()),
             )
-            .await?
-        {
-            PutIf::Stored { etag } => {
+            .await;
+        match publish {
+            Ok(PutIf::Stored { etag }) => {
                 self.etag = etag;
                 self.state = next;
                 Ok(())
             }
-            PutIf::PreconditionFailed { .. } => {
+            Ok(PutIf::PreconditionFailed { .. }) => {
                 let Some(current) = read_lease_state(&self.client, &self.key).await? else {
                     return Err(Error::Fenced {
                         held_epoch: self.state.epoch,
@@ -961,8 +981,17 @@ impl ObjectWriterLease {
                 }
                 self.etag = current.etag;
                 self.state = current.state;
-                self.invalidate_wal_cache_if_stale();
                 Ok(())
+            }
+            Err(error) => {
+                if let Ok(Some(current)) = read_lease_state(&self.client, &self.key).await
+                    && current.state == next
+                {
+                    self.etag = current.etag;
+                    self.state = current.state;
+                    return Ok(());
+                }
+                Err(error)
             }
         }
     }
@@ -990,62 +1019,79 @@ impl ObjectWriterLease {
             self.state = current.state;
             let mut next = self.state.clone();
             next.lease_expires_at_ms = 0;
-            match self
+            let publish = self
                 .client
                 .put_if(
                     &self.key,
                     encode_lease_state(next.clone())?,
                     Precondition::IfMatch(self.etag.clone()),
                 )
-                .await?
-            {
-                PutIf::Stored { etag } => {
+                .await;
+            match publish {
+                Ok(PutIf::Stored { etag }) => {
                     self.etag = etag;
                     self.state = next;
                     return Ok(());
                 }
-                PutIf::PreconditionFailed { .. } => {}
+                Ok(PutIf::PreconditionFailed { .. }) => {}
+                Err(error) => {
+                    if let Ok(Some(current)) = read_lease_state(&self.client, &self.key).await
+                        && current.state == next
+                    {
+                        self.etag = current.etag;
+                        self.state = current.state;
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
             }
         }
     }
 
-    async fn publish_commit_head(
-        &mut self,
-        sequence: Sequence,
-        wal_key: String,
-        segment: Vec<u8>,
-    ) -> Result<()> {
+    async fn publish_commit_head(&mut self, sequence: Sequence, wal_key: String) -> Result<()> {
         loop {
-            if self.state.committed_sequence >= sequence
-                && self.state.current_wal_key.as_deref() == Some(wal_key.as_str())
-            {
-                return Ok(());
+            match self.state.committed_sequence.cmp(&sequence) {
+                std::cmp::Ordering::Greater => {
+                    return Err(Error::Corruption {
+                        message: format!(
+                            "object WAL head advanced to sequence {} while publishing older sequence {}",
+                            self.state.committed_sequence.get(),
+                            sequence.get()
+                        ),
+                    });
+                }
+                std::cmp::Ordering::Equal => {
+                    if self.state.current_wal_key.as_deref() == Some(wal_key.as_str()) {
+                        return Ok(());
+                    }
+                    return Err(Error::Corruption {
+                        message: format!(
+                            "object WAL sequence {} names conflicting immutable segment heads",
+                            sequence.get()
+                        ),
+                    });
+                }
+                std::cmp::Ordering::Less => {}
             }
             let mut next = self.state.clone();
-            if next.committed_sequence < sequence {
-                next.committed_sequence = sequence;
-            }
+            next.committed_sequence = sequence;
             next.current_wal_key = Some(wal_key.clone());
             next.lease_expires_at_ms = object_lease_deadline_ms(current_epoch_millis()?);
-            match self
+            let publish = self
                 .client
                 .put_if(
                     &self.key,
                     encode_lease_state(next.clone())?,
                     Precondition::IfMatch(self.etag.clone()),
                 )
-                .await?
-            {
-                PutIf::Stored { etag } => {
+                .await;
+            match publish {
+                Ok(PutIf::Stored { etag }) => {
                     self.etag = etag;
                     self.state = next;
-                    self.cached_wal_segment = Some(CachedWalSegment {
-                        key: wal_key,
-                        bytes: segment.clone(),
-                    });
                     return Ok(());
                 }
-                PutIf::PreconditionFailed { .. } => {
+                Ok(PutIf::PreconditionFailed { .. }) => {
                     let Some(current) = read_lease_state(&self.client, &self.key).await? else {
                         return Err(Error::Fenced {
                             held_epoch: self.state.epoch,
@@ -1068,17 +1114,20 @@ impl ObjectWriterLease {
                     }
                     self.etag = current.etag;
                     self.state = current.state;
-                    self.invalidate_wal_cache_if_stale();
+                }
+                Err(error) => {
+                    if let Ok(Some(current)) = read_lease_state(&self.client, &self.key).await
+                        && current.state.epoch == next.epoch
+                        && current.state.committed_sequence >= sequence
+                        && current.state.current_wal_key.as_deref() == Some(wal_key.as_str())
+                    {
+                        self.etag = current.etag;
+                        self.state = current.state;
+                        return Ok(());
+                    }
+                    return Err(error);
                 }
             }
-        }
-    }
-
-    fn invalidate_wal_cache_if_stale(&mut self) {
-        if self.cached_wal_segment.as_ref().is_some_and(|cached| {
-            Some(cached.key.as_str()) != self.state.current_wal_key.as_deref()
-        }) {
-            self.cached_wal_segment = None;
         }
     }
 
@@ -1087,61 +1136,46 @@ impl ObjectWriterLease {
         db_path: &std::path::Path,
         replay_floor: Sequence,
     ) -> Result<Vec<String>> {
-        self.ensure_current().await?;
+        self.refresh_current().await?;
         loop {
-            let Some(current_key) = self.state.current_wal_key.clone() else {
+            if self.state.current_wal_key.is_none() {
                 return Ok(Vec::new());
-            };
-            let bytes = self
-                .client
-                .get(&current_key)
-                .await?
-                .ok_or_else(|| Error::Corruption {
-                    message: format!("object WAL segment {current_key} is missing"),
-                })?;
-            let batches = wal::decode_frames_after(bytes.as_ref(), replay_floor)?
-                .into_iter()
-                .filter(|batch| batch.sequence <= self.state.committed_sequence)
-                .collect::<Vec<_>>();
+            }
+            let (batches, delete_keys) =
+                read_object_wal_chain(&self.client, db_path, &self.state, replay_floor).await?;
             let mut next = self.state.clone();
-            let mut next_cache = None;
-            let delete_keys = vec![current_key.clone()];
             if batches.is_empty() {
                 next.current_wal_key = None;
-                self.cached_wal_segment = None;
             } else {
                 let rewritten = wal::encode_batches_after(&batches, replay_floor)?;
                 let last_sequence = batches.last().map_or(replay_floor, |batch| batch.sequence);
-                let next_key =
-                    wal::object_wal_rewrite_path(db_path, self.state.epoch, last_sequence)
-                        .to_string_lossy()
-                        .into_owned();
-                self.client
-                    .put(&next_key, Arc::from(rewritten.as_slice()))
-                    .await?;
-                next_cache = Some(CachedWalSegment {
-                    key: next_key.clone(),
-                    bytes: rewritten,
-                });
+                let segment = encode_object_wal_segment(None, &rewritten)?;
+                let identity = object_wal_segment_identity(&segment);
+                let next_key = canonical_object_key(&wal::object_wal_rewrite_path(
+                    db_path,
+                    self.state.epoch,
+                    last_sequence,
+                    &identity,
+                ))?;
+                put_immutable_object(&self.client, &next_key, Arc::from(segment)).await?;
                 next.current_wal_key = Some(next_key);
             }
             next.lease_expires_at_ms = object_lease_deadline_ms(current_epoch_millis()?);
-            match self
+            let publish = self
                 .client
                 .put_if(
                     &self.key,
                     encode_lease_state(next.clone())?,
                     Precondition::IfMatch(self.etag.clone()),
                 )
-                .await?
-            {
-                PutIf::Stored { etag } => {
+                .await;
+            match publish {
+                Ok(PutIf::Stored { etag }) => {
                     self.etag = etag;
                     self.state = next;
-                    self.cached_wal_segment = next_cache;
                     return Ok(delete_keys);
                 }
-                PutIf::PreconditionFailed { .. } => {
+                Ok(PutIf::PreconditionFailed { .. }) => {
                     let Some(current) = read_lease_state(&self.client, &self.key).await? else {
                         return Err(Error::Fenced {
                             held_epoch: self.state.epoch,
@@ -1164,11 +1198,243 @@ impl ObjectWriterLease {
                     }
                     self.etag = current.etag;
                     self.state = current.state;
-                    self.invalidate_wal_cache_if_stale();
+                }
+                Err(error) => {
+                    if let Ok(Some(current)) = read_lease_state(&self.client, &self.key).await
+                        && current.state == next
+                    {
+                        self.etag = current.etag;
+                        self.state = current.state;
+                        return Ok(delete_keys);
+                    }
+                    return Err(error);
                 }
             }
         }
     }
+}
+
+fn encode_object_wal_segment(previous_key: Option<&str>, frames: &[u8]) -> Result<Vec<u8>> {
+    let previous_key = previous_key.unwrap_or_default();
+    let key_len = u32::try_from(previous_key.len())
+        .map_err(|_| Error::invalid_options("object WAL predecessor key exceeds u32::MAX"))?;
+    let capacity = OBJECT_WAL_SEGMENT_HEADER_LEN
+        .checked_add(previous_key.len())
+        .and_then(|size| size.checked_add(frames.len()))
+        .ok_or_else(|| Error::invalid_options("object WAL segment size overflow"))?;
+    let mut segment = Vec::with_capacity(capacity);
+    segment.extend_from_slice(OBJECT_WAL_SEGMENT_MAGIC);
+    segment.extend_from_slice(&key_len.to_le_bytes());
+    segment.extend_from_slice(previous_key.as_bytes());
+    segment.extend_from_slice(frames);
+    Ok(segment)
+}
+
+fn object_wal_segment_identity(segment: &[u8]) -> String {
+    let digest = Sha256::digest(segment);
+    let mut identity = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut identity, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    identity
+}
+
+fn decode_object_wal_segment<'bytes>(
+    key: &str,
+    bytes: &'bytes [u8],
+) -> Result<(Option<String>, &'bytes [u8])> {
+    if bytes.get(..OBJECT_WAL_SEGMENT_MAGIC.len()) != Some(OBJECT_WAL_SEGMENT_MAGIC) {
+        return Err(Error::Corruption {
+            message: format!("object WAL segment {key} has an invalid format marker"),
+        });
+    }
+    let key_len_bytes: [u8; 4] = bytes
+        .get(8..12)
+        .ok_or_else(|| Error::Corruption {
+            message: format!("object WAL segment {key} has a truncated chain header"),
+        })?
+        .try_into()
+        .expect("checked object WAL predecessor length bytes");
+    let key_len =
+        usize::try_from(u32::from_le_bytes(key_len_bytes)).map_err(|_| Error::Corruption {
+            message: format!("object WAL segment {key} predecessor length overflow"),
+        })?;
+    let payload_offset = OBJECT_WAL_SEGMENT_HEADER_LEN
+        .checked_add(key_len)
+        .ok_or_else(|| Error::Corruption {
+            message: format!("object WAL segment {key} predecessor offset overflow"),
+        })?;
+    let predecessor = bytes
+        .get(OBJECT_WAL_SEGMENT_HEADER_LEN..payload_offset)
+        .ok_or_else(|| Error::Corruption {
+            message: format!("object WAL segment {key} has a truncated predecessor key"),
+        })?;
+    let frames = bytes
+        .get(payload_offset..)
+        .ok_or_else(|| Error::Corruption {
+            message: format!("object WAL segment {key} has a truncated frame payload"),
+        })?;
+    let predecessor = if predecessor.is_empty() {
+        None
+    } else {
+        Some(
+            std::str::from_utf8(predecessor)
+                .map_err(|_| Error::Corruption {
+                    message: format!("object WAL segment {key} predecessor is not UTF-8"),
+                })?
+                .to_owned(),
+        )
+    };
+    Ok((predecessor, frames))
+}
+
+async fn put_immutable_object(
+    client: &Arc<dyn ObjectClient>,
+    key: &str,
+    bytes: Arc<[u8]>,
+) -> Result<()> {
+    let publish = client
+        .put_if(key, Arc::clone(&bytes), Precondition::IfNoneMatch)
+        .await;
+    match publish {
+        Ok(PutIf::Stored { .. }) => Ok(()),
+        Ok(PutIf::PreconditionFailed { .. }) => {
+            let existing = client.get(key).await?;
+            if existing.as_deref() == Some(bytes.as_ref()) {
+                Ok(())
+            } else {
+                Err(Error::Corruption {
+                    message: format!(
+                        "immutable object WAL segment {key} already has different bytes"
+                    ),
+                })
+            }
+        }
+        Err(error) => {
+            if let Ok(Some(existing)) = client.get(key).await
+                && existing.as_ref() == bytes.as_ref()
+            {
+                return Ok(());
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn read_object_wal_chain(
+    client: &Arc<dyn ObjectClient>,
+    db_path: &std::path::Path,
+    state: &ObjectLeaseState,
+    replay_floor: Sequence,
+) -> Result<(Vec<wal::WalBatch>, Vec<String>)> {
+    if state.committed_sequence <= replay_floor {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut current = state
+        .current_wal_key
+        .clone()
+        .ok_or_else(|| Error::Corruption {
+            message: format!(
+                "object WAL head reached sequence {} without a segment",
+                state.committed_sequence.get()
+            ),
+        })?;
+    let mut visited = HashSet::new();
+    let mut keys = Vec::new();
+    let mut batches = Vec::new();
+    loop {
+        validate_object_wal_key(db_path, &current)?;
+        if !visited.insert(current.clone()) {
+            return Err(Error::Corruption {
+                message: format!("object WAL chain contains a cycle at {current}"),
+            });
+        }
+        let bytes = client
+            .get(&current)
+            .await?
+            .ok_or_else(|| Error::Corruption {
+                message: format!("object WAL segment {current} is missing"),
+            })?;
+        let (previous, frames) = decode_object_wal_segment(&current, &bytes)?;
+        batches.extend(
+            wal::decode_frames_after(frames, replay_floor)?
+                .into_iter()
+                .filter(|batch| batch.sequence <= state.committed_sequence),
+        );
+        keys.push(current);
+        let Some(previous) = previous else {
+            break;
+        };
+        current = previous;
+    }
+    batches.sort_unstable_by_key(|batch| batch.sequence);
+    let mut previous = replay_floor;
+    for batch in &batches {
+        let expected = previous
+            .get()
+            .checked_add(1)
+            .map(Sequence::new)
+            .ok_or_else(|| Error::Corruption {
+                message: "object WAL sequence overflow while validating its chain".to_owned(),
+            })?;
+        if batch.sequence != expected {
+            return Err(Error::Corruption {
+                message: format!(
+                    "object WAL chain expected sequence {}, got {}",
+                    expected.get(),
+                    batch.sequence.get()
+                ),
+            });
+        }
+        previous = batch.sequence;
+    }
+    if previous != state.committed_sequence {
+        return Err(Error::Corruption {
+            message: format!(
+                "object WAL chain ended at sequence {}, below committed head {}",
+                previous.get(),
+                state.committed_sequence.get()
+            ),
+        });
+    }
+    Ok((batches, keys))
+}
+
+fn validate_object_wal_key(db_path: &std::path::Path, key: &str) -> Result<()> {
+    let root = canonical_object_key(db_path)?;
+    let canonical = crate::object_store::canonical_object_prefix(key)?;
+    let expected_parent = if root.is_empty() {
+        None
+    } else {
+        Some(root.as_str())
+    };
+    let path = std::path::Path::new(&canonical);
+    let parent = path
+        .parent()
+        .and_then(std::path::Path::to_str)
+        .filter(|parent| !parent.is_empty());
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default();
+    if canonical != key || parent != expected_parent || !crate::is_wal_object_key(name) {
+        return Err(Error::Corruption {
+            message: format!("object WAL chain key {key:?} is outside database root {root:?}"),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) async fn object_store_wal_batches_after_replay_floor(
+    client: Arc<dyn ObjectClient>,
+    db_path: &std::path::Path,
+    state: &ObjectLeaseState,
+    replay_floor: Sequence,
+) -> Result<Vec<wal::WalBatch>> {
+    read_object_wal_chain(&client, db_path, state, replay_floor)
+        .await
+        .map(|(batches, _)| batches)
 }
 
 struct ObservedLeaseState {

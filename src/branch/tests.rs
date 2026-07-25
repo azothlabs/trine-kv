@@ -3,10 +3,18 @@ use crate::storage::{
     StorageObjectKind,
     fault_injection::{StorageFaultGuard, StorageFaultPoint},
 };
-use crate::{Db, DbOptions, KeyRange, ReadVersion};
+use crate::{Db, DbOptions, Error, KeyRange};
 
 fn memory_db() -> Db {
     Db::open_sync(DbOptions::memory()).expect("open in-memory db")
+}
+
+#[test]
+fn registry_entries_require_current_format_marker() {
+    assert!(matches!(
+        RegistryEntry::decode(&[0; 32]),
+        Err(Error::Corruption { .. })
+    ));
 }
 
 #[test]
@@ -144,6 +152,54 @@ fn durable_branch_persists_writes_and_shadows_parent() {
 }
 
 #[test]
+fn durable_branch_storage_names_cannot_collide_at_component_boundaries() {
+    let db = memory_db();
+    let first_bucket = "b\u{1}c";
+    let second_branch = "a\u{1}b";
+    db.bucket_sync(first_bucket).expect("first parent bucket");
+    db.bucket_sync("c").expect("second parent bucket");
+    let fork = db.latest_read_version();
+    db.create_branch("a", fork).expect("first branch");
+    db.create_branch(second_branch, fork)
+        .expect("second branch");
+
+    let mut first = db.open_branch("a").expect("open first branch");
+    first
+        .put(first_bucket, b"k", b"first".to_vec())
+        .expect("write first branch");
+    let mut second = db.open_branch(second_branch).expect("open second branch");
+    second
+        .put("c", b"k", b"second".to_vec())
+        .expect("write second branch");
+
+    drop(first);
+    drop(second);
+    assert_eq!(
+        db.open_branch("a")
+            .expect("reopen first")
+            .get(first_bucket, b"k")
+            .expect("read first"),
+        Some(b"first".to_vec())
+    );
+    assert_eq!(
+        db.open_branch(second_branch)
+            .expect("reopen second")
+            .get("c", b"k")
+            .expect("read second"),
+        Some(b"second".to_vec())
+    );
+
+    db.delete_branch("a").expect("delete first branch");
+    assert_eq!(
+        db.open_branch(second_branch)
+            .expect("second survives first deletion")
+            .get("c", b"k")
+            .expect("read surviving branch"),
+        Some(b"second".to_vec())
+    );
+}
+
+#[test]
 fn durable_branch_write_commits_data_and_registry_together() {
     let dir =
         std::env::temp_dir().join(format!("trine-branch-atomic-write-{}", std::process::id()));
@@ -167,7 +223,7 @@ fn durable_branch_write_commits_data_and_registry_together() {
     let registry = db.read_registry("dev").expect("registry").expect("entry");
     assert!(registry.written_buckets.is_empty());
     assert_eq!(
-        db.bucket_sync(data_bucket("dev", "data"))
+        db.internal_bucket_sync(data_bucket("dev", "data"))
             .expect("data bucket")
             .get_sync(b"k")
             .expect("data read"),
@@ -198,9 +254,10 @@ fn deleting_marker_hides_branch_and_delete_resumes() {
 
     let mut entry = db.read_registry("dev").expect("registry").expect("entry");
     entry.lifecycle = BranchLifecycle::Deleting;
-    db.bucket_sync(registry_bucket())
+    let encoded = entry.encode().expect("encode interrupted delete marker");
+    db.internal_bucket_sync(registry_bucket())
         .expect("registry bucket")
-        .put_sync(b"dev".to_vec(), entry.encode())
+        .put_sync(b"dev".to_vec(), encoded)
         .expect("persist interrupted delete marker");
 
     assert!(db.list_branches().expect("list").is_empty());
@@ -236,18 +293,6 @@ fn stale_handle_cannot_write_recreated_branch_generation() {
             .expect("read replacement"),
         None
     );
-}
-
-#[test]
-fn legacy_registry_entry_decodes_as_active_generation_zero() {
-    let mut legacy = Vec::new();
-    legacy.extend_from_slice(&7_u64.to_le_bytes());
-    legacy.extend_from_slice(&0_u32.to_le_bytes());
-    legacy.push(0);
-    let decoded = RegistryEntry::decode(&legacy).expect("legacy entry decodes");
-    assert_eq!(decoded.fork, ReadVersion::from_u64(7));
-    assert_eq!(decoded.lifecycle, BranchLifecycle::Active);
-    assert_eq!(decoded.generation, [0; 16]);
 }
 
 #[test]
@@ -530,10 +575,10 @@ fn branch_info_exposes_fork_and_parent_without_opening_data() {
 }
 
 #[test]
-fn orphan_fork_checkpoint_cannot_be_rebound_to_another_version() {
+fn orphan_fork_checkpoint_is_reconciled_to_the_registry_intent() {
     let db = Db::open_sync(DbOptions::memory().with_keep_last_read_versions(64)).expect("open");
     let old_fork = db.latest_read_version();
-    db.create_checkpoint_at_sync(&fork_checkpoint("dev"), old_fork)
+    db.create_internal_checkpoint_at_sync(&fork_checkpoint("dev"), old_fork)
         .expect("orphan checkpoint creates");
     db.bucket_sync("data")
         .expect("bucket")
@@ -542,23 +587,14 @@ fn orphan_fork_checkpoint_cannot_be_rebound_to_another_version() {
     let new_fork = db.latest_read_version();
     assert_ne!(old_fork, new_fork);
 
-    let error = db
-        .create_branch("dev", new_fork)
-        .expect_err("a stale orphan checkpoint cannot pin the new fork");
-    assert!(error.to_string().contains("different version"));
-    assert!(
-        db.branch_info("dev").expect("registry reads").is_none(),
-        "checkpoint mismatch must not publish a branch registry entry"
-    );
-
-    db.create_branch("dev", old_fork)
-        .expect("retrying the matching interrupted create succeeds");
+    db.create_branch("dev", new_fork)
+        .expect("stale orphan is removed before activating the new intent");
     assert_eq!(
         db.branch_info("dev")
             .expect("registry reads")
             .expect("branch publishes")
             .fork(),
-        old_fork
+        new_fork
     );
 }
 

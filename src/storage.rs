@@ -828,6 +828,31 @@ impl StorageObjectDeleteBackend for MemoryStorageBackend {
     }
 }
 
+impl StorageObjectListBackend for MemoryStorageBackend {
+    fn list_objects(
+        &self,
+        request: StorageObjectListRequest,
+    ) -> StorageFuture<'_, Vec<StorageObjectId>> {
+        Box::pin(async move {
+            let objects = self.lock_objects()?;
+            let mut listed = objects
+                .keys()
+                .filter(|object| object.kind() == request.kind())
+                .filter(|object| object.path().parent() == Some(request.root()))
+                .filter(|object| {
+                    request.file_extension().is_none_or(|extension| {
+                        object.path().extension().and_then(|value| value.to_str())
+                            == Some(extension)
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            listed.sort_unstable();
+            Ok(listed)
+        })
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct MemoryStorageObject {

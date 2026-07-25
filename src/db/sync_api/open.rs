@@ -11,8 +11,8 @@ use super::{
     create_storage_directory_all_async, ensure_default_bucket_in_manifest,
     ensure_default_bucket_in_manifest_async, ensure_default_bucket_loaded,
     list_persistent_directory_files, list_persistent_directory_files_async, manifest,
-    object_store_committed_wal_batches, object_store_wal_paths_after_replay_floor,
-    persistent_path_from_options, recovery, repair_safe_temporary_files_for_open,
+    object_store_committed_wal_batches, persistent_path_from_options, recovery,
+    repair_safe_temporary_files_for_open,
     repair_safe_temporary_files_for_open_from_directory_files_async,
     run_persistent_recovery_checks, run_persistent_recovery_checks_from_directory_files_async,
     runtime, validate_common_options, validate_options, verify_object_client_contract_for_open,
@@ -20,8 +20,10 @@ use super::{
 };
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::db::open_helpers::run_persistent_recovery_checks_async;
+use crate::object_store::{canonical_object_key, canonical_object_prefix};
 use crate::options::ContentReclamationMode;
 use crate::storage::MemoryStorageBackend;
+use crate::substrate::object_store_wal_batches_after_replay_floor;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::{
     storage::{
@@ -657,7 +659,8 @@ impl Db {
             return Err(Error::unsupported_durability(options.durability));
         }
 
-        let db_path = PathBuf::from(prefix.into());
+        let prefix = canonical_object_prefix(&prefix.into())?;
+        let db_path = PathBuf::from(prefix);
         if let ContentReclamationMode::QualifiedObjectStore(qualification) =
             &options.content_reclamation
         {
@@ -688,16 +691,11 @@ impl Db {
                 verify_object_client_contract_for_open(&wal_client, &db_path, "wal").await?;
             }
         }
-        let manifest_key = manifest::manifest_path(&db_path)
-            .to_string_lossy()
-            .into_owned();
+        let manifest_key = canonical_object_key(&manifest::manifest_path(&db_path))?;
 
         // Acquire the writer lease before the manifest, so its fencing epoch is
         // known and can be stamped into every publish.
-        let lease_key = db_path
-            .join(recovery::PROCESS_LOCK_FILE_NAME)
-            .to_string_lossy()
-            .into_owned();
+        let lease_key = canonical_object_key(&db_path.join(recovery::PROCESS_LOCK_FILE_NAME))?;
         let (substrate, remote_wal_state) = if options.read_only {
             let remote_wal_state =
                 ObjectWriterLease::read_current(Arc::clone(&wal_client), lease_key)
@@ -738,15 +736,15 @@ impl Db {
             buckets_from_manifest_async(&backend, &db_path, manifest.state(), true).await?;
         ensure_default_bucket_loaded(&mut buckets, &options)?;
         let replay_floor = manifest.state().wal_replay_floor();
-        let wal_paths = object_store_wal_paths_after_replay_floor(&remote_wal_state, replay_floor)?;
-        let wal_streams = wal::read_recovery_streams_after_paths_with_backend_async(
-            &wal_backend,
-            &wal_paths,
+        let wal_batches = object_store_wal_batches_after_replay_floor(
+            Arc::clone(&wal_client),
+            &db_path,
+            &remote_wal_state,
             replay_floor,
         )
         .await?;
         let batches = object_store_committed_wal_batches(
-            wal::merge_batch_streams_by_sequence(wal_streams)?,
+            wal_batches,
             replay_floor,
             remote_wal_state.committed_sequence,
         )?;

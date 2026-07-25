@@ -2,7 +2,7 @@ use std::{marker::PhantomData, sync::Arc};
 
 use crate::{
     db::Db,
-    error::Result,
+    error::{Error, Result},
     iterator::{Direction, Iter, LazyIter},
     lsm::{LsmPointReadSnapshot, LsmTree},
     options::{BucketOptions, WriteOptions},
@@ -13,11 +13,47 @@ use crate::{
 };
 
 pub(crate) const DEFAULT_BUCKET_NAME: &str = "default";
+pub(crate) const INTERNAL_BUCKET_PREFIX: &str = "\u{1}trine-";
+const MAX_USER_BUCKET_NAME_BYTES: usize = 1_024;
+
+pub(crate) fn validate_user_named_bucket(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::invalid_options("bucket name cannot be empty"));
+    }
+    if name == DEFAULT_BUCKET_NAME {
+        return Err(Error::invalid_options(
+            "default bucket is accessed through Db helpers",
+        ));
+    }
+    if name.starts_with(INTERNAL_BUCKET_PREFIX) {
+        return Err(Error::invalid_options(
+            "bucket name uses Trine's reserved internal namespace",
+        ));
+    }
+    if name.len() > MAX_USER_BUCKET_NAME_BYTES {
+        return Err(Error::invalid_options(
+            "bucket name exceeds the 1024-byte limit",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn require_internal_bucket(name: &str) -> Result<()> {
+    if name.starts_with(INTERNAL_BUCKET_PREFIX) {
+        Ok(())
+    } else {
+        Err(Error::Corruption {
+            message: format!("internal bucket name {name:?} is outside the reserved namespace"),
+        })
+    }
+}
 
 /// Name of an optional bucket returned through `Db::bucket`.
 ///
-/// `Db` validates bucket names when creating them. The reserved default bucket
-/// is reached through direct `Db` helpers or `Db::default_bucket`.
+/// `Db` validates bucket names when creating them. Names must be non-empty,
+/// contain at most 1024 UTF-8 bytes, and stay outside Trine's reserved internal
+/// namespace. The reserved default bucket is reached through direct `Db`
+/// helpers or `Db::default_bucket`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BucketName(String);
 
@@ -161,7 +197,7 @@ impl Bucket {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Closed`](crate::Error::Closed) if the parent database
+    /// Returns [`Error::Closed`] if the parent database
     /// is closed, plus storage or format errors encountered while reading
     /// tables or blob files. Any such error fails the whole batch.
     ///
@@ -251,6 +287,8 @@ impl Bucket {
         let mut batch = WriteBatch::new();
         if self.name.as_str() == DEFAULT_BUCKET_NAME {
             batch.put(key, value);
+        } else if self.name.as_str().starts_with(INTERNAL_BUCKET_PREFIX) {
+            batch.put_internal_bucket(self.name.as_str(), key, value)?;
         } else {
             batch.put_bucket(self.name.as_str(), key, value)?;
         }
@@ -272,6 +310,8 @@ impl Bucket {
         let mut batch = WriteBatch::new();
         if self.name.as_str() == DEFAULT_BUCKET_NAME {
             batch.delete(key);
+        } else if self.name.as_str().starts_with(INTERNAL_BUCKET_PREFIX) {
+            batch.delete_internal_bucket(self.name.as_str(), key)?;
         } else {
             batch.delete_bucket(self.name.as_str(), key)?;
         }
@@ -293,6 +333,8 @@ impl Bucket {
         let mut batch = WriteBatch::new();
         if self.name.as_str() == DEFAULT_BUCKET_NAME {
             batch.delete_range(range);
+        } else if self.name.as_str().starts_with(INTERNAL_BUCKET_PREFIX) {
+            batch.delete_range_internal_bucket(self.name.as_str(), range)?;
         } else {
             batch.delete_range_bucket(self.name.as_str(), range)?;
         }
@@ -505,7 +547,7 @@ impl Bucket {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Closed`](crate::Error::Closed) if the parent database
+    /// Returns [`Error::Closed`] if the parent database
     /// is closed, plus storage or format errors encountered while reading
     /// tables or blob files. Any such error fails the whole batch.
     ///
@@ -551,6 +593,8 @@ impl Bucket {
         let mut batch = WriteBatch::new();
         if self.name.as_str() == DEFAULT_BUCKET_NAME {
             batch.put(key, value);
+        } else if self.name.as_str().starts_with(INTERNAL_BUCKET_PREFIX) {
+            batch.put_internal_bucket(self.name.as_str(), key, value)?;
         } else {
             batch.put_bucket(self.name.as_str(), key, value)?;
         }
@@ -573,6 +617,8 @@ impl Bucket {
         let mut batch = WriteBatch::new();
         if self.name.as_str() == DEFAULT_BUCKET_NAME {
             batch.delete(key);
+        } else if self.name.as_str().starts_with(INTERNAL_BUCKET_PREFIX) {
+            batch.delete_internal_bucket(self.name.as_str(), key)?;
         } else {
             batch.delete_bucket(self.name.as_str(), key)?;
         }
@@ -595,6 +641,8 @@ impl Bucket {
         let mut batch = WriteBatch::new();
         if self.name.as_str() == DEFAULT_BUCKET_NAME {
             batch.delete_range(range);
+        } else if self.name.as_str().starts_with(INTERNAL_BUCKET_PREFIX) {
+            batch.delete_range_internal_bucket(self.name.as_str(), range)?;
         } else {
             batch.delete_range_bucket(self.name.as_str(), range)?;
         }

@@ -15,6 +15,7 @@ fn classifies_wal_objects_by_final_segment() {
 use std::{
     fs,
     future::Future,
+    path::Path,
     task::{Context, Poll, Waker},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -28,10 +29,21 @@ use super::{
     DEFAULT_WAL_SHARD_COUNT, WAL_FILE_NAME, WAL_FORMAT_VERSION, WAL_FRONT_DOOR_QUEUE_CAPACITY,
     WAL_MAGIC, WalFrontDoor, append_batch_with_backend_async, checksum, decode_frames_after,
     decode_payload, discover_wal_paths_with_backend, discover_wal_paths_with_backend_async,
-    merge_batch_streams_by_sequence, read_all_batches, read_batches_after_with_backend,
-    read_batches_after_with_backend_async, read_recovery_streams_after_with_backend_async,
-    rewrite_batches_after_with_backend_async, wal_rewrite_tmp_path, wal_shard_path,
+    merge_batch_streams_by_sequence, object_wal_sequence_from_path, read_all_batches,
+    read_batches_after_with_backend, read_batches_after_with_backend_async,
+    read_recovery_streams_after_with_backend_async, rewrite_batches_after_with_backend_async,
+    wal_rewrite_tmp_path, wal_shard_path,
 };
+
+#[test]
+fn object_wal_paths_require_content_identity() {
+    let path =
+        Path::new("trine.wal.epoch-00000000000000000001.commit-00000000000000000002.trinewal");
+    assert!(matches!(
+        object_wal_sequence_from_path(path),
+        Err(crate::Error::Corruption { .. })
+    ));
+}
 
 #[test]
 fn wal_front_door_accepts_whole_commit_record() {

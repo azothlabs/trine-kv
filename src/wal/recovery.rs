@@ -33,20 +33,30 @@ pub fn wal_shard_path(db_path: &Path, shard_index: usize) -> PathBuf {
 }
 
 #[must_use]
-pub(crate) fn object_wal_commit_path(db_path: &Path, epoch: u64, sequence: Sequence) -> PathBuf {
+pub(crate) fn object_wal_commit_path(
+    db_path: &Path,
+    epoch: u64,
+    sequence: Sequence,
+    identity: &str,
+) -> PathBuf {
     let width = OBJECT_WAL_SEQUENCE_DIGITS;
     db_path.join(format!(
-        "{OBJECT_WAL_FILE_PREFIX}{epoch:0width$}{OBJECT_WAL_COMMIT_MARKER}{:0width$}{OBJECT_WAL_FILE_SUFFIX}",
-        sequence.get()
+        "{OBJECT_WAL_FILE_PREFIX}{epoch:0width$}{OBJECT_WAL_COMMIT_MARKER}{:0width$}-{identity}{OBJECT_WAL_FILE_SUFFIX}",
+        sequence.get(),
     ))
 }
 
 #[must_use]
-pub(crate) fn object_wal_rewrite_path(db_path: &Path, epoch: u64, sequence: Sequence) -> PathBuf {
+pub(crate) fn object_wal_rewrite_path(
+    db_path: &Path,
+    epoch: u64,
+    sequence: Sequence,
+    identity: &str,
+) -> PathBuf {
     let width = OBJECT_WAL_SEQUENCE_DIGITS;
     db_path.join(format!(
-        "{OBJECT_WAL_REWRITE_PREFIX}{epoch:0width$}{OBJECT_WAL_REWRITE_MARKER}{:0width$}{OBJECT_WAL_FILE_SUFFIX}",
-        sequence.get()
+        "{OBJECT_WAL_REWRITE_PREFIX}{epoch:0width$}{OBJECT_WAL_REWRITE_MARKER}{:0width$}-{identity}{OBJECT_WAL_FILE_SUFFIX}",
+        sequence.get(),
     ))
 }
 

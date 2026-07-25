@@ -1,14 +1,17 @@
 use super::open_helpers::{
     buckets_from_manifest_async, ensure_default_bucket_loaded, lock_poisoned,
-    object_store_committed_wal_batches, object_store_wal_paths_after_replay_floor,
-    validate_checkpoint_name,
+    object_store_committed_wal_batches, require_internal_checkpoint_name, validate_checkpoint_name,
 };
 use super::{
     Arc, Bucket, BucketName, BucketOptions, CommitInfo, DEFAULT_BUCKET_NAME, Db, Direction,
     DurabilityMode, Error, HostStorageBackend, IntoOpenOptions, Iter, KeyRange, LazyIter,
     MaintenanceBudget, MaintenanceOutcome, ManifestStore, ObjectLeaseState, ObjectWriterLease,
     ReadVersion, Result, Snapshot, StorageMode, Value, WriteOptions, commit, manifest, recovery,
-    wal,
+};
+use crate::{
+    bucket::{require_internal_bucket, validate_user_named_bucket},
+    object_store::canonical_object_key,
+    substrate::object_store_wal_batches_after_replay_floor,
 };
 
 /// Primary async database API. Synchronous callers can use the explicit
@@ -121,13 +124,8 @@ impl Db {
         let wal_backend = self.object_wal_storage()?;
         let wal_client = wal_backend.client();
         let db_path = self.object_store_db_path().to_path_buf();
-        let manifest_key = manifest::manifest_path(&db_path)
-            .to_string_lossy()
-            .into_owned();
-        let lease_key = db_path
-            .join(recovery::PROCESS_LOCK_FILE_NAME)
-            .to_string_lossy()
-            .into_owned();
+        let manifest_key = canonical_object_key(&manifest::manifest_path(&db_path))?;
+        let lease_key = canonical_object_key(&db_path.join(recovery::PROCESS_LOCK_FILE_NAME))?;
 
         let remote_wal_state = ObjectWriterLease::read_current(Arc::clone(&wal_client), lease_key)
             .await?
@@ -139,15 +137,15 @@ impl Db {
         ensure_default_bucket_loaded(&mut buckets, &self.inner.options)?;
 
         let replay_floor = manifest.state().wal_replay_floor();
-        let wal_paths = object_store_wal_paths_after_replay_floor(&remote_wal_state, replay_floor)?;
-        let wal_streams = wal::read_recovery_streams_after_paths_with_backend_async(
-            &wal_backend,
-            &wal_paths,
+        let wal_batches = object_store_wal_batches_after_replay_floor(
+            Arc::clone(&wal_client),
+            &db_path,
+            &remote_wal_state,
             replay_floor,
         )
         .await?;
         let batches = object_store_committed_wal_batches(
-            wal::merge_batch_streams_by_sequence(wal_streams)?,
+            wal_batches,
             replay_floor,
             remote_wal_state.committed_sequence,
         )?;
@@ -196,8 +194,9 @@ impl Db {
     ///
     /// # Parameters
     ///
-    /// - `name`: non-empty bucket name. The reserved default bucket name must
-    ///   be accessed with [`Db::default_bucket`].
+    /// - `name`: non-empty bucket name of at most 1024 UTF-8 bytes. The default
+    ///   name and Trine's internal namespace are reserved; access the default
+    ///   through [`Db::default_bucket`].
     pub async fn bucket(&self, name: impl Into<BucketName>) -> Result<Bucket> {
         self.bucket_with_options(name, BucketOptions::default())
             .await
@@ -211,7 +210,8 @@ impl Db {
     ///
     /// # Parameters
     ///
-    /// - `name`: non-empty bucket name.
+    /// - `name`: non-empty bucket name of at most 1024 UTF-8 bytes, outside the
+    ///   default and internal reserved namespaces.
     /// - `options`: compression, filter, prefix, blob, and block settings used
     ///   if the bucket is created.
     pub async fn bucket_with_options(
@@ -219,20 +219,39 @@ impl Db {
         name: impl Into<BucketName>,
         options: BucketOptions,
     ) -> Result<Bucket> {
+        let name = name.into();
+        validate_user_named_bucket(name.as_str())?;
         if self.inner.options.storage_mode.is_object_store_persistent() {
             return self
-                .bucket_with_options_object_store_async(name.into(), options)
+                .bucket_with_options_object_store_async(name, options)
+                .await;
+        }
+
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        if self.inner.options.storage_mode.is_browser_persistent() {
+            return self.bucket_with_options_browser_async(name, options).await;
+        }
+
+        self.bucket_with_options_sync(name, options)
+    }
+
+    pub(crate) async fn internal_bucket(&self, name: impl Into<BucketName>) -> Result<Bucket> {
+        let name = name.into();
+        require_internal_bucket(name.as_str())?;
+        if self.inner.options.storage_mode.is_object_store_persistent() {
+            return self
+                .bucket_with_options_object_store_async(name, BucketOptions::default())
                 .await;
         }
 
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         if self.inner.options.storage_mode.is_browser_persistent() {
             return self
-                .bucket_with_options_browser_async(name.into(), options)
+                .bucket_with_options_browser_async(name, BucketOptions::default())
                 .await;
         }
 
-        self.bucket_with_options_sync(name, options)
+        self.internal_bucket_sync(name)
     }
 
     /// Creates a named checkpoint at the newest visible read version.
@@ -243,13 +262,14 @@ impl Db {
     ///
     /// # Parameters
     ///
-    /// - `name`: non-empty checkpoint name, unique within this database until
+    /// - `name`: non-empty checkpoint name of at most 1024 UTF-8 bytes, outside
+    ///   Trine's internal namespace and unique within this database until
     ///   deleted.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Closed`], [`Error::ReadOnly`],
-    /// [`Error::InvalidOptions`] for an empty name, or
+    /// [`Error::InvalidOptions`] for an invalid or reserved name, or
     /// [`Error::CheckpointAlreadyExists`] if `name` already exists.
     pub async fn create_checkpoint(&self, name: &str) -> Result<ReadVersion> {
         self.ensure_open()?;
@@ -284,7 +304,7 @@ impl Db {
     /// # Errors
     ///
     /// Returns [`Error::Closed`], [`Error::ReadOnly`],
-    /// [`Error::InvalidOptions`] for an empty name, or
+    /// [`Error::InvalidOptions`] for an invalid or reserved name, or
     /// [`Error::CheckpointNotFound`] if `name` does not exist.
     pub async fn delete_checkpoint(&self, name: &str) -> Result<()> {
         self.ensure_open()?;
@@ -307,6 +327,27 @@ impl Db {
         self.delete_checkpoint_sync(name)
     }
 
+    pub(crate) async fn delete_internal_checkpoint(&self, name: &str) -> Result<()> {
+        self.ensure_open()?;
+        require_internal_checkpoint_name(name)?;
+        if self.inner.options.read_only {
+            return Err(Error::ReadOnly);
+        }
+
+        if self.inner.options.storage_mode.is_object_store_persistent() {
+            self.publish_object_manifest_delete_checkpoint(name.to_owned())
+                .await?;
+            return Ok(());
+        }
+
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        if self.inner.options.storage_mode.is_browser_persistent() {
+            return self.delete_checkpoint_browser_async(name).await;
+        }
+
+        self.delete_internal_checkpoint_sync(name)
+    }
+
     /// Returns the read version pinned by a named checkpoint.
     ///
     /// This is the async counterpart of [`Db::checkpoint_read_version_sync`].
@@ -319,10 +360,15 @@ impl Db {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Closed`], [`Error::InvalidOptions`] for an empty name,
-    /// or [`Error::CheckpointNotFound`] if `name` does not exist.
+    /// Returns [`Error::Closed`], [`Error::InvalidOptions`] for an invalid or
+    /// reserved name, or [`Error::CheckpointNotFound`] if `name` does not
+    /// exist.
     pub async fn checkpoint_read_version(&self, name: &str) -> Result<ReadVersion> {
         self.checkpoint_read_version_sync(name)
+    }
+
+    pub(crate) fn internal_checkpoint_read_version(&self, name: &str) -> Result<ReadVersion> {
+        self.internal_checkpoint_read_version_sync(name)
     }
 
     /// Reads the newest committed value for `key` from the default bucket.

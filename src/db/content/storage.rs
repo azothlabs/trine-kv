@@ -4,6 +4,7 @@ use super::{
     StorageObjectId, StorageObjectKind, StorageObjectReadBackend, StorageObjectWriteBackend,
     UploadId, UploadSessionState, content_lock_shard_index,
 };
+use crate::storage::{StorageObjectListBackend, StorageObjectListRequest};
 
 impl Db {
     pub(crate) async fn write_content_chunk(
@@ -89,7 +90,8 @@ impl Db {
 
     pub(crate) async fn write_upload_state(&self, state: &UploadSessionState) -> Result<()> {
         let object = self.content_upload_state_object(state.upload_id())?;
-        self.write_content_object(object, (*state).encode()?).await
+        let state = state.with_updated_at_unix_ms(crate::content::current_epoch_millis()?);
+        self.write_content_object(object, state.encode()?).await
     }
 
     pub(crate) async fn require_upload_state(
@@ -215,6 +217,50 @@ impl Db {
             StorageObjectKind::ContentUpload,
             path,
         ))
+    }
+
+    pub(super) async fn list_upload_states(&self) -> Result<Vec<UploadSessionState>> {
+        let root = self.content_root()?.join("uploads");
+        let request = StorageObjectListRequest::native_file(StorageObjectKind::ContentUpload, root)
+            .with_file_extension("trineu");
+        let objects = match &self.inner.options.storage_mode {
+            StorageMode::InMemory => self.inner.content_memory.list_objects(request).await?,
+            StorageMode::Persistent { .. }
+            | StorageMode::HostPersistent {
+                backend: HostStorageBackend::Wasi { .. },
+            } => self.inner.native_storage.list_objects(request).await?,
+            StorageMode::HostPersistent {
+                backend: HostStorageBackend::ObjectStore,
+            } => self.object_storage()?.list_objects(request).await?,
+            StorageMode::HostPersistent {
+                backend: HostStorageBackend::Browser { .. },
+            } => {
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                {
+                    self.browser_storage()?.list_objects(request).await?
+                }
+                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+                {
+                    return Err(Error::unsupported_backend(
+                        "browser content objects require wasm32-unknown-unknown",
+                    ));
+                }
+            }
+        };
+
+        let mut states = Vec::with_capacity(objects.len());
+        for object in objects {
+            let upload_id = upload_id_from_state_object(&object)?;
+            let Some(bytes) = self.read_content_object(object).await? else {
+                // A concurrent abort or maintenance pass can remove a state
+                // after listing. Absence is not corruption; a later listing
+                // will simply omit the completed cleanup.
+                continue;
+            };
+            states.push(UploadSessionState::decode(&bytes, upload_id)?);
+        }
+        states.sort_unstable_by_key(|state| state.upload_id());
+        Ok(states)
     }
 
     async fn write_content_object(&self, object: StorageObjectId, bytes: Arc<[u8]>) -> Result<()> {
@@ -355,4 +401,44 @@ fn hex_identifier<const N: usize>(bytes: [u8; N]) -> String {
         let _ = write!(value, "{byte:02x}");
     }
     value
+}
+
+fn upload_id_from_state_object(object: &StorageObjectId) -> Result<UploadId> {
+    let stem = object
+        .path()
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| Error::Corruption {
+            message: format!(
+                "content upload state object {} has no UTF-8 identity",
+                object.path().display()
+            ),
+        })?;
+    if stem.len() != 32 {
+        return Err(Error::Corruption {
+            message: format!(
+                "content upload state object {} has malformed identity length",
+                object.path().display()
+            ),
+        });
+    }
+    let mut bytes = [0_u8; 16];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let offset = index * 2;
+        let high = decode_hex_nibble(stem.as_bytes()[offset])?;
+        let low = decode_hex_nibble(stem.as_bytes()[offset + 1])?;
+        *byte = (high << 4) | low;
+    }
+    Ok(UploadId::from_bytes(bytes))
+}
+
+fn decode_hex_nibble(byte: u8) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(Error::Corruption {
+            message: "content upload state object has a non-hex identity".to_owned(),
+        }),
+    }
 }
