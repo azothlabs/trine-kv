@@ -45,6 +45,8 @@ use crate::bucket::BucketName;
 use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::snapshot::Snapshot;
+use crate::state_transition::DurableTransition;
+use crate::transaction::TransactionOptions;
 use crate::types::{KeyRange, KeyValue, ReadVersion, Value};
 
 /// Prefix reserving the buckets branching keeps its own state in. Branch names
@@ -96,12 +98,37 @@ impl BranchInfo {
 /// A durable branch's persisted metadata: where it forked, the parent branch it
 /// forked from (`None` = the root lineage), and which user buckets it has written
 /// (so a read need not touch — or create — a data bucket the branch never wrote).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchLifecycle {
+    Active,
+    Deleting,
+}
+
+impl BranchLifecycle {
+    fn require_active(self) -> Result<()> {
+        match self {
+            Self::Active => Ok(()),
+            Self::Deleting => Err(Error::invalid_options("branch deletion is in progress")),
+        }
+    }
+
+    fn begin_delete(self) -> DurableTransition<Self> {
+        match self {
+            Self::Active => DurableTransition::Apply(Self::Deleting),
+            Self::Deleting => DurableTransition::AlreadyApplied(Self::Deleting),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RegistryEntry {
     /// The global version this branch forked its parent at.
     fork: ReadVersion,
     /// The parent branch name, or `None` when forked from the root lineage.
     parent: Option<String>,
     written_buckets: BTreeSet<String>,
+    lifecycle: BranchLifecycle,
+    generation: [u8; 16],
 }
 
 fn put_str(out: &mut Vec<u8>, value: &str) {
@@ -128,6 +155,11 @@ impl RegistryEntry {
             }
             None => out.push(0),
         }
+        out.push(match self.lifecycle {
+            BranchLifecycle::Active => 0,
+            BranchLifecycle::Deleting => 1,
+        });
+        out.extend_from_slice(&self.generation);
         out
     }
 
@@ -158,19 +190,43 @@ impl RegistryEntry {
         }
         // Trailing optional parent (absent in pre-nesting entries).
         let parent = match bytes.get(pos) {
-            None | Some(&0) => None,
+            None => None,
+            Some(&0) => {
+                pos += 1;
+                None
+            }
             Some(&1) => {
                 pos += 1;
                 let len = take_u32(&mut pos)? as usize;
                 let name = bytes.get(pos..pos + len).ok_or_else(corrupt)?;
+                pos += len;
                 Some(String::from_utf8(name.to_vec()).map_err(|_| corrupt())?)
             }
             Some(_) => return Err(corrupt()),
+        };
+        let lifecycle = match bytes.get(pos) {
+            None => BranchLifecycle::Active,
+            Some(&0) => {
+                pos += 1;
+                BranchLifecycle::Active
+            }
+            Some(&1) => {
+                pos += 1;
+                BranchLifecycle::Deleting
+            }
+            Some(_) => return Err(corrupt()),
+        };
+        let generation = match bytes.get(pos..) {
+            Some([]) => [0; 16],
+            Some(raw) if raw.len() == 16 => raw.try_into().expect("checked generation length"),
+            _ => return Err(corrupt()),
         };
         Ok(Self {
             fork,
             parent,
             written_buckets,
+            lifecycle,
+            generation,
         })
     }
 }
@@ -214,6 +270,7 @@ struct DurableState {
     chain: Vec<DurableLayer>,
     leaf_fork: ReadVersion,
     leaf_parent: Option<String>,
+    leaf_generation: [u8; 16],
 }
 
 /// How a branch stores its divergent writes.
@@ -280,6 +337,11 @@ impl<'db> Branch<'db> {
                 None => {}
             },
             Backing::Durable(state) => {
+                require_branch_generation_active(
+                    self.db,
+                    &state.chain[0].name,
+                    state.leaf_generation,
+                )?;
                 // Walk the chain leaf-first: the first level that holds the key
                 // (a present value or a tombstone) is definitive; otherwise fall
                 // through to the next ancestor, and finally to the root snapshot.
@@ -295,7 +357,7 @@ impl<'db> Branch<'db> {
                         Some(at) => data.get_at_sync(at, key)?,
                     };
                     if let Some(raw) = raw {
-                        return Ok(decode_branch_value(&raw));
+                        return decode_branch_value(&raw);
                     }
                 }
             }
@@ -343,29 +405,41 @@ impl<'db> Branch<'db> {
                 Ok(())
             }
             Backing::Durable(state) => {
-                // Writes only ever touch the leaf (the opened branch's own data
-                // bucket); ancestors are read-only fall-through.
-                let leaf_fork = state.leaf_fork;
-                let leaf_parent = state.leaf_parent.clone();
                 let leaf = &mut state.chain[0];
-                let data = db.bucket_sync(data_bucket(&leaf.name, bucket.as_str()))?;
-                match write {
-                    OverlayWrite::Put(value) => data.put_sync(key, encode_present(&value))?,
-                    OverlayWrite::Delete => data.put_sync(key, vec![TAG_TOMBSTONE])?,
+                let registry_name = registry_bucket();
+                let data_name = data_bucket(&leaf.name, bucket.as_str());
+                // Bucket creation may publish metadata, so complete it before
+                // starting the transaction. The branch data and registry value
+                // themselves are then one atomic commit.
+                db.bucket_sync(registry_name.as_str())?;
+                db.bucket_sync(data_name.as_str())?;
+                let encoded = match write {
+                    OverlayWrite::Put(value) => encode_present(&value),
+                    OverlayWrite::Delete => vec![TAG_TOMBSTONE],
+                };
+                let mut transaction = db.transaction(TransactionOptions::default());
+                let raw = transaction
+                    .get_bucket_sync(&registry_name, leaf.name.as_bytes())?
+                    .ok_or_else(|| Error::invalid_options("branch no longer exists"))?;
+                let mut current = RegistryEntry::decode(&raw)?;
+                current.lifecycle.require_active()?;
+                if current.generation != state.leaf_generation
+                    || current.fork != state.leaf_fork
+                    || current.parent != state.leaf_parent
+                {
+                    return Err(Error::invalid_options(
+                        "branch handle belongs to a replaced branch generation",
+                    ));
                 }
-                // Record the first write to a user bucket so reads consult it (and
-                // so the parent is consulted directly for never-written buckets).
-                if leaf.written.insert(bucket.as_str().to_owned()) {
-                    persist_registry(
-                        db,
-                        &leaf.name,
-                        &RegistryEntry {
-                            fork: leaf_fork,
-                            parent: leaf_parent,
-                            written_buckets: leaf.written.clone(),
-                        },
-                    )?;
-                }
+                current.written_buckets.insert(bucket.as_str().to_owned());
+                transaction.put_bucket(&data_name, key, encoded)?;
+                transaction.put_bucket(
+                    &registry_name,
+                    leaf.name.as_bytes().to_vec(),
+                    current.encode(),
+                )?;
+                transaction.commit_sync()?;
+                leaf.written = current.written_buckets;
                 Ok(())
             }
         }
@@ -407,6 +481,11 @@ impl<'db> Branch<'db> {
                 sources.push(MergeSource::new(Box::new(entries.into_iter().map(Ok))));
             }
             Backing::Durable(state) => {
+                require_branch_generation_active(
+                    self.db,
+                    &state.chain[0].name,
+                    state.leaf_generation,
+                )?;
                 for layer in &state.chain {
                     if !layer.written.contains(bucket.as_str()) {
                         continue;
@@ -419,9 +498,8 @@ impl<'db> Branch<'db> {
                         Some(at) => data.range_at_sync(at, range)?,
                     };
                     sources.push(MergeSource::new(Box::new(rows.map(|row| {
-                        row.map(|kv| {
-                            let value = decode_branch_value(&kv.value);
-                            (kv.key, value)
+                        row.and_then(|kv| {
+                            decode_branch_value(&kv.value).map(|value| (kv.key, value))
                         })
                     }))));
                 }
@@ -551,36 +629,138 @@ fn range_contains(range: &KeyRange, key: &[u8]) -> bool {
 }
 
 /// Decodes a durable branch data value: `Some(value)` for a present write,
-/// `None` for a tombstone (deleted on the branch) or a malformed/empty record.
-fn decode_branch_value(raw: &[u8]) -> Option<Value> {
+/// `None` for a tombstone (deleted on the branch).
+fn decode_branch_value(raw: &[u8]) -> Result<Option<Value>> {
     match raw.first() {
-        Some(&TAG_PRESENT) => Some(raw[1..].to_vec()),
-        _ => None,
+        Some(&TAG_PRESENT) => Ok(Some(raw[1..].to_vec())),
+        Some(&TAG_TOMBSTONE) if raw.len() == 1 => Ok(None),
+        _ => Err(Error::Corruption {
+            message: "malformed durable branch value".to_owned(),
+        }),
     }
 }
 
-fn persist_registry(db: &Db, name: &str, entry: &RegistryEntry) -> Result<()> {
-    db.bucket_sync(registry_bucket())?
-        .put_sync(name.as_bytes().to_vec(), entry.encode())
+fn require_branch_generation_active(db: &Db, name: &str, generation: [u8; 16]) -> Result<()> {
+    let current = db
+        .read_registry(name)?
+        .ok_or_else(|| Error::invalid_options("branch no longer exists"))?;
+    current.lifecycle.require_active()?;
+    if current.generation != generation {
+        return Err(Error::invalid_options(
+            "branch handle belongs to a replaced branch generation",
+        ));
+    }
+    Ok(())
 }
 
-async fn persist_registry_async(db: &Db, name: &str, entry: &RegistryEntry) -> Result<()> {
-    db.bucket(registry_bucket())
-        .await?
-        .put(name.as_bytes().to_vec(), entry.encode())
-        .await
+fn new_branch_generation() -> Result<[u8; 16]> {
+    let mut generation = [0; 16];
+    getrandom::fill(&mut generation)
+        .map_err(|error| Error::runtime_busy(format!("branch generation entropy: {error}")))?;
+    Ok(generation)
 }
 
-async fn list_branches_async(db: &Db) -> Result<Vec<String>> {
-    let registry = db.bucket(registry_bucket()).await?;
-    let mut names = Vec::new();
-    for row in registry.range(&KeyRange::all()).await? {
+fn begin_branch_delete(db: &Db, name: &str) -> Result<Option<RegistryEntry>> {
+    let registry = registry_bucket();
+    db.bucket_sync(registry.as_str())?;
+    let mut transaction = db.transaction(TransactionOptions::default());
+    let mut rows = transaction.range_bucket_sync(&registry, KeyRange::all())?;
+    let mut target = None;
+    while let Some(row) = rows.next_sync() {
         let row = row?;
-        names.push(String::from_utf8(row.key).map_err(|_| Error::Corruption {
+        let entry = RegistryEntry::decode(&row.value)?;
+        let row_name = String::from_utf8(row.key).map_err(|_| Error::Corruption {
             message: "branch registry holds a non-utf8 name".to_owned(),
-        })?);
+        })?;
+        if entry.lifecycle == BranchLifecycle::Active && entry.parent.as_deref() == Some(name) {
+            return Err(Error::invalid_options(
+                "cannot delete a branch that still has child branches",
+            ));
+        }
+        if row_name == name {
+            target = Some(entry);
+        }
     }
-    Ok(names)
+    drop(rows);
+    let Some(mut target) = target else {
+        return Ok(None);
+    };
+    match target.lifecycle.begin_delete() {
+        DurableTransition::AlreadyApplied(_) => Ok(Some(target)),
+        DurableTransition::Apply(lifecycle) => {
+            target.lifecycle = lifecycle;
+            transaction.put_bucket(&registry, name.as_bytes().to_vec(), target.encode())?;
+            transaction.commit_sync()?;
+            Ok(Some(target))
+        }
+    }
+}
+
+async fn begin_branch_delete_async(db: &Db, name: &str) -> Result<Option<RegistryEntry>> {
+    let registry = registry_bucket();
+    db.bucket(registry.as_str()).await?;
+    let mut transaction = db.transaction(TransactionOptions::default());
+    let mut rows = transaction.range_bucket(&registry, KeyRange::all()).await?;
+    let mut target = None;
+    while let Some(row) = rows.next().await? {
+        let entry = RegistryEntry::decode(&row.value)?;
+        let row_name = String::from_utf8(row.key).map_err(|_| Error::Corruption {
+            message: "branch registry holds a non-utf8 name".to_owned(),
+        })?;
+        if entry.lifecycle == BranchLifecycle::Active && entry.parent.as_deref() == Some(name) {
+            return Err(Error::invalid_options(
+                "cannot delete a branch that still has child branches",
+            ));
+        }
+        if row_name == name {
+            target = Some(entry);
+        }
+    }
+    drop(rows);
+    let Some(mut target) = target else {
+        return Ok(None);
+    };
+    match target.lifecycle.begin_delete() {
+        DurableTransition::AlreadyApplied(_) => Ok(Some(target)),
+        DurableTransition::Apply(lifecycle) => {
+            target.lifecycle = lifecycle;
+            transaction.put_bucket(&registry, name.as_bytes().to_vec(), target.encode())?;
+            transaction.commit().await?;
+            Ok(Some(target))
+        }
+    }
+}
+
+fn finish_branch_delete(db: &Db, name: &str, generation: [u8; 16]) -> Result<()> {
+    let registry = registry_bucket();
+    let mut transaction = db.transaction(TransactionOptions::default());
+    let Some(raw) = transaction.get_bucket_sync(&registry, name.as_bytes())? else {
+        return Ok(());
+    };
+    let entry = RegistryEntry::decode(&raw)?;
+    if entry.lifecycle != BranchLifecycle::Deleting || entry.generation != generation {
+        return Err(Error::Corruption {
+            message: "branch delete completion observed a different durable generation".to_owned(),
+        });
+    }
+    transaction.delete_bucket(&registry, name.as_bytes().to_vec())?;
+    transaction.commit_sync().map(|_| ())
+}
+
+async fn finish_branch_delete_async(db: &Db, name: &str, generation: [u8; 16]) -> Result<()> {
+    let registry = registry_bucket();
+    let mut transaction = db.transaction(TransactionOptions::default());
+    let Some(raw) = transaction.get_bucket(&registry, name.as_bytes()).await? else {
+        return Ok(());
+    };
+    let entry = RegistryEntry::decode(&raw)?;
+    if entry.lifecycle != BranchLifecycle::Deleting || entry.generation != generation {
+        return Err(Error::Corruption {
+            message: "branch delete completion observed a different durable generation".to_owned(),
+        });
+    }
+    transaction.delete_bucket(&registry, name.as_bytes().to_vec())?;
+    transaction.commit().await.map(|_| ())
 }
 
 /// The checkpoint name pinning a durable branch's fork. A checkpoint is durable
@@ -668,7 +848,8 @@ impl Db {
     /// exists with a different fork, or if persisting the branch fails.
     pub fn create_branch(&self, name: &str, from: ReadVersion) -> Result<()> {
         if let Some(existing) = self.read_registry(name)? {
-            if existing.fork == from {
+            existing.lifecycle.require_active()?;
+            if existing.fork == from && existing.parent.is_none() {
                 return Ok(());
             }
             return Err(Error::invalid_options(
@@ -679,15 +860,28 @@ impl Db {
         // checkpoint lives in the manifest, so the parent's GC cannot reclaim the
         // history the branch reads through, even after a restart.
         ensure_fork_checkpoint(self, name, from)?;
-        persist_registry(
-            self,
-            name,
-            &RegistryEntry {
-                fork: from,
-                parent: None,
-                written_buckets: BTreeSet::new(),
-            },
-        )
+        let registry = registry_bucket();
+        self.bucket_sync(registry.as_str())?;
+        let mut transaction = self.transaction(TransactionOptions::default());
+        if let Some(raw) = transaction.get_bucket_sync(&registry, name.as_bytes())? {
+            let existing = RegistryEntry::decode(&raw)?;
+            existing.lifecycle.require_active()?;
+            if existing.fork == from && existing.parent.is_none() {
+                return Ok(());
+            }
+            return Err(Error::invalid_options(
+                "branch already exists with a different fork version",
+            ));
+        }
+        let entry = RegistryEntry {
+            fork: from,
+            parent: None,
+            written_buckets: BTreeSet::new(),
+            lifecycle: BranchLifecycle::Active,
+            generation: new_branch_generation()?,
+        };
+        transaction.put_bucket(&registry, name.as_bytes().to_vec(), entry.encode())?;
+        transaction.commit_sync().map(|_| ())
     }
 
     /// Async-first form of [`Db::create_branch`]. Required for object-store
@@ -699,7 +893,8 @@ impl Db {
     /// Same validation and persistence errors as [`Db::create_branch`].
     pub async fn create_branch_at(&self, name: &str, from: ReadVersion) -> Result<()> {
         if let Some(existing) = self.read_registry_async(name).await? {
-            if existing.fork == from {
+            existing.lifecycle.require_active()?;
+            if existing.fork == from && existing.parent.is_none() {
                 return Ok(());
             }
             return Err(Error::invalid_options(
@@ -707,16 +902,28 @@ impl Db {
             ));
         }
         ensure_fork_checkpoint_async(self, name, from).await?;
-        persist_registry_async(
-            self,
-            name,
-            &RegistryEntry {
-                fork: from,
-                parent: None,
-                written_buckets: BTreeSet::new(),
-            },
-        )
-        .await
+        let registry = registry_bucket();
+        self.bucket(registry.as_str()).await?;
+        let mut transaction = self.transaction(TransactionOptions::default());
+        if let Some(raw) = transaction.get_bucket(&registry, name.as_bytes()).await? {
+            let existing = RegistryEntry::decode(&raw)?;
+            existing.lifecycle.require_active()?;
+            if existing.fork == from && existing.parent.is_none() {
+                return Ok(());
+            }
+            return Err(Error::invalid_options(
+                "branch already exists with a different fork version",
+            ));
+        }
+        let entry = RegistryEntry {
+            fork: from,
+            parent: None,
+            written_buckets: BTreeSet::new(),
+            lifecycle: BranchLifecycle::Active,
+            generation: new_branch_generation()?,
+        };
+        transaction.put_bucket(&registry, name.as_bytes().to_vec(), entry.encode())?;
+        transaction.commit().await.map(|_| ())
     }
 
     /// Creates a **durable** named branch forked from another branch `parent` at
@@ -733,9 +940,10 @@ impl Db {
     /// Returns an error if `parent` does not exist, if `name` already exists, or
     /// if persisting the branch fails.
     pub fn create_branch_from(&self, name: &str, parent: &str) -> Result<()> {
-        if self.read_registry(parent)?.is_none() {
-            return Err(Error::invalid_options("parent branch does not exist"));
-        }
+        self.read_registry(parent)?
+            .ok_or_else(|| Error::invalid_options("parent branch does not exist"))?
+            .lifecycle
+            .require_active()?;
         if self.read_registry(name)?.is_some() {
             return Err(Error::invalid_options("branch already exists"));
         }
@@ -744,15 +952,30 @@ impl Db {
         // the chain reads through retained.
         let from = self.latest_read_version();
         ensure_fork_checkpoint(self, name, from)?;
-        persist_registry(
-            self,
-            name,
-            &RegistryEntry {
-                fork: from,
-                parent: Some(parent.to_owned()),
-                written_buckets: BTreeSet::new(),
-            },
-        )
+        let registry = registry_bucket();
+        self.bucket_sync(registry.as_str())?;
+        let mut transaction = self.transaction(TransactionOptions::default());
+        let parent_raw = transaction
+            .get_bucket_sync(&registry, parent.as_bytes())?
+            .ok_or_else(|| Error::invalid_options("parent branch does not exist"))?;
+        RegistryEntry::decode(&parent_raw)?
+            .lifecycle
+            .require_active()?;
+        if transaction
+            .get_bucket_sync(&registry, name.as_bytes())?
+            .is_some()
+        {
+            return Err(Error::invalid_options("branch already exists"));
+        }
+        let entry = RegistryEntry {
+            fork: from,
+            parent: Some(parent.to_owned()),
+            written_buckets: BTreeSet::new(),
+            lifecycle: BranchLifecycle::Active,
+            generation: new_branch_generation()?,
+        };
+        transaction.put_bucket(&registry, name.as_bytes().to_vec(), entry.encode())?;
+        transaction.commit_sync().map(|_| ())
     }
 
     /// Async-first form of [`Db::create_branch_from`].
@@ -780,24 +1003,42 @@ impl Db {
     /// conditional-write, durability, and backend errors from publishing the
     /// fork metadata. A failed call never publishes a partial registry entry.
     pub async fn create_branch_from_async(&self, name: &str, parent: &str) -> Result<()> {
-        if self.read_registry_async(parent).await?.is_none() {
-            return Err(Error::invalid_options("parent branch does not exist"));
-        }
+        self.read_registry_async(parent)
+            .await?
+            .ok_or_else(|| Error::invalid_options("parent branch does not exist"))?
+            .lifecycle
+            .require_active()?;
         if self.read_registry_async(name).await?.is_some() {
             return Err(Error::invalid_options("branch already exists"));
         }
         let from = self.latest_read_version();
         ensure_fork_checkpoint_async(self, name, from).await?;
-        persist_registry_async(
-            self,
-            name,
-            &RegistryEntry {
-                fork: from,
-                parent: Some(parent.to_owned()),
-                written_buckets: BTreeSet::new(),
-            },
-        )
-        .await
+        let registry = registry_bucket();
+        self.bucket(registry.as_str()).await?;
+        let mut transaction = self.transaction(TransactionOptions::default());
+        let parent_raw = transaction
+            .get_bucket(&registry, parent.as_bytes())
+            .await?
+            .ok_or_else(|| Error::invalid_options("parent branch does not exist"))?;
+        RegistryEntry::decode(&parent_raw)?
+            .lifecycle
+            .require_active()?;
+        if transaction
+            .get_bucket(&registry, name.as_bytes())
+            .await?
+            .is_some()
+        {
+            return Err(Error::invalid_options("branch already exists"));
+        }
+        let entry = RegistryEntry {
+            fork: from,
+            parent: Some(parent.to_owned()),
+            written_buckets: BTreeSet::new(),
+            lifecycle: BranchLifecycle::Active,
+            generation: new_branch_generation()?,
+        };
+        transaction.put_bucket(&registry, name.as_bytes().to_vec(), entry.encode())?;
+        transaction.commit().await.map(|_| ())
     }
 
     /// Opens a durable named branch, re-pinning its fork and assembling its read
@@ -812,8 +1053,10 @@ impl Db {
         let leaf = self
             .read_registry(name)?
             .ok_or_else(|| Error::invalid_options("no such branch"))?;
+        leaf.lifecycle.require_active()?;
         let leaf_fork = leaf.fork;
         let leaf_parent = leaf.parent.clone();
+        let leaf_generation = leaf.generation;
 
         // The leaf reads its own latest writes; each ancestor is read frozen at
         // the version the child below it forked it.
@@ -830,6 +1073,7 @@ impl Db {
                 .ok_or_else(|| Error::Corruption {
                     message: format!("branch {parent_name} is missing (an ancestor of {name})"),
                 })?;
+            entry.lifecycle.require_active()?;
             chain.push(DurableLayer {
                 name: parent_name,
                 written: entry.written_buckets,
@@ -847,11 +1091,13 @@ impl Db {
                 chain,
                 leaf_fork,
                 leaf_parent,
+                leaf_generation,
             },
         ))
     }
 
-    /// Lists the durable branch names, in name order.
+    /// Lists active durable branch names, in name order. A branch whose
+    /// recoverable deletion is in progress is intentionally omitted.
     ///
     /// # Errors
     ///
@@ -861,55 +1107,37 @@ impl Db {
         let mut names = Vec::new();
         for row in registry.range_sync(&KeyRange::all())? {
             let row = row?;
-            names.push(String::from_utf8(row.key).map_err(|_| Error::Corruption {
+            let name = String::from_utf8(row.key).map_err(|_| Error::Corruption {
                 message: "branch registry holds a non-utf8 name".to_owned(),
-            })?);
+            })?;
+            if RegistryEntry::decode(&row.value)?.lifecycle == BranchLifecycle::Active {
+                names.push(name);
+            }
         }
         Ok(names)
     }
 
-    /// Deletes a durable branch: releases its fork pin (so the parent can again
-    /// GC that history) and forgets the branch, so it can no longer be opened.
+    /// Deletes a durable branch through a recoverable persisted lifecycle.
     ///
-    /// The branch's data buckets are left in place for now (a bucket-drop
-    /// branches forked from it, is an error (a child depends on this branch's
-    /// fork pin staying in place).
+    /// The registry first changes atomically from active to deleting while the
+    /// same transaction verifies that no active child exists. From that point,
+    /// opens, reads, writes, lineage lookup, and listing reject or hide the
+    /// branch. Cleanup then removes divergent data, releases the fork
+    /// checkpoint, and removes the deleting marker last.
     ///
-    /// The branch's divergent data is reclaimed: each data bucket it wrote is
-    /// cleared, so the space is recovered by compaction and a future branch
-    /// reusing the name starts clean. (The now-empty bucket shells themselves are
-    /// removed only once the KV gains a bucket-drop primitive — a later slice —
-    /// but they are gated by the registry's `written_buckets`, so they are never
-    /// read after the branch is gone.)
+    /// Every cleanup step is idempotent. Retrying after a process or storage
+    /// failure resumes from the deleting marker; deleting an already absent
+    /// branch also succeeds. Backends without bucket drop clear the divergent
+    /// bucket contents before releasing the checkpoint.
     ///
     /// # Errors
     ///
-    /// Returns an error if the branch does not exist, still has children, or if
-    /// releasing its state fails.
+    /// Returns an error if the branch still has active children, if its durable
+    /// state is malformed, or if a cleanup step fails.
     pub fn delete_branch(&self, name: &str) -> Result<()> {
-        let entry = self
-            .read_registry(name)?
-            .ok_or_else(|| Error::invalid_options("no such branch"))?;
-        // A child branch reads through this branch's history; refuse to drop the
-        // pin out from under it.
-        for other in self.list_branches()? {
-            if other == name {
-                continue;
-            }
-            if let Some(other_entry) = self.read_registry(&other)? {
-                if other_entry.parent.as_deref() == Some(name) {
-                    return Err(Error::invalid_options(
-                        "cannot delete a branch that still has child branches",
-                    ));
-                }
-            }
-        }
-        // Release the fork pin (the checkpoint may be absent if a prior delete was
-        // interrupted after this step — tolerate that).
-        match self.delete_checkpoint_sync(&fork_checkpoint(name)) {
-            Ok(()) | Err(Error::CheckpointNotFound { .. }) => {}
-            Err(error) => return Err(error),
-        }
+        let Some(entry) = begin_branch_delete(self, name)? else {
+            return Ok(());
+        };
         // Reclaim the branch's divergent data: drop each data bucket it wrote.
         // On a backend without bucket-drop, fall back to clearing the contents so
         // a same-named branch created later does not inherit stale rows (the empty
@@ -924,8 +1152,13 @@ impl Db {
                 Err(error) => return Err(error),
             }
         }
-        self.bucket_sync(registry_bucket())?
-            .delete_sync(name.as_bytes().to_vec())
+        // The branch is already durably invisible. Release the history pin only
+        // after its data is gone, then remove the Deleting marker last.
+        match self.delete_checkpoint_sync(&fork_checkpoint(name)) {
+            Ok(()) | Err(Error::CheckpointNotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        finish_branch_delete(self, name, entry.generation)
     }
 
     /// Async-first form of [`Db::delete_branch`]. Required for object-store
@@ -936,26 +1169,9 @@ impl Db {
     ///
     /// Same validation and persistence errors as [`Db::delete_branch`].
     pub async fn delete_branch_async(&self, name: &str) -> Result<()> {
-        let entry = self
-            .read_registry_async(name)
-            .await?
-            .ok_or_else(|| Error::invalid_options("no such branch"))?;
-        for other in list_branches_async(self).await? {
-            if other == name {
-                continue;
-            }
-            if let Some(other_entry) = self.read_registry_async(&other).await? {
-                if other_entry.parent.as_deref() == Some(name) {
-                    return Err(Error::invalid_options(
-                        "cannot delete a branch that still has child branches",
-                    ));
-                }
-            }
-        }
-        match self.delete_checkpoint(&fork_checkpoint(name)).await {
-            Ok(()) | Err(Error::CheckpointNotFound { .. }) => {}
-            Err(error) => return Err(error),
-        }
+        let Some(entry) = begin_branch_delete_async(self, name).await? else {
+            return Ok(());
+        };
         for user_bucket in &entry.written_buckets {
             let data = data_bucket(name, user_bucket);
             match self.drop_bucket(data.clone()).await {
@@ -969,15 +1185,17 @@ impl Db {
                 Err(error) => return Err(error),
             }
         }
-        self.bucket(registry_bucket())
-            .await?
-            .delete(name.as_bytes().to_vec())
-            .await
+        match self.delete_checkpoint(&fork_checkpoint(name)).await {
+            Ok(()) | Err(Error::CheckpointNotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        finish_branch_delete_async(self, name, entry.generation).await
     }
 
-    /// Returns a durable branch's lineage (its fork version and parent branch),
-    /// or `None` when no such branch exists — without assembling a read chain or
-    /// opening any data bucket.
+    /// Returns an active durable branch's lineage (its fork version and parent
+    /// branch), or `None` when no such active branch exists — without assembling
+    /// a read chain or opening any data bucket. A branch being deleted is
+    /// reported as `None`.
     ///
     /// This lets a higher layer reuse this crate's durable branch lifecycle (the
     /// fork pin that survives restarts and aggressive GC, the registry, and
@@ -991,10 +1209,13 @@ impl Db {
     /// Returns an error if the registry cannot be read or a stored entry is
     /// malformed.
     pub fn branch_info(&self, name: &str) -> Result<Option<BranchInfo>> {
-        Ok(self.read_registry(name)?.map(|entry| BranchInfo {
-            fork: entry.fork,
-            parent: entry.parent,
-        }))
+        Ok(self
+            .read_registry(name)?
+            .filter(|entry| entry.lifecycle == BranchLifecycle::Active)
+            .map(|entry| BranchInfo {
+                fork: entry.fork,
+                parent: entry.parent,
+            }))
     }
 
     /// Async-first form of [`Db::branch_info`].
@@ -1022,6 +1243,7 @@ impl Db {
         Ok(self
             .read_registry_async(name)
             .await?
+            .filter(|entry| entry.lifecycle == BranchLifecycle::Active)
             .map(|entry| BranchInfo {
                 fork: entry.fork,
                 parent: entry.parent,

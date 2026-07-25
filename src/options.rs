@@ -48,7 +48,7 @@ pub enum HostStorageBackend {
 /// token, lease, hold, or crash-recovery checks. It only permits the final
 /// sweep protocol to run on a backend whose deletion semantics have been
 /// independently qualified.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ContentReclamationMode {
     /// Retain descriptors and chunks even when all pre-delete checks pass.
     #[default]
@@ -626,7 +626,7 @@ impl DbOptions {
     /// background deletion or weakens lifecycle proof; callers must explicitly
     /// stage and run a final sweep for each exact content identity.
     #[must_use]
-    pub const fn with_content_reclamation(mut self, mode: ContentReclamationMode) -> Self {
+    pub fn with_content_reclamation(mut self, mode: ContentReclamationMode) -> Self {
         self.content_reclamation = mode;
         self
     }

@@ -20,6 +20,7 @@ use super::{
 };
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::db::open_helpers::run_persistent_recovery_checks_async;
+use crate::options::ContentReclamationMode;
 use crate::storage::MemoryStorageBackend;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::{
@@ -629,8 +630,9 @@ impl Db {
     /// # Errors
     ///
     /// Returns [`Error::InvalidOptions`] when `options` is not object-store mode,
-    /// or any error returned by the storage or WAL client while opening,
-    /// recovering, or acquiring the writer lease.
+    /// [`Error::UnsupportedBackend`] when a reclamation capability belongs to a
+    /// different storage client or prefix, or any error returned by the storage
+    /// or WAL client while opening, recovering, or acquiring the writer lease.
     #[cfg_attr(
         all(target_arch = "wasm32", target_os = "unknown"),
         allow(clippy::arc_with_non_send_sync)
@@ -655,9 +657,23 @@ impl Db {
             return Err(Error::unsupported_durability(options.durability));
         }
 
+        let db_path = PathBuf::from(prefix.into());
+        if let ContentReclamationMode::QualifiedObjectStore(qualification) =
+            &options.content_reclamation
+        {
+            if !qualification.matches_prefix(&db_path) {
+                return Err(Error::unsupported_backend(
+                    "object-store reclamation qualification names a different database prefix",
+                ));
+            }
+            if !qualification.matches_client(&storage_client) {
+                return Err(Error::unsupported_backend(
+                    "object-store reclamation qualification belongs to a different client instance",
+                ));
+            }
+        }
         let backend = ObjectStoreBackend::new(Arc::clone(&storage_client));
         let wal_backend = ObjectStoreBackend::new(Arc::clone(&wal_client));
-        let db_path = PathBuf::from(prefix.into());
         // The default trust mode assumes adapter qualification happened outside
         // open (CI/startup/health check). VerifyOnOpen is the explicit
         // fail-closed mode for deployments that want this open call to probe.

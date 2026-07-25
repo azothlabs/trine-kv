@@ -187,25 +187,53 @@ impl ObjectStoreReclamationAttestation {
 /// Verified capability for unversioned object-store reclamation.
 ///
 /// Values can be obtained only from [`qualify_object_store_reclamation`]. The
-/// capability is scoped by the external evidence digest and must be supplied
-/// again when reopening a database with a Prepared cloud sweep.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// capability retains and is valid only for the exact [`ObjectClient`] instance
+/// that ran the probe, the database prefix, and the external evidence digest.
+/// It cannot authorize another wrapper or client even when that client names the
+/// same provider namespace. The same capability must be supplied again when
+/// reopening a database with a Prepared cloud sweep.
+#[derive(Clone)]
 pub struct QualifiedObjectStoreReclamation {
     evidence_digest: ObjectStoreReclamationEvidenceDigest,
     namespace_digest: [u8; 32],
+    client: Arc<dyn ObjectClient>,
 }
 
 impl QualifiedObjectStoreReclamation {
     /// Returns the provider-evidence digest bound to this qualification.
     #[must_use]
-    pub const fn evidence_digest(self) -> ObjectStoreReclamationEvidenceDigest {
+    pub const fn evidence_digest(&self) -> ObjectStoreReclamationEvidenceDigest {
         self.evidence_digest
     }
 
-    pub(crate) fn matches_prefix(self, prefix: &Path) -> bool {
+    pub(crate) fn matches_prefix(&self, prefix: &Path) -> bool {
         self.namespace_digest == object_store_reclamation_namespace_digest(prefix)
     }
+
+    pub(crate) fn matches_client(&self, client: &Arc<dyn ObjectClient>) -> bool {
+        Arc::ptr_eq(&self.client, client)
+    }
 }
+
+impl std::fmt::Debug for QualifiedObjectStoreReclamation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QualifiedObjectStoreReclamation")
+            .field("evidence_digest", &self.evidence_digest)
+            .field("namespace_digest", &self.namespace_digest)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for QualifiedObjectStoreReclamation {
+    fn eq(&self, other: &Self) -> bool {
+        self.evidence_digest == other.evidence_digest
+            && self.namespace_digest == other.namespace_digest
+            && Arc::ptr_eq(&self.client, &other.client)
+    }
+}
+
+impl Eq for QualifiedObjectStoreReclamation {}
 
 /// Precondition for a conditional write ([`ObjectClient::put_if`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -473,6 +501,7 @@ pub async fn qualify_object_store_reclamation(
     Ok(QualifiedObjectStoreReclamation {
         evidence_digest: attestation.evidence_digest,
         namespace_digest: object_store_reclamation_namespace_digest(Path::new(&prefix)),
+        client,
     })
 }
 
@@ -996,16 +1025,17 @@ impl ObjectStoreBackend {
         object: StorageObjectId,
     ) -> Result<()> {
         let key = Self::object_key(&object);
-        if let Some(meta) = self.client.head(&key).await? {
-            if meta.version.is_some() {
+        match self.client.head(&key).await? {
+            Some(meta) if meta.version.is_some() => {
                 return Err(Error::unsupported_backend(
                     "object-store content key has a provider version",
                 ));
             }
-        } else {
-            return Ok(());
+            Some(_) => {
+                self.client.delete(&key).await?;
+            }
+            None => {}
         }
-        self.client.delete(&key).await?;
         verify_object_store_reclamation_absent(&self.client, &key).await
     }
 }
@@ -1347,14 +1377,16 @@ mod tests {
         inner: InMemoryObjectStore,
         report_version: bool,
         retain_on_delete: bool,
+        hide_head: bool,
     }
 
     impl ReclamationProbeClient {
-        fn new(report_version: bool, retain_on_delete: bool) -> Self {
+        fn new(report_version: bool, retain_on_delete: bool, hide_head: bool) -> Self {
             Self {
                 inner: InMemoryObjectStore::new(),
                 report_version,
                 retain_on_delete,
+                hide_head,
             }
         }
 
@@ -1407,6 +1439,9 @@ mod tests {
         fn head<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<ObjectMeta>> {
             let key = key.to_owned();
             Box::pin(async move {
+                if self.hide_head {
+                    return Ok(None);
+                }
                 self.inner
                     .head(&key)
                     .await
@@ -1446,7 +1481,7 @@ mod tests {
             ObjectStoreReclamationEvidenceDigest::for_bytes(b"test provider evidence"),
         );
         let qualified_client: Arc<dyn ObjectClient> =
-            Arc::new(ReclamationProbeClient::new(false, false));
+            Arc::new(ReclamationProbeClient::new(false, false, false));
         let qualification = block_on(Box::pin(qualify_object_store_reclamation(
             Arc::clone(&qualified_client),
             "qualified-prefix",
@@ -1456,9 +1491,13 @@ mod tests {
         assert_eq!(qualification.evidence_digest(), evidence.evidence_digest());
         assert!(qualification.matches_prefix(Path::new("qualified-prefix")));
         assert!(!qualification.matches_prefix(Path::new("different-prefix")));
+        assert!(qualification.matches_client(&qualified_client));
+        let different_client: Arc<dyn ObjectClient> =
+            Arc::new(ReclamationProbeClient::new(false, false, false));
+        assert!(!qualification.matches_client(&different_client));
 
         let versioned_client: Arc<dyn ObjectClient> =
-            Arc::new(ReclamationProbeClient::new(true, false));
+            Arc::new(ReclamationProbeClient::new(true, false, false));
         assert!(matches!(
             block_on(Box::pin(qualify_object_store_reclamation(
                 versioned_client,
@@ -1469,7 +1508,7 @@ mod tests {
         ));
 
         let sticky_client: Arc<dyn ObjectClient> =
-            Arc::new(ReclamationProbeClient::new(false, true));
+            Arc::new(ReclamationProbeClient::new(false, true, false));
         assert!(matches!(
             block_on(Box::pin(qualify_object_store_reclamation(
                 sticky_client,
@@ -1478,6 +1517,30 @@ mod tests {
             ))),
             Err(Error::Corruption { .. })
         ));
+    }
+
+    #[test]
+    fn verified_delete_does_not_trust_head_absence_alone() {
+        let concrete = Arc::new(ReclamationProbeClient::new(false, false, true));
+        block_on(concrete.put("db/content-object", bytes(b"still present")))
+            .expect("seed hidden object");
+        let client: Arc<dyn ObjectClient> = concrete.clone();
+        let backend = ObjectStoreBackend::new(client);
+        let object = StorageObjectId::native_file(
+            crate::storage::StorageObjectKind::ContentChunk,
+            "db/content-object",
+        );
+
+        assert!(matches!(
+            block_on(Box::pin(backend.delete_unversioned_object_verified(object))),
+            Err(Error::Corruption { .. })
+        ));
+        assert_eq!(
+            block_on(concrete.get("db/content-object"))
+                .expect("hidden object reads")
+                .as_deref(),
+            Some(b"still present".as_slice())
+        );
     }
 
     #[test]

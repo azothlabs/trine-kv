@@ -1,5 +1,9 @@
-use super::fork_checkpoint;
-use crate::{Db, DbOptions, KeyRange};
+use super::{BranchLifecycle, RegistryEntry, data_bucket, fork_checkpoint, registry_bucket};
+use crate::storage::{
+    StorageObjectKind,
+    fault_injection::{StorageFaultGuard, StorageFaultPoint},
+};
+use crate::{Db, DbOptions, KeyRange, ReadVersion};
 
 fn memory_db() -> Db {
     Db::open_sync(DbOptions::memory()).expect("open in-memory db")
@@ -137,6 +141,113 @@ fn durable_branch_persists_writes_and_shadows_parent() {
 
     assert_eq!(db.list_branches().expect("list"), vec!["dev".to_string()]);
     assert!(dev.is_durable());
+}
+
+#[test]
+fn durable_branch_write_commits_data_and_registry_together() {
+    let dir =
+        std::env::temp_dir().join(format!("trine-branch-atomic-write-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = Db::open_sync(&dir).expect("open");
+    db.bucket_sync("data").expect("bucket");
+    db.create_branch("dev", db.latest_read_version())
+        .expect("create");
+    let mut dev = db.open_branch("dev").expect("open");
+
+    let fault = StorageFaultGuard::install(
+        &dir,
+        StorageFaultPoint::WalAppend,
+        Some(StorageObjectKind::Wal),
+        1,
+    );
+    assert!(dev.put("data", b"k", b"v".to_vec()).is_err());
+    assert_eq!(fault.calls(), 1);
+    drop(fault);
+
+    let registry = db.read_registry("dev").expect("registry").expect("entry");
+    assert!(registry.written_buckets.is_empty());
+    assert_eq!(
+        db.bucket_sync(data_bucket("dev", "data"))
+            .expect("data bucket")
+            .get_sync(b"k")
+            .expect("data read"),
+        None
+    );
+
+    dev.put("data", b"k", b"v".to_vec())
+        .expect("same handle retries");
+    drop(dev);
+    let reopened = db.open_branch("dev").expect("branch reopens");
+    assert_eq!(
+        reopened.get("data", b"k").expect("read"),
+        Some(b"v".to_vec())
+    );
+    drop(reopened);
+    drop(db);
+    std::fs::remove_dir_all(dir).expect("test database removes");
+}
+
+#[test]
+fn deleting_marker_hides_branch_and_delete_resumes() {
+    let db = memory_db();
+    db.bucket_sync("data").expect("bucket");
+    db.create_branch("dev", db.latest_read_version())
+        .expect("create");
+    let mut stale = db.open_branch("dev").expect("open");
+    stale.put("data", b"k", b"v".to_vec()).expect("branch data");
+
+    let mut entry = db.read_registry("dev").expect("registry").expect("entry");
+    entry.lifecycle = BranchLifecycle::Deleting;
+    db.bucket_sync(registry_bucket())
+        .expect("registry bucket")
+        .put_sync(b"dev".to_vec(), entry.encode())
+        .expect("persist interrupted delete marker");
+
+    assert!(db.list_branches().expect("list").is_empty());
+    assert!(db.branch_info("dev").expect("info").is_none());
+    assert!(db.open_branch("dev").is_err());
+    assert!(stale.get("data", b"k").is_err());
+    assert!(stale.put("data", b"k2", b"v2".to_vec()).is_err());
+
+    db.delete_branch("dev").expect("delete resumes");
+    db.delete_branch("dev")
+        .expect("completed delete is idempotent");
+    assert!(db.read_registry("dev").expect("registry").is_none());
+}
+
+#[test]
+fn stale_handle_cannot_write_recreated_branch_generation() {
+    let db = memory_db();
+    db.bucket_sync("data").expect("bucket");
+    let fork = db.latest_read_version();
+    db.create_branch("dev", fork).expect("create");
+    let mut stale = db.open_branch("dev").expect("open old generation");
+    db.delete_branch("dev").expect("delete old generation");
+    db.create_branch("dev", fork).expect("recreate");
+
+    assert!(
+        stale.put("data", b"stale", b"value".to_vec()).is_err(),
+        "an old handle must not mutate a replacement with the same name and fork"
+    );
+    assert_eq!(
+        db.open_branch("dev")
+            .expect("open replacement")
+            .get("data", b"stale")
+            .expect("read replacement"),
+        None
+    );
+}
+
+#[test]
+fn legacy_registry_entry_decodes_as_active_generation_zero() {
+    let mut legacy = Vec::new();
+    legacy.extend_from_slice(&7_u64.to_le_bytes());
+    legacy.extend_from_slice(&0_u32.to_le_bytes());
+    legacy.push(0);
+    let decoded = RegistryEntry::decode(&legacy).expect("legacy entry decodes");
+    assert_eq!(decoded.fork, ReadVersion::from_u64(7));
+    assert_eq!(decoded.lifecycle, BranchLifecycle::Active);
+    assert_eq!(decoded.generation, [0; 16]);
 }
 
 #[test]

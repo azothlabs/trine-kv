@@ -134,6 +134,7 @@ pub mod s3;
 pub mod search;
 /// Snapshot handles for repeatable reads.
 pub mod snapshot;
+mod state_transition;
 /// Live database statistics exposed to callers.
 pub mod stats;
 mod storage;

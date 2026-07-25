@@ -95,6 +95,62 @@ fn test_upload_options() -> ContentUploadOptions {
 }
 
 #[test]
+fn empty_content_upload_has_a_durable_zero_byte_reservation_and_seals() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory())
+            .await
+            .expect("memory db opens");
+        let upload = db
+            .begin_content_upload(test_upload_options().with_expected_length(0))
+            .await
+            .expect("empty upload begins");
+        let sealed = upload.seal().await.expect("empty upload seals");
+        assert_eq!(sealed.content_id(), ContentId::for_bytes(b""));
+        assert_eq!(sealed.len(), 0);
+        let content = db
+            .open_content(sealed.storage_domain_id(), sealed.content_id())
+            .await
+            .expect("empty content opens");
+        assert_eq!(content.len(), 0);
+        assert!(
+            content
+                .read_range(0, 1)
+                .await
+                .expect("empty read")
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn object_store_reclamation_qualification_is_not_transferable_between_clients() {
+    block_on(async {
+        let qualified_client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+        let other_client = Arc::new(InMemoryObjectStore::new());
+        let qualification = qualify_object_store_reclamation(
+            Arc::clone(&qualified_client),
+            "client-bound-reclamation",
+            ObjectStoreReclamationAttestation::new(
+                ObjectStoreReclamationEvidenceDigest::for_bytes(b"client-bound evidence"),
+            ),
+        )
+        .await
+        .expect("first client qualifies");
+        assert!(matches!(
+            Db::open_object_store_at(
+                other_client,
+                "client-bound-reclamation",
+                DbOptions::object_store().with_content_reclamation(
+                    ContentReclamationMode::QualifiedObjectStore(qualification),
+                ),
+            )
+            .await,
+            Err(Error::UnsupportedBackend { .. })
+        ));
+    });
+}
+
+#[test]
 fn caller_supplied_upload_id_binds_options_and_recovers_exact_state() {
     block_on(async {
         let db = Db::open(DbOptions::memory()).await.expect("open database");
@@ -1694,11 +1750,29 @@ fn qualified_filesystem_sweep_reclaims_after_reopen_and_allows_later_reupload() 
         let db = Db::open(options())
             .await
             .expect("native db reopens after delete fault");
-        let reclaimed = db
-            .resume_content_reclaim_sweep(sealed.storage_domain_id(), sealed.content_id())
-            .await
-            .expect("filesystem sweep resumes and completes");
-        assert!(reclaimed.reclaimed_at().is_some());
+        let (first, second) =
+            thread::scope(|scope| {
+                let first = scope.spawn(|| {
+                    block_on(db.resume_content_reclaim_sweep(
+                        sealed.storage_domain_id(),
+                        sealed.content_id(),
+                    ))
+                });
+                let second = scope.spawn(|| {
+                    block_on(db.resume_content_reclaim_sweep(
+                        sealed.storage_domain_id(),
+                        sealed.content_id(),
+                    ))
+                });
+                (
+                    first.join().expect("first sweep thread joins"),
+                    second.join().expect("second sweep thread joins"),
+                )
+            });
+        let first = first.expect("first concurrent sweep completes");
+        let second = second.expect("second concurrent sweep is idempotent");
+        assert!(first.reclaimed_at().is_some());
+        assert_eq!(first, second);
         assert!(matches!(
             db.open_content_leased(
                 sealed.storage_domain_id(),
@@ -1893,8 +1967,9 @@ async fn qualified_object_store_sweep_impl() {
     .await
     .expect("object-store delete contract qualifies");
     let options = || {
-        DbOptions::object_store()
-            .with_content_reclamation(ContentReclamationMode::QualifiedObjectStore(qualification))
+        DbOptions::object_store().with_content_reclamation(
+            ContentReclamationMode::QualifiedObjectStore(qualification.clone()),
+        )
     };
 
     let db = Db::open_object_store_at(client.clone(), prefix, options())
@@ -2069,8 +2144,9 @@ async fn s3_live_qualified_content_reclamation() {
     .await
     .expect("live provider reclamation contract qualifies");
     let options = || {
-        DbOptions::object_store()
-            .with_content_reclamation(ContentReclamationMode::QualifiedObjectStore(qualification))
+        DbOptions::object_store().with_content_reclamation(
+            ContentReclamationMode::QualifiedObjectStore(qualification.clone()),
+        )
     };
 
     let db = Db::open_object_store_at(Arc::clone(&client), &prefix, options())
@@ -3593,8 +3669,8 @@ fn object_store_counts_requests_detects_tampering_and_hides_failed_seal() {
         let sealed = upload.seal().await.expect("object upload seals");
         let after_seal = client.counts();
         assert_eq!(
-            after_seal.put, 11,
-            "begin/progress, physical reservation, chunks, descriptor, sealing, token WAL, physical finalize, and sealed state"
+            after_seal.put, 12,
+            "begin, initial zero reservation, progress/reservation, chunks, descriptor, sealing, token WAL, physical finalize, and sealed state"
         );
 
         let handle = db

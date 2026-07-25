@@ -554,14 +554,12 @@ fn list_native_file_directory_entries(
         let entry = entry?;
         let path = entry.path();
         // Node's WASI Preview 1 `fd_readdir` can restart its cookie and repeat
-        // the already-returned files when this directory also contains a
-        // subdirectory. Stop at the first repeated path: every file before the
-        // restart has already been captured, while continuing would loop
-        // forever. Native directory iterators do not need this host workaround.
+        // already-returned files when this directory also contains a
+        // subdirectory. A repeated entry means the host did not prove that the
+        // listing is complete. Fail closed instead of returning a partial list
+        // that recovery could mistake for the complete WAL/table set.
         #[cfg(target_os = "wasi")]
-        if !remember_wasi_directory_entry(&mut seen, &path) {
-            break;
-        }
+        remember_wasi_directory_entry(&mut seen, &path)?;
         let metadata = entry.metadata()?;
         if !metadata.is_file() {
             continue;
@@ -577,8 +575,16 @@ fn list_native_file_directory_entries(
 }
 
 #[cfg(any(test, target_os = "wasi"))]
-fn remember_wasi_directory_entry(seen: &mut BTreeSet<PathBuf>, path: &Path) -> bool {
-    seen.insert(path.to_path_buf())
+fn remember_wasi_directory_entry(seen: &mut BTreeSet<PathBuf>, path: &Path) -> Result<()> {
+    if seen.insert(path.to_path_buf()) {
+        return Ok(());
+    }
+    Err(Error::Corruption {
+        message: format!(
+            "WASI directory iterator repeated {}, so the listing may be incomplete",
+            path.display()
+        ),
+    })
 }
 
 pub(in crate::storage) fn sync_native_file_directory_after_renames(
@@ -761,17 +767,8 @@ mod tests {
     #[test]
     fn wasi_directory_repeat_is_detected_at_the_first_restarted_path() {
         let mut seen = BTreeSet::new();
-        assert!(remember_wasi_directory_entry(
-            &mut seen,
-            Path::new("db/trine.wal")
-        ));
-        assert!(remember_wasi_directory_entry(
-            &mut seen,
-            Path::new("db/MANIFEST")
-        ));
-        assert!(!remember_wasi_directory_entry(
-            &mut seen,
-            Path::new("db/trine.wal")
-        ));
+        assert!(remember_wasi_directory_entry(&mut seen, Path::new("db/trine.wal")).is_ok());
+        assert!(remember_wasi_directory_entry(&mut seen, Path::new("db/MANIFEST")).is_ok());
+        assert!(remember_wasi_directory_entry(&mut seen, Path::new("db/trine.wal")).is_err());
     }
 }
