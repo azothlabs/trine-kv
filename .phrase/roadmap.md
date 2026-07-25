@@ -4764,6 +4764,43 @@ soak harness.
   API, durability-contract, provider-adapter, publishing, tagging, or pushing
   changes.
 
+### Phase 192: Full-Code Audit Root-Cause Remediation
+
+**Status**: Complete
+
+**Goal**: Resolve the full-code audit findings at their owning invariants:
+commit ordering, bucket lifecycle, object fencing/CAS, recovery bounds, worker
+completion, atomic publication, read amplification, cache capacity, statistics,
+dependency advisories, and release automation.
+
+**Entry Condition**: The line-by-line audit identified correctness, liveness,
+resource-bound, documentation, dependency, and CI supply-chain defects across
+the engine rather than one isolated feature.
+
+**Acceptance Gate**:
+
+- Range-tombstone compaction, object WAL ordering, post-WAL publication failure,
+  bucket drop, branch lineage, content reclaim/seal, and stale reader handles
+  preserve their lifecycle and visibility invariants under regression tests.
+- Object lease v3, manifest ambiguous-CAS reconciliation, content-addressed WAL
+  identity, and bounded replay/list/read paths fail closed.
+- Worker panics complete waiters and do not kill reusable workers; wakers run
+  outside internal mutexes; write backpressure has a bounded progress wait.
+- Browser manifest/WAL replacement uses close-commit publication, and optional
+  native whole-object reads use one opened handle.
+- Cache capacity is globally exact, table/hash validation is linear, and
+  non-native table-byte statistics are meaningful.
+- Mutable CI action refs and unsafe workflow interpolation are removed;
+  benchmark/docs scripts reject malformed inputs; dependency audit is clean.
+- Full tests, all-features checks, strict Clippy, Rustdoc/doctests, formatting,
+  script tests, and supported WASM target gates pass.
+
+**Major Out Of Scope**:
+
+- New public features, storage-format migration beyond lease v3's backward
+  decoder, multi-primary object writers, provider retention bypass, publishing,
+  tagging, committing, or pushing changes.
+
 ### Consumer-selected slice: Qualified object-store content reclamation
 
 **Status**: Complete for TrineDB Phase 23.

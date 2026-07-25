@@ -1,10 +1,9 @@
 # Object-Storage Backend
 
-Status: **Design (not implemented).** This document specifies a fourth storage
-backend for trine-kv that persists the database on object storage (Amazon S3 and
-S3-compatible / other providers) instead of a local filesystem. It is the
-durability foundation for running trinedb as a self-hostable or managed cloud
-service where data lives on cheap object storage.
+Status: **Implemented.** This document records the current object-storage
+durability contract for trine-kv. The backend persists the database on Amazon
+S3, S3-compatible providers, or any implementation of Trine's `ObjectClient`
+contract instead of a local filesystem.
 
 This is a **data-plane** feature and stays open source: a self-hosting user must
 be able to point their own server at their own bucket, exactly as they can point
@@ -17,12 +16,12 @@ is unchanged.
 - Persist the full database (SSTables, blobs, manifest, WAL) on an object store.
 - Keep strong, crash-consistent semantics: a committed transaction stays
   committed; recovery reconstructs a consistent state from the bucket alone.
-- Reuse the existing storage-backend seam (capabilities + `Storage*Backend`
-  traits). No changes to the LSM core, MVCC, or the transaction API.
+- Reuse the storage-backend and durability-substrate seams. The LSM core, MVCC,
+  and transaction API retain the same visibility semantics.
 - Provider-agnostic: S3 first, but the object primitive is a small trait so
   S3-compatible stores (R2, MinIO, GCS XML, Azure Blob) drop in.
-- Keep the embedded core dependency-free: the object-store backend and its cloud
-  SDK live behind a cargo feature gate.
+- Keep provider adapters optional. The provider-neutral in-memory client is in
+  the core; the S3 adapter is behind the `s3` feature.
 
 ## Non-goals (handled elsewhere or later)
 
@@ -60,20 +59,18 @@ filesystem). Relevant pieces in `src/storage.rs`:
   - `StorageWalRewriteBackend::rewrite_wal` — atomic whole-WAL replace via a
     temporary object + swap.
   - `StorageManifestReadBackend::read_current_manifest` /
-    `StorageManifestPublishBackend::publish_manifest` — **the commit point.**
+    `StorageManifestPublishBackend::publish_manifest` — atomic metadata publish.
   - `StorageWriterLeaseBackend::acquire_writer_lease` — single-writer fencing.
   - `StorageDirectory{Create,List,Sync}Backend` — namespace/list/durability of a
     "directory" (a key prefix on an object store).
-- **Selection:** `options::HostStorageBackend` (`Wasi`, `Browser`) is the public
-  enum that chooses a non-native backend. We add an `ObjectStore` variant; the
-  native-file and in-memory defaults are untouched.
+- **Selection:** `DbOptions::object_store()` plus
+  `Db::open_object_store[_at]` selects this backend. Native-file and in-memory
+  defaults are untouched.
 
-The decisive consequence: the LSM already isolates **the only three operations
-whose object-store semantics differ from a filesystem** behind their own traits
-— `publish_manifest` (the commit), `acquire_writer_lease` (the writer fence),
-and the WAL append/rewrite. Everything else (SSTables, blobs) is write-once and
-maps directly to whole-object PUT + range GET. So this backend is "implement the
-traits + solve those three," not an engine rewrite.
+The decisive consequence is that the object-specific semantics remain
+concentrated in manifest CAS, the writer/WAL-head lease, and immutable segmented
+WAL publication. SSTables and blobs stay write-once and map directly to whole
+object PUT plus bounded range GET.
 
 ## The object primitive
 
@@ -114,74 +111,74 @@ AtomicManifestPublish (via put_if CAS), WriterLease (via put_if + TTL),
 AsyncTasks
 ```
 
-Notably **absent: `Append`.** S3 objects are immutable; there is no append. The
-WAL is handled without it (below), exactly as the browser backend handles
-non-filesystem persistence.
+Notably **absent: `Append`.** S3 objects are immutable. The object-store
+durability substrate implements WAL acceptance by publishing immutable,
+content-addressed segment objects and advancing the lease/WAL-head object with
+a conditional PUT.
 
 ## Mapping each object kind
 
 | Kind | Object-store mapping |
 |------|----------------------|
 | `Table` (SSTable), `Blob` | Write-once → `put` whole object. Reads → `get` or `get_range` (block reads). Compaction writes new keys and `delete`s obsolete ones. Perfect fit for immutable LSM output. |
-| `Manifest` | The linearizable commit point. `read_current_manifest` → `get`; `publish_manifest` → `put_if` CAS (see Commit). |
+| `Manifest` | Atomic table, bucket, checkpoint, and GC metadata. `read_current_manifest` → `get`; publish → conditional `put_if` CAS. It is not rewritten for every user commit. |
 | `RecoveryReport` | `put` / `get`, non-critical. |
 | `Temporary` | Backing for `rewrite_wal`'s temp object; `put` then swap, or skip (whole-object PUT is already atomic). |
-| `Wal` | No append on S3. See WAL. |
-| `WriterLease` | A small object guarded by `put_if` + TTL/epoch fencing. See Concurrency. |
+| `Wal` | Immutable, content-addressed segment chain. The current head is stored in the writer-lease object. |
+| `WriterLease` | A small CAS-guarded object containing epoch, random owner nonce, expiry, confirmed sequence, and WAL head. |
 
 ## The three hard problems
 
 ### 1. WAL without append
 
-S3 objects are immutable, so the filesystem WAL (one growing file, `append_io` +
-`fsync`) does not translate. Options:
+Each accepted group is encoded into an immutable segment containing its
+predecessor key and consecutive commit frames. The object key includes a SHA-256
+content identity; replay recomputes and verifies that identity before decoding.
+The writer lane serializes sequence reservation with WAL handoff, so concurrent
+callers cannot publish sequence holes or reorder the remote chain.
 
-- **(A) Segmented WAL — chosen.** Each flush/commit batch becomes a new,
-  numbered WAL **segment object** (`wal/<seq>`). The "append" of N records
-  becomes a `put` of one segment. Recovery lists `wal/*`, orders by seq, and
-  replays. Checkpoint/truncation (today's `rewrite_wal`) becomes "delete
-  segments below the checkpoint."
-- **(B) Whole-WAL rewrite** (what the browser backend effectively does):
-  read-modify-write the entire WAL object per commit. Simple but O(WAL size) per
-  commit — fine for tiny WALs, bad on S3. Reject for the server case.
+The lease object is the linearizable WAL-head commit point. A segment PUT alone
+is only an orphan; the commit is confirmed after CAS advances the lease's
+confirmed sequence and head to that exact segment. If a PUT/CAS response is
+lost, Trine reads back the state and treats only an exact byte-for-byte intended
+state as success. A readable different state is a conflict; an unreadable
+outcome remains an error rather than being guessed successful.
 
-Segmenting drives the **commit-latency** story: one object PUT per commit is
-~tens of ms on S3. Mitigate with **group commit** — coalesce concurrent
-transactions' WAL records into a single segment PUT, amortizing latency across a
-batch. This pairs naturally with the existing `DurabilityMode`.
+`DurabilityMode::Buffered` accepts frames into process memory. Callers that need
+remote durability must use `persist(DurabilityMode::Flush)` (or a stronger
+supported mode) before relying on recovery. Object storage rejects filesystem
+sync modes whose guarantees it cannot provide.
 
-### 2. The commit point = manifest CAS
+Replay and admission are bounded: a segment is at most 128 MiB, a group reserves
+64 KiB of that limit for framing, a chain is at most 16,384 segments, and one
+replay is at most 1 GiB. Exceeding a bound fails closed.
 
-A trine-kv commit advances the manifest to point at the new set of SSTables/WAL.
-On object storage this becomes:
+### 2. Manifest CAS
 
-1. PUT the new SSTable/WAL objects (immutable, safe to write before commit).
-2. `publish_manifest` = `put_if(manifest_key, new_manifest, IfMatch(prev_etag))`.
-   - Success → the new version is the durable, linearizable truth.
-   - `Conflict` (etag moved) → someone else advanced the manifest; surface as the
-     existing conflict error and retry/rebase.
+The manifest is the linearizable metadata point for SSTable sets, buckets,
+checkpoints, and pending reclamation; ordinary user commits are durable through
+the WAL-head CAS and do not rewrite the manifest. Table/blob objects are written
+first, then an edit is published with conditional PUT.
 
-This maps **directly onto trinedb's optimistic MVCC**: trinedb already validates
-conflicts at commit and returns a retryable busy error. "CAS the manifest" is the
-same contract one layer down. No new semantics.
-
-Orphan objects from a lost CAS race (SSTables written but not referenced) are
-reclaimed by a GC pass that lists objects unreferenced by the current manifest
-and deletes them after a safety interval.
+CAS conflicts rebase only when the edit is still semantically applicable.
+Already-applied exact edits are idempotent; table-ID collisions and partially
+applied replacements are corruption. When a conditional PUT reports a transport
+error, read-after-error accepts only the exact intended manifest bytes as
+published. Orphan immutable objects are reclaimed only after current manifest
+reachability is checked.
 
 ### 3. Writer fencing across processes/nodes
 
-trine-kv has a `WriterLease` capability (single writer owns the DB). On object
-storage the lease is a small object acquired via `put_if(IfNoneMatch)` carrying
-an owner id + expiry + monotonically increasing **epoch (fencing token)**. The
-holder renews before expiry; a crashed holder's lease expires and another writer
-can take it at a higher epoch. The manifest records the epoch so a stale,
-fenced-out writer's `publish_manifest` CAS fails. This keeps the single-logical-
-writer invariant the rest of the design assumes.
+Lease format v3 binds every acquisition or takeover to both a monotonically
+increasing epoch and a fresh random 128-bit owner nonce. Every renewal, WAL-head
+CAS, rewrite, and release verifies both values. This closes the same-epoch ABA
+hole: a stale handle is fenced even if it observes an epoch reused by legacy
+state or a replacement owner. Legacy and v2 leases remain readable with an
+all-zero owner only for compatibility; new writes publish v3.
 
 ## Concurrency model on object storage
 
-- **Single logical writer + many readers (recommended first target).** One
+- **Single logical writer + many readers.** One
   writer node holds the lease and advances the manifest; any number of reader
   nodes open the manifest read-only and serve queries from cached objects. This
   is the cheap, consistent, scale-out-reads model (and matches scale-to-zero:
@@ -203,56 +200,31 @@ writer invariant the rest of the design assumes.
 - Cost note: object storage bills per-request + egress. Favor larger blocks,
   group commit, and caching to keep request counts down.
 
-## Deployment modes (same backend, different write-timing policy)
+## Deployment mode
 
-1. **Live backend.** The object store *is* the durable store; every commit's
-   manifest CAS happens against it. Strong consistency, cheapest at rest,
-   network-dependent for writes. This is the cloud server's normal mode.
-2. **Async replica target.** A local-first node commits to local LSM first, and a
-   background shipper mirrors immutable objects to the bucket and advances the
-   remote manifest when connected (offline tolerated; reconnect drains the
-   queue). This is the substrate for the local-first sync product; the backend
-   implementation is identical, only *who advances the remote manifest, and when*
-   differs. Detailed in the sync design (next doc).
-
-A per-transaction / per-database **remote durability level** governs mode 2:
-`local` (commit returns on local durability; remote is eventual) vs `synced`
-(commit waits for remote manifest CAS). This extends the existing
-`DurabilityMode` with a remote tier.
+The implemented mode uses the object store as the authoritative durable store.
+An asynchronous local-to-remote replica target remains out of scope and must not
+be inferred from `DurabilityMode::Buffered`.
 
 ## Public surface (trinedb / trine-kv)
 
-- `options::HostStorageBackend::ObjectStore { provider, bucket, prefix, creds, .. }`
-  selects the backend. Native-file / in-memory remain the defaults.
-- Feature gate, e.g. `object-store` (and `object-store-s3` for the AWS SDK), so
-  the embedded core pulls in no cloud dependencies unless enabled.
+- `DbOptions::object_store()` configures engine policy;
+  `Db::open_object_store` and `Db::open_object_store_at` supply the client and
+  optional database prefix.
+- The provider-neutral client contract is always available; the S3 adapter is
+  enabled by the `s3` feature.
 - trinedb exposes it through its existing `DbOptions` path; the SQL/MVCC/
   transaction layers are untouched.
 
-## Implementation slices
+## Provider contract and remaining scope
 
-1. **`ObjectClient` trait + an in-process fake** (an `ObjectStore` over a local
-   directory or in-memory map, with real `put_if`/etag semantics). Lets us build
-   and test the whole backend — segmented WAL, manifest CAS, lease fencing —
-   under object semantics with **zero cloud dependency**, deterministically.
-2. **Object-store backend** implementing the `Storage*Backend` traits against
-   `ObjectClient`, with capability declaration; wire into `HostStorageBackend`.
-   Run trine-kv's existing recovery/durability test suites against the fake.
-3. **S3 `ObjectClient`** (AWS SDK or `object_store` crate) behind the feature
-   gate; integration test against MinIO / S3-compatible local server.
-4. **Group commit + block-cache tuning**; cold-start and cost benchmarks.
-5. (Later) replica-target mode + remote durability level — coordinated with the
-   sync design.
+The client must provide atomic create-if-absent and ETag-based compare-and-swap,
+read-after-write visibility, bounded range reads, and observable deletion.
+`verify_object_client_contract_on_open` can probe unsafe conditional-PUT
+implementations. S3 listing is capped at 100,000 returned objects per operation;
+larger namespaces fail with `RuntimeBusy` instead of allocating without bound.
+The ETag used after PUT comes only from that PUT response—Trine never substitutes
+a later HEAD result that could belong to another write.
 
-## Open questions
-
-- **Conditional-write support across providers.** S3, R2, GCS, Azure differ in
-  CAS/precondition support and consistency. Define the minimum
-  (`put_if` IfMatch/IfNoneMatch + read-after-write) and degrade gracefully
-  (read-only / single-process) when absent.
-- **WAL segment sizing & group-commit window** vs commit-latency target.
-- **GC policy** for orphaned objects (safety interval, listing cost).
-- **Lease TTL / clock assumptions** for fencing; tolerate clock skew via epochs,
-  not wall-clock comparison alone.
-- **Manifest growth**: keep it compact (version-edit log + periodic snapshot) so
-  cold start and every commit PUT stay small.
+Multi-primary writers, versioned-object reclamation, replica shipping, and
+provider-specific retention/lock bypass remain out of scope.

@@ -49,11 +49,16 @@ const OBJECT_WAL_GROUP_COMMIT_DELAY: Duration = Duration::from_millis(5);
 const OBJECT_LEASE_TTL: Duration = Duration::from_secs(30);
 const OBJECT_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(10);
 const OBJECT_LEASE_MAGIC: u32 = 0x5452_4c53;
-const OBJECT_LEASE_VERSION: u16 = 2;
+const OBJECT_LEASE_VERSION: u16 = 3;
 const OBJECT_LEASE_V2_HEADER_LEN: usize = 34;
+const OBJECT_LEASE_V3_HEADER_LEN: usize = 50;
 const OBJECT_LEASE_MAX_BYTES: u64 = 64 * 1024;
 const OBJECT_WAL_SEGMENT_MAGIC: &[u8; 8] = b"TRNOWAL1";
 const OBJECT_WAL_SEGMENT_HEADER_LEN: usize = 12;
+const OBJECT_WAL_MAX_SEGMENT_BYTES: usize = 128 * 1024 * 1024;
+const OBJECT_WAL_MAX_GROUP_FRAME_BYTES: usize = OBJECT_WAL_MAX_SEGMENT_BYTES - 64 * 1024;
+const OBJECT_WAL_MAX_CHAIN_SEGMENTS: usize = 16_384;
+const OBJECT_WAL_MAX_REPLAY_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Backend-specific runtime durability operations (WAL lifecycle + writer
 /// lease) that the commit / flush / close paths drive.
@@ -298,6 +303,7 @@ impl FilesystemSubstrate {
 /// doubles as a fencing token and the published remote WAL head.
 pub(crate) struct ObjectStoreSubstrate {
     wal_lane: ObjectWalLane,
+    buffered: Mutex<Vec<(Sequence, Arc<[u8]>)>>,
     fencing_epoch: u64,
     records_accepted: std::sync::atomic::AtomicU64,
     bytes_accepted: std::sync::atomic::AtomicU64,
@@ -317,6 +323,7 @@ impl ObjectStoreSubstrate {
         let fencing_epoch = lease.state.epoch;
         Ok(Self {
             wal_lane: ObjectWalLane::spawn(lease, db_path)?,
+            buffered: Mutex::new(Vec::new()),
             fencing_epoch,
             records_accepted: std::sync::atomic::AtomicU64::new(0),
             bytes_accepted: std::sync::atomic::AtomicU64::new(0),
@@ -335,28 +342,50 @@ impl ObjectStoreSubstrate {
         operations: &[BatchOperation],
         durability: DurabilityMode,
     ) -> Result<()> {
-        if durability == DurabilityMode::Buffered {
-            return Ok(());
-        }
         let frame = wal::encode_batch_frame(sequence, operations)?;
         let bytes_accepted = frame.len() as u64;
-        self.wal_lane.accept_commit(sequence, frame.into())?;
+        self.buffered
+            .lock()
+            .map_err(|_| lock_poisoned_error("object WAL buffered commits"))?
+            .push((sequence, frame.into()));
         self.records_accepted
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.bytes_accepted
             .fetch_add(bytes_accepted, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
+        if durability == DurabilityMode::Buffered {
+            Ok(())
+        } else {
+            self.flush_buffered()
+        }
     }
 
     fn persist_wal(&self, durability: DurabilityMode) -> Result<()> {
         if durability == DurabilityMode::Buffered {
             return Ok(());
         }
+        self.flush_buffered()?;
         self.wal_lane.persist()
     }
 
     fn rewrite_wal_after_replay_floor(&self, replay_floor: Sequence) -> Result<()> {
+        self.flush_buffered()?;
         self.wal_lane.rewrite_after_replay_floor(replay_floor)
+    }
+
+    fn flush_buffered(&self) -> Result<()> {
+        let mut buffered = self
+            .buffered
+            .lock()
+            .map_err(|_| lock_poisoned_error("object WAL buffered commits"))?;
+        buffered.sort_by_key(|(sequence, _)| *sequence);
+        for (published, (sequence, frame)) in buffered.iter().enumerate() {
+            if let Err(error) = self.wal_lane.accept_commit(*sequence, Arc::clone(frame)) {
+                buffered.drain(..published);
+                return Err(error);
+            }
+        }
+        buffered.clear();
+        Ok(())
     }
 
     fn wal_stats(&self) -> WalFrontDoorStats {
@@ -397,7 +426,7 @@ impl ObjectWalLane {
         let future_driver = ObjectWalFutureDriver::new()?;
         let worker = thread::Builder::new()
             .name("trine-object-wal".to_owned())
-            .spawn(move || run_object_wal_worker(lease, db_path, receiver, future_driver))
+            .spawn(move || run_object_wal_worker(lease, &db_path, &receiver, &future_driver))
             .map_err(Error::Io)?;
         Ok(Self {
             sender: Mutex::new(Some(sender)),
@@ -564,12 +593,11 @@ impl ObjectWalFutureDriver {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn run_object_wal_worker(
     mut lease: ObjectWriterLease,
-    db_path: PathBuf,
-    receiver: mpsc::Receiver<ObjectWalCommand>,
-    future_driver: ObjectWalFutureDriver,
+    db_path: &std::path::Path,
+    receiver: &mpsc::Receiver<ObjectWalCommand>,
+    future_driver: &ObjectWalFutureDriver,
 ) {
     let mut deferred = None;
     loop {
@@ -584,63 +612,182 @@ fn run_object_wal_worker(
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             },
         };
-        match command {
-            ObjectWalCommand::Accept(first) => {
-                let mut accepts = vec![first];
-                while let Ok(command) = receiver.recv_timeout(OBJECT_WAL_GROUP_COMMIT_DELAY) {
-                    match command {
-                        ObjectWalCommand::Accept(accept) => accepts.push(accept),
-                        other => {
-                            deferred = Some(other);
-                            break;
-                        }
-                    }
-                    while let Ok(command) = receiver.try_recv() {
-                        match command {
-                            ObjectWalCommand::Accept(accept) => accepts.push(accept),
-                            other => {
-                                deferred = Some(other);
-                                break;
-                            }
-                        }
-                    }
-                    if deferred.is_some() {
-                        break;
-                    }
-                }
-                complete_object_wal_accepts(&mut lease, &db_path, &future_driver, accepts);
-            }
-            ObjectWalCommand::Persist { completion } => {
-                let result = future_driver.block_on(lease.renew());
-                completion.complete(result);
-            }
-            ObjectWalCommand::Rewrite {
-                replay_floor,
-                completion,
-            } => {
-                let result = future_driver.block_on(async {
-                    let deleted = lease
-                        .rewrite_segment_after_replay_floor(&db_path, replay_floor)
-                        .await?;
-                    for key in deleted {
-                        lease.client.delete(&key).await?;
-                    }
-                    wal::delete_object_wal_at_or_below_with_backend_async(
-                        &crate::object_store::ObjectStoreBackend::new(Arc::clone(&lease.client)),
-                        &db_path,
-                        replay_floor,
-                    )
-                    .await
-                });
-                completion.complete(result);
-            }
-            ObjectWalCommand::Release { completion } => {
-                let result = future_driver.block_on(lease.release());
-                completion.complete(result);
-                return;
-            }
+        if run_object_wal_command(
+            &mut lease,
+            db_path,
+            receiver,
+            future_driver,
+            command,
+            &mut deferred,
+        ) {
+            return;
         }
     }
+}
+
+fn run_object_wal_command(
+    lease: &mut ObjectWriterLease,
+    db_path: &std::path::Path,
+    receiver: &mpsc::Receiver<ObjectWalCommand>,
+    future_driver: &ObjectWalFutureDriver,
+    command: ObjectWalCommand,
+    deferred: &mut Option<ObjectWalCommand>,
+) -> bool {
+    match command {
+        ObjectWalCommand::Accept(first) => {
+            let accepts = collect_object_wal_accepts(first, receiver, deferred);
+            let completions = accepts
+                .iter()
+                .map(|accept| Arc::clone(&accept.completion))
+                .collect::<Vec<_>>();
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                complete_object_wal_accepts(lease, db_path, future_driver, accepts);
+            }))
+            .is_err()
+            {
+                complete_object_wal_worker_panic(completions);
+                fail_object_wal_after_panic(receiver, deferred.take());
+                return true;
+            }
+        }
+        ObjectWalCommand::Persist { completion } => {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                future_driver.block_on(lease.renew())
+            }));
+            let Ok(result) = result else {
+                complete_object_wal_worker_panic(vec![completion]);
+                fail_object_wal_after_panic(receiver, deferred.take());
+                return true;
+            };
+            completion.complete(result);
+        }
+        ObjectWalCommand::Rewrite {
+            replay_floor,
+            completion,
+        } => {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rewrite_object_wal(lease, db_path, replay_floor, future_driver)
+            }));
+            let Ok(result) = result else {
+                complete_object_wal_worker_panic(vec![completion]);
+                fail_object_wal_after_panic(receiver, deferred.take());
+                return true;
+            };
+            completion.complete(result);
+        }
+        ObjectWalCommand::Release { completion } => {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                future_driver.block_on(lease.release())
+            }));
+            let Ok(result) = result else {
+                complete_object_wal_worker_panic(vec![completion]);
+                fail_object_wal_after_panic(receiver, deferred.take());
+                return true;
+            };
+            completion.complete(result);
+            return true;
+        }
+    }
+    false
+}
+
+fn collect_object_wal_accepts(
+    first: ObjectWalAccept,
+    receiver: &mpsc::Receiver<ObjectWalCommand>,
+    deferred: &mut Option<ObjectWalCommand>,
+) -> Vec<ObjectWalAccept> {
+    let mut accept_bytes = first.frame.len();
+    let mut accepts = vec![first];
+    while let Ok(command) = receiver.recv_timeout(OBJECT_WAL_GROUP_COMMIT_DELAY) {
+        match command {
+            ObjectWalCommand::Accept(accept)
+                if accept_bytes
+                    .checked_add(accept.frame.len())
+                    .is_some_and(|bytes| bytes <= OBJECT_WAL_MAX_GROUP_FRAME_BYTES) =>
+            {
+                accept_bytes += accept.frame.len();
+                accepts.push(accept);
+            }
+            other => {
+                *deferred = Some(other);
+                break;
+            }
+        }
+        while let Ok(command) = receiver.try_recv() {
+            match command {
+                ObjectWalCommand::Accept(accept)
+                    if accept_bytes
+                        .checked_add(accept.frame.len())
+                        .is_some_and(|bytes| bytes <= OBJECT_WAL_MAX_GROUP_FRAME_BYTES) =>
+                {
+                    accept_bytes += accept.frame.len();
+                    accepts.push(accept);
+                }
+                other => {
+                    *deferred = Some(other);
+                    break;
+                }
+            }
+        }
+        if deferred.is_some() {
+            break;
+        }
+    }
+    accepts
+}
+
+fn rewrite_object_wal(
+    lease: &mut ObjectWriterLease,
+    db_path: &std::path::Path,
+    replay_floor: Sequence,
+    future_driver: &ObjectWalFutureDriver,
+) -> Result<()> {
+    future_driver.block_on(async {
+        let deleted = lease
+            .rewrite_segment_after_replay_floor(db_path, replay_floor)
+            .await?;
+        for key in deleted {
+            lease.client.delete(&key).await?;
+        }
+        wal::delete_object_wal_at_or_below_with_backend_async(
+            &crate::object_store::ObjectStoreBackend::new(Arc::clone(&lease.client)),
+            db_path,
+            replay_floor,
+        )
+        .await
+    })
+}
+
+fn complete_object_wal_worker_panic(completions: Vec<Arc<ObjectWalCompletion>>) {
+    for completion in completions {
+        completion.complete(Err(Error::runtime_busy("object WAL worker task panicked")));
+    }
+}
+
+fn fail_object_wal_after_panic(
+    receiver: &mpsc::Receiver<ObjectWalCommand>,
+    deferred: Option<ObjectWalCommand>,
+) {
+    if let Some(command) = deferred {
+        complete_object_wal_command_after_panic(command);
+    }
+    // Stay alive in a terminal failed state until every sender is gone. That
+    // closes the race where a sender successfully enqueues after a one-shot
+    // drain but before the receiver is dropped, which would otherwise strand
+    // its waiter forever.
+    while let Ok(command) = receiver.recv() {
+        complete_object_wal_command_after_panic(command);
+    }
+}
+
+fn complete_object_wal_command_after_panic(command: ObjectWalCommand) {
+    let completion = match command {
+        ObjectWalCommand::Accept(accept) => accept.completion,
+        ObjectWalCommand::Persist { completion }
+        | ObjectWalCommand::Rewrite { completion, .. }
+        | ObjectWalCommand::Release { completion } => completion,
+    };
+    complete_object_wal_worker_panic(vec![completion]);
 }
 
 fn complete_object_wal_accepts(
@@ -720,6 +867,7 @@ pub(crate) struct ObjectWriterLease {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ObjectLeaseState {
     pub(crate) epoch: u64,
+    pub(crate) owner_id: [u8; 16],
     pub(crate) committed_sequence: Sequence,
     pub(crate) current_wal_key: Option<String>,
     pub(crate) lease_expires_at_ms: u64,
@@ -729,6 +877,7 @@ impl ObjectLeaseState {
     pub(crate) fn empty() -> Self {
         Self {
             epoch: 0,
+            owner_id: [0; 16],
             committed_sequence: Sequence::ZERO,
             current_wal_key: None,
             lease_expires_at_ms: 0,
@@ -763,10 +912,17 @@ impl ObjectWriterLease {
         loop {
             let now_ms = current_epoch_millis()?;
             let lease_expires_at_ms = object_lease_deadline_ms(now_ms);
+            let mut owner_id = [0_u8; 16];
+            getrandom::fill(&mut owner_id).map_err(|error| {
+                Error::Io(io::Error::other(format!(
+                    "object-store writer owner randomness failed: {error}"
+                )))
+            })?;
             let (next_state, precondition) = match read_lease_state(&client, &key).await? {
                 None => (
                     ObjectLeaseState {
                         epoch: 1,
+                        owner_id,
                         committed_sequence: Sequence::ZERO,
                         current_wal_key: None,
                         lease_expires_at_ms,
@@ -787,6 +943,7 @@ impl ObjectWriterLease {
                         .ok_or_else(|| Error::Corruption {
                             message: "object-store writer epoch overflow".to_owned(),
                         })?;
+                    state.owner_id = owner_id;
                     state.lease_expires_at_ms = lease_expires_at_ms;
                     (state, Precondition::IfMatch(meta.etag))
                 }
@@ -935,6 +1092,12 @@ impl ObjectWriterLease {
                 ),
             });
         }
+        if current.state.owner_id != self.state.owner_id {
+            return Err(Error::Fenced {
+                held_epoch: self.state.epoch,
+                current_epoch: current.state.epoch,
+            });
+        }
         self.etag = current.etag;
         self.state = current.state;
         Ok(())
@@ -979,6 +1142,12 @@ impl ObjectWriterLease {
                         ),
                     });
                 }
+                if current.state.owner_id != self.state.owner_id {
+                    return Err(Error::Fenced {
+                        held_epoch: self.state.epoch,
+                        current_epoch: current.state.epoch,
+                    });
+                }
                 self.etag = current.etag;
                 self.state = current.state;
                 Ok(())
@@ -1013,6 +1182,12 @@ impl ObjectWriterLease {
                         "writer lease {} moved backward from epoch {} to {}",
                         self.key, self.state.epoch, current.state.epoch
                     ),
+                });
+            }
+            if current.state.owner_id != self.state.owner_id {
+                return Err(Error::Fenced {
+                    held_epoch: self.state.epoch,
+                    current_epoch: current.state.epoch,
                 });
             }
             self.etag = current.etag;
@@ -1112,12 +1287,19 @@ impl ObjectWriterLease {
                             ),
                         });
                     }
+                    if current.state.owner_id != self.state.owner_id {
+                        return Err(Error::Fenced {
+                            held_epoch: self.state.epoch,
+                            current_epoch: current.state.epoch,
+                        });
+                    }
                     self.etag = current.etag;
                     self.state = current.state;
                 }
                 Err(error) => {
                     if let Ok(Some(current)) = read_lease_state(&self.client, &self.key).await
                         && current.state.epoch == next.epoch
+                        && current.state.owner_id == next.owner_id
                         && current.state.committed_sequence >= sequence
                         && current.state.current_wal_key.as_deref() == Some(wal_key.as_str())
                     {
@@ -1196,6 +1378,12 @@ impl ObjectWriterLease {
                             ),
                         });
                     }
+                    if current.state.owner_id != self.state.owner_id {
+                        return Err(Error::Fenced {
+                            held_epoch: self.state.epoch,
+                            current_epoch: current.state.epoch,
+                        });
+                    }
                     self.etag = current.etag;
                     self.state = current.state;
                 }
@@ -1227,6 +1415,11 @@ fn encode_object_wal_segment(previous_key: Option<&str>, frames: &[u8]) -> Resul
     segment.extend_from_slice(&key_len.to_le_bytes());
     segment.extend_from_slice(previous_key.as_bytes());
     segment.extend_from_slice(frames);
+    crate::limits::ensure_corruption_len(
+        segment.len(),
+        OBJECT_WAL_MAX_SEGMENT_BYTES,
+        "object WAL segment length",
+    )?;
     Ok(segment)
 }
 
@@ -1343,34 +1536,100 @@ async fn read_object_wal_chain(
     let mut visited = HashSet::new();
     let mut keys = Vec::new();
     let mut batches = Vec::new();
+    let mut replay_bytes = 0usize;
     loop {
-        validate_object_wal_key(db_path, &current)?;
         if !visited.insert(current.clone()) {
             return Err(Error::Corruption {
                 message: format!("object WAL chain contains a cycle at {current}"),
             });
         }
-        let bytes = client
-            .get(&current)
-            .await?
-            .ok_or_else(|| Error::Corruption {
-                message: format!("object WAL segment {current} is missing"),
-            })?;
-        let (previous, frames) = decode_object_wal_segment(&current, &bytes)?;
+        if visited.len() > OBJECT_WAL_MAX_CHAIN_SEGMENTS {
+            return Err(Error::Corruption {
+                message: format!(
+                    "object WAL chain exceeds {OBJECT_WAL_MAX_CHAIN_SEGMENTS} segments"
+                ),
+            });
+        }
+        let segment =
+            read_verified_object_wal_segment(client, db_path, &current, replay_floor).await?;
+        replay_bytes =
+            replay_bytes
+                .checked_add(segment.byte_len)
+                .ok_or_else(|| Error::Corruption {
+                    message: "object WAL replay byte count overflow".to_owned(),
+                })?;
+        crate::limits::ensure_corruption_len(
+            replay_bytes,
+            OBJECT_WAL_MAX_REPLAY_BYTES,
+            "object WAL replay bytes",
+        )?;
         batches.extend(
-            wal::decode_frames_after(frames, replay_floor)?
+            segment
+                .batches
                 .into_iter()
                 .filter(|batch| batch.sequence <= state.committed_sequence),
         );
         keys.push(current);
-        let Some(previous) = previous else {
+        let Some(previous) = segment.previous else {
             break;
         };
         current = previous;
     }
     batches.sort_unstable_by_key(|batch| batch.sequence);
+    validate_object_wal_sequences(&batches, replay_floor, state.committed_sequence)?;
+    Ok((batches, keys))
+}
+
+struct VerifiedObjectWalSegment {
+    previous: Option<String>,
+    batches: Vec<wal::WalBatch>,
+    byte_len: usize,
+}
+
+async fn read_verified_object_wal_segment(
+    client: &Arc<dyn ObjectClient>,
+    db_path: &std::path::Path,
+    key: &str,
+    replay_floor: Sequence,
+) -> Result<VerifiedObjectWalSegment> {
+    validate_object_wal_key(db_path, key)?;
+    let bytes = client.get(key).await?.ok_or_else(|| Error::Corruption {
+        message: format!("object WAL segment {key} is missing"),
+    })?;
+    crate::limits::ensure_corruption_len(
+        bytes.len(),
+        OBJECT_WAL_MAX_SEGMENT_BYTES,
+        "object WAL segment length",
+    )?;
+    let identity = key
+        .strip_suffix(".trinewal")
+        .and_then(|stem| stem.rsplit_once('-'))
+        .map(|(_, identity)| identity)
+        .ok_or_else(|| Error::Corruption {
+            message: format!("object WAL segment {key} has no content identity"),
+        })?;
+    if identity != object_wal_segment_identity(&bytes) {
+        return Err(Error::Corruption {
+            message: format!("object WAL segment {key} content identity mismatch"),
+        });
+    }
+    let byte_len = bytes.len();
+    let (previous, frames) = decode_object_wal_segment(key, &bytes)?;
+    let batches = wal::decode_frames_after(frames, replay_floor)?;
+    Ok(VerifiedObjectWalSegment {
+        previous,
+        batches,
+        byte_len,
+    })
+}
+
+fn validate_object_wal_sequences(
+    batches: &[wal::WalBatch],
+    replay_floor: Sequence,
+    committed_sequence: Sequence,
+) -> Result<()> {
     let mut previous = replay_floor;
-    for batch in &batches {
+    for batch in batches {
         let expected = previous
             .get()
             .checked_add(1)
@@ -1389,16 +1648,16 @@ async fn read_object_wal_chain(
         }
         previous = batch.sequence;
     }
-    if previous != state.committed_sequence {
+    if previous != committed_sequence {
         return Err(Error::Corruption {
             message: format!(
                 "object WAL chain ended at sequence {}, below committed head {}",
                 previous.get(),
-                state.committed_sequence.get()
+                committed_sequence.get()
             ),
         });
     }
-    Ok((batches, keys))
+    Ok(())
 }
 
 fn validate_object_wal_key(db_path: &std::path::Path, key: &str) -> Result<()> {

@@ -7,7 +7,7 @@ use std::{
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     ptr::NonNull,
-    sync::{Arc, mpsc},
+    sync::mpsc,
 };
 
 use block2::{Block, RcBlock};
@@ -46,14 +46,6 @@ pub(super) fn read_exact_at_owned(
         )));
     }
     Ok(StorageReadBuffer::from_vec(offset, bytes))
-}
-
-pub(super) fn read_optional(path: &Path, max_bytes: usize) -> Result<Option<Arc<[u8]>>> {
-    match read_dispatch(path, 0, max_bytes) {
-        Ok(bytes) => Ok(Some(Arc::from(bytes))),
-        Err(Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
 }
 
 pub(super) fn write_truncate(path: &Path, bytes: &[u8], durability: DurabilityMode) -> Result<()> {

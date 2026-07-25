@@ -660,6 +660,8 @@ impl Db {
             state.chunk_count(),
         )?;
         let seal_guard = self.lock_content_seal().await;
+        self.require_content_descriptor_publication_allowed(storage_domain_id, content_id)
+            .await?;
         let reused = if let Some(existing) = self
             .read_content_descriptor(storage_domain_id, content_id)
             .await?
@@ -676,8 +678,6 @@ impl Db {
             }
             existing.upload_id() != upload_id
         } else {
-            self.require_content_descriptor_publication_allowed(storage_domain_id, content_id)
-                .await?;
             self.write_content_descriptor(storage_domain_id, content_id, descriptor.encode())
                 .await?;
             false

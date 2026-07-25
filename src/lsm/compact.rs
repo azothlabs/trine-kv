@@ -279,8 +279,10 @@ fn can_move_without_rewrite(input_tables: &[Arc<Table>], output_level: table::Ta
 /// reader. All three must hold for a single tombstone:
 ///
 /// - it spatially covers the whole table key span;
-/// - it is at least as new as every record in the table, so it hides them all
-///   (a put at seq `s` is hidden by a tombstone at seq `t` when `s <= t`);
+/// - it is strictly newer than every record in the table, so it hides them all;
+///   equality is insufficient because table properties do not retain the
+///   per-operation batch index that orders a range delete and point write from
+///   the same commit;
 /// - it is visible to the oldest retained reader (`tombstone.seq <=
 ///   oldest_active_snapshot`), so no snapshot still needs the covered data.
 ///
@@ -296,7 +298,7 @@ fn table_fully_covered_by_droppable_tombstone(
     }
     range_tombstones.iter().any(|tombstone| {
         tombstone.sequence <= oldest_active_snapshot
-            && properties.largest_sequence <= tombstone.sequence
+            && properties.largest_sequence < tombstone.sequence
             && range_tombstone::key_is_in_range(&properties.smallest_user_key, &tombstone.range)
             && range_tombstone::key_is_in_range(&properties.largest_user_key, &tombstone.range)
     })
@@ -903,7 +905,6 @@ mod tests {
                 CompactionOptions {
                     target_table_bytes: 1,
                     level_size_multiplier: 2,
-                    max_l0_files: 4,
                     local_l0_compaction: true,
                 },
             )
@@ -936,7 +937,6 @@ mod tests {
                 CompactionOptions {
                     target_table_bytes: 1,
                     level_size_multiplier: 2,
-                    max_l0_files: 4,
                     local_l0_compaction: true,
                 },
             )
@@ -975,7 +975,6 @@ mod tests {
                     // LevelSize trigger fires and the no-pressure policy is tested.
                     target_table_bytes: u64::MAX / 4,
                     level_size_multiplier: 2,
-                    max_l0_files: 4,
                     local_l0_compaction: true,
                 },
             )
@@ -1016,7 +1015,6 @@ mod tests {
                 CompactionOptions {
                     target_table_bytes: u64::MAX / 4,
                     level_size_multiplier: 2,
-                    max_l0_files: 4,
                     local_l0_compaction: true,
                 },
             )
@@ -1068,6 +1066,20 @@ mod tests {
             &props,
             &tombstones,
             Sequence::new(20)
+        ));
+    }
+
+    #[test]
+    fn table_at_tombstone_sequence_is_not_droppable_without_batch_order() {
+        let props = covered_props("c", "e", 10);
+        let tombstones = vec![range_tombstone("a", "z", 10)];
+        // A later point write in the same batch has the same sequence and a
+        // larger batch index. Table properties do not preserve that ordering,
+        // so equal-sequence tables must be merged record by record.
+        assert!(!table_fully_covered_by_droppable_tombstone(
+            &props,
+            &tombstones,
+            Sequence::new(10)
         ));
     }
 

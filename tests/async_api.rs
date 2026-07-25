@@ -455,7 +455,7 @@ fn persistent_async_reads_load_blob_values_through_storage_backend() {
     block_on(db.put(b"b".to_vec(), lazy_value.clone())).expect("lazy value writes");
     block_on(db.flush()).expect("async flush writes blob-backed table");
 
-    let before_point_tasks = db.stats().storage_sync_adapter_tasks;
+    let before_point = db.stats().storage_operations;
     assert_eq!(
         block_on(db.get(b"a")).expect("async point read loads blob"),
         Some(point_value)
@@ -463,8 +463,10 @@ fn persistent_async_reads_load_blob_values_through_storage_backend() {
     let after_point = db.stats();
     assert_eq!(after_point.blob_read_count, 1);
     assert!(
-        after_point.storage_sync_adapter_tasks > before_point_tasks,
-        "async point read should enter the storage backend"
+        after_point.storage_operations.open_read.requests > before_point.open_read.requests
+            && after_point.storage_operations.read_exact_at.requests
+                > before_point.read_exact_at.requests,
+        "async point read should open and range-read through the storage backend"
     );
 
     let mut iter =
@@ -475,7 +477,7 @@ fn persistent_async_reads_load_blob_values_through_storage_backend() {
     assert_eq!(row.key, b"b".to_vec());
     assert!(!row.value.is_inline());
 
-    let before_lazy_tasks = db.stats().storage_sync_adapter_tasks;
+    let before_lazy = db.stats().storage_operations;
     assert_eq!(
         block_on(row.value.read()).expect("async lazy value reads"),
         lazy_value
@@ -483,8 +485,10 @@ fn persistent_async_reads_load_blob_values_through_storage_backend() {
     let after_lazy = db.stats();
     assert_eq!(after_lazy.blob_read_count, 2);
     assert!(
-        after_lazy.storage_sync_adapter_tasks > before_lazy_tasks,
-        "async lazy value read should enter the storage backend"
+        after_lazy.storage_operations.open_read.requests > before_lazy.open_read.requests
+            && after_lazy.storage_operations.read_exact_at.requests
+                > before_lazy.read_exact_at.requests,
+        "async lazy value read should open and range-read through the storage backend"
     );
 
     cleanup_dir(&path);

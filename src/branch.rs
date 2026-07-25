@@ -1289,7 +1289,13 @@ impl Db {
         }];
         let mut child_fork = leaf.fork;
         let mut parent = leaf.parent;
+        let mut visited = std::collections::BTreeSet::from([name.to_owned()]);
         while let Some(parent_name) = parent {
+            if !visited.insert(parent_name.clone()) {
+                return Err(Error::Corruption {
+                    message: format!("branch lineage contains a cycle at {parent_name}"),
+                });
+            }
             let entry = self
                 .read_registry(&parent_name)?
                 .ok_or_else(|| Error::Corruption {
@@ -1357,7 +1363,6 @@ impl Db {
     pub fn delete_branch(&self, name: &str) -> Result<()> {
         validate_branch_name(name)?;
         let Some(entry) = begin_branch_delete(self, name)? else {
-            delete_checkpoint_if_present(self, &fork_checkpoint(name))?;
             return Ok(());
         };
         // Reclaim the branch's divergent data: drop each data bucket it wrote.
@@ -1394,7 +1399,6 @@ impl Db {
     pub async fn delete_branch_async(&self, name: &str) -> Result<()> {
         validate_branch_name(name)?;
         let Some(entry) = begin_branch_delete_async(self, name).await? else {
-            delete_checkpoint_if_present_async(self, &fork_checkpoint(name)).await?;
             return Ok(());
         };
         for user_bucket in &entry.written_buckets {

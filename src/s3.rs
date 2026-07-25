@@ -14,16 +14,18 @@
 
 use std::sync::Arc;
 
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use object_store::{
-    Error as OsError, GetOptions, GetRange, ObjectStore, PutMode, PutOptions, PutPayload,
-    UpdateVersion, path::Path as OsPath,
+    Error as OsError, GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
+    PutPayload, UpdateVersion, path::Path as OsPath,
 };
 
 use crate::error::{Error, Result};
 use crate::object_store::{
     ETag, ObjectClient, ObjectFuture, ObjectMeta, ObjectVersion, Precondition, PutIf,
 };
+
+const MAX_LIST_RESULTS: usize = 100_000;
 
 /// Adapts any [`object_store::ObjectStore`] to trine's [`ObjectClient`].
 #[derive(Clone)]
@@ -138,19 +140,12 @@ fn map_object_store_error(error: OsError) -> Error {
     Error::Io(std::io::Error::other(error))
 }
 
-/// Resolve the `ETag` for a write, fetching it via `head` if the store did not
-/// return one on the put.
-async fn resolve_put_etag(
-    e_tag: Option<String>,
-    store: &Arc<dyn ObjectStore>,
-    path: &OsPath,
-) -> Result<ETag> {
-    if let Some(e_tag) = e_tag {
-        return Ok(ETag::new(e_tag));
-    }
-    let meta = store.head(path).await.map_err(map_object_store_error)?;
-    meta.e_tag.map(ETag::new).ok_or_else(|| Error::Corruption {
-        message: "object store did not return an ETag (required for manifest CAS)".to_owned(),
+/// Extract the `ETag` from the write response itself. A follow-up HEAD is not a
+/// safe substitute: another writer may overwrite the key between PUT and HEAD,
+/// which would associate that writer's `ETag` with our bytes.
+fn resolve_put_etag(e_tag: Option<String>) -> Result<ETag> {
+    e_tag.map(ETag::new).ok_or_else(|| Error::Corruption {
+        message: "object store PUT did not return an ETag required for safe CAS".to_owned(),
     })
 }
 
@@ -198,7 +193,7 @@ impl ObjectClient for ObjectStoreClient {
                 .put(&path, payload)
                 .await
                 .map_err(map_object_store_error)?;
-            resolve_put_etag(result.e_tag, &self.store, &path).await
+            resolve_put_etag(result.e_tag)
         })
     }
 
@@ -215,13 +210,20 @@ impl ObjectClient for ObjectStoreClient {
 
     fn list<'op>(&'op self, prefix: &str) -> ObjectFuture<'op, Vec<ObjectMeta>> {
         let os_prefix = OsPath::from(prefix);
+        let prefix = prefix.to_owned();
         Box::pin(async move {
             let metas: Vec<object_store::ObjectMeta> = self
                 .store
                 .list(Some(&os_prefix))
+                .take(MAX_LIST_RESULTS + 1)
                 .try_collect()
                 .await
                 .map_err(map_object_store_error)?;
+            if metas.len() > MAX_LIST_RESULTS {
+                return Err(Error::runtime_busy(format!(
+                    "object listing for {prefix:?} exceeds {MAX_LIST_RESULTS} results"
+                )));
+            }
             // object_store yields keys in lexicographic order, matching the
             // ObjectClient contract. List ETags are not used for CAS (only the
             // key is read by the table/blob listers), so an absent ETag is fine.
@@ -281,7 +283,7 @@ impl ObjectClient for ObjectStoreClient {
             let payload = PutPayload::from(bytes.to_vec());
             match self.store.put_opts(&path, payload, options).await {
                 Ok(result) => Ok(PutIf::Stored {
-                    etag: resolve_put_etag(result.e_tag, &self.store, &path).await?,
+                    etag: resolve_put_etag(result.e_tag)?,
                 }),
                 // A lost CAS race is the expected, retryable outcome: report the
                 // current ETag so the manifest commit can rebase and retry.

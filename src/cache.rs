@@ -79,7 +79,6 @@ impl BlockCacheKey {
 #[derive(Debug)]
 pub(crate) struct BlockCache {
     capacity_bytes: u64,
-    shard_capacity_bytes: u64,
     hits: CacheCounter,
     misses: CacheCounter,
     shards: Vec<RwLock<BlockCacheState>>,
@@ -91,14 +90,12 @@ impl BlockCache {
             Ok(value) => value,
             Err(_) => u64::MAX,
         };
-        let shard_capacity_bytes = shard_capacity_bytes(capacity_bytes, BLOCK_CACHE_SHARD_COUNT);
         let shards = (0..BLOCK_CACHE_SHARD_COUNT)
             .map(|_| RwLock::new(BlockCacheState::default()))
             .collect();
 
         Self {
             capacity_bytes,
-            shard_capacity_bytes,
             hits: CacheCounter::new(),
             misses: CacheCounter::new(),
             shards,
@@ -205,7 +202,8 @@ impl BlockCache {
         // immediately available. Misses load the block outside the shard write
         // lock; another reader may race and insert the same block first, which
         // is harmless and keeps file I/O out of the lock.
-        let shard = &self.shards[block_cache_shard_index(key)];
+        let shard_index = block_cache_shard_index(key);
+        let shard = &self.shards[shard_index];
         if let Ok(state) = shard.read() {
             if let Some(entry) = state.entries.get(&key) {
                 let value = entry.value.clone();
@@ -234,7 +232,11 @@ impl BlockCache {
         self.misses.increment();
         if loaded_bytes <= self.capacity_bytes {
             state.insert(key, loaded_bytes, loaded.clone());
-            state.evict_to(self.shard_capacity_bytes);
+            state.evict_to(shard_capacity_bytes(
+                self.capacity_bytes,
+                BLOCK_CACHE_SHARD_COUNT,
+                shard_index,
+            ));
         }
 
         Ok(loaded)
@@ -254,7 +256,8 @@ impl BlockCache {
             return load().await.map(|(value, _)| value);
         }
 
-        let shard = &self.shards[block_cache_shard_index(key)];
+        let shard_index = block_cache_shard_index(key);
+        let shard = &self.shards[shard_index];
         if let Ok(state) = shard.read() {
             if let Some(entry) = state.entries.get(&key) {
                 let value = entry.value.clone();
@@ -283,7 +286,11 @@ impl BlockCache {
         self.misses.increment();
         if loaded_bytes <= self.capacity_bytes {
             state.insert(key, loaded_bytes, loaded.clone());
-            state.evict_to(self.shard_capacity_bytes);
+            state.evict_to(shard_capacity_bytes(
+                self.capacity_bytes,
+                BLOCK_CACHE_SHARD_COUNT,
+                shard_index,
+            ));
         }
 
         Ok(loaded)
@@ -349,9 +356,11 @@ fn estimate_index_partition_bytes(partition: &[TableDataBlock]) -> u64 {
         .fold(1_u64, u64::saturating_add)
 }
 
-fn shard_capacity_bytes(capacity_bytes: u64, shard_count: usize) -> u64 {
+fn shard_capacity_bytes(capacity_bytes: u64, shard_count: usize, shard_index: usize) -> u64 {
     let shard_count = u64::try_from(shard_count).unwrap_or(u64::MAX).max(1);
-    capacity_bytes.saturating_add(shard_count.saturating_sub(1)) / shard_count
+    let base = capacity_bytes / shard_count;
+    let remainder = capacity_bytes % shard_count;
+    base + u64::from(usize_to_u64_saturating(shard_index) < remainder)
 }
 
 fn block_cache_shard_index(key: BlockCacheKey) -> usize {
@@ -423,10 +432,8 @@ impl BlockCacheState {
             // churn gives up low-priority entries before touching metadata.
             let key = if let Some(key) = self.low_order.pop_front() {
                 key
-            } else if self.high_order.len() > 1 {
-                self.high_order
-                    .pop_front()
-                    .expect("high order has more than one entry")
+            } else if let Some(key) = self.high_order.pop_front() {
+                key
             } else {
                 return;
             };
@@ -489,7 +496,7 @@ mod tests {
 
     use super::{
         BLOCK_CACHE_SHARD_COUNT, BlockCache, BlockCacheKey, BlockCacheState, CacheKind, CacheValue,
-        block_cache_shard_index, promote_order,
+        block_cache_shard_index, promote_order, shard_capacity_bytes,
     };
     use crate::table::{DecodedDataBlock, TableId};
 
@@ -504,6 +511,16 @@ mod tests {
         assert_ne!(data, filter);
         assert_ne!(data, range_tombstone);
         assert_ne!(data, blob);
+    }
+
+    #[test]
+    fn shard_budgets_sum_to_the_exact_global_capacity() {
+        for capacity in [1_u64, 127, 128, 129, 65_537] {
+            let allocated = (0..BLOCK_CACHE_SHARD_COUNT)
+                .map(|index| shard_capacity_bytes(capacity, BLOCK_CACHE_SHARD_COUNT, index))
+                .sum::<u64>();
+            assert_eq!(allocated, capacity);
+        }
     }
 
     #[test]
@@ -577,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_high_priority_entry_survives_low_priority_churn() {
+    fn oversized_high_priority_entry_cannot_bypass_capacity() {
         let target_shard = 0;
         let high_key = key_in_shard(CacheKind::IndexBlock, target_shard, 1);
         let low_key = key_in_shard(
@@ -593,13 +610,13 @@ mod tests {
             CacheValue::IndexPartition(Arc::new(Vec::new())),
         );
         state.evict_to(2);
-        assert!(state.entries.contains_key(&high_key));
+        assert!(!state.entries.contains_key(&high_key));
 
         state.insert(low_key, 1, CacheValue::DataBlock(Arc::new(empty_block())));
         state.evict_to(2);
 
-        assert!(state.entries.contains_key(&high_key));
-        assert!(!state.entries.contains_key(&low_key));
+        assert!(!state.entries.contains_key(&high_key));
+        assert!(state.entries.contains_key(&low_key));
     }
 
     #[test]

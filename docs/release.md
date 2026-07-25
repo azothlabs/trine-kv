@@ -44,10 +44,10 @@ python3 scripts/check_docs_drift.py
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
-cargo check --target wasm32-unknown-unknown --lib
-RUSTFLAGS="-D warnings" cargo check --target wasm32-wasip1 --lib
+cargo check --target wasm32-unknown-unknown --lib --all-features
+RUSTFLAGS="-D warnings" cargo check --target wasm32-wasip1 --lib --all-features
 CARGO_TARGET_WASM32_WASIP1_RUNNER="wasmtime run --dir ." cargo test --target wasm32-wasip1 --lib wasi_persistent
-cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings
+cargo clippy --target wasm32-unknown-unknown --lib --all-features -- -D warnings
 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner WASM_BINDGEN_TEST_ONLY_WEB=1 WASM_BINDGEN_TEST_NO_ORIGIN_ISOLATION=1 cargo test --target wasm32-unknown-unknown --test browser_persistent_wasm --test browser_dedicated_worker_wasm --test browser_shared_worker_wasm
 cargo run --example quickstart
 cargo run --example sync_quickstart
@@ -97,10 +97,10 @@ The package list should not include `.github/`, `.phrase/`, `.rust-skills/`,
 - `python3 scripts/check_docs_drift.py`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --all-targets --all-features`
-- `cargo check --target wasm32-unknown-unknown --lib`
-- `RUSTFLAGS="-D warnings" cargo check --target wasm32-wasip1 --lib`
+- `cargo check --target wasm32-unknown-unknown --lib --all-features`
+- `RUSTFLAGS="-D warnings" cargo check --target wasm32-wasip1 --lib --all-features`
 - `cargo test --target wasm32-wasip1 --lib wasi_persistent` under `wasmtime run --dir .`
-- `cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings`
+- `cargo clippy --target wasm32-unknown-unknown --lib --all-features -- -D warnings`
 - `cargo test --target wasm32-unknown-unknown --test browser_persistent_wasm --test browser_dedicated_worker_wasm --test browser_shared_worker_wasm`
   under the browser test runner with
   `WASM_BINDGEN_TEST_NO_ORIGIN_ISOLATION=1`. The test server must not add

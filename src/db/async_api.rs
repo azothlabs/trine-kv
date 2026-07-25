@@ -716,6 +716,12 @@ impl Db {
     /// - `mode`: durability level to request for pending WAL bytes.
     pub async fn persist(&self, mode: DurabilityMode) -> Result<()> {
         if self.inner.options.storage_mode.is_object_store_persistent() {
+            if matches!(
+                mode,
+                DurabilityMode::SyncData | DurabilityMode::SyncAll | DurabilityMode::SyncAllStrict
+            ) {
+                return Err(Error::unsupported_durability(mode));
+            }
             return self.inner.substrate.persist_wal_async(mode).await;
         }
 

@@ -100,7 +100,21 @@ pub(super) fn run_wal_lane_worker(
                 Err(_) => break,
             }
         }
-        process_wal_lane_batch(&backend, &path, &writer_open, &mut state, batch);
+        let panic_replies = batch
+            .iter()
+            .map(WalLaneCommand::panic_reply)
+            .collect::<Vec<_>>();
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            process_wal_lane_batch(&backend, &path, &writer_open, &mut state, batch);
+        }))
+        .is_err()
+        {
+            state = WalLaneWorkerState::default();
+            writer_open.store(false, Ordering::Release);
+            for reply in panic_replies {
+                reply.complete(Err(Error::runtime_busy("WAL lane worker task panicked")));
+            }
+        }
     }
 }
 

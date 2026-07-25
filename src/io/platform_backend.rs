@@ -1,6 +1,7 @@
 use std::{
     fs::File,
     io,
+    panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
 };
@@ -93,7 +94,10 @@ pub(super) fn run_worker(receiver: mpsc::Receiver<PlatformIoTask>) {
     };
 
     for task in receiver {
-        runtime.block_on(task.run());
+        let completion = task.panic_completion();
+        if panic::catch_unwind(AssertUnwindSafe(|| runtime.block_on(task.run()))).is_err() {
+            completion.complete();
+        }
     }
 }
 
@@ -128,41 +132,41 @@ pub(super) async fn read_exact_at_owned(
 }
 
 #[allow(clippy::unused_async)]
+#[cfg_attr(target_os = "macos", allow(unused_variables))]
 pub(super) async fn read_optional(path: PathBuf, max_bytes: usize) -> Result<Option<Arc<[u8]>>> {
-    ensure_optional_read_len(&path, max_bytes)?;
     #[cfg(target_os = "macos")]
     {
-        apple_dispatch::read_optional(&path, max_bytes)
+        // The backend matrix routes this operation to the bounded thread-pool
+        // implementation on macOS so metadata and bytes come from one handle.
+        unreachable!("macOS optional reads are routed to the thread-pool backend")
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        match compio::fs::read(path).await {
-            Ok(bytes) => Ok(Some(Arc::from(bytes))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(Error::Io(error)),
-        }
-    }
-}
+        use compio::io::AsyncReadAtExt;
 
-fn ensure_optional_read_len(path: &Path, max_bytes: usize) -> Result<()> {
-    let len = match std::fs::metadata(path) {
-        Ok(metadata) => metadata.len(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(Error::Io(error)),
-    };
-    let len = usize::try_from(len).map_err(|_| Error::Corruption {
-        message: format!("object {} length exceeds usize", path.display()),
-    })?;
-    if len > max_bytes {
-        return Err(Error::Corruption {
-            message: format!(
-                "object {} length {len} exceeds maximum {max_bytes}",
-                path.display()
-            ),
-        });
+        let file = match compio::fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(Error::Io(error)),
+        };
+        let len = file.metadata().await.map_err(Error::Io)?.len();
+        let len = usize::try_from(len).map_err(|_| Error::Corruption {
+            message: format!("object {} length exceeds usize", path.display()),
+        })?;
+        if len > max_bytes {
+            return Err(Error::Corruption {
+                message: format!(
+                    "object {} length {len} exceeds maximum {max_bytes}",
+                    path.display()
+                ),
+            });
+        }
+        let buffer = vec![0; len];
+        let compio::buf::BufResult(result, buffer) = file.read_exact_at(buffer, 0).await;
+        result.map_err(Error::Io)?;
+        Ok(Some(Arc::from(buffer)))
     }
-    Ok(())
 }
 
 pub(super) async fn write_temp_rename(

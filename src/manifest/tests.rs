@@ -17,6 +17,76 @@ use crate::{
     storage::NativeFileBackend,
 };
 
+struct AppliedManifestThenError {
+    inner: std::sync::Arc<dyn crate::object_store::ObjectClient>,
+    fail_once: std::sync::atomic::AtomicBool,
+}
+
+impl crate::object_store::ObjectClient for AppliedManifestThenError {
+    fn get<'op>(
+        &'op self,
+        key: &str,
+    ) -> crate::object_store::ObjectFuture<'op, Option<std::sync::Arc<[u8]>>> {
+        self.inner.get(key)
+    }
+
+    fn get_range<'op>(
+        &'op self,
+        key: &str,
+        offset: u64,
+        len: u64,
+    ) -> crate::object_store::ObjectFuture<'op, std::sync::Arc<[u8]>> {
+        self.inner.get_range(key, offset, len)
+    }
+
+    fn put<'op>(
+        &'op self,
+        key: &str,
+        bytes: std::sync::Arc<[u8]>,
+    ) -> crate::object_store::ObjectFuture<'op, crate::object_store::ETag> {
+        self.inner.put(key, bytes)
+    }
+
+    fn delete<'op>(&'op self, key: &str) -> crate::object_store::ObjectFuture<'op, ()> {
+        self.inner.delete(key)
+    }
+
+    fn list<'op>(
+        &'op self,
+        prefix: &str,
+    ) -> crate::object_store::ObjectFuture<'op, Vec<crate::object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn head<'op>(
+        &'op self,
+        key: &str,
+    ) -> crate::object_store::ObjectFuture<'op, Option<crate::object_store::ObjectMeta>> {
+        self.inner.head(key)
+    }
+
+    fn put_if<'op>(
+        &'op self,
+        key: &str,
+        bytes: std::sync::Arc<[u8]>,
+        precondition: crate::object_store::Precondition,
+    ) -> crate::object_store::ObjectFuture<'op, crate::object_store::PutIf> {
+        let future = self.inner.put_if(key, bytes, precondition);
+        let fail = self
+            .fail_once
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
+        Box::pin(async move {
+            let outcome = future.await?;
+            if fail && matches!(outcome, crate::object_store::PutIf::Stored { .. }) {
+                return Err(crate::Error::Io(std::io::Error::other(
+                    "injected response loss after manifest CAS applied",
+                )));
+            }
+            Ok(outcome)
+        })
+    }
+}
+
 #[test]
 fn manifest_decode_rejects_table_count_before_large_allocation() {
     let mut payload = Vec::new();
@@ -241,6 +311,29 @@ fn object_manifest_creates_then_advances_via_cas() {
     assert_eq!(
         manifest.state().wal_replay_floor(),
         crate::types::Sequence::new(9)
+    );
+}
+
+#[test]
+fn object_manifest_reconciles_applied_then_errored_cas() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let inner: std::sync::Arc<dyn ObjectClient> = std::sync::Arc::new(InMemoryObjectStore::new());
+    let client = std::sync::Arc::new(AppliedManifestThenError {
+        inner,
+        fail_once: std::sync::atomic::AtomicBool::new(true),
+    });
+    let mut manifest =
+        poll_ready(super::ObjectManifestStore::open(client, "MANIFEST", 1)).expect("open");
+
+    assert!(matches!(
+        poll_ready(manifest.try_publish(object_manifest_state(5)))
+            .expect("read-after-error reconciles exact intended state"),
+        super::PublishOutcome::Published
+    ));
+    assert_eq!(
+        manifest.state().wal_replay_floor(),
+        crate::types::Sequence::new(5)
     );
 }
 

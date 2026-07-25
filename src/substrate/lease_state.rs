@@ -1,7 +1,7 @@
 use super::{
     Arc, Error, OBJECT_LEASE_MAGIC, OBJECT_LEASE_MAX_BYTES, OBJECT_LEASE_TTL,
-    OBJECT_LEASE_V2_HEADER_LEN, OBJECT_LEASE_VERSION, ObjectClient, ObjectLeaseState,
-    ObservedLeaseState, Result, Sequence,
+    OBJECT_LEASE_V2_HEADER_LEN, OBJECT_LEASE_V3_HEADER_LEN, OBJECT_LEASE_VERSION, ObjectClient,
+    ObjectLeaseState, ObservedLeaseState, Result, Sequence,
 };
 #[cfg(not(all(feature = "s3", not(target_family = "wasm"))))]
 use super::{Context, Future, Poll, Wake, Waker, thread};
@@ -36,10 +36,11 @@ pub(super) fn encode_lease_state(state: ObjectLeaseState) -> Result<Arc<[u8]>> {
     let key_len = state.current_wal_key.as_ref().map_or(0, String::len);
     let key_len = u32::try_from(key_len)
         .map_err(|_| Error::invalid_options("object WAL segment key exceeds u32::MAX"))?;
-    let mut bytes = Vec::with_capacity(OBJECT_LEASE_V2_HEADER_LEN + key_len as usize);
+    let mut bytes = Vec::with_capacity(OBJECT_LEASE_V3_HEADER_LEN + key_len as usize);
     bytes.extend_from_slice(&OBJECT_LEASE_MAGIC.to_le_bytes());
     bytes.extend_from_slice(&OBJECT_LEASE_VERSION.to_le_bytes());
     bytes.extend_from_slice(&state.epoch.to_le_bytes());
+    bytes.extend_from_slice(&state.owner_id);
     bytes.extend_from_slice(&state.committed_sequence.get().to_le_bytes());
     bytes.extend_from_slice(&state.lease_expires_at_ms.to_le_bytes());
     bytes.extend_from_slice(&key_len.to_le_bytes());
@@ -51,12 +52,13 @@ pub(super) fn encode_lease_state(state: ObjectLeaseState) -> Result<Arc<[u8]>> {
 
 pub(super) fn decode_lease_state(key: &str, bytes: &[u8]) -> Result<ObjectLeaseState> {
     if bytes.len() >= 4 && read_u32_le(key, &bytes[..4], "magic")? == OBJECT_LEASE_MAGIC {
-        return decode_lease_state_v2(key, bytes);
+        return decode_versioned_lease_state(key, bytes);
     }
     if bytes.len() == 8 {
         let epoch = decode_u64(key, bytes, "epoch")?;
         return Ok(ObjectLeaseState {
             epoch,
+            owner_id: [0; 16],
             committed_sequence: Sequence::ZERO,
             current_wal_key: None,
             lease_expires_at_ms: 0,
@@ -67,6 +69,7 @@ pub(super) fn decode_lease_state(key: &str, bytes: &[u8]) -> Result<ObjectLeaseS
         let committed_sequence = Sequence::new(decode_u64(key, &bytes[8..], "commit head")?);
         return Ok(ObjectLeaseState {
             epoch,
+            owner_id: [0; 16],
             committed_sequence,
             current_wal_key: None,
             lease_expires_at_ms: 0,
@@ -80,33 +83,71 @@ pub(super) fn decode_lease_state(key: &str, bytes: &[u8]) -> Result<ObjectLeaseS
     let epoch = decode_u64(key, &bytes[..8], "epoch")?;
     let committed_sequence = Sequence::new(decode_u64(key, &bytes[8..16], "commit head")?);
     let key_len = read_u32_le(key, &bytes[16..20], "WAL segment key length")?;
-    decode_lease_state_with_key(key, bytes, 20, key_len, epoch, committed_sequence, 0)
+    decode_lease_state_with_key(
+        key,
+        bytes,
+        20,
+        key_len,
+        ObjectLeaseState {
+            epoch,
+            owner_id: [0; 16],
+            committed_sequence,
+            current_wal_key: None,
+            lease_expires_at_ms: 0,
+        },
+    )
 }
 
-pub(super) fn decode_lease_state_v2(key: &str, bytes: &[u8]) -> Result<ObjectLeaseState> {
+pub(super) fn decode_versioned_lease_state(key: &str, bytes: &[u8]) -> Result<ObjectLeaseState> {
     if bytes.len() < OBJECT_LEASE_V2_HEADER_LEN {
         return Err(Error::Corruption {
             message: format!("writer lease {key} has a malformed v2 state"),
         });
     }
     let version = read_u16_le(key, &bytes[4..6], "version")?;
-    if version != OBJECT_LEASE_VERSION {
+    if version == 2 {
+        let epoch = decode_u64(key, &bytes[6..14], "epoch")?;
+        let committed_sequence = Sequence::new(decode_u64(key, &bytes[14..22], "commit head")?);
+        let lease_expires_at_ms = decode_u64(key, &bytes[22..30], "lease expiry")?;
+        let key_len = read_u32_le(key, &bytes[30..34], "WAL segment key length")?;
+        return decode_lease_state_with_key(
+            key,
+            bytes,
+            OBJECT_LEASE_V2_HEADER_LEN,
+            key_len,
+            ObjectLeaseState {
+                epoch,
+                owner_id: [0; 16],
+                committed_sequence,
+                current_wal_key: None,
+                lease_expires_at_ms,
+            },
+        );
+    }
+    if version != OBJECT_LEASE_VERSION || bytes.len() < OBJECT_LEASE_V3_HEADER_LEN {
         return Err(Error::Corruption {
-            message: format!("writer lease {key} has unsupported version {version}"),
+            message: format!("writer lease {key} has unsupported or malformed version {version}"),
         });
     }
     let epoch = decode_u64(key, &bytes[6..14], "epoch")?;
-    let committed_sequence = Sequence::new(decode_u64(key, &bytes[14..22], "commit head")?);
-    let lease_expires_at_ms = decode_u64(key, &bytes[22..30], "lease expiry")?;
-    let key_len = read_u32_le(key, &bytes[30..34], "WAL segment key length")?;
+    let owner_id: [u8; 16] = bytes[14..30].try_into().map_err(|_| Error::Corruption {
+        message: format!("writer lease {key} has malformed owner id"),
+    })?;
+    let committed_sequence = Sequence::new(decode_u64(key, &bytes[30..38], "commit head")?);
+    let lease_expires_at_ms = decode_u64(key, &bytes[38..46], "lease expiry")?;
+    let key_len = read_u32_le(key, &bytes[46..50], "WAL segment key length")?;
     decode_lease_state_with_key(
         key,
         bytes,
-        OBJECT_LEASE_V2_HEADER_LEN,
+        OBJECT_LEASE_V3_HEADER_LEN,
         key_len,
-        epoch,
-        committed_sequence,
-        lease_expires_at_ms,
+        ObjectLeaseState {
+            epoch,
+            owner_id,
+            committed_sequence,
+            current_wal_key: None,
+            lease_expires_at_ms,
+        },
     )
 }
 
@@ -115,9 +156,7 @@ pub(super) fn decode_lease_state_with_key(
     bytes: &[u8],
     key_offset: usize,
     key_len: u32,
-    epoch: u64,
-    committed_sequence: Sequence,
-    lease_expires_at_ms: u64,
+    mut state: ObjectLeaseState,
 ) -> Result<ObjectLeaseState> {
     let key_len = usize::try_from(key_len).map_err(|_| Error::Corruption {
         message: format!("writer lease {key} WAL segment key length overflow"),
@@ -132,7 +171,7 @@ pub(super) fn decode_lease_state_with_key(
             message: format!("writer lease {key} has malformed WAL segment key bytes"),
         });
     }
-    let current_wal_key = if key_len == 0 {
+    state.current_wal_key = if key_len == 0 {
         None
     } else {
         let key_bytes = bytes
@@ -148,12 +187,7 @@ pub(super) fn decode_lease_state_with_key(
                 .to_owned(),
         )
     };
-    Ok(ObjectLeaseState {
-        epoch,
-        committed_sequence,
-        current_wal_key,
-        lease_expires_at_ms,
-    })
+    Ok(state)
 }
 
 pub(super) fn read_u16_le(key: &str, bytes: &[u8], field: &str) -> Result<u16> {

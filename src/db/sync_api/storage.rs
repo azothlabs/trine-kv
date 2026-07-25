@@ -39,7 +39,8 @@ impl Db {
     pub fn persist_sync(&self, mode: DurabilityMode) -> Result<()> {
         self.ensure_open()?;
 
-        if self.inner.options.storage_mode.is_wasi_persistent()
+        if (self.inner.options.storage_mode.is_wasi_persistent()
+            || self.inner.options.storage_mode.is_object_store_persistent())
             && matches!(
                 mode,
                 DurabilityMode::SyncData | DurabilityMode::SyncAll | DurabilityMode::SyncAllStrict
@@ -352,25 +353,6 @@ impl Db {
             .map_err(|_| lock_poisoned("manifest store"))?
             .clone_object_manifest()?;
         Ok((object, serialize))
-    }
-
-    pub(in crate::db) async fn publish_object_manifest_create_bucket(
-        &self,
-        name: String,
-        options: crate::BucketOptions,
-    ) -> Result<()> {
-        let (mut object, _serialize) = self.checkout_object_manifest().await?;
-        object.create_bucket(name, options).await?;
-        self.install_object_manifest_after_durable_publish("bucket creation", object)
-    }
-
-    pub(in crate::db) async fn publish_object_manifest_drop_bucket(
-        &self,
-        name: String,
-    ) -> Result<()> {
-        let (mut object, _serialize) = self.checkout_object_manifest().await?;
-        object.drop_bucket(name).await?;
-        self.install_object_manifest_after_durable_publish("bucket drop", object)
     }
 
     pub(in crate::db) async fn publish_object_manifest_create_checkpoint(

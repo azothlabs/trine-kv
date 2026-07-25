@@ -313,6 +313,7 @@ fn object_wal_chain_rejects_cross_database_keys_and_sequence_holes() {
     let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
     let cross_database = ObjectLeaseState {
         epoch: 1,
+        owner_id: [1; 16],
         committed_sequence: Sequence::new(1),
         current_wal_key: Some(
             "other/trine.wal.epoch-00000000000000000001.commit-00000000000000000001.trinewal"
@@ -347,6 +348,7 @@ fn object_wal_chain_rejects_cross_database_keys_and_sequence_holes() {
     ));
     let hole = ObjectLeaseState {
         epoch: 1,
+        owner_id: [1; 16],
         committed_sequence: Sequence::new(2),
         current_wal_key: Some(key),
         lease_expires_at_ms: u64::MAX,
@@ -515,6 +517,7 @@ fn object_writer_lease_rejects_live_second_writer_and_takes_expired() {
 
     let expired = ObjectLeaseState {
         epoch: first.epoch(),
+        owner_id: first.state.owner_id,
         committed_sequence: Sequence::ZERO,
         current_wal_key: None,
         lease_expires_at_ms: 0,

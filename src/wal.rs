@@ -180,7 +180,7 @@ struct PendingWalAppend {
     reply: WalLaneReply,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct WalLaneReply {
     completion: Arc<WalLaneCompletion>,
 }
@@ -261,6 +261,17 @@ impl WalLaneCompletion {
 impl WalLaneReply {
     fn complete(self, result: Result<()>) {
         self.completion.complete(result);
+    }
+}
+
+impl WalLaneCommand {
+    #[cfg(not(target_os = "wasi"))]
+    fn panic_reply(&self) -> WalLaneReply {
+        match self {
+            Self::Append { reply, .. }
+            | Self::Persist { reply, .. }
+            | Self::Rewrite { reply, .. } => reply.clone(),
+        }
     }
 }
 

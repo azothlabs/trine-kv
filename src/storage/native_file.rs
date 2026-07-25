@@ -515,8 +515,11 @@ mod browser_persistent_storage {
                 Self::capabilities_for_browser()
                     .require(StorageCapability::AtomicManifestPublish)?;
                 require_browser_durability(durability)?;
-                self.write_object_bytes_with_durability(&object, &bytes, durability)
-                    .await
+                // FileSystemWritableFileStream stages changes and exposes them
+                // only when close succeeds. A SyncAccessHandle truncates the
+                // live file in place, so it must never implement an atomic
+                // publication point even when the worker supports it.
+                self.write_object_bytes(&object, &bytes).await
             })
         }
     }
@@ -608,10 +611,10 @@ mod browser_persistent_storage {
         ) -> StorageFuture<'_, ()> {
             Box::pin(async move {
                 prepare_browser_wal_rewrite(&object, &temporary_object, durability)?;
-                self.write_object_bytes_with_durability(&temporary_object, &bytes, durability)
-                    .await?;
-                self.write_object_bytes_with_durability(&object, &bytes, durability)
-                    .await?;
+                // Both writes use WritableFileStream's close-commit boundary;
+                // direct SyncAccessHandle truncation is not crash-atomic.
+                self.write_object_bytes(&temporary_object, &bytes).await?;
+                self.write_object_bytes(&object, &bytes).await?;
                 self.delete_object(temporary_object).await
             })
         }

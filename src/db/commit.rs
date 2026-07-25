@@ -187,7 +187,6 @@ impl Db {
         not(target_os = "wasi")
     ))]
     async fn commit_write_request_async(&self, request: WriteRequest) -> Result<CommitInfo> {
-        let _publish_activity = self.inner.publish_barrier.begin_activity()?;
         let accepted_state = self.accept_write_request_with_wal_preaccept(request, false)?;
         self.publish_accepted_write_state_async(accepted_state)
             .await
@@ -287,15 +286,14 @@ impl Db {
         match accepted_state {
             AcceptedWriteState::Noop(commit_info) => Ok(commit_info),
             AcceptedWriteState::Pending(writer_state) => {
-                let sequenced = {
-                    let publish = self.inner.publish_barrier.enter_sequence()?;
-                    self.sequence_writer_local_state_under_barrier(writer_state, &publish)?
-                };
+                let object_order = self.object_wal_commit_order()?;
+                let sequenced = self.sequence_writer_local_state(writer_state)?;
                 let sequenced = match sequenced {
                     SequencedWriteState::Noop(commit_info) => return Ok(commit_info),
                     SequencedWriteState::Pending(sequenced) => sequenced,
                 };
                 let durable = self.accept_deferred_wal_for_sequenced_write(sequenced)?;
+                drop(object_order);
                 let published = {
                     let _memtable_publish = self
                         .inner
@@ -318,6 +316,25 @@ impl Db {
                 Ok(published.commit_info)
             }
         }
+    }
+
+    fn sequence_writer_local_state(
+        &self,
+        writer_state: WriterLocalWriteState,
+    ) -> Result<SequencedWriteState> {
+        let publish = self.inner.publish_barrier.enter_sequence()?;
+        self.sequence_writer_local_state_under_barrier(writer_state, &publish)
+    }
+
+    fn object_wal_commit_order(&self) -> Result<Option<std::sync::MutexGuard<'_, ()>>> {
+        if !self.inner.options.storage_mode.is_object_store_persistent() {
+            return Ok(None);
+        }
+        self.inner
+            .object_wal_commit_order
+            .lock()
+            .map(Some)
+            .map_err(|_| lock_poisoned("object WAL commit order"))
     }
 
     fn sequence_writer_local_state_under_barrier(
@@ -404,17 +421,28 @@ impl Db {
         match accepted_state {
             AcceptedWriteState::Noop(commit_info) => Ok(commit_info),
             AcceptedWriteState::Pending(writer_state) => {
-                let sequenced = {
-                    let publish = self.inner.publish_barrier.enter_sequence()?;
-                    self.sequence_writer_local_state_under_barrier(writer_state, &publish)?
+                let durable = if self.inner.options.storage_mode.is_object_store_persistent() {
+                    // Object-store acceptance is synchronous. Keep reservation
+                    // and handoff ordered, then drop the std mutex before any
+                    // await or memtable publication.
+                    let _object_order = self
+                        .inner
+                        .object_wal_commit_order
+                        .lock()
+                        .map_err(|_| lock_poisoned("object WAL commit order"))?;
+                    let sequenced = match self.sequence_writer_local_state(writer_state)? {
+                        SequencedWriteState::Noop(commit_info) => return Ok(commit_info),
+                        SequencedWriteState::Pending(sequenced) => sequenced,
+                    };
+                    self.accept_deferred_wal_for_sequenced_write(sequenced)?
+                } else {
+                    let sequenced = match self.sequence_writer_local_state(writer_state)? {
+                        SequencedWriteState::Noop(commit_info) => return Ok(commit_info),
+                        SequencedWriteState::Pending(sequenced) => sequenced,
+                    };
+                    self.accept_deferred_wal_for_sequenced_write_async(sequenced)
+                        .await?
                 };
-                let sequenced = match sequenced {
-                    SequencedWriteState::Noop(commit_info) => return Ok(commit_info),
-                    SequencedWriteState::Pending(sequenced) => sequenced,
-                };
-                let durable = self
-                    .accept_deferred_wal_for_sequenced_write_async(sequenced)
-                    .await?;
                 let published = {
                     let _memtable_publish = self
                         .inner
@@ -537,13 +565,18 @@ impl Db {
         publication_started: bool,
         error: Error,
     ) -> Result<PublishedWrite> {
-        if !publication_started {
+        // A persistent commit is outcome-unknown as soon as its WAL front door
+        // accepted the record, even if the very first memtable mutation fails.
+        // Marking that slot skipped would let later commits become visible
+        // while recovery can still replay this one. Only a WAL-free in-memory
+        // commit can safely skip a slot before publishing any delta.
+        if !publication_started && !self.has_wal_front_door() {
             self.inner.commit_tracker.mark_skipped(slot)?;
             return Err(error);
         }
 
         let message = format!(
-            "commit {} failed after partially publishing in-memory state: {error}; \
+            "commit {} failed after partially publishing in-memory state or after WAL acceptance: {error}; \
              database handle closed; reopen persistent databases to replay WAL",
             slot.sequence().get()
         );
@@ -602,7 +635,8 @@ impl Db {
 
     fn validate_storage_durability(&self, durability: DurabilityMode) -> Result<()> {
         if (self.inner.options.storage_mode.is_wasi_persistent()
-            || self.inner.options.storage_mode.is_browser_persistent())
+            || self.inner.options.storage_mode.is_browser_persistent()
+            || self.inner.options.storage_mode.is_object_store_persistent())
             && matches!(
                 durability,
                 DurabilityMode::SyncData | DurabilityMode::SyncAll | DurabilityMode::SyncAllStrict
@@ -642,13 +676,13 @@ impl Db {
             }
         }
 
-        Ok(PreparedCommit::new(
+        PreparedCommit::new(
             write_options,
             transaction_reads,
             wal_operations,
             commit_sequence_stamps,
             deltas,
-        ))
+        )
     }
 
     fn validate_transaction_reads(

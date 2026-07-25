@@ -1,10 +1,28 @@
 # Storage Substrate Seam
 
-Status: **Design (probe-driven).** This note records what an architecture probe
-of the open / commit / flush paths found, and redefines how the object-storage
-backend (see `object-storage-backend.md`) should plug in. It supersedes the
-naive "thread one backend enum through every helper" approach, which the probe
-showed to be both large *and* the wrong abstraction.
+Status: **Implemented; historical probe notes retained below.** This note
+records how the durability-substrate architecture was derived. The current
+object-store contract is normative in `object-storage-backend.md`; implementation
+status annotations later in this file describe the completed slices.
+
+## Current implementation addendum
+
+- Filesystem durability uses appendable WAL lanes and atomic rename publication.
+  Object storage uses immutable, content-addressed WAL segments whose confirmed
+  head lives in the CAS-protected writer lease. It is no longer WAL-less.
+- Lease v3 carries epoch plus a fresh random 128-bit owner nonce. Every
+  renewal/head update/rewrite/release verifies both, so same-epoch stale owners
+  are fenced. Legacy formats are read-compatible only.
+- Manifest CAS publishes table/bucket/checkpoint/GC metadata. An ordinary user
+  commit is confirmed by WAL-head CAS, not by rewriting the manifest.
+- Ambiguous conditional writes are reconciled by read-back only when the
+  observed bytes exactly equal the intended state. Different readable state is
+  conflict; unreadable state remains unknown/error.
+- Buffered object commits remain process-local until explicit
+  `persist(Flush)` or stronger supported persistence. Filesystem-only sync modes
+  are rejected.
+- Segment, chain, replay-byte, manifest-read, list-result, and range-read bounds
+  are enforced before unbounded allocation or traversal.
 
 ## Why the naive approach is wrong
 

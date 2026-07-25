@@ -1,57 +1,51 @@
 # Current Phase
 
-## Qualified object-store content reclamation for TrineDB Phase 23
+## Full-code audit root-cause remediation
 
 **Status:** Complete.
 
 ### Implemented boundary
 
-- Physical deletion remains default-off. Native filesystem qualification is
-  unchanged; object storage now requires a capability returned by the async
-  `qualify_object_store_reclamation` probe.
-- Qualification binds a host-retained evidence digest for the exact provider,
-  bucket, database prefix, configuration revision, namespace ownership,
-  versioning, locks, retention, legal hold, backup/replication, and lifecycle
-  boundary. Endpoint names never imply support.
-- Live probes exercise both `content-v1/chunks` and `content-v1/domains`, require
-  no provider version after create/overwrite, and require immediate HEAD, GET,
-  and LIST absence after idempotent delete.
-- Prepared sweep v2 stores the backend and provider evidence digest. Missing or
-  changed evidence after reopen rejects resume and retains remaining bytes.
-- Each cloud delete is followed by an immediate existence check. Chunks remain
-  before descriptor in the deletion order; any error retains Prepared.
+- Commit and lifecycle invariants: strict same-sequence range tombstone table
+  dropping, bucket write admission/drain fencing, post-WAL fail-closed handling,
+  object-store sequence/WAL handoff ordering, stale read-only bucket refresh,
+  branch-cycle detection, and create/delete intent reconciliation.
+- Object durability: lease v3 epoch plus random owner nonce, exact
+  read-after-error reconciliation, idempotent manifest edits, PUT-response ETag
+  ownership, immutable WAL content identity, and segment/chain/replay/list
+  bounds.
+- Read and memory bounds: async indexed blob range reads, exact blob properties,
+  linear hash-index coverage validation, one-handle optional reads, exact global
+  block-cache capacity, and backend-neutral table byte statistics.
+- Liveness and atomicity: panic-to-completion worker behavior, wake-outside-lock,
+  terminal WAL lane failure, bounded write-backpressure waiting, browser
+  close-commit publication, and content seal/reclaim serialization.
+- Engineering gates: immutable action SHAs, workflow input isolation and strict
+  SemVer, benchmark-input validation, docs-drift hardening, and patched
+  object-store/XML dependencies.
 
 ### Verification evidence
 
-- Deterministic tests reject visible provider versions and successful-but-sticky
-  deletes.
-- Object-store lifecycle test proves evidence mismatch rejection, injected
-  descriptor-delete failure, Prepared persistence, retry, final absence, and
-  no revival through leased open.
-- MinIO control plane reported an unversioned bucket with locking unsupported;
-  the full qualification, Prepared close/reopen, sweep, and provider-prefix
-  absence test passed.
-- R2 ran the same isolated full lifecycle through Infisical dev credentials and
-  passed in 50.25 seconds. Data-plane metadata reported no object versions and
-  both protected path probes plus actual chunk/descriptor deletion were
-  immediately absent.
+- Full all-target/all-feature test gate passes: 552 library tests with three
+  intentional provider-live ignores, every integration target, examples, and
+  benchmark target.
+- Strict all-target/all-feature Clippy, Rustdoc warnings, 31 doctests, formatting,
+  diff checks, documentation drift, and seven Python script tests pass.
+- `wasm32-wasip1` strict compilation and seven persistence tests pass.
+  `wasm32-unknown-unknown` all-feature check/Clippy and 20 Chrome persistence,
+  dedicated-worker, and shared-worker tests pass.
+- Six destructive storage fault tests pass serially. `cargo audit` reports zero
+  vulnerabilities after `quinn-proto` 0.11.15; the only allowed warning is
+  compio's transitive unmaintained `paste` macro.
 
-### Completion gate
+### Remaining upstream boundary
 
-- The final MinIO lifecycle passed in 1.44 seconds and the final real R2
-  lifecycle passed in 55.14 seconds after actual deletion was tightened to
-  HEAD, GET, and LIST absence.
-- All-feature regression passed 515/518 library tests with three intentional
-  ignores, every integration target, 31 doctests, strict Rustdoc, and all-target
-  wildcard-import Clippy.
-- Provider control-plane evidence remains an explicit host responsibility. The
-  available R2 credentials are data-plane credentials and cannot enumerate
-  Cloudflare bucket-lock configuration.
+- Removing `paste` requires compio 0.19, whose `compio-buf` uses a standard
+  library API unavailable on Trine's Rust 1.85 MSRV without declaring the higher
+  requirement. Retain the audited compio 0.14 graph until upstream restores
+  MSRV compatibility or Trine deliberately changes its MSRV.
 
 ### Out of scope
 
-- Versioned bucket cleanup, delete-marker traversal, or historical-version
-  deletion.
-- Bypassing provider locks, retention, legal hold, backup, or replication.
-- Automatic qualification from an S3-compatible endpoint.
-- WASI and browser reclamation.
+- Publishing, tagging, committing, pushing, multi-primary object writers,
+  versioned-object deletion, and new public features.

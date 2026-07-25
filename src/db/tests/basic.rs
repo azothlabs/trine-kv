@@ -1,5 +1,7 @@
 use super::*;
 use crate::{TransactionOptions, WriteBatch};
+use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 
 #[test]
 fn public_bucket_apis_reject_the_internal_namespace() {
@@ -247,7 +249,7 @@ fn object_store_verify_on_open_rejects_unsafe_put_if_client() {
 }
 
 #[test]
-fn object_store_buffered_write_requires_flush_to_recover() {
+fn object_store_buffered_write_is_recovered_after_explicit_persist() {
     use crate::object_store::{InMemoryObjectStore, ObjectClient};
 
     let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
@@ -263,11 +265,82 @@ fn object_store_buffered_write_requires_flush_to_recover() {
             db.get_sync(b"k").expect("in-process read").as_deref(),
             Some(b"buffered".as_slice())
         );
+        block_on_test_future(db.persist(DurabilityMode::Flush))
+            .expect("explicit persist flushes buffered remote WAL");
     }
 
     let db = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
         .expect("reopen object-store database");
-    assert_eq!(db.get_sync(b"k").expect("reopen read"), None);
+    assert_eq!(
+        db.get_sync(b"k").expect("reopen read").as_deref(),
+        Some(b"buffered".as_slice())
+    );
+}
+
+#[test]
+fn object_store_concurrent_commits_publish_one_contiguous_wal_order() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    const WRITERS: u32 = 24;
+    let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let db = Arc::new(
+        block_on_test_future(Db::open_object_store(
+            Arc::clone(&client),
+            DbOptions::object_store(),
+        ))
+        .expect("open object-store database"),
+    );
+
+    let mut writers = Vec::new();
+    for index in 0..WRITERS {
+        let db = Arc::clone(&db);
+        writers.push(std::thread::spawn(move || {
+            let key = format!("concurrent-{index:02}");
+            let value = index.to_le_bytes();
+            db.put_sync(key.as_bytes(), value)
+        }));
+    }
+    for writer in writers {
+        writer
+            .join()
+            .expect("writer thread does not panic")
+            .expect("concurrent object-store commit succeeds");
+    }
+
+    let lease = block_on_test_future(ObjectWriterLease::read_current(Arc::clone(&client), "LOCK"))
+        .expect("read WAL head")
+        .expect("writer lease exists");
+    assert_eq!(lease.committed_sequence, Sequence::new(u64::from(WRITERS)));
+    let batches = block_on_test_future(
+        crate::substrate::object_store_wal_batches_after_replay_floor(
+            Arc::clone(&client),
+            std::path::Path::new(""),
+            &lease,
+            Sequence::ZERO,
+        ),
+    )
+    .expect("replay concurrent WAL chain");
+    assert_eq!(batches.len(), WRITERS as usize);
+    assert!(
+        batches
+            .windows(2)
+            .all(|pair| pair[0].sequence.next() == Some(pair[1].sequence)),
+        "remote WAL sequences must be strictly contiguous"
+    );
+
+    drop(db);
+    let reopened = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
+        .expect("reopen object-store database");
+    for index in 0..WRITERS {
+        let key = format!("concurrent-{index:02}");
+        assert_eq!(
+            reopened
+                .get_sync(key.as_bytes())
+                .expect("read concurrent value")
+                .as_deref(),
+            Some(index.to_le_bytes().as_slice())
+        );
+    }
 }
 
 #[test]
@@ -354,8 +427,22 @@ fn object_store_recovery_ignores_frames_beyond_remote_wal_head() {
         )
         .expect("encode uncommitted frame");
         segment.extend_from_slice(&uncommitted);
-        block_on_test_future(client.put(&segment_key, Arc::from(segment.as_slice())))
-            .expect("overwrite segment before head advances");
+        let digest = Sha256::digest(&segment);
+        let mut identity = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            write!(&mut identity, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        let unreferenced_key = crate::wal::object_wal_commit_path(
+            std::path::Path::new(""),
+            state.epoch,
+            Sequence::new(2),
+            &identity,
+        );
+        block_on_test_future(client.put(
+            unreferenced_key.to_str().expect("WAL key utf8"),
+            Arc::from(segment.as_slice()),
+        ))
+        .expect("write segment before head advances");
     }
 
     let db = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
@@ -405,8 +492,8 @@ fn object_store_recovery_rejects_truncated_confirmed_wal_segment() {
     let error = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
         .expect_err("truncated confirmed WAL segment must fail closed");
     assert!(
-        matches!(error, Error::Corruption { ref message } if message.contains("below committed head")),
-        "expected missing confirmed WAL corruption, got {error:?}"
+        matches!(error, Error::Corruption { ref message } if message.contains("content identity mismatch")),
+        "expected WAL content-identity corruption, got {error:?}"
     );
 }
 
@@ -548,6 +635,37 @@ fn object_store_read_only_refresh_reloads_manifest_after_flush() {
             .expect("refreshed async read")
             .as_deref(),
         Some(b"table".as_slice())
+    );
+}
+
+#[test]
+fn object_store_refresh_updates_existing_named_bucket_handles() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let writer = block_on_test_future(Db::open_object_store(
+        Arc::clone(&client),
+        DbOptions::object_store(),
+    ))
+    .expect("open writer");
+    let writer_bucket = block_on_test_future(writer.bucket("docs")).expect("create docs");
+
+    let reader = block_on_test_future(Db::open_object_store(
+        Arc::clone(&client),
+        DbOptions::object_store().read_only(),
+    ))
+    .expect("open reader");
+    let retained = block_on_test_future(reader.bucket("docs")).expect("open retained handle");
+
+    block_on_test_future(writer_bucket.put(b"title", b"fresh")).expect("write docs");
+    block_on_test_future(writer.flush()).expect("flush docs");
+    block_on_test_future(reader.refresh_object_store()).expect("refresh reader");
+
+    assert_eq!(
+        block_on_test_future(retained.get(b"title"))
+            .expect("retained handle follows refreshed registry")
+            .as_deref(),
+        Some(b"fresh".as_slice())
     );
 }
 

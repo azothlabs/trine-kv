@@ -228,6 +228,42 @@ fn compaction_keeps_range_deleted_keys_for_older_snapshot() {
 }
 
 #[test]
+fn compaction_preserves_put_after_range_delete_in_same_batch() {
+    let path = temp_db_path("same-batch-range-delete-compaction");
+    let mut options = DbOptions::persistent(&path);
+    options.background_worker_count = 0;
+    {
+        let db = Db::open_sync(options.clone()).expect("persistent db opens");
+        let bucket = db.default_bucket_sync().expect("bucket opens");
+
+        bucket.put_sync(b"m", b"old").expect("old value writes");
+        db.flush_sync().expect("old value flushes");
+
+        let mut batch = WriteBatch::new();
+        batch.delete_range(KeyRange::half_open(b"a", b"z"));
+        batch.put(b"m", b"new");
+        db.write_sync(batch, WriteOptions::default())
+            .expect("same-batch delete then put commits");
+        db.flush_sync().expect("same-batch table flushes");
+        db.compact_range_sync(KeyRange::all())
+            .expect("tables compact");
+
+        assert_eq!(
+            bucket.get_sync(b"m").expect("value reads after compaction"),
+            Some(b"new".to_vec())
+        );
+    }
+    {
+        let db = Db::open_sync(options).expect("database reopens");
+        assert_eq!(
+            db.get_sync(b"m").expect("value reads after reopen"),
+            Some(b"new".to_vec())
+        );
+    }
+    fs::remove_dir_all(path).expect("cleanup test database");
+}
+
+#[test]
 fn strict_durability_write_persists_and_reopens() {
     let path = temp_db_path("strict-durability-write");
     let mut options = DbOptions::persistent(&path);

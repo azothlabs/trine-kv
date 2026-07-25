@@ -62,6 +62,7 @@ impl Db {
         validate_bucket_options(&options)?;
 
         if let Some(existing_state) = self.bucket_state_if_exists(name.as_str())? {
+            existing_state.ensure_available()?;
             let existing_options = existing_state.options.clone();
             if existing_options != options {
                 return Err(Error::invalid_options(
@@ -153,19 +154,21 @@ impl Db {
             return Err(Error::ReadOnly);
         }
         if matches!(self.inner.options.storage_mode, StorageMode::InMemory) {
-            let removed = self
+            let tree = self
                 .inner
                 .buckets
-                .write()
+                .read()
                 .map_err(|_| lock_poisoned("bucket registry"))?
-                .remove(name.as_str());
-            return if removed.is_none() {
-                Err(Error::invalid_options(
-                    "cannot drop a bucket that does not exist",
-                ))
-            } else {
-                Ok(())
-            };
+                .get(name.as_str())
+                .cloned()
+                .ok_or_else(|| {
+                    Error::invalid_options("cannot drop a bucket that does not exist")
+                })?;
+            let drop_guard = tree.begin_drop()?;
+            drop_guard.wait_for_writes_sync()?;
+            remove_bucket_state(&self.inner.buckets, name.as_str(), &tree)?;
+            drop_guard.commit();
+            return Ok(());
         }
         // A native filesystem path: the local-disk `Persistent` backend, and the
         // WASI backend (which is the same native file machinery over a WASI
@@ -183,21 +186,20 @@ impl Db {
                 ));
             }
         };
-        // Flush first so the bucket has no unflushed WAL records that recovery
-        // would replay into a now-missing bucket (this also advances the WAL
-        // replay floor past them).
-        self.flush_sync()?;
-        let removed = self
+        let tree = self
             .inner
             .buckets
-            .write()
+            .read()
             .map_err(|_| lock_poisoned("bucket registry"))?
-            .remove(name.as_str());
-        let Some(tree) = removed else {
-            return Err(Error::invalid_options(
-                "cannot drop a bucket that does not exist",
-            ));
-        };
+            .get(name.as_str())
+            .cloned()
+            .ok_or_else(|| Error::invalid_options("cannot drop a bucket that does not exist"))?;
+        let drop_guard = tree.begin_drop()?;
+        drop_guard.wait_for_writes_sync()?;
+        // Closing admission before the flush guarantees that every WAL record
+        // accepted for this bucket has reached its memtable. The flush therefore
+        // advances the replay floor past the complete admitted write set.
+        self.flush_sync()?;
         let tables = tree.tables_snapshot()?;
         let blob_ids: Vec<u64> = tables
             .iter()
@@ -210,6 +212,8 @@ impl Db {
                 .map_err(|_| lock_poisoned("manifest store"))?
                 .drop_bucket(name.as_str(), blob_ids, sequence)?;
         }
+        remove_bucket_state(&self.inner.buckets, name.as_str(), &tree)?;
+        drop_guard.commit();
         // Retire the bucket's table files (deferred while readers hold a
         // reference) and its now-orphaned blob files.
         self.retire_obsolete_table_files(&native_path, tables)?;
@@ -246,15 +250,24 @@ impl Db {
             return Err(Error::ReadOnly);
         }
         if self.inner.options.storage_mode.is_object_store_persistent() {
-            // Object store: remove the bucket from the manifest via CAS; its table
-            // and blob objects are now unreferenced and reclaimed by orphan GC.
-            self.publish_object_manifest_drop_bucket(name.as_str().to_owned())
-                .await?;
-            self.inner
+            let tree = self
+                .inner
                 .buckets
-                .write()
+                .read()
                 .map_err(|_| lock_poisoned("bucket registry"))?
-                .remove(name.as_str());
+                .get(name.as_str())
+                .cloned()
+                .ok_or_else(|| {
+                    Error::invalid_options("cannot drop a bucket that does not exist")
+                })?;
+            let drop_guard = tree.begin_drop()?;
+            drop_guard.wait_for_writes().await?;
+            self.flush().await?;
+            let (mut object, _serialize) = self.checkout_object_manifest().await?;
+            object.drop_bucket(name.as_str().to_owned()).await?;
+            self.install_object_manifest_after_durable_publish("bucket drop", object)?;
+            remove_bucket_state(&self.inner.buckets, name.as_str(), &tree)?;
+            drop_guard.commit();
             // Reclaim the now-orphaned objects (best effort: the bucket is already
             // logically dropped; periodic orphan GC also collects them).
             let _ = self.cleanup_object_store_orphans_async().await;
@@ -277,6 +290,9 @@ impl Db {
                     "cannot drop a bucket that does not exist",
                 ));
             };
+            let drop_guard = tree.begin_drop()?;
+            drop_guard.wait_for_writes().await?;
+            self.flush().await?;
             let tables = tree.tables_snapshot()?;
             let blob_ids: Vec<u64> = tables
                 .iter()
@@ -307,11 +323,8 @@ impl Db {
                     )?;
                 }
             }
-            self.inner
-                .buckets
-                .write()
-                .map_err(|_| lock_poisoned("bucket registry"))?
-                .remove(name.as_str());
+            remove_bucket_state(&self.inner.buckets, name.as_str(), &tree)?;
+            drop_guard.commit();
             drop(tree);
             let db_path = self.browser_db_path()?;
             self.retire_obsolete_table_files_browser_async(db_path, tables)
@@ -333,6 +346,7 @@ impl Db {
         validate_bucket_options(&options)?;
 
         if let Some(existing_state) = self.bucket_state_if_exists(name.as_str())? {
+            existing_state.ensure_available()?;
             let existing_options = existing_state.options.clone();
             if existing_options != options {
                 return Err(Error::invalid_options(
@@ -350,8 +364,26 @@ impl Db {
             return Err(Error::ReadOnly);
         }
 
-        self.publish_object_manifest_create_bucket(name.as_str().to_owned(), options.clone())
+        let (mut object, _serialize) = self.checkout_object_manifest().await?;
+        if let Some(existing_state) = self.bucket_state_if_exists(name.as_str())? {
+            existing_state.ensure_available()?;
+            let existing_options = existing_state.options.clone();
+            if existing_options != options {
+                return Err(Error::invalid_options(
+                    "existing bucket options do not match requested options",
+                ));
+            }
+            return Ok(Bucket::new(
+                self.clone(),
+                name,
+                existing_options,
+                existing_state,
+            ));
+        }
+        object
+            .create_bucket(name.as_str().to_owned(), options.clone())
             .await?;
+        self.install_object_manifest_after_durable_publish("bucket creation", object)?;
 
         let (bucket_options, state) = (|| -> Result<_> {
             let mut buckets = self
@@ -387,6 +419,7 @@ impl Db {
         validate_bucket_options(&options)?;
 
         if let Some(existing_state) = self.bucket_state_if_exists(name.as_str())? {
+            existing_state.ensure_available()?;
             let existing_options = existing_state.options.clone();
             if existing_options != options {
                 return Err(Error::invalid_options(
@@ -407,6 +440,7 @@ impl Db {
 
         let _manifest_publish = self.inner.browser_manifest_async_lock.lock().await;
         if let Some(existing_state) = self.bucket_state_if_exists(name.as_str())? {
+            existing_state.ensure_available()?;
             let existing_options = existing_state.options.clone();
             if existing_options != options {
                 return Err(Error::invalid_options(
@@ -876,4 +910,24 @@ impl Db {
             Direction::Reverse,
         )
     }
+}
+
+fn remove_bucket_state(
+    registry: &std::sync::RwLock<std::collections::BTreeMap<String, Arc<LsmTree>>>,
+    name: &str,
+    expected: &Arc<LsmTree>,
+) -> Result<()> {
+    let mut buckets = registry
+        .write()
+        .map_err(|_| lock_poisoned("bucket registry"))?;
+    let current = buckets.get(name).ok_or_else(|| Error::Corruption {
+        message: format!("bucket {name} disappeared during deletion"),
+    })?;
+    if !Arc::ptr_eq(current, expected) {
+        return Err(Error::Corruption {
+            message: format!("bucket {name} was replaced during deletion"),
+        });
+    }
+    buckets.remove(name);
+    Ok(())
 }

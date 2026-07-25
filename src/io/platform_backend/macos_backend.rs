@@ -11,7 +11,7 @@ pub(super) const fn matrix() -> PlatformIoBackendMatrix {
         kind: PlatformIoBackendKind::MacOsNative,
         length_lookup: ThreadPoolManagedAsync,
         owned_random_read: PlatformNativeAsyncButPartial,
-        optional_whole_object_read: PlatformNativeAsyncButPartial,
+        optional_whole_object_read: ThreadPoolManagedAsync,
         temp_write_rename_publish: PlatformNativeAsyncButPartial,
         append_object_open: PlatformNativeAsyncButPartial,
         append: PlatformNativeAsyncButPartial,

@@ -46,7 +46,6 @@ impl CompactionDecision {
 pub(crate) struct CompactionOptions {
     pub(crate) target_table_bytes: u64,
     pub(crate) level_size_multiplier: u64,
-    pub(crate) max_l0_files: usize,
     pub(crate) local_l0_compaction: bool,
 }
 
@@ -1057,7 +1056,6 @@ mod tests {
         CompactionOptions {
             target_table_bytes: 100,
             level_size_multiplier: 10,
-            max_l0_files: 8,
             local_l0_compaction: true,
         }
     }

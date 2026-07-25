@@ -580,6 +580,13 @@ fn orphan_fork_checkpoint_is_reconciled_to_the_registry_intent() {
     let old_fork = db.latest_read_version();
     db.create_internal_checkpoint_at_sync(&fork_checkpoint("dev"), old_fork)
         .expect("orphan checkpoint creates");
+    db.delete_branch("dev")
+        .expect("absent branch delete is idempotent");
+    assert_eq!(
+        db.internal_checkpoint_read_version_sync(&fork_checkpoint("dev"))
+            .expect("delete must not race a concurrent creator's orphan checkpoint"),
+        old_fork
+    );
     db.bucket_sync("data")
         .expect("bucket")
         .put_sync(b"advance".to_vec(), b"1".to_vec())
@@ -595,6 +602,39 @@ fn orphan_fork_checkpoint_is_reconciled_to_the_registry_intent() {
             .expect("branch publishes")
             .fork(),
         new_fork
+    );
+}
+
+#[test]
+fn open_branch_rejects_a_corrupt_lineage_cycle() {
+    let db = Db::open_sync(DbOptions::memory().with_keep_last_read_versions(64)).expect("open");
+    let fork = db.latest_read_version();
+    let registry = db
+        .internal_bucket_sync(registry_bucket())
+        .expect("open registry");
+    for (name, parent, generation) in [("a", "b", [1; 16]), ("b", "a", [2; 16])] {
+        let entry = RegistryEntry {
+            fork,
+            parent: Some(parent.to_owned()),
+            written_buckets: std::collections::BTreeSet::default(),
+            lifecycle: BranchLifecycle::Active,
+            generation,
+        };
+        registry
+            .put_sync(
+                name.as_bytes(),
+                entry.encode().expect("encode corrupt entry"),
+            )
+            .expect("install corrupt lineage");
+    }
+
+    let error = match db.open_branch("a") {
+        Ok(_) => panic!("lineage cycle must fail closed"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, Error::Corruption { ref message } if message.contains("cycle")),
+        "unexpected cycle error: {error:?}"
     );
 }
 

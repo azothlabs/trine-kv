@@ -17,7 +17,7 @@ class DocumentationDriftTests(unittest.TestCase):
         self.assertEqual(CHECK.check_release_contract(), [])
         self.assertEqual(CHECK.check_local_markdown_links("README.md"), [])
 
-    def test_legacy_checkout_runtime_is_rejected(self) -> None:
+    def test_mutable_action_reference_is_rejected(self) -> None:
         original_root = CHECK.ROOT
         with tempfile.TemporaryDirectory() as directory:
             CHECK.ROOT = Path(directory)
@@ -29,11 +29,16 @@ class DocumentationDriftTests(unittest.TestCase):
                 self.assertEqual(
                     CHECK.check_checkout_action_versions(),
                     [
+                        ".github/workflows/ci.yaml: actions/checkout uses mutable reference v4; "
+                        "expected an immutable 40-character commit SHA",
                         ".github/workflows/ci.yaml: actions/checkout uses v4; "
-                        "expected v7 for the Node.js 24 runtime"
+                        f"expected audited v7 commit {CHECK.CHECKOUT_ACTION_SHA}",
                     ],
                 )
-                workflow.write_text("uses: actions/checkout@v7\n", encoding="utf-8")
+                workflow.write_text(
+                    f"uses: actions/checkout@{CHECK.CHECKOUT_ACTION_SHA} # v7\n",
+                    encoding="utf-8",
+                )
                 self.assertEqual(CHECK.check_checkout_action_versions(), [])
             finally:
                 CHECK.ROOT = original_root

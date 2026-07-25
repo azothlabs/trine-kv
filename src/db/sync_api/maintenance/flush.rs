@@ -10,7 +10,11 @@ use super::{
 use crate::DurabilityMode;
 
 impl Db {
-    pub(in crate::db) fn bucket_state(&self, bucket: &str) -> Result<Arc<LsmTree>> {
+    pub(crate) fn reads_follow_bucket_registry(&self) -> bool {
+        self.inner.options.read_only && self.inner.options.storage_mode.is_object_store_persistent()
+    }
+
+    pub(crate) fn bucket_state(&self, bucket: &str) -> Result<Arc<LsmTree>> {
         self.bucket_state_if_exists(bucket)?
             .ok_or_else(|| Error::BucketMissing {
                 name: bucket.to_owned(),
@@ -101,6 +105,13 @@ impl Db {
                 return Ok(());
             }
 
+            // Snapshot progress before attempting foreground maintenance. A
+            // background worker can win the maintenance guard and complete
+            // between the foreground busy result and our request below. If we
+            // sampled afterwards, that real progress would be lost and this
+            // writer could wait until timeout for a change that already
+            // happened.
+            let progress = self.inner.maintenance.progress();
             let outcome = self.run_maintenance_for_pressure(&db_path, pressure)?;
             if outcome.made_progress() {
                 continue;
@@ -108,7 +119,6 @@ impl Db {
 
             if self.background_workers_enabled() {
                 self.inner.maintenance.request(pressure.request());
-                let progress = self.inner.maintenance.progress();
                 self.record_cooperative_maintenance_yield();
                 if self
                     .inner
@@ -117,8 +127,19 @@ impl Db {
                 {
                     continue;
                 }
-                self.record_maintenance_budget_exhaustion();
+                // The worker can clear pressure without publishing another
+                // progress transition after the timed wait observes its final
+                // state. Recheck the actual invariant before reporting
+                // backpressure failure.
+                self.take_background_maintenance_error()?;
+                if self.write_pressure()?.none() {
+                    return Ok(());
+                }
             }
+            self.record_maintenance_budget_exhaustion();
+            return Err(Error::runtime_busy(
+                "write pressure could not make maintenance progress",
+            ));
         }
     }
 

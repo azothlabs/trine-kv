@@ -822,7 +822,6 @@ pub(super) fn compaction_options(
     compaction::CompactionOptions {
         target_table_bytes: usize_to_u64_saturating(options.target_table_bytes),
         level_size_multiplier: usize_to_u64_saturating(options.level_size_multiplier),
-        max_l0_files: options.max_l0_files,
         local_l0_compaction,
     }
 }

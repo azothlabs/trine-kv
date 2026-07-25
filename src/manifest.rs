@@ -247,9 +247,23 @@ impl<C: ObjectClient> ObjectManifestStore<C> {
         match client.head(key).await? {
             None => Ok((ManifestState::empty(), None)),
             Some(meta) => {
+                if meta.size > limits::MAX_MANIFEST_PAYLOAD_BYTES as u64 {
+                    return Err(Error::Corruption {
+                        message: format!(
+                            "manifest object {key} length {} exceeds maximum {}",
+                            meta.size,
+                            limits::MAX_MANIFEST_PAYLOAD_BYTES
+                        ),
+                    });
+                }
                 let bytes = client.get(key).await?.ok_or_else(|| Error::Corruption {
                     message: format!("manifest object {key} vanished between head and get"),
                 })?;
+                limits::ensure_corruption_len(
+                    bytes.len(),
+                    limits::MAX_MANIFEST_PAYLOAD_BYTES,
+                    "manifest object length",
+                )?;
                 Ok((decode_manifest(&bytes)?, Some(meta.etag)))
             }
         }
@@ -278,17 +292,33 @@ impl<C: ObjectClient> ObjectManifestStore<C> {
             Some(etag) => Precondition::IfMatch(etag.clone()),
             None => Precondition::IfNoneMatch,
         };
-        match self.client.put_if(&self.key, bytes, precondition).await? {
-            PutIf::Stored { etag } => {
+        let publish = self.client.put_if(&self.key, bytes, precondition).await;
+        match publish {
+            Ok(PutIf::Stored { etag }) => {
                 self.state = next;
                 self.etag = Some(etag);
                 Ok(PublishOutcome::Published)
             }
-            PutIf::PreconditionFailed { .. } => {
+            Ok(PutIf::PreconditionFailed { .. }) => {
                 let (current, etag) = Self::read_current(&self.client, &self.key).await?;
                 self.state = current.clone();
                 self.etag = etag;
                 Ok(PublishOutcome::Conflict { current })
+            }
+            Err(error) => {
+                // A conditional PUT can reach durable storage even when its
+                // response is lost. Reconcile against the exact intended state;
+                // if another edit already followed ours, return Conflict and
+                // let the idempotent edit rebase onto that newer state.
+                if let Ok((current, etag)) = Self::read_current(&self.client, &self.key).await {
+                    self.state = current.clone();
+                    self.etag = etag;
+                    if current == next {
+                        return Ok(PublishOutcome::Published);
+                    }
+                    return Ok(PublishOutcome::Conflict { current });
+                }
+                Err(error)
             }
         }
     }
@@ -410,14 +440,25 @@ impl<C: ObjectClient> ObjectManifestStore<C> {
             }
             let mut next_state = state.clone();
             for (bucket, properties) in &tables {
-                next_state
-                    .tables
-                    .entry(bucket.clone())
-                    .or_default()
-                    .push(properties.clone());
+                let bucket_tables = next_state.tables.entry(bucket.clone()).or_default();
+                if let Some(existing) = bucket_tables
+                    .iter()
+                    .find(|existing| existing.id == properties.id)
+                {
+                    if existing != properties {
+                        return Err(Error::Corruption {
+                            message: format!(
+                                "table id {} has conflicting manifest properties",
+                                properties.id.get()
+                            ),
+                        });
+                    }
+                } else {
+                    bucket_tables.push(properties.clone());
+                }
             }
             next_state.wal_replay_floor = wal_replay_floor;
-            Ok(Some(next_state))
+            Ok((next_state != *state).then_some(next_state))
         })
         .await
     }
@@ -431,19 +472,28 @@ impl<C: ObjectClient> ObjectManifestStore<C> {
         pending_deletion_sequence: Sequence,
     ) -> Result<()> {
         self.commit_edit(|state| {
-            for (bucket, removed_table_ids, _) in &replacements {
+            for (bucket, removed_table_ids, replacement_tables) in &replacements {
                 let tables = state.tables.get(bucket).ok_or_else(|| Error::Corruption {
                     message: format!("compaction references missing bucket: {bucket}"),
                 })?;
-                for table_id in removed_table_ids {
-                    if !tables.iter().any(|properties| properties.id == *table_id) {
-                        return Err(Error::Corruption {
-                            message: format!(
-                                "compaction input table is missing: {}",
-                                table_id.get()
-                            ),
-                        });
-                    }
+                let present_inputs = removed_table_ids
+                    .iter()
+                    .filter(|table_id| tables.iter().any(|table| table.id == **table_id))
+                    .count();
+                let outputs_match = replacement_tables.iter().all(|replacement| {
+                    tables
+                        .iter()
+                        .any(|table| table.id == replacement.id && table == replacement)
+                });
+                if present_inputs == 0 && outputs_match {
+                    continue;
+                }
+                if present_inputs != removed_table_ids.len() {
+                    return Err(Error::Corruption {
+                        message: format!(
+                            "compaction manifest edit for bucket {bucket} is partially applied"
+                        ),
+                    });
                 }
             }
 
@@ -456,9 +506,33 @@ impl<C: ObjectClient> ObjectManifestStore<C> {
                         .ok_or_else(|| Error::Corruption {
                             message: format!("manifest is missing table list for bucket: {bucket}"),
                         })?;
+                let already_applied = removed_table_ids
+                    .iter()
+                    .all(|table_id| !tables.iter().any(|table| table.id == *table_id))
+                    && replacement_tables.iter().all(|replacement| {
+                        tables
+                            .iter()
+                            .any(|table| table.id == replacement.id && table == replacement)
+                    });
+                if already_applied {
+                    continue;
+                }
                 tables.retain(|properties| !removed_table_ids.contains(&properties.id));
                 for replacement in replacement_tables {
-                    tables.push(replacement.clone());
+                    if let Some(existing) =
+                        tables.iter().find(|existing| existing.id == replacement.id)
+                    {
+                        if existing != replacement {
+                            return Err(Error::Corruption {
+                                message: format!(
+                                    "replacement table id {} has conflicting properties",
+                                    replacement.id.get()
+                                ),
+                            });
+                        }
+                    } else {
+                        tables.push(replacement.clone());
+                    }
                 }
             }
             for file_id in &pending_blob_deletions {
@@ -467,7 +541,7 @@ impl<C: ObjectClient> ObjectManifestStore<C> {
                     .entry(*file_id)
                     .or_insert(pending_deletion_sequence);
             }
-            Ok(Some(next_state))
+            Ok((next_state != *state).then_some(next_state))
         })
         .await
     }

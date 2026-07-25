@@ -326,7 +326,25 @@ fn data_block_hash_index_mismatch_fails_closed() {
 
     let error = decode_data_block(encoded)
         .expect_err("data block decode should rebuild and compare the index");
-    assert_invalid_table_message(&error, "hash index does not match records");
+    assert_invalid_table_message(&error, "do not cover every record exactly once");
+}
+
+#[test]
+fn data_block_hash_index_rejects_overlapping_ranges_without_rebuilding() {
+    let records = vec![
+        test_point_record(b"a", 2, b"alpha"),
+        test_point_record(b"b", 1, b"bravo"),
+    ];
+    let mut encoded = encode_data_block(&records).expect("data block encodes");
+    let hash_section = encoded
+        .len()
+        .checked_sub(4 + 2 * MIN_DATA_BLOCK_HASH_ENTRY_BYTES)
+        .expect("test block has two hash entries");
+    let second_start = hash_section + 4 + MIN_DATA_BLOCK_HASH_ENTRY_BYTES + 8;
+    encoded[second_start..second_start + 4].copy_from_slice(&0_u32.to_le_bytes());
+
+    let error = decode_data_block(encoded).expect_err("overlapping hash ranges must fail");
+    assert_invalid_table_message(&error, "do not cover every record exactly once");
 }
 
 #[test]

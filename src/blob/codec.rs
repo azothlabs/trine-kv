@@ -3,8 +3,9 @@ use super::{
     BLOB_HEADER_WITHOUT_CHECKSUM_LEN, BLOB_MAGIC, BlobFile, BlobFileHeader, BlobFileProperties,
     BlobFileRecord, BlobIndex, BlobRecord, BlockingStorageReadObject, CodecId, Error, InternalKey,
     MIN_BLOB_RECORD_FRAME_BYTES, NativeFileBackend, Path, Result, Sequence, StorageReadBackend,
-    ValueKind, blob_object_len, blob_storage_backend, codec, limits,
-    open_blob_read_object_with_backend, read_blob_exact_at, read_blob_file_with_backend_async,
+    StorageReadObject, ValueKind, blob_object_len, blob_object_len_async, blob_storage_backend,
+    codec, limits, open_blob_read_object_with_backend, open_blob_read_object_with_backend_async,
+    read_blob_exact_at, read_blob_exact_at_async,
 };
 
 pub fn encode_blob_file(
@@ -201,14 +202,16 @@ pub(crate) async fn read_record_for_index_with_backend_async<B>(
 where
     B: StorageReadBackend,
 {
-    let blob_file = read_blob_file_with_backend_async(backend, db_path, index.file_id).await?;
-    let record = blob_file
-        .records
-        .into_iter()
-        .find(|record| record.index == *index)
-        .ok_or_else(|| Error::Corruption {
-            message: "blob index record is missing".to_owned(),
-        })?;
+    let object = open_blob_read_object_with_backend_async(backend, db_path, index.file_id).await?;
+    let file_len =
+        blob_object_len_async(&object, "referenced blob file metadata cannot be read").await?;
+    validate_indexed_blob_header_async(&object, index.file_id).await?;
+    let record = read_indexed_blob_record_async(&object, file_len, index).await?;
+    if record.index != *index {
+        return Err(Error::Corruption {
+            message: "blob index metadata mismatch".to_owned(),
+        });
+    }
     if expected_internal_key.is_some_and(|expected| record.record.internal_key != *expected) {
         return Err(Error::Corruption {
             message: "blob record internal key mismatch".to_owned(),
@@ -228,6 +231,30 @@ pub(super) fn validate_indexed_blob_header(
         &mut header_bytes,
         "referenced blob header cannot be read",
     )?;
+    let header = decode_header(&header_bytes)?;
+    if header.file_id != expected_file_id {
+        return Err(Error::Corruption {
+            message: format!(
+                "blob file id mismatch: path has {expected_file_id}, header has {}",
+                header.file_id
+            ),
+        });
+    }
+    Ok(())
+}
+
+pub(super) async fn validate_indexed_blob_header_async(
+    object: &impl StorageReadObject,
+    expected_file_id: u64,
+) -> Result<()> {
+    let mut header_bytes = [0_u8; BLOB_HEADER_LEN];
+    read_blob_exact_at_async(
+        object,
+        0,
+        &mut header_bytes,
+        "referenced blob header cannot be read",
+    )
+    .await?;
     let header = decode_header(&header_bytes)?;
     if header.file_id != expected_file_id {
         return Err(Error::Corruption {
@@ -280,6 +307,56 @@ pub(super) fn read_indexed_blob_record(
         &mut body,
         "referenced blob record body cannot be read",
     )?;
+    if checksum(&body) != record_checksum {
+        return Err(Error::Corruption {
+            message: "blob record checksum mismatch".to_owned(),
+        });
+    }
+
+    decode_record_body(index.file_id, index.offset, record_checksum, &body)
+}
+
+pub(super) async fn read_indexed_blob_record_async(
+    object: &impl StorageReadObject,
+    file_len: u64,
+    index: &BlobIndex,
+) -> Result<BlobFileRecord> {
+    if index.offset < BLOB_HEADER_LEN as u64 {
+        return Err(invalid_blob("blob index offset points before records"));
+    }
+
+    let frame_end = checked_blob_offset_add(
+        index.offset,
+        MIN_BLOB_RECORD_FRAME_BYTES as u64,
+        "blob record frame bounds",
+    )?;
+    if frame_end > file_len {
+        return Err(invalid_blob("blob index frame is outside the blob file"));
+    }
+
+    let mut frame = [0_u8; MIN_BLOB_RECORD_FRAME_BYTES];
+    read_blob_exact_at_async(
+        object,
+        index.offset,
+        &mut frame,
+        "referenced blob record frame cannot be read",
+    )
+    .await?;
+    let body_len = checked_blob_record_body_len(read_u64_at(&frame, 0)?)?;
+    let record_checksum = read_u32_at(&frame, 8)?;
+    let body_end = checked_blob_offset_add(frame_end, body_len, "blob record body bounds")?;
+    if body_end > file_len {
+        return Err(invalid_blob("blob index body is outside the blob file"));
+    }
+
+    let mut body = vec![0_u8; u64_to_usize(body_len, "blob record length")?];
+    read_blob_exact_at_async(
+        object,
+        frame_end,
+        &mut body,
+        "referenced blob record body cannot be read",
+    )
+    .await?;
     if checksum(&body) != record_checksum {
         return Err(Error::Corruption {
             message: "blob record checksum mismatch".to_owned(),
@@ -495,7 +572,7 @@ pub(super) fn decode_properties(bytes: &[u8]) -> Result<BlobFileProperties> {
     }
 
     let mut cursor = Cursor::new(&bytes[..checksum_offset]);
-    Ok(BlobFileProperties {
+    let properties = BlobFileProperties {
         record_count: cursor.read_u64()?,
         value_bytes: cursor.read_u64()?,
         encoded_bytes: cursor.read_u64()?,
@@ -504,7 +581,11 @@ pub(super) fn decode_properties(bytes: &[u8]) -> Result<BlobFileProperties> {
         largest_internal_key: cursor.read_internal_key()?,
         smallest_sequence: Sequence::new(cursor.read_u64()?),
         largest_sequence: Sequence::new(cursor.read_u64()?),
-    })
+    };
+    if cursor.remaining_len() != 0 {
+        return Err(invalid_blob("blob properties have trailing bytes"));
+    }
+    Ok(properties)
 }
 
 pub(super) fn put_footer(bytes: &mut Vec<u8>, properties_offset: u64, properties_len: u64) {

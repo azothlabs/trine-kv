@@ -12,7 +12,11 @@ use std::{
 #[cfg(any(not(target_os = "wasi"), test))]
 use std::task::{Context, Poll, Waker};
 
-const BACKGROUND_MAINTENANCE_PROGRESS_WAIT: Duration = Duration::from_millis(2);
+// Foreground writes may hand pressure relief to a background worker when that
+// worker already owns the maintenance guard. Give real filesystem work a
+// bounded completion window; a scheduler-scale timeout (the former 2 ms) turns
+// healthy flush latency into spurious RuntimeBusy errors.
+const BACKGROUND_MAINTENANCE_PROGRESS_WAIT: Duration = Duration::from_secs(5);
 
 use crate::{
     blob::{self, ValueRef},
@@ -242,6 +246,11 @@ pub(crate) struct DbInner {
     commit_tracker: CommitTracker,
     closed: AtomicBool,
     publish_barrier: PublishBarrier,
+    /// Serializes object-store commit-slot reservation with the corresponding
+    /// remote-WAL handoff. The remote WAL represents gaps as empty commits, so
+    /// accepting N+1 before N would make N unrecoverable. This lock is never
+    /// held across an `.await`.
+    object_wal_commit_order: Mutex<()>,
     memtable_publish_lock: Mutex<()>,
     buckets: RwLock<BTreeMap<String, Arc<LsmTree>>>,
     snapshots: Arc<SnapshotTracker>,

@@ -1,6 +1,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
+    panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -69,7 +70,10 @@ pub(super) fn matrix() -> PlatformIoBackendMatrix {
 
 pub(super) fn run_worker(receiver: crossbeam_channel::Receiver<PlatformIoTask>) {
     for task in receiver {
-        task.run_thread_pool();
+        let completion = task.panic_completion();
+        if panic::catch_unwind(AssertUnwindSafe(|| task.run_thread_pool())).is_err() {
+            completion.complete();
+        }
     }
 }
 
@@ -89,12 +93,13 @@ pub(super) fn read_exact_at_owned(
     Ok(StorageReadBuffer::from_vec(offset, buffer))
 }
 
-pub(super) fn read_optional(path: PathBuf, max_bytes: usize) -> Result<Option<Arc<[u8]>>> {
-    let len = match fs::metadata(&path) {
-        Ok(metadata) => metadata.len(),
+pub(super) fn read_optional(path: &Path, max_bytes: usize) -> Result<Option<Arc<[u8]>>> {
+    let file = match File::open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(Error::Io(error)),
     };
+    let len = file.metadata()?.len();
     let len = usize::try_from(len).map_err(|_| Error::Corruption {
         message: format!("object {} length exceeds usize", path.display()),
     })?;
@@ -106,11 +111,20 @@ pub(super) fn read_optional(path: PathBuf, max_bytes: usize) -> Result<Option<Ar
             ),
         });
     }
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(Arc::from(bytes))),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(Error::Io(error)),
+    let read_limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(len);
+    file.take(read_limit).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(Error::Corruption {
+            message: format!(
+                "object {} grew beyond maximum {max_bytes} while it was read",
+                path.display()
+            ),
+        });
     }
+    Ok(Some(Arc::from(bytes)))
 }
 
 pub(super) fn write_temp_rename(

@@ -348,11 +348,14 @@ impl Runtime {
         self.spawn_blocking(move || {
             let result = panic::catch_unwind(AssertUnwindSafe(task))
                 .unwrap_or_else(|_| Err(Error::runtime_busy("blocking task panicked")));
-            if let Ok(mut state) = task_state.lock() {
+            let waker = if let Ok(mut state) = task_state.lock() {
                 state.result = Some(result);
-                if let Some(waker) = state.waker.take() {
-                    waker.wake();
-                }
+                state.waker.take()
+            } else {
+                None
+            };
+            if let Some(waker) = waker {
+                waker.wake();
             }
         })?;
         Ok(BlockingResultFuture { state })
@@ -741,6 +744,29 @@ mod tests {
         let worker_name = block_on_test_future(future).expect("blocking result completes");
 
         assert!(worker_name.starts_with("trine-kv-blocking-"));
+    }
+
+    #[test]
+    fn native_blocking_result_future_reports_task_panic_and_worker_survives() {
+        let runtime = Runtime::with_blocking_limits(RuntimeOptions::native_threads(), 1, 2);
+        let panicked = runtime
+            .spawn_blocking_result::<()>(|| panic!("injected blocking task panic"))
+            .expect("spawn panicking blocking task");
+
+        let error =
+            block_on_test_future(panicked).expect_err("task panic must complete the future");
+        assert!(
+            matches!(error, Error::RuntimeBusy { ref message } if message.contains("panicked")),
+            "unexpected panic result: {error:?}"
+        );
+
+        let follow_up = runtime
+            .spawn_blocking_result(|| Ok(7_u8))
+            .expect("worker accepts a task after a caught panic");
+        assert_eq!(
+            block_on_test_future(follow_up).expect("follow-up task completes"),
+            7
+        );
     }
 
     #[test]

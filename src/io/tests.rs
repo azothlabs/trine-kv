@@ -226,6 +226,7 @@ fn assert_linux_native_platform_matrix(matrix: &PlatformIoBackendMatrix) {
 #[derive(Clone, Copy)]
 struct PartialNativeRows {
     length_lookup: PlatformIoTaskClass,
+    optional_whole_object_read: PlatformIoTaskClass,
     append_object_open: PlatformIoTaskClass,
     persist: PlatformIoTaskClass,
     object_delete: PlatformIoTaskClass,
@@ -237,6 +238,7 @@ struct PartialNativeRows {
 #[allow(dead_code)]
 const WINDOWS_PARTIAL_NATIVE_ROWS: PartialNativeRows = PartialNativeRows {
     length_lookup: PlatformIoTaskClass::ThreadPoolManagedAsync,
+    optional_whole_object_read: PlatformIoTaskClass::PlatformNativeAsyncButPartial,
     append_object_open: PlatformIoTaskClass::ThreadPoolManagedAsync,
     persist: PlatformIoTaskClass::ThreadPoolManagedAsync,
     object_delete: PlatformIoTaskClass::ThreadPoolManagedAsync,
@@ -248,6 +250,7 @@ const WINDOWS_PARTIAL_NATIVE_ROWS: PartialNativeRows = PartialNativeRows {
 #[allow(dead_code)]
 const MACOS_PARTIAL_NATIVE_ROWS: PartialNativeRows = PartialNativeRows {
     length_lookup: PlatformIoTaskClass::ThreadPoolManagedAsync,
+    optional_whole_object_read: PlatformIoTaskClass::ThreadPoolManagedAsync,
     append_object_open: PlatformIoTaskClass::PlatformNativeAsyncButPartial,
     persist: PlatformIoTaskClass::PlatformNativeAsyncButPartial,
     object_delete: PlatformIoTaskClass::ThreadPoolManagedAsync,
@@ -259,6 +262,7 @@ const MACOS_PARTIAL_NATIVE_ROWS: PartialNativeRows = PartialNativeRows {
 #[allow(dead_code)]
 const BSD_SOLARISH_PARTIAL_NATIVE_ROWS: PartialNativeRows = PartialNativeRows {
     length_lookup: PlatformIoTaskClass::ThreadPoolManagedAsync,
+    optional_whole_object_read: PlatformIoTaskClass::PlatformNativeAsyncButPartial,
     append_object_open: PlatformIoTaskClass::ThreadPoolManagedAsync,
     persist: PlatformIoTaskClass::PlatformNativeAsyncButPartial,
     object_delete: PlatformIoTaskClass::ThreadPoolManagedAsync,
@@ -283,7 +287,7 @@ fn assert_partial_native_platform_matrix(
         &[
             (Op::LengthLookup, rows.length_lookup),
             (Op::OwnedRandomRead, Partial),
-            (Op::OptionalWholeObjectRead, Partial),
+            (Op::OptionalWholeObjectRead, rows.optional_whole_object_read),
             (Op::TempWriteRenamePublish, Partial),
             (Op::AppendObjectOpen, rows.append_object_open),
             (Op::Append, Partial),

@@ -351,6 +351,41 @@ fn indexed_read_uses_only_target_record() {
 }
 
 #[test]
+fn async_indexed_read_uses_only_target_record() {
+    let file_id = 45;
+    let db_path = std::path::Path::new("async-targeted-blob-db");
+    let header = BlobFileHeader::new(file_id, Sequence::new(1), 8, CodecId::None);
+    let records = vec![
+        blob_record("key-a", 1, 0, b"value-a".to_vec(), CodecId::None),
+        blob_record("key-b", 1, 0, b"value-b".to_vec(), CodecId::None),
+    ];
+    let (mut bytes, indexes) = encode_blob_file(header, &records).expect("blob encodes");
+    let corrupt_second_body = usize::try_from(indexes[1].offset)
+        .expect("offset fits usize")
+        .saturating_add(super::MIN_BLOB_RECORD_FRAME_BYTES);
+    bytes[corrupt_second_body] ^= 0xff;
+    let backend = MemoryStorageBackend::new();
+    backend
+        .insert_read_object(
+            StorageObjectId::native_file(
+                StorageObjectKind::Blob,
+                super::blob_path(db_path, file_id),
+            ),
+            bytes,
+        )
+        .expect("memory blob object inserts");
+
+    let value = poll_ready(read_value_for_internal_key_with_backend_async(
+        &backend,
+        db_path,
+        &ValueRef::BlobIndex(indexes[0]),
+        None,
+    ))
+    .expect("async targeted read skips unrelated corrupt record");
+    assert_eq!(value, b"value-a");
+}
+
+#[test]
 fn standalone_large_value_wrappers_round_trip() {
     let temp = temp_blob_dir("standalone-large-value-wrappers");
     let internal_key = InternalKey::new(b"key".to_vec(), Sequence::new(3), ValueKind::Put, 0);

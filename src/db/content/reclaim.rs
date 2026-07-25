@@ -451,6 +451,10 @@ impl Db {
             return Err(Error::ReadOnly);
         }
         self.ensure_content_reclamation_supported()?;
+        // Descriptor publication/deduplication and physical deletion share one
+        // gate. Once a sweep is Prepared, a sealing upload can neither reuse nor
+        // recreate the descriptor between the final policy check and deletion.
+        let _seal = self.lock_content_seal().await;
         self.internal_bucket(CONTENT_CONTROL_BUCKET).await?;
         let key = content_reclaim_sweep_key(storage_domain_id, content_id);
         let mut inspect = self.transaction(TransactionOptions::default());

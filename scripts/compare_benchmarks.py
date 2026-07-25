@@ -50,7 +50,14 @@ def read_summary(path: Path) -> dict[str, int]:
         name = row.get("name")
         elapsed = row.get("elapsed_us_median")
         if name and elapsed:
-            rows[name] = int(elapsed)
+            if name in rows:
+                raise ValueError(f"{path} contains duplicate benchmark row {name!r}")
+            value = int(elapsed)
+            if value < 0:
+                raise ValueError(
+                    f"{path} benchmark row {name!r} has negative elapsed time"
+                )
+            rows[name] = value
     return rows
 
 
@@ -61,6 +68,10 @@ def compare(
     max_regression_percent: float,
     absolute_noise_us: int,
 ) -> list[Comparison]:
+    if max_regression_percent < 0:
+        raise ValueError("max regression percent must be non-negative")
+    if absolute_noise_us < 0:
+        raise ValueError("absolute noise threshold must be non-negative")
     missing = [
         name for name in required_rows if name not in baseline or name not in current
     ]

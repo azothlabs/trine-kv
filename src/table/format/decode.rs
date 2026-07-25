@@ -244,14 +244,41 @@ pub(in crate::table) fn decode_data_block_point_lookup_index(
         "data block hash index entry count exceeds block bytes",
     )?;
     let mut entries = Vec::with_capacity(entry_count);
+    let mut coverage_delta = vec![0_i64; record_headers.len().saturating_add(1)];
     for _ in 0..entry_count {
         let entry = BlockHashEntry {
             key_hash: cursor.read_u64()?,
             start_record: cursor.read_u32()?,
             end_record: cursor.read_u32()?,
         };
-        validate_data_block_hash_entry(entry, bytes, record_headers)?;
+        let start = u32_to_usize(entry.start_record);
+        let end = u32_to_usize(entry.end_record);
+        if start >= end || end > record_headers.len() {
+            return Err(invalid_table("data block hash index range is invalid"));
+        }
+        coverage_delta[start] += 1;
+        coverage_delta[end] -= 1;
         entries.push(entry);
+    }
+    let mut coverage = 0_i64;
+    for delta in coverage_delta.iter().take(record_headers.len()) {
+        coverage += delta;
+        if coverage != 1 {
+            return Err(invalid_table(
+                "data block hash index ranges do not cover every record exactly once",
+            ));
+        }
+    }
+    if coverage_delta
+        .last()
+        .is_some_and(|delta| coverage + delta != 0)
+    {
+        return Err(invalid_table("data block hash index range is invalid"));
+    }
+    // Coverage is now proven disjoint, so validating every entry scans each
+    // record exactly once in total instead of permitting quadratic overlap.
+    for entry in &entries {
+        validate_data_block_hash_entry(*entry, bytes, record_headers)?;
     }
 
     let decoded = DataBlockPointLookupIndex::from_entries(entries);

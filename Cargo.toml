@@ -71,7 +71,7 @@ s3 = ["dep:object_store", "dep:tokio"]
 # Real object-storage backend (S3 and compatible) behind the `s3` feature.
 # Its HTTP stack requires native sockets, so neither the dependency nor its
 # Tokio reactor is selected for browser WASM or WASI.
-object_store = { version = "0.12", default-features = false, features = ["aws"], optional = true }
+object_store = { version = "0.14", default-features = false, features = ["aws"], optional = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"], optional = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]

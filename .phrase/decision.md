@@ -161,6 +161,22 @@ Evidence notes should separate:
   per-output-level curve is a write-time change with no storage-format impact;
   only a user-configurable curve touches `BucketOptions`/manifest and needs a
   version bump plus migration/recovery tests.
+- Object-store confirmed writes use an immutable content-addressed WAL chain.
+  The CAS-protected lease/WAL head, not the manifest, is the per-commit durable
+  point. Sequence reservation and WAL handoff are serialized without holding a
+  lock across async I/O.
+- Object writer identity is `(epoch, owner_nonce)`. Lease format v3 creates a
+  fresh random 128-bit owner nonce for every acquisition/takeover, and every
+  mutating lease operation verifies both fields. Legacy zero-owner leases are
+  decode-compatible but are never the identity of a new acquisition.
+- Ambiguous object-store conditional writes succeed only after exact intended
+  bytes are observed by read-back. A different readable state is conflict and
+  an unreadable outcome remains an error. Never infer success from a later HEAD
+  ETag.
+- Bucket deletion is a lifecycle transition: fence new admissions, drain
+  admitted writes, publish durable metadata, then remove registry visibility.
+  Failure before publication reopens admission; success permanently fences the
+  retired generation.
 
 ## Phase Gate Rules
 

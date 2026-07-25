@@ -371,9 +371,12 @@ impl Db {
                 });
                 for table in tables {
                     let properties = table.properties();
-                    let table_bytes = persistent_path.map_or(0, |db_path| {
-                        table_file_bytes(&self.inner.native_storage, db_path, properties.id)
-                    });
+                    let table_bytes = persistent_path.map_or_else(
+                        || table.estimated_file_bytes(),
+                        |db_path| {
+                            table_file_bytes(&self.inner.native_storage, db_path, properties.id)
+                        },
+                    );
                     let table_filters = table.filter_stats();
                     stats.filters.saturating_add_assign(table_filters);
                     let level_filter_entry =

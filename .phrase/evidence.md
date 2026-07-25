@@ -16969,3 +16969,60 @@ Negative check:
 - The host must stop sweep workers and rotate evidence before changing provider
   configuration or namespace ownership. Existing Prepared state intentionally
   rejects a different digest.
+
+## 2026-07-25: full-code audit root-cause remediation
+
+### Observation
+
+- The audit found defects at shared invariants rather than isolated call sites:
+  same-sequence tombstone ordering, write/drop admission, remote WAL sequencing,
+  lease identity, ambiguous CAS outcomes, reclaim/seal serialization, worker
+  panic completion, resource bounds, and atomic browser publication.
+- Read paths also contained whole-blob amplification, optional-read TOCTOU,
+  quadratic hash-index validation, approximate cache capacity, and incomplete
+  non-native statistics.
+- Release automation accepted mutable action references and insufficiently
+  validated workflow/benchmark inputs. The dependency graph contained current
+  XML advisories and later exposed RUSTSEC-2026-0185 in `quinn-proto`.
+
+### Implementation evidence
+
+- Added strict compaction batch-order safety, bucket admission/drain guards held
+  through WAL and memory publication, post-WAL fail-closed behavior, serialized
+  object sequence/WAL handoff, and registry-following read-only object handles.
+- Added object lease v3 `(epoch, random owner nonce)`, exact read-after-error
+  reconciliation, idempotent manifest edits, PUT-owned ETags, immutable segment
+  identity, and segment/chain/replay/list/read caps.
+- Serialized content reclaim completion with descriptor sealing, detected branch
+  lineage cycles, removed orphan-checkpoint deletion from absent branch delete,
+  and made worker panic results terminal and observable without waking under
+  internal locks.
+- Replaced async whole-blob reads with bounded indexed range reads, made
+  hash-index validation linear, made shard cache budgets sum exactly to the
+  configured global cap, and reported estimated table bytes on remote backends.
+- Forced browser manifest/WAL publication through close-commit writable streams,
+  made native optional reads use one file handle, pinned external CI actions by
+  SHA, isolated release inputs, hardened scripts, upgraded `object_store` to
+  0.14.1, and locked `quinn-proto` to 0.11.15.
+
+### Verification
+
+- `cargo test --all-targets --all-features`: 552 library tests pass, three
+  intentional provider-live tests ignored; every integration, example, and
+  benchmark target passes.
+- Strict all-target/all-feature Clippy, Rustdoc, 31 doctests, formatting, diff,
+  documentation-drift, seven Python script tests, and six serial destructive
+  fault tests pass.
+- WASI strict compilation plus seven persistence tests pass. Browser all-feature
+  check/Clippy plus 20 Chrome persistence/worker tests pass.
+- Current RustSec database reports zero vulnerabilities. The remaining
+  `paste 1.0.15` item is an allowed unmaintained warning through compio 0.14.
+  Compio 0.19 was tested and rejected because it uses an API unavailable on the
+  declared Rust 1.85 MSRV without declaring the higher requirement.
+
+### Safety boundary
+
+- No public feature, publish, tag, commit, or push was added.
+- Object storage remains single-writer. Versioned-object cleanup and provider
+  retention/lock bypass remain unsupported.
+- The user-owned untracked `.infisical.json` was not modified.

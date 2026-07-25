@@ -194,15 +194,18 @@ impl<T> IoCompletion<T> {
     }
 
     pub(crate) fn complete(&self, result: Result<T>) -> Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| Error::runtime_busy("I/O completion state is poisoned"))?;
-        if state.result.is_some() {
-            return Err(Error::runtime_busy("I/O completion already finished"));
-        }
-        state.result = Some(result);
-        if let Some(waker) = state.waker.take() {
+        let waker = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| Error::runtime_busy("I/O completion state is poisoned"))?;
+            if state.result.is_some() {
+                return Err(Error::runtime_busy("I/O completion already finished"));
+            }
+            state.result = Some(result);
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
             waker.wake();
         }
         Ok(())
@@ -491,6 +494,45 @@ enum PlatformIoTask {
 }
 
 #[cfg(feature = "platform-io")]
+enum PlatformIoPanicCompletion {
+    Len(IoCompletion<u64>),
+    Read(IoCompletion<StorageReadBuffer>),
+    Optional(IoCompletion<Option<Arc<[u8]>>>),
+    Paths(IoCompletion<Vec<PathBuf>>),
+    Unit(IoCompletion<()>),
+    #[cfg(any(unix, windows))]
+    Lease(IoCompletion<File>),
+}
+
+#[cfg(feature = "platform-io")]
+impl PlatformIoPanicCompletion {
+    fn complete(self) {
+        let error = || Error::runtime_busy("platform I/O worker task panicked");
+        match self {
+            Self::Len(completion) => {
+                let _ = completion.complete(Err(error()));
+            }
+            Self::Read(completion) => {
+                let _ = completion.complete(Err(error()));
+            }
+            Self::Optional(completion) => {
+                let _ = completion.complete(Err(error()));
+            }
+            Self::Paths(completion) => {
+                let _ = completion.complete(Err(error()));
+            }
+            Self::Unit(completion) => {
+                let _ = completion.complete(Err(error()));
+            }
+            #[cfg(any(unix, windows))]
+            Self::Lease(completion) => {
+                let _ = completion.complete(Err(error()));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "platform-io")]
 impl PlatformIoDriver {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -764,6 +806,34 @@ impl PlatformIoTask {
         }
     }
 
+    fn panic_completion(&self) -> PlatformIoPanicCompletion {
+        match self {
+            Self::Len { completion, .. } => PlatformIoPanicCompletion::Len(completion.clone()),
+            Self::ReadExactAtOwned { completion, .. } => {
+                PlatformIoPanicCompletion::Read(completion.clone())
+            }
+            Self::ReadOptional { completion, .. } => {
+                PlatformIoPanicCompletion::Optional(completion.clone())
+            }
+            Self::ListFilePaths { completion, .. } => {
+                PlatformIoPanicCompletion::Paths(completion.clone())
+            }
+            Self::Append { completion, .. }
+            | Self::OpenAppend { completion, .. }
+            | Self::Persist { completion, .. }
+            | Self::WriteTempRename { completion, .. }
+            | Self::Delete { completion, .. }
+            | Self::CreateDirAll { completion, .. }
+            | Self::SyncDir { completion, .. } => {
+                PlatformIoPanicCompletion::Unit(completion.clone())
+            }
+            #[cfg(any(unix, windows))]
+            Self::AcquireWriterLease { completion, .. } => {
+                PlatformIoPanicCompletion::Lease(completion.clone())
+            }
+        }
+    }
+
     fn run_thread_pool(self) {
         match self {
             Self::Len { path, completion } => {
@@ -787,7 +857,7 @@ impl PlatformIoTask {
             } => {
                 complete_platform_io(
                     &completion,
-                    platform_threadpool::read_optional(path, max_bytes),
+                    platform_threadpool::read_optional(&path, max_bytes),
                 );
             }
             Self::WriteTempRename {

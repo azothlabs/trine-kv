@@ -159,6 +159,14 @@ impl Bucket {
         &self.options
     }
 
+    fn latest_read_state(&self) -> Result<Arc<LsmTree>> {
+        if self.db.reads_follow_bucket_registry() {
+            self.db.bucket_state(self.name.as_str())
+        } else {
+            Ok(Arc::clone(&self.state))
+        }
+    }
+
     /// Reads the newest committed value for `key` from this bucket.
     ///
     /// This is the bucket-scoped form of [`Db::get_sync`]. It searches only
@@ -168,12 +176,9 @@ impl Bucket {
     ///
     /// - `key`: user key bytes inside this bucket.
     pub fn get_sync(&self, key: &[u8]) -> Result<Option<Value>> {
-        self.db.get_at_state_with_pin_state(
-            &self.state,
-            key,
-            self.db.last_committed_sequence(),
-            false,
-        )
+        let state = self.latest_read_state()?;
+        self.db
+            .get_at_state_with_pin_state(&state, key, self.db.last_committed_sequence(), false)
     }
 
     /// Reads many newest committed values from this bucket.
@@ -222,8 +227,9 @@ impl Bucket {
     where
         K: AsRef<[u8]>,
     {
+        let state = self.latest_read_state()?;
         let reader = self.db.reader_for_state_keys_at_sequence(
-            &self.state,
+            &state,
             keys,
             self.db.last_committed_sequence(),
             false,
@@ -259,7 +265,8 @@ impl Bucket {
         &self,
         snapshot: &'snapshot Snapshot,
     ) -> Result<BucketReader<'snapshot>> {
-        self.db.reader_for_state(&self.state, snapshot)
+        let state = self.latest_read_state()?;
+        self.db.reader_for_state(&state, snapshot)
     }
 
     /// Writes one key/value pair to this bucket using default write options.
@@ -522,9 +529,10 @@ impl Bucket {
 impl Bucket {
     /// Reads the newest committed value for `key` from this bucket.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Value>> {
+        let state = self.latest_read_state()?;
         self.db
             .get_at_state_with_pin_state_async(
-                &self.state,
+                &state,
                 key,
                 self.db.last_committed_sequence(),
                 false,
@@ -555,8 +563,9 @@ impl Bucket {
     where
         K: AsRef<[u8]>,
     {
+        let state = self.latest_read_state()?;
         let reader = self.db.reader_for_state_keys_at_sequence(
-            &self.state,
+            &state,
             keys,
             self.db.last_committed_sequence(),
             false,

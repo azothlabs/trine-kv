@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CHECKOUT_ACTION_VERSION = "v7"
+CHECKOUT_ACTION_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
 
 
 def require_snippets(path: str, snippets: tuple[str, ...]) -> list[str]:
@@ -69,11 +69,19 @@ def check_checkout_action_versions() -> list[str]:
     errors: list[str] = []
     for workflow in sorted((ROOT / ".github/workflows").glob("*.y*ml")):
         text = workflow.read_text(encoding="utf-8")
-        for version in re.findall(r"actions/checkout@([^\s]+)", text):
-            if version != CHECKOUT_ACTION_VERSION:
+        for action, reference in re.findall(
+            r"uses:\s+([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)@([^\s#]+)",
+            text,
+        ):
+            if not re.fullmatch(r"[0-9a-f]{40}", reference):
                 errors.append(
-                    f"{workflow.relative_to(ROOT)}: actions/checkout uses {version}; "
-                    f"expected {CHECKOUT_ACTION_VERSION} for the Node.js 24 runtime"
+                    f"{workflow.relative_to(ROOT)}: {action} uses mutable reference {reference}; "
+                    "expected an immutable 40-character commit SHA"
+                )
+            if action == "actions/checkout" and reference != CHECKOUT_ACTION_SHA:
+                errors.append(
+                    f"{workflow.relative_to(ROOT)}: actions/checkout uses {reference}; "
+                    f"expected audited v7 commit {CHECKOUT_ACTION_SHA}"
                 )
     return errors
 
@@ -90,10 +98,10 @@ def check_release_contract() -> list[str]:
         "cargo fmt --check",
         "cargo clippy --all-targets --all-features -- -D warnings",
         "cargo test --all-targets --all-features",
-        "cargo check --target wasm32-unknown-unknown --lib",
-        "cargo check --target wasm32-wasip1 --lib",
+        "cargo check --target wasm32-unknown-unknown --lib --all-features",
+        "cargo check --target wasm32-wasip1 --lib --all-features",
         "cargo test --target wasm32-wasip1 --lib wasi_persistent",
-        "cargo clippy --target wasm32-unknown-unknown --lib -- -D warnings",
+        "cargo clippy --target wasm32-unknown-unknown --lib --all-features -- -D warnings",
         (
             "cargo test --target wasm32-unknown-unknown "
             "--test browser_persistent_wasm "
@@ -117,7 +125,7 @@ def check_release_contract() -> list[str]:
     )
     destructive_gate = ("cargo test -q destructive_ --lib -- --test-threads=1",)
     wasi_warning_gate = (
-        'RUSTFLAGS="-D warnings" cargo check --target wasm32-wasip1 --lib',
+        'RUSTFLAGS="-D warnings" cargo check --target wasm32-wasip1 --lib --all-features',
     )
     wasm_runner_install = (
         "rustup toolchain install 1.88.0 --profile minimal",
@@ -178,6 +186,15 @@ def check_release_contract() -> list[str]:
                 ".github/workflows/publish.yml: Verify requested version step must contain "
                 f"`{snippet}`"
             )
+    if "REQUESTED_VERSION: ${{ inputs.version }}" not in publish:
+        errors.append(
+            ".github/workflows/publish.yml: requested version must enter the shell through env"
+        )
+    version_shell = version_step.partition("run: |")[2]
+    if "${{ inputs.version }}" in version_shell:
+        errors.append(
+            ".github/workflows/publish.yml: requested version must not be interpolated into shell code"
+        )
     if not re.search(
         r"- name: Check documentation drift\s+run: python3 scripts/check_docs_drift\.py",
         publish,

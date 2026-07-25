@@ -202,6 +202,7 @@ impl Db {
                 commit_tracker: CommitTracker::new(Sequence::ZERO),
                 closed: AtomicBool::new(false),
                 publish_barrier: PublishBarrier::new(),
+                object_wal_commit_order: Mutex::new(()),
                 memtable_publish_lock: Mutex::new(()),
                 buckets: RwLock::new(buckets),
                 snapshots: Arc::new(SnapshotTracker::default()),

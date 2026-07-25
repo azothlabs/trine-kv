@@ -61,6 +61,7 @@ pub(super) struct PreparedCommit {
     pub(super) commit_sequence_stamps: Vec<CommitSequenceStamp>,
     pub(super) deltas: Vec<PreparedShardDelta>,
     pub(super) touched_states: Vec<Arc<LsmTree>>,
+    pub(super) _write_admissions: Vec<crate::lsm::LsmWriteAdmission>,
     pub(super) estimated_bytes: u64,
 }
 
@@ -236,20 +237,26 @@ impl PreparedCommit {
         wal_operations: Vec<BatchOperation>,
         commit_sequence_stamps: Vec<CommitSequenceStamp>,
         deltas: Vec<PreparedShardDelta>,
-    ) -> Self {
+    ) -> Result<Self> {
         let touched_states = unique_lsm_trees(deltas.iter().map(|delta| Arc::clone(&delta.state)));
+        let write_admissions = touched_states
+            .iter()
+            .map(Arc::clone)
+            .map(|state| state.admit_write())
+            .collect::<Result<Vec<_>>>()?;
         let estimated_bytes = deltas.iter().fold(0_u64, |bytes, delta| {
             bytes.saturating_add(delta.estimated_bytes)
         });
-        Self {
+        Ok(Self {
             write_options,
             transaction_reads,
             wal_operations,
             commit_sequence_stamps,
             deltas,
             touched_states,
+            _write_admissions: write_admissions,
             estimated_bytes,
-        }
+        })
     }
 
     #[must_use]
