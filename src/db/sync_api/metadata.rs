@@ -469,6 +469,10 @@ impl Db {
                 .inner
                 .maintenance_budget_exhaustions
                 .load(Ordering::Acquire),
+            manifest_sync_adapter_tasks: self
+                .inner
+                .manifest_sync_adapter_tasks
+                .load(Ordering::Relaxed),
             ..DbStats::default()
         }
     }

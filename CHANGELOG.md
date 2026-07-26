@@ -49,6 +49,10 @@ to 1.95, which starts a new pre-`1.0` minor line.
 
 ### Fixed
 
+- Platform-I/O flush verification now attributes bounded-adapter work to
+  explicit manifest transitions or storage fallbacks instead of assuming a
+  fixed task count. This keeps whole-operation fallback detectable while
+  allowing durable file-ID reservation to add legitimate manifest cutovers.
 - Commit ordering, bucket deletion, object-store lease/CAS/WAL fencing,
   recovery bounds, worker completion, browser publication, blob range reads,
   cache capacity, table validation/statistics, dependency advisories, and

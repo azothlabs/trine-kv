@@ -28,6 +28,12 @@ before step implementations.
 - The remaining concurrent cutoff comparison was made an explicit four-state,
   two-operation decision table. All three mutations of that decision are
   rejected.
+- Linux CI exposed that the platform-I/O flush test treated one historical
+  sync-adapter task as a permanent allowance. Durable file-ID reservation
+  legitimately added another manifest transition. `DbStats` now classifies
+  manifest adapter tasks explicitly, and the test rejects every unattributed
+  task instead of accepting a fixed numeric threshold. The exact Rust 1.95
+  Linux container test passes.
 
 ## Rules
 

@@ -116,6 +116,12 @@ pub struct DbStats {
     pub storage_sync_adapter_queued_tasks: usize,
     /// Sync-adapter tasks submitted.
     pub storage_sync_adapter_submitted_tasks: u64,
+    /// Host-manifest transitions submitted to the runtime sync adapter.
+    ///
+    /// A transition owns one serialized filesystem-manifest publication. This
+    /// counter distinguishes those narrow durability cutovers from storage
+    /// backend fallback tasks and from an accidental whole-operation adapter.
+    pub manifest_sync_adapter_tasks: u64,
     /// Sync-adapter tasks completed.
     pub storage_sync_adapter_completed_tasks: u64,
     /// Sync-adapter tasks rejected because the queue was full or unavailable.

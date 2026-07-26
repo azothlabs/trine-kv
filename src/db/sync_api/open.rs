@@ -231,6 +231,7 @@ impl Db {
                 scan_waste: Arc::new(ScanWasteMetrics::default()),
                 maintenance_cooperative_yields: AtomicU64::new(0),
                 maintenance_budget_exhaustions: AtomicU64::new(0),
+                manifest_sync_adapter_tasks: AtomicU64::new(0),
                 native_storage,
                 content_memory: MemoryStorageBackend::new(),
                 content_seal_lock: futures::lock::Mutex::new(()),

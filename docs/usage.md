@@ -150,7 +150,10 @@ driver (`storage_uses_platform_io_driver`) and separates true or partial native
 platform async work (`storage_platform_async_io_tasks`) from platform-io managed
 thread-pool work (`storage_platform_thread_pool_managed_async_tasks`),
 platform-driver blocking fallback work (`storage_platform_sync_fallback_tasks`),
-and Trine's bounded sync-adapter task count. `storage_uses_platform_async_io` is
+and Trine's bounded sync-adapter task count. Host-manifest durability cutovers
+are reported separately as `manifest_sync_adapter_tasks`; this lets operators
+distinguish a narrow serialized manifest transition from storage fallback work
+or an accidental whole-operation adapter. `storage_uses_platform_async_io` is
 true when the selected native platform driver can complete Trine operations
 asynchronously without blocking the caller runtime; use the per-operation class
 counters to see whether each operation was true native async, partial native

@@ -503,13 +503,18 @@ fn persistent_async_maintenance_runs_on_runtime_blocking_task() {
     let db = block_on(Db::open(options)).expect("persistent async open");
     block_on(db.put(b"k".to_vec(), b"value".to_vec())).expect("write succeeds");
 
-    let before_flush = db.stats().storage_sync_adapter_submitted_tasks;
+    let before_flush = db.stats();
     block_on(db.flush()).expect("async flush succeeds");
     let after_flush = db.stats();
     assert_eq!(after_flush.immutable_memtables, 0);
     assert!(
-        after_flush.storage_sync_adapter_submitted_tasks > before_flush,
+        after_flush.storage_sync_adapter_submitted_tasks
+            > before_flush.storage_sync_adapter_submitted_tasks,
         "native fallback async flush should run through the runtime blocking task boundary"
+    );
+    assert!(
+        after_flush.manifest_sync_adapter_tasks > before_flush.manifest_sync_adapter_tasks,
+        "host manifest cutovers must be classified separately from storage fallback tasks"
     );
 
     let before_compact = db.stats().storage_sync_adapter_submitted_tasks;
@@ -548,11 +553,37 @@ fn platform_io_async_flush_awaits_storage_without_whole_flush_adapter() {
     let after = db.stats();
 
     assert_eq!(after.immutable_memtables, 0);
-    assert!(
-        after.storage_sync_adapter_submitted_tasks
-            <= before.storage_sync_adapter_submitted_tasks + 1,
-        "platform async flush should not spawn the whole flush through the sync adapter; \
-         DbStats may perform one native table-size lookup while observing the result"
+    let submitted_adapter_tasks = after
+        .storage_sync_adapter_submitted_tasks
+        .checked_sub(before.storage_sync_adapter_submitted_tasks)
+        .expect("sync-adapter submitted-task counter is monotonic");
+    let manifest_adapter_tasks = after
+        .manifest_sync_adapter_tasks
+        .checked_sub(before.manifest_sync_adapter_tasks)
+        .expect("manifest sync-adapter task counter is monotonic");
+    let storage_adapter_tasks = after
+        .storage_sync_adapter_tasks
+        .checked_sub(before.storage_sync_adapter_tasks)
+        .expect("storage sync-adapter task counter is monotonic");
+    assert_eq!(
+        storage_adapter_tasks, 0,
+        "platform async flush storage I/O must stay on the platform driver"
+    );
+    assert_eq!(
+        submitted_adapter_tasks,
+        manifest_adapter_tasks + storage_adapter_tasks,
+        "every sync-adapter task must be attributed to a narrow manifest transition or a \
+         classified storage fallback; an unattributed task may be a whole-flush adapter"
+    );
+    assert_eq!(
+        manifest_adapter_tasks,
+        after
+            .storage_operations
+            .publish_manifest
+            .requests
+            .checked_sub(before.storage_operations.publish_manifest.requests)
+            .expect("manifest publish request counter is monotonic"),
+        "each manifest adapter task must own exactly one manifest durability cutover"
     );
     assert_platform_io_flush_publish_class(&before, &after);
     assert!(

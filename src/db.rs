@@ -284,6 +284,11 @@ pub(crate) struct DbInner {
     scan_waste: Arc<ScanWasteMetrics>,
     maintenance_cooperative_yields: AtomicU64,
     maintenance_budget_exhaustions: AtomicU64,
+    /// Accepted host-manifest transitions running on the runtime sync adapter.
+    ///
+    /// This is separate from native-storage fallback accounting so diagnostics
+    /// can prove that an async operation did not adapt the whole operation.
+    manifest_sync_adapter_tasks: AtomicU64,
     native_storage: NativeFileBackend,
     /// Private object registry used only by `ContentObject` chunks and
     /// descriptors in an in-memory database.

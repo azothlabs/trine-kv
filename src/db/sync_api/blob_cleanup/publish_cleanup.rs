@@ -125,18 +125,19 @@ impl Db {
         #[cfg(not(target_os = "wasi"))]
         {
             let inner = Arc::clone(&self.inner);
+            let transition = self.inner.runtime.spawn_blocking_result(move || {
+                let manifest = inner.manifest.as_ref().ok_or_else(|| Error::Corruption {
+                    message: "persistent database is missing manifest store".to_owned(),
+                })?;
+                let mut manifest = manifest
+                    .lock()
+                    .map_err(|_| lock_poisoned("manifest store"))?;
+                edit(&mut manifest)
+            })?;
             self.inner
-                .runtime
-                .spawn_blocking_result(move || {
-                    let manifest = inner.manifest.as_ref().ok_or_else(|| Error::Corruption {
-                        message: "persistent database is missing manifest store".to_owned(),
-                    })?;
-                    let mut manifest = manifest
-                        .lock()
-                        .map_err(|_| lock_poisoned("manifest store"))?;
-                    edit(&mut manifest)
-                })?
-                .await
+                .manifest_sync_adapter_tasks
+                .fetch_add(1, Ordering::Relaxed);
+            transition.await
         }
     }
 
