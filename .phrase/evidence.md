@@ -26,6 +26,34 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-07-26: first supported manifest format starts at version 1
+
+### Observation
+
+- Trine KV has no adopters or deployed database state.
+- The current manifest layout was numbered 2 only because an earlier
+  development layout had used 1.
+
+### Interpretation
+
+- Development history is not a supported-format history. The first supported
+  manifest must start at version 1 while retaining an explicit header version
+  for future incompatible releases.
+
+### Verification
+
+- `MANIFEST_VERSION` is 1 and the changelog describes it as the first supported
+  persistent baseline.
+- The decoder rejects both lower and higher non-current version numbers.
+- All 23 focused manifest tests, the 606-test all-feature library suite, every
+  integration target, 31 doctests, strict native Clippy, and the browser target
+  check passed.
+
+### Recommended Next Action
+
+- Advance the manifest version only after a supported release exists and an
+  incompatible persistent-layout change is intentionally accepted.
+
 ## 2026-07-26: typed plans and responsibility-level module boundaries
 
 ### Observation

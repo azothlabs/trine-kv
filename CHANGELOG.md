@@ -22,8 +22,8 @@ This entry covers every repository change since `v0.5.13`.
   native synchronous callers use the explicit `*_sync` adapters.
   `Branch::range` now returns `AsyncBranchRange`, while `range_sync` returns
   `BranchRange`.
-- Persistent manifest format v2 adds durable file-ID and bucket-generation
-  high-water marks. It is the first supported persistent-format baseline.
+- The manifest format includes durable file-ID and bucket-generation high-water
+  marks. This is format version 1, the first supported persistent baseline.
   Earlier development-only manifest, branch-registry, and object-store WAL
   encodings are intentionally rejected; no deployed-data migration is needed.
 - The crate version remains `0.6.0`; architecture work does not independently

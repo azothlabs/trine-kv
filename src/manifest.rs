@@ -30,10 +30,9 @@ use crate::storage::BrowserStorageBackend;
 
 pub const MANIFEST_FILE_NAME: &str = "MANIFEST";
 const MANIFEST_MAGIC: u32 = 0x5452_4d46;
-// Reset to 1 for the first published storage contract — the crate has no users
-// yet, so each incompatible pre-1.0 layout gets one exact integer version.
-// Version 2 adds durable file-id and bucket-generation high-water marks.
-const MANIFEST_VERSION: u16 = 2;
+// This is the first supported storage contract. Development-only layouts were
+// collapsed before adoption, so future incompatible releases advance from 1.
+const MANIFEST_VERSION: u16 = 1;
 const HEADER_LEN: usize = 14;
 // The lower bound for one table entry: fixed fields plus two empty byte fields.
 // Decoding uses this to reject impossible counts before reserving memory.

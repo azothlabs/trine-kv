@@ -152,14 +152,18 @@ fn manifest_decode_rejects_payload_len_before_large_allocation() {
 }
 
 #[test]
-fn manifest_decode_rejects_the_previous_incompatible_layout_version() {
-    let mut bytes = encode_manifest_bytes(&ManifestState::empty())
+fn manifest_decode_rejects_every_non_current_layout_version() {
+    let current = encode_manifest_bytes(&ManifestState::empty())
         .expect("current manifest encodes")
         .to_vec();
-    bytes[4..6].copy_from_slice(&1_u16.to_le_bytes());
 
-    let error = decode_manifest(&bytes).expect_err("previous layout version must be rejected");
-    assert!(matches!(error, crate::Error::UnsupportedFormat { .. }));
+    for unsupported_version in [0_u16, 2_u16] {
+        let mut bytes = current.clone();
+        bytes[4..6].copy_from_slice(&unsupported_version.to_le_bytes());
+
+        let error = decode_manifest(&bytes).expect_err("unknown layout version must be rejected");
+        assert!(matches!(error, crate::Error::UnsupportedFormat { .. }));
+    }
 }
 
 fn put_bucket_options_header(payload: &mut Vec<u8>) {
