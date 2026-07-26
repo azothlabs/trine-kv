@@ -1,7 +1,35 @@
 use super::super::{
     ContentUploadInfo, ContentUploadMaintenanceReport, Db, Error, Result, UploadIdRetirement,
-    UploadSessionState, UploadSessionStatus,
+    UploadSessionState,
 };
+use crate::content::ContentUploadState;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadMaintenanceOperation {
+    ReapInactive,
+    PruneSealed,
+}
+
+const fn upload_is_eligible(
+    state: ContentUploadState,
+    updated_at_unix_ms: u64,
+    exclusive_cutoff_unix_ms: u64,
+    operation: UploadMaintenanceOperation,
+) -> bool {
+    if updated_at_unix_ms >= exclusive_cutoff_unix_ms {
+        return false;
+    }
+    matches!(
+        (operation, state),
+        (
+            UploadMaintenanceOperation::ReapInactive,
+            ContentUploadState::Open | ContentUploadState::Aborting
+        ) | (
+            UploadMaintenanceOperation::PruneSealed,
+            ContentUploadState::Sealed
+        )
+    )
+}
 
 impl Db {
     /// Lists every durable upload state known to this database.
@@ -72,12 +100,12 @@ impl Db {
                 Err(Error::ContentUploadNotFound { .. }) => continue,
                 Err(error) => return Err(error),
             };
-            if current.updated_at_unix_ms() >= inactive_before_unix_ms {
-                continue;
-            }
-            if matches!(
-                current.status(),
-                UploadSessionStatus::Open | UploadSessionStatus::Aborting
+            let current_info = current.maintenance_info();
+            if upload_is_eligible(
+                current_info.state(),
+                current_info.updated_at_unix_ms(),
+                inactive_before_unix_ms,
+                UploadMaintenanceOperation::ReapInactive,
             ) {
                 self.discard_open_upload(&current).await?;
                 report.aborted = report.aborted.saturating_add(1);
@@ -129,14 +157,46 @@ impl Db {
                 Err(Error::ContentUploadNotFound { .. }) => continue,
                 Err(error) => return Err(error),
             };
-            if current.updated_at_unix_ms() < sealed_before_unix_ms
-                && matches!(current.status(), UploadSessionStatus::Sealed(_))
-            {
+            let current = current.maintenance_info();
+            if upload_is_eligible(
+                current.state(),
+                current.updated_at_unix_ms(),
+                sealed_before_unix_ms,
+                UploadMaintenanceOperation::PruneSealed,
+            ) {
                 self.retire_upload_id(upload_id, UploadIdRetirement::Sealed)
                     .await?;
                 report.pruned_sealed = report.pruned_sealed.saturating_add(1);
             }
         }
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ContentUploadState, UploadMaintenanceOperation, upload_is_eligible};
+
+    #[test]
+    fn upload_maintenance_eligibility_is_a_complete_state_boundary_table() {
+        use ContentUploadState::{Aborting, Open, Sealed, Sealing};
+        use UploadMaintenanceOperation::{PruneSealed, ReapInactive};
+
+        for state in [Open, Sealing, Sealed, Aborting] {
+            assert!(!upload_is_eligible(state, 100, 100, ReapInactive));
+            assert!(!upload_is_eligible(state, 100, 100, PruneSealed));
+            assert!(!upload_is_eligible(state, 101, 100, ReapInactive));
+            assert!(!upload_is_eligible(state, 101, 100, PruneSealed));
+        }
+
+        assert!(upload_is_eligible(Open, 99, 100, ReapInactive));
+        assert!(upload_is_eligible(Aborting, 99, 100, ReapInactive));
+        assert!(!upload_is_eligible(Sealing, 99, 100, ReapInactive));
+        assert!(!upload_is_eligible(Sealed, 99, 100, ReapInactive));
+
+        assert!(upload_is_eligible(Sealed, 99, 100, PruneSealed));
+        assert!(!upload_is_eligible(Open, 99, 100, PruneSealed));
+        assert!(!upload_is_eligible(Sealing, 99, 100, PruneSealed));
+        assert!(!upload_is_eligible(Aborting, 99, 100, PruneSealed));
     }
 }

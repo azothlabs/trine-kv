@@ -29,18 +29,20 @@ Feature: Durable namespace boundaries
     When I try to open named bucket "default"
     Then the operation is rejected as invalid options
 
-  @REQ-BATCH-002
+  @REQ-BATCH-002 @REQ-RECOVERY-001 @REQ-ASYNC-001
   Scenario: One accepted batch changes the default and a named namespace together
     Given a new durable database
     And named bucket "ledger" exists
     When I atomically write key "balance" as "90" and named bucket "ledger" key "entry" as "debit-10"
+    And I reopen the database
     Then key "balance" contains "90"
     And named bucket "ledger" key "entry" contains "debit-10"
 
-  @REQ-BATCH-001
+  @REQ-BATCH-001 @REQ-RECOVERY-002
   Scenario: A rejected cross-namespace batch changes no namespace
     Given a new durable database
     And key "balance" contains "100"
     When I try to atomically write key "balance" as "0" and missing bucket "missing" key "entry" as "debit-100"
     Then the operation is rejected because the bucket is missing
-    And key "balance" contains "100"
+    When I reopen the database
+    Then key "balance" contains "100"

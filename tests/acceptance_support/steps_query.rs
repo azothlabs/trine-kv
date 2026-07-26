@@ -1,22 +1,7 @@
 use cucumber::{given, then, when};
 use trine_kv::{Iter, KeyRange};
 
-use super::world::TrineWorld;
-
-fn parse_rows(specification: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
-    if specification.is_empty() {
-        return Vec::new();
-    }
-    specification
-        .split(',')
-        .map(|entry| {
-            let (key, value) = entry
-                .split_once('=')
-                .expect("row fixture uses key=value syntax");
-            (key.as_bytes().to_vec(), value.as_bytes().to_vec())
-        })
-        .collect()
-}
+use super::{fixtures::parse_rows, world::TrineWorld};
 
 async fn drain(mut cursor: Iter) -> trine_kv::Result<Vec<(Vec<u8>, Vec<u8>)>> {
     let mut rows = Vec::new();

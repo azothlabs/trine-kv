@@ -9,7 +9,10 @@ use std::{
 use std::sync::Arc;
 
 use trine_kv::{
-    Bucket, ContentId, Db, DbOptions, Error, Iter, ReadVersion, Snapshot, StorageDomainId,
+    Bucket, ContentAccessBarrierId, ContentHandle, ContentId, ContentPhysicalHold,
+    ContentPhysicalHoldId, ContentPhysicalHoldKind, ContentPhysicalHoldOwnerId, ContentUpload,
+    ContentUploadMaintenanceReport, Db, DbOptions, Error, Iter, ReadVersion, Snapshot,
+    StorageDomainId, UploadId,
 };
 
 #[cfg(feature = "s3")]
@@ -57,6 +60,24 @@ pub(crate) struct TrineWorld {
     pub(crate) sealed_content_bytes: Option<Vec<u8>>,
     pub(crate) content_domain: Option<StorageDomainId>,
     pub(crate) expected_content_id: Option<ContentId>,
+    pub(crate) pending_upload: Option<ContentUpload>,
+    pub(crate) remembered_upload_id: Option<UploadId>,
+    pub(crate) remembered_upload_updated_at: Option<u64>,
+    pub(crate) upload_maintenance_report: Option<ContentUploadMaintenanceReport>,
+    pub(crate) remembered_content_id: Option<ContentId>,
+    pub(crate) retained_content_handle: Option<ContentHandle>,
+    pub(crate) leased_content_handle: Option<ContentHandle>,
+    pub(crate) cloned_leased_content_handle: Option<ContentHandle>,
+    pub(crate) remembered_lease_deadline: Option<u64>,
+    pub(crate) first_barrier_id: Option<ContentAccessBarrierId>,
+    pub(crate) second_barrier_id: Option<ContentAccessBarrierId>,
+    pub(crate) remembered_hold_id: Option<ContentPhysicalHoldId>,
+    pub(crate) remembered_hold_owner: Option<ContentPhysicalHoldOwnerId>,
+    pub(crate) remembered_hold_kind: Option<ContentPhysicalHoldKind>,
+    pub(crate) remembered_hold_deadline: Option<u64>,
+    pub(crate) physical_hold: Option<ContentPhysicalHold>,
+    pub(crate) branch_rows: Vec<(Vec<u8>, Vec<u8>)>,
+    pub(crate) upload_bytes: Vec<u8>,
 }
 
 impl TrineWorld {
@@ -77,10 +98,31 @@ impl TrineWorld {
         Ok(())
     }
 
+    pub(crate) async fn open_new_native(
+        &mut self,
+        keep_last_read_versions: u64,
+    ) -> trine_kv::Result<()> {
+        assert!(
+            self.db.is_none(),
+            "scenario database may only be created once"
+        );
+        self.keep_last_read_versions = keep_last_read_versions;
+        let location = DurableLocation::Native(new_native_path());
+        let db = open_location(&location, keep_last_read_versions, false).await?;
+        self.location = Some(location);
+        self.db = Some(db);
+        Ok(())
+    }
+
     pub(crate) async fn reopen(&mut self, read_only: bool) -> trine_kv::Result<()> {
         self.snapshot.take();
         self.retained_cursor.take();
         self.retained_bucket.take();
+        self.pending_upload.take();
+        self.retained_content_handle.take();
+        self.leased_content_handle.take();
+        self.cloned_leased_content_handle.take();
+        self.physical_hold.take();
         if let Some(db) = self.db.take() {
             db.close().await?;
         }
@@ -110,10 +152,19 @@ impl TrineWorld {
         }
     }
 
+    pub(crate) fn expected_content_for_upload(&self) -> ContentId {
+        ContentId::for_bytes(&self.upload_bytes)
+    }
+
     pub(crate) async fn cleanup(&mut self) -> trine_kv::Result<()> {
         self.snapshot.take();
         self.retained_cursor.take();
         self.retained_bucket.take();
+        self.pending_upload.take();
+        self.retained_content_handle.take();
+        self.leased_content_handle.take();
+        self.cloned_leased_content_handle.take();
+        self.physical_hold.take();
         if let Some(db) = self.db.take() {
             db.close().await?;
         }
@@ -146,9 +197,9 @@ fn unique_suffix() -> String {
 
 fn new_location() -> trine_kv::Result<DurableLocation> {
     match std::env::var("TRINE_ACCEPTANCE_BACKEND").as_deref() {
-        Err(std::env::VarError::NotPresent) | Ok("native") => Ok(DurableLocation::Native(
-            std::env::temp_dir().join(format!("trine-gherkin-{}", unique_suffix())),
-        )),
+        Err(std::env::VarError::NotPresent) | Ok("native") => {
+            Ok(DurableLocation::Native(new_native_path()))
+        }
         Ok("s3") => new_object_store_location(),
         Ok(other) => Err(Error::invalid_options(format!(
             "unsupported TRINE_ACCEPTANCE_BACKEND {other:?}; expected native or s3"
@@ -157,6 +208,10 @@ fn new_location() -> trine_kv::Result<DurableLocation> {
             "TRINE_ACCEPTANCE_BACKEND is not valid Unicode: {error}"
         ))),
     }
+}
+
+fn new_native_path() -> PathBuf {
+    std::env::temp_dir().join(format!("trine-gherkin-{}", unique_suffix()))
 }
 
 #[cfg(feature = "s3")]
@@ -210,13 +265,18 @@ async fn cleanup_object_prefix(
     client: &Arc<dyn ObjectClient>,
     prefix: &str,
 ) -> trine_kv::Result<()> {
+    let mut last_delete_error = None;
     for _ in 0..8 {
         let objects = client.list(prefix).await?;
         if objects.is_empty() {
             return Ok(());
         }
         for object in objects {
-            client.delete(&object.key).await?;
+            if let Err(error) = client.delete(&object.key).await {
+                // A timed-out delete has an unknown result. Verification by
+                // listing is authoritative; retry only objects still visible.
+                last_delete_error = Some(error.to_string());
+            }
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -226,8 +286,10 @@ async fn cleanup_object_prefix(
     } else {
         Err(Error::Corruption {
             message: format!(
-                "acceptance cleanup left {} objects under isolated prefix {prefix}",
-                remaining.len()
+                "acceptance cleanup left {} objects under isolated prefix {prefix}; \
+                 last delete error: {}",
+                remaining.len(),
+                last_delete_error.as_deref().unwrap_or("none"),
             ),
         })
     }

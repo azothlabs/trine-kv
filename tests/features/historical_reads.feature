@@ -2,7 +2,7 @@ Feature: Historical read promises
   Snapshots and accepted read versions are repeatable views. Maintenance may
   reclaim history only after no configured or named promise retains it.
 
-  @REQ-HISTORY-001
+  @REQ-HISTORY-001 @REQ-ASYNC-001
   Scenario: A snapshot remains repeatable across writes and maintenance
     Given a new durable database
     And key "account" contains "v1"
@@ -30,7 +30,7 @@ Feature: Historical read promises
     And I try to open the remembered read version
     Then the operation is rejected because the read version expired
 
-  @REQ-RANGE-001
+  @REQ-RANGE-001 @REQ-ASYNC-001
   Scenario: A half-open deletion preserves its end key
     Given a new durable database
     And key "a" contains "one"

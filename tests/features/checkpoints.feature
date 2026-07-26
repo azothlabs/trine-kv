@@ -2,7 +2,7 @@ Feature: Durable checkpoint reachability
   A named checkpoint is an application-owned promise that an older committed
   view remains readable until the checkpoint is deleted.
 
-  @REQ-HISTORY-004
+  @REQ-HISTORY-004 @REQ-RECOVERY-003 @REQ-ASYNC-001
   Scenario: A checkpoint preserves the old value after maintenance and reopen
     Given a new durable database
     And key "policy" contains "v1"
@@ -11,8 +11,10 @@ Feature: Durable checkpoint reachability
     And I flush the database
     And I compact the database
     And I reopen the database
+    And I reopen the database
     And I read key "policy" at the checkpoint
     Then the value is "v1"
+    And key "policy" contains "v2"
 
   @REQ-HISTORY-005
   Scenario: Deleting a checkpoint releases its historical promise

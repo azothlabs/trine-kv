@@ -14,6 +14,14 @@ to 1.95, which starts a new pre-`1.0` minor line.
 
 ### Added
 
+- Added requirement-first durable acceptance coverage for branch lineages,
+  resumable-upload maintenance, leased-only access, leases, physical holds,
+  cross-bucket recovery, and unpolled asynchronous mutations. The
+  backend-neutral corpus runs unchanged on native storage and qualified R2;
+  synchronous branch data operations use a separate durable-native profile.
+- Added a persistent randomized branch/reference-model test, executable
+  acceptance traceability checks, and an explicit upload-maintenance lifecycle
+  decision table validated by focused mutation testing.
 - Added explicit object-store content-reclamation qualification. A host-retained
   provider-evidence digest and live probes of both protected content path
   families produce a capability scoped to one database prefix.

@@ -3,7 +3,7 @@ Feature: Durable commit boundaries
   accepted state whether it still resides in the write-ahead log or has moved
   through table maintenance.
 
-  @REQ-DURABLE-001
+  @REQ-DURABLE-001 @REQ-ASYNC-001
   Scenario: A confirmed value survives reopen before flush
     Given a new durable database
     When I write key "session" with value "confirmed"
@@ -44,3 +44,10 @@ Feature: Durable commit boundaries
     When I close the database
     And I try to read key "anything"
     Then the operation is rejected because the database is closed
+
+  @REQ-ASYNC-002
+  Scenario: An asynchronous mutation has no effect until it is polled
+    Given a new durable database
+    When I create and discard an unpolled write of key "never-polled" as "invisible"
+    And I reopen the database
+    Then key "never-polled" is absent

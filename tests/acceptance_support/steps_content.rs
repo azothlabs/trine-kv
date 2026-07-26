@@ -1,28 +1,9 @@
 use std::time::Duration;
 
 use cucumber::{then, when};
-use trine_kv::{
-    ContentAttachmentScope, ContentId, ContentUploadOptions, Error, OwnerScopeId, StorageDomainId,
-};
+use trine_kv::{ContentId, ContentUploadOptions, Error};
 
-use super::world::TrineWorld;
-
-fn content_scope() -> ContentAttachmentScope {
-    ContentAttachmentScope::new(
-        StorageDomainId::from_bytes([11; 16]),
-        OwnerScopeId::from_bytes([12; 16]),
-    )
-}
-
-async fn seal_bytes(world: &TrineWorld, value: &[u8]) -> trine_kv::Result<ContentId> {
-    let scope = content_scope();
-    let mut upload = world
-        .db()
-        .begin_content_upload(ContentUploadOptions::new(scope, Duration::from_hours(1)))
-        .await?;
-    upload.write(value).await?;
-    Ok(upload.seal().await?.content_id())
-}
+use super::{content_fixture::content_scope, world::TrineWorld};
 
 #[when(expr = "I stage immutable content {string} without sealing it")]
 async fn stage_unsealed_content(world: &mut TrineWorld, value: String) {
@@ -59,9 +40,10 @@ async fn try_open_staged_content(world: &mut TrineWorld) {
 #[when(expr = "I upload and seal immutable content {string}")]
 async fn upload_and_seal_content(world: &mut TrineWorld, value: String) {
     world.first_content_id = Some(
-        seal_bytes(world, value.as_bytes())
+        super::content_fixture::seal_bytes(world.db(), value.as_bytes())
             .await
-            .expect("content upload seals"),
+            .expect("content upload seals")
+            .content_id(),
     );
     world.sealed_content_bytes = Some(value.into_bytes());
     world.content_domain = Some(content_scope().storage_domain_id());
@@ -78,9 +60,10 @@ async fn upload_and_seal_same_content(world: &mut TrineWorld) {
         .expect("first immutable content bytes are retained");
     assert_eq!(expected, ContentId::for_bytes(value));
     world.second_content_id = Some(
-        seal_bytes(world, value)
+        super::content_fixture::seal_bytes(world.db(), value)
             .await
-            .expect("identical content upload seals"),
+            .expect("identical content upload seals")
+            .content_id(),
     );
 }
 

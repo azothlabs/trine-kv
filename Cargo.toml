@@ -54,6 +54,10 @@ harness = false
 name = "acceptance"
 harness = false
 
+[[test]]
+name = "acceptance_native"
+harness = false
+
 [lints.rust]
 unsafe_code = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

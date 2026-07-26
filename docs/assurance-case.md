@@ -25,8 +25,8 @@ Fast pull-request gates:
 
 - formatting and strict Clippy;
 - all-target/all-feature tests and supported WASM checks;
-- 30 requirement-traced Gherkin scenarios with 167 steps against durable native
-  storage on every run;
+- 52 backend-neutral requirement-traced Gherkin scenarios with 352 steps and 6
+  durable-native branch scenarios with 55 steps on every run;
 - dependency advisory scan;
 - a 75% line-coverage floor.
 
@@ -67,9 +67,9 @@ dependencies or by remote providers. Browser transaction aborts, object-store
 CAS ambiguity, listing delay, and provider-side deletion are covered by
 contract fakes and targeted tests, but still require live-host qualification.
 
-The same 30-scenario corpus and the object request/fault suite also pass
-against real R2. That is evidence for the tested R2 account, bucket policy,
-endpoint, and run; it does not generalize to every provider or future
+The same 52-scenario backend-neutral corpus and the object request/fault suite
+also pass against real R2. That is evidence for the tested R2 account, bucket
+policy, endpoint, and run; it does not generalize to every provider or future
 configuration.
 
 ## Commands
@@ -77,6 +77,7 @@ configuration.
 ```text
 cargo test --all-targets --all-features
 cargo test --test acceptance
+cargo test --test acceptance_native
 TRINE_ACCEPTANCE_BACKEND=s3 cargo test --features s3 --test acceptance
 cargo test --test property_model
 cargo test --test concurrency_model

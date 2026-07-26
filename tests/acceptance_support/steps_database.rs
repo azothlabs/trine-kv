@@ -30,6 +30,12 @@ async fn write_key(world: &mut TrineWorld, key: String, value: String) {
     key_contains(world, key, value).await;
 }
 
+#[when(expr = "I create and discard an unpolled write of key {string} as {string}")]
+fn discard_unpolled_write(world: &mut TrineWorld, key: String, value: String) {
+    let mutation = world.db().put(key.into_bytes(), value.into_bytes());
+    drop(mutation);
+}
+
 #[when(expr = "I try to write key {string} with value {string}")]
 async fn try_write_key(world: &mut TrineWorld, key: String, value: String) {
     let result = world.db().put(key.into_bytes(), value.into_bytes()).await;

@@ -39,6 +39,15 @@ tests.
 | `REQ-RANGE-*`, `REQ-CURSOR-*` | V1 §§8, 21, 22 | half-open deletion and ordered snapshot-consistent cursors |
 | `REQ-NS-*` | V1 §§5, 23 plus the public generation-fenced `Bucket` contract | durable isolation and rejection of stale namespace authority |
 | `REQ-CONTENT-*` | public `ContentUpload`/`ContentId` lifecycle contract and Phase 194 content acceptance gate | staging is invisible, seal publishes immutable bytes, equal bytes have stable identity |
+| `REQ-UPLOAD-*`, `REQ-LEASE-*`, `REQ-HOLD-*`, `REQ-ACCESS-*` | public content lifecycle APIs and their versioned protocols | resumable publication, durable lease/hold authority, and the irreversible leased-only boundary |
+| `REQ-BRANCH-*` | public `Db`/`Branch` contract and `docs/branching.md` | frozen fork views, isolated divergence, nesting, retention, and generation-fenced deletion |
+| `REQ-ASYNC-*`, `REQ-RECOVERY-*` | V1 durability contract and the public async lifecycle | async operations preserve the same accepted durable state and rejected operations remain absent |
+
+The expanded requirement catalog lives in
+`docs/acceptance-requirements-v2.md`. An executable traceability check requires
+every catalog entry to name a Feature scenario or a separately verified
+integration-test witness, so the suite cannot define completeness by whatever
+it happens to test today.
 
 Low-level format corruption, syscall crash points, provider request accounting,
 and internal transition exhaustiveness remain separate fault, format, model,
@@ -51,6 +60,12 @@ Native profile:
 
 ```text
 cargo test --test acceptance
+```
+
+Durable-native branch profile:
+
+```text
+cargo test --test acceptance_native
 ```
 
 Real S3-compatible profile:
@@ -66,9 +81,9 @@ that its objects were removed.
 
 ## Coverage boundary
 
-These 30 scenarios are the durable cross-backend acceptance contract, not a
-second spelling of every lower-level test. Arbitrary malformed bytes, exact
-crash points, provider response ambiguity, bounded concurrency schedules, and
-proof predicates remain in fuzz, fault, model, and formal suites because
-expressing those mechanisms as application prose would make the Feature files
-less independent—not more complete.
+The 52 backend-neutral scenarios and 6 durable-native branch scenarios are the
+acceptance contract, not a second spelling of every lower-level test. Arbitrary
+malformed bytes, exact crash points, provider response ambiguity, bounded
+concurrency schedules, and proof predicates remain in fuzz, fault, model, and
+formal suites because expressing those mechanisms as application prose would
+make the Feature files less independent—not more complete.

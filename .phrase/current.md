@@ -2,7 +2,7 @@
 
 ## Architecture clarity and layered assurance
 
-**Status:** Complete.
+**Status:** Complete after requirements-first acceptance expansion.
 
 ### Goal
 
@@ -18,20 +18,24 @@
 
 1. Native all-target/all-feature suite: every executed target passed; provider
    live tests remain intentionally ignored in the default run.
-2. One requirement-driven Gherkin corpus contains 8 features, 30 scenarios,
-   and 167 steps. It passed unchanged against isolated native directories and
-   isolated prefixes in real R2.
+2. The backend-neutral requirement-driven Gherkin corpus contains 10 features,
+   52 scenarios, and 352 steps. It passed unchanged against isolated native
+   directories and isolated prefixes in real R2. A separate durable-native
+   branch profile adds 6 scenarios and 55 steps.
 3. Strict native and browser Clippy, WASI warning-denied check, Rustdoc, 31
    doctests, formatting, documentation drift, workflow YAML, and diff hygiene
    passed.
-4. Coverage gate passed at 77.22% lines; dependency audit scanned 368 locked
-   dependencies with no advisory.
+4. Coverage passed at 77.32% lines, 75.43% functions, and 75.95% regions;
+   dependency audit scanned 368 locked dependencies with no advisory.
 5. Kani verified 5/5 harnesses; focused Miri transition checks passed; Loom
    enumerated the small commit/waiter schedule.
 6. Six decoder fuzz targets completed local short campaigns without a crash;
    the scheduled workflow extends each campaign.
 7. Mutation check evaluated 20 trusted-core variants: 19 were detected and one
    was compile-invalid, leaving no surviving variant.
+8. Upload-maintenance mutation analysis initially exposed two missing
+   distinctions. The expanded Feature and explicit lifecycle decision table
+   now reject every viable focused mutation.
 
 ### Residual scope
 
