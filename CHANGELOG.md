@@ -4,40 +4,58 @@ All public crate releases use Semantic Versioning.
 
 ## Unreleased
 
-- Made durable branches async-first end to end. The primary create, open,
-  list, read, write, scan, lineage, and delete methods now use async storage;
-  native synchronous adapters use explicit `*_sync` names.
-- Added `AsyncBranchRange`; asynchronous branch scans no longer erase their
-  storage iterators behind the synchronous `Iterator` interface.
-- Replaced independently optional backend fields on `DbInner` with one owned
-  backend state and a narrow random-read capability.
-- Removed the unused all-capabilities storage dispatcher that was exercised
-  only by tests.
-- Split database opening, platform I/O, browser storage, lease state, content
-  transaction extensions, and large test suites into responsibility-named
-  modules, with executable architecture-boundary checks.
-- Split branch implementation by registry encoding, owned state, handle I/O,
-  range merge, durable transition, and public API responsibilities. Sync APIs
-  now drive the same async orchestration and range merge instead of maintaining
-  a second lifecycle execution path.
-- Split content transaction extensions by token/activity, reclaim intent,
-  quarantine, grace, sweep, and protected guard responsibilities, with explicit
-  dependency imports for every module.
-- Move storage-independent transaction state into a private responsibility
-  module without adding a separately released crate.
-- Group object-store and browser resources into backend-owned capability
-  bundles, remove wrong-backend runtime accessors, and replace broad
-  source-text and file-tree architecture assertions with compile-checked public
-  contracts.
+## 0.6.0 - 2026-07-26
 
-## 0.6.0 - 2026-07-25
+Immutable-content lifecycle, async-storage architecture, and assurance release.
+This entry covers every repository change since `v0.5.13`.
 
-Toolchain and audit-hardening release. This release keeps the v1 public API and
-storage contracts while raising the minimum supported Rust version from 1.85
-to 1.95, which starts a new pre-`1.0` minor line.
+### Compatibility
+
+- The minimum supported Rust version is now 1.95. The crate, lockfile,
+  `rust-toolchain.toml`, CI, publishing, documentation, and examples use the
+  `0.6` release line consistently.
+- Durable Branch APIs are async-first. Create, open, list, read, write, scan,
+  lineage, and delete methods use their unsuffixed async names; native
+  synchronous callers must use the explicit `*_sync` adapters.
+  `Branch::range` now returns `AsyncBranchRange`, while `range_sync` returns
+  `BranchRange`.
+- Persistent manifest format v2 adds durable file-ID and bucket-generation
+  high-water marks. Version-1 manifests from `0.5.x` are rejected rather than
+  upgraded in place. Durable branch registry records and object-store WAL keys
+  also use strict new encodings; retain a recoverable `0.5.13` copy when
+  planning application-level data migration.
+- The crate version remains `0.6.0`; architecture work does not independently
+  advance the release version.
 
 ### Added
 
+- Added immutable content objects with SHA-256 identities, verified range
+  reads, streaming reads, descriptor validation, and storage-domain isolation.
+- Added crash-resumable, revisioned content uploads. Callers can begin, resume,
+  append, seal, or abort an upload; confirmed progress survives reopen and seal
+  recomputes the complete content identity before publication.
+- Added caller-owned idempotent upload IDs, expected-length enforcement,
+  per-domain physical quotas, upload inspection, inactive-upload reaping, and
+  sealed-session pruning. Aborted and pruned IDs remain retired instead of
+  silently becoming new uploads.
+- Added portable algorithm-tagged `ContentId` encoding and scoped attachment
+  tokens. A token binds sealed content to storage and owner scopes and can be
+  consumed atomically with ordinary transaction writes.
+- Added transaction values that are stamped with their final commit sequence
+  after optimistic validation and before WAL acceptance, allowing upper layers
+  to persist exact local visibility metadata in the same atomic commit.
+- Added durable content read leases with renewal, expiry, reopen, cloned-handle
+  sharing, leased range reads, and read-only enforcement.
+- Added durable physical holds for migration, backup, repair, provider,
+  administrative, processing, and offline work. Holds support owner-checked
+  resume, monotonic renewal, expiry, and idempotent release.
+- Added irreversible leased-only access barriers, reader-drain attestations,
+  atomic reclaim intents, crash-safe quarantine, and non-authorizing grace
+  records. Upload or hold activity revives protected content atomically.
+- Added default-off physical content reclamation. Native filesystem sweeps are
+  capability-qualified; object-store sweeps bind provider evidence and the
+  exact database prefix, reject visible versions or retention controls, and
+  verify HEAD, GET, and LIST absence after deletion.
 - Added requirement-first durable acceptance coverage for branch lineages,
   resumable-upload maintenance, leased-only access, leases, physical holds,
   cross-bucket recovery, and unpolled asynchronous mutations. The
@@ -51,9 +69,32 @@ to 1.95, which starts a new pre-`1.0` minor line.
   families produce a capability scoped to one database prefix.
 - Object metadata now retains the provider's opaque version identity so
   versioned and delete-marker behavior can fail closed.
+- Added six decoder fuzz targets, Kani harnesses, focused Loom and Miri checks,
+  property/reference models, mutation checks, a native failure-boundary
+  catalog, coverage reporting, and documented assurance/acceptance contracts.
 
 ### Changed
 
+- Durable branches now have recoverable Creating/Active/Deleting lifecycle
+  transitions and per-generation stale-handle fencing. Name collisions preserve
+  the authoritative fork checkpoint, nested lineage is typed, deletion is
+  resumable, and a parent cannot be deleted while a child remains.
+- Branch registry encoding, lifecycle state, handle I/O, range merging,
+  transitions, and public orchestration are separate modules. Sync Branch APIs
+  drive the same async orchestration and the same range merge implementation,
+  eliminating the second execution path.
+- Database opening, engine maintenance, object storage, browser storage,
+  platform I/O, transaction state, and content lifecycle responsibilities are
+  divided into focused modules. Storage-independent transaction state remains a
+  private module in the main crate rather than a separately released package.
+- `DbInner` now owns one exhaustive `DatabaseStorage` variant. Memory,
+  filesystem, object-store, and browser resources are exposed as complete typed
+  bundles; wrong-backend accessors and their runtime corruption paths were
+  removed.
+- Native platform I/O now uses a bounded, resource-aware, completion-driven
+  scheduler. Native-completion and managed-fallback executors share one
+  ordering domain, append sessions and publish plans preserve object
+  invariants, and close drains accepted work before joining workers.
 - CI now runs native, WASI, and browser verification as independent jobs. This
   keeps target failures attributable and allows the three release gates to run
   in parallel.
@@ -62,6 +103,8 @@ to 1.95, which starts a new pre-`1.0` minor line.
   release line consistently.
 - Native platform I/O now uses the compio 0.19 dependency family, removing the
   transitive unmaintained `paste` macro.
+- Native S3 support now uses `object_store` 0.14 and remains excluded from
+  browser/WASI dependency graphs.
 - The wasm-bindgen CLI is installed by the same Rust 1.95 toolchain used to
   compile and test Trine; the auxiliary Rust 1.88 installation is removed.
 - Source and test code now satisfy the Rust 1.95 strict Clippy gate, including
@@ -73,9 +116,40 @@ to 1.95, which starts a new pre-`1.0` minor line.
 - Qualified cloud deletion checks for a provider version before DELETE and
   requires immediate HEAD, GET, and LIST absence afterward. Any uncertainty
   leaves the sweep Prepared for retry.
+- Object-store commits use immutable content-addressed WAL segments and a
+  CAS-protected lease/WAL head as the confirmed commit point. Writer identity
+  binds both epoch and a fresh owner nonce; ambiguous conditional writes are
+  accepted only after exact intended bytes are read back.
+- Browser OPFS now stores immutable-content objects and uses the same content
+  upload, lease, reopen, and writer-conflict contracts as other durable
+  backends. WASI directory enumeration stops at repeated cookies instead of
+  hanging on affected Preview 1 hosts.
+- Broad source-text and file-tree architecture assertions were replaced by
+  exhaustive types, Rust visibility, module dependencies, and compile-checked
+  public Branch and Transaction contracts.
 
 ### Fixed
 
+- Confirmed object-store WAL frames are recovered after reopen, bounded by
+  segment, chain, and total replay limits. Segment identities, predecessor
+  links, canonical object keys, lease ownership, and read-after-error
+  reconciliation now fail closed on ambiguous or mismatched state.
+- Manifest publication validates monotonic replay, file-ID,
+  bucket-generation, and writer-fencing high-water marks. File identifiers are
+  reserved durably before output creation, preventing reuse after crashes.
+- Bucket generations isolate deleted/recreated namespaces and reject stale
+  handles. Internal namespaces cannot be opened through public bucket APIs, and
+  bucket deletion fences new writes, drains accepted work, publishes metadata,
+  then retires storage.
+- Branch creation and deletion recover safely across checkpoint, registry, and
+  data-bucket failure windows. Recreating a name starts a clean generation and
+  cannot inherit divergent data from the retired branch.
+- Content upload, token, lease, hold, barrier, quarantine, grace, and sweep
+  codecs now reject malformed lengths, unknown tags, trailing bytes, identity
+  mismatches, expired authority, and incomplete storage observations.
+- Content maintenance serializes quota and lifecycle changes correctly,
+  preserves idempotency across reopen, and cleans partial or retired chunks
+  without deleting sealed content.
 - Host-only test harness dependencies are now excluded from browser and WASI
   target builds. In particular, WASI persistence tests no longer compile
   `proptest`'s Unix/Windows-only process-timeout dependency chain.
@@ -91,6 +165,18 @@ to 1.95, which starts a new pre-`1.0` minor line.
   cache capacity, table validation/statistics, dependency advisories, and
   release-automation findings from the full-code audit are resolved at their
   owning invariants.
+
+### Verification
+
+- The all-feature suite passes 606 core tests with 4 intentionally ignored,
+  plus every integration target and 31 doctests.
+- The backend-neutral acceptance corpus passes all 52 scenarios and 352 steps;
+  the durable native Branch profile passes all 6 scenarios and 55 steps.
+- Strict native and browser Clippy, warning-denied Rustdoc and WASI checks,
+  formatting, diff hygiene, and `cargo package` verification pass.
+- Real R2 and MinIO qualification covers the object-store acceptance,
+  conditional-write, and content-reclamation paths. Hosted browser/WASI and
+  non-macOS platform jobs remain the release evidence for their exact targets.
 
 ## 0.5.13 - 2026-07-18
 
