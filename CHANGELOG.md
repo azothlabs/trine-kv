@@ -9,21 +9,23 @@ All public crate releases use Semantic Versioning.
 Immutable-content lifecycle, async-storage architecture, and assurance release.
 This entry covers every repository change since `v0.5.13`.
 
-### Compatibility
+### Release baseline
 
-- The minimum supported Rust version is now 1.95. The crate, lockfile,
+- Trine KV has no adopters or deployed database state yet. The following are
+  the supported `0.6.0` baselines, not migration requirements for existing
+  users.
+- The supported Rust toolchain starts at 1.95. The crate, lockfile,
   `rust-toolchain.toml`, CI, publishing, documentation, and examples use the
   `0.6` release line consistently.
-- Durable Branch APIs are async-first. Create, open, list, read, write, scan,
-  lineage, and delete methods use their unsuffixed async names; native
-  synchronous callers must use the explicit `*_sync` adapters.
+- The initial durable Branch API is async-first. Create, open, list, read,
+  write, scan, lineage, and delete methods use their unsuffixed async names;
+  native synchronous callers use the explicit `*_sync` adapters.
   `Branch::range` now returns `AsyncBranchRange`, while `range_sync` returns
   `BranchRange`.
 - Persistent manifest format v2 adds durable file-ID and bucket-generation
-  high-water marks. Version-1 manifests from `0.5.x` are rejected rather than
-  upgraded in place. Durable branch registry records and object-store WAL keys
-  also use strict new encodings; retain a recoverable `0.5.13` copy when
-  planning application-level data migration.
+  high-water marks. It is the first supported persistent-format baseline.
+  Earlier development-only manifest, branch-registry, and object-store WAL
+  encodings are intentionally rejected; no deployed-data migration is needed.
 - The crate version remains `0.6.0`; architecture work does not independently
   advance the release version.
 
