@@ -223,9 +223,7 @@ pub(super) fn acquire_writer_lease(path: &Path, owner: &[u8]) -> Result<File> {
         .open(path)
         .map_err(Error::Io)?;
     if !fs4::fs_std::FileExt::try_lock_exclusive(&file).map_err(Error::Io)? {
-        return Err(Error::Corruption {
-            message: format!("database lock is already held: {}", path.display()),
-        });
+        return Err(Error::lease_unavailable(path.display().to_string()));
     }
 
     file.set_len(0)?;

@@ -1,12 +1,12 @@
 use super::{
     Arc, ContentAccessBarrierRecord, ContentId, Db, DurabilityMode, Error, HostStorageBackend,
-    MutexGuard, PathBuf, Result, StorageDomainId, StorageMode, StorageObjectDeleteBackend,
-    StorageObjectId, StorageObjectKind, StorageObjectReadBackend, StorageObjectWriteBackend,
-    UploadId, UploadIdRetirement, UploadSessionState, UploadSessionStatus,
+    MutexGuard, PathBuf, Result, StorageDomainId, StorageMode, StorageObjectId, StorageObjectKind,
+    UploadId, UploadIdRetirement, UploadSessionState, backend::ContentObjectBackend,
     content_lock_shard_index, decode_upload_id_tombstone, encode_upload_id_tombstone,
 };
+use crate::content::UploadStatePublish;
 use crate::object_store::{Precondition, PutIf};
-use crate::storage::{StorageObjectListBackend, StorageObjectListRequest};
+use crate::storage::StorageObjectListRequest;
 
 impl Db {
     pub(crate) async fn write_content_chunk(
@@ -255,30 +255,7 @@ impl Db {
             .join(upload_id.to_string());
         let request = StorageObjectListRequest::native_file(StorageObjectKind::ContentChunk, root)
             .with_file_extension("trinec");
-        match &self.inner.options.storage_mode {
-            StorageMode::InMemory => self.inner.content_memory.list_objects(request).await,
-            StorageMode::Persistent { .. }
-            | StorageMode::HostPersistent {
-                backend: HostStorageBackend::Wasi { .. },
-            } => self.inner.native_storage.list_objects(request).await,
-            StorageMode::HostPersistent {
-                backend: HostStorageBackend::ObjectStore,
-            } => self.object_storage()?.list_objects(request).await,
-            StorageMode::HostPersistent {
-                backend: HostStorageBackend::Browser { .. },
-            } => {
-                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                {
-                    self.browser_storage()?.list_objects(request).await
-                }
-                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-                {
-                    Err(Error::unsupported_backend(
-                        "browser content objects require wasm32-unknown-unknown",
-                    ))
-                }
-            }
-        }
+        ContentObjectBackend::for_db(self)?.list(request).await
     }
 
     pub(super) async fn delete_content_chunk_object(&self, object: StorageObjectId) -> Result<()> {
@@ -385,30 +362,7 @@ impl Db {
         let root = self.content_root()?.join("uploads");
         let request = StorageObjectListRequest::native_file(StorageObjectKind::ContentUpload, root)
             .with_file_extension("trineu");
-        match &self.inner.options.storage_mode {
-            StorageMode::InMemory => self.inner.content_memory.list_objects(request).await,
-            StorageMode::Persistent { .. }
-            | StorageMode::HostPersistent {
-                backend: HostStorageBackend::Wasi { .. },
-            } => self.inner.native_storage.list_objects(request).await,
-            StorageMode::HostPersistent {
-                backend: HostStorageBackend::ObjectStore,
-            } => self.object_storage()?.list_objects(request).await,
-            StorageMode::HostPersistent {
-                backend: HostStorageBackend::Browser { .. },
-            } => {
-                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                {
-                    self.browser_storage()?.list_objects(request).await
-                }
-                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-                {
-                    Err(Error::unsupported_backend(
-                        "browser content objects require wasm32-unknown-unknown",
-                    ))
-                }
-            }
-        }
+        ContentObjectBackend::for_db(self)?.list(request).await
     }
 
     async fn write_content_object(&self, object: StorageObjectId, bytes: Arc<[u8]>) -> Result<()> {
@@ -417,52 +371,17 @@ impl Db {
             return Err(Error::ReadOnly);
         }
         let durability = self.content_durability();
-        match &self.inner.options.storage_mode {
-            StorageMode::InMemory => {
-                self.inner
-                    .content_memory
-                    .write_object(object, bytes, durability)
-                    .await
-            }
-            StorageMode::Persistent { .. }
-            | StorageMode::HostPersistent {
-                backend: HostStorageBackend::Wasi { .. },
-            } => {
-                self.inner
-                    .native_storage
-                    .write_object(object, bytes, durability)
-                    .await
-            }
-            StorageMode::HostPersistent {
-                backend: HostStorageBackend::ObjectStore,
-            } => {
-                self.fence_object_mutation_or_close("before content-object write")
-                    .await?;
-                let result = self
-                    .object_storage()?
-                    .write_object(object, bytes, durability)
-                    .await;
-                self.fence_object_mutation_or_close("after content-object write")
-                    .await?;
-                result
-            }
-            StorageMode::HostPersistent {
-                backend: HostStorageBackend::Browser { .. },
-            } => {
-                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                {
-                    self.browser_storage()?
-                        .write_object(object, bytes, durability)
-                        .await
-                }
-                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-                {
-                    Err(Error::unsupported_backend(
-                        "browser content objects require wasm32-unknown-unknown",
-                    ))
-                }
-            }
+        let backend = ContentObjectBackend::for_db(self)?;
+        if backend.requires_lease_fence() {
+            self.fence_object_mutation_or_close("before content-object write")
+                .await?;
         }
+        let result = backend.write(object, bytes, durability).await;
+        if backend.requires_lease_fence() {
+            self.fence_object_mutation_or_close("after content-object write")
+                .await?;
+        }
+        result
     }
 
     async fn write_upload_state_object_store_cas(
@@ -476,14 +395,14 @@ impl Db {
         let backend = self.object_storage()?;
         let observed = backend.read_object_versioned(&object).await?;
         let precondition = match observed {
-            None if intended.revision() == 0 => Precondition::IfNoneMatch,
-            None => {
-                return Err(Error::ContentUploadConflict {
-                    upload_id: intended.upload_id().to_string(),
-                    expected_revision: intended.revision(),
-                    actual_revision: 0,
-                });
-            }
+            None => match intended.plan_publish_against(None)? {
+                UploadStatePublish::Create => Precondition::IfNoneMatch,
+                UploadStatePublish::Replace { .. } | UploadStatePublish::AlreadyApplied => {
+                    return Err(Error::Corruption {
+                        message: "absent upload state produced a non-create transition".to_owned(),
+                    });
+                }
+            },
             Some((current_bytes, etag)) => {
                 if let Some(retirement) =
                     decode_upload_id_tombstone(&current_bytes, intended.upload_id())?
@@ -491,26 +410,19 @@ impl Db {
                     return Err(upload_retirement_error(intended.upload_id(), retirement));
                 }
                 let current = UploadSessionState::decode(&current_bytes, intended.upload_id())?;
-                if current.logically_eq_ignoring_updated_at(intended) {
-                    self.fence_object_mutation_or_close("after idempotent upload-state CAS")
-                        .await?;
-                    return Ok(());
+                match intended.plan_publish_against(Some(&current))? {
+                    UploadStatePublish::Replace { .. } => Precondition::IfMatch(etag),
+                    UploadStatePublish::AlreadyApplied => {
+                        self.fence_object_mutation_or_close("after idempotent upload-state CAS")
+                            .await?;
+                        return Ok(());
+                    }
+                    UploadStatePublish::Create => {
+                        return Err(Error::Corruption {
+                            message: "present upload state produced a create transition".to_owned(),
+                        });
+                    }
                 }
-                let expected_revision =
-                    current
-                        .revision()
-                        .checked_add(1)
-                        .ok_or_else(|| Error::Corruption {
-                            message: "content upload revision overflow".to_owned(),
-                        })?;
-                if intended.revision() != expected_revision {
-                    return Err(Error::ContentUploadConflict {
-                        upload_id: intended.upload_id().to_string(),
-                        expected_revision: intended.revision(),
-                        actual_revision: current.revision(),
-                    });
-                }
-                Precondition::IfMatch(etag)
             }
         };
 
@@ -591,18 +503,7 @@ impl Db {
             return result;
         }
         let current = UploadSessionState::decode(&current_bytes, upload_id)?;
-        let allowed = matches!(
-            (retirement, current.status()),
-            (UploadIdRetirement::Aborted, UploadSessionStatus::Aborting)
-                | (UploadIdRetirement::Sealed, UploadSessionStatus::Sealed(_))
-        );
-        if !allowed {
-            return Err(Error::ContentUploadConflict {
-                upload_id: upload_id.to_string(),
-                expected_revision: current.revision(),
-                actual_revision: current.revision(),
-            });
-        }
+        current.require_retirement(retirement)?;
         let publish = backend
             .put_object_if(&object, bytes, Precondition::IfMatch(etag))
             .await;
@@ -647,13 +548,12 @@ impl Db {
             .map_err(|error| {
                 let message =
                     format!("object mutation lease fence failed {stage}: {error}; database closed");
-                self.inner
-                    .closed
-                    .store(true, std::sync::atomic::Ordering::Release);
-                self.inner.maintenance.record_error(Error::Corruption {
-                    message: message.clone(),
-                });
-                self.inner.maintenance.shutdown();
+                self.stop_writes_after_fatal_error(
+                    crate::db::FatalWriteStopReason::Fenced,
+                    Error::Corruption {
+                        message: message.clone(),
+                    },
+                );
                 Error::Corruption { message }
             })
     }
@@ -663,73 +563,22 @@ impl Db {
         object: StorageObjectId,
     ) -> Result<Option<Arc<[u8]>>> {
         self.ensure_open()?;
-        match &self.inner.options.storage_mode {
-            StorageMode::InMemory => self.inner.content_memory.read_object_bytes(object).await,
-            StorageMode::Persistent { .. }
-            | StorageMode::HostPersistent {
-                backend: HostStorageBackend::Wasi { .. },
-            } => self.inner.native_storage.read_object_bytes(object).await,
-            StorageMode::HostPersistent {
-                backend: HostStorageBackend::ObjectStore,
-            } => self.object_storage()?.read_object_bytes(object).await,
-            StorageMode::HostPersistent {
-                backend: HostStorageBackend::Browser { .. },
-            } => {
-                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                {
-                    self.browser_storage()?.read_object_bytes(object).await
-                }
-                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-                {
-                    Err(Error::unsupported_backend(
-                        "browser content objects require wasm32-unknown-unknown",
-                    ))
-                }
-            }
-        }
+        ContentObjectBackend::for_db(self)?.read(object).await
     }
 
     async fn delete_content_object(&self, object: StorageObjectId) -> Result<()> {
         self.ensure_open()?;
-        match &self.inner.options.storage_mode {
-            StorageMode::InMemory => self.inner.content_memory.delete_object(object).await,
-            StorageMode::Persistent { .. }
-            | StorageMode::HostPersistent {
-                backend: HostStorageBackend::Wasi { .. },
-            } => {
-                self.inner
-                    .native_storage
-                    .delete_object_durable(object, self.content_durability())
-                    .await
-            }
-            StorageMode::HostPersistent {
-                backend: HostStorageBackend::ObjectStore,
-            } => {
-                self.fence_object_mutation_or_close("before content-object deletion")
-                    .await?;
-                let result = self
-                    .object_storage()?
-                    .delete_unversioned_object_verified(object)
-                    .await;
-                self.fence_object_mutation_or_close("after content-object deletion")
-                    .await?;
-                result
-            }
-            StorageMode::HostPersistent {
-                backend: HostStorageBackend::Browser { .. },
-            } => {
-                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                {
-                    self.browser_storage()?.delete_object(object).await
-                }
-                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-                {
-                    Err(Error::unsupported_backend(
-                        "browser content objects require wasm32-unknown-unknown",
-                    ))
-                }
-            }
+        let backend = ContentObjectBackend::for_db(self)?;
+        if backend.requires_lease_fence() {
+            self.fence_object_mutation_or_close("before content-object deletion")
+                .await?;
         }
+        let result = backend.delete(object, self.content_durability()).await;
+        if backend.requires_lease_fence() {
+            self.fence_object_mutation_or_close("after content-object deletion")
+                .await?;
+        }
+        result
     }
 
     pub(super) fn content_durability(&self) -> DurabilityMode {

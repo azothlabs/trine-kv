@@ -6,30 +6,47 @@ use super::{
 #[cfg(not(all(feature = "s3", not(target_family = "wasm"))))]
 use super::{Context, Future, Poll, Wake, Waker, thread};
 
+const OBJECT_LEASE_READ_MAX_ATTEMPTS: usize = 16;
+
 pub(super) async fn read_lease_state(
     client: &Arc<dyn ObjectClient>,
     key: &str,
 ) -> Result<Option<ObservedLeaseState>> {
-    let Some(meta) = client.head(key).await? else {
-        return Ok(None);
-    };
-    if meta.size > OBJECT_LEASE_MAX_BYTES {
-        return Err(Error::Corruption {
-            message: format!(
-                "writer lease {key} length {} exceeds maximum {OBJECT_LEASE_MAX_BYTES}",
-                meta.size
-            ),
-        });
+    for _ in 0..OBJECT_LEASE_READ_MAX_ATTEMPTS {
+        let Some(meta) = client.head(key).await? else {
+            return Ok(None);
+        };
+        if meta.size > OBJECT_LEASE_MAX_BYTES {
+            return Err(Error::Corruption {
+                message: format!(
+                    "writer lease {key} length {} exceeds maximum {OBJECT_LEASE_MAX_BYTES}",
+                    meta.size
+                ),
+            });
+        }
+        let bytes = if meta.size == 0 {
+            let Some(current) = client.head(key).await? else {
+                continue;
+            };
+            if current.size != 0 || current.etag != meta.etag {
+                continue;
+            }
+            Arc::from([])
+        } else {
+            match client.get_range(key, 0, meta.size, &meta.etag).await {
+                Ok(bytes) => bytes,
+                Err(Error::ObjectVersionChanged { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        };
+        return Ok(Some(ObservedLeaseState {
+            etag: meta.etag,
+            state: decode_lease_state(key, &bytes)?,
+        }));
     }
-    let bytes = if meta.size == 0 {
-        Arc::from([])
-    } else {
-        client.get_range(key, 0, meta.size, &meta.etag).await?
-    };
-    Ok(Some(ObservedLeaseState {
-        etag: meta.etag,
-        state: decode_lease_state(key, &bytes)?,
-    }))
+    Err(Error::lease_unavailable(format!(
+        "{key} changed during {OBJECT_LEASE_READ_MAX_ATTEMPTS} consecutive observations"
+    )))
 }
 
 pub(super) fn encode_lease_state(state: ObjectLeaseState) -> Result<Arc<[u8]>> {

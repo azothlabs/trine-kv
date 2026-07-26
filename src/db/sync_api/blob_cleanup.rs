@@ -8,7 +8,7 @@ use super::{
     NamedFlushInput, Ordering, Path, Result, Sequence, StorageObjectKind, Table, ValueRef,
     apply_blob_gc_indexes, blob, blob_gc_blob_records, blob_gc_table_write_options,
     cleanup_pending_obsolete_blob_files, cleanup_pending_obsolete_table_files,
-    delete_pending_obsolete_blob_files, lock_poisoned, referenced_blob_file_ids_from_manifest,
+    deletable_pending_blob_file_ids, delete_pending_obsolete_blob_files, lock_poisoned,
     remove_storage_files, table, take_deletable_obsolete_tables, usize_to_u64_saturating,
     write_blob_gc_replacement_tables,
 };

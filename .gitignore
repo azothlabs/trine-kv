@@ -1,4 +1,10 @@
 /target/
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/target/
+/verification/kani/target/
+/mutants.out*/
 .DS_Store
 __pycache__/
 *.py[cod]
+fuzz/target/

@@ -444,6 +444,9 @@ impl Db {
 
     pub(in crate::db) fn base_stats(&self) -> DbStats {
         DbStats {
+            fatal_write_stop: crate::db::FatalWriteStopReason::stats(
+                self.inner.fatal_write_stop_reason.load(Ordering::Acquire),
+            ),
             active_snapshots: self.inner.snapshots.active_count(),
             compaction_runs: self.inner.compaction_runs.load(Ordering::Acquire),
             compaction_input_tables: self.inner.compaction_input_tables.load(Ordering::Acquire),
@@ -647,6 +650,28 @@ impl Db {
         } else {
             Ok(())
         }
+    }
+
+    pub(in crate::db) fn stop_writes_after_fatal_error(
+        &self,
+        reason: crate::db::FatalWriteStopReason,
+        report: Error,
+    ) {
+        let first_stop = self
+            .inner
+            .fatal_write_stop_reason
+            .compare_exchange(
+                crate::db::FatalWriteStopReason::NONE,
+                reason.code(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        self.inner.closed.store(true, Ordering::Release);
+        if first_stop {
+            self.inner.maintenance.record_error(report);
+        }
+        self.inner.maintenance.shutdown();
     }
 
     pub(crate) fn begin_activity(&self) -> Result<crate::db::PublishActivityGuard<'_>> {

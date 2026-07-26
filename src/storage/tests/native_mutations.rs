@@ -395,7 +395,7 @@ fn native_file_backend_acquires_and_releases_writer_lease() {
     let error = backend
         .acquire_writer_lease_blocking(object.clone())
         .expect_err("existing writer lease fails closed");
-    assert!(error.to_string().contains("database lock is already held"));
+    assert!(matches!(error, Error::LeaseUnavailable { .. }));
 
     drop(lease);
     assert!(
@@ -439,7 +439,7 @@ fn native_file_backend_recovers_stale_writer_lease_marker() {
     let error = NativeFileBackend::new()
         .acquire_writer_lease_blocking(object.clone())
         .expect_err("live OS writer lease still blocks a second writer");
-    assert!(error.to_string().contains("database lock is already held"));
+    assert!(matches!(error, Error::LeaseUnavailable { .. }));
 
     drop(lease);
     assert!(

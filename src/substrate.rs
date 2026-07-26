@@ -1116,13 +1116,12 @@ fn object_wal_group_frame_bytes(
     accepts: &[ObjectWalAccept],
 ) -> Result<usize> {
     let empty_frame_bytes = wal::encode_batch_frame(Sequence::ZERO, &[])?.len();
-    let mut expected_sequence =
-        committed_sequence
-            .get()
-            .checked_add(1)
-            .ok_or_else(|| Error::Corruption {
-                message: "object WAL cannot advance past u64::MAX".to_owned(),
-            })?;
+    let mut expected_sequence = committed_sequence
+        .checked_next()
+        .ok_or_else(|| Error::Corruption {
+            message: "object WAL cannot advance past u64::MAX".to_owned(),
+        })?
+        .get();
     let mut total_bytes = 0usize;
     for (index, accept) in accepts.iter().enumerate() {
         let gap = accept
@@ -1186,6 +1185,19 @@ pub(crate) struct ObjectLeaseState {
     pub(crate) lease_expires_at_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LeaseStatePublish {
+    Publish(ObjectLeaseState),
+    AlreadyApplied,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseOwnerObservation {
+    CurrentOwner,
+    Fenced { current_epoch: u64 },
+    EpochRegression { current_epoch: u64 },
+}
+
 impl ObjectLeaseState {
     pub(crate) fn empty() -> Self {
         Self {
@@ -1199,6 +1211,77 @@ impl ObjectLeaseState {
 
     fn is_expired_at(&self, now_ms: u64) -> bool {
         self.lease_expires_at_ms <= now_ms
+    }
+
+    fn observe_owner(&self, current: &Self) -> LeaseOwnerObservation {
+        match current.epoch.cmp(&self.epoch) {
+            std::cmp::Ordering::Greater => LeaseOwnerObservation::Fenced {
+                current_epoch: current.epoch,
+            },
+            std::cmp::Ordering::Less => LeaseOwnerObservation::EpochRegression {
+                current_epoch: current.epoch,
+            },
+            std::cmp::Ordering::Equal if current.owner_id != self.owner_id => {
+                LeaseOwnerObservation::Fenced {
+                    current_epoch: current.epoch,
+                }
+            }
+            std::cmp::Ordering::Equal => LeaseOwnerObservation::CurrentOwner,
+        }
+    }
+
+    fn plan_renew(&self, lease_expires_at_ms: u64) -> Self {
+        Self {
+            lease_expires_at_ms,
+            ..self.clone()
+        }
+    }
+
+    fn plan_release(&self) -> Self {
+        Self {
+            lease_expires_at_ms: 0,
+            ..self.clone()
+        }
+    }
+
+    fn plan_commit_head(
+        &self,
+        sequence: Sequence,
+        wal_key: &str,
+        lease_expires_at_ms: u64,
+    ) -> Result<LeaseStatePublish> {
+        match self.committed_sequence.cmp(&sequence) {
+            std::cmp::Ordering::Greater => Err(Error::Corruption {
+                message: format!(
+                    "object WAL head advanced to sequence {} while publishing older sequence {}",
+                    self.committed_sequence.get(),
+                    sequence.get()
+                ),
+            }),
+            std::cmp::Ordering::Equal if self.current_wal_key.as_deref() == Some(wal_key) => {
+                Ok(LeaseStatePublish::AlreadyApplied)
+            }
+            std::cmp::Ordering::Equal => Err(Error::Corruption {
+                message: format!(
+                    "object WAL sequence {} names conflicting immutable segment heads",
+                    sequence.get()
+                ),
+            }),
+            std::cmp::Ordering::Less => Ok(LeaseStatePublish::Publish(Self {
+                committed_sequence: sequence,
+                current_wal_key: Some(wal_key.to_owned()),
+                lease_expires_at_ms,
+                ..self.clone()
+            })),
+        }
+    }
+
+    fn plan_rewrite_head(&self, current_wal_key: Option<String>, lease_expires_at_ms: u64) -> Self {
+        Self {
+            current_wal_key,
+            lease_expires_at_ms,
+            ..self.clone()
+        }
     }
 }
 
@@ -1244,8 +1327,8 @@ impl ObjectWriterLease {
                 ),
                 Some(meta) => {
                     if !meta.state.is_expired_at(now_ms) {
-                        return Err(Error::runtime_busy(format!(
-                            "object-store writer lease {key} is held until {}",
+                        return Err(Error::lease_unavailable(format!(
+                            "{key} is held until {}",
                             meta.state.lease_expires_at_ms
                         )));
                     }
@@ -1329,22 +1412,16 @@ impl ObjectWriterLease {
         let mut expected = self
             .state
             .committed_sequence
-            .get()
-            .checked_add(1)
-            .map(Sequence::new)
+            .checked_next()
             .ok_or_else(|| Error::Corruption {
                 message: "object WAL cannot advance past u64::MAX".to_owned(),
             })?;
         for accept in accepts {
             while expected < accept.sequence {
                 frames.extend_from_slice(&wal::encode_batch_frame(expected, &[])?);
-                expected = expected
-                    .get()
-                    .checked_add(1)
-                    .map(Sequence::new)
-                    .ok_or_else(|| Error::Corruption {
-                        message: "object WAL skipped sequence overflow".to_owned(),
-                    })?;
+                expected = expected.checked_next().ok_or_else(|| Error::Corruption {
+                    message: "object WAL skipped sequence overflow".to_owned(),
+                })?;
             }
             frames.extend_from_slice(&accept.frame);
             if expected != accept.sequence {
@@ -1386,35 +1463,34 @@ impl ObjectWriterLease {
                 current_epoch: 0,
             });
         };
-        if current.state.epoch > self.state.epoch {
-            return Err(Error::Fenced {
+        self.accept_observed(current)
+    }
+
+    fn accept_observed(&mut self, current: ObservedLeaseState) -> Result<()> {
+        match self.state.observe_owner(&current.state) {
+            LeaseOwnerObservation::CurrentOwner => {
+                self.etag = current.etag;
+                self.state = current.state;
+                Ok(())
+            }
+            LeaseOwnerObservation::Fenced { current_epoch } => Err(Error::Fenced {
                 held_epoch: self.state.epoch,
-                current_epoch: current.state.epoch,
-            });
-        }
-        if current.state.epoch < self.state.epoch {
-            return Err(Error::Corruption {
+                current_epoch,
+            }),
+            LeaseOwnerObservation::EpochRegression { current_epoch } => Err(Error::Corruption {
                 message: format!(
-                    "writer lease {} moved backward from epoch {} to {}",
-                    self.key, self.state.epoch, current.state.epoch
+                    "writer lease {} moved backward from epoch {} to {current_epoch}",
+                    self.key, self.state.epoch
                 ),
-            });
+            }),
         }
-        if current.state.owner_id != self.state.owner_id {
-            return Err(Error::Fenced {
-                held_epoch: self.state.epoch,
-                current_epoch: current.state.epoch,
-            });
-        }
-        self.etag = current.etag;
-        self.state = current.state;
-        Ok(())
     }
 
     async fn renew(&mut self) -> Result<()> {
         self.refresh_current().await?;
-        let mut next = self.state.clone();
-        next.lease_expires_at_ms = object_lease_deadline_ms(current_epoch_millis()?);
+        let next = self
+            .state
+            .plan_renew(object_lease_deadline_ms(current_epoch_millis()?));
         let publish = self
             .client
             .put_if(
@@ -1436,29 +1512,7 @@ impl ObjectWriterLease {
                         current_epoch: 0,
                     });
                 };
-                if current.state.epoch > self.state.epoch {
-                    return Err(Error::Fenced {
-                        held_epoch: self.state.epoch,
-                        current_epoch: current.state.epoch,
-                    });
-                }
-                if current.state.epoch < self.state.epoch {
-                    return Err(Error::Corruption {
-                        message: format!(
-                            "writer lease {} moved backward from epoch {} to {}",
-                            self.key, self.state.epoch, current.state.epoch
-                        ),
-                    });
-                }
-                if current.state.owner_id != self.state.owner_id {
-                    return Err(Error::Fenced {
-                        held_epoch: self.state.epoch,
-                        current_epoch: current.state.epoch,
-                    });
-                }
-                self.etag = current.etag;
-                self.state = current.state;
-                Ok(())
+                self.accept_observed(current)
             }
             Err(error) => {
                 if let Ok(Some(current)) = read_lease_state(&self.client, &self.key).await
@@ -1478,30 +1532,8 @@ impl ObjectWriterLease {
             let Some(current) = read_lease_state(&self.client, &self.key).await? else {
                 return Ok(());
             };
-            if current.state.epoch > self.state.epoch {
-                return Err(Error::Fenced {
-                    held_epoch: self.state.epoch,
-                    current_epoch: current.state.epoch,
-                });
-            }
-            if current.state.epoch < self.state.epoch {
-                return Err(Error::Corruption {
-                    message: format!(
-                        "writer lease {} moved backward from epoch {} to {}",
-                        self.key, self.state.epoch, current.state.epoch
-                    ),
-                });
-            }
-            if current.state.owner_id != self.state.owner_id {
-                return Err(Error::Fenced {
-                    held_epoch: self.state.epoch,
-                    current_epoch: current.state.epoch,
-                });
-            }
-            self.etag = current.etag;
-            self.state = current.state;
-            let mut next = self.state.clone();
-            next.lease_expires_at_ms = 0;
+            self.accept_observed(current)?;
+            let next = self.state.plan_release();
             let publish = self
                 .client
                 .put_if(
@@ -1533,33 +1565,14 @@ impl ObjectWriterLease {
 
     async fn publish_commit_head(&mut self, sequence: Sequence, wal_key: String) -> Result<()> {
         loop {
-            match self.state.committed_sequence.cmp(&sequence) {
-                std::cmp::Ordering::Greater => {
-                    return Err(Error::Corruption {
-                        message: format!(
-                            "object WAL head advanced to sequence {} while publishing older sequence {}",
-                            self.state.committed_sequence.get(),
-                            sequence.get()
-                        ),
-                    });
-                }
-                std::cmp::Ordering::Equal => {
-                    if self.state.current_wal_key.as_deref() == Some(wal_key.as_str()) {
-                        return Ok(());
-                    }
-                    return Err(Error::Corruption {
-                        message: format!(
-                            "object WAL sequence {} names conflicting immutable segment heads",
-                            sequence.get()
-                        ),
-                    });
-                }
-                std::cmp::Ordering::Less => {}
-            }
-            let mut next = self.state.clone();
-            next.committed_sequence = sequence;
-            next.current_wal_key = Some(wal_key.clone());
-            next.lease_expires_at_ms = object_lease_deadline_ms(current_epoch_millis()?);
+            let next = match self.state.plan_commit_head(
+                sequence,
+                &wal_key,
+                object_lease_deadline_ms(current_epoch_millis()?),
+            )? {
+                LeaseStatePublish::Publish(next) => next,
+                LeaseStatePublish::AlreadyApplied => return Ok(()),
+            };
             let publish = self
                 .client
                 .put_if(
@@ -1581,28 +1594,7 @@ impl ObjectWriterLease {
                             current_epoch: 0,
                         });
                     };
-                    if current.state.epoch > self.state.epoch {
-                        return Err(Error::Fenced {
-                            held_epoch: self.state.epoch,
-                            current_epoch: current.state.epoch,
-                        });
-                    }
-                    if current.state.epoch < self.state.epoch {
-                        return Err(Error::Corruption {
-                            message: format!(
-                                "writer lease {} moved backward from epoch {} to {}",
-                                self.key, self.state.epoch, current.state.epoch
-                            ),
-                        });
-                    }
-                    if current.state.owner_id != self.state.owner_id {
-                        return Err(Error::Fenced {
-                            held_epoch: self.state.epoch,
-                            current_epoch: current.state.epoch,
-                        });
-                    }
-                    self.etag = current.etag;
-                    self.state = current.state;
+                    self.accept_observed(current)?;
                 }
                 Err(error) => {
                     if let Ok(Some(current)) = read_lease_state(&self.client, &self.key).await
@@ -1633,9 +1625,8 @@ impl ObjectWriterLease {
             }
             let (batches, delete_keys) =
                 read_object_wal_chain(&self.client, db_path, &self.state, replay_floor).await?;
-            let mut next = self.state.clone();
-            if batches.is_empty() {
-                next.current_wal_key = None;
+            let current_wal_key = if batches.is_empty() {
+                None
             } else {
                 let rewritten = wal::encode_batches_after(&batches, replay_floor)?;
                 let last_sequence = batches.last().map_or(replay_floor, |batch| batch.sequence);
@@ -1648,9 +1639,12 @@ impl ObjectWriterLease {
                     &identity,
                 ))?;
                 put_immutable_object(&self.client, &next_key, Arc::from(segment)).await?;
-                next.current_wal_key = Some(next_key);
-            }
-            next.lease_expires_at_ms = object_lease_deadline_ms(current_epoch_millis()?);
+                Some(next_key)
+            };
+            let next = self.state.plan_rewrite_head(
+                current_wal_key,
+                object_lease_deadline_ms(current_epoch_millis()?),
+            );
             let publish = self
                 .client
                 .put_if(
@@ -1672,28 +1666,7 @@ impl ObjectWriterLease {
                             current_epoch: 0,
                         });
                     };
-                    if current.state.epoch > self.state.epoch {
-                        return Err(Error::Fenced {
-                            held_epoch: self.state.epoch,
-                            current_epoch: current.state.epoch,
-                        });
-                    }
-                    if current.state.epoch < self.state.epoch {
-                        return Err(Error::Corruption {
-                            message: format!(
-                                "writer lease {} moved backward from epoch {} to {}",
-                                self.key, self.state.epoch, current.state.epoch
-                            ),
-                        });
-                    }
-                    if current.state.owner_id != self.state.owner_id {
-                        return Err(Error::Fenced {
-                            held_epoch: self.state.epoch,
-                            current_epoch: current.state.epoch,
-                        });
-                    }
-                    self.etag = current.etag;
-                    self.state = current.state;
+                    self.accept_observed(current)?;
                 }
                 Err(error) => {
                     if let Ok(Some(current)) = read_lease_state(&self.client, &self.key).await
@@ -2016,5 +1989,14 @@ use lease_state::{
     current_epoch_millis, encode_lease_state, lock_poisoned_error, object_lease_deadline_ms,
     read_lease_state,
 };
+
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_decode_object_control(bytes: &[u8]) {
+    let _ = lease_state::decode_lease_state("fuzz/LOCK", bytes);
+    if let Ok((_previous, frames)) = decode_object_wal_segment("fuzz/wal", bytes) {
+        let _ = wal::decode_frames_after(frames, Sequence::ZERO);
+    }
+}
+
 #[cfg(test)]
 mod tests;

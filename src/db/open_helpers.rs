@@ -51,9 +51,7 @@ pub(super) fn validate_object_store_committed_wal_coverage(
     }
 
     let mut expected = replay_floor
-        .get()
-        .checked_add(1)
-        .map(Sequence::new)
+        .checked_next()
         .ok_or_else(|| Error::Corruption {
             message: "object-store WAL replay floor cannot advance past u64::MAX".to_owned(),
         })?;
@@ -70,14 +68,9 @@ pub(super) fn validate_object_store_committed_wal_coverage(
         if batch.sequence == committed_sequence {
             return Ok(());
         }
-        expected = expected
-            .get()
-            .checked_add(1)
-            .map(Sequence::new)
-            .ok_or_else(|| Error::Corruption {
-                message: "object-store WAL committed sequence cannot advance past u64::MAX"
-                    .to_owned(),
-            })?;
+        expected = expected.checked_next().ok_or_else(|| Error::Corruption {
+            message: "object-store WAL committed sequence cannot advance past u64::MAX".to_owned(),
+        })?;
     }
 
     Err(Error::Corruption {
@@ -625,6 +618,20 @@ pub(super) fn referenced_blob_file_ids_from_manifest(manifest: &ManifestState) -
         .collect()
 }
 
+/// Returns only pending blob files that no published table can still reach.
+///
+/// Every cleanup adapter uses this policy so native sync, native async, and
+/// browser paths cannot disagree about the reachability safety rule.
+pub(super) fn deletable_pending_blob_file_ids(manifest: &ManifestState) -> Vec<u64> {
+    let referenced = referenced_blob_file_ids_from_manifest(manifest);
+    manifest
+        .pending_blob_deletions()
+        .keys()
+        .copied()
+        .filter(|file_id| crate::invariants::gc_delete_allowed(true, referenced.contains(file_id)))
+        .collect()
+}
+
 pub(super) fn allowed_blob_file_ids_from_manifest(manifest: &ManifestState) -> BTreeSet<u64> {
     let mut file_ids = referenced_blob_file_ids_from_manifest(manifest);
     file_ids.extend(manifest.pending_blob_deletions().keys().copied());
@@ -970,17 +977,10 @@ pub(super) fn delete_pending_obsolete_blob_files<'manifest>(
         let manifest = manifest
             .lock()
             .map_err(|_| lock_poisoned("manifest store"))?;
-        let referenced_blob_ids = referenced_blob_file_ids_from_manifest(manifest.state());
         // Manifest metadata is the deletion authority. A pending entry that is
         // still referenced is inconsistent, so leave it on disk instead of
         // risking a read-visible blob file.
-        manifest
-            .state()
-            .pending_blob_deletions()
-            .keys()
-            .copied()
-            .filter(|file_id| !referenced_blob_ids.contains(file_id))
-            .collect::<Vec<_>>()
+        deletable_pending_blob_file_ids(manifest.state())
     };
     if pending_file_ids.is_empty() {
         return Ok((manifest, Vec::new()));

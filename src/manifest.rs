@@ -203,6 +203,48 @@ impl ManifestState {
         Ok(())
     }
 
+    /// Proves that `next` can be published directly after this state.
+    ///
+    /// These high-water marks are allocation and recovery fences, not ordinary
+    /// mutable fields. Keeping their transition rules here makes every backend
+    /// publish the same manifest state machine and prevents a future edit path
+    /// from accidentally moving a durable fence backwards.
+    fn validate_successor(&self, next: &Self) -> Result<()> {
+        next.validate_next_file_id()?;
+        next.validate_bucket_generations()?;
+
+        require_manifest_monotonic(
+            "WAL replay floor",
+            self.wal_replay_floor.get(),
+            next.wal_replay_floor.get(),
+        )?;
+        require_manifest_monotonic(
+            "file-id high-water mark",
+            self.next_file_id,
+            next.next_file_id,
+        )?;
+        require_manifest_monotonic(
+            "bucket-generation high-water mark",
+            self.next_bucket_generation,
+            next.next_bucket_generation,
+        )?;
+        require_manifest_monotonic("writer fencing epoch", self.writer_epoch, next.writer_epoch)?;
+
+        for (name, generation) in &self.bucket_generations {
+            if let Some(next_generation) = next.bucket_generations.get(name)
+                && next_generation != generation
+            {
+                return Err(Error::Corruption {
+                    message: format!(
+                        "manifest changed generation of retained bucket {name:?} from \
+                         {generation} to {next_generation}"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn insert_new_bucket(&mut self, name: String, options: BucketOptions) -> Result<()> {
         let generation = self.next_bucket_generation;
         self.next_bucket_generation =
@@ -220,6 +262,15 @@ impl ManifestState {
         self.bucket_generations.remove(name);
         self.tables.remove(name);
     }
+}
+
+fn require_manifest_monotonic(field: &str, current: u64, next: u64) -> Result<()> {
+    if !crate::invariants::durable_fence_advances(current, next) {
+        return Err(Error::Corruption {
+            message: format!("manifest {field} moved backward from {current} to {next}"),
+        });
+    }
+    Ok(())
 }
 
 /// A durably committed, single-use range of table/blob file identifiers.
@@ -447,6 +498,7 @@ impl<C: ObjectClient> ObjectManifestStore<C> {
         }
         // Stamp our epoch so a stale prior owner is fenced on its next publish.
         next.writer_epoch = self.writer_epoch;
+        self.state.validate_successor(&next)?;
         let bytes = encode_manifest_bytes(&next)?;
         let precondition = match &self.etag {
             Some(etag) => Precondition::IfMatch(etag.clone()),

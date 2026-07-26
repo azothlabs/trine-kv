@@ -334,6 +334,20 @@ pub enum Error {
     ReadOnly,
     /// The database handle is closed.
     Closed,
+    /// Another writer currently owns the durable database lease.
+    LeaseUnavailable {
+        /// Durable resource whose writer lease could not be acquired.
+        resource: String,
+    },
+    /// A conditional object read raced with replacement of that object.
+    ///
+    /// Mutable control-object readers may retry from fresh metadata. Readers of
+    /// immutable objects must treat this as evidence that their storage
+    /// contract was violated.
+    ObjectVersionChanged {
+        /// Object key whose observed entity tag was no longer current.
+        key: String,
+    },
     /// The configured runtime cannot accept the requested work now.
     RuntimeBusy {
         /// Human-readable runtime capacity detail.
@@ -399,6 +413,20 @@ impl Error {
         Self::RuntimeBusy {
             message: message.into(),
         }
+    }
+
+    /// Creates a typed single-writer ownership error.
+    #[must_use]
+    pub fn lease_unavailable(resource: impl Into<String>) -> Self {
+        Self::LeaseUnavailable {
+            resource: resource.into(),
+        }
+    }
+
+    /// Creates a typed conditional-read race for an object-store adapter.
+    #[must_use]
+    pub fn object_version_changed(key: impl Into<String>) -> Self {
+        Self::ObjectVersionChanged { key: key.into() }
     }
 
     /// Returns whether the manifest namespace already changed even though its
@@ -509,6 +537,15 @@ impl fmt::Display for Error {
             ),
             Self::ReadOnly => formatter.write_str("database is read-only"),
             Self::Closed => formatter.write_str("database is closed"),
+            Self::LeaseUnavailable { resource } => {
+                write!(formatter, "writer lease is unavailable: {resource}")
+            }
+            Self::ObjectVersionChanged { key } => {
+                write!(
+                    formatter,
+                    "object version changed during conditional read: {key}"
+                )
+            }
             Self::RuntimeBusy { message } => write!(formatter, "runtime busy: {message}"),
             Self::BucketMissing { name } => write!(formatter, "bucket is missing: {name}"),
             Self::InvalidOptions { message } => write!(formatter, "invalid options: {message}"),

@@ -441,6 +441,17 @@ pub(crate) struct UploadSessionState {
     updated_at_unix_ms: u64,
 }
 
+/// Storage action required to publish one validated upload-session revision.
+///
+/// The state object decides revision legality; storage adapters only translate
+/// this plan into create-only or compare-and-swap operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UploadStatePublish {
+    Create,
+    Replace { previous_revision: u64 },
+    AlreadyApplied,
+}
+
 impl UploadSessionState {
     pub(crate) fn initial(
         upload_id: UploadId,
@@ -582,6 +593,59 @@ impl UploadSessionState {
             && self.partial_len == other.partial_len
             && self.upload_token == other.upload_token
             && self.status == other.status
+    }
+
+    pub(crate) fn plan_publish_against(
+        &self,
+        current: Option<&Self>,
+    ) -> Result<UploadStatePublish> {
+        let Some(current) = current else {
+            return if self.revision == 0 {
+                Ok(UploadStatePublish::Create)
+            } else {
+                Err(Error::ContentUploadConflict {
+                    upload_id: self.upload_id.to_string(),
+                    expected_revision: self.revision,
+                    actual_revision: 0,
+                })
+            };
+        };
+        if current.logically_eq_ignoring_updated_at(self) {
+            return Ok(UploadStatePublish::AlreadyApplied);
+        }
+        let next_revision = current
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| Error::Corruption {
+                message: "content upload revision overflow".to_owned(),
+            })?;
+        if self.revision != next_revision {
+            return Err(Error::ContentUploadConflict {
+                upload_id: self.upload_id.to_string(),
+                expected_revision: self.revision,
+                actual_revision: current.revision,
+            });
+        }
+        Ok(UploadStatePublish::Replace {
+            previous_revision: current.revision,
+        })
+    }
+
+    pub(crate) fn require_retirement(self, retirement: UploadIdRetirement) -> Result<()> {
+        let allowed = matches!(
+            (retirement, self.status),
+            (UploadIdRetirement::Aborted, UploadSessionStatus::Aborting)
+                | (UploadIdRetirement::Sealed, UploadSessionStatus::Sealed(_))
+        );
+        if allowed {
+            Ok(())
+        } else {
+            Err(Error::ContentUploadConflict {
+                upload_id: self.upload_id.to_string(),
+                expected_revision: self.revision,
+                actual_revision: self.revision,
+            })
+        }
     }
 
     pub(crate) const fn maintenance_info(self) -> ContentUploadInfo {
@@ -1021,4 +1085,90 @@ pub(crate) fn decode_chunk(
         });
     }
     Ok(payload)
+}
+
+#[cfg(test)]
+mod transition_tests {
+    use std::time::Duration;
+
+    use super::{UploadIdRetirement, UploadSessionState, UploadSessionStatus, UploadStatePublish};
+    use crate::{
+        ContentAttachmentScope, ContentUploadOptions, Error, OwnerScopeId, StorageDomainId,
+        UploadId, UploadToken,
+    };
+
+    fn initial_state() -> UploadSessionState {
+        let options = ContentUploadOptions::new(
+            ContentAttachmentScope::new(
+                StorageDomainId::from_bytes([1; 16]),
+                OwnerScopeId::from_bytes([2; 16]),
+            ),
+            Duration::from_mins(1),
+        );
+        let mut token = [4; 33];
+        token[0] = 1;
+        let state = UploadSessionState {
+            upload_id: UploadId::from_bytes([3; 16]),
+            revision: 0,
+            options,
+            length: 0,
+            complete_chunks: 0,
+            partial_len: 0,
+            upload_token: UploadToken::from_bytes(token).expect("test token version is valid"),
+            status: UploadSessionStatus::Open,
+            updated_at_unix_ms: 1,
+        };
+        state.validate().expect("initial upload state is valid");
+        state
+    }
+
+    #[test]
+    fn upload_publish_transition_plans_create_retry_and_successor() {
+        let initial = initial_state();
+        assert_eq!(
+            initial
+                .plan_publish_against(None)
+                .expect("revision zero creates"),
+            UploadStatePublish::Create
+        );
+        assert_eq!(
+            initial
+                .plan_publish_against(Some(&initial.with_updated_at_unix_ms(7)))
+                .expect("logical retry is idempotent"),
+            UploadStatePublish::AlreadyApplied
+        );
+
+        let aborting = initial.into_aborting().expect("open may abort");
+        assert_eq!(
+            aborting
+                .plan_publish_against(Some(&initial))
+                .expect("one-step successor replaces"),
+            UploadStatePublish::Replace {
+                previous_revision: 0
+            }
+        );
+    }
+
+    #[test]
+    fn upload_publish_transition_rejects_gap_and_invalid_retirement() {
+        let initial = initial_state();
+        let gap = UploadSessionState {
+            revision: 2,
+            updated_at_unix_ms: 2,
+            ..initial
+        };
+        assert!(matches!(
+            gap.plan_publish_against(Some(&initial)),
+            Err(Error::ContentUploadConflict { .. })
+        ));
+        assert!(matches!(
+            initial.require_retirement(UploadIdRetirement::Aborted),
+            Err(Error::ContentUploadConflict { .. })
+        ));
+        initial
+            .into_aborting()
+            .expect("open may abort")
+            .require_retirement(UploadIdRetirement::Aborted)
+            .expect("aborting state may retire as aborted");
+    }
 }

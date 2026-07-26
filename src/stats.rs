@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Snapshot of live database, storage, maintenance, cache, and read-path stats.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DbStats {
+    /// Exactly-once automatic stop state and its causal classification.
+    pub fatal_write_stop: FatalWriteStopStats,
     /// Number of bucket states currently loaded.
     pub live_buckets: usize,
     /// Number of pinned snapshots.
@@ -150,6 +152,21 @@ pub struct DbStats {
     pub read_path: ReadPathStats,
     /// Filter hit, miss, and false-positive counters.
     pub filters: FilterStats,
+}
+
+/// Automatic write-stop state after a fatal integrity event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FatalWriteStopStats {
+    /// Whether this handle has stopped accepting writes after a fatal event.
+    pub stopped: bool,
+    /// Fatal automatic write stops. A handle records at most one stop.
+    pub total: u64,
+    /// Stops caused by an internal integrity violation.
+    pub corruption: u64,
+    /// Stops caused by loss of the writer fencing lease.
+    pub fencing: u64,
+    /// Stops where a durable mutation may already have happened.
+    pub outcome_unknown: u64,
 }
 
 /// Request count and total latency for one storage operation.

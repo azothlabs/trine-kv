@@ -320,14 +320,19 @@ pub enum FailOnCorruptionPolicy {
 /// use trine_kv::{Db, DbOptions, DurabilityMode};
 ///
 /// # fn main() -> trine_kv::Result<()> {
+/// # let path = std::env::temp_dir().join(format!("trine-doc-options-{}", std::process::id()));
+/// # let _ = std::fs::remove_dir_all(&path);
 /// let persistent = Db::open_sync(
-///     DbOptions::new("target/doc-example-options")
+///     DbOptions::new(&path)
 ///         .with_durability(DurabilityMode::SyncAll),
 /// )?;
 ///
 /// let memory = Db::open_sync(DbOptions::memory())?;
 /// assert_eq!(persistent.options().read_only, false);
 /// assert_eq!(memory.options().read_only, false);
+/// # persistent.close_sync();
+/// # drop(persistent);
+/// # std::fs::remove_dir_all(path)?;
 /// # Ok(())
 /// # }
 /// ```

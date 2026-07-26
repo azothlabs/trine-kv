@@ -90,12 +90,17 @@ impl Sequence {
     }
 
     #[must_use]
-    #[cfg(test)]
-    pub(crate) const fn next(self) -> Option<Self> {
-        match self.0.checked_add(1) {
+    pub(crate) const fn checked_next(self) -> Option<Self> {
+        match crate::invariants::checked_sequence_successor(self.0) {
             Some(value) => Some(Self(value)),
             None => None,
         }
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) const fn next(self) -> Option<Self> {
+        self.checked_next()
     }
 }
 

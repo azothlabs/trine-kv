@@ -5,8 +5,8 @@ use super::{
     CompactionTriggerStats, Db, Error, ManifestStore, Mutex, NamedCompactionInput,
     NamedCompactionOutput, NamedFlushInput, Ordering, Path, Result, Sequence, StorageObjectKind,
     Table, blob, cleanup_pending_obsolete_blob_files, cleanup_pending_obsolete_table_files,
-    delete_pending_obsolete_blob_files, lock_poisoned, referenced_blob_file_ids_from_manifest,
-    table, take_deletable_obsolete_tables, usize_to_u64_saturating,
+    deletable_pending_blob_file_ids, delete_pending_obsolete_blob_files, lock_poisoned, table,
+    take_deletable_obsolete_tables, usize_to_u64_saturating,
 };
 use crate::manifest::FileIdReservation;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -38,11 +38,12 @@ impl Db {
             "{operation} published durable state but failed to update local state: {error}; \
              database handle closed; reopen persistent databases to recover"
         );
-        self.inner.closed.store(true, Ordering::Release);
-        self.inner.maintenance.record_error(Error::Corruption {
-            message: message.clone(),
-        });
-        self.inner.maintenance.shutdown();
+        self.stop_writes_after_fatal_error(
+            crate::db::FatalWriteStopReason::Corruption,
+            Error::Corruption {
+                message: message.clone(),
+            },
+        );
         Error::Corruption { message }
     }
 
@@ -58,14 +59,15 @@ impl Db {
         if !error.manifest_was_published() {
             return error;
         }
-        self.inner.closed.store(true, Ordering::Release);
-        self.inner.maintenance.record_error(Error::Corruption {
-            message: format!(
-                "{operation} changed the manifest namespace but could not confirm directory \
+        self.stop_writes_after_fatal_error(
+            crate::db::FatalWriteStopReason::OutcomeUnknown,
+            Error::Corruption {
+                message: format!(
+                    "{operation} changed the manifest namespace but could not confirm directory \
                  durability; database handle closed and newly referenced files retained"
-            ),
-        });
-        self.inner.maintenance.shutdown();
+                ),
+            },
+        );
         error
     }
 
@@ -455,14 +457,7 @@ impl Db {
             let manifest = manifest
                 .lock()
                 .map_err(|_| lock_poisoned("manifest store"))?;
-            let referenced_blob_ids = referenced_blob_file_ids_from_manifest(manifest.state());
-            manifest
-                .state()
-                .pending_blob_deletions()
-                .keys()
-                .copied()
-                .filter(|file_id| !referenced_blob_ids.contains(file_id))
-                .collect::<Vec<_>>()
+            deletable_pending_blob_file_ids(manifest.state())
         };
         if pending_file_ids.is_empty() {
             return Ok((manifest, Vec::new()));
@@ -541,14 +536,7 @@ impl Db {
             let manifest = manifest
                 .lock()
                 .map_err(|_| lock_poisoned("manifest store"))?;
-            let referenced_blob_ids = referenced_blob_file_ids_from_manifest(manifest.state());
-            manifest
-                .state()
-                .pending_blob_deletions()
-                .keys()
-                .copied()
-                .filter(|file_id| !referenced_blob_ids.contains(file_id))
-                .collect::<Vec<_>>()
+            deletable_pending_blob_file_ids(manifest.state())
         };
         if pending_file_ids.is_empty() {
             return Ok((manifest, Vec::new()));

@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::*;
@@ -44,6 +44,7 @@ struct AppliedThenErroredClient {
     inner: Arc<dyn ObjectClient>,
     fail_put_if_call: usize,
     put_if_calls: AtomicUsize,
+    fail_get_range_once: AtomicBool,
 }
 
 impl std::fmt::Debug for AppliedThenErroredClient {
@@ -61,6 +62,16 @@ impl AppliedThenErroredClient {
             inner,
             fail_put_if_call,
             put_if_calls: AtomicUsize::new(0),
+            fail_get_range_once: AtomicBool::new(false),
+        }
+    }
+
+    fn with_one_version_change(inner: Arc<dyn ObjectClient>) -> Self {
+        Self {
+            inner,
+            fail_put_if_call: usize::MAX,
+            put_if_calls: AtomicUsize::new(0),
+            fail_get_range_once: AtomicBool::new(true),
         }
     }
 }
@@ -77,6 +88,10 @@ impl ObjectClient for AppliedThenErroredClient {
         len: u64,
         expected_etag: &ETag,
     ) -> ObjectFuture<'op, Arc<[u8]>> {
+        if self.fail_get_range_once.swap(false, Ordering::AcqRel) {
+            let key = key.to_owned();
+            return Box::pin(async move { Err(Error::object_version_changed(key)) });
+        }
         self.inner.get_range(key, offset, len, expected_etag)
     }
 
@@ -543,7 +558,7 @@ fn object_writer_lease_rejects_live_second_writer_and_takes_expired() {
 
     let error = poll_ready(ObjectWriterLease::acquire(Arc::clone(&client), "LOCK"))
         .expect_err("live lease rejects a second writer");
-    assert!(error.to_string().contains("writer lease LOCK is held"));
+    assert!(matches!(error, Error::LeaseUnavailable { .. }));
 
     let expired = ObjectLeaseState {
         epoch: first.epoch(),
@@ -570,5 +585,96 @@ fn object_writer_lease_rejects_live_second_writer_and_takes_expired() {
     assert_eq!(second.epoch(), 2);
     let error = poll_ready(ObjectWriterLease::acquire(client, "LOCK"))
         .expect_err("new live lease rejects another writer");
-    assert!(error.to_string().contains("writer lease LOCK is held"));
+    assert!(matches!(error, Error::LeaseUnavailable { .. }));
+}
+
+#[test]
+fn object_writer_lease_retries_a_version_change_during_observation() {
+    use crate::object_store::InMemoryObjectStore;
+
+    let inner: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let _first = poll_ready(ObjectWriterLease::acquire(Arc::clone(&inner), "LOCK"))
+        .expect("first writer acquires the lease");
+    let racing: Arc<dyn ObjectClient> =
+        Arc::new(AppliedThenErroredClient::with_one_version_change(inner));
+
+    let error = poll_ready(ObjectWriterLease::acquire(racing, "LOCK"))
+        .expect_err("the active first writer still owns the lease after a read race");
+    assert!(matches!(error, Error::LeaseUnavailable { .. }));
+}
+
+#[test]
+fn lease_owner_observation_distinguishes_takeover_and_regression() {
+    let held = ObjectLeaseState {
+        epoch: 7,
+        owner_id: [1; 16],
+        committed_sequence: Sequence::new(9),
+        current_wal_key: Some("wal-9".to_owned()),
+        lease_expires_at_ms: 100,
+    };
+
+    assert_eq!(
+        held.observe_owner(&held),
+        LeaseOwnerObservation::CurrentOwner
+    );
+    assert_eq!(
+        held.observe_owner(&ObjectLeaseState {
+            epoch: 8,
+            owner_id: [2; 16],
+            ..held.clone()
+        }),
+        LeaseOwnerObservation::Fenced { current_epoch: 8 }
+    );
+    assert_eq!(
+        held.observe_owner(&ObjectLeaseState {
+            owner_id: [2; 16],
+            ..held.clone()
+        }),
+        LeaseOwnerObservation::Fenced { current_epoch: 7 }
+    );
+    assert_eq!(
+        held.observe_owner(&ObjectLeaseState {
+            epoch: 6,
+            ..held.clone()
+        }),
+        LeaseOwnerObservation::EpochRegression { current_epoch: 6 }
+    );
+}
+
+#[test]
+fn lease_commit_head_transition_is_monotonic_and_idempotent() {
+    let state = ObjectLeaseState {
+        epoch: 3,
+        owner_id: [4; 16],
+        committed_sequence: Sequence::new(10),
+        current_wal_key: Some("wal-10".to_owned()),
+        lease_expires_at_ms: 100,
+    };
+
+    assert_eq!(
+        state
+            .plan_commit_head(Sequence::new(10), "wal-10", 200)
+            .expect("same head is idempotent"),
+        LeaseStatePublish::AlreadyApplied
+    );
+    assert!(matches!(
+        state.plan_commit_head(Sequence::new(10), "other", 200),
+        Err(Error::Corruption { .. })
+    ));
+    assert!(matches!(
+        state.plan_commit_head(Sequence::new(9), "wal-9", 200),
+        Err(Error::Corruption { .. })
+    ));
+
+    let LeaseStatePublish::Publish(next) = state
+        .plan_commit_head(Sequence::new(11), "wal-11", 200)
+        .expect("next head advances")
+    else {
+        panic!("advancing sequence requires a publish");
+    };
+    assert_eq!(next.committed_sequence, Sequence::new(11));
+    assert_eq!(next.current_wal_key.as_deref(), Some("wal-11"));
+    assert_eq!(next.lease_expires_at_ms, 200);
+    assert_eq!(next.epoch, state.epoch);
+    assert_eq!(next.owner_id, state.owner_id);
 }

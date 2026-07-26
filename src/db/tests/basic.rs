@@ -1,6 +1,26 @@
 use super::*;
 
 #[test]
+fn fatal_write_stop_reason_has_one_exact_public_classification() {
+    for (reason, corruption, fencing, outcome_unknown) in [
+        (FatalWriteStopReason::Corruption, 1, 0, 0),
+        (FatalWriteStopReason::Fenced, 0, 1, 0),
+        (FatalWriteStopReason::OutcomeUnknown, 0, 0, 1),
+    ] {
+        let stats = FatalWriteStopReason::stats(reason.code());
+        assert!(stats.stopped);
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.corruption, corruption);
+        assert_eq!(stats.fencing, fencing);
+        assert_eq!(stats.outcome_unknown, outcome_unknown);
+    }
+    assert_eq!(
+        FatalWriteStopReason::stats(FatalWriteStopReason::NONE),
+        crate::stats::FatalWriteStopStats::default()
+    );
+}
+
+#[test]
 fn snapshot_is_rejected_by_a_different_database_lineage() {
     let first = Db::open_sync(DbOptions::memory()).expect("open first db");
     let second = Db::open_sync(DbOptions::memory()).expect("open second db");
@@ -215,8 +235,8 @@ fn object_store_rejects_live_second_writer() {
     ))
     .expect_err("open b while A is live");
     assert!(
-        matches!(error, Error::RuntimeBusy { .. }),
-        "expected RuntimeBusy, got {error:?}"
+        matches!(error, Error::LeaseUnavailable { .. }),
+        "expected LeaseUnavailable, got {error:?}"
     );
 
     // A remains the legitimate owner and can keep writing.

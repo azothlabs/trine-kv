@@ -6,6 +6,7 @@ use std::{
 use crate::{
     bucket::Bucket,
     error::{Error, Result},
+    invariants::{SnapshotReachability, classify_snapshot_reachability},
     iterator::{Iter, LazyIter},
     types::{KeyRange, ReadVersion, Sequence, Value},
 };
@@ -54,17 +55,24 @@ impl SnapshotTracker {
             .unwrap_or(latest_sequence)
             .min(retained_floor);
         let requested = ReadVersion::from_sequence(read_sequence);
-        if read_sequence > latest_sequence {
-            return Err(Error::ReadVersionTooNew {
-                requested,
-                latest: ReadVersion::from_sequence(latest_sequence),
-            });
-        }
-        if read_sequence < oldest_retained {
-            return Err(Error::ReadVersionExpired {
-                requested,
-                oldest_retained: ReadVersion::from_sequence(oldest_retained),
-            });
+        match classify_snapshot_reachability(
+            read_sequence.get(),
+            oldest_retained.get(),
+            latest_sequence.get(),
+        ) {
+            SnapshotReachability::TooNew => {
+                return Err(Error::ReadVersionTooNew {
+                    requested,
+                    latest: ReadVersion::from_sequence(latest_sequence),
+                });
+            }
+            SnapshotReachability::TooOld => {
+                return Err(Error::ReadVersionExpired {
+                    requested,
+                    oldest_retained: ReadVersion::from_sequence(oldest_retained),
+                });
+            }
+            SnapshotReachability::Reachable => {}
         }
 
         *active.entry(read_sequence).or_default() += 1;

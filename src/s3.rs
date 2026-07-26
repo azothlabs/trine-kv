@@ -199,11 +199,7 @@ impl ObjectClient for ObjectStoreClient {
             let result = match self.store.get_opts(&path, options).await {
                 Ok(result) => result,
                 Err(OsError::Precondition { .. } | OsError::NotFound { .. }) => {
-                    return Err(Error::Corruption {
-                        message: format!(
-                            "object {key} changed or disappeared during immutable range reads"
-                        ),
-                    });
+                    return Err(Error::object_version_changed(key));
                 }
                 Err(error) => return Err(map_object_store_error(error)),
             };
@@ -390,7 +386,7 @@ impl ObjectClient for ObjectStoreClient {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use super::{ObjectStoreClient, S3ClientOptions};
@@ -400,6 +396,7 @@ mod tests {
         ETag, ObjectClient, ObjectFuture, ObjectListPage, ObjectMeta, Precondition, PutIf,
     };
     use crate::options::DbOptions;
+    use crate::runtime::RuntimeOptions;
 
     fn memory_client() -> ObjectStoreClient {
         ObjectStoreClient::new(Arc::new(object_store::memory::InMemory::new()))
@@ -770,18 +767,27 @@ mod tests {
     async fn wait_for_list_condition(
         client: &Arc<dyn ObjectClient>,
         prefix: &str,
+        expectation: &str,
         condition: impl Fn(&[ObjectMeta]) -> bool,
     ) -> Result<(Vec<ObjectMeta>, usize, Duration)> {
         let started = Instant::now();
+        let mut last_objects = Vec::new();
         for attempt in 1..=12 {
             let objects = client.list(prefix).await?;
             if condition(&objects) {
                 return Ok((objects, attempt, started.elapsed()));
             }
+            last_objects = objects;
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         Err(Error::Corruption {
-            message: format!("R2 listing for prefix {prefix} did not reach expected state"),
+            message: format!(
+                "R2 listing for prefix {prefix} did not reach {expectation}; last objects: {:?}",
+                last_objects
+                    .iter()
+                    .map(|object| object.key.as_str())
+                    .collect::<Vec<_>>()
+            ),
         })
     }
 
@@ -905,6 +911,18 @@ mod tests {
     }
 
     #[test]
+    fn adapter_range_read_reports_a_typed_version_change() {
+        let client = memory_client();
+        let stale = block_on(client.put("mutable", bytes(b"v1"))).expect("first version stores");
+        block_on(client.put("mutable", bytes(b"v2"))).expect("replacement stores");
+
+        assert!(matches!(
+            block_on(client.get_range("mutable", 0, 2, &stale)),
+            Err(Error::ObjectVersionChanged { .. })
+        ));
+    }
+
+    #[test]
     fn database_round_trips_over_object_store_adapter() {
         let client: Arc<dyn ObjectClient> = Arc::new(memory_client());
 
@@ -1007,6 +1025,41 @@ mod tests {
         }
     }
 
+    /// Confirms that a real provider preserves the public single-writer error
+    /// contract while the first writer's renewable lease is active.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires real R2 credentials; run with --features s3 -- --ignored"]
+    async fn s3_live_second_writer_reports_lease_unavailable() {
+        let Some(client) = live_s3_client() else {
+            return;
+        };
+        let prefix = unique_prefix("writer-ownership");
+        let first = Db::open_object_store_at(
+            Arc::clone(&client),
+            prefix.clone(),
+            DbOptions::object_store(),
+        )
+        .await
+        .expect("first R2 writer opens");
+        let second = Db::open_object_store_at(
+            Arc::clone(&client),
+            prefix.clone(),
+            DbOptions::object_store(),
+        )
+        .await;
+
+        first.close().await.expect("first R2 writer closes");
+        cleanup_prefix(&client, &prefix)
+            .await
+            .expect("writer-ownership prefix cleans up");
+
+        let error = second.expect_err("second R2 writer must not acquire an active lease");
+        assert!(
+            matches!(error, Error::LeaseUnavailable { .. }),
+            "expected LeaseUnavailable, observed {error:?}"
+        );
+    }
+
     /// Live R2 measurement/fault suite for the object-store compute/storage
     /// split. Ignored by default because it performs billable requests.
     #[tokio::test(flavor = "multi_thread")]
@@ -1068,11 +1121,13 @@ mod tests {
             "sequential durable writes should not exceed one WAL PUT plus one head CAS per write"
         );
 
-        let (objects_before_flush, wal_list_attempts, wal_list_latency) =
-            wait_for_list_condition(&client, prefix, |objects| {
-                WalObjectSummary::from_objects(objects).count == 1
-            })
-            .await?;
+        let (objects_before_flush, wal_list_attempts, wal_list_latency) = wait_for_list_condition(
+            &client,
+            prefix,
+            "one WAL segment per completed sequential write",
+            |objects| WalObjectSummary::from_objects(objects).count == WRITE_COUNT,
+        )
+        .await?;
         let wal_before_flush = WalObjectSummary::from_objects(&objects_before_flush);
 
         let refresh_counts_before = metrics.snapshot();
@@ -1093,7 +1148,7 @@ mod tests {
 
         let wal_cleanup_counts_before = metrics.snapshot();
         let (objects_after_flush, wal_cleanup_attempts, wal_cleanup_latency) =
-            wait_for_list_condition(&client, prefix, |objects| {
+            wait_for_list_condition(&client, prefix, "no WAL segment after flush", |objects| {
                 WalObjectSummary::from_objects(objects).count == 0
             })
             .await?;
@@ -1101,29 +1156,32 @@ mod tests {
         let wal_cleanup_counts = metrics.snapshot().delta_since(wal_cleanup_counts_before);
 
         let group_prefix = format!("{prefix}/group");
-        let group_writer = Db::open_object_store_at(
-            Arc::clone(&client),
-            group_prefix.clone(),
-            DbOptions::object_store(),
-        )
-        .await?;
+        let mut group_options = DbOptions::object_store();
+        group_options.runtime = RuntimeOptions::native_threads();
+        let group_writer =
+            Db::open_object_store_at(Arc::clone(&client), group_prefix.clone(), group_options)
+                .await?;
         let group_counts_before = metrics.snapshot();
-        let group_latency = run_concurrent_puts(&group_writer, GROUP_WRITE_COUNT, "group-key")?;
+        let group_latency =
+            run_concurrent_puts(&group_writer, GROUP_WRITE_COUNT, "group-key").await?;
         let group_counts = metrics.snapshot().delta_since(group_counts_before);
-        if group_counts.put != 1 || group_counts.put_if != 1 {
+        if group_counts.put != 0 || group_counts.put_if != 2 {
             return Err(Error::Corruption {
                 message: format!(
-                    "R2 group commit billing regression: expected 1 WAL PUT + 1 head CAS, got \
+                    "R2 group commit billing regression: expected 1 conditional WAL create + 1 \
+                     head CAS, got \
                      put={} put_if={}",
                     group_counts.put, group_counts.put_if
                 ),
             });
         }
-        let (group_objects, group_wal_attempts, group_wal_latency) =
-            wait_for_list_condition(&client, &group_prefix, |objects| {
-                WalObjectSummary::from_objects(objects).count == 1
-            })
-            .await?;
+        let (group_objects, group_wal_attempts, group_wal_latency) = wait_for_list_condition(
+            &client,
+            &group_prefix,
+            "one group-commit WAL segment",
+            |objects| WalObjectSummary::from_objects(objects).count == 1,
+        )
+        .await?;
         let group_wal = WalObjectSummary::from_objects(&group_objects);
         let group_reader = Db::open_object_store_at(
             Arc::clone(&client),
@@ -1233,9 +1291,12 @@ mod tests {
         }
         let cleanup_put_latency = cleanup_started.elapsed();
         let (cleanup_objects, cleanup_list_attempts, cleanup_list_latency) =
-            wait_for_list_condition(&client, &cleanup_prefix, |objects| {
-                objects.len() >= CLEANUP_OBJECTS
-            })
+            wait_for_list_condition(
+                &client,
+                &cleanup_prefix,
+                "all manual-cleanup fixtures",
+                |objects| objects.len() >= CLEANUP_OBJECTS,
+            )
             .await?;
 
         let delete_started = Instant::now();
@@ -1244,7 +1305,13 @@ mod tests {
         }
         let cleanup_delete_latency = delete_started.elapsed();
         let (_cleanup_after_delete, cleanup_delete_attempts, cleanup_delete_visible_latency) =
-            wait_for_list_condition(&client, &cleanup_prefix, <[ObjectMeta]>::is_empty).await?;
+            wait_for_list_condition(
+                &client,
+                &cleanup_prefix,
+                "an empty prefix after manual cleanup",
+                <[ObjectMeta]>::is_empty,
+            )
+            .await?;
         let manual_cleanup_counts = metrics.snapshot().delta_since(manual_cleanup_counts_before);
 
         eprintln!(
@@ -1334,30 +1401,17 @@ mod tests {
         Ok(())
     }
 
-    fn run_concurrent_puts(db: &Db, count: usize, key_prefix: &str) -> Result<Duration> {
-        tokio::task::block_in_place(|| {
-            let barrier = Arc::new(Barrier::new(count + 1));
-            let mut handles = Vec::with_capacity(count);
-            for index in 0..count {
-                let db = db.clone();
-                let barrier = Arc::clone(&barrier);
-                let key = format!("{key_prefix}-{index:02}").into_bytes();
-                let value = format!("value-{index:02}").into_bytes();
-                handles.push(std::thread::spawn(move || {
-                    barrier.wait();
-                    db.put_sync(key, value)
-                }));
-            }
-
-            let started = Instant::now();
-            barrier.wait();
-            for handle in handles {
-                let result = handle.join().map_err(|_| Error::Corruption {
-                    message: "R2 group commit worker thread panicked".to_owned(),
-                })?;
-                result?;
-            }
-            Ok(started.elapsed())
-        })
+    async fn run_concurrent_puts(db: &Db, count: usize, key_prefix: &str) -> Result<Duration> {
+        let writes = (0..count).map(|index| {
+            let db = db.clone();
+            let key = format!("{key_prefix}-{index:02}").into_bytes();
+            let value = format!("value-{index:02}").into_bytes();
+            async move { db.put(key, value).await }
+        });
+        let started = Instant::now();
+        for result in futures::future::join_all(writes).await {
+            result?;
+        }
+        Ok(started.elapsed())
     }
 }

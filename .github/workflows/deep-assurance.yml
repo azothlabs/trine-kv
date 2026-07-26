@@ -1,0 +1,161 @@
+name: Deep Assurance
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/deep-assurance.yml"
+      - "fuzz/**"
+      - "src/**"
+      - "tests/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+  schedule:
+    - cron: "41 2 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  ASSURANCE_NIGHTLY: nightly-2026-07-06
+
+jobs:
+  audit-and-coverage:
+    name: Dependency Audit and Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@f133eefe930d61f0d9371efd474daf0125ed3dd1 # 1.95.0
+        with:
+          components: llvm-tools-preview
+
+      - name: Install pinned assurance tools
+        run: |
+          cargo install cargo-audit --version 0.22.1 --locked
+          cargo install cargo-llvm-cov --version 0.8.7 --locked
+
+      - name: Check dependency advisories
+        run: cargo audit
+
+      - name: Enforce line coverage floor
+        run: >-
+          cargo llvm-cov --all-features --lib --tests
+          --fail-under-lines 75
+
+  model-check:
+    name: Kani Trusted Core
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@f133eefe930d61f0d9371efd474daf0125ed3dd1 # 1.95.0
+
+      - name: Install Kani
+        run: |
+          cargo install kani-verifier --version 0.67.0 --locked
+          cargo kani setup
+
+      - name: Prove trusted invariants
+        run: cargo kani --manifest-path verification/kani/Cargo.toml
+
+  interpreter:
+    name: Miri Trusted Transitions
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install nightly with Miri
+        run: |
+          rustup toolchain install "$ASSURANCE_NIGHTLY" --component miri
+          cargo +"$ASSURANCE_NIGHTLY" miri setup
+
+      - name: Check manifest transitions
+        run: cargo +"$ASSURANCE_NIGHTLY" miri test --lib manifest_successor
+
+      - name: Check lease transitions
+        run: cargo +"$ASSURANCE_NIGHTLY" miri test --lib lease_
+
+      - name: Check upload transitions
+        run: cargo +"$ASSURANCE_NIGHTLY" miri test --lib upload_publish_transition
+
+  fuzz-decoders:
+    name: Fuzz Decoder (${{ matrix.target }})
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - manifest
+          - wal
+          - table
+          - blob
+          - upload
+          - object_control
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install nightly
+        run: rustup toolchain install "$ASSURANCE_NIGHTLY"
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.12.0 --locked
+
+      - name: Exercise arbitrary and malformed inputs
+        run: >-
+          cargo +"$ASSURANCE_NIGHTLY" fuzz run ${{ matrix.target }}
+          -- -dict=fuzz/dictionaries/formats.dict -max_total_time=60
+
+  sanitizers:
+    name: ${{ matrix.sanitizer }} Sanitizer
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer:
+          - address
+          - thread
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install nightly
+        run: rustup toolchain install "$ASSURANCE_NIGHTLY"
+
+      - name: Run library suite under sanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
+          RUSTDOCFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
+        run: >-
+          cargo +"$ASSURANCE_NIGHTLY" test --lib --all-features
+          --target x86_64-unknown-linux-gnu
+
+  mutation:
+    name: Trusted-Core Mutation Check
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@f133eefe930d61f0d9371efd474daf0125ed3dd1 # 1.95.0
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --version 27.0.0 --locked
+
+      - name: Require invariant mutations to be detected
+        run: >-
+          cargo mutants -f src/invariants.rs -E 'proofs::'
+          --timeout 60 -- --lib invariants::tests

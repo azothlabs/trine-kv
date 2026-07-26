@@ -1,7 +1,7 @@
 use std::{
     future::Future,
     ops::Bound,
-    sync::{Arc, Mutex, atomic::Ordering},
+    sync::{Arc, Mutex},
 };
 #[cfg(not(target_os = "wasi"))]
 use std::{
@@ -678,11 +678,12 @@ impl Db {
              database handle closed; reopen persistent databases to replay WAL",
             slot.sequence().get()
         );
-        self.inner.closed.store(true, Ordering::Release);
-        self.inner.maintenance.record_error(Error::Corruption {
-            message: message.clone(),
-        });
-        self.inner.maintenance.shutdown();
+        self.stop_writes_after_fatal_error(
+            crate::db::FatalWriteStopReason::Corruption,
+            Error::Corruption {
+                message: message.clone(),
+            },
+        );
         Err(Error::Corruption { message })
     }
 
@@ -692,11 +693,12 @@ impl Db {
              database handle closed; reopen the database to determine the committed state",
             sequence.get()
         );
-        self.inner.closed.store(true, Ordering::Release);
-        self.inner.maintenance.record_error(Error::Corruption {
-            message: message.clone(),
-        });
-        self.inner.maintenance.shutdown();
+        self.stop_writes_after_fatal_error(
+            crate::db::FatalWriteStopReason::OutcomeUnknown,
+            Error::Corruption {
+                message: message.clone(),
+            },
+        );
         Error::Corruption { message }
     }
 

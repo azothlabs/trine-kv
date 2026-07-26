@@ -13,6 +13,8 @@ use super::{
     usize_to_u64_saturating,
 };
 
-mod background;
 mod compaction;
+mod coordinator;
 mod flush;
+mod reads;
+mod registry;

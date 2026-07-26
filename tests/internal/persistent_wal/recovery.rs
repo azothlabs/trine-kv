@@ -391,10 +391,11 @@ fn persistent_writer_open_fails_when_directory_lock_is_held() {
     let db = Db::open_sync(options.clone()).expect("first writer opens");
     assert!(lock_path.exists());
 
-    let message = corruption_message(
-        Db::open_sync(options.clone()).expect_err("second writer must fail closed"),
+    let error = Db::open_sync(options.clone()).expect_err("second writer must fail closed");
+    assert!(
+        matches!(error, Error::LeaseUnavailable { .. }),
+        "expected LeaseUnavailable, got {error:?}"
     );
-    assert!(message.contains("database lock is already held"));
     assert!(
         lock_path.exists(),
         "failed writer open should leave the owner lock untouched"

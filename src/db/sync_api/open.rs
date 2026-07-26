@@ -18,6 +18,9 @@ use super::{
     runtime, validate_common_options, validate_options, verify_object_client_contract_for_open,
     wal,
 };
+use std::sync::atomic::AtomicU8;
+
+use crate::db::FatalWriteStopReason;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::db::open_helpers::run_persistent_recovery_checks_async;
 use crate::object_store::{canonical_object_key, canonical_object_prefix};
@@ -201,6 +204,7 @@ impl Db {
                 user_handles: AtomicUsize::new(1),
                 commit_tracker: CommitTracker::new(Sequence::ZERO),
                 closed: AtomicBool::new(false),
+                fatal_write_stop_reason: AtomicU8::new(FatalWriteStopReason::NONE),
                 publish_barrier: PublishBarrier::new(),
                 object_wal_commit_order: Mutex::new(()),
                 memtable_publish_lock: Mutex::new(()),
@@ -283,11 +287,16 @@ impl Db {
     /// use trine_kv::{Db, DbOptions};
     ///
     /// # fn main() -> trine_kv::Result<()> {
-    /// let persistent = Db::open_sync("target/doc-example-open-sync")?;
+    /// # let path = std::env::temp_dir().join(format!("trine-doc-open-{}", std::process::id()));
+    /// # let _ = std::fs::remove_dir_all(&path);
+    /// let persistent = Db::open_sync(&path)?;
     /// persistent.put_sync(b"k", b"v")?;
     ///
     /// let memory = Db::open_sync(DbOptions::memory())?;
     /// memory.put_sync(b"session", b"only in memory")?;
+    /// # persistent.close_sync();
+    /// # drop(persistent);
+    /// # std::fs::remove_dir_all(path)?;
     /// # Ok(())
     /// # }
     /// ```

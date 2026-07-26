@@ -11,9 +11,9 @@ use std::{
 };
 
 use super::{
-    BACKGROUND_MAINTENANCE_PROGRESS_WAIT, CompactionReservation, Db, Error, MaintenanceBudget,
-    MaintenanceCoordinator, compaction_reservations_conflict, record_maintenance_success,
-    shutdown_background_workers,
+    BACKGROUND_MAINTENANCE_PROGRESS_WAIT, CompactionReservation, Db, Error, FatalWriteStopReason,
+    MaintenanceBudget, MaintenanceCoordinator, compaction_reservations_conflict,
+    record_maintenance_success, shutdown_background_workers,
 };
 use crate::{
     bucket::DEFAULT_BUCKET_NAME,

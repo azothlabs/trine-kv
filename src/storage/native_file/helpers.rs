@@ -368,6 +368,12 @@ pub(in crate::storage) fn append_native_file_object(
     #[cfg(target_os = "wasi")]
     file.seek(SeekFrom::End(0))?;
     file.write_all(bytes)?;
+    #[cfg(test)]
+    crate::storage::fault_injection::check_after(
+        crate::storage::fault_injection::StorageFaultPoint::WalAppend,
+        Some(object.kind()),
+        object.path(),
+    )?;
     persist_native_append_file(file, object, durability)
 }
 
@@ -389,7 +395,7 @@ pub(in crate::storage) fn persist_native_append_file(
         object.path(),
     )?;
 
-    match durability {
+    let result = match durability {
         DurabilityMode::Buffered => Ok(()),
         DurabilityMode::Flush => {
             file.flush()?;
@@ -398,7 +404,15 @@ pub(in crate::storage) fn persist_native_append_file(
         DurabilityMode::SyncData | DurabilityMode::SyncAll | DurabilityMode::SyncAllStrict => {
             crate::durability::sync_file_for_durability(file, durability)
         }
-    }
+    };
+    result?;
+    #[cfg(test)]
+    crate::storage::fault_injection::check_after(
+        crate::storage::fault_injection::StorageFaultPoint::WalPersist,
+        Some(object.kind()),
+        object.path(),
+    )?;
+    Ok(())
 }
 
 pub(in crate::storage) fn rewrite_native_file_wal(
@@ -424,6 +438,12 @@ pub(in crate::storage) fn rewrite_native_file_wal(
         object.path(),
     )?;
     fs::rename(&tmp_path, &path)?;
+    #[cfg(test)]
+    crate::storage::fault_injection::check_after(
+        crate::storage::fault_injection::StorageFaultPoint::WalRewritePublish,
+        Some(object.kind()),
+        object.path(),
+    )?;
     if requires_parent_dir_sync_after_rename(durability) {
         sync_native_file_parent_directory_after_rename(&path)?;
     }
@@ -451,9 +471,9 @@ pub(in crate::storage) fn acquire_native_file_writer_lease(
     if fs4::fs_std::FileExt::try_lock_exclusive(&file).map_err(Error::Io)? {
         Ok(file)
     } else {
-        Err(Error::Corruption {
-            message: format!("database lock is already held: {}", object.path().display()),
-        })
+        Err(Error::lease_unavailable(
+            object.path().display().to_string(),
+        ))
     }
 }
 
@@ -474,9 +494,7 @@ pub(in crate::storage) fn acquire_native_file_writer_lease(
         .open(object.path())
         .map_err(|error| {
             if error.kind() == io::ErrorKind::AlreadyExists {
-                Error::Corruption {
-                    message: format!("database lock is already held: {}", object.path().display()),
-                }
+                Error::lease_unavailable(object.path().display().to_string())
             } else {
                 Error::Io(error)
             }
@@ -609,7 +627,14 @@ pub(in crate::storage) fn sync_native_file_directory_after_renames(
         directory.path(),
     )?;
 
-    sync_dir_after_renames(directory.path())
+    sync_dir_after_renames(directory.path())?;
+    #[cfg(test)]
+    crate::storage::fault_injection::check_after(
+        crate::storage::fault_injection::StorageFaultPoint::DirectorySync,
+        None,
+        directory.path(),
+    )?;
+    Ok(())
 }
 
 pub(in crate::storage) fn sync_native_file_parent_directory_after_rename(
@@ -624,7 +649,14 @@ pub(in crate::storage) fn sync_native_file_parent_directory_after_rename(
         path,
     )?;
 
-    sync_parent_dir_after_rename(path)
+    sync_parent_dir_after_rename(path)?;
+    #[cfg(test)]
+    crate::storage::fault_injection::check_after(
+        crate::storage::fault_injection::StorageFaultPoint::DirectorySync,
+        None,
+        path,
+    )?;
+    Ok(())
 }
 
 pub(in crate::storage) fn read_current_manifest_from_native_file(
@@ -708,6 +740,12 @@ pub(in crate::storage) fn write_native_file_object(
         object.path(),
     )?;
     fs::rename(&tmp_path, &path)?;
+    #[cfg(test)]
+    crate::storage::fault_injection::check_after(
+        crate::storage::fault_injection::StorageFaultPoint::ObjectPublish,
+        Some(object.kind()),
+        object.path(),
+    )?;
     if requires_parent_dir_sync_after_rename(durability) {
         sync_native_file_parent_directory_after_rename(&path)?;
     }
@@ -729,7 +767,14 @@ pub(in crate::storage) fn delete_native_file_object(object: &StorageObjectId) ->
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(Error::Io(error)),
-    }
+    }?;
+    #[cfg(test)]
+    crate::storage::fault_injection::check_after(
+        crate::storage::fault_injection::StorageFaultPoint::ObjectDelete,
+        Some(object.kind()),
+        object.path(),
+    )?;
+    Ok(())
 }
 
 pub(in crate::storage) fn publish_manifest_to_native_file(
@@ -750,9 +795,19 @@ pub(in crate::storage) fn publish_manifest_to_native_file(
         object.path(),
     )?;
     fs::rename(&tmp_path, &path)?;
-    if requires_parent_dir_sync_after_rename(durability)
-        && let Err(error) = sync_published_manifest_parent(object, &path)
-    {
+    let confirm_publish = || -> Result<()> {
+        #[cfg(test)]
+        crate::storage::fault_injection::check_after(
+            crate::storage::fault_injection::StorageFaultPoint::ManifestPublish,
+            Some(object.kind()),
+            object.path(),
+        )?;
+        if requires_parent_dir_sync_after_rename(durability) {
+            sync_published_manifest_parent(object, &path)?;
+        }
+        Ok(())
+    };
+    if let Err(error) = confirm_publish() {
         let source = match error {
             Error::Io(source) => source,
             other => io::Error::other(other),
@@ -772,7 +827,14 @@ fn sync_published_manifest_parent(object: &StorageObjectId, path: &Path) -> Resu
     )?;
     #[cfg(not(test))]
     let _ = object;
-    sync_native_file_parent_directory_after_rename(path)
+    sync_native_file_parent_directory_after_rename(path)?;
+    #[cfg(test)]
+    crate::storage::fault_injection::check_after(
+        crate::storage::fault_injection::StorageFaultPoint::ManifestDirectorySync,
+        Some(object.kind()),
+        object.path(),
+    )?;
+    Ok(())
 }
 
 pub(in crate::storage) fn sync_native_file_for_durability(

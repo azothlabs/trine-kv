@@ -1,0 +1,15 @@
+[package]
+name = "trine-kv-invariants-proof"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.93"
+publish = false
+
+[lib]
+path = "../../src/invariants.rs"
+
+[workspace]
+
+[lints.rust]
+unsafe_code = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

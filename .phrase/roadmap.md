@@ -31,7 +31,7 @@ implementation.
 
 ### Phase 2: Scaffold Rust Crate
 
-**Status**: Complete
+**Status**: In Progress
 
 **Goal**: Create the Rust crate and module skeleton that matches the accepted
 spec.
@@ -4845,3 +4845,47 @@ requires HEAD, GET, and LIST absence; MinIO and real R2 full lifecycles pass.
 **Major Out Of Scope**: version traversal, delete-marker cleanup, bypassing
 provider retention or locks, implicit endpoint qualification, browser/WASI
 reclamation, and background deletion.
+
+### Phase 194: Architecture Clarity And Layered Assurance
+
+**Status**: Complete
+
+**Goal**: Make storage, maintenance, and durable state transitions explain
+their own invariants through module boundaries and explicit transition APIs,
+then attach repeatable machine evidence to those invariants.
+
+**Entry Condition**: The full-code audit and its remediation are complete, and
+the remaining work is architectural debt plus residual-risk reduction rather
+than a known data-correctness defect.
+
+**Acceptance Gate**:
+
+- Object storage, content storage, and maintenance code are divided by owned
+  responsibility; sync, async, browser, native-file, and object-store adapters
+  reuse one semantic decision layer instead of duplicating state rules.
+- Manifest, WAL, upload, and lease state changes expose explicit legal
+  transitions, idempotent outcomes, and irreversible-I/O plans.
+- Executable invariant checks cover commit sequence continuity, manifest
+  monotonicity, immutable objects, snapshot reachability, lease fencing, and
+  reachability-safe garbage collection.
+- Property/reference tests, bounded concurrency schedules, persistent-format
+  fuzz targets, and a systematic per-I/O fault matrix are runnable locally and
+  in CI at an appropriate cadence.
+- Miri, sanitizers, dependency advisories, mutation testing, and coverage have
+  documented commands, machine-readable outputs, and CI gates or scheduled
+  evidence jobs.
+- Requirement-traced Gherkin features cover durable commit, namespace,
+  snapshot, checkpoint, transaction, recovery, maintenance, cursor, writer
+  ownership, and immutable-content lifecycles. One expectation corpus passes
+  unchanged against native storage and a real object-store provider; volatile
+  memory mode is not used as durability evidence.
+- Architecture and assurance documents state exactly what is proved, tested,
+  assumed, or left to the host/provider.
+- Default and all-feature tests, strict Clippy, Rustdoc/doctests, supported
+  WASM checks, formatting, and diff checks pass.
+
+**Major Out Of Scope**:
+
+- New end-user database features, new storage formats, weakened durability,
+  multi-primary writers, provider retention bypass, publishing, tagging, or
+  pushing changes.

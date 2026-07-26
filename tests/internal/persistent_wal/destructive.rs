@@ -1,7 +1,6 @@
 use std::{
     env,
     fs::OpenOptions as StdOpenOptions,
-    io::Write as _,
     sync::{Arc, Mutex, OnceLock},
 };
 
@@ -9,7 +8,7 @@ use super::*;
 use crate::storage::{
     BlockingStorageObjectDeleteBackend, BlockingStorageWalRewriteBackend, NativeFileBackend,
     StorageObjectId, StorageObjectKind,
-    fault_injection::{StorageFaultGuard, StorageFaultPoint},
+    fault_injection::{StorageFaultGuard, StorageFaultPhase, StorageFaultPoint},
 };
 
 static REPORT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -144,6 +143,50 @@ fn destructive_wal_persist_failure_has_an_explicit_unknown_commit_result() {
 }
 
 #[test]
+fn destructive_wal_append_after_boundary_reports_only_an_unknown_exact_result() {
+    let path = temp_db_path("destructive-wal-append-after");
+    let options = destructive_options(&path);
+    let db = Db::open_sync(options.clone()).expect("database opens");
+
+    let fault = StorageFaultGuard::install_at(
+        &path,
+        StorageFaultPoint::WalAppend,
+        StorageFaultPhase::After,
+        Some(StorageObjectKind::Wal),
+        1,
+    );
+    let error = db
+        .put_sync(b"uncertain", b"complete-frame")
+        .expect_err("post-append boundary reaches caller");
+    assert_unknown_wal_failure(&error, StorageFaultPoint::WalAppend);
+    let health = db.stats();
+    assert!(health.fatal_write_stop.stopped);
+    assert_eq!(health.fatal_write_stop.total, 1);
+    assert_eq!(health.fatal_write_stop.outcome_unknown, 1);
+    assert_eq!(health.fatal_write_stop.corruption, 0);
+    assert_eq!(health.fatal_write_stop.fencing, 0);
+    assert_eq!(fault.calls(), 1);
+    drop(fault);
+    db.close_sync();
+    drop(db);
+
+    let reopened = Db::open_sync(options).expect("database reopens after unknown append result");
+    let observed = reopened
+        .get_sync(b"uncertain")
+        .expect("uncertain exact value reads");
+    assert!(
+        observed.is_none() || observed == Some(b"complete-frame".to_vec()),
+        "recovery may retain or discard the complete frame, but cannot invent bytes"
+    );
+    reopened.close_sync();
+    fs::remove_dir_all(path).expect("cleanup destructive database");
+    record_destructive_result(
+        "wal_append_after_write",
+        "unknown_exact_result_reopened_cleanly",
+    );
+}
+
+#[test]
 fn destructive_table_publish_failure_fails_closed_then_repairs_safe_temp() {
     let path = temp_db_path("destructive-table-publish");
     let options = destructive_options(&path);
@@ -208,6 +251,37 @@ fn destructive_manifest_publish_failure_requires_explicit_safe_temp_repair() {
     db.close_sync();
     fs::remove_dir_all(path).expect("cleanup destructive database");
     record_destructive_result("manifest_publish_before_rename", "failed_closed_and_repaired");
+}
+
+#[test]
+fn destructive_manifest_after_publish_is_reported_as_durability_unknown() {
+    let path = temp_db_path("destructive-manifest-after-publish");
+    let options = destructive_options(&path);
+    let fault = StorageFaultGuard::install_at(
+        &path,
+        StorageFaultPoint::ManifestPublish,
+        StorageFaultPhase::After,
+        Some(StorageObjectKind::Manifest),
+        1,
+    );
+    let error =
+        Db::open_sync(options.clone()).expect_err("post-publish boundary reaches the caller");
+    assert!(matches!(
+        error,
+        Error::ManifestPublishedDurabilityUnknown { .. }
+    ));
+    assert_eq!(fault.calls(), 1);
+    drop(fault);
+
+    let db = Db::open_sync(options).expect("published manifest is recoverable");
+    db.put_sync(b"after", b"usable")
+        .expect("reopened database accepts writes");
+    db.close_sync();
+    fs::remove_dir_all(path).expect("cleanup destructive database");
+    record_destructive_result(
+        "manifest_publish_after_rename",
+        "durability_unknown_and_recoverable",
+    );
 }
 
 #[test]
@@ -290,4 +364,58 @@ fn destructive_wal_rewrite_and_delete_faults_preserve_existing_files() {
 
     fs::remove_dir_all(path).expect("cleanup destructive root");
     record_destructive_result("wal_rewrite_and_delete", "atomic_retry_succeeded");
+}
+
+#[test]
+fn destructive_after_boundaries_expose_applied_rewrite_and_delete() {
+    let path = temp_db_path("destructive-storage-after-boundaries");
+    fs::create_dir_all(&path).expect("create destructive root");
+    let wal_path = path.join("trine.wal");
+    let wal_temp = path.join("trine.wal.tmp");
+    fs::write(&wal_path, b"old").expect("write original WAL");
+    let wal = StorageObjectId::native_file(StorageObjectKind::Wal, &wal_path);
+    let temporary = StorageObjectId::native_file(StorageObjectKind::Wal, &wal_temp);
+    let backend = NativeFileBackend::new();
+
+    let rewrite_fault = StorageFaultGuard::install_at(
+        &path,
+        StorageFaultPoint::WalRewritePublish,
+        StorageFaultPhase::After,
+        Some(StorageObjectKind::Wal),
+        1,
+    );
+    let error = backend
+        .rewrite_wal_blocking(
+            wal.clone(),
+            temporary,
+            Arc::from(b"new".as_slice()),
+            DurabilityMode::SyncAll,
+        )
+        .expect_err("post-rewrite boundary reaches caller");
+    assert_injected_io(&error, StorageFaultPoint::WalRewritePublish);
+    assert_eq!(fs::read(&wal_path).expect("published WAL reads"), b"new");
+    drop(rewrite_fault);
+
+    let delete_fault = StorageFaultGuard::install_at(
+        &path,
+        StorageFaultPoint::ObjectDelete,
+        StorageFaultPhase::After,
+        Some(StorageObjectKind::Wal),
+        1,
+    );
+    let error = backend
+        .delete_object_blocking(wal.clone())
+        .expect_err("post-delete boundary reaches caller");
+    assert_injected_io(&error, StorageFaultPoint::ObjectDelete);
+    assert!(!wal_path.exists(), "delete completed before response loss");
+    drop(delete_fault);
+    backend
+        .delete_object_blocking(wal)
+        .expect("idempotent delete retry succeeds");
+
+    fs::remove_dir_all(path).expect("cleanup destructive root");
+    record_destructive_result(
+        "wal_rewrite_and_delete_after",
+        "applied_outcomes_are_idempotent",
+    );
 }

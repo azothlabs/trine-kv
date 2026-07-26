@@ -1,49 +1,77 @@
 # Current Phase
 
-## Rust 1.95 toolchain contract
+## Architecture clarity and layered assurance
 
 **Status:** Complete.
 
 ### Goal
 
-- Make Rust 1.95 the real minimum compiler across package metadata, local
-  development, CI, publishing, production evidence, release docs, and the
-  dependency graph.
-- Move to the `0.6` release line because an MSRV increase is a compatibility
-  break for Rust 1.85 users.
+- Remove duplicated durable-state decisions from platform adapters.
+- Divide object storage, content storage, and maintenance by owned
+  responsibility.
+- Make legal durable transitions and irreversible I/O plans explicit.
+- Turn the six critical engine invariants into executable evidence.
+- Add complete Gherkin acceptance coverage and repeatable deep-verification
+  gates.
 
-### Implemented boundary
+### Evidence collected
 
-- Pin the repository toolchain and immutable GitHub Actions reference to Rust
-  1.95.0.
-- Remove the separate Rust 1.88 wasm-bindgen installation path.
-- Upgrade native platform-I/O dependencies to compio 0.19 and remove the
-  transitive unmaintained `paste` macro.
-- Update active dependency examples, release policy, changelog, and drift
-  checks.
-- Run the full Rust 1.95 verification gate and record evidence.
+1. Native all-target/all-feature suite: every executed target passed; provider
+   live tests remain intentionally ignored in the default run.
+2. One requirement-driven Gherkin corpus contains 8 features, 30 scenarios,
+   and 167 steps. It passed unchanged against isolated native directories and
+   isolated prefixes in real R2.
+3. Strict native and browser Clippy, WASI warning-denied check, Rustdoc, 31
+   doctests, formatting, documentation drift, workflow YAML, and diff hygiene
+   passed.
+4. Coverage gate passed at 77.22% lines; dependency audit scanned 368 locked
+   dependencies with no advisory.
+5. Kani verified 5/5 harnesses; focused Miri transition checks passed; Loom
+   enumerated the small commit/waiter schedule.
+6. Six decoder fuzz targets completed local short campaigns without a crash;
+   the scheduled workflow extends each campaign.
+7. Mutation check evaluated 20 trusted-core variants: 19 were detected and one
+   was compile-invalid, leaving no surviving variant.
 
-### Discovery result
+### Residual scope
 
-- Compio 0.19.1 requires both the `MaybeUninit` slice API and `cfg_select!`;
-  Rust 1.95 is the first stable toolchain satisfying the full dependency graph.
-- The official 0.19 dependency family replaces `paste` with maintained macros,
-  so no private fork or compiler escape hatch is required.
+- Real R2 is qualified for the acceptance and request-measurement suites. Other
+  live providers, real browser/WASI hosts, kernel/filesystem/controller
+  failures, and hardware power loss remain deployment evidence.
+- The native 17-boundary catalog covers every represented atomic hook, not
+  hidden syscalls inside dependencies or remote provider internals.
+- The guarantee layers reduce residual risk and make it observable; they do not
+  create a logically valid claim that unknown defects are impossible.
+
+### Backend boundary receipt
+
+- Trine operations: immutable object create/read/range/list, conditional
+  metadata publish, verified delete, native/browser manifest publish, WAL
+  append/persist/rewrite, content chunk/session mutation.
+- Owned interfaces: `ObjectClient`, storage read/write/delete/list traits,
+  manifest stores, durability substrate, and explicit transition plans.
+- Backends: native filesystem, in-memory object client, S3-compatible object
+  client, WASI host filesystem, and browser OPFS.
+- Known limits: provider conditionals and deletion visibility remain external
+  assumptions and must be qualified; browser/WASI runners are host-provided;
+  power-loss guarantees cannot exceed the selected durability mode.
+- Leak-check scope: temporary objects, retired upload chunks, obsolete
+  table/blob files, queued WAL completions, and publish guards.
+- Verification gate: focused transition/property tests, Gherkin acceptance,
+  systematic fault matrix, all-feature tests, strict Clippy, Rustdoc/doctests,
+  supported WASM checks, and deep scheduled tools.
 
 ### Acceptance gate
 
-- Rust 1.95 native all-target/all-feature tests, strict Clippy, Rustdoc,
-  doctests, eight examples, forced-exit recovery, mixed-load recovery, and six
-  destructive fault tests pass.
-- `wasm32-wasip1` strict compilation and seven persistence tests pass.
-  Browser all-feature check/Clippy and 20 Chrome OPFS/Worker tests pass.
-- Package content verification, `cargo package --locked`, and
-  `cargo publish --dry-run --locked` pass for `trine-kv 0.6.0`.
-- The freshly updated RustSec database reports zero vulnerabilities and zero
-  warnings; `paste` is absent from the dependency graph.
-- Seven script tests, documentation drift, formatting, and diff checks pass.
+- Gherkin scenarios are derived from stable public requirements, use only
+  durable backends, and run with identical expected outcomes on native storage
+  and real R2.
+- No public behavior, storage format, MVCC rule, or durability guarantee
+  changes silently.
+- Architecture documentation identifies the trusted core and adapter
+  assumptions.
 
 ### Out of scope
 
-- Rust beyond 1.95, private dependency forks, publishing, tagging,
-  storage-format changes, and new public features.
+- New end-user features, weakened safety defaults, publishing, tagging, or
+  pushing changes.

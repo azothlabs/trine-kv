@@ -736,6 +736,69 @@ fn object_store_manifest_rejects_sync_publish() {
     );
 }
 
+#[test]
+fn manifest_successor_rejects_every_regressing_durable_fence() {
+    let mut current = ManifestState::empty();
+    current.wal_replay_floor = crate::types::Sequence::new(9);
+    current.next_file_id = 12;
+    current.next_bucket_generation = 7;
+    current.writer_epoch = 4;
+
+    let regressions = [
+        {
+            let mut next = current.clone();
+            next.wal_replay_floor = crate::types::Sequence::new(8);
+            next
+        },
+        {
+            let mut next = current.clone();
+            next.next_file_id = 11;
+            next
+        },
+        {
+            let mut next = current.clone();
+            next.next_bucket_generation = 6;
+            next
+        },
+        {
+            let mut next = current.clone();
+            next.writer_epoch = 3;
+            next
+        },
+    ];
+
+    for next in regressions {
+        assert!(
+            matches!(
+                current.validate_successor(&next),
+                Err(crate::Error::Corruption { .. })
+            ),
+            "regressing successor must be rejected: {next:?}"
+        );
+    }
+}
+
+#[test]
+fn manifest_successor_preserves_retained_bucket_identity() {
+    let mut current = ManifestState::empty();
+    current
+        .insert_new_bucket("accounts".to_owned(), BucketOptions::default())
+        .expect("bucket inserts");
+
+    let mut changed = current.clone();
+    changed.bucket_generations.insert("accounts".to_owned(), 2);
+    changed.next_bucket_generation = 3;
+
+    assert!(matches!(
+        current.validate_successor(&changed),
+        Err(crate::Error::Corruption { .. })
+    ));
+
+    let mut removed = current.clone();
+    removed.remove_bucket("accounts");
+    assert!(current.validate_successor(&removed).is_ok());
+}
+
 fn poll_ready<T>(future: impl Future<Output = crate::Result<T>>) -> crate::Result<T> {
     let waker = Waker::noop();
     let mut context = Context::from_waker(waker);

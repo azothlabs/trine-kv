@@ -17108,3 +17108,83 @@ Negative check:
   `platform-io-native` library path.
 - The official `rust:1.95-bookworm` Linux container passes the hosted CI command
   `cargo clippy --all-targets --all-features -- -D warnings`.
+
+## 2026-07-26: Phase 194 architecture and layered assurance
+
+### Requirement and architecture evidence
+
+- Durable decisions now follow the dependency direction documented in
+  `docs/architecture.md`: pure invariants, explicit state transitions,
+  orchestration, then platform adapters.
+- Object storage is divided into contract qualification, deterministic memory
+  behavior, storage-trait translation, and tests. Content orchestration is
+  divided into backend selection, storage, lease/hold, reclaim, and
+  session/seal/abort/quota/maintenance upload stages. Maintenance is divided
+  into coordinator, registry, reads, flush, and compaction responsibilities.
+- Commit-sequence, manifest-fence, immutable-create, snapshot reachability,
+  lease fencing, and reachability-safe deletion rules share a minimal
+  executable invariant core. Manifest, upload, and object-lease publications
+  expose typed transition decisions before irreversible I/O.
+- The native fault catalog enumerates 17 supported before/after boundaries for
+  append, persist, immutable publish, manifest rename/directory sync, WAL
+  rewrite, general directory sync, and delete. Object-store tests separately
+  cover CAS failure before application and response loss after application.
+
+### Gherkin acceptance evidence
+
+- The old implementation-shaped acceptance examples were replaced by 8
+  requirement-traced Feature files with 30 scenarios and 167 steps. Expected
+  outcomes are traced to V1 specification sections and documented public
+  lifecycle promises in `docs/acceptance-contract.md`.
+- Every scenario opens durable storage. Volatile memory mode is deliberately
+  absent. One backend-neutral runner executes the same Feature corpus and
+  expected outcomes against a unique native directory or object-store prefix.
+- The native profile passed all 8 features, 30 scenarios, and 167 steps.
+- Through Infisical's dev environment, the unchanged real-R2 profile passed all
+  8 features, 30 scenarios, and 167 steps, including verified after-scenario
+  prefix cleanup.
+- Acceptance design exposed that writer-ownership conflicts had no stable
+  public error category. `Error::LeaseUnavailable` now represents the same
+  caller-observable outcome on native, WASI, browser, and object-store
+  adapters; focused native and real-R2 ownership checks pass.
+- A subsequent real-R2 run exposed a HEAD/range-read race when the active
+  writer renewed `LOCK`: an ETag change was incorrectly reported as corruption.
+  `ObjectClient::get_range` now has the typed `ObjectVersionChanged` outcome;
+  mutable lease observation retries from fresh metadata while immutable
+  table/blob reads translate the same event into fail-closed corruption. A
+  deterministic injected-race test and a second complete real-R2 run pass.
+
+### Real-provider evidence
+
+- The ignored R2 measurement/fault suite passed with Infisical-provided dev
+  credentials. Twelve sequential confirmed writes produced twelve immutable
+  WAL segments and flush removed them. Twelve genuinely concurrent async
+  writes grouped into one immutable segment with exactly two conditional
+  requests: one segment create and one WAL-head CAS.
+- Refresh, split-chain reopen, ambiguous conditional-write reconciliation, and
+  cleanup visibility checks passed. No credential value is recorded in the
+  repository.
+
+### Assurance boundary
+
+- Kani, Miri, Loom, property/reference sequences, six persistent decoder fuzz
+  targets, dependency audit, mutation testing, coverage, and sanitizer jobs are
+  mapped in `docs/assurance-case.md` and the pinned deep-assurance workflow.
+- These independent layers establish the documented finite scope. They do not
+  prove that an unknown defect is logically impossible, nor do they substitute
+  for live browser/WASI, other-provider, kernel, controller, or hardware
+  qualification.
+
+### Final gate
+
+- `cargo test --all-targets --all-features` passed: 598 library tests, four
+  intentional live/production-evidence ignores, and every executed integration,
+  Gherkin, example, and benchmark target.
+- Native all-target/all-feature Clippy and browser Clippy passed with warnings
+  denied. The WASI all-feature library check passed with warnings denied.
+- Coverage passed at 77.22% lines, 75.37% functions, and 75.84% regions.
+  Rustdoc and all 31 doctests passed; doctest storage now uses isolated
+  temporary paths so stale on-disk formats cannot contaminate later runs.
+- Cargo audit scanned 368 locked dependencies against 1,169 advisories and
+  reported no vulnerability. Seven script tests, documentation drift, workflow
+  YAML parsing, formatting, and diff hygiene passed.

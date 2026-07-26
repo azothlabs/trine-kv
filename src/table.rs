@@ -1097,5 +1097,11 @@ use format::{
     validate_index_top_level_codec, validate_sorted_point_records, validate_table_filters_for_key,
 };
 pub(crate) use metadata::*;
+
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_decode_table(bytes: &[u8]) {
+    let _ = decode_table_bytes(bytes);
+}
+
 #[cfg(test)]
 mod tests;

@@ -36,10 +36,7 @@ use crate::{
     options::{
         ContentReclamationMode, DurabilityMode, HostStorageBackend, StorageMode, WriteOptions,
     },
-    storage::{
-        StorageObjectDeleteBackend, StorageObjectId, StorageObjectKind, StorageObjectReadBackend,
-        StorageObjectWriteBackend,
-    },
+    storage::{StorageObjectId, StorageObjectKind},
     transaction::TransactionOptions,
     types::KeyRange,
 };
@@ -63,6 +60,7 @@ fn content_lock_shard_index(
         .expect("content lock shard always fits usize")
 }
 
+mod backend;
 mod lease_hold;
 mod reclaim;
 mod storage;

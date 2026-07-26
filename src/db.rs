@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, MutexGuard, RwLock, Weak,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -43,8 +43,8 @@ use crate::{
     snapshot::{Snapshot, SnapshotTracker},
     stats::{
         BlobReadMetrics, CompactionLevelStats, CompactionSkip, CompactionSkipStats,
-        CompactionTrigger, CompactionTriggerStats, DbStats, FilterStats, LevelFilterStats,
-        LevelStats, ScanWasteMetrics,
+        CompactionTrigger, CompactionTriggerStats, DbStats, FatalWriteStopStats, FilterStats,
+        LevelFilterStats, LevelStats, ScanWasteMetrics,
     },
     storage::{
         BlockingStorageDirectoryCreateBackend, BlockingStorageDirectoryListBackend,
@@ -245,6 +245,7 @@ pub(crate) struct DbInner {
     user_handles: AtomicUsize,
     commit_tracker: CommitTracker,
     closed: AtomicBool,
+    fatal_write_stop_reason: AtomicU8,
     publish_barrier: PublishBarrier,
     /// Serializes object-store commit-slot reservation with the corresponding
     /// remote-WAL handoff. The remote WAL represents gaps as empty commits, so
@@ -329,6 +330,32 @@ pub(crate) struct DbInner {
     runtime_shutdown: CancellationToken,
     maintenance: Arc<MaintenanceCoordinator>,
     background_workers: Mutex<Vec<RuntimeTask>>,
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::db) enum FatalWriteStopReason {
+    Corruption = 1,
+    Fenced = 2,
+    OutcomeUnknown = 3,
+}
+
+impl FatalWriteStopReason {
+    const NONE: u8 = 0;
+
+    const fn code(self) -> u8 {
+        self as u8
+    }
+
+    fn stats(code: u8) -> FatalWriteStopStats {
+        FatalWriteStopStats {
+            stopped: code != Self::NONE,
+            total: u64::from(code != Self::NONE),
+            corruption: u64::from(code == Self::Corruption as u8),
+            fencing: u64::from(code == Self::Fenced as u8),
+            outcome_unknown: u64::from(code == Self::OutcomeUnknown as u8),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -449,7 +476,7 @@ impl CommitTracker {
     pub(super) fn reserve_slot(&self) -> Result<CommitSlot> {
         let reserved = self
             .last_reserved_sequence
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(1)
             })
             .map_err(|_| Error::Corruption {

@@ -906,8 +906,8 @@ mod browser_persistent_storage {
             .await
             .map_err(|_| Error::unsupported_backend("browser persistent writer lease callback"))?;
         if !acquired {
-            return Err(Error::runtime_busy(
-                "browser persistent writer lease is already held",
+            return Err(Error::lease_unavailable(
+                "browser persistent database namespace",
             ));
         }
 

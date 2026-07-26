@@ -51,6 +51,9 @@ fn forced_process_exit_recovery() {
         for committed_round in 0..=round {
             assert_crash_round_visible(&db, committed_round);
         }
+        let recovery_health = db.stats();
+        assert!(!recovery_health.fatal_write_stop.stopped);
+        assert_eq!(recovery_health.fatal_write_stop.total, 0);
         db.close_sync();
     }
 
@@ -59,7 +62,8 @@ fn forced_process_exit_recovery() {
         concat!(
             "{{\"scenario\":\"forced_process_exit_recovery\",",
             "\"os\":\"{}\",\"arch\":\"{}\",\"rounds\":{},",
-            "\"confirmed_writes\":{},\"elapsed_ms\":{}}}"
+            "\"confirmed_writes\":{},\"elapsed_ms\":{},",
+            "\"recovery_verified\":true,\"fatal_write_stops\":0}}"
         ),
         env::consts::OS,
         env::consts::ARCH,
@@ -166,7 +170,10 @@ fn concurrent_mixed_load_soak_reopens_cleanly() {
             "\"os\":\"{}\",\"arch\":\"{}\",\"seed\":{},",
             "\"threads\":{},\"operations\":{},\"elapsed_ms\":{},",
             "\"operations_per_second\":{},\"maintenance_passes\":{},",
-            "\"tables_before_reopen\":{},\"compactions\":{}}}"
+            "\"tables_before_reopen\":{},\"compactions\":{},",
+            "\"writes_stopped_by_fatal_error\":{},\"fatal_write_stops\":{},",
+            "\"fatal_corruption_stops\":{},\"fatal_fencing_stops\":{},",
+            "\"fatal_outcome_unknown_stops\":{}}}"
         ),
         env::consts::OS,
         env::consts::ARCH,
@@ -177,7 +184,12 @@ fn concurrent_mixed_load_soak_reopens_cleanly() {
         operations_per_second,
         maintenance_passes,
         stats.total_tables,
-        stats.compaction_runs
+        stats.compaction_runs,
+        stats.fatal_write_stop.stopped,
+        stats.fatal_write_stop.total,
+        stats.fatal_write_stop.corruption,
+        stats.fatal_write_stop.fencing,
+        stats.fatal_write_stop.outcome_unknown
     ));
     println!(
         "production maturity: soak seed={} threads={} operations={} elapsed_ms={} \

@@ -174,7 +174,7 @@ pub(super) fn encode_state(state: &ManifestState) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-pub(super) fn decode_manifest(bytes: &[u8]) -> Result<ManifestState> {
+pub(crate) fn decode_manifest(bytes: &[u8]) -> Result<ManifestState> {
     if bytes.len() < HEADER_LEN {
         return Err(invalid_manifest("short header"));
     }

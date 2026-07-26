@@ -126,6 +126,38 @@ Scheduled CI raises the operation count and stores one JSONL report per
 operating system. Throughput in that report is observational. It is not a
 cross-machine performance comparison.
 
+## Staged Release And Automatic Write Stop
+
+Promote a build through shadow/read-only, small write cohort, and progressively
+larger write cohorts. Each stage must retain its exact binary revision,
+configuration digest, storage-provider identity, start/end times, recovery
+results, and `DbStats` snapshot. Promotion stops when error, corruption,
+fencing, unknown-outcome, latency, reopen-time, or storage-growth thresholds
+are exceeded.
+
+Trine automatically stops a handle after an internal integrity violation,
+writer-fencing loss, or a durable mutation whose exact result cannot be
+determined. Alert immediately when
+`fatal_write_stop.stopped` is true or `fatal_write_stop.total` is non-zero.
+The three reason counters distinguish corruption, fencing, and unknown durable
+outcomes. Do not restart a write cohort blindly: preserve logs and the maturity
+JSONL, open a quarantined copy when possible, run read/recovery verification,
+and record the operator decision.
+
+An auditable recovery record should include:
+
+- database identity and deployment revision;
+- first typed error and automatic-stop reason counters;
+- last confirmed application operation identifier;
+- durability mode and host/provider evidence;
+- reopen result and confirmed-key/reference-model checks;
+- files or objects quarantined, retained, or removed;
+- operator, timestamp, decision, and rollout stage.
+
+The production maturity JSONL is the repository-provided base record. A
+deployment should append its service and storage identifiers without including
+credentials or user data.
+
 ## Runtime Matrix
 
 The `.github/workflows/production-evidence.yml` workflow runs on Linux, macOS,

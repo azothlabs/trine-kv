@@ -15,11 +15,16 @@
 //! use trine_kv::Db;
 //!
 //! # fn main() -> trine_kv::Result<()> {
-//! let db = Db::open_sync("target/doc-example-basic")?;
+//! # let path = std::env::temp_dir().join(format!("trine-doc-basic-{}", std::process::id()));
+//! # let _ = std::fs::remove_dir_all(&path);
+//! let db = Db::open_sync(&path)?;
 //! db.put_sync(b"user:1", b"Ada")?;
 //!
 //! let value = db.get_sync(b"user:1")?;
 //! assert_eq!(value, Some(b"Ada".to_vec()));
+//! # db.close_sync();
+//! # drop(db);
+//! # std::fs::remove_dir_all(path)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -60,12 +65,16 @@
 //! use trine_kv::{Db, DbOptions, RuntimeOptions};
 //!
 //! # async fn example() -> trine_kv::Result<()> {
-//! let mut options = DbOptions::new("target/doc-example-platform-io");
+//! # let path = std::env::temp_dir().join(format!("trine-doc-platform-{}", std::process::id()));
+//! # let _ = std::fs::remove_dir_all(&path);
+//! let mut options = DbOptions::new(&path);
 //! options.runtime = RuntimeOptions::platform_io();
 //!
 //! let db = Db::open(options).await?;
 //! db.put(b"k", b"v").await?;
 //! db.flush().await?;
+//! # db.close().await?;
+//! # std::fs::remove_dir_all(path)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -100,6 +109,7 @@ pub mod error;
 #[allow(dead_code)]
 mod filter;
 mod internal_key;
+mod invariants;
 mod io;
 /// Forward and reverse iterators over committed rows.
 pub mod iterator;
@@ -195,6 +205,10 @@ pub use transaction::{Transaction, TransactionOptions};
 pub use types::{CommitInfo, KeyRange, KeyValue, ReadVersion, Value};
 pub use wal::is_wal_object_key;
 pub use write_batch::WriteBatch;
+
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
 
 #[cfg(test)]
 mod persistent_wal_tests {

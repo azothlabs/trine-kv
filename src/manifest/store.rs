@@ -704,6 +704,7 @@ impl ManifestStore {
     }
 
     fn publish_next_state(&mut self, next_state: ManifestState) -> Result<PublishOutcome> {
+        self.state.validate_successor(&next_state)?;
         // Manifest publish is the durable cutover point. Keep the in-memory
         // state unchanged until storage publish succeeds, so a failed create,
         // flush, or compaction cannot make later operations believe an edit was
@@ -742,6 +743,7 @@ impl ManifestStore {
     ) -> Result<PublishOutcome> {
         match &mut self.storage {
             ManifestStoreBackend::Native(native_storage) => {
+                self.state.validate_successor(&next_state)?;
                 let outcome = publish_manifest_with_backend_async(
                     native_storage,
                     &self.path,
@@ -759,6 +761,7 @@ impl ManifestStore {
             }
             #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
             ManifestStoreBackend::Browser(storage) => {
+                self.state.validate_successor(&next_state)?;
                 let outcome = publish_manifest_with_backend_async(
                     storage,
                     &self.path,
