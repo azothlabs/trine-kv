@@ -30,6 +30,15 @@ impl Db {
     /// - `options`: either [`crate::DbOptions`] or a path-like value converted
     ///   through [`crate::DbOptions::new`].
     ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidOptions`] for invalid paths or option
+    /// combinations, [`Error::UnsupportedBackend`] or
+    /// [`Error::UnsupportedDurability`] when the selected target cannot honor
+    /// the requested backend or durability, and [`Error::LeaseUnavailable`]
+    /// when another writable handle owns the persistent namespace. Storage and
+    /// recovery failures are returned as typed I/O or corruption errors.
+    ///
     /// # Examples
     ///
     /// ```rust

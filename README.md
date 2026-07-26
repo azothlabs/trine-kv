@@ -184,8 +184,10 @@ Read [Durability notes](docs/durability.md) before choosing a durability mode.
 
 ## Current Boundaries
 
-- One persistent database directory has one live writer. Read-only open is for
-  a stable directory state, not live multi-process access beside a writer.
+- One persistent storage namespace has one live writer. A second writable open
+  returns `Error::LeaseUnavailable` on native, WASI, browser, and object-store
+  backends. Read-only open is for a stable storage state, not concurrent access
+  beside a writer.
 - There is no replication or database-server protocol.
 - Online backup semantics are not defined; validate an application-level
   backup and restore procedure before relying on it.

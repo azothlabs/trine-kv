@@ -45,15 +45,20 @@
 11. Native, WASI, and browser CI checks are independent jobs. The documentation
     drift guard rejects collapsing them back into one failure domain, while a
     result-only `Verify` job preserves the aggregate required check.
+12. The first independent Browser Verify run exposed two remaining tests that
+    expected the superseded `RuntimeBusy` writer-lock category. Browser runtime
+    behavior already returned the accepted `LeaseUnavailable`; the tests now
+    assert that cross-backend contract. Local Chrome 150 with its matching
+    ChromeDriver passed all 20 DedicatedWorker, persistent, and SharedWorker
+    tests after the correction.
 
 ### Residual scope
 
 - Real R2 is qualified for the acceptance and request-measurement suites. Other
   live providers, real browser/WASI hosts, kernel/filesystem/controller
   failures, and hardware power loss remain deployment evidence.
-- Local browser test binaries compile, but this macOS host's Safari WebDriver
-  was killed before execution. The hosted Chrome job remains the browser
-  release evidence for the corrected commit.
+- Local Chrome 150 passes all 20 browser tests. The hosted Chrome job remains
+  the browser release evidence for the exact corrected commit.
 - The native 17-boundary catalog covers every represented atomic hook, not
   hidden syscalls inside dependencies or remote provider internals.
 - The guarantee layers reduce residual risk and make it observable; they do not

@@ -55,6 +55,9 @@ to 1.95, which starts a new pre-`1.0` minor line.
 - Host-only test harness dependencies are now excluded from browser and WASI
   target builds. In particular, WASI persistence tests no longer compile
   `proptest`'s Unix/Windows-only process-timeout dependency chain.
+- Browser writer-lease tests now enforce the same `LeaseUnavailable` error
+  contract as native, WASI, and object-store writers instead of retaining the
+  superseded runtime-capacity classification.
 - Platform-I/O flush verification now attributes bounded-adapter work to
   explicit manifest transitions or storage fallbacks instead of assuming a
   fixed task count. This keeps whole-operation fallback detectable while

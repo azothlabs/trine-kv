@@ -512,7 +512,10 @@ async fn browser_persistent_web_locks_reject_second_writer() {
     let error = Db::open(DbOptions::browser_persistent_at(&namespace))
         .await
         .expect_err("second browser writer should be rejected");
-    assert!(matches!(error, Error::RuntimeBusy { .. }), "{error}");
+    assert!(
+        matches!(error, Error::LeaseUnavailable { .. }),
+        "expected LeaseUnavailable, got {error:?}"
+    );
 
     drop(first);
 
@@ -536,7 +539,10 @@ async fn browser_persistent_path_aliases_share_writer_lease() {
     let error = Db::open(DbOptions::browser_persistent_at(&alias))
         .await
         .expect_err("absolute browser namespace alias should share writer lease");
-    assert!(matches!(error, Error::RuntimeBusy { .. }), "{error}");
+    assert!(
+        matches!(error, Error::LeaseUnavailable { .. }),
+        "expected LeaseUnavailable, got {error:?}"
+    );
     drop(first);
 
     let db = Db::open(DbOptions::browser_persistent_read_only_at(&alias))

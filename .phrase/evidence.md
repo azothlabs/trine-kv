@@ -17229,8 +17229,37 @@ Negative check:
 
 - The corrected changes are not committed, so `cargo package --locked` and
   hosted checks for the exact corrected commit cannot yet pass.
-- Local browser test binaries compiled, but Safari WebDriver was killed before
-  executing them. The independent hosted Chrome job must pass after the
-  corrected commit is pushed.
+- Local Chrome 150 with a matching official ChromeDriver passed all 20
+  DedicatedWorker, persistent, and SharedWorker tests. The independent hosted
+  Chrome job must still pass for the exact corrected commit.
 - Linux/macOS/Windows production-evidence jobs and a publishing dry run must
   pass for the exact release commit before publishing 0.6.0.
+
+## 2026-07-26: Browser writer-lease contract follow-up
+
+### Observation
+
+- The independent hosted Browser Verify job compiled and linted the browser
+  target, installed Chrome 150 and its matching driver, and passed all four
+  DedicatedWorker tests.
+- Thirteen of fifteen browser persistence tests passed. The two failures
+  received `Error::LeaseUnavailable` from a second writer open but still
+  expected the superseded `Error::RuntimeBusy` category.
+
+### Interpretation
+
+- Browser writer locking behaved according to the accepted cross-backend
+  writer-ownership contract. The failures were stale target-only assertions
+  that the previously combined CI job had not reached after WASI failed.
+
+### Recommended next action
+
+- Commit the two browser assertion corrections, push them, and require all
+  fifteen browser persistence tests plus the aggregate Verify job to pass.
+
+### Local verification
+
+- Browser target Clippy and all three browser test binaries compiled.
+- Google Chrome 150.0.7871.186 with ChromeDriver 150.0.7871.124 passed four
+  DedicatedWorker tests, fifteen browser persistence tests, and one
+  SharedWorker test.

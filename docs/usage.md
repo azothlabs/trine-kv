@@ -302,8 +302,11 @@ private storage root. Prefer `browser_persistent_at(path)` for applications,
 tests, tenants, or components that need isolated WAL, manifest, table, and blob
 files. Browser paths are UTF-8 namespace paths scoped inside the origin-private
 root. They are normalized before storage access and writer-lock naming, so path
-aliases share one writer lease. Parent-directory components and platform
-prefixes are rejected at open.
+aliases share one writer lease. A second writable open through the same path or
+an alias returns `Error::LeaseUnavailable`, matching native, WASI, and
+object-store writer conflicts. `Error::RuntimeBusy` remains reserved for
+runtime capacity or bounded-progress failures, such as maintenance pressure.
+Parent-directory components and platform prefixes are rejected at open.
 
 Read-only browser open is also async:
 

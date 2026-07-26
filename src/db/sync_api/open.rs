@@ -278,9 +278,10 @@ impl Db {
     ///
     /// Returns [`Error::InvalidOptions`] for invalid paths or option
     /// combinations, [`Error::UnsupportedBackend`] when the selected host
-    /// backend is unavailable on this target, [`Error::Corruption`] when
-    /// recovery detects unsafe durable state, or [`Error::Io`] for storage
-    /// failures.
+    /// backend is unavailable on this target, [`Error::LeaseUnavailable`] when
+    /// another writable handle owns the persistent namespace,
+    /// [`Error::Corruption`] when recovery detects unsafe durable state, or
+    /// [`Error::Io`] for storage failures.
     ///
     /// # Examples
     ///
@@ -568,8 +569,9 @@ impl Db {
     /// # Errors
     ///
     /// Returns [`Error::InvalidOptions`] when `options` is not object-store mode,
-    /// [`Error::Fenced`] when another writer owns a newer WAL-tier epoch, or
-    /// storage/`ObjectClient` errors from either tier.
+    /// [`Error::LeaseUnavailable`] when another live writer owns the WAL-tier
+    /// lease, [`Error::Fenced`] when this writer has been superseded by a newer
+    /// epoch, or storage/`ObjectClient` errors from either tier.
     ///
     /// # Examples
     ///
@@ -614,7 +616,8 @@ impl Db {
     /// # Errors
     ///
     /// Returns [`Error::InvalidOptions`] when `options` is not object-store mode,
-    /// or storage/`ObjectClient` errors from reading the manifest and acquiring
+    /// [`Error::LeaseUnavailable`] when another live writer owns the prefix, or
+    /// storage/`ObjectClient` errors from reading the manifest and acquiring
     /// the writer lease.
     #[cfg_attr(
         all(target_arch = "wasm32", target_os = "unknown"),
@@ -644,8 +647,9 @@ impl Db {
     ///
     /// Returns [`Error::InvalidOptions`] when `options` is not object-store mode,
     /// [`Error::UnsupportedBackend`] when a reclamation capability belongs to a
-    /// different storage client or prefix, or any error returned by the storage
-    /// or WAL client while opening, recovering, or acquiring the writer lease.
+    /// different storage client or prefix, [`Error::LeaseUnavailable`] when
+    /// another live writer owns the WAL-tier lease, or any error returned by
+    /// the storage or WAL client while opening or recovering.
     #[cfg_attr(
         all(target_arch = "wasm32", target_os = "unknown"),
         allow(clippy::arc_with_non_send_sync)
