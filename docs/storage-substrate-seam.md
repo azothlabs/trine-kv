@@ -10,9 +10,9 @@ status annotations later in this file describe the completed slices.
 - Filesystem durability uses appendable WAL lanes and atomic rename publication.
   Object storage uses immutable, content-addressed WAL segments whose confirmed
   head lives in the CAS-protected writer lease. It is no longer WAL-less.
-- Lease v3 carries epoch plus a fresh random 128-bit owner nonce. Every
+- The lease carries epoch plus a fresh random 128-bit owner nonce. Every
   renewal/head update/rewrite/release verifies both, so same-epoch stale owners
-  are fenced. Legacy formats are read-compatible only.
+  are fenced. Other lease encodings fail closed.
 - Manifest CAS publishes table/bucket/checkpoint/GC metadata. An ordinary user
   commit is confirmed by WAL-head CAS, not by rewriting the manifest.
 - Ambiguous conditional writes are reconciled by read-back only when the
@@ -445,14 +445,15 @@ stands as the Band-2 dispatch type for where a single backend value is needed.
       (b) **object-store compaction (`dad8cef`)** — `run_compaction_once_object_store_async`
       + `build_compaction_outputs_object_store_async`; publish via
       `ObjectManifestStore::replace_tables_batch_and_mark_blob_deletions` (CAS
-      rebase-retry); obsolete input/blob objects reclaimed by orphan GC
-      (snapshot-safe), not inline. `compact_range`/`compact_range_with_budget`
+      rebase-retry); obsolete input/blob objects are immutable and retained until
+      durable remote reader retirement exists. `compact_range`/`compact_range_with_budget`
       dispatch object storage; `run_maintenance_with_budget` = flush + compact + GC.
       Test: 3 flushed tables (incl. overwrite) → compact → correct reads → GC →
       reopen → correct.
 
       **The object-storage backend (2c) is complete: open / put / get / flush /
-      reopen / named buckets / compaction / orphan GC, async-only, Send-safe,
+      reopen / named buckets / compaction / conservative orphan retention,
+      async-only, Send-safe,
       tested vs `InMemoryObjectStore`. 364 tests green, clippy + wasm clean.**
     - **2c-4d DONE — writer-lease fencing actually enforced at manifest publish.**
       2c-3/2c-4c acquired the `ObjectWriterLease` (epoch bump via CAS) and held it,

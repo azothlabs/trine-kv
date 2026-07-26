@@ -116,11 +116,11 @@ pub(super) fn validate_common_options(options: &DbOptions) -> Result<()> {
     if options.max_key_bytes == 0 {
         return Err(Error::invalid_options("max key size must be non-zero"));
     }
-    if options.max_key_bytes > DbOptions::MAX_WRITE_FIELD_BYTES {
+    if options.max_key_bytes > DbOptions::MAX_KEY_BYTES {
         return Err(Error::invalid_options(format!(
             "max key size {} exceeds maximum {}",
             options.max_key_bytes,
-            DbOptions::MAX_WRITE_FIELD_BYTES
+            DbOptions::MAX_KEY_BYTES
         )));
     }
     if options.max_value_bytes == 0 {
@@ -398,7 +398,15 @@ pub(super) fn buckets_from_manifest(
 
         buckets.insert(
             name.clone(),
-            Arc::new(LsmTree::new(options.clone(), tables)?),
+            Arc::new(LsmTree::new_with_generation(
+                options.clone(),
+                tables,
+                manifest
+                    .bucket_generation(name)
+                    .ok_or_else(|| Error::Corruption {
+                        message: format!("manifest bucket {name:?} has no generation"),
+                    })?,
+            )?),
         );
     }
 
@@ -437,7 +445,15 @@ where
 
         buckets.insert(
             name.clone(),
-            Arc::new(LsmTree::new(options.clone(), tables)?),
+            Arc::new(LsmTree::new_with_generation(
+                options.clone(),
+                tables,
+                manifest
+                    .bucket_generation(name)
+                    .ok_or_else(|| Error::Corruption {
+                        message: format!("manifest bucket {name:?} has no generation"),
+                    })?,
+            )?),
         );
     }
 
@@ -469,10 +485,7 @@ pub(super) fn ensure_default_bucket_in_manifest(
         return Ok(());
     }
 
-    manifest.create_bucket(
-        DEFAULT_BUCKET_NAME.to_owned(),
-        options.default_bucket_options.clone(),
-    )
+    manifest.create_bucket(DEFAULT_BUCKET_NAME, options.default_bucket_options.clone())
 }
 
 #[cfg_attr(
@@ -649,7 +662,7 @@ pub(super) fn payloads_have_blob_references(payloads: &[LsmCompactionTablePayloa
         payload
             .point_records
             .iter()
-            .any(|(_, value)| matches!(value, Some(ValueRef::BlobIndex(_) | ValueRef::Blob { .. })))
+            .any(|(_, value)| matches!(value, Some(ValueRef::BlobIndex(_))))
     })
 }
 
@@ -691,7 +704,6 @@ pub(super) fn payload_blob_bytes_by_file(
 pub(super) fn blob_reference_bytes(value: Option<&ValueRef>) -> Option<(u64, u64)> {
     match value {
         Some(ValueRef::BlobIndex(index)) => Some((index.file_id, index.encoded_len)),
-        Some(ValueRef::Blob { file_id, len, .. }) => Some((*file_id, *len)),
         Some(ValueRef::Inline(_)) | None => None,
     }
 }
@@ -788,6 +800,13 @@ pub(super) fn write_blob_gc_replacement_tables(
 pub(super) fn validate_bucket_options(options: &BucketOptions) -> Result<()> {
     if options.block_bytes == 0 {
         return Err(Error::invalid_options("block size must be non-zero"));
+    }
+    if options.block_bytes > crate::limits::MAX_DECODED_BLOCK_BYTES {
+        return Err(Error::invalid_options(format!(
+            "block size {} exceeds maximum {}",
+            options.block_bytes,
+            crate::limits::MAX_DECODED_BLOCK_BYTES
+        )));
     }
     if matches!(
         options.filter_policy,

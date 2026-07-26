@@ -1,13 +1,13 @@
 use super::{
-    Arc, BucketOptions, Error, ManifestState, ManifestStore, ManifestStoreBackend,
-    NativeFileBackend, ObjectClient, ObjectManifestStore, PathBuf, PreparedManifestPublish,
+    Arc, BucketOptions, Error, FileIdReservation, ManifestState, ManifestStore,
+    ManifestStoreBackend, NativeFileBackend, ObjectClient, ObjectManifestStore, PathBuf,
     PublishOutcome, Result, Sequence, TableId, TableProperties, decode_manifest,
     native_manifest_publish_durability, publish_manifest_with_backend,
     publish_manifest_with_backend_async, read_manifest_bytes_with_backend,
     read_manifest_bytes_with_backend_async,
 };
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-use super::{BrowserStorageBackend, DurabilityMode};
+use super::{BrowserStorageBackend, DurabilityMode, PreparedManifestPublish};
 
 impl ManifestStore {
     #[cfg(test)]
@@ -182,8 +182,8 @@ impl ManifestStore {
         &self.state
     }
 
-    pub fn create_bucket(&mut self, name: String, options: BucketOptions) -> Result<()> {
-        if let Some(existing) = self.state.buckets.get(&name) {
+    pub fn create_bucket(&mut self, name: &str, options: BucketOptions) -> Result<()> {
+        if let Some(existing) = self.state.buckets.get(name) {
             if existing == &options {
                 return Ok(());
             }
@@ -193,8 +193,7 @@ impl ManifestStore {
         }
 
         let mut next_state = self.state.clone();
-        next_state.buckets.insert(name.clone(), options);
-        next_state.tables.entry(name).or_default();
+        next_state.insert_new_bucket(name.to_owned(), options)?;
         self.publish_next_state(next_state)?.published_or_err()
     }
 
@@ -214,8 +213,7 @@ impl ManifestStore {
             ));
         }
         let mut next_state = self.state.clone();
-        next_state.buckets.remove(name);
-        next_state.tables.remove(name);
+        next_state.remove_bucket(name);
         for file_id in pending_blob_deletions {
             next_state
                 .pending_blob_deletions
@@ -241,8 +239,7 @@ impl ManifestStore {
                 ));
             }
             let mut next_state = state.clone();
-            next_state.buckets.insert(name.clone(), options.clone());
-            next_state.tables.entry(name.clone()).or_default();
+            next_state.insert_new_bucket(name.clone(), options.clone())?;
             Ok(Some(next_state))
         })
         .await
@@ -307,10 +304,10 @@ impl ManifestStore {
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     pub(crate) fn prepare_create_bucket_publish(
         &self,
-        name: String,
+        name: &str,
         options: BucketOptions,
     ) -> Result<Option<PreparedManifestPublish>> {
-        if let Some(existing) = self.state.buckets.get(&name) {
+        if let Some(existing) = self.state.buckets.get(name) {
             if existing == &options {
                 return Ok(None);
             }
@@ -320,8 +317,7 @@ impl ManifestStore {
         }
 
         let mut next_state = self.state.clone();
-        next_state.buckets.insert(name.clone(), options);
-        next_state.tables.entry(name).or_default();
+        next_state.insert_new_bucket(name.to_owned(), options)?;
         Ok(Some(PreparedManifestPublish {
             path: self.path.clone(),
             storage: self.storage.clone(),
@@ -343,8 +339,7 @@ impl ManifestStore {
             ));
         }
         let mut next_state = self.state.clone();
-        next_state.buckets.remove(name);
-        next_state.tables.remove(name);
+        next_state.remove_bucket(name);
         for file_id in pending_blob_deletions {
             next_state
                 .pending_blob_deletions
@@ -398,6 +393,7 @@ impl ManifestStore {
         })
     }
 
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     pub(crate) fn install_prepared_publish(
         &mut self,
         prepared: PreparedManifestPublish,
@@ -411,8 +407,49 @@ impl ManifestStore {
         Ok(())
     }
 
-    pub fn next_table_id(&self) -> Result<TableId> {
-        self.state.next_table_id()
+    pub(crate) fn reserve_file_ids(&mut self, count: usize) -> Result<FileIdReservation> {
+        let count = u64::try_from(count)
+            .map_err(|_| Error::invalid_options("file-id reservation count exceeds u64::MAX"))?;
+        if count == 0 {
+            return Ok(FileIdReservation::new(
+                self.state.next_file_id,
+                self.state.next_file_id,
+            ));
+        }
+        self.state.validate_next_file_id()?;
+        let start = self.state.next_file_id;
+        let end_exclusive = start.checked_add(count).ok_or_else(|| Error::Corruption {
+            message: "file-id high-water mark overflow".to_owned(),
+        })?;
+        let mut next_state = self.state.clone();
+        next_state.next_file_id = end_exclusive;
+        self.publish_next_state(next_state)?.published_or_err()?;
+        Ok(FileIdReservation::new(start, end_exclusive))
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    pub(crate) fn prepare_reserve_file_ids_publish(
+        &self,
+        count: usize,
+    ) -> Result<(PreparedManifestPublish, FileIdReservation)> {
+        let count = u64::try_from(count)
+            .map_err(|_| Error::invalid_options("file-id reservation count exceeds u64::MAX"))?;
+        self.state.validate_next_file_id()?;
+        let start = self.state.next_file_id;
+        let end_exclusive = start.checked_add(count).ok_or_else(|| Error::Corruption {
+            message: "file-id high-water mark overflow".to_owned(),
+        })?;
+        let mut next_state = self.state.clone();
+        next_state.next_file_id = end_exclusive;
+        Ok((
+            PreparedManifestPublish {
+                path: self.path.clone(),
+                storage: self.storage.clone(),
+                base_state: self.state.clone(),
+                next_state,
+            },
+            FileIdReservation::new(start, end_exclusive),
+        ))
     }
 
     pub fn add_tables(
@@ -468,7 +505,7 @@ impl ManifestStore {
         .await
     }
 
-    #[allow(dead_code)]
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     pub(crate) fn prepare_add_tables_publish(
         &self,
         tables: Vec<(String, TableProperties)>,
@@ -575,7 +612,7 @@ impl ManifestStore {
         self.publish_next_state(next_state)?.published_or_err()
     }
 
-    #[allow(dead_code)]
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     pub(crate) fn prepare_replace_tables_batch_publish(
         &self,
         replacements: Vec<(String, Vec<TableId>, Vec<TableProperties>)>,
@@ -645,7 +682,7 @@ impl ManifestStore {
         self.publish_next_state(next_state)?.published_or_err()
     }
 
-    #[allow(dead_code)]
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     pub(crate) fn prepare_clear_pending_blob_deletions_publish(
         &self,
         file_ids: &[u64],
@@ -690,7 +727,10 @@ impl ManifestStore {
         // Only advance once the durable manifest actually cut over. A lost CAS
         // race (object-storage substrate) leaves the state untouched so the
         // caller can rebase onto the winner and retry.
-        if matches!(outcome, PublishOutcome::Published) {
+        if matches!(
+            outcome,
+            PublishOutcome::Published | PublishOutcome::PublishedDurabilityUnknown { .. }
+        ) {
             self.state = next_state;
         }
         Ok(outcome)
@@ -709,7 +749,10 @@ impl ManifestStore {
                     native_manifest_publish_durability(),
                 )
                 .await?;
-                if matches!(outcome, PublishOutcome::Published) {
+                if matches!(
+                    outcome,
+                    PublishOutcome::Published | PublishOutcome::PublishedDurabilityUnknown { .. }
+                ) {
                     self.state = next_state;
                 }
                 Ok(outcome)
@@ -723,7 +766,10 @@ impl ManifestStore {
                     DurabilityMode::Flush,
                 )
                 .await?;
-                if matches!(outcome, PublishOutcome::Published) {
+                if matches!(
+                    outcome,
+                    PublishOutcome::Published | PublishOutcome::PublishedDurabilityUnknown { .. }
+                ) {
                     self.state = next_state;
                 }
                 Ok(outcome)
@@ -751,14 +797,21 @@ impl ManifestStore {
         &mut self,
         edit: impl Fn(&ManifestState) -> Result<Option<ManifestState>>,
     ) -> Result<()> {
-        loop {
+        for _ in 0..super::MANIFEST_EDIT_MAX_ATTEMPTS {
             let Some(next_state) = edit(&self.state)? else {
                 return Ok(());
             };
             match self.publish_next_state_async(next_state).await? {
                 PublishOutcome::Published => return Ok(()),
+                PublishOutcome::PublishedDurabilityUnknown { error } => return Err(error),
                 PublishOutcome::Conflict { .. } => {}
             }
         }
+        Err(Error::Conflict {
+            message: format!(
+                "manifest edit exceeded {} concurrent CAS retries",
+                super::MANIFEST_EDIT_MAX_ATTEMPTS
+            ),
+        })
     }
 }

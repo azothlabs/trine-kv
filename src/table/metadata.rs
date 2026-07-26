@@ -65,7 +65,7 @@ where
     table_file_ids_from_objects(backend.list_objects(request).await?)
 }
 
-pub(super) fn table_file_ids_from_objects(
+pub(crate) fn table_file_ids_from_objects(
     objects: impl IntoIterator<Item = StorageObjectId>,
 ) -> Result<BTreeSet<TableId>> {
     let mut table_ids = BTreeSet::new();
@@ -573,9 +573,7 @@ where
         })?;
     let mut rewritten = Vec::with_capacity(point_records.len());
     for mut record in point_records {
-        if let Some(value @ (ValueRef::BlobIndex(_) | ValueRef::Blob { .. })) =
-            record.value.as_ref()
-        {
+        if let Some(value @ ValueRef::BlobIndex(_)) = record.value.as_ref() {
             let bytes = crate::blob::read_value_for_internal_key_with_backend_async(
                 backend,
                 db_path,
@@ -822,7 +820,6 @@ pub(super) fn table_blob_references(point_records: &[TablePointRecord]) -> Vec<T
         };
         let (file_id, referenced_bytes) = match value {
             ValueRef::BlobIndex(index) => (index.file_id, index.encoded_len),
-            ValueRef::Blob { file_id, len, .. } => (*file_id, *len),
             ValueRef::Inline(_) => continue,
         };
 
@@ -868,7 +865,11 @@ pub(super) fn table_key_bounds(
             finite_bound_bytes(&tombstone.range.start),
             finite_bound_bytes(&tombstone.range.end),
         ) else {
-            continue;
+            // The concrete bound pair cannot encode a half-infinite span. Mark
+            // the whole table unbounded so point/range pruning stays
+            // conservative; retaining point-only bounds here can skip a
+            // tombstone that extends beyond every point record in the file.
+            return (Vec::new(), Vec::new());
         };
         update_smallest(&mut smallest, start);
         update_largest(&mut largest, end);
@@ -1045,4 +1046,38 @@ pub(super) fn index_partitions_for_loaded_blocks(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod key_bound_tests {
+    use std::ops::Bound;
+
+    use crate::{
+        internal_key::{InternalKey, ValueKind},
+        table::{TablePointRecord, TableRangeTombstone},
+        types::{KeyRange, Sequence},
+    };
+
+    use super::table_key_bounds;
+
+    #[test]
+    fn half_infinite_tombstone_disables_finite_table_pruning_bounds() {
+        let points = vec![TablePointRecord {
+            internal_key: InternalKey::new(b"middle".to_vec(), Sequence::new(1), ValueKind::Put, 0),
+            value: None,
+        }];
+        let tombstones = vec![TableRangeTombstone {
+            range: KeyRange {
+                start: Bound::Unbounded,
+                end: Bound::Excluded(b"z".to_vec()),
+            },
+            sequence: Sequence::new(2),
+            batch_index: 0,
+        }];
+
+        assert_eq!(
+            table_key_bounds(&points, &tombstones),
+            (Vec::new(), Vec::new())
+        );
+    }
 }

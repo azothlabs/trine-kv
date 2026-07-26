@@ -112,7 +112,11 @@ impl Db {
         }
 
         if let Err(error) = self.publish_compacted_tables(&outputs, &obsolete_blob_ids) {
-            let _ = remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
+            let error = self.close_after_manifest_durability_failure("blob GC", error);
+            if !self.closed_after_durable_publish_error() {
+                let _ =
+                    remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
+            }
             return Err(error);
         }
 
@@ -210,6 +214,7 @@ impl Db {
             .publish_compacted_tables_host_async(&outputs, &obsolete_blob_ids)
             .await;
         if let Err(error) = publish_result {
+            let error = self.close_after_manifest_durability_failure("blob GC", error);
             if !self.closed_after_durable_publish_error() {
                 let _ = self
                     .remove_storage_files_host_async(db_path, &written_table_ids)
@@ -279,8 +284,15 @@ impl Db {
             .map(|candidate| candidate.file_id)
             .collect::<BTreeSet<_>>();
 
-        let mut next_table_id = self.next_table_id()?;
-        let new_blob_file_id = next_table_id.get();
+        let rewrite_table_count = self.count_blob_gc_rewrite_tables(&candidate_file_ids)?;
+        let reservation_count =
+            rewrite_table_count
+                .checked_add(1)
+                .ok_or_else(|| Error::Corruption {
+                    message: "blob GC file-id reservation count overflow".to_owned(),
+                })?;
+        let mut file_ids = self.reserve_file_ids(reservation_count)?;
+        let new_blob_file_id = file_ids.next_file_id()?;
         let buckets = self
             .inner
             .buckets
@@ -298,10 +310,7 @@ impl Db {
                 {
                     continue;
                 }
-                let output_table_id = next_table_id;
-                next_table_id = next_table_id.next().ok_or_else(|| Error::Corruption {
-                    message: "table id counter overflow".to_owned(),
-                })?;
+                let output_table_id = file_ids.next_table_id()?;
 
                 let table_index = tables.len();
                 let point_records = table.point_records()?;
@@ -351,6 +360,29 @@ impl Db {
             tables,
             records: rewrite_records,
         }))
+    }
+
+    fn count_blob_gc_rewrite_tables(&self, candidate_file_ids: &BTreeSet<u64>) -> Result<usize> {
+        let buckets = self
+            .inner
+            .buckets
+            .read()
+            .map_err(|_| lock_poisoned("bucket registry"))?;
+        let mut count = 0_usize;
+        for tree in buckets.values() {
+            for table in tree.tables_snapshot()? {
+                if table
+                    .blob_file_ids()
+                    .iter()
+                    .any(|file_id| candidate_file_ids.contains(file_id))
+                {
+                    count = count.checked_add(1).ok_or_else(|| Error::Corruption {
+                        message: "blob GC rewrite table count overflow".to_owned(),
+                    })?;
+                }
+            }
+        }
+        Ok(count)
     }
 
     fn reserve_blob_gc_rewrite(
@@ -407,8 +439,15 @@ impl Db {
             .collect::<BTreeSet<_>>();
 
         let storage = self.inner.native_storage.clone();
-        let mut next_table_id = self.next_table_id()?;
-        let new_blob_file_id = next_table_id.get();
+        let rewrite_table_count = self.count_blob_gc_rewrite_tables(&candidate_file_ids)?;
+        let reservation_count =
+            rewrite_table_count
+                .checked_add(1)
+                .ok_or_else(|| Error::Corruption {
+                    message: "blob GC file-id reservation count overflow".to_owned(),
+                })?;
+        let mut file_ids = self.reserve_file_ids_host_async(reservation_count).await?;
+        let new_blob_file_id = file_ids.next_file_id()?;
         let mut tables = Vec::new();
         let mut rewrite_sources = Vec::new();
         {
@@ -427,10 +466,7 @@ impl Db {
                     {
                         continue;
                     }
-                    let output_table_id = next_table_id;
-                    next_table_id = next_table_id.next().ok_or_else(|| Error::Corruption {
-                        message: "table id counter overflow".to_owned(),
-                    })?;
+                    let output_table_id = file_ids.next_table_id()?;
 
                     let table_index = tables.len();
                     let point_records = table.point_records()?;
@@ -510,8 +546,15 @@ impl Db {
             .collect::<BTreeSet<_>>();
 
         let storage = self.browser_storage()?;
-        let mut next_table_id = self.next_table_id()?;
-        let new_blob_file_id = next_table_id.get();
+        let rewrite_table_count = self.count_blob_gc_rewrite_tables(&candidate_file_ids)?;
+        let reservation_count =
+            rewrite_table_count
+                .checked_add(1)
+                .ok_or_else(|| Error::Corruption {
+                    message: "blob GC file-id reservation count overflow".to_owned(),
+                })?;
+        let mut file_ids = self.reserve_file_ids_host_async(reservation_count).await?;
+        let new_blob_file_id = file_ids.next_file_id()?;
         let mut tables = Vec::new();
         let mut rewrite_sources = Vec::new();
         {
@@ -530,10 +573,7 @@ impl Db {
                     {
                         continue;
                     }
-                    let output_table_id = next_table_id;
-                    next_table_id = next_table_id.next().ok_or_else(|| Error::Corruption {
-                        message: "table id counter overflow".to_owned(),
-                    })?;
+                    let output_table_id = file_ids.next_table_id()?;
 
                     let table_index = tables.len();
                     let point_records = table.point_records()?;

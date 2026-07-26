@@ -13,6 +13,7 @@ struct PreparedCompactionRun {
     oldest_active_snapshot: Sequence,
     inputs: Vec<NamedCompactionInput>,
     guard: MaintenanceCompactionGuard,
+    _snapshot_guard: crate::snapshot::CompactionSnapshotGuard,
     budget_exhausted: bool,
 }
 
@@ -21,7 +22,45 @@ enum CompactionRunPreparation {
     Outcome(MaintenanceOutcome),
 }
 
+pub(in crate::db) struct PreparedCompactionRewrite {
+    pub(in crate::db) payloads: Vec<crate::lsm::CompactionTablePayload>,
+    pub(in crate::db) table_options: table::TableWriteOptions,
+}
+
 impl Db {
+    pub(in crate::db) fn prepare_compaction_rewrites(
+        &self,
+        oldest_active_snapshot: Sequence,
+        compaction_inputs: &[NamedCompactionInput],
+    ) -> Result<Vec<Option<PreparedCompactionRewrite>>> {
+        compaction_inputs
+            .iter()
+            .map(|input| {
+                let force_rewrite_trivial =
+                    input.tree.options.blob_level_merge_policy == BlobLevelMergePolicy::Always;
+                if input.input.trivial_move && !force_rewrite_trivial {
+                    return Ok(None);
+                }
+                let payloads = input.tree.build_compaction_table_payloads(
+                    &input.input,
+                    &input.input.compaction_range,
+                    oldest_active_snapshot,
+                    self.inner.options.target_table_bytes,
+                )?;
+                let mut table_options = input.input.table_options.clone();
+                table_options.rewrite_blob_indexes = should_rewrite_blob_indexes_for_compaction(
+                    &input.input,
+                    &payloads,
+                    input.tree.options.blob_level_merge_policy,
+                );
+                Ok(Some(PreparedCompactionRewrite {
+                    payloads,
+                    table_options,
+                }))
+            })
+            .collect()
+    }
+
     pub(in crate::db) fn collect_compaction_inputs(
         &self,
         range: &KeyRange,
@@ -93,6 +132,7 @@ impl Db {
             oldest_active_snapshot,
             inputs: compaction_inputs,
             guard: compaction_guard,
+            _snapshot_guard,
             budget_exhausted,
         } = match self.prepare_compaction_run(range, local_l0_compaction, budget)? {
             CompactionRunPreparation::Ready(run) => run,
@@ -132,7 +172,11 @@ impl Db {
             return Err(error);
         }
         if let Err(error) = self.publish_compacted_tables(&written_tables, &obsolete_blob_ids) {
-            let _ = remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
+            let error = self.close_after_manifest_durability_failure("compaction", error);
+            if !self.closed_after_durable_publish_error() {
+                let _ =
+                    remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
+            }
             return Err(error);
         }
 
@@ -193,6 +237,7 @@ impl Db {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // compaction keeps one linear publish/install transaction
     pub(in crate::db) async fn run_compaction_once_with_budget_host_async(
         &self,
         db_path: &Path,
@@ -204,6 +249,7 @@ impl Db {
             oldest_active_snapshot,
             inputs: compaction_inputs,
             guard: compaction_guard,
+            _snapshot_guard,
             budget_exhausted,
         } = match self.prepare_compaction_run(range, local_l0_compaction, budget)? {
             CompactionRunPreparation::Ready(run) => run,
@@ -266,6 +312,7 @@ impl Db {
             .publish_compacted_tables_host_async(&written_tables, &obsolete_blob_ids)
             .await;
         if let Err(error) = publish_result {
+            let error = self.close_after_manifest_durability_failure("compaction", error);
             if !self.closed_after_durable_publish_error() {
                 let _ = self
                     .remove_storage_files_host_async(db_path, &written_table_ids)
@@ -313,7 +360,10 @@ impl Db {
         local_l0_compaction: bool,
         budget: MaintenanceBudget,
     ) -> Result<CompactionRunPreparation> {
-        let oldest_active_snapshot = self.oldest_retained_sequence();
+        let latest = self.last_committed_sequence();
+        let retained_floor = self.retained_floor_without_active_snapshots(latest);
+        let (oldest_active_snapshot, snapshot_guard) =
+            self.inner.snapshots.begin_compaction(retained_floor);
         let inputs =
             self.collect_compaction_inputs(range, oldest_active_snapshot, local_l0_compaction)?;
         if inputs.is_empty() {
@@ -354,6 +404,7 @@ impl Db {
             oldest_active_snapshot,
             inputs,
             guard,
+            _snapshot_guard: snapshot_guard,
             budget_exhausted,
         }))
     }
@@ -452,14 +503,24 @@ impl Db {
         oldest_active_snapshot: Sequence,
         compaction_inputs: &[NamedCompactionInput],
     ) -> Result<PendingCompactionOutputs> {
+        let rewrites =
+            self.prepare_compaction_rewrites(oldest_active_snapshot, compaction_inputs)?;
+        let output_table_count = rewrites
+            .iter()
+            .flatten()
+            .try_fold(0usize, |count, rewrite| {
+                count
+                    .checked_add(rewrite.payloads.len())
+                    .ok_or_else(|| Error::Corruption {
+                        message: "compaction output table count overflow".to_owned(),
+                    })
+            })?;
+        let mut file_ids = self.reserve_file_ids(output_table_count)?;
         let mut outputs = Vec::with_capacity(compaction_inputs.len());
         let mut written_table_ids = Vec::new();
-        let mut next_table_id = self.next_table_id()?;
 
-        for input in compaction_inputs {
-            let force_rewrite_trivial =
-                input.tree.options.blob_level_merge_policy == BlobLevelMergePolicy::Always;
-            if input.input.trivial_move && !force_rewrite_trivial {
+        for (input, rewrite) in compaction_inputs.iter().zip(rewrites) {
+            let Some(rewrite) = rewrite else {
                 outputs.push(NamedCompactionOutput {
                     bucket: input.bucket.clone(),
                     trigger: Some(input.input.trigger),
@@ -469,45 +530,10 @@ impl Db {
                     },
                 });
                 continue;
-            }
-
-            let payloads = match input.tree.build_compaction_table_payloads(
-                &input.input,
-                &input.input.compaction_range,
-                oldest_active_snapshot,
-                self.inner.options.target_table_bytes,
-            ) {
-                Ok(payloads) => payloads,
-                Err(error) => {
-                    let _ = remove_storage_files(
-                        &self.inner.native_storage,
-                        db_path,
-                        &written_table_ids,
-                    );
-                    return Err(error);
-                }
             };
-            let mut table_options = input.input.table_options.clone();
-            table_options.rewrite_blob_indexes = should_rewrite_blob_indexes_for_compaction(
-                &input.input,
-                &payloads,
-                input.tree.options.blob_level_merge_policy,
-            );
-            let mut output_tables = Vec::with_capacity(payloads.len());
-            for payload in payloads {
-                let table_id = next_table_id;
-                next_table_id = if let Some(table_id) = next_table_id.next() {
-                    table_id
-                } else {
-                    let _ = remove_storage_files(
-                        &self.inner.native_storage,
-                        db_path,
-                        &written_table_ids,
-                    );
-                    return Err(Error::Corruption {
-                        message: "table id counter overflow".to_owned(),
-                    });
-                };
+            let mut output_tables = Vec::with_capacity(rewrite.payloads.len());
+            for payload in rewrite.payloads {
+                let table_id = file_ids.next_table_id()?;
 
                 let table_path = table::table_path(db_path, table_id);
                 written_table_ids.push(table_id);
@@ -516,7 +542,7 @@ impl Db {
                     &table_path,
                     table_id,
                     input.input.table_level,
-                    &table_options,
+                    &rewrite.table_options,
                     &payload.point_records,
                     &payload.range_tombstones,
                     self.filesystem_publish_durability(),
@@ -557,14 +583,24 @@ impl Db {
         compaction_inputs: &[NamedCompactionInput],
     ) -> Result<PendingCompactionOutputs> {
         let storage = self.inner.native_storage.clone();
+        let rewrites =
+            self.prepare_compaction_rewrites(oldest_active_snapshot, compaction_inputs)?;
+        let output_table_count = rewrites
+            .iter()
+            .flatten()
+            .try_fold(0usize, |count, rewrite| {
+                count
+                    .checked_add(rewrite.payloads.len())
+                    .ok_or_else(|| Error::Corruption {
+                        message: "compaction output table count overflow".to_owned(),
+                    })
+            })?;
+        let mut file_ids = self.reserve_file_ids_host_async(output_table_count).await?;
         let mut outputs = Vec::with_capacity(compaction_inputs.len());
         let mut written_table_ids = Vec::new();
-        let mut next_table_id = self.next_table_id()?;
 
-        for input in compaction_inputs {
-            let force_rewrite_trivial =
-                input.tree.options.blob_level_merge_policy == BlobLevelMergePolicy::Always;
-            if input.input.trivial_move && !force_rewrite_trivial {
+        for (input, rewrite) in compaction_inputs.iter().zip(rewrites) {
+            let Some(rewrite) = rewrite else {
                 outputs.push(NamedCompactionOutput {
                     bucket: input.bucket.clone(),
                     trigger: Some(input.input.trigger),
@@ -574,37 +610,10 @@ impl Db {
                     },
                 });
                 continue;
-            }
-
-            let payloads = match input.tree.build_compaction_table_payloads(
-                &input.input,
-                &input.input.compaction_range,
-                oldest_active_snapshot,
-                self.inner.options.target_table_bytes,
-            ) {
-                Ok(payloads) => payloads,
-                Err(error) => {
-                    let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
-                    return Err(error);
-                }
             };
-            let mut table_options = input.input.table_options.clone();
-            table_options.rewrite_blob_indexes = should_rewrite_blob_indexes_for_compaction(
-                &input.input,
-                &payloads,
-                input.tree.options.blob_level_merge_policy,
-            );
-            let mut output_tables = Vec::with_capacity(payloads.len());
-            for payload in payloads {
-                let table_id = next_table_id;
-                next_table_id = if let Some(table_id) = next_table_id.next() {
-                    table_id
-                } else {
-                    let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
-                    return Err(Error::Corruption {
-                        message: "table id counter overflow".to_owned(),
-                    });
-                };
+            let mut output_tables = Vec::with_capacity(rewrite.payloads.len());
+            for payload in rewrite.payloads {
+                let table_id = file_ids.next_table_id()?;
 
                 let table_path = table::table_path(db_path, table_id);
                 written_table_ids.push(table_id);
@@ -613,7 +622,7 @@ impl Db {
                     &table_path,
                     table_id,
                     input.input.table_level,
-                    &table_options,
+                    &rewrite.table_options,
                     &payload.point_records,
                     &payload.range_tombstones,
                     self.filesystem_publish_durability(),
@@ -653,14 +662,24 @@ impl Db {
         compaction_inputs: &[NamedCompactionInput],
     ) -> Result<PendingCompactionOutputs> {
         let storage = self.browser_storage()?;
+        let rewrites =
+            self.prepare_compaction_rewrites(oldest_active_snapshot, compaction_inputs)?;
+        let output_table_count = rewrites
+            .iter()
+            .flatten()
+            .try_fold(0usize, |count, rewrite| {
+                count
+                    .checked_add(rewrite.payloads.len())
+                    .ok_or_else(|| Error::Corruption {
+                        message: "compaction output table count overflow".to_owned(),
+                    })
+            })?;
+        let mut file_ids = self.reserve_file_ids_host_async(output_table_count).await?;
         let mut outputs = Vec::with_capacity(compaction_inputs.len());
         let mut written_table_ids = Vec::new();
-        let mut next_table_id = self.next_table_id()?;
 
-        for input in compaction_inputs {
-            let force_rewrite_trivial =
-                input.tree.options.blob_level_merge_policy == BlobLevelMergePolicy::Always;
-            if input.input.trivial_move && !force_rewrite_trivial {
+        for (input, rewrite) in compaction_inputs.iter().zip(rewrites) {
+            let Some(rewrite) = rewrite else {
                 outputs.push(NamedCompactionOutput {
                     bucket: input.bucket.clone(),
                     trigger: Some(input.input.trigger),
@@ -670,37 +689,10 @@ impl Db {
                     },
                 });
                 continue;
-            }
-
-            let payloads = match input.tree.build_compaction_table_payloads(
-                &input.input,
-                &input.input.compaction_range,
-                oldest_active_snapshot,
-                self.inner.options.target_table_bytes,
-            ) {
-                Ok(payloads) => payloads,
-                Err(error) => {
-                    let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
-                    return Err(error);
-                }
             };
-            let mut table_options = input.input.table_options.clone();
-            table_options.rewrite_blob_indexes = should_rewrite_blob_indexes_for_compaction(
-                &input.input,
-                &payloads,
-                input.tree.options.blob_level_merge_policy,
-            );
-            let mut output_tables = Vec::with_capacity(payloads.len());
-            for payload in payloads {
-                let table_id = next_table_id;
-                next_table_id = if let Some(table_id) = next_table_id.next() {
-                    table_id
-                } else {
-                    let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
-                    return Err(Error::Corruption {
-                        message: "table id counter overflow".to_owned(),
-                    });
-                };
+            let mut output_tables = Vec::with_capacity(rewrite.payloads.len());
+            for payload in rewrite.payloads {
+                let table_id = file_ids.next_table_id()?;
 
                 let table_path = table::table_path(db_path, table_id);
                 written_table_ids.push(table_id);
@@ -709,7 +701,7 @@ impl Db {
                     &table_path,
                     table_id,
                     input.input.table_level,
-                    &table_options,
+                    &rewrite.table_options,
                     &payload.point_records,
                     &payload.range_tombstones,
                     DurabilityMode::Flush,

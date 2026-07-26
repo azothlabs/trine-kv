@@ -3,8 +3,8 @@ use super::{
     MIN_INTERNAL_KEY_BYTES, PREFIX_EXTRACTOR_CUSTOM, PREFIX_EXTRACTOR_DISABLED,
     PREFIX_EXTRACTOR_FIXED_LEN, PREFIX_EXTRACTOR_SEPARATOR, PrefixExtractor, Range, Result,
     SectionHandle, Sequence, TableBlobReference, TableId, TableLevel, TablePointRecord,
-    TableProperties, VALUE_BLOB, VALUE_BLOB_INDEX, VALUE_INLINE, VALUE_KIND_POINT_DELETE,
-    VALUE_KIND_PUT, VALUE_KIND_RANGE_DELETE, VALUE_NONE, ValueKind, ValueRef, limits,
+    TableProperties, VALUE_BLOB_INDEX, VALUE_INLINE, VALUE_KIND_POINT_DELETE, VALUE_KIND_PUT,
+    VALUE_KIND_RANGE_DELETE, VALUE_NONE, ValueKind, ValueRef, limits,
 };
 
 pub(in crate::table) fn validate_sorted_point_records(
@@ -91,18 +91,6 @@ pub(in crate::table) fn put_value_ref(bytes: &mut Vec<u8>, value: Option<&ValueR
         Some(ValueRef::BlobIndex(index)) => {
             put_u8(bytes, VALUE_BLOB_INDEX);
             put_blob_index(bytes, *index);
-        }
-        Some(ValueRef::Blob {
-            file_id,
-            offset,
-            len,
-            checksum,
-        }) => {
-            put_u8(bytes, VALUE_BLOB);
-            put_u64(bytes, *file_id);
-            put_u64(bytes, *offset);
-            put_u64(bytes, *len);
-            put_u32(bytes, *checksum);
         }
     }
     Ok(())
@@ -210,7 +198,6 @@ pub(in crate::table) fn value_ref_encoded_len(value: Option<&ValueRef>) -> usize
         None => 1,
         Some(ValueRef::Inline(bytes)) => 1 + 4 + bytes.len(),
         Some(ValueRef::BlobIndex(_)) => 1 + 8 + 8 + 8 + 8 + 4 + 4 + 1,
-        Some(ValueRef::Blob { .. }) => 1 + 8 + 8 + 8 + 4,
     }
 }
 

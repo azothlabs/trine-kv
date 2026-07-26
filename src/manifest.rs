@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io,
     path::{Path, PathBuf},
     sync::Arc,
@@ -31,24 +31,30 @@ use crate::storage::BrowserStorageBackend;
 pub const MANIFEST_FILE_NAME: &str = "MANIFEST";
 const MANIFEST_MAGIC: u32 = 0x5452_4d46;
 // Reset to 1 for the first published storage contract — the crate has no users
-// yet, so the pre-1.0 version churn is collapsed rather than carried. (A
-// structured `vX.Y.Z` scheme is preferred going forward.)
-const MANIFEST_VERSION: u16 = 1;
-// Clean break: only the current manifest format is read. Older on-disk manifests
-// are rejected rather than decoded through version-gated fallbacks.
-const MIN_SUPPORTED_MANIFEST_VERSION: u16 = MANIFEST_VERSION;
+// yet, so each incompatible pre-1.0 layout gets one exact integer version.
+// Version 2 adds durable file-id and bucket-generation high-water marks.
+const MANIFEST_VERSION: u16 = 2;
 const HEADER_LEN: usize = 14;
 // The lower bound for one table entry: fixed fields plus two empty byte fields.
 // Decoding uses this to reject impossible counts before reserving memory.
 const MIN_TABLE_PROPERTY_BYTES: usize = 45;
+const MANIFEST_EDIT_MAX_ATTEMPTS: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestState {
     wal_replay_floor: Sequence,
     buckets: BTreeMap<String, BucketOptions>,
+    bucket_generations: BTreeMap<String, u64>,
     tables: BTreeMap<String, Vec<TableProperties>>,
     pending_blob_deletions: BTreeMap<u64, Sequence>,
     checkpoints: BTreeMap<String, Sequence>,
+    /// Exclusive high-water mark for every table/blob file identifier that has
+    /// been durably reserved. It advances before the corresponding objects are
+    /// written, so a crash may leave a gap but can never cause identifier reuse.
+    next_file_id: u64,
+    /// Exclusive high-water mark for logical bucket incarnations. Dropping and
+    /// recreating the same name consumes a new generation permanently.
+    next_bucket_generation: u64,
     /// The fencing epoch of the writer that last published this manifest. Used
     /// only by the object-store backend (the filesystem backend uses a `LOCK`
     /// file for mutual exclusion and always leaves this 0); a publish observing a
@@ -63,9 +69,12 @@ impl ManifestState {
         Self {
             wal_replay_floor: Sequence::ZERO,
             buckets: BTreeMap::new(),
+            bucket_generations: BTreeMap::new(),
             tables: BTreeMap::new(),
             pending_blob_deletions: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
+            next_file_id: 1,
+            next_bucket_generation: 1,
             writer_epoch: 0,
         }
     }
@@ -78,6 +87,10 @@ impl ManifestState {
     #[must_use]
     pub fn buckets(&self) -> &BTreeMap<String, BucketOptions> {
         &self.buckets
+    }
+
+    pub(crate) fn bucket_generation(&self, name: &str) -> Option<u64> {
+        self.bucket_generations.get(name).copied()
     }
 
     #[must_use]
@@ -95,20 +108,155 @@ impl ManifestState {
         &self.checkpoints
     }
 
-    pub fn next_table_id(&self) -> Result<TableId> {
+    fn derived_next_file_id(&self) -> Result<u64> {
         let highest = self
             .tables
             .values()
-            .flat_map(|tables| tables.iter().map(|properties| properties.id.get()))
+            .flat_map(|tables| {
+                tables.iter().flat_map(|properties| {
+                    std::iter::once(properties.id.get())
+                        .chain(properties.blob_file_ids().iter().copied())
+                })
+            })
+            .chain(self.pending_blob_deletions.keys().copied())
             .max()
             .unwrap_or(0);
 
-        highest
-            .checked_add(1)
-            .map(TableId)
-            .ok_or_else(|| Error::Corruption {
-                message: "table id counter overflow".to_owned(),
-            })
+        highest.checked_add(1).ok_or_else(|| Error::Corruption {
+            message: "table id counter overflow".to_owned(),
+        })
+    }
+
+    fn validate_next_file_id(&self) -> Result<()> {
+        let minimum = self.derived_next_file_id()?;
+        if self.next_file_id < minimum {
+            return Err(Error::Corruption {
+                message: format!(
+                    "manifest file-id high-water mark {} is below live-object minimum {minimum}",
+                    self.next_file_id
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_bucket_generations(&self) -> Result<()> {
+        if self.bucket_generations.len() != self.buckets.len()
+            || self
+                .buckets
+                .keys()
+                .any(|name| !self.bucket_generations.contains_key(name))
+        {
+            return Err(Error::Corruption {
+                message: "manifest bucket-generation map does not match bucket map".to_owned(),
+            });
+        }
+        let mut generations = BTreeSet::new();
+        let highest = self.bucket_generations.values().copied().max().unwrap_or(0);
+        if self
+            .bucket_generations
+            .values()
+            .any(|generation| *generation == 0 || !generations.insert(*generation))
+            || self.next_bucket_generation <= highest
+        {
+            return Err(Error::Corruption {
+                message:
+                    "manifest bucket generations are zero, duplicated, or above their high-water mark"
+                        .to_owned(),
+            });
+        }
+        if self.tables.len() != self.buckets.len()
+            || self
+                .buckets
+                .keys()
+                .any(|name| !self.tables.contains_key(name))
+        {
+            return Err(Error::Corruption {
+                message: "manifest table-bucket map does not match bucket map".to_owned(),
+            });
+        }
+        let mut table_ids = BTreeSet::new();
+        for properties in self.tables.values().flatten() {
+            if properties.id.get() == 0 || !table_ids.insert(properties.id.get()) {
+                return Err(Error::Corruption {
+                    message: format!(
+                        "manifest contains invalid or duplicate table id {}",
+                        properties.id.get()
+                    ),
+                });
+            }
+            for file_id in properties.blob_file_ids() {
+                if *file_id == 0 {
+                    return Err(Error::Corruption {
+                        message: "manifest contains zero live blob file id".to_owned(),
+                    });
+                }
+            }
+        }
+        for file_id in self.pending_blob_deletions.keys() {
+            if *file_id == 0 {
+                return Err(Error::Corruption {
+                    message: "manifest contains zero pending blob file id".to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_new_bucket(&mut self, name: String, options: BucketOptions) -> Result<()> {
+        let generation = self.next_bucket_generation;
+        self.next_bucket_generation =
+            generation.checked_add(1).ok_or_else(|| Error::Corruption {
+                message: "bucket-generation high-water mark overflow".to_owned(),
+            })?;
+        self.bucket_generations.insert(name.clone(), generation);
+        self.buckets.insert(name.clone(), options);
+        self.tables.entry(name).or_default();
+        Ok(())
+    }
+
+    fn remove_bucket(&mut self, name: &str) {
+        self.buckets.remove(name);
+        self.bucket_generations.remove(name);
+        self.tables.remove(name);
+    }
+}
+
+/// A durably committed, single-use range of table/blob file identifiers.
+///
+/// The manifest high-water mark has already advanced when this value is
+/// returned. Dropping unused identifiers is safe; they intentionally become
+/// permanent gaps rather than being recycled after failures.
+#[derive(Debug)]
+pub(crate) struct FileIdReservation {
+    next: u64,
+    end_exclusive: u64,
+}
+
+impl FileIdReservation {
+    fn new(start: u64, end_exclusive: u64) -> Self {
+        Self {
+            next: start,
+            end_exclusive,
+        }
+    }
+
+    pub(crate) fn next_table_id(&mut self) -> Result<TableId> {
+        let id = self.next_file_id()?;
+        Ok(TableId(id))
+    }
+
+    pub(crate) fn next_file_id(&mut self) -> Result<u64> {
+        if self.next >= self.end_exclusive {
+            return Err(Error::Corruption {
+                message: "file-id reservation exhausted".to_owned(),
+            });
+        }
+        let id = self.next;
+        self.next = self.next.checked_add(1).ok_or_else(|| Error::Corruption {
+            message: "file-id reservation counter overflow".to_owned(),
+        })?;
+        Ok(id)
     }
 }
 
@@ -149,6 +297,13 @@ enum ManifestStoreBackend {
 pub(crate) enum PublishOutcome {
     /// The new state is now the durable manifest.
     Published,
+    /// The namespace points at the new manifest, but syncing the parent
+    /// directory failed. Referenced objects must be retained and the database
+    /// handle must stop accepting work.
+    PublishedDurabilityUnknown {
+        /// Durability confirmation failure returned to the caller.
+        error: Error,
+    },
     /// Another writer published first. `current` is the winning manifest state,
     /// so the caller can rebase its edit and retry. Constructed by
     /// [`ObjectManifestStore::try_publish`] (object-storage CAS); the filesystem
@@ -171,6 +326,7 @@ impl PublishOutcome {
     fn published_or_err(self) -> Result<()> {
         match self {
             Self::Published => Ok(()),
+            Self::PublishedDurabilityUnknown { error } => Err(error),
             Self::Conflict { .. } => Err(Error::Conflict {
                 message: "manifest publish lost a concurrent CAS race".to_owned(),
             }),
@@ -247,12 +403,16 @@ impl<C: ObjectClient> ObjectManifestStore<C> {
         match client.head(key).await? {
             None => Ok((ManifestState::empty(), None)),
             Some(meta) => {
-                if meta.size > limits::MAX_MANIFEST_PAYLOAD_BYTES as u64 {
+                let max_manifest_bytes = limits::MAX_MANIFEST_PAYLOAD_BYTES
+                    .checked_add(HEADER_LEN)
+                    .ok_or_else(|| Error::Corruption {
+                        message: "manifest size limit overflow".to_owned(),
+                    })?;
+                if meta.size > max_manifest_bytes as u64 {
                     return Err(Error::Corruption {
                         message: format!(
                             "manifest object {key} length {} exceeds maximum {}",
-                            meta.size,
-                            limits::MAX_MANIFEST_PAYLOAD_BYTES
+                            meta.size, max_manifest_bytes
                         ),
                     });
                 }
@@ -261,7 +421,7 @@ impl<C: ObjectClient> ObjectManifestStore<C> {
                 })?;
                 limits::ensure_corruption_len(
                     bytes.len(),
-                    limits::MAX_MANIFEST_PAYLOAD_BYTES,
+                    max_manifest_bytes,
                     "manifest object length",
                 )?;
                 Ok((decode_manifest(&bytes)?, Some(meta.etag)))
@@ -292,6 +452,7 @@ impl<C: ObjectClient> ObjectManifestStore<C> {
             Some(etag) => Precondition::IfMatch(etag.clone()),
             None => Precondition::IfNoneMatch,
         };
+        let base = self.state.clone();
         let publish = self.client.put_if(&self.key, bytes, precondition).await;
         match publish {
             Ok(PutIf::Stored { etag }) => {
@@ -316,6 +477,9 @@ impl<C: ObjectClient> ObjectManifestStore<C> {
                     if current == next {
                         return Ok(PublishOutcome::Published);
                     }
+                    if current == base {
+                        return Err(error);
+                    }
                     return Ok(PublishOutcome::Conflict { current });
                 }
                 Err(error)
@@ -331,16 +495,51 @@ impl<C: ObjectClient> ObjectManifestStore<C> {
         &mut self,
         edit: impl Fn(&ManifestState) -> Result<Option<ManifestState>>,
     ) -> Result<()> {
-        loop {
+        for _ in 0..MANIFEST_EDIT_MAX_ATTEMPTS {
             let Some(next_state) = edit(&self.state)? else {
                 return Ok(());
             };
             match self.try_publish(next_state).await? {
                 PublishOutcome::Published => return Ok(()),
+                PublishOutcome::PublishedDurabilityUnknown { error } => return Err(error),
                 // `try_publish` refreshed `self.state` to the winner; rebase.
                 PublishOutcome::Conflict { .. } => {}
             }
         }
+        Err(Error::Conflict {
+            message: format!(
+                "manifest edit exceeded {MANIFEST_EDIT_MAX_ATTEMPTS} concurrent CAS retries"
+            ),
+        })
+    }
+
+    pub(crate) async fn reserve_file_ids(&mut self, count: usize) -> Result<FileIdReservation> {
+        let count = u64::try_from(count)
+            .map_err(|_| Error::invalid_options("file-id reservation count exceeds u64::MAX"))?;
+        for _ in 0..MANIFEST_EDIT_MAX_ATTEMPTS {
+            self.state.validate_next_file_id()?;
+            let start = self.state.next_file_id;
+            let end_exclusive = start.checked_add(count).ok_or_else(|| Error::Corruption {
+                message: "file-id high-water mark overflow".to_owned(),
+            })?;
+            if count == 0 {
+                return Ok(FileIdReservation::new(start, end_exclusive));
+            }
+            let mut next_state = self.state.clone();
+            next_state.next_file_id = end_exclusive;
+            match self.try_publish(next_state).await? {
+                PublishOutcome::Published => {
+                    return Ok(FileIdReservation::new(start, end_exclusive));
+                }
+                PublishOutcome::PublishedDurabilityUnknown { error } => return Err(error),
+                PublishOutcome::Conflict { .. } => {}
+            }
+        }
+        Err(Error::Conflict {
+            message: format!(
+                "file-id reservation exceeded {MANIFEST_EDIT_MAX_ATTEMPTS} concurrent CAS retries"
+            ),
+        })
     }
 
     /// Force-publish the current state so this writer's fencing epoch is stamped
@@ -367,16 +566,15 @@ impl<C: ObjectClient> ObjectManifestStore<C> {
                 ));
             }
             let mut next_state = state.clone();
-            next_state.buckets.insert(name.clone(), options.clone());
-            next_state.tables.entry(name.clone()).or_default();
+            next_state.insert_new_bucket(name.clone(), options.clone())?;
             Ok(Some(next_state))
         })
         .await
     }
 
     /// Drop a bucket and its table list, CAS-published with rebase-retry. The
-    /// bucket's now-unreferenced table and blob objects are reclaimed by the
-    /// object-store orphan GC (no explicit blob marking needed).
+    /// bucket's now-unreferenced immutable table and blob objects are retained
+    /// until remote reader retirement can be proven.
     pub(crate) async fn drop_bucket(&mut self, name: String) -> Result<()> {
         self.commit_edit(|state| {
             if !state.buckets.contains_key(&name) {
@@ -385,8 +583,7 @@ impl<C: ObjectClient> ObjectManifestStore<C> {
                 ));
             }
             let mut next_state = state.clone();
-            next_state.buckets.remove(&name);
-            next_state.tables.remove(&name);
+            next_state.remove_bucket(&name);
             Ok(Some(next_state))
         })
         .await
@@ -547,6 +744,7 @@ impl<C: ObjectClient> ObjectManifestStore<C> {
     }
 }
 
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedManifestPublish {
     path: PathBuf,
@@ -559,6 +757,7 @@ mod format;
 mod store;
 
 pub(crate) use format::*;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 impl PreparedManifestPublish {
     pub(crate) async fn publish_async(&self) -> Result<()> {
         let outcome = match &self.storage {

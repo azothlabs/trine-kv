@@ -10,12 +10,13 @@ use super::{
     StorageCapability, StorageDirectoryCreateBackend, StorageDirectoryFile, StorageDirectoryId,
     StorageDirectoryListBackend, StorageDirectorySyncBackend, StorageFuture,
     StorageManifestPublishBackend, StorageManifestReadBackend, StorageObjectDeleteBackend,
-    StorageObjectId, StorageObjectListBackend, StorageObjectListRequest, StorageObjectReadBackend,
-    StorageObjectWriteBackend, StorageOperation, StorageReadBackend, StorageReadFuture,
-    StorageWalRewriteBackend, StorageWriterLeaseBackend, create_native_file_directory_all,
-    delete_native_file_object, list_native_file_directory_files, list_native_file_objects,
-    publish_manifest_to_native_file, read_current_manifest_from_native_file,
-    read_native_file_object_bytes, record_timed_storage_future, record_timed_storage_result,
+    StorageObjectId, StorageObjectListBackend, StorageObjectListPage, StorageObjectListRequest,
+    StorageObjectReadBackend, StorageObjectWriteBackend, StorageOperation, StorageReadBackend,
+    StorageReadFuture, StorageWalRewriteBackend, StorageWriterLeaseBackend,
+    create_native_file_directory_all, delete_native_file_object, list_native_file_directory_files,
+    list_native_file_objects, paginate_storage_objects, publish_manifest_to_native_file,
+    read_current_manifest_from_native_file, read_native_file_object_bytes,
+    record_timed_storage_future, record_timed_storage_result,
     requires_parent_dir_sync_after_rename, rewrite_native_file_wal,
     sync_native_file_directory_after_renames, sync_native_file_parent_directory_after_rename,
     write_native_file_object,
@@ -715,6 +716,18 @@ impl StorageObjectListBackend for NativeFileBackend {
 
         self.run_owned_storage_task(StorageOperation::ListObjects, move || {
             list_native_file_objects(&request)
+        })
+    }
+
+    fn list_objects_page(
+        &self,
+        request: StorageObjectListRequest,
+        after: Option<&str>,
+        limit: usize,
+    ) -> StorageFuture<'_, StorageObjectListPage> {
+        let after = after.map(str::to_owned);
+        Box::pin(async move {
+            paginate_storage_objects(self.list_objects(request).await?, after.as_deref(), limit)
         })
     }
 }

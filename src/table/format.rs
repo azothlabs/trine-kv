@@ -16,7 +16,7 @@ use super::{
     StorageReadBackend, StorageReadObject, StorageReadSource, TABLE_MAGIC, TABLE_VERSION, Table,
     TableBlobReference, TableDataBlock, TableFilterStats, TableFooter, TableId, TableLevel,
     TablePointRecord, TableProperties, TableRangeTombstone, TableReadPathStats, TableSection,
-    VALUE_BLOB, VALUE_BLOB_INDEX, VALUE_INLINE, VALUE_KIND_POINT_DELETE, VALUE_KIND_PUT,
+    VALUE_BLOB_INDEX, VALUE_INLINE, VALUE_KIND_POINT_DELETE, VALUE_KIND_PUT,
     VALUE_KIND_RANGE_DELETE, VALUE_NONE, ValueKind, ValueRef, ValueRefHeader, block_bounds,
     checksum, index_partitions_for_loaded_blocks, limits, range_tombstone,
     should_pin_read_metadata, table_properties, table_read_source,

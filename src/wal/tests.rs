@@ -21,7 +21,13 @@ use std::{
 };
 
 use crate::{
-    limits, options::DurabilityMode, storage::NativeFileBackend, types::Sequence,
+    limits,
+    options::DurabilityMode,
+    storage::{
+        NativeFileBackend, StorageObjectKind,
+        fault_injection::{StorageFaultGuard, StorageFaultPoint},
+    },
+    types::Sequence,
     write_batch::BatchOperation,
 };
 
@@ -108,6 +114,71 @@ fn wal_front_door_rewrite_reopens_append_lane() {
         .map(|batch| batch.sequence)
         .collect::<Vec<_>>();
     assert_eq!(sequences, vec![Sequence::new(2), Sequence::new(3)]);
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn partial_append_failure_permanently_stops_the_lane() {
+    let dir = temp_dir("front-door-partial-append");
+    fs::create_dir_all(&dir).expect("create WAL test dir");
+    let path = dir.join(WAL_FILE_NAME);
+    let backend = NativeFileBackend::new();
+    let front_door =
+        WalFrontDoor::open_single_lane_with_backend(&backend, &path).expect("front door opens");
+    let _fault = StorageFaultGuard::install(
+        &dir,
+        StorageFaultPoint::WalAppendPartial,
+        Some(StorageObjectKind::Wal),
+        1,
+    );
+
+    front_door
+        .accept_commit(Sequence::new(1), &[put("a", "one")], DurabilityMode::Flush)
+        .expect_err("partial append is reported");
+    let partial_len = fs::metadata(&path).expect("partial WAL metadata").len();
+    front_door
+        .accept_commit(Sequence::new(2), &[put("b", "two")], DurabilityMode::Flush)
+        .expect_err("failed lane rejects every later commit");
+    assert_eq!(
+        fs::metadata(&path).expect("stopped WAL metadata").len(),
+        partial_len,
+        "no frame may be appended after a partial tail"
+    );
+    drop(front_door);
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn rewrite_failure_permanently_stops_the_lane() {
+    let dir = temp_dir("front-door-rewrite-failure");
+    fs::create_dir_all(&dir).expect("create WAL test dir");
+    let path = dir.join(WAL_FILE_NAME);
+    let backend = NativeFileBackend::new();
+    let front_door =
+        WalFrontDoor::open_single_lane_with_backend(&backend, &path).expect("front door opens");
+    front_door
+        .accept_commit(Sequence::new(1), &[put("a", "one")], DurabilityMode::Flush)
+        .expect("seed WAL");
+    let _fault = StorageFaultGuard::install(
+        &dir,
+        StorageFaultPoint::WalRewritePublish,
+        Some(StorageObjectKind::Wal),
+        1,
+    );
+
+    front_door
+        .rewrite_after_replay_floor(Sequence::new(1))
+        .expect_err("rewrite failure is reported");
+    let stopped_len = fs::metadata(&path).expect("WAL metadata").len();
+    front_door
+        .accept_commit(Sequence::new(2), &[put("b", "two")], DurabilityMode::Flush)
+        .expect_err("failed rewrite closes the lane");
+    assert_eq!(
+        fs::metadata(&path).expect("stopped WAL metadata").len(),
+        stopped_len,
+        "no append may continue after an uncertain rewrite"
+    );
+    drop(front_door);
     cleanup_dir(&dir);
 }
 

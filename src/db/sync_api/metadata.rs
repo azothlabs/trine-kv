@@ -6,6 +6,10 @@ use super::{
 };
 
 impl Db {
+    pub(crate) fn snapshot_sequence(&self, snapshot: &Snapshot) -> Result<Sequence> {
+        snapshot.read_sequence_for(&self.inner.snapshots)
+    }
+
     /// Creates a snapshot at the latest visible read version.
     ///
     /// Reads through the returned [`Snapshot`] see the database as of the
@@ -184,10 +188,13 @@ impl Db {
     /// [`Self::create_checkpoint_at_sync`].
     pub(in crate::db) fn record_checkpoint(&self, name: &str, sequence: Sequence) -> Result<()> {
         if let Some(manifest) = &self.inner.manifest {
-            manifest
+            let result = manifest
                 .lock()
                 .map_err(|_| lock_poisoned("manifest store"))?
-                .create_checkpoint(name.to_owned(), sequence)?;
+                .create_checkpoint(name.to_owned(), sequence);
+            result.map_err(|error| {
+                self.close_after_manifest_durability_failure("checkpoint creation", error)
+            })?;
         } else {
             let mut checkpoints = self
                 .inner
@@ -239,10 +246,13 @@ impl Db {
         }
 
         if let Some(manifest) = &self.inner.manifest {
-            manifest
+            let result = manifest
                 .lock()
                 .map_err(|_| lock_poisoned("manifest store"))?
-                .delete_checkpoint(name.to_owned())?;
+                .delete_checkpoint(name.to_owned());
+            result.map_err(|error| {
+                self.close_after_manifest_durability_failure("checkpoint deletion", error)
+            })?;
         } else {
             let mut checkpoints = self
                 .inner
@@ -637,5 +647,9 @@ impl Db {
         } else {
             Ok(())
         }
+    }
+
+    pub(crate) fn begin_activity(&self) -> Result<crate::db::PublishActivityGuard<'_>> {
+        self.inner.publish_barrier.begin_activity()
     }
 }

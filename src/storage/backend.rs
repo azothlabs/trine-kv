@@ -11,9 +11,9 @@ use super::{
     StorageCapabilities, StorageDirectoryCreateBackend, StorageDirectoryFile, StorageDirectoryId,
     StorageDirectoryListBackend, StorageDirectorySyncBackend, StorageFuture,
     StorageManifestPublishBackend, StorageManifestReadBackend, StorageObjectDeleteBackend,
-    StorageObjectId, StorageObjectListBackend, StorageObjectListRequest, StorageObjectReadBackend,
-    StorageObjectWriteBackend, StorageReadBackend, StorageReadFuture, StorageReadObject,
-    StorageWalRewriteBackend, StorageWriterLeaseBackend,
+    StorageObjectId, StorageObjectListBackend, StorageObjectListPage, StorageObjectListRequest,
+    StorageObjectReadBackend, StorageObjectWriteBackend, StorageReadBackend, StorageReadFuture,
+    StorageReadObject, StorageWalRewriteBackend, StorageWriterLeaseBackend,
 };
 
 /// The storage backend the engine binds to, dispatched as an enum so the
@@ -313,6 +313,20 @@ impl StorageObjectListBackend for StorageBackend {
         match self {
             StorageBackend::Native(backend) => backend.list_objects(request),
             StorageBackend::ObjectStore(backend) => backend.list_objects(request),
+        }
+    }
+
+    fn list_objects_page(
+        &self,
+        request: StorageObjectListRequest,
+        after: Option<&str>,
+        limit: usize,
+    ) -> StorageFuture<'_, StorageObjectListPage> {
+        match self {
+            StorageBackend::Native(backend) => backend.list_objects_page(request, after, limit),
+            StorageBackend::ObjectStore(backend) => {
+                backend.list_objects_page(request, after, limit)
+            }
         }
     }
 }

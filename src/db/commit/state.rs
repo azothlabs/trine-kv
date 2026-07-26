@@ -19,6 +19,13 @@ pub(super) struct WriteRequest {
     pub(super) commit_sequence_stamps: Vec<CommitSequenceStamp>,
     pub(super) write_options: WriteOptions,
     pub(super) transaction_reads: Option<TransactionReads>,
+    pub(super) expected_bucket: Option<ExpectedBucketState>,
+}
+
+#[derive(Debug)]
+pub(in crate::db) struct ExpectedBucketState {
+    pub(in crate::db) name: String,
+    pub(in crate::db) state: Arc<LsmTree>,
 }
 
 #[derive(Debug)]
@@ -177,7 +184,19 @@ impl WriteRequest {
             commit_sequence_stamps,
             write_options,
             transaction_reads: None,
+            expected_bucket: None,
         }
+    }
+
+    pub(super) fn batch_for_bucket(
+        batch: WriteBatch,
+        write_options: WriteOptions,
+        name: String,
+        state: Arc<LsmTree>,
+    ) -> Self {
+        let mut request = Self::batch(batch, write_options);
+        request.expected_bucket = Some(ExpectedBucketState { name, state });
+        request
     }
 
     pub(super) fn transaction(
@@ -195,6 +214,7 @@ impl WriteRequest {
                 read_sequence,
                 read_set,
             }),
+            expected_bucket: None,
         }
     }
 }
@@ -244,9 +264,11 @@ impl PreparedCommit {
             .map(Arc::clone)
             .map(|state| state.admit_write())
             .collect::<Result<Vec<_>>>()?;
-        let estimated_bytes = deltas.iter().fold(0_u64, |bytes, delta| {
-            bytes.saturating_add(delta.estimated_bytes)
-        });
+        let estimated_bytes = deltas.iter().try_fold(0_u64, |bytes, delta| {
+            bytes
+                .checked_add(delta.estimated_bytes)
+                .ok_or_else(|| Error::invalid_options("prepared write size overflow"))
+        })?;
         Ok(Self {
             write_options,
             transaction_reads,

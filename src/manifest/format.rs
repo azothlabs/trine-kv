@@ -2,11 +2,10 @@ use super::{
     Arc, BTreeMap, BlobLevelMergePolicy, BlockingStorageManifestPublishBackend,
     BlockingStorageManifestReadBackend, BucketOptions, CodecId, CompressionProfile, DurabilityMode,
     Error, FilterDepthCurve, FilterPolicy, HEADER_LEN, IndexSearchPolicy, InternalKey,
-    MANIFEST_MAGIC, MANIFEST_VERSION, MIN_SUPPORTED_MANIFEST_VERSION, MIN_TABLE_PROPERTY_BYTES,
-    ManifestState, NativeFileBackend, Path, PrefixExtractor, PrefixFilterPolicy, PublishOutcome,
-    Result, Sequence, StorageManifestPublishBackend, StorageManifestReadBackend, StorageObjectId,
-    StorageObjectKind, TableBlobReference, TableId, TableLevel, TableProperties, ValueKind, io,
-    limits,
+    MANIFEST_MAGIC, MANIFEST_VERSION, MIN_TABLE_PROPERTY_BYTES, ManifestState, NativeFileBackend,
+    Path, PrefixExtractor, PrefixFilterPolicy, PublishOutcome, Result, Sequence,
+    StorageManifestPublishBackend, StorageManifestReadBackend, StorageObjectId, StorageObjectKind,
+    TableBlobReference, TableId, TableLevel, TableProperties, ValueKind, io, limits,
 };
 
 #[cfg(test)]
@@ -71,7 +70,15 @@ pub(super) fn publish_manifest_with_backend(
 ) -> Result<PublishOutcome> {
     let bytes = encode_manifest_bytes(state)?;
     let object = manifest_storage_object(path);
-    backend.publish_manifest_blocking(object, bytes, native_manifest_publish_durability())?;
+    if let Err(error) =
+        backend.publish_manifest_blocking(object, bytes, native_manifest_publish_durability())
+    {
+        return if error.manifest_was_published() {
+            Ok(PublishOutcome::PublishedDurabilityUnknown { error })
+        } else {
+            Err(error)
+        };
+    }
     // Temp-write + atomic rename cannot lose a CAS race, so the filesystem
     // manifest always advances.
     Ok(PublishOutcome::Published)
@@ -99,7 +106,13 @@ where
 {
     let bytes = encode_manifest_bytes(state)?;
     let object = manifest_storage_object(path);
-    backend.publish_manifest(object, bytes, durability).await?;
+    if let Err(error) = backend.publish_manifest(object, bytes, durability).await {
+        return if error.manifest_was_published() {
+            Ok(PublishOutcome::PublishedDurabilityUnknown { error })
+        } else {
+            Err(error)
+        };
+    }
     Ok(PublishOutcome::Published)
 }
 
@@ -131,6 +144,8 @@ pub(super) fn manifest_storage_object(path: &Path) -> StorageObjectId {
 }
 
 pub(super) fn encode_state(state: &ManifestState) -> Result<Vec<u8>> {
+    state.validate_next_file_id()?;
+    state.validate_bucket_generations()?;
     let mut bytes = Vec::new();
     let bucket_count = u32::try_from(state.buckets.len())
         .map_err(|_| Error::invalid_options("too many buckets for manifest"))?;
@@ -140,11 +155,21 @@ pub(super) fn encode_state(state: &ManifestState) -> Result<Vec<u8>> {
     for (name, options) in &state.buckets {
         put_bytes(&mut bytes, name.as_bytes())?;
         put_bucket_options(&mut bytes, options)?;
+        put_u64(
+            &mut bytes,
+            state
+                .bucket_generation(name)
+                .ok_or_else(|| Error::Corruption {
+                    message: format!("bucket {name:?} is missing its generation"),
+                })?,
+        );
     }
     put_tables(&mut bytes, &state.tables)?;
     put_pending_blob_deletions(&mut bytes, &state.pending_blob_deletions)?;
     put_checkpoints(&mut bytes, &state.checkpoints)?;
     put_u64(&mut bytes, state.writer_epoch);
+    put_u64(&mut bytes, state.next_file_id);
+    put_u64(&mut bytes, state.next_bucket_generation);
 
     Ok(bytes)
 }
@@ -168,7 +193,7 @@ pub(super) fn decode_manifest(bytes: &[u8]) -> Result<ManifestState> {
             message: "manifest magic mismatch".to_owned(),
         });
     }
-    if !(MIN_SUPPORTED_MANIFEST_VERSION..=MANIFEST_VERSION).contains(&version) {
+    if version != MANIFEST_VERSION {
         return Err(Error::UnsupportedFormat {
             message: format!("unsupported manifest version {version}"),
         });
@@ -196,6 +221,8 @@ pub(super) fn decode_state(payload: &[u8]) -> Result<ManifestState> {
     let wal_replay_floor = Sequence::new(cursor.read_u64()?);
     let bucket_count = cursor.read_u32()? as usize;
     let mut buckets = BTreeMap::new();
+    let mut bucket_generations = BTreeMap::new();
+    let mut previous_bucket = None::<String>;
 
     for _ in 0..bucket_count {
         let name =
@@ -203,25 +230,42 @@ pub(super) fn decode_state(payload: &[u8]) -> Result<ManifestState> {
                 message: "manifest bucket name is not valid UTF-8".to_owned(),
             })?;
         let options = cursor.read_bucket_options()?;
-        buckets.insert(name, options);
+        let generation = cursor.read_u64()?;
+        if previous_bucket
+            .as_ref()
+            .is_some_and(|previous| previous >= &name)
+        {
+            return Err(invalid_manifest("manifest buckets are not strictly sorted"));
+        }
+        bucket_generations.insert(name.clone(), generation);
+        buckets.insert(name.clone(), options);
+        previous_bucket = Some(name);
     }
     let tables = cursor.read_tables()?;
     let pending_blob_deletions = cursor.read_pending_blob_deletions()?;
     let checkpoints = cursor.read_checkpoints()?;
     let writer_epoch = cursor.read_u64()?;
+    let next_file_id = cursor.read_u64()?;
+    let next_bucket_generation = cursor.read_u64()?;
 
     if !cursor.is_finished() {
         return Err(invalid_manifest("trailing payload bytes"));
     }
 
-    Ok(ManifestState {
+    let state = ManifestState {
         wal_replay_floor,
         buckets,
+        bucket_generations,
         tables,
         pending_blob_deletions,
         checkpoints,
+        next_file_id,
+        next_bucket_generation,
         writer_epoch,
-    })
+    };
+    state.validate_next_file_id()?;
+    state.validate_bucket_generations()?;
+    Ok(state)
 }
 
 pub(super) fn put_bucket_options(bytes: &mut Vec<u8>, options: &BucketOptions) -> Result<()> {
@@ -592,6 +636,7 @@ impl<'payload> Cursor<'payload> {
     fn read_tables(&mut self) -> Result<BTreeMap<String, Vec<TableProperties>>> {
         let table_bucket_count = self.read_u32()? as usize;
         let mut tables = BTreeMap::new();
+        let mut previous_bucket = None::<String>;
 
         for _ in 0..table_bucket_count {
             let bucket = String::from_utf8(self.read_bytes()?.to_vec()).map_err(|_| {
@@ -599,6 +644,14 @@ impl<'payload> Cursor<'payload> {
                     message: "manifest table bucket is not valid UTF-8".to_owned(),
                 }
             })?;
+            if previous_bucket
+                .as_ref()
+                .is_some_and(|previous| previous >= &bucket)
+            {
+                return Err(invalid_manifest(
+                    "manifest table buckets are not strictly sorted",
+                ));
+            }
             let table_count = self.read_u32()? as usize;
             if table_count > self.remaining_len() / MIN_TABLE_PROPERTY_BYTES {
                 return Err(invalid_manifest("table count exceeds payload bytes"));
@@ -607,7 +660,8 @@ impl<'payload> Cursor<'payload> {
             for _ in 0..table_count {
                 table_list.push(self.read_table_properties()?);
             }
-            tables.insert(bucket, table_list);
+            tables.insert(bucket.clone(), table_list);
+            previous_bucket = Some(bucket);
         }
 
         Ok(tables)
@@ -804,7 +858,7 @@ impl<'payload> Cursor<'payload> {
         match self.read_u8()? {
             0 => Ok(IndexSearchPolicy::Linear),
             1 => Ok(IndexSearchPolicy::Binary),
-            2..=4 => Ok(IndexSearchPolicy::Auto),
+            4 => Ok(IndexSearchPolicy::Auto),
             tag => Err(Error::InvalidFormat {
                 message: format!("unknown manifest index search policy {tag}"),
             }),

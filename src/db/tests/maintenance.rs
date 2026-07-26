@@ -135,6 +135,70 @@ fn write_pressure_maintenance_reports_foreground_progress() {
 }
 
 #[test]
+fn partial_cross_bucket_flush_keeps_wal_needed_by_older_bucket() {
+    let path = temp_db_path("partial-cross-bucket-flush-wal-floor");
+    let mut options = DbOptions::persistent(&path);
+    options.background_worker_count = 0;
+    options.write_buffer_bytes = 1;
+    options.max_l0_files = 64;
+    let db = Db::open_sync(options.clone()).expect("open db");
+    let older = db.bucket_sync("z-older").expect("open older bucket");
+    let newer = db.bucket_sync("a-newer").expect("open newer bucket");
+
+    older
+        .put_sync(b"older-key", b"older-value")
+        .expect("write older immutable");
+    newer
+        .put_sync(b"newer-key", b"newer-value")
+        .expect("write newer immutable");
+
+    let (_, outcome) = db
+        .run_flush_once_with_budget(&path, false, MaintenanceBudget::single_unit())
+        .expect("flush one immutable");
+    assert_eq!(outcome.flushes, 1);
+
+    let replay_floor = db
+        .inner
+        .manifest
+        .as_ref()
+        .expect("persistent manifest")
+        .lock()
+        .expect("manifest lock")
+        .state()
+        .wal_replay_floor();
+    assert_eq!(
+        replay_floor,
+        Sequence::ZERO,
+        "the newer bucket's table must not retire the older bucket's WAL"
+    );
+
+    drop(newer);
+    drop(older);
+    drop(db);
+
+    let reopened = Db::open_sync(options).expect("reopen db");
+    assert_eq!(
+        reopened
+            .bucket_sync("z-older")
+            .expect("older bucket")
+            .get_sync(b"older-key")
+            .expect("read older value"),
+        Some(b"older-value".to_vec())
+    );
+    assert_eq!(
+        reopened
+            .bucket_sync("a-newer")
+            .expect("newer bucket")
+            .get_sync(b"newer-key")
+            .expect("read newer value"),
+        Some(b"newer-value".to_vec())
+    );
+
+    drop(reopened);
+    fs::remove_dir_all(path).expect("cleanup test db");
+}
+
+#[test]
 fn persistent_open_attaches_runtime_enabled_native_storage_backend() {
     let path = temp_db_path("persistent-runtime-native-storage");
     let mut options = DbOptions::persistent(&path);

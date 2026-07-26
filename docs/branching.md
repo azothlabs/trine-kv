@@ -185,9 +185,10 @@ async `Db::drop_bucket` (adds object store and browser).
   bucket's tables keeps working and the files are freed only once no reference
   remains; a `flush_sync` first advances the WAL replay floor so recovery never
   replays into a dropped bucket.
-- **Object store**: remove the bucket from the manifest via a CAS publish, making
-  its table and blob objects unreferenced, then reclaim them with the existing
-  snapshot-safe **orphan GC** (`cleanup_object_store_orphans_async`).
+- **Object store**: remove the bucket from the manifest via a CAS publish. Table
+  and blob objects are immutable and retained because a writer cannot prove that
+  another process has retired an older read-only manifest. Physical reclamation
+  stays disabled until that reader-retirement state is durable.
 - **Browser**: publish the removal to the IndexedDB-backed manifest (marking its
   blobs), then retire its table and blob files through the browser async cleanup.
 

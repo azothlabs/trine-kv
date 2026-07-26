@@ -34,13 +34,14 @@ mod state;
 pub(super) use helpers::replay_wal_batches_into_buckets;
 use helpers::{
     effective_durability, include_max_key, include_min_key, operation_estimated_bytes,
-    unique_lsm_trees, validate_operation_resource_bounds,
+    unique_lsm_trees, validate_operation_resource_bounds, validate_operation_storage_encoding,
 };
 #[cfg(all(
     not(all(target_arch = "wasm32", target_os = "unknown")),
     not(target_os = "wasi")
 ))]
 use state::BackgroundWriteFuture;
+pub(in crate::db) use state::ExpectedBucketState;
 use state::{
     AcceptedWrite, AcceptedWriteState, DurableSequencedWrite, PreparedCommit, PreparedShardDelta,
     PreparedShardId, PublishedWrite, SequencedWrite, SequencedWriteState, TransactionReads,
@@ -63,6 +64,21 @@ impl Db {
         self.run_accepted_write(WriteRequest::batch(batch, options))
     }
 
+    pub(crate) fn write_bucket_sync(
+        &self,
+        batch: WriteBatch,
+        options: WriteOptions,
+        name: String,
+        state: Arc<LsmTree>,
+    ) -> Result<CommitInfo> {
+        if self.inner.options.storage_mode.is_browser_persistent() {
+            return Err(Error::unsupported_backend(
+                "browser persistent writes require async API",
+            ));
+        }
+        self.run_accepted_write(WriteRequest::batch_for_bucket(batch, options, name, state))
+    }
+
     #[must_use = "write futures do nothing unless polled"]
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     /// Commits an atomic write batch asynchronously with explicit write
@@ -73,6 +89,18 @@ impl Db {
         options: WriteOptions,
     ) -> impl Future<Output = Result<CommitInfo>> + Send + 'static {
         self.run_accepted_write_async(WriteRequest::batch(batch, options))
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    pub(crate) async fn write_bucket(
+        &self,
+        batch: WriteBatch,
+        options: WriteOptions,
+        name: String,
+        state: Arc<LsmTree>,
+    ) -> Result<CommitInfo> {
+        self.run_accepted_write_async(WriteRequest::batch_for_bucket(batch, options, name, state))
+            .await
     }
 
     #[must_use = "write futures do nothing unless polled"]
@@ -94,6 +122,20 @@ impl Db {
             db.run_owned_write_request_async(WriteRequest::batch(batch, options))
                 .await
         }
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    pub(crate) async fn write_bucket(
+        &self,
+        batch: WriteBatch,
+        options: WriteOptions,
+        name: String,
+        state: Arc<LsmTree>,
+    ) -> Result<CommitInfo> {
+        self.run_owned_write_request_async(WriteRequest::batch_for_bucket(
+            batch, options, name, state,
+        ))
+        .await
     }
 
     pub(crate) fn commit_transaction(
@@ -187,6 +229,7 @@ impl Db {
         not(target_os = "wasi")
     ))]
     async fn commit_write_request_async(&self, request: WriteRequest) -> Result<CommitInfo> {
+        let _publish_activity = self.inner.publish_barrier.begin_activity()?;
         let accepted_state = self.accept_write_request_with_wal_preaccept(request, false)?;
         self.publish_accepted_write_state_async(accepted_state)
             .await
@@ -236,6 +279,7 @@ impl Db {
             commit_sequence_stamps,
             write_options,
             transaction_reads,
+            expected_bucket,
         } = request;
         self.ensure_open()?;
 
@@ -268,6 +312,7 @@ impl Db {
             commit_sequence_stamps,
             write_options,
             transaction_reads,
+            expected_bucket.as_ref(),
         )?;
         let wal_accept = if preaccept_wal {
             self.preaccept_wal_front_door_if_ready(&prepared)?
@@ -405,8 +450,14 @@ impl Db {
             && let Err(error) =
                 self.accept_wal_front_door(slot.sequence(), &prepared.wal_operations, durability)
         {
-            self.inner.commit_tracker.mark_skipped(slot)?;
-            return Err(error);
+            if matches!(
+                error,
+                Error::RuntimeBusy { .. } | Error::InvalidOptions { .. }
+            ) {
+                self.inner.commit_tracker.mark_skipped(slot)?;
+                return Err(error);
+            }
+            return Err(self.close_after_wal_acceptance_failure(slot.sequence(), &error));
         }
 
         Ok(DurableSequencedWrite::new(prepared, slot))
@@ -421,19 +472,62 @@ impl Db {
             AcceptedWriteState::Noop(commit_info) => Ok(commit_info),
             AcceptedWriteState::Pending(writer_state) => {
                 let durable = if self.inner.options.storage_mode.is_object_store_persistent() {
-                    // Object-store acceptance is synchronous. Keep reservation
-                    // and handoff ordered, then drop the std mutex before any
-                    // await or memtable publication.
-                    let _object_order = self
-                        .inner
-                        .object_wal_commit_order
-                        .lock()
-                        .map_err(|_| lock_poisoned("object WAL commit order"))?;
-                    let sequenced = match self.sequence_writer_local_state(writer_state)? {
-                        SequencedWriteState::Noop(commit_info) => return Ok(commit_info),
-                        SequencedWriteState::Pending(sequenced) => sequenced,
+                    // Sequence reservation and lane enqueue are one ordered
+                    // critical section. The potentially slow object-store
+                    // durability wait happens after releasing the std mutex,
+                    // allowing later commits to enter the lane and coalesce.
+                    let (prepared, slot, waiter) = {
+                        let _object_order = self
+                            .inner
+                            .object_wal_commit_order
+                            .lock()
+                            .map_err(|_| lock_poisoned("object WAL commit order"))?;
+                        let sequenced = match self.sequence_writer_local_state(writer_state)? {
+                            SequencedWriteState::Noop(commit_info) => return Ok(commit_info),
+                            SequencedWriteState::Pending(sequenced) => sequenced,
+                        };
+                        let SequencedWrite {
+                            prepared,
+                            slot,
+                            durability,
+                            accept_wal,
+                        } = sequenced;
+                        let waiter = if accept_wal {
+                            match self.inner.substrate.enqueue_object_commit(
+                                slot.sequence(),
+                                &prepared.wal_operations,
+                                durability,
+                            ) {
+                                Ok(waiter) => Some(waiter),
+                                Err(error)
+                                    if matches!(
+                                        error,
+                                        Error::RuntimeBusy { .. } | Error::InvalidOptions { .. }
+                                    ) =>
+                                {
+                                    self.inner.commit_tracker.mark_skipped(slot)?;
+                                    return Err(error);
+                                }
+                                Err(error) => {
+                                    return Err(self.close_after_wal_acceptance_failure(
+                                        slot.sequence(),
+                                        &error,
+                                    ));
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        (prepared, slot, waiter)
                     };
-                    self.accept_deferred_wal_for_sequenced_write(sequenced)?
+                    if let Some(waiter) = waiter
+                        && let Err(error) = waiter.wait().await
+                    {
+                        return Err(
+                            self.close_after_wal_acceptance_failure(slot.sequence(), &error)
+                        );
+                    }
+                    DurableSequencedWrite::new(prepared, slot)
                 } else {
                     let sequenced = match self.sequence_writer_local_state(writer_state)? {
                         SequencedWriteState::Noop(commit_info) => return Ok(commit_info),
@@ -484,8 +578,14 @@ impl Db {
                 .accept_wal_front_door_async(slot.sequence(), &prepared.wal_operations, durability)
                 .await
         {
-            self.inner.commit_tracker.mark_skipped(slot)?;
-            return Err(error);
+            if matches!(
+                error,
+                Error::RuntimeBusy { .. } | Error::InvalidOptions { .. }
+            ) {
+                self.inner.commit_tracker.mark_skipped(slot)?;
+                return Err(error);
+            }
+            return Err(self.close_after_wal_acceptance_failure(slot.sequence(), &error));
         }
 
         Ok(DurableSequencedWrite::new(prepared, slot))
@@ -586,6 +686,20 @@ impl Db {
         Err(Error::Corruption { message })
     }
 
+    fn close_after_wal_acceptance_failure(&self, sequence: Sequence, error: &Error) -> Error {
+        let message = format!(
+            "commit {} failed after WAL admission, so its durable outcome is unknown: {error}; \
+             database handle closed; reopen the database to determine the committed state",
+            sequence.get()
+        );
+        self.inner.closed.store(true, Ordering::Release);
+        self.inner.maintenance.record_error(Error::Corruption {
+            message: message.clone(),
+        });
+        self.inner.maintenance.shutdown();
+        Error::Corruption { message }
+    }
+
     fn preaccept_wal_front_door_if_ready(
         &self,
         prepared: &PreparedCommit,
@@ -603,8 +717,14 @@ impl Db {
         if let Err(error) =
             self.accept_wal_front_door(slot.sequence(), &prepared.wal_operations, durability)
         {
-            self.inner.commit_tracker.mark_skipped(slot)?;
-            return Err(error);
+            if matches!(
+                error,
+                Error::RuntimeBusy { .. } | Error::InvalidOptions { .. }
+            ) {
+                self.inner.commit_tracker.mark_skipped(slot)?;
+                return Err(error);
+            }
+            return Err(self.close_after_wal_acceptance_failure(slot.sequence(), &error));
         }
 
         Ok(WalAcceptState::Accepted(slot))
@@ -651,8 +771,12 @@ impl Db {
         commit_sequence_stamps: Vec<CommitSequenceStamp>,
         write_options: WriteOptions,
         transaction_reads: Option<TransactionReads>,
+        expected_bucket: Option<&ExpectedBucketState>,
     ) -> Result<PreparedCommit> {
-        let states = self.resolve_batch_buckets(&operations)?;
+        let states = self.resolve_batch_buckets(&operations, expected_bucket)?;
+        for (operation, state) in operations.iter().zip(&states) {
+            validate_operation_storage_encoding(operation, &state.options)?;
+        }
         let wal_operations = operations.clone();
         let mut deltas = Vec::new();
 

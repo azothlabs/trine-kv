@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::*;
-use crate::object_store::{ObjectFuture, ObjectMeta};
+use crate::object_store::{ObjectFuture, ObjectListPage, ObjectMeta};
 use crate::storage::NativeFileBackend;
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -70,8 +70,14 @@ impl ObjectClient for AppliedThenErroredClient {
         self.inner.get(key)
     }
 
-    fn get_range<'op>(&'op self, key: &str, offset: u64, len: u64) -> ObjectFuture<'op, Arc<[u8]>> {
-        self.inner.get_range(key, offset, len)
+    fn get_range<'op>(
+        &'op self,
+        key: &str,
+        offset: u64,
+        len: u64,
+        expected_etag: &ETag,
+    ) -> ObjectFuture<'op, Arc<[u8]>> {
+        self.inner.get_range(key, offset, len, expected_etag)
     }
 
     fn put<'op>(&'op self, key: &str, bytes: Arc<[u8]>) -> ObjectFuture<'op, ETag> {
@@ -84,6 +90,15 @@ impl ObjectClient for AppliedThenErroredClient {
 
     fn list<'op>(&'op self, prefix: &str) -> ObjectFuture<'op, Vec<ObjectMeta>> {
         self.inner.list(prefix)
+    }
+
+    fn list_page<'op>(
+        &'op self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> ObjectFuture<'op, ObjectListPage> {
+        self.inner.list_page(prefix, after, limit)
     }
 
     fn head<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<ObjectMeta>> {
@@ -141,8 +156,14 @@ impl ObjectClient for CountingObjectClient {
         self.inner.get(key)
     }
 
-    fn get_range<'op>(&'op self, key: &str, offset: u64, len: u64) -> ObjectFuture<'op, Arc<[u8]>> {
-        self.inner.get_range(key, offset, len)
+    fn get_range<'op>(
+        &'op self,
+        key: &str,
+        offset: u64,
+        len: u64,
+        expected_etag: &ETag,
+    ) -> ObjectFuture<'op, Arc<[u8]>> {
+        self.inner.get_range(key, offset, len, expected_etag)
     }
 
     fn put<'op>(&'op self, key: &str, bytes: Arc<[u8]>) -> ObjectFuture<'op, ETag> {
@@ -156,6 +177,15 @@ impl ObjectClient for CountingObjectClient {
 
     fn list<'op>(&'op self, prefix: &str) -> ObjectFuture<'op, Vec<ObjectMeta>> {
         self.inner.list(prefix)
+    }
+
+    fn list_page<'op>(
+        &'op self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> ObjectFuture<'op, ObjectListPage> {
+        self.inner.list_page(prefix, after, limit)
     }
 
     fn head<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<ObjectMeta>> {

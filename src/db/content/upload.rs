@@ -4,9 +4,10 @@ use super::{
     ContentPhysicalReservationRecord, ContentTokenIndexRecord, ContentUpload, ContentUploadInfo,
     ContentUploadMaintenanceReport, ContentUploadOptions, ContentUploadResume, Db, DurabilityMode,
     Error, Result, SealedContent, Sha256, StorageDomainId, TransactionOptions, UploadId,
-    UploadSessionState, UploadSessionStatus, UploadToken, UploadTokenRecord, WriteOptions,
-    content_physical_account_key, content_physical_quota_key, content_physical_reservation_key,
-    content_token_index_key, current_epoch_millis, initial_upload_reservation, upload_token_key,
+    UploadIdRetirement, UploadSessionState, UploadSessionStatus, UploadToken, UploadTokenRecord,
+    WriteOptions, content_physical_account_key, content_physical_quota_key,
+    content_physical_reservation_key, content_token_index_key, current_epoch_millis,
+    decode_upload_id_tombstone, initial_upload_reservation, upload_token_key,
 };
 use sha2::Digest;
 
@@ -23,6 +24,7 @@ impl Db {
     /// Returns storage, listing, decoding, and integrity errors. A malformed
     /// state fails the complete listing instead of being silently skipped.
     pub async fn list_content_uploads(&self) -> Result<Vec<ContentUploadInfo>> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         self.list_upload_states().await.map(|states| {
             states
@@ -54,10 +56,15 @@ impl Db {
         &self,
         inactive_before_unix_ms: u64,
     ) -> Result<ContentUploadMaintenanceReport> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
+        // Tombstones are permanent. Revisit them on every maintenance pass so
+        // an eventually consistent listing cannot turn a missed first cleanup
+        // into a permanent orphan.
+        self.cleanup_retired_upload_chunks().await?;
         let candidates = self.list_upload_states().await?;
         let mut report = ContentUploadMaintenanceReport::default();
         for candidate in candidates {
@@ -89,25 +96,32 @@ impl Db {
 
     /// Removes sealed upload state older than an exclusive cutoff.
     ///
-    /// This only removes the upload-idempotency record. The immutable content
+    /// This replaces the full upload-idempotency record with a permanent,
+    /// lightweight upload-id tombstone. The immutable content
     /// descriptor, chunks selected by that descriptor, attachment token, and
-    /// quota accounting remain unchanged. After pruning, retrying seal or resume
-    /// by the old `UploadId` returns [`Error::ContentUploadNotFound`].
+    /// quota accounting remain unchanged. The tombstone prevents the public
+    /// `UploadId` from ever being rebound to the same physical chunk namespace.
+    /// After pruning, retrying begin, seal, resume, or abort by the old identity
+    /// returns [`Error::ContentUploadSealed`].
     ///
     /// Sealing records are retained because they may still need crash recovery.
     /// # Errors
     ///
-    /// Returns read-only, storage, listing, decoding, or deletion errors. Every
-    /// successful deletion is final even if a later candidate fails; retrying
-    /// the same cutoff is safe.
+    /// Returns read-only, storage, listing, decoding, or write errors. Every
+    /// successful retirement is final even if a later candidate fails;
+    /// retrying the same cutoff is safe.
     pub async fn prune_sealed_content_uploads(
         &self,
         sealed_before_unix_ms: u64,
     ) -> Result<ContentUploadMaintenanceReport> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
+        // Sealed tombstones retain canonical chunks but no longer need any
+        // revisioned partial; aborted tombstones own no live chunks at all.
+        self.cleanup_retired_upload_chunks().await?;
         let candidates = self.list_upload_states().await?;
         let mut report = ContentUploadMaintenanceReport::default();
         for candidate in candidates {
@@ -126,7 +140,8 @@ impl Db {
             if current.updated_at_unix_ms() < sealed_before_unix_ms
                 && matches!(current.status(), UploadSessionStatus::Sealed(_))
             {
-                self.delete_upload_state(upload_id).await?;
+                self.retire_upload_id(upload_id, UploadIdRetirement::Sealed)
+                    .await?;
                 report.pruned_sealed = report.pruned_sealed.saturating_add(1);
             }
         }
@@ -154,6 +169,7 @@ impl Db {
         storage_domain_id: StorageDomainId,
         limit: Option<u64>,
     ) -> Result<ContentPhysicalQuota> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
@@ -196,6 +212,7 @@ impl Db {
         &self,
         storage_domain_id: StorageDomainId,
     ) -> Result<ContentPhysicalQuota> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         self.internal_bucket(CONTENT_CONTROL_BUCKET).await?;
         let mut transaction = self.transaction(TransactionOptions::default());
@@ -275,6 +292,7 @@ impl Db {
         &self,
         options: ContentUploadOptions,
     ) -> Result<ContentUpload> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
@@ -324,9 +342,8 @@ impl Db {
     /// Returns [`Error::InvalidOptions`] for invalid options or an identity
     /// already bound to different options, [`Error::Closed`] or
     /// [`Error::ReadOnly`] when writes are unavailable, and typed backend,
-    /// integrity, or recovery errors. An aborted identity is absent and may be
-    /// started again; callers that require permanent request identity should not
-    /// retry begin after a confirmed abort.
+    /// integrity, or recovery errors. Aborted and sealed identities are
+    /// permanently retired and cannot be started again.
     ///
     /// # Examples
     ///
@@ -359,6 +376,7 @@ impl Db {
         upload_id: UploadId,
         options: ContentUploadOptions,
     ) -> Result<ContentUploadResume> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
@@ -367,6 +385,16 @@ impl Db {
         let upload_guard = self.lock_content_upload(upload_id).await;
         let object = self.content_upload_state_object(upload_id)?;
         if let Some(bytes) = self.read_content_object(object).await? {
+            if let Some(retirement) = decode_upload_id_tombstone(&bytes, upload_id)? {
+                return Err(match retirement {
+                    UploadIdRetirement::Sealed => Error::ContentUploadSealed {
+                        upload_id: upload_id.to_string(),
+                    },
+                    UploadIdRetirement::Aborted => Error::ContentUploadNotFound {
+                        upload_id: upload_id.to_string(),
+                    },
+                });
+            }
             let state = UploadSessionState::decode(&bytes, upload_id)?;
             if state.status() == UploadSessionStatus::Aborting {
                 self.discard_open_upload(&state).await?;
@@ -465,6 +493,7 @@ impl Db {
     /// }
     /// ```
     pub async fn resume_content_upload(&self, upload_id: UploadId) -> Result<ContentUploadResume> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         let upload_guard = self.lock_content_upload(upload_id).await;
         let state = self.require_upload_state(upload_id).await?;
@@ -482,7 +511,11 @@ impl Db {
                 let mut buffer = Vec::with_capacity(state.options().chunk_bytes());
                 if state.partial_len() != 0 {
                     let frame = self
-                        .read_content_chunk(upload_id, state.complete_chunks())
+                        .read_content_partial_chunk(
+                            upload_id,
+                            state.complete_chunks(),
+                            state.revision(),
+                        )
                         .await?
                         .ok_or_else(|| Error::Corruption {
                             message: format!(
@@ -525,17 +558,18 @@ impl Db {
     ///
     /// The complete SHA-256 is recomputed from verified durable chunks, so this
     /// works after process restart without serializing hash-library internals.
-    /// Descriptor publication happens first, followed by a durable `sealing`
-    /// checkpoint, one transactional token record, and the final `sealed`
-    /// checkpoint. A retry after any crash observes those records and returns
-    /// the same bearer token, expiry, identity, length, and durability result.
+    /// A durable `sealing` checkpoint is published before the descriptor,
+    /// followed by one transactional token record and the final `sealed`
+    /// checkpoint. A retry after any crash completes any missing descriptor and
+    /// returns the same bearer token, expiry, identity, length, and durability
+    /// result.
     ///
     /// # Errors
     ///
     /// Returns [`Error::ContentUploadNotFound`], a typed expected length/digest
     /// mismatch, or a storage/format/integrity error. An expectation mismatch
-    /// aborts the session. Other failures before descriptor publication leave
-    /// the upload open and resumable.
+    /// aborts the session. Failures after the durable `sealing` checkpoint leave
+    /// the upload in an idempotently completable state.
     pub async fn seal_content_upload(&self, upload_id: UploadId) -> Result<SealedContent> {
         self.seal_content_upload_at(upload_id, None).await
     }
@@ -545,6 +579,7 @@ impl Db {
         upload_id: UploadId,
         expected_revision: Option<u64>,
     ) -> Result<SealedContent> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
@@ -599,21 +634,14 @@ impl Db {
                 message: "sealed upload entered seal preparation".to_owned(),
             }),
             UploadSessionStatus::Sealing(sealed) => {
-                let descriptor = self
-                    .read_content_descriptor(sealed.storage_domain_id(), sealed.content_id())
-                    .await?
-                    .ok_or_else(|| Error::Corruption {
-                        message: format!(
-                            "sealing upload {upload_id} is missing content descriptor {}",
-                            sealed.content_id()
-                        ),
-                    })?;
-                let descriptor = ContentDescriptor::decode(
-                    &descriptor,
+                let _seal = self.lock_content_seal().await;
+                self.require_content_descriptor_publication_allowed(
                     sealed.storage_domain_id(),
                     sealed.content_id(),
-                )?;
-                Ok((*state, sealed, descriptor.upload_id() != upload_id))
+                )
+                .await?;
+                let reused = self.ensure_sealing_descriptor(state, sealed).await?;
+                Ok((*state, sealed, reused))
             }
             UploadSessionStatus::Open => self.prepare_open_upload_seal(state).await,
             UploadSessionStatus::Aborting => Err(Error::ContentUploadNotFound {
@@ -651,18 +679,61 @@ impl Db {
             .checked_add(state.options().token_ttl_ms()?)
             .ok_or_else(|| Error::invalid_options("upload token expiry overflow"))?;
         let storage_domain_id = state.options().attachment_scope().storage_domain_id();
-        let descriptor = ContentDescriptor::new(
-            storage_domain_id,
-            content_id,
-            upload_id,
-            state.length(),
-            state.options().chunk_bytes(),
-            state.chunk_count(),
-        )?;
         let seal_guard = self.lock_content_seal().await;
         self.require_content_descriptor_publication_allowed(storage_domain_id, content_id)
             .await?;
-        let reused = if let Some(existing) = self
+        let existing = self
+            .read_content_descriptor(storage_domain_id, content_id)
+            .await?;
+        if let Some(existing) = &existing {
+            let existing = ContentDescriptor::decode(existing, storage_domain_id, content_id)?;
+            if existing.length() != state.length() {
+                return Err(Error::Corruption {
+                    message: format!(
+                        "content descriptor {content_id} length {} differs from upload length {}",
+                        existing.length(),
+                        state.length()
+                    ),
+                });
+            }
+        }
+        let sealing_state =
+            (*state).into_sealing(content_id, expires_at, self.content_durability())?;
+        // The recovery marker must become durable before the descriptor becomes
+        // visible. Once the session is Sealing, abort/reaper paths refuse to
+        // delete its chunks and a retry can safely publish a missing descriptor.
+        self.write_upload_state(&sealing_state).await?;
+        let UploadSessionStatus::Sealing(sealed) = sealing_state.status() else {
+            return Err(Error::InvalidFormat {
+                message: "content upload did not enter sealing state".to_owned(),
+            });
+        };
+        let reused = if let Some(existing) = existing {
+            ContentDescriptor::decode(&existing, storage_domain_id, content_id)?.upload_id()
+                != upload_id
+        } else {
+            self.promote_sealing_partial_chunk(&sealing_state).await?;
+            self.write_content_descriptor(
+                storage_domain_id,
+                content_id,
+                Self::descriptor_for_sealing_state(&sealing_state, sealed)?.encode(),
+            )
+            .await?;
+            self.remove_sealing_partial_chunk(&sealing_state).await?;
+            false
+        };
+        drop(seal_guard);
+        Ok((sealing_state, sealed, reused))
+    }
+
+    async fn ensure_sealing_descriptor(
+        &self,
+        state: &UploadSessionState,
+        sealed: SealedContent,
+    ) -> Result<bool> {
+        let storage_domain_id = sealed.storage_domain_id();
+        let content_id = sealed.content_id();
+        if let Some(existing) = self
             .read_content_descriptor(storage_domain_id, content_id)
             .await?
         {
@@ -676,22 +747,90 @@ impl Db {
                     ),
                 });
             }
-            existing.upload_id() != upload_id
-        } else {
-            self.write_content_descriptor(storage_domain_id, content_id, descriptor.encode())
-                .await?;
-            false
-        };
-        let sealing_state =
-            (*state).into_sealing(content_id, expires_at, self.content_durability())?;
-        self.write_upload_state(&sealing_state).await?;
-        drop(seal_guard);
-        let UploadSessionStatus::Sealing(sealed) = sealing_state.status() else {
-            return Err(Error::InvalidFormat {
-                message: "content upload did not enter sealing state".to_owned(),
+            let reused = existing.upload_id() != state.upload_id();
+            if !reused {
+                self.remove_sealing_partial_chunk(state).await?;
+            }
+            return Ok(reused);
+        }
+
+        self.promote_sealing_partial_chunk(state).await?;
+        let descriptor = Self::descriptor_for_sealing_state(state, sealed)?;
+        self.write_content_descriptor(storage_domain_id, content_id, descriptor.encode())
+            .await?;
+        self.remove_sealing_partial_chunk(state).await?;
+        Ok(false)
+    }
+
+    async fn promote_sealing_partial_chunk(&self, state: &UploadSessionState) -> Result<()> {
+        if state.partial_len() == 0 {
+            return Ok(());
+        }
+        let source_revision =
+            state
+                .revision()
+                .checked_sub(1)
+                .ok_or_else(|| Error::InvalidFormat {
+                    message: "sealing upload has no preceding open revision".to_owned(),
+                })?;
+        let index = state.complete_chunks();
+        let frame = self
+            .read_content_partial_chunk(state.upload_id(), index, source_revision)
+            .await?
+            .ok_or_else(|| Error::Corruption {
+                message: format!(
+                    "content upload {} is missing immutable partial chunk revision {source_revision}",
+                    state.upload_id()
+                ),
+            })?;
+        let payload = crate::content::decode_chunk(&frame, state.upload_id(), index)?;
+        if payload.len()
+            != usize::try_from(state.partial_len()).map_err(|_| Error::InvalidFormat {
+                message: "content partial length exceeds usize".to_owned(),
+            })?
+        {
+            return Err(Error::Corruption {
+                message: format!(
+                    "content upload {} partial chunk length differs from sealing state",
+                    state.upload_id()
+                ),
             });
-        };
-        Ok((sealing_state, sealed, reused))
+        }
+        self.write_content_chunk(state.upload_id(), index, frame)
+            .await
+    }
+
+    async fn remove_sealing_partial_chunk(&self, state: &UploadSessionState) -> Result<()> {
+        if state.partial_len() == 0 {
+            return Ok(());
+        }
+        let source_revision =
+            state
+                .revision()
+                .checked_sub(1)
+                .ok_or_else(|| Error::InvalidFormat {
+                    message: "sealing upload has no preceding open revision".to_owned(),
+                })?;
+        self.delete_content_partial_chunk(
+            state.upload_id(),
+            state.complete_chunks(),
+            source_revision,
+        )
+        .await
+    }
+
+    fn descriptor_for_sealing_state(
+        state: &UploadSessionState,
+        sealed: SealedContent,
+    ) -> Result<ContentDescriptor> {
+        ContentDescriptor::new(
+            sealed.storage_domain_id(),
+            sealed.content_id(),
+            state.upload_id(),
+            state.length(),
+            state.options().chunk_bytes(),
+            state.chunk_count(),
+        )
     }
 
     async fn ensure_upload_token_record(
@@ -789,10 +928,9 @@ impl Db {
 
     /// Aborts durable upload state and schedules no content visibility.
     ///
-    /// The session record is deleted before chunk cleanup. A crash during
-    /// cleanup can therefore leave only unreachable staging chunks, never a
-    /// resumable session that references missing bytes. Cleanup deletion is
-    /// idempotent and may be retried by maintenance.
+    /// A durable `aborting` state is published before chunk cleanup, then
+    /// replaced by a permanent retired-ID marker. A crash during cleanup can
+    /// therefore be resumed without ever reopening the upload for writes.
     ///
     /// # Errors
     ///
@@ -807,6 +945,7 @@ impl Db {
         upload_id: UploadId,
         expected_revision: Option<u64>,
     ) -> Result<()> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
@@ -855,7 +994,7 @@ impl Db {
         if state.partial_len() != 0 {
             let index = state.complete_chunks();
             let frame = self
-                .read_content_chunk(state.upload_id(), index)
+                .read_content_partial_chunk(state.upload_id(), index, state.revision())
                 .await?
                 .ok_or_else(|| Error::Corruption {
                     message: format!(
@@ -1167,8 +1306,11 @@ impl Db {
     }
 
     async fn cleanup_upload_chunks(&self, state: &UploadSessionState) -> Result<()> {
-        for index in 0..state.chunk_count() {
-            self.delete_content_chunk(state.upload_id(), index).await?;
+        for object in self
+            .list_content_upload_chunk_objects(state.upload_id())
+            .await?
+        {
+            self.delete_content_chunk_object(object).await?;
         }
         Ok(())
     }

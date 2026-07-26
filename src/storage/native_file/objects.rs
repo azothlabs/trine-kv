@@ -1,4 +1,3 @@
-use super::super::poll_ready_storage_future;
 #[cfg(feature = "platform-io")]
 use super::super::{Context, Future, Poll, Waker};
 use super::{
@@ -10,9 +9,9 @@ use super::{
     acquire_native_file_writer_lease, append_native_file_object,
     clear_native_file_writer_lease_owner, fs, len_native_file_handle, lock_native_append_file,
     open_native_append_file, open_native_file, persist_native_append_file,
-    read_exact_at_native_file_handle, read_exact_at_native_file_handle_owned,
-    read_exact_at_native_file_owned, read_exact_from_native_file, record_timed_storage_future,
-    record_timed_storage_result, write_native_file_writer_lease_owner, writer_lease_owner_text,
+    read_exact_at_native_file_handle_owned, read_exact_at_native_file_owned,
+    read_exact_from_native_file, record_timed_storage_future, record_timed_storage_result,
+    write_native_file_writer_lease_owner, writer_lease_owner_text,
 };
 #[cfg(feature = "platform-io")]
 use super::{PlatformIoDriver, PlatformIoOperation, record_platform_io_task};
@@ -45,12 +44,40 @@ impl NativeFileObject {
         })
     }
 
-    fn read_exact_at_offset(&self, offset: usize, bytes: &mut [u8]) -> Result<()> {
-        read_exact_at_native_file_handle(self.file.as_ref(), &self.object, offset, bytes)
-    }
-
     fn read_exact_at_offset_owned(&self, offset: usize, len: usize) -> Result<StorageReadBuffer> {
         read_exact_at_native_file_handle_owned(self.file.as_ref(), &self.object, offset, len)
+    }
+
+    fn read_exact_at_owned_unrecorded(
+        &self,
+        offset: usize,
+        len: usize,
+    ) -> StorageReadFuture<'_, StorageReadBuffer> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = &self.platform_io {
+            record_platform_io_task(
+                self.metrics.as_ref(),
+                driver,
+                PlatformIoOperation::OwnedRandomRead,
+            );
+            return Box::pin(async move { self.read_exact_at_owned_io(offset, len)?.await });
+        }
+
+        if let Some(runtime) = self.runtime.clone()
+            && runtime.capabilities().blocking_adapter()
+        {
+            let object = self.object.clone();
+            self.metrics.record_blocking_adapter_task();
+            return Box::pin(async move {
+                BlockingAdapterIoDriver::new(runtime)
+                    .submit_read_exact_at_owned(move || {
+                        read_exact_at_native_file_owned(&object, offset, len)
+                    })?
+                    .await
+            });
+        }
+        self.metrics.record_inline_task();
+        Box::pin(async move { self.read_exact_at_owned_io(offset, len)?.await })
     }
 }
 
@@ -115,10 +142,15 @@ impl StorageReadObject for NativeFileObject {
         offset: usize,
         bytes: &'op mut [u8],
     ) -> StorageReadFuture<'op, ()> {
+        let read = self.read_exact_at_owned_unrecorded(offset, bytes.len());
         record_timed_storage_future(
             Arc::clone(&self.metrics),
             StorageOperation::ReadExactAt,
-            Box::pin(async move { self.read_exact_at_offset(offset, bytes) }),
+            Box::pin(async move {
+                let buffer = read.await?;
+                bytes.copy_from_slice(buffer.as_slice());
+                Ok(())
+            }),
         )
     }
 
@@ -127,42 +159,11 @@ impl StorageReadObject for NativeFileObject {
         offset: usize,
         len: usize,
     ) -> StorageReadFuture<'_, StorageReadBuffer> {
-        #[cfg(feature = "platform-io")]
-        if let Some(driver) = &self.platform_io {
-            record_platform_io_task(
-                self.metrics.as_ref(),
-                driver,
-                PlatformIoOperation::OwnedRandomRead,
-            );
-            return record_timed_storage_future(
-                Arc::clone(&self.metrics),
-                StorageOperation::ReadExactAtOwned,
-                Box::pin(async move { self.read_exact_at_owned_io(offset, len)?.await }),
-            );
-        }
-
-        if let Some(runtime) = self.runtime.clone()
-            && runtime.capabilities().blocking_adapter()
-        {
-            let object = self.object.clone();
-            self.metrics.record_blocking_adapter_task();
-            return record_timed_storage_future(
-                Arc::clone(&self.metrics),
-                StorageOperation::ReadExactAtOwned,
-                Box::pin(async move {
-                    BlockingAdapterIoDriver::new(runtime)
-                        .submit_read_exact_at_owned(move || {
-                            read_exact_at_native_file_owned(&object, offset, len)
-                        })?
-                        .await
-                }),
-            );
-        }
-        self.metrics.record_inline_task();
+        let read = self.read_exact_at_owned_unrecorded(offset, len);
         record_timed_storage_future(
             Arc::clone(&self.metrics),
             StorageOperation::ReadExactAtOwned,
-            Box::pin(async move { self.read_exact_at_owned_io(offset, len)?.await }),
+            read,
         )
     }
 }
@@ -175,7 +176,11 @@ impl BlockingStorageReadObject for NativeFileObject {
     }
 
     fn read_exact_at_blocking(&self, offset: usize, bytes: &mut [u8]) -> Result<()> {
-        poll_ready_storage_future(StorageReadObject::read_exact_at(self, offset, bytes))
+        record_timed_storage_result(self.metrics.as_ref(), StorageOperation::ReadExactAt, || {
+            let buffer = self.read_exact_at_offset_owned(offset, bytes.len())?;
+            bytes.copy_from_slice(buffer.as_slice());
+            Ok(())
+        })
     }
 
     fn read_exact_at_owned_blocking(&self, offset: usize, len: usize) -> Result<StorageReadBuffer> {

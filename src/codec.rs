@@ -97,6 +97,13 @@ pub(crate) fn encode_block(codec: CodecId, input: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
+pub(crate) fn max_encoded_block_len(codec: CodecId, input_len: usize) -> Option<usize> {
+    match codec {
+        CodecId::None => Some(input_len),
+        CodecId::FastLz4Block => input_len.checked_add(input_len / 255)?.checked_add(16),
+    }
+}
+
 pub(crate) fn decode_block(
     codec: CodecId,
     input: &[u8],

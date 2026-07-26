@@ -91,7 +91,7 @@ impl PointValueSource {
     pub(crate) fn from_value_ref(value: ValueRef) -> Self {
         match value {
             ValueRef::Inline(bytes) => Self::Value(PointValue::from_owned(bytes)),
-            ValueRef::BlobIndex(_) | ValueRef::Blob { .. } => Self::Blob(value),
+            ValueRef::BlobIndex(_) => Self::Blob(value),
         }
     }
 

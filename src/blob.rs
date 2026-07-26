@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, btree_map::Entry},
+    collections::BTreeSet,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -104,12 +104,6 @@ pub struct BlobFile {
 pub enum ValueRef {
     Inline(Vec<u8>),
     BlobIndex(BlobIndex),
-    Blob {
-        file_id: u64,
-        offset: u64,
-        len: u64,
-        checksum: u32,
-    },
 }
 
 impl ValueRef {
@@ -118,7 +112,6 @@ impl ValueRef {
         match self {
             Self::Inline(bytes) => bytes.len() as u64,
             Self::BlobIndex(index) => index.value_len,
-            Self::Blob { len, .. } => *len,
         }
     }
 }

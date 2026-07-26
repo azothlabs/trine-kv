@@ -24,8 +24,22 @@ fn destructive_options(path: &std::path::Path) -> DbOptions {
 
 fn assert_injected_io(error: &Error, point: StorageFaultPoint) {
     assert!(
-        matches!(error, Error::Io(source) if source.to_string().contains(&format!("{point:?}"))),
+        matches!(
+            error,
+            Error::Io(source) | Error::ManifestPublishedDurabilityUnknown { source }
+                if source.to_string().contains(&format!("{point:?}"))
+        ),
         "expected injected {point:?} I/O error, got {error:?}"
+    );
+}
+
+fn assert_unknown_wal_failure(error: &Error, point: StorageFaultPoint) {
+    assert!(
+        matches!(error, Error::Corruption { message } if
+            message.contains(&format!("{point:?}"))
+                && message.contains("durable outcome is unknown")
+                && message.contains("database handle closed")),
+        "expected stage-aware {point:?} WAL failure, got {error:?}"
     );
 }
 
@@ -68,18 +82,23 @@ fn destructive_wal_append_failure_does_not_publish_the_write() {
     let error = db
         .put_sync(b"rejected", b"must-not-appear")
         .expect_err("injected WAL append failure reaches caller");
-    assert_injected_io(&error, StorageFaultPoint::WalAppend);
+    assert_unknown_wal_failure(&error, StorageFaultPoint::WalAppend);
     assert_eq!(fault.calls(), 1);
     drop(fault);
 
-    db.put_sync(b"after", b"visible")
-        .expect("later write can commit");
+    assert!(
+        db.put_sync(b"after", b"visible").is_err(),
+        "a possibly partial WAL append permanently closes the lane"
+    );
     db.close_sync();
     drop(db);
 
-    let reopened = Db::open_sync(options).expect("database reopens");
+    let reopened = Db::open_sync(options.clone()).expect("database reopens");
     assert_eq!(reopened.get_sync(b"baseline").expect("baseline reads"), Some(b"safe".to_vec()));
     assert_eq!(reopened.get_sync(b"rejected").expect("rejected key reads"), None);
+    reopened
+        .put_sync(b"after", b"visible")
+        .expect("writes resume only after recovery");
     assert_eq!(reopened.get_sync(b"after").expect("later key reads"), Some(b"visible".to_vec()));
     reopened.close_sync();
     fs::remove_dir_all(path).expect("cleanup destructive database");
@@ -103,7 +122,7 @@ fn destructive_wal_persist_failure_has_an_explicit_unknown_commit_result() {
     let error = db
         .put_sync(b"unknown", b"complete-record")
         .expect_err("injected WAL persistence failure reaches caller");
-    assert_injected_io(&error, StorageFaultPoint::WalPersist);
+    assert_unknown_wal_failure(&error, StorageFaultPoint::WalPersist);
     assert_eq!(fault.calls(), 1);
     drop(fault);
     db.close_sync();

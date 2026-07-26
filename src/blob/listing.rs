@@ -37,7 +37,7 @@ where
     blob_file_ids_from_objects(backend.list_objects(request).await?)
 }
 
-pub(super) fn blob_file_ids_from_objects(
+pub(crate) fn blob_file_ids_from_objects(
     objects: impl IntoIterator<Item = StorageObjectId>,
 ) -> Result<BTreeSet<u64>> {
     let mut file_ids = BTreeSet::new();

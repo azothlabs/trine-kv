@@ -63,6 +63,25 @@ pub(super) fn enqueue_wal_lane_command(
     }
 }
 
+#[cfg(not(target_os = "wasi"))]
+pub(super) fn try_enqueue_wal_lane_command(
+    lane: &WalFrontDoorLane,
+    command: impl FnOnce(WalLaneReply) -> WalLaneCommand,
+) -> Result<WalLaneWaiter> {
+    let sender = lane
+        .sender
+        .as_ref()
+        .ok_or_else(wal_front_door_worker_stopped)?;
+    let (reply, waiter) = WalLaneCompletion::pair();
+    match sender.try_send(command(reply)) {
+        Ok(()) => Ok(waiter),
+        Err(mpsc::TrySendError::Full(_)) => Err(Error::runtime_busy(
+            "WAL admission queue is full; retry after pending commits drain",
+        )),
+        Err(mpsc::TrySendError::Disconnected(_)) => Err(wal_front_door_worker_stopped()),
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 /// Maximum commits coalesced into one group-commit fsync. Bounds the latency and
 /// memory of a single drain pass when the queue is flooded.
@@ -75,6 +94,7 @@ pub(super) struct WalLaneWorkerState {
     persisted_level: Option<DurabilityMode>,
     last_appended_sequence: Option<Sequence>,
     confirmed_sequence: Option<Sequence>,
+    terminal_error: Option<String>,
 }
 
 // Thread entry point: it owns its lane state for the worker's lifetime.
@@ -100,21 +120,32 @@ pub(super) fn run_wal_lane_worker(
                 Err(_) => break,
             }
         }
-        let panic_replies = batch
-            .iter()
-            .map(WalLaneCommand::panic_reply)
-            .collect::<Vec<_>>();
+        let panic_replies = batch.iter().map(WalLaneCommand::reply).collect::<Vec<_>>();
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             process_wal_lane_batch(&backend, &path, &writer_open, &mut state, batch);
         }))
         .is_err()
         {
-            state = WalLaneWorkerState::default();
             writer_open.store(false, Ordering::Release);
             for reply in panic_replies {
-                reply.complete(Err(Error::runtime_busy("WAL lane worker task panicked")));
+                reply.complete(Err(wal_lane_worker_panicked()));
             }
+            // Remain alive only to fail commands that raced with the panic.
+            // Dropping queued replies would strand their waiters forever.
+            while let Ok(command) = receiver.recv() {
+                command.reply().complete(Err(wal_lane_worker_panicked()));
+            }
+            return;
         }
+    }
+}
+
+#[cfg(not(target_os = "wasi"))]
+fn wal_lane_worker_panicked() -> Error {
+    Error::Corruption {
+        message:
+            "WAL lane worker panicked after storage mutation may have started; reopen the database"
+                .to_owned(),
     }
 }
 
@@ -131,37 +162,27 @@ pub(super) fn process_wal_lane_batch(
     let mut pending_durability = DurabilityMode::Buffered;
 
     for command in batch {
+        if let Some(message) = state.terminal_error.as_deref() {
+            command.reply().complete(Err(wal_lane_failed(message)));
+            continue;
+        }
         match command {
             WalLaneCommand::Append {
                 sequence,
                 frame,
                 durability,
                 reply,
-            } => {
-                // Append without persisting; the batch persist below covers it.
-                match append_wal_lane_frame(
-                    backend,
-                    path,
-                    &mut state.writer,
-                    writer_open,
-                    &frame,
-                    DurabilityMode::Buffered,
-                ) {
-                    Ok(()) => {
-                        if wal_durability_rank(durability) > wal_durability_rank(pending_durability)
-                        {
-                            pending_durability = durability;
-                        }
-                        // Mark the lane dirty: these bytes are not yet covered
-                        // by the requested storage boundary, so a later persist
-                        // must touch the backend.
-                        state.persisted_level = Some(DurabilityMode::Buffered);
-                        state.last_appended_sequence = Some(sequence);
-                        pending.push(PendingWalAppend { sequence, reply });
-                    }
-                    Err(error) => reply.complete(Err(error)),
-                }
-            }
+            } => process_wal_append(
+                backend,
+                path,
+                writer_open,
+                state,
+                &mut pending,
+                &mut pending_durability,
+                PendingWalAppend { sequence, reply },
+                &frame,
+                durability,
+            ),
             WalLaneCommand::Persist { durability, reply } => {
                 let combined =
                     if wal_durability_rank(durability) > wal_durability_rank(pending_durability) {
@@ -169,7 +190,8 @@ pub(super) fn process_wal_lane_batch(
                     } else {
                         pending_durability
                     };
-                let result = flush_wal_lane_batch(backend, path, state, combined, &mut pending);
+                let result =
+                    flush_wal_lane_batch(backend, path, writer_open, state, combined, &mut pending);
                 reply.complete(duplicate_wal_lane_result(&result));
                 pending_durability = DurabilityMode::Buffered;
             }
@@ -178,22 +200,100 @@ pub(super) fn process_wal_lane_batch(
                 reply,
             } => {
                 // A rewrite changes the file; flush queued appends first.
-                let _ =
-                    flush_wal_lane_batch(backend, path, state, pending_durability, &mut pending);
-                pending_durability = DurabilityMode::Buffered;
-                let result = rewrite_wal_lane_after_replay_floor(
+                let flush_result = flush_wal_lane_batch(
                     backend,
                     path,
-                    &mut state.writer,
-                    &mut state.persisted_level,
-                    replay_floor,
+                    writer_open,
+                    state,
+                    pending_durability,
+                    &mut pending,
                 );
+                pending_durability = DurabilityMode::Buffered;
+                let result = flush_result.and_then(|()| {
+                    rewrite_wal_lane_after_replay_floor(
+                        backend,
+                        path,
+                        &mut state.writer,
+                        &mut state.persisted_level,
+                        replay_floor,
+                    )
+                });
+                if let Err(error) = &result
+                    && state.terminal_error.is_none()
+                {
+                    let message = format!(
+                        "WAL rewrite failed after the file namespace may have changed: {error}; \
+                         the lane is closed until database reopen"
+                    );
+                    state.writer = None;
+                    state.persisted_level = None;
+                    state.terminal_error = Some(message);
+                    writer_open.store(false, Ordering::Release);
+                }
                 reply.complete(result);
             }
         }
     }
 
-    let _ = flush_wal_lane_batch(backend, path, state, pending_durability, &mut pending);
+    let _ = flush_wal_lane_batch(
+        backend,
+        path,
+        writer_open,
+        state,
+        pending_durability,
+        &mut pending,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_wal_append(
+    backend: &NativeFileBackend,
+    path: &Path,
+    writer_open: &AtomicBool,
+    state: &mut WalLaneWorkerState,
+    pending: &mut Vec<PendingWalAppend>,
+    pending_durability: &mut DurabilityMode,
+    append: PendingWalAppend,
+    frame: &[u8],
+    durability: DurabilityMode,
+) {
+    // Append without persisting; the batch persist below covers it.
+    match append_wal_lane_frame(
+        backend,
+        path,
+        &mut state.writer,
+        writer_open,
+        frame,
+        DurabilityMode::Buffered,
+    ) {
+        Ok(()) => {
+            if wal_durability_rank(durability) > wal_durability_rank(*pending_durability) {
+                *pending_durability = durability;
+            }
+            // Mark the lane dirty: these bytes are not yet covered by the
+            // requested storage boundary, so a later persist must touch the
+            // backend.
+            state.persisted_level = Some(DurabilityMode::Buffered);
+            state.last_appended_sequence = Some(append.sequence);
+            pending.push(append);
+        }
+        Err(error) => {
+            let message = format!(
+                "WAL append failed after the file may have changed: {error}; \
+                 the lane is closed until database reopen"
+            );
+            state.writer = None;
+            state.persisted_level = None;
+            state.terminal_error = Some(message.clone());
+            writer_open.store(false, Ordering::Release);
+            for pending_append in pending.drain(..) {
+                pending_append
+                    .reply
+                    .complete(Err(wal_lane_failed(message.as_str())));
+            }
+            append.reply.complete(Err(error));
+        }
+    }
 }
 
 /// Persist the buffered appends with one backend request and complete waiters.
@@ -204,6 +304,7 @@ pub(super) fn process_wal_lane_batch(
 pub(super) fn flush_wal_lane_batch(
     backend: &NativeFileBackend,
     path: &Path,
+    writer_open: &AtomicBool,
     state: &mut WalLaneWorkerState,
     durability: DurabilityMode,
     pending: &mut Vec<PendingWalAppend>,
@@ -218,11 +319,27 @@ pub(super) fn flush_wal_lane_batch(
         has_new_appends,
         pending_max_sequence.or(state.last_appended_sequence),
     );
+    if let Err(error) = &result {
+        let message = format!(
+            "WAL persist failed with an uncertain durability boundary: {error}; \
+             the lane is closed until database reopen"
+        );
+        state.writer = None;
+        state.persisted_level = None;
+        state.terminal_error = Some(message);
+        writer_open.store(false, Ordering::Release);
+    }
     for pending in pending.drain(..) {
         let reply = pending.reply;
         reply.complete(duplicate_wal_lane_result(&result));
     }
     result
+}
+
+fn wal_lane_failed(message: &str) -> Error {
+    Error::Corruption {
+        message: message.to_owned(),
+    }
 }
 
 pub(super) fn persist_wal_lane_batch(

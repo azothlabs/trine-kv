@@ -12,20 +12,19 @@
 //! to the caller (the manifest commit) as [`PutIf::PreconditionFailed`], not an
 //! error.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
-use futures::{StreamExt, TryStreamExt};
+use futures::TryStreamExt;
 use object_store::{
-    Error as OsError, GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
-    PutPayload, UpdateVersion, path::Path as OsPath,
+    Error as OsError, GetOptions, GetRange, ObjectMeta as OsObjectMeta, ObjectStore,
+    ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion, path::Path as OsPath,
 };
 
 use crate::error::{Error, Result};
 use crate::object_store::{
-    ETag, ObjectClient, ObjectFuture, ObjectMeta, ObjectVersion, Precondition, PutIf,
+    ETag, ObjectClient, ObjectFuture, ObjectListPage, ObjectMeta, ObjectVersion, Precondition,
+    PutIf,
 };
-
-const MAX_LIST_RESULTS: usize = 100_000;
 
 /// Adapts any [`object_store::ObjectStore`] to trine's [`ObjectClient`].
 #[derive(Clone)]
@@ -149,8 +148,22 @@ fn resolve_put_etag(e_tag: Option<String>) -> Result<ETag> {
     })
 }
 
+fn object_meta_from_provider(meta: OsObjectMeta) -> Result<ObjectMeta> {
+    let key = meta.location.as_ref().to_owned();
+    let etag = meta.e_tag.map(ETag::new).ok_or_else(|| Error::Corruption {
+        message: format!("object store listing omitted the ETag required for key {key:?}"),
+    })?;
+    Ok(ObjectMeta {
+        key,
+        size: meta.size,
+        etag,
+        version: meta.version.map(ObjectVersion::new),
+    })
+}
+
 impl ObjectClient for ObjectStoreClient {
     fn get<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<Arc<[u8]>>> {
+        let key = key.to_owned();
         let path = OsPath::from(key);
         Box::pin(async move {
             match self.store.get(&path).await {
@@ -164,21 +177,36 @@ impl ObjectClient for ObjectStoreClient {
         })
     }
 
-    fn get_range<'op>(&'op self, key: &str, offset: u64, len: u64) -> ObjectFuture<'op, Arc<[u8]>> {
-        let path = OsPath::from(key);
+    fn get_range<'op>(
+        &'op self,
+        key: &str,
+        offset: u64,
+        len: u64,
+        expected_etag: &ETag,
+    ) -> ObjectFuture<'op, Arc<[u8]>> {
+        let key = key.to_owned();
+        let path = OsPath::from(key.clone());
+        let expected_etag = expected_etag.as_str().to_owned();
         Box::pin(async move {
             let end = offset
                 .checked_add(len)
                 .ok_or_else(|| Error::invalid_options("object range end overflow"))?;
             let options = GetOptions {
+                if_match: Some(expected_etag),
                 range: Some(GetRange::Bounded(offset..end)),
                 ..GetOptions::default()
             };
-            let result = self
-                .store
-                .get_opts(&path, options)
-                .await
-                .map_err(map_object_store_error)?;
+            let result = match self.store.get_opts(&path, options).await {
+                Ok(result) => result,
+                Err(OsError::Precondition { .. } | OsError::NotFound { .. }) => {
+                    return Err(Error::Corruption {
+                        message: format!(
+                            "object {key} changed or disappeared during immutable range reads"
+                        ),
+                    });
+                }
+                Err(error) => return Err(map_object_store_error(error)),
+            };
             let bytes = result.bytes().await.map_err(map_object_store_error)?;
             Ok(Arc::from(bytes.as_ref()))
         })
@@ -209,33 +237,91 @@ impl ObjectClient for ObjectStoreClient {
     }
 
     fn list<'op>(&'op self, prefix: &str) -> ObjectFuture<'op, Vec<ObjectMeta>> {
-        let os_prefix = OsPath::from(prefix);
         let prefix = prefix.to_owned();
         Box::pin(async move {
-            let metas: Vec<object_store::ObjectMeta> = self
+            let os_prefix = OsPath::from(prefix);
+            let mut metas = self
                 .store
                 .list(Some(&os_prefix))
-                .take(MAX_LIST_RESULTS + 1)
-                .try_collect()
+                .try_collect::<Vec<_>>()
                 .await
                 .map_err(map_object_store_error)?;
-            if metas.len() > MAX_LIST_RESULTS {
-                return Err(Error::runtime_busy(format!(
-                    "object listing for {prefix:?} exceeds {MAX_LIST_RESULTS} results"
-                )));
+            metas.sort_unstable_by(|left, right| left.location.cmp(&right.location));
+            if let Some(pair) = metas
+                .windows(2)
+                .find(|pair| pair[0].location == pair[1].location)
+            {
+                return Err(Error::Corruption {
+                    message: format!(
+                        "object store listed duplicate key {:?}",
+                        pair[0].location.as_ref()
+                    ),
+                });
             }
-            // object_store yields keys in lexicographic order, matching the
-            // ObjectClient contract. List ETags are not used for CAS (only the
-            // key is read by the table/blob listers), so an absent ETag is fine.
-            Ok(metas
-                .into_iter()
-                .map(|meta| ObjectMeta {
-                    key: meta.location.as_ref().to_owned(),
-                    size: meta.size,
-                    etag: ETag::new(meta.e_tag.unwrap_or_default()),
-                    version: meta.version.map(ObjectVersion::new),
-                })
-                .collect())
+            metas.into_iter().map(object_meta_from_provider).collect()
+        })
+    }
+
+    fn list_page<'op>(
+        &'op self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> ObjectFuture<'op, ObjectListPage> {
+        let os_prefix = OsPath::from(prefix);
+        let after = after.map(OsPath::from);
+        Box::pin(async move {
+            if limit == 0 {
+                return Err(Error::invalid_options(
+                    "object listing page limit must be non-zero",
+                ));
+            }
+            let take = limit
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_options("object listing page limit overflow"))?;
+            let mut stream = match after.as_ref() {
+                Some(after) => self.store.list_with_offset(Some(&os_prefix), after),
+                None => self.store.list(Some(&os_prefix)),
+            };
+            // `object_store::ObjectStore` does not promise that its listing
+            // stream is ordered. Keep only the lexicographically smallest
+            // `limit + 1` entries while draining the stream so the continuation
+            // cannot skip an unseen smaller key. Memory remains O(limit).
+            let mut metas = BTreeMap::new();
+            while let Some(meta) = stream.try_next().await.map_err(map_object_store_error)? {
+                let key = meta.location.as_ref().to_owned();
+                if metas.insert(key.clone(), meta).is_some() {
+                    return Err(Error::Corruption {
+                        message: format!("object store listed duplicate key {key:?}"),
+                    });
+                }
+                if metas.len() > take {
+                    let largest = metas
+                        .last_key_value()
+                        .map(|(key, _)| key.clone())
+                        .expect("non-empty map has a last key");
+                    metas.remove(&largest);
+                }
+            }
+            let has_more = metas.len() > limit;
+            if has_more {
+                let largest = metas
+                    .last_key_value()
+                    .map(|(key, _)| key.clone())
+                    .expect("non-empty map has a last key");
+                metas.remove(&largest);
+            }
+            let objects = metas
+                .into_values()
+                .map(object_meta_from_provider)
+                .collect::<Result<Vec<_>>>()?;
+            let next_after = has_more
+                .then(|| objects.last().map(|meta| meta.key.clone()))
+                .flatten();
+            Ok(ObjectListPage {
+                objects,
+                next_after,
+            })
         })
     }
 
@@ -310,7 +396,9 @@ mod tests {
     use super::{ObjectStoreClient, S3ClientOptions};
     use crate::Db;
     use crate::error::{Error, Result};
-    use crate::object_store::{ETag, ObjectClient, ObjectFuture, ObjectMeta, Precondition, PutIf};
+    use crate::object_store::{
+        ETag, ObjectClient, ObjectFuture, ObjectListPage, ObjectMeta, Precondition, PutIf,
+    };
     use crate::options::DbOptions;
 
     fn memory_client() -> ObjectStoreClient {
@@ -512,13 +600,15 @@ mod tests {
             key: &str,
             offset: u64,
             len: u64,
+            expected_etag: &ETag,
         ) -> ObjectFuture<'op, Arc<[u8]>> {
             let inner = Arc::clone(&self.inner);
             let metrics = Arc::clone(&self.metrics);
             let key = key.to_owned();
+            let expected_etag = expected_etag.clone();
             Box::pin(async move {
                 let started = Instant::now();
-                let result = inner.get_range(&key, offset, len).await;
+                let result = inner.get_range(&key, offset, len, &expected_etag).await;
                 metrics.record("get_range", started.elapsed());
                 result
             })
@@ -558,6 +648,15 @@ mod tests {
                 metrics.record("list", started.elapsed());
                 result
             })
+        }
+
+        fn list_page<'op>(
+            &'op self,
+            prefix: &str,
+            after: Option<&str>,
+            limit: usize,
+        ) -> ObjectFuture<'op, ObjectListPage> {
+            self.inner.list_page(prefix, after, limit)
         }
 
         fn head<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<ObjectMeta>> {
@@ -744,7 +843,7 @@ mod tests {
             Some(b"hello world".as_slice())
         );
         assert_eq!(
-            block_on(client.get_range("db/0001.trinet", 6, 5))
+            block_on(client.get_range("db/0001.trinet", 6, 5, &etag))
                 .unwrap()
                 .as_ref(),
             b"world"
@@ -759,6 +858,11 @@ mod tests {
         let listed = block_on(client.list("db/")).unwrap();
         let keys: Vec<&str> = listed.iter().map(|m| m.key.as_str()).collect();
         assert_eq!(keys, ["db/0001.trinet", "db/0002.trinet"]);
+        let first = block_on(client.list_page("db/", None, 1)).unwrap();
+        assert_eq!(first.objects[0].key, "db/0001.trinet");
+        let second = block_on(client.list_page("db/", first.next_after.as_deref(), 1)).unwrap();
+        assert_eq!(second.objects[0].key, "db/0002.trinet");
+        assert!(second.next_after.is_none());
 
         block_on(client.delete("db/0001.trinet")).unwrap();
         assert!(block_on(client.get("db/0001.trinet")).unwrap().is_none());

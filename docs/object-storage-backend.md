@@ -169,12 +169,11 @@ reachability is checked.
 
 ### 3. Writer fencing across processes/nodes
 
-Lease format v3 binds every acquisition or takeover to both a monotonically
+The lease format binds every acquisition or takeover to both a monotonically
 increasing epoch and a fresh random 128-bit owner nonce. Every renewal, WAL-head
 CAS, rewrite, and release verifies both values. This closes the same-epoch ABA
-hole: a stale handle is fenced even if it observes an epoch reused by legacy
-state or a replacement owner. Legacy and v2 leases remain readable with an
-all-zero owner only for compatibility; new writes publish v3.
+hole: a stale handle is fenced even if it observes an epoch reused by a
+replacement owner. Other lease encodings are rejected.
 
 ## Concurrency model on object storage
 

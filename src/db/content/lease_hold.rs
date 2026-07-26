@@ -32,6 +32,7 @@ impl Db {
         storage_domain_id: StorageDomainId,
         content_id: ContentId,
     ) -> Result<ContentHandle> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         if let ContentAccessMode::LeasedOnly { barrier_id } =
             self.content_access_mode(storage_domain_id).await?
@@ -135,6 +136,7 @@ impl Db {
         content_id: ContentId,
         options: ContentLeaseOptions,
     ) -> Result<ContentHandle> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
@@ -177,6 +179,7 @@ impl Db {
         handle: &ContentHandle,
         ttl: Duration,
     ) -> Result<u64> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
@@ -319,6 +322,7 @@ impl Db {
         hold_id: ContentPhysicalHoldId,
         options: ContentPhysicalHoldOptions,
     ) -> Result<ContentPhysicalHold> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
@@ -420,6 +424,7 @@ impl Db {
         hold_id: ContentPhysicalHoldId,
         owner_id: ContentPhysicalHoldOwnerId,
     ) -> Result<ContentPhysicalHold> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         let bucket = self.internal_bucket(CONTENT_PHYSICAL_HOLD_BUCKET).await?;
         let key = content_physical_hold_key(storage_domain_id, content_id, hold_id);
@@ -452,6 +457,7 @@ impl Db {
         hold: &ContentPhysicalHold,
         ttl: Duration,
     ) -> Result<u64> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
@@ -536,6 +542,7 @@ impl Db {
         &self,
         hold: &ContentPhysicalHold,
     ) -> Result<()> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
@@ -608,6 +615,7 @@ impl Db {
         &self,
         expired_before_unix_ms: u64,
     ) -> Result<ContentLifecycleMaintenanceReport> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);

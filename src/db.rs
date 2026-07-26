@@ -375,7 +375,7 @@ pub(super) struct PublishBarrierGuard<'barrier> {
 }
 
 #[derive(Debug)]
-pub(super) struct PublishActivityGuard<'barrier> {
+pub(crate) struct PublishActivityGuard<'barrier> {
     barrier: &'barrier PublishBarrier,
 }
 
@@ -651,7 +651,11 @@ impl PublishBarrier {
 impl Drop for PublishActivityGuard<'_> {
     fn drop(&mut self) {
         if let Ok(mut activity) = self.barrier.activity.lock() {
-            activity.active = activity.active.saturating_sub(1);
+            if activity.active == 0 {
+                debug_assert!(false, "publish activity guard count underflow");
+                return;
+            }
+            activity.active -= 1;
             if activity.active == 0 {
                 self.barrier.idle.notify_all();
             }

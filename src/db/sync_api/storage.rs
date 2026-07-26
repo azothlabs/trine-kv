@@ -1,12 +1,9 @@
 use super::{
-    Arc, BlobLevelMergePolicy, CompactionReservation, Db, DurabilityMode, Error,
-    HostStorageBackend, KeyRange, LsmCompactionOutput, MaintenanceBudget, MaintenanceOutcome,
-    NamedCompactionInput, NamedCompactionOutput, NamedFlushInput, ObjectClient, ObjectStoreBackend,
-    Path, PendingCompactionOutputs, Result, Sequence, StorageMode, StorageObjectDeleteBackend,
-    StorageObjectId, StorageObjectKind, Table, blob, compaction_trigger_stat_deltas,
-    is_level_layout_compaction_error, lock_poisoned, referenced_blob_file_ids_from_manifest,
-    referenced_table_file_ids, should_rewrite_blob_indexes_for_compaction,
-    sync_storage_directory_after_renames, table,
+    Arc, CompactionReservation, Db, DurabilityMode, Error, HostStorageBackend, KeyRange,
+    LsmCompactionOutput, MaintenanceBudget, MaintenanceOutcome, NamedCompactionInput,
+    NamedCompactionOutput, NamedFlushInput, ObjectClient, ObjectStoreBackend, Path,
+    PendingCompactionOutputs, Result, Sequence, StorageMode, Table, compaction_trigger_stat_deltas,
+    is_level_layout_compaction_error, lock_poisoned, sync_storage_directory_after_renames, table,
 };
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use super::{Ordering, shutdown_background_workers, sync_storage_directory_after_renames_async};
@@ -222,21 +219,21 @@ impl Db {
         if flush_inputs.is_empty() {
             return Ok(());
         }
-        let flush_sequence = flush_inputs
-            .iter()
-            .map(|input| input.input.freeze_sequence)
-            .max()
-            .expect("non-empty flush input list has a max sequence");
+        let mut file_ids = self
+            .reserve_file_ids_object_store_async(flush_inputs.len())
+            .await?;
         let backend = self.object_storage()?;
         let mut written_tables = Vec::with_capacity(flush_inputs.len());
         for input in flush_inputs {
-            let table_path = table::table_path(db_path, input.input.table_id);
-            // A write failure leaves the freshly-PUT objects unreferenced by the
-            // manifest; they are reclaimed by orphan-object GC (2c-5).
+            let table_id = file_ids.next_table_id()?;
+            let table_path = table::table_path(db_path, table_id);
+            // A write failure leaves the freshly-PUT immutable object
+            // unreferenced. It remains a safe permanent gap until remote reader
+            // retirement is represented durably.
             let table = table::write_table_with_backend_async(
                 &backend,
                 &table_path,
-                input.input.table_id,
+                table_id,
                 input.input.table_level,
                 &input.input.table_options,
                 &input.input.point_records,
@@ -247,18 +244,18 @@ impl Db {
             written_tables.push((input.bucket.clone(), Arc::new(table)));
         }
 
-        // No publish barrier here: object-store manifest publishes are serialized
-        // by `object_manifest_async_lock` (held across the CAS await, Send-safe),
-        // and `close` is a no-op for object storage, so there is no publish-vs-close
-        // race to guard. Holding the barrier's std guard across the await would
-        // make this future `!Send`.
-        self.publish_flushed_tables_object_store_async(&written_tables, flush_sequence)
+        // Manifest edits are serialized by `object_manifest_async_lock` across
+        // the CAS await. The caller owns a publish-activity guard for the whole
+        // flush, while this helper takes only short std-mutex sections so the
+        // returned future remains `Send`.
+        let replay_floor = self.replay_floor_after_flush_serialized(flush_inputs)?;
+        self.publish_flushed_tables_object_store_async(&written_tables, replay_floor)
             .await?;
         Self::install_flushed_tables(flush_inputs, written_tables)
             .map_err(|error| self.close_after_durable_publish_error("flush", &error))?;
         self.inner
             .substrate
-            .rewrite_wal_after_replay_floor_async(flush_sequence)
+            .rewrite_wal_after_replay_floor_async(replay_floor)
             .await?;
         Ok(())
     }
@@ -296,7 +293,9 @@ impl Db {
                 .map_err(|_| lock_poisoned("manifest store"))?;
             manifest.prepare_create_checkpoint_publish(name.to_owned(), sequence)?
         };
-        prepared_publish.publish_async().await?;
+        prepared_publish.publish_async().await.map_err(|error| {
+            self.close_after_manifest_durability_failure("checkpoint creation", error)
+        })?;
         self.install_prepared_manifest_after_durable_publish(
             "checkpoint creation",
             manifest,
@@ -321,7 +320,9 @@ impl Db {
                 .map_err(|_| lock_poisoned("manifest store"))?;
             manifest.prepare_delete_checkpoint_publish(name.to_owned())?
         };
-        prepared_publish.publish_async().await?;
+        prepared_publish.publish_async().await.map_err(|error| {
+            self.close_after_manifest_durability_failure("checkpoint deletion", error)
+        })?;
         self.install_prepared_manifest_after_durable_publish(
             "checkpoint deletion",
             manifest,
@@ -363,6 +364,16 @@ impl Db {
         let (mut object, _serialize) = self.checkout_object_manifest().await?;
         object.create_checkpoint(name, sequence).await?;
         self.install_object_manifest_after_durable_publish("checkpoint creation", object)
+    }
+
+    pub(in crate::db) async fn reserve_file_ids_object_store_async(
+        &self,
+        count: usize,
+    ) -> Result<crate::manifest::FileIdReservation> {
+        let (mut object, _serialize) = self.checkout_object_manifest().await?;
+        let reservation = object.reserve_file_ids(count).await?;
+        self.install_object_manifest_after_durable_publish("file-id reservation", object)?;
+        Ok(reservation)
     }
 
     pub(in crate::db) async fn publish_object_manifest_delete_checkpoint(
@@ -425,74 +436,27 @@ impl Db {
             .map_err(|error| self.close_after_durable_publish_error(operation, &error))
     }
 
-    /// Delete object-store table/blob objects the published manifest does not
-    /// reference — orphans left by a flush that wrote objects but failed before
-    /// the manifest CAS published them. Returns the number of objects removed.
+    /// Reports the number of object-store table/blob objects reclaimed.
     ///
-    /// Serialized with flush via the maintenance flush guard so it never removes
-    /// an object an in-flight flush just wrote (cross-process safety comes from
-    /// the single-writer lease). The manifest mutex is held only to snapshot the
-    /// referenced ids, not across the deletes.
+    /// Object-store table/blob objects are immutable and retained indefinitely
+    /// until the format gains a durable cross-process reader-retirement
+    /// protocol. Neither a current manifest snapshot nor a writer lease proves
+    /// that an older read-only process has released an object, so deleting here
+    /// would violate snapshot and lazy-value lifetime guarantees. Returning
+    /// zero is the conservative, data-safe policy.
+    #[allow(clippy::unused_async)] // keeps the maintenance call shape uniform across async backends
     pub(in crate::db) async fn cleanup_object_store_orphans_async(&self) -> Result<usize> {
         self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
-        let Some(_flush_guard) = self.inner.maintenance.try_start_flush() else {
-            return Err(Error::runtime_busy(
-                "object-store orphan GC cannot run during a flush",
-            ));
-        };
-        let backend = self.object_storage()?;
-        let db_path = self.object_store_db_path();
-
-        let (referenced_tables, referenced_blobs) = {
-            let manifest = self
-                .inner
-                .manifest
-                .as_ref()
-                .ok_or_else(|| Error::Corruption {
-                    message: "object-store database is missing manifest store".to_owned(),
-                })?;
-            let manifest = manifest
-                .lock()
-                .map_err(|_| lock_poisoned("manifest store"))?;
-            (
-                referenced_table_file_ids(manifest.state()),
-                referenced_blob_file_ids_from_manifest(manifest.state()),
-            )
-        };
-
-        let mut deleted = 0_usize;
-        for table_id in table::list_table_file_ids_with_backend_async(&backend, db_path).await? {
-            if !referenced_tables.contains(&table_id) {
-                backend
-                    .delete_object(StorageObjectId::native_file(
-                        StorageObjectKind::Table,
-                        table::table_path(db_path, table_id),
-                    ))
-                    .await?;
-                deleted += 1;
-            }
-        }
-        for file_id in blob::list_blob_file_ids_with_backend_async(&backend, db_path).await? {
-            if !referenced_blobs.contains(&file_id) {
-                backend
-                    .delete_object(StorageObjectId::native_file(
-                        StorageObjectKind::Blob,
-                        blob::blob_path(db_path, file_id),
-                    ))
-                    .await?;
-                deleted += 1;
-            }
-        }
-        Ok(deleted)
+        Ok(0)
     }
 
     /// Compact object-store tables overlapping `range` once. Mirrors the browser
     /// async compaction, but publishes the table replacement via the object-store
-    /// manifest CAS and leaves the now-unreferenced input table objects + obsolete
-    /// blobs to orphan GC (which is snapshot-safe), rather than deleting inline.
+    /// manifest CAS and retains now-unreferenced input table objects + obsolete
+    /// blobs, rather than deleting while remote reader lifetime is unknowable.
     #[allow(clippy::too_many_lines)] // faithful mirror of the browser compaction orchestration
     pub(in crate::db) async fn run_compaction_once_object_store_async(
         &self,
@@ -501,7 +465,10 @@ impl Db {
         local_l0_compaction: bool,
         budget: MaintenanceBudget,
     ) -> Result<MaintenanceOutcome> {
-        let oldest_active_snapshot = self.oldest_retained_sequence();
+        let latest = self.last_committed_sequence();
+        let retained_floor = self.retained_floor_without_active_snapshots(latest);
+        let (oldest_active_snapshot, _snapshot_guard) =
+            self.inner.snapshots.begin_compaction(retained_floor);
         let compaction_inputs =
             self.collect_compaction_inputs(range, oldest_active_snapshot, local_l0_compaction)?;
         if compaction_inputs.is_empty() {
@@ -561,7 +528,7 @@ impl Db {
 
         match self.validate_compacted_tables(&written_tables) {
             Ok(()) => {}
-            // Output objects left unreferenced are reclaimed by orphan GC.
+            // Output objects left unreferenced remain immutable permanent gaps.
             Err(error) if is_level_layout_compaction_error(&error) => {
                 return Ok(MaintenanceOutcome::default());
             }
@@ -600,7 +567,7 @@ impl Db {
             &trigger_stats,
         );
         // The replaced input table objects and obsolete blob objects are now
-        // unreferenced by the manifest; orphan GC reclaims them snapshot-safely.
+        // unreferenced and conservatively retained for older remote readers.
 
         let outcome = MaintenanceOutcome {
             compactions: compaction_inputs.len(),
@@ -614,7 +581,8 @@ impl Db {
     }
 
     /// Build compaction output table objects (object-store backend). On error the
-    /// freshly-written objects are left for orphan GC. Mirrors the browser version.
+    /// freshly-written objects remain immutable permanent gaps. Mirrors the
+    /// browser version except for conservative remote retention.
     pub(in crate::db) async fn build_compaction_outputs_object_store_async(
         &self,
         db_path: &Path,
@@ -622,14 +590,26 @@ impl Db {
         compaction_inputs: &[NamedCompactionInput],
     ) -> Result<PendingCompactionOutputs> {
         let backend = self.object_storage()?;
+        let rewrites =
+            self.prepare_compaction_rewrites(oldest_active_snapshot, compaction_inputs)?;
+        let output_table_count = rewrites
+            .iter()
+            .flatten()
+            .try_fold(0usize, |count, rewrite| {
+                count
+                    .checked_add(rewrite.payloads.len())
+                    .ok_or_else(|| Error::Corruption {
+                        message: "compaction output table count overflow".to_owned(),
+                    })
+            })?;
+        let mut file_ids = self
+            .reserve_file_ids_object_store_async(output_table_count)
+            .await?;
         let mut outputs = Vec::with_capacity(compaction_inputs.len());
         let mut written_table_ids = Vec::new();
-        let mut next_table_id = self.next_table_id()?;
 
-        for input in compaction_inputs {
-            let force_rewrite_trivial =
-                input.tree.options.blob_level_merge_policy == BlobLevelMergePolicy::Always;
-            if input.input.trivial_move && !force_rewrite_trivial {
+        for (input, rewrite) in compaction_inputs.iter().zip(rewrites) {
+            let Some(rewrite) = rewrite else {
                 outputs.push(NamedCompactionOutput {
                     bucket: input.bucket.clone(),
                     trigger: Some(input.input.trigger),
@@ -639,26 +619,10 @@ impl Db {
                     },
                 });
                 continue;
-            }
-
-            let payloads = input.tree.build_compaction_table_payloads(
-                &input.input,
-                &input.input.compaction_range,
-                oldest_active_snapshot,
-                self.inner.options.target_table_bytes,
-            )?;
-            let mut table_options = input.input.table_options.clone();
-            table_options.rewrite_blob_indexes = should_rewrite_blob_indexes_for_compaction(
-                &input.input,
-                &payloads,
-                input.tree.options.blob_level_merge_policy,
-            );
-            let mut output_tables = Vec::with_capacity(payloads.len());
-            for payload in payloads {
-                let table_id = next_table_id;
-                next_table_id = next_table_id.next().ok_or_else(|| Error::Corruption {
-                    message: "table id counter overflow".to_owned(),
-                })?;
+            };
+            let mut output_tables = Vec::with_capacity(rewrite.payloads.len());
+            for payload in rewrite.payloads {
+                let table_id = file_ids.next_table_id()?;
                 let table_path = table::table_path(db_path, table_id);
                 written_table_ids.push(table_id);
                 let table = table::write_table_with_backend_async(
@@ -666,7 +630,7 @@ impl Db {
                     &table_path,
                     table_id,
                     input.input.table_level,
-                    &table_options,
+                    &rewrite.table_options,
                     &payload.point_records,
                     &payload.range_tombstones,
                     DurabilityMode::Flush,
@@ -889,8 +853,6 @@ impl Db {
         Ok(())
     }
 
-    // Keep the public shape aligned with the accepted v1 protocol:
-    // `Db::compact_range_sync(range) -> Result<()>`.
     /// Compacts table files that overlap `range`.
     ///
     /// Compaction rewrites overlapping table files into lower levels according

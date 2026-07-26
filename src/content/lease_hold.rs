@@ -561,6 +561,7 @@ impl ContentHandle {
     /// [`Error::ContentDigestMismatch`] / [`Error::Corruption`] if a chunk is
     /// missing, malformed, or tampered with.
     pub async fn read_range(&self, start: u64, length: u64) -> Result<Arc<[u8]>> {
+        let _activity = self.db.begin_activity()?;
         self.ensure_lease_active()?;
         if start > self.descriptor.length() {
             return Err(Error::ContentRangeOutOfBounds {
@@ -636,6 +637,7 @@ impl ContentHandle {
     ///
     /// Returns a storage, format, or digest error at the first invalid chunk.
     pub async fn verify(&self) -> Result<()> {
+        let _activity = self.db.begin_activity()?;
         let mut stream = self.stream();
         let mut hasher = Sha256::new();
         while let Some(bytes) = stream.next().await? {
@@ -670,6 +672,7 @@ impl ContentStream {
     /// Propagates the same storage, format, and integrity errors as
     /// [`ContentHandle::read_range`].
     pub async fn next(&mut self) -> Result<Option<Arc<[u8]>>> {
+        let _activity = self.handle.db.begin_activity()?;
         if self.position == self.handle.len() {
             return Ok(None);
         }

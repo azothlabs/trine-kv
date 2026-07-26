@@ -90,6 +90,33 @@ fn runtime_enabled_native_file_owned_read_uses_blocking_adapter() {
 }
 
 #[test]
+fn runtime_enabled_borrowed_read_never_performs_file_io_in_poll() {
+    let path = temp_storage_root("trine-kv-runtime-borrowed-read").join("table.trinet");
+    std::fs::create_dir_all(path.parent().expect("test parent")).expect("test parent creates");
+    std::fs::write(&path, b"abcdef").expect("test file writes");
+
+    let runtime = Runtime::with_blocking_limits(RuntimeOptions::native_threads(), 1, 2);
+    let release = hold_runtime_blocking_worker(&runtime);
+    let backend = NativeFileBackend::with_runtime(runtime);
+    let object_id = StorageObjectId::native_file(StorageObjectKind::Table, &path);
+    let object = poll_ready_storage_future(backend.open_read(object_id))
+        .expect("runtime-backed object opens");
+    let mut bytes = [0_u8; 4];
+    let mut read = StorageReadObject::read_exact_at(&object, 1, &mut bytes);
+    let waker = test_waker();
+    let mut context = Context::from_waker(&waker);
+    assert!(
+        matches!(read.as_mut().poll(&mut context), Poll::Pending),
+        "borrowed read must hand file IO to the occupied blocking adapter"
+    );
+
+    release.send(()).expect("release blocking worker");
+    block_on_test_future(read).expect("borrowed read completes");
+    assert_eq!(&bytes, b"bcde");
+    std::fs::remove_dir_all(path.parent().expect("test parent")).expect("test root removes");
+}
+
+#[test]
 fn runtime_enabled_native_file_object_read_uses_blocking_adapter() {
     let path = std::env::temp_dir().join(format!(
         "trine-kv-runtime-object-read-{}-{}",
@@ -295,4 +322,20 @@ fn native_file_backend_reads_current_manifest() {
     assert_eq!(&*bytes, b"manifest bytes");
 
     std::fs::remove_dir_all(root).expect("test dir removes");
+}
+
+#[test]
+fn native_manifest_read_rejects_oversized_file_before_allocating_it() {
+    let root = temp_storage_root("trine-kv-storage-manifest-oversized");
+    std::fs::create_dir_all(&root).expect("manifest root creates");
+    let object = StorageObjectId::native_file(StorageObjectKind::Manifest, root.join("MANIFEST"));
+    let file = std::fs::File::create(object.path()).expect("sparse manifest creates");
+    file.set_len((crate::limits::MAX_MANIFEST_PAYLOAD_BYTES as u64) + 4096)
+        .expect("sparse manifest length sets");
+
+    let error = NativeFileBackend::new()
+        .read_current_manifest_blocking(object)
+        .expect_err("oversized manifest is rejected from metadata");
+    assert!(matches!(error, Error::Corruption { .. }));
+    std::fs::remove_dir_all(root).expect("manifest root removes");
 }

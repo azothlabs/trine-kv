@@ -171,7 +171,7 @@ pub use db::{Db, IntoOpenOptions, MaintenanceBudget, MaintenanceOutcome};
 pub use error::{ContentReclaimBlocker, Error, Result};
 pub use iterator::{Direction, Iter, LazyIter, LazyKeyValue, LazyValue};
 pub use object_store::{
-    ETag, InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta,
+    ETag, InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectListPage, ObjectMeta,
     ObjectStoreReclamationAttestation, ObjectStoreReclamationEvidenceDigest, ObjectVersion,
     Precondition, PutIf, QualifiedObjectStoreReclamation, qualify_object_store_reclamation,
     verify_object_client_contract,

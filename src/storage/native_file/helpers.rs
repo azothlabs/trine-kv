@@ -354,6 +354,16 @@ pub(in crate::storage) fn append_native_file_object(
         Some(object.kind()),
         object.path(),
     )?;
+    #[cfg(test)]
+    if let Err(error) = crate::storage::fault_injection::check(
+        crate::storage::fault_injection::StorageFaultPoint::WalAppendPartial,
+        Some(object.kind()),
+        object.path(),
+    ) {
+        let partial_len = bytes.len().div_ceil(2);
+        file.write_all(&bytes[..partial_len])?;
+        return Err(error);
+    }
 
     #[cfg(target_os = "wasi")]
     file.seek(SeekFrom::End(0))?;
@@ -622,8 +632,14 @@ pub(in crate::storage) fn read_current_manifest_from_native_file(
 ) -> Result<Option<Arc<[u8]>>> {
     require_native_file_manifest_read(object)?;
 
-    match fs::read(object.path()) {
-        Ok(bytes) => Ok(Some(Arc::from(bytes))),
+    match File::open(object.path()) {
+        Ok(mut file) => {
+            let len = u64_to_usize(file.metadata()?.len(), "manifest file length")?;
+            ensure_whole_object_read_len(object, len)?;
+            let mut bytes = allocate_read_buffer(len)?;
+            file.read_exact(&mut bytes)?;
+            Ok(Some(Arc::from(bytes)))
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
@@ -734,11 +750,29 @@ pub(in crate::storage) fn publish_manifest_to_native_file(
         object.path(),
     )?;
     fs::rename(&tmp_path, &path)?;
-    if requires_parent_dir_sync_after_rename(durability) {
-        sync_native_file_parent_directory_after_rename(&path)?;
+    if requires_parent_dir_sync_after_rename(durability)
+        && let Err(error) = sync_published_manifest_parent(object, &path)
+    {
+        let source = match error {
+            Error::Io(source) => source,
+            other => io::Error::other(other),
+        };
+        return Err(Error::ManifestPublishedDurabilityUnknown { source });
     }
 
     Ok(())
+}
+
+fn sync_published_manifest_parent(object: &StorageObjectId, path: &Path) -> Result<()> {
+    #[cfg(test)]
+    crate::storage::fault_injection::check(
+        crate::storage::fault_injection::StorageFaultPoint::ManifestDirectorySync,
+        Some(object.kind()),
+        object.path(),
+    )?;
+    #[cfg(not(test))]
+    let _ = object;
+    sync_native_file_parent_directory_after_rename(path)
 }
 
 pub(in crate::storage) fn sync_native_file_for_durability(

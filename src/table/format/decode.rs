@@ -6,9 +6,9 @@ use super::{
     MIN_INDEX_PARTITION_ENTRY_BYTES, MIN_RANGE_TOMBSTONE_BYTES, POINT_KEY_FILTER_ABSENT,
     POINT_KEY_FILTER_PRESENT, PREFIX_FILTER_ABSENT, PREFIX_FILTER_PRESENT, PointKeyFilter,
     PrefixFilter, RESTART_POINT_BYTES, Range, Result, SectionHandle, Sequence, TablePointRecord,
-    TableProperties, TableRangeTombstone, TableSection, VALUE_BLOB, VALUE_BLOB_INDEX, VALUE_INLINE,
-    VALUE_NONE, ValueRefHeader, block_bounds, ensure_count_fits_remaining, invalid_table,
-    range_tombstone, section_bounds, u32_to_usize, user_key_hash, usize_to_u32,
+    TableProperties, TableRangeTombstone, TableSection, VALUE_BLOB_INDEX, VALUE_INLINE, VALUE_NONE,
+    ValueRefHeader, block_bounds, ensure_count_fits_remaining, invalid_table, range_tombstone,
+    section_bounds, u32_to_usize, user_key_hash, usize_to_u32,
 };
 
 pub(in crate::table) fn validate_block_codec(
@@ -156,12 +156,6 @@ pub(in crate::table) fn read_value_ref_header(
                 len: bytes.end.saturating_sub(bytes.start),
             }))
         }
-        VALUE_BLOB => Ok(Some(ValueRefHeader::Blob {
-            file_id: cursor.read_u64()?,
-            offset: cursor.read_u64()?,
-            len: cursor.read_u64()?,
-            checksum: cursor.read_u32()?,
-        })),
         VALUE_BLOB_INDEX => Ok(Some(ValueRefHeader::BlobIndex(BlobIndex {
             file_id: cursor.read_u64()?,
             offset: cursor.read_u64()?,
@@ -736,4 +730,17 @@ pub(in crate::table) fn record_view_matches_internal_key(
         && record.sequence == key.sequence()
         && record.kind == key.kind()
         && record.batch_index == key.batch_index()
+}
+
+#[cfg(test)]
+mod value_reference_tests {
+    use super::*;
+
+    #[test]
+    fn raw_blob_reference_tag_is_rejected() {
+        let mut cursor = Cursor::new(&[2]);
+        let error = read_value_ref_header(&mut cursor)
+            .expect_err("raw blob references are not part of the current table format");
+        assert!(matches!(error, Error::InvalidFormat { .. }));
+    }
 }

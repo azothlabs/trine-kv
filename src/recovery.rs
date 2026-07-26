@@ -16,8 +16,9 @@ use crate::{
         BlockingStorageObjectDeleteBackend, BlockingStorageObjectReadBackend,
         BlockingStorageObjectWriteBackend, BlockingStorageReadBackend,
         BlockingStorageWriterLeaseBackend, NativeFileBackend, NativeFileWriterLease,
-        StorageCapability, StorageDirectoryFile, StorageDirectoryId, StorageDirectoryListBackend,
-        StorageObjectDeleteBackend, StorageObjectId, StorageObjectKind, StorageObjectListBackend,
+        OBJECT_LIST_PAGE_SIZE, StorageCapability, StorageDirectoryFile, StorageDirectoryId,
+        StorageDirectoryListBackend, StorageObjectDeleteBackend, StorageObjectId,
+        StorageObjectKind, StorageObjectListBackend, StorageObjectListRequest,
         StorageObjectReadBackend, StorageObjectWriteBackend, StorageReadBackend,
         StorageWriterLeaseBackend,
     },
@@ -324,16 +325,48 @@ where
 {
     let mut unreferenced_files = Vec::new();
 
-    for table_id in table::list_table_file_ids_with_backend_async(backend, db_path).await? {
-        if !referenced_table_ids.contains(&table_id) {
-            unreferenced_files.push(storage_file_name(&table::table_path(db_path, table_id))?);
+    let table_request = StorageObjectListRequest::native_file(StorageObjectKind::Table, db_path)
+        .with_file_extension(table::TABLE_FILE_EXTENSION);
+    let mut after = None;
+    loop {
+        let page = backend
+            .list_objects_page(
+                table_request.clone(),
+                after.as_deref(),
+                OBJECT_LIST_PAGE_SIZE,
+            )
+            .await?;
+        for table_id in table::table_file_ids_from_objects(page.objects)? {
+            if !referenced_table_ids.contains(&table_id) {
+                unreferenced_files.push(storage_file_name(&table::table_path(db_path, table_id))?);
+            }
         }
+        let Some(next_after) = page.next_after else {
+            break;
+        };
+        after = Some(next_after);
     }
 
-    for blob_id in blob::list_blob_file_ids_with_backend_async(backend, db_path).await? {
-        if !referenced_blob_ids.contains(&blob_id) {
-            unreferenced_files.push(storage_file_name(&blob::blob_path(db_path, blob_id))?);
+    let blob_request = StorageObjectListRequest::native_file(StorageObjectKind::Blob, db_path)
+        .with_file_extension(blob::BLOB_FILE_EXTENSION);
+    let mut after = None;
+    loop {
+        let page = backend
+            .list_objects_page(
+                blob_request.clone(),
+                after.as_deref(),
+                OBJECT_LIST_PAGE_SIZE,
+            )
+            .await?;
+        for blob_id in blob::blob_file_ids_from_objects(page.objects)? {
+            if !referenced_blob_ids.contains(&blob_id) {
+                unreferenced_files.push(storage_file_name(&blob::blob_path(db_path, blob_id))?);
+            }
         }
+        let Some(next_after) = page.next_after else {
+            break;
+        };
+        after = Some(next_after);
     }
 
     unreferenced_files.sort();

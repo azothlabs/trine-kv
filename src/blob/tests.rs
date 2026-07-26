@@ -2,9 +2,10 @@ use std::collections::BTreeSet;
 
 use crate::{
     blob::{
-        BlobFileHeader, BlobRecord, ValueRef, decode_blob_file, encode_blob_file,
-        inline_blob_values, read_blob_file_with_backend_async, read_indexed_value,
-        read_record_for_index, read_value_for_internal_key_with_backend_async, write_large_values,
+        BlobFileHeader, BlobRecord, ValueRef, decode_blob_file, decode_records_with_budget,
+        encode_blob_file, inline_blob_values, read_blob_file_with_backend_async,
+        read_indexed_value, read_record_for_index, read_value_for_internal_key_with_backend_async,
+        write_large_values,
     },
     codec::CodecId,
     internal_key::{InternalKey, ValueKind},
@@ -41,6 +42,26 @@ fn blob_file_round_trips_ordered_records() {
         decoded.properties.value_bytes,
         (b"Ada".len() + b"Lin Lin Lin Lin".len()) as u64
     );
+}
+
+#[test]
+fn aggregate_decoded_blob_budget_is_enforced_before_next_value_allocation() {
+    let header = BlobFileHeader::new(7, Sequence::new(42), 1, CodecId::FastLz4Block);
+    let records = vec![
+        blob_record("a", 2, 0, vec![0; 32], CodecId::FastLz4Block),
+        blob_record("b", 1, 0, vec![0; 32], CodecId::FastLz4Block),
+    ];
+    let (bytes, _) = encode_blob_file(header, &records).expect("blob encodes");
+    let footer = &bytes[bytes.len() - super::BLOB_FOOTER_LEN..];
+    let properties_offset = usize::try_from(u64::from_le_bytes(
+        footer[..8].try_into().expect("properties offset bytes"),
+    ))
+    .expect("properties offset fits usize");
+    let record_bytes = &bytes[super::BLOB_HEADER_LEN..properties_offset];
+
+    let error = decode_records_with_budget(header.file_id, record_bytes, 48)
+        .expect_err("second value exceeds the aggregate decode budget");
+    assert!(matches!(error, crate::Error::InvalidFormat { .. }));
 }
 
 #[test]
@@ -126,6 +147,54 @@ fn inline_blob_values_reuses_open_blob_file() {
 }
 
 #[test]
+fn async_inline_blob_values_reuses_open_blob_file() {
+    let temp = temp_blob_dir("async-inline-cache");
+    let backend = NativeFileBackend::new();
+    let header = BlobFileHeader::new(52, Sequence::new(3), 16, CodecId::None);
+    let records = vec![
+        blob_record("user:1", 3, 0, b"value-one".to_vec(), CodecId::None),
+        blob_record("user:2", 2, 0, b"value-two".to_vec(), CodecId::None),
+    ];
+    let indexes = super::write_blob_file_with_backend(&backend, &temp, 52, header, &records)
+        .expect("blob file writes");
+    let table_records = vec![
+        (
+            records[0].internal_key.clone(),
+            Some(ValueRef::BlobIndex(indexes[0])),
+        ),
+        (
+            records[1].internal_key.clone(),
+            Some(ValueRef::BlobIndex(indexes[1])),
+        ),
+    ];
+    let before = backend.stats().operations.open_read.requests;
+
+    let rewritten = poll_ready(super::inline_blob_values_with_backend_async(
+        &backend,
+        &temp,
+        &table_records,
+    ))
+    .expect("blob values inline");
+    let after = backend.stats().operations.open_read.requests;
+
+    assert_eq!(after.saturating_sub(before), 1);
+    assert_eq!(
+        rewritten,
+        vec![
+            (
+                records[0].internal_key.clone(),
+                Some(ValueRef::Inline(b"value-one".to_vec()))
+            ),
+            (
+                records[1].internal_key.clone(),
+                Some(ValueRef::Inline(b"value-two".to_vec()))
+            ),
+        ]
+    );
+    std::fs::remove_dir_all(temp).expect("cleanup temp dir");
+}
+
+#[test]
 fn blob_file_rejects_corrupt_footer() {
     let (mut bytes, _) = encode_blob_file(
         BlobFileHeader::new(9, Sequence::new(1), 8, CodecId::None),
@@ -185,24 +254,6 @@ fn indexed_blob_read_rejects_record_body_len_before_large_allocation() {
             .expect_err("oversized record body should fail before allocation");
 
     assert!(error.to_string().contains("blob record length"));
-    std::fs::remove_dir_all(temp).expect("cleanup temp dir");
-}
-
-#[test]
-fn direct_blob_ref_rejects_len_before_large_allocation() {
-    let temp = temp_blob_dir("oversized-direct-ref");
-    let value = ValueRef::Blob {
-        file_id: 99,
-        offset: 0,
-        len: (super::limits::MAX_DECODED_BLOCK_BYTES as u64) + 1,
-        checksum: 0,
-    };
-    let backend = NativeFileBackend::new();
-
-    let error = super::read_value_for_internal_key_with_backend(&backend, &temp, &value, None)
-        .expect_err("oversized direct blob reference should fail before opening blob");
-
-    assert!(error.to_string().contains("blob length"));
     std::fs::remove_dir_all(temp).expect("cleanup temp dir");
 }
 

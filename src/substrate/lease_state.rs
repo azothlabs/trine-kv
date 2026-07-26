@@ -1,7 +1,7 @@
 use super::{
     Arc, Error, OBJECT_LEASE_MAGIC, OBJECT_LEASE_MAX_BYTES, OBJECT_LEASE_TTL,
-    OBJECT_LEASE_V2_HEADER_LEN, OBJECT_LEASE_V3_HEADER_LEN, OBJECT_LEASE_VERSION, ObjectClient,
-    ObjectLeaseState, ObservedLeaseState, Result, Sequence,
+    OBJECT_LEASE_V3_HEADER_LEN, OBJECT_LEASE_VERSION, ObjectClient, ObjectLeaseState,
+    ObservedLeaseState, Result, Sequence,
 };
 #[cfg(not(all(feature = "s3", not(target_family = "wasm"))))]
 use super::{Context, Future, Poll, Wake, Waker, thread};
@@ -24,7 +24,7 @@ pub(super) async fn read_lease_state(
     let bytes = if meta.size == 0 {
         Arc::from([])
     } else {
-        client.get_range(key, 0, meta.size).await?
+        client.get_range(key, 0, meta.size, &meta.etag).await?
     };
     Ok(Some(ObservedLeaseState {
         etag: meta.etag,
@@ -47,86 +47,30 @@ pub(super) fn encode_lease_state(state: ObjectLeaseState) -> Result<Arc<[u8]>> {
     if let Some(key) = state.current_wal_key {
         bytes.extend_from_slice(key.as_bytes());
     }
+    if u64::try_from(bytes.len()).map_or(true, |encoded_len| encoded_len > OBJECT_LEASE_MAX_BYTES) {
+        return Err(Error::invalid_options(format!(
+            "writer lease encoded length {} exceeds maximum {OBJECT_LEASE_MAX_BYTES}",
+            bytes.len()
+        )));
+    }
     Ok(Arc::from(bytes))
 }
 
 pub(super) fn decode_lease_state(key: &str, bytes: &[u8]) -> Result<ObjectLeaseState> {
-    if bytes.len() >= 4 && read_u32_le(key, &bytes[..4], "magic")? == OBJECT_LEASE_MAGIC {
-        return decode_versioned_lease_state(key, bytes);
-    }
-    if bytes.len() == 8 {
-        let epoch = decode_u64(key, bytes, "epoch")?;
-        return Ok(ObjectLeaseState {
-            epoch,
-            owner_id: [0; 16],
-            committed_sequence: Sequence::ZERO,
-            current_wal_key: None,
-            lease_expires_at_ms: 0,
-        });
-    }
-    if bytes.len() == 16 {
-        let epoch = decode_u64(key, &bytes[..8], "epoch")?;
-        let committed_sequence = Sequence::new(decode_u64(key, &bytes[8..], "commit head")?);
-        return Ok(ObjectLeaseState {
-            epoch,
-            owner_id: [0; 16],
-            committed_sequence,
-            current_wal_key: None,
-            lease_expires_at_ms: 0,
-        });
-    }
-    if bytes.len() < 20 {
+    if bytes.len() < OBJECT_LEASE_V3_HEADER_LEN {
         return Err(Error::Corruption {
             message: format!("writer lease {key} has a malformed state"),
         });
     }
-    let epoch = decode_u64(key, &bytes[..8], "epoch")?;
-    let committed_sequence = Sequence::new(decode_u64(key, &bytes[8..16], "commit head")?);
-    let key_len = read_u32_le(key, &bytes[16..20], "WAL segment key length")?;
-    decode_lease_state_with_key(
-        key,
-        bytes,
-        20,
-        key_len,
-        ObjectLeaseState {
-            epoch,
-            owner_id: [0; 16],
-            committed_sequence,
-            current_wal_key: None,
-            lease_expires_at_ms: 0,
-        },
-    )
-}
-
-pub(super) fn decode_versioned_lease_state(key: &str, bytes: &[u8]) -> Result<ObjectLeaseState> {
-    if bytes.len() < OBJECT_LEASE_V2_HEADER_LEN {
+    if read_u32_le(key, &bytes[..4], "magic")? != OBJECT_LEASE_MAGIC {
         return Err(Error::Corruption {
-            message: format!("writer lease {key} has a malformed v2 state"),
+            message: format!("writer lease {key} has invalid magic"),
         });
     }
     let version = read_u16_le(key, &bytes[4..6], "version")?;
-    if version == 2 {
-        let epoch = decode_u64(key, &bytes[6..14], "epoch")?;
-        let committed_sequence = Sequence::new(decode_u64(key, &bytes[14..22], "commit head")?);
-        let lease_expires_at_ms = decode_u64(key, &bytes[22..30], "lease expiry")?;
-        let key_len = read_u32_le(key, &bytes[30..34], "WAL segment key length")?;
-        return decode_lease_state_with_key(
-            key,
-            bytes,
-            OBJECT_LEASE_V2_HEADER_LEN,
-            key_len,
-            ObjectLeaseState {
-                epoch,
-                owner_id: [0; 16],
-                committed_sequence,
-                current_wal_key: None,
-                lease_expires_at_ms,
-            },
-        );
-    }
-    if version != OBJECT_LEASE_VERSION || bytes.len() < OBJECT_LEASE_V3_HEADER_LEN {
+    if version != OBJECT_LEASE_VERSION {
         return Err(Error::Corruption {
-            message: format!("writer lease {key} has unsupported or malformed version {version}"),
+            message: format!("writer lease {key} has unsupported version {version}"),
         });
     }
     let epoch = decode_u64(key, &bytes[6..14], "epoch")?;

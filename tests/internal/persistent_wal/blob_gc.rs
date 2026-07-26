@@ -170,8 +170,8 @@ fn persistent_blob_level_merge_defers_pending_blob_clear_publish() {
                 .publish_manifest
                 .requests
                 .saturating_sub(before.storage_operations.publish_manifest.requests),
-            1,
-            "foreground level merge should not publish a second manifest only to clear cleanup metadata"
+            2,
+            "one publish reserves globally unique output IDs and one installs outputs; cleanup metadata is not cleared by a third publish"
         );
         assert_eq!(
             blob_file_paths(&path).len(),
@@ -759,4 +759,3 @@ fn persistent_compaction_keeps_lazy_iterator_table_files_until_pin_released() {
 
     fs::remove_dir_all(path).expect("cleanup test db");
 }
-

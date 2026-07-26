@@ -15,7 +15,6 @@ use super::tree::{LsmTree, lock_poisoned};
 pub(crate) struct FlushInput {
     pub(crate) memtable: Arc<crate::memtable::Memtable>,
     pub(crate) freeze_sequence: Sequence,
-    pub(crate) table_id: table::TableId,
     pub(crate) table_level: table::TableLevel,
     pub(crate) table_options: table::TableWriteOptions,
     pub(crate) point_records: Vec<(InternalKey, Option<ValueRef>)>,
@@ -23,10 +22,56 @@ pub(crate) struct FlushInput {
 }
 
 impl LsmTree {
-    pub(crate) fn prepare_flush_inputs(
+    /// Returns the oldest sequence that would still need WAL replay after the
+    /// supplied immutable memtables have been durably published.
+    ///
+    /// Callers serialize this snapshot with memtable publication. Scanning the
+    /// actual records (rather than using each immutable's freeze high-water
+    /// mark) is required because a bucket can be idle across many global
+    /// commits and therefore contain sequences far below its freeze boundary.
+    pub(crate) fn oldest_unflushed_sequence_excluding(
         &self,
-        next_table_id: &mut table::TableId,
-    ) -> Result<Vec<FlushInput>> {
+        flushed_memtables: &[Arc<crate::memtable::Memtable>],
+    ) -> Result<Option<Sequence>> {
+        let mut oldest = None;
+
+        let active_memtable = self
+            .active_memtable
+            .read()
+            .map_err(|_| lock_poisoned("active memtable"))?
+            .clone();
+        update_oldest_point_sequence(&mut oldest, &active_memtable)?;
+
+        let active_tombstones = self
+            .range_tombstones
+            .read()
+            .map_err(|_| lock_poisoned("range tombstones"))?;
+        for tombstone in active_tombstones.iter() {
+            update_oldest_sequence(&mut oldest, tombstone.sequence);
+        }
+        drop(active_tombstones);
+
+        let immutable_memtables = self
+            .immutable_memtables
+            .read()
+            .map_err(|_| lock_poisoned("immutable memtable queue"))?;
+        for immutable in immutable_memtables.iter() {
+            if flushed_memtables
+                .iter()
+                .any(|flushed| Arc::ptr_eq(flushed, &immutable.memtable))
+            {
+                continue;
+            }
+            update_oldest_point_sequence(&mut oldest, &immutable.memtable)?;
+            for tombstone in immutable.range_tombstones.iter() {
+                update_oldest_sequence(&mut oldest, tombstone.sequence);
+            }
+        }
+
+        Ok(oldest)
+    }
+
+    pub(crate) fn prepare_flush_inputs(&self) -> Result<Vec<FlushInput>> {
         let immutable_memtables = self
             .immutable_memtables
             .read()
@@ -62,15 +107,11 @@ impl LsmTree {
             inputs.push(FlushInput {
                 memtable: Arc::clone(&immutable.memtable),
                 freeze_sequence: immutable.freeze_sequence,
-                table_id: *next_table_id,
                 table_level: table::TableLevel::ZERO,
                 table_options: table_write_options(&self.options),
                 point_records,
                 range_tombstones,
             });
-            *next_table_id = next_table_id.next().ok_or_else(|| Error::Corruption {
-                message: "table id counter overflow".to_owned(),
-            })?;
         }
 
         Ok(inputs)
@@ -102,6 +143,23 @@ impl LsmTree {
 
         Ok(())
     }
+}
+
+fn update_oldest_point_sequence(
+    oldest: &mut Option<Sequence>,
+    memtable: &crate::memtable::Memtable,
+) -> Result<()> {
+    let entries = memtable
+        .read_entries()
+        .map_err(|_| lock_poisoned("memtable entries"))?;
+    for internal_key in entries.keys() {
+        update_oldest_sequence(oldest, internal_key.sequence());
+    }
+    Ok(())
+}
+
+fn update_oldest_sequence(oldest: &mut Option<Sequence>, candidate: Sequence) {
+    *oldest = Some(oldest.map_or(candidate, |current| current.min(candidate)));
 }
 
 fn table_write_options(options: &BucketOptions) -> table::TableWriteOptions {

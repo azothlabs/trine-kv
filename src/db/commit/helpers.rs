@@ -147,6 +147,51 @@ pub(super) fn validate_operation_resource_bounds(
     Ok(())
 }
 
+pub(super) fn validate_operation_storage_encoding(
+    operation: &BatchOperation,
+    bucket_options: &crate::options::BucketOptions,
+) -> Result<()> {
+    let BatchOperation::Put { key, value, .. } = operation else {
+        return Ok(());
+    };
+
+    // Internal key: u32 key length + key + sequence + kind + batch index.
+    let internal_key_len = 4_usize
+        .checked_add(key.len())
+        .and_then(|len| len.checked_add(8 + 1 + 4))
+        .ok_or_else(|| Error::invalid_options("internal key encoded length overflow"))?;
+    if value.len() < bucket_options.blob_threshold_bytes {
+        // Inline value reference: tag + u32 length + value.
+        let record_len = internal_key_len
+            .checked_add(1 + 4)
+            .and_then(|len| len.checked_add(value.len()))
+            .ok_or_else(|| Error::invalid_options("table record encoded length overflow"))?;
+        if record_len > crate::limits::MAX_DECODED_BLOCK_BYTES {
+            return Err(Error::invalid_options(format!(
+                "inline table record length {record_len} exceeds maximum {}",
+                crate::limits::MAX_DECODED_BLOCK_BYTES
+            )));
+        }
+        return Ok(());
+    }
+
+    let encoded_value_len =
+        crate::codec::max_encoded_block_len(bucket_options.compression.codec_id(), value.len())
+            .ok_or_else(|| Error::invalid_options("blob encoded value length overflow"))?;
+    // value_len + encoded_len + codec + value checksum.
+    let body_len = internal_key_len
+        .checked_add(8 + 8 + 1 + 4)
+        .and_then(|len| len.checked_add(encoded_value_len))
+        .ok_or_else(|| Error::invalid_options("blob record body length overflow"))?;
+    if body_len > crate::limits::MAX_BLOB_RECORD_BODY_BYTES {
+        return Err(Error::invalid_options(format!(
+            "blob record body length {body_len} exceeds maximum {}",
+            crate::limits::MAX_BLOB_RECORD_BODY_BYTES
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn validate_bound_len(bound: &Bound<Vec<u8>>, max_key_bytes: usize) -> Result<()> {
     match bound {
         Bound::Included(bytes) | Bound::Excluded(bytes) => {

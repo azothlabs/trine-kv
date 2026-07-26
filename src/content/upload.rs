@@ -2,11 +2,12 @@ use super::{
     Arc, CHUNK_HEADER_LEN, CHUNK_MAGIC, ContentAttachmentScope, ContentHashAlgorithm, ContentId,
     ContentUploadOptions, DESCRIPTOR_LEN, DESCRIPTOR_MAGIC, Db, Digest, DurabilityMode, Duration,
     Error, MAX_CHUNK_BYTES, MIN_CHUNK_BYTES, OwnerScopeId, Result, SealedContent, Sha256,
-    StorageDomainId, UPLOAD_STATE_ABORTING, UPLOAD_STATE_LEN, UPLOAD_STATE_MAGIC,
-    UPLOAD_STATE_OPEN, UPLOAD_STATE_SEALED, UPLOAD_STATE_SEALING, UPLOAD_STATE_UPDATED_AT_OFFSET,
-    UploadId, UploadToken, array_at, current_epoch_millis, decode_content_id, decode_durability,
-    decode_optional_content_id, decode_optional_u64, digest_string, encode_durability,
-    encode_optional_content_id, encode_optional_u64, fmt, mem,
+    StorageDomainId, UPLOAD_ID_TOMBSTONE_LEN, UPLOAD_ID_TOMBSTONE_MAGIC, UPLOAD_STATE_ABORTING,
+    UPLOAD_STATE_LEN, UPLOAD_STATE_MAGIC, UPLOAD_STATE_OPEN, UPLOAD_STATE_SEALED,
+    UPLOAD_STATE_SEALING, UPLOAD_STATE_UPDATED_AT_OFFSET, UploadId, UploadToken, array_at,
+    current_epoch_millis, decode_content_id, decode_durability, decode_optional_content_id,
+    decode_optional_u64, digest_string, encode_durability, encode_optional_content_id,
+    encode_optional_u64, fmt, mem,
 };
 
 /// Result of resuming durable state for an [`UploadId`].
@@ -20,6 +21,57 @@ pub enum ContentUploadResume {
     Open(ContentUpload),
     /// The upload was already sealed; this is the idempotent prior result.
     Sealed(SealedContent),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UploadIdRetirement {
+    Aborted,
+    Sealed,
+}
+
+pub(crate) fn encode_upload_id_tombstone(
+    upload_id: UploadId,
+    retirement: UploadIdRetirement,
+) -> Arc<[u8]> {
+    let mut bytes = Vec::with_capacity(UPLOAD_ID_TOMBSTONE_LEN);
+    bytes.extend_from_slice(UPLOAD_ID_TOMBSTONE_MAGIC);
+    bytes.push(match retirement {
+        UploadIdRetirement::Aborted => 0,
+        UploadIdRetirement::Sealed => 1,
+    });
+    bytes.extend_from_slice(&upload_id.to_bytes());
+    debug_assert_eq!(bytes.len(), UPLOAD_ID_TOMBSTONE_LEN);
+    Arc::from(bytes)
+}
+
+pub(crate) fn decode_upload_id_tombstone(
+    bytes: &[u8],
+    expected: UploadId,
+) -> Result<Option<UploadIdRetirement>> {
+    if bytes.get(..8) != Some(UPLOAD_ID_TOMBSTONE_MAGIC) {
+        return Ok(None);
+    }
+    if bytes.len() != UPLOAD_ID_TOMBSTONE_LEN {
+        return Err(Error::InvalidFormat {
+            message: "invalid retired upload-id marker length".to_owned(),
+        });
+    }
+    let retirement = match bytes[8] {
+        0 => UploadIdRetirement::Aborted,
+        1 => UploadIdRetirement::Sealed,
+        _ => {
+            return Err(Error::InvalidFormat {
+                message: "invalid retired upload-id marker state".to_owned(),
+            });
+        }
+    };
+    let encoded = UploadId(array_at::<16>(bytes, 9, "retired upload identity")?);
+    if encoded != expected {
+        return Err(Error::InvalidFormat {
+            message: "retired upload-id marker identity mismatch".to_owned(),
+        });
+    }
+    Ok(Some(retirement))
 }
 
 /// Durable lifecycle visible to content-upload maintenance.
@@ -220,12 +272,13 @@ impl ContentUpload {
     /// write, [`Error::InvalidOptions`] on length overflow, or a backend storage
     /// error while persisting a completed chunk.
     pub async fn write(&mut self, mut bytes: &[u8]) -> Result<()> {
+        let db = self.db.clone();
+        let _activity = db.begin_activity()?;
         self.ensure_active()?;
         if bytes.is_empty() {
             return Ok(());
         }
 
-        let db = self.db.clone();
         let _upload = db.lock_content_upload(self.upload_id).await;
         let durable = db.require_upload_state(self.upload_id).await?;
         durable.require_open_revision(self.revision)?;
@@ -248,6 +301,10 @@ impl ContentUpload {
         db.reserve_content_upload_bytes(&durable, desired_reservation)
             .await?;
         self.length = next_length;
+        let next_revision = self
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| Error::invalid_options("content upload revision overflow"))?;
 
         while !bytes.is_empty() {
             let available = self.options.chunk_bytes() - self.buffer.len();
@@ -266,17 +323,18 @@ impl ContentUpload {
             let frame = encode_chunk(self.upload_id, self.complete_chunks, &self.buffer)?;
             if let Err(error) = self
                 .db
-                .write_content_chunk(self.upload_id, self.complete_chunks, frame)
+                .write_content_partial_chunk(
+                    self.upload_id,
+                    self.complete_chunks,
+                    next_revision,
+                    frame,
+                )
                 .await
             {
                 self.failed = true;
                 return Err(error);
             }
         }
-        let next_revision = self
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| Error::invalid_options("content upload revision overflow"))?;
         let state = UploadSessionState::open(
             self.upload_id,
             next_revision,
@@ -320,9 +378,9 @@ impl ContentUpload {
 
     /// Aborts the upload and makes every staging chunk unreachable.
     ///
-    /// No descriptor is published. The durable session is deleted before
-    /// best-effort chunk cleanup, so a crash cannot leave a resumable session
-    /// that points at missing bytes.
+    /// No descriptor is published. The durable session enters `aborting`
+    /// before chunk cleanup and ends as a permanent retired-ID marker, so a
+    /// crash cannot reopen it as writable state.
     ///
     /// # Errors
     ///
@@ -513,6 +571,17 @@ impl UploadSessionState {
             updated_at_unix_ms,
             ..self
         }
+    }
+
+    pub(crate) fn logically_eq_ignoring_updated_at(&self, other: &Self) -> bool {
+        self.upload_id == other.upload_id
+            && self.revision == other.revision
+            && self.options == other.options
+            && self.length == other.length
+            && self.complete_chunks == other.complete_chunks
+            && self.partial_len == other.partial_len
+            && self.upload_token == other.upload_token
+            && self.status == other.status
     }
 
     pub(crate) const fn maintenance_info(self) -> ContentUploadInfo {

@@ -8,11 +8,27 @@ use super::{
     delete_pending_obsolete_blob_files, lock_poisoned, referenced_blob_file_ids_from_manifest,
     table, take_deletable_obsolete_tables, usize_to_u64_saturating,
 };
+use crate::manifest::FileIdReservation;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::manifest::PreparedManifestPublish;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::storage::{StorageObjectDeleteBackend, StorageObjectId};
 
 impl Db {
+    pub(in crate::db) fn durable_bucket_generation(&self, name: &str) -> Result<u64> {
+        let Some(manifest) = &self.inner.manifest else {
+            return Ok(0);
+        };
+        manifest
+            .lock()
+            .map_err(|_| lock_poisoned("manifest store"))?
+            .state()
+            .bucket_generation(name)
+            .ok_or_else(|| Error::Corruption {
+                message: format!("manifest bucket {name:?} has no generation"),
+            })
+    }
+
     pub(in crate::db) fn close_after_durable_publish_error(
         &self,
         operation: &'static str,
@@ -34,6 +50,26 @@ impl Db {
         self.inner.closed.load(Ordering::Acquire)
     }
 
+    pub(in crate::db) fn close_after_manifest_durability_failure(
+        &self,
+        operation: &'static str,
+        error: Error,
+    ) -> Error {
+        if !error.manifest_was_published() {
+            return error;
+        }
+        self.inner.closed.store(true, Ordering::Release);
+        self.inner.maintenance.record_error(Error::Corruption {
+            message: format!(
+                "{operation} changed the manifest namespace but could not confirm directory \
+                 durability; database handle closed and newly referenced files retained"
+            ),
+        });
+        self.inner.maintenance.shutdown();
+        error
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     pub(in crate::db) fn install_prepared_manifest_after_durable_publish(
         &self,
         operation: &'static str,
@@ -47,8 +83,9 @@ impl Db {
             .map_err(|error| self.close_after_durable_publish_error(operation, &error))
     }
 
-    pub(in crate::db) fn next_table_id(&self) -> Result<table::TableId> {
-        self.inner
+    pub(in crate::db) fn reserve_file_ids(&self, count: usize) -> Result<FileIdReservation> {
+        let result = self
+            .inner
             .manifest
             .as_ref()
             .ok_or_else(|| Error::Corruption {
@@ -56,7 +93,94 @@ impl Db {
             })?
             .lock()
             .map_err(|_| lock_poisoned("manifest store"))?
-            .next_table_id()
+            .reserve_file_ids(count);
+        result.map_err(|error| {
+            self.close_after_manifest_durability_failure("file-id reservation", error)
+        })
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    pub(in crate::db) async fn edit_host_manifest_async<T, F>(&self, edit: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut ManifestStore) -> Result<T> + Send + 'static,
+    {
+        #[cfg(target_os = "wasi")]
+        {
+            let manifest = self
+                .inner
+                .manifest
+                .as_ref()
+                .ok_or_else(|| Error::Corruption {
+                    message: "persistent database is missing manifest store".to_owned(),
+                })?;
+            let mut manifest = manifest
+                .lock()
+                .map_err(|_| lock_poisoned("manifest store"))?;
+            edit(&mut manifest)
+        }
+
+        #[cfg(not(target_os = "wasi"))]
+        {
+            let inner = Arc::clone(&self.inner);
+            self.inner
+                .runtime
+                .spawn_blocking_result(move || {
+                    let manifest = inner.manifest.as_ref().ok_or_else(|| Error::Corruption {
+                        message: "persistent database is missing manifest store".to_owned(),
+                    })?;
+                    let mut manifest = manifest
+                        .lock()
+                        .map_err(|_| lock_poisoned("manifest store"))?;
+                    edit(&mut manifest)
+                })?
+                .await
+        }
+    }
+
+    pub(in crate::db) async fn reserve_file_ids_host_async(
+        &self,
+        count: usize,
+    ) -> Result<FileIdReservation> {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let result = self
+            .edit_host_manifest_async(move |manifest| manifest.reserve_file_ids(count))
+            .await;
+
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let result = {
+            let _manifest_publish = self.inner.browser_manifest_async_lock.lock().await;
+            let manifest = self
+                .inner
+                .manifest
+                .as_ref()
+                .ok_or_else(|| Error::Corruption {
+                    message: "persistent database is missing manifest store".to_owned(),
+                })?;
+            if count == 0 {
+                return manifest
+                    .lock()
+                    .map_err(|_| lock_poisoned("manifest store"))?
+                    .reserve_file_ids(0);
+            }
+            let (prepared, reservation) = {
+                let manifest = manifest
+                    .lock()
+                    .map_err(|_| lock_poisoned("manifest store"))?;
+                manifest.prepare_reserve_file_ids_publish(count)?
+            };
+            prepared.publish_async().await?;
+            self.install_prepared_manifest_after_durable_publish(
+                "file-id reservation",
+                manifest,
+                prepared,
+            )?;
+            Ok(reservation)
+        };
+
+        result.map_err(|error| {
+            self.close_after_manifest_durability_failure("file-id reservation", error)
+        })
     }
 
     pub(in crate::db) fn publish_flushed_tables(
@@ -153,7 +277,10 @@ impl Db {
                 self.last_committed_sequence(),
             )?
         };
-        prepared.publish_async().await?;
+        prepared
+            .publish_async()
+            .await
+            .map_err(|error| self.close_after_manifest_durability_failure("compaction", error))?;
         manifest
             .lock()
             .map_err(|_| lock_poisoned("manifest store"))?
@@ -196,8 +323,8 @@ impl Db {
     /// Installs each compaction output and returns the obsolete input table
     /// handles whose files are now eligible for liveness-gated deletion. Callers
     /// that manage table files through the pending-obsolete queue pass the result
-    /// to `retire_obsolete_table_files`; object-store mode ignores it and relies
-    /// on snapshot-safe orphan GC instead.
+    /// to `retire_obsolete_table_files`; object-store mode ignores it and
+    /// conservatively retains immutable objects for older remote readers.
     pub(in crate::db) fn install_compacted_tables(
         &self,
         outputs: Vec<NamedCompactionOutput>,
@@ -290,21 +417,14 @@ impl Db {
             return Ok(());
         }
 
-        let prepared = {
-            let manifest = manifest
-                .lock()
-                .map_err(|_| lock_poisoned("manifest store"))?;
-            manifest.prepare_clear_pending_blob_deletions_publish(&pending_file_ids)
-        };
-        let Some(prepared) = prepared else {
-            return Ok(());
-        };
-        prepared.publish_async().await?;
-        self.install_prepared_manifest_after_durable_publish(
-            "obsolete blob cleanup",
-            manifest,
-            prepared,
-        )
+        let _ = manifest;
+        self.edit_host_manifest_async(move |manifest| {
+            manifest.clear_pending_blob_deletions(&pending_file_ids)
+        })
+        .await
+        .map_err(|error| {
+            self.close_after_manifest_durability_failure("obsolete blob cleanup", error)
+        })
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -383,7 +503,9 @@ impl Db {
         let Some(prepared) = prepared else {
             return Ok(());
         };
-        prepared.publish_async().await?;
+        prepared.publish_async().await.map_err(|error| {
+            self.close_after_manifest_durability_failure("obsolete blob cleanup", error)
+        })?;
         self.install_prepared_manifest_after_durable_publish(
             "obsolete blob cleanup",
             manifest,

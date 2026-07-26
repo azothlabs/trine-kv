@@ -662,6 +662,7 @@ impl Db {
 
         let prefix = canonical_object_prefix(&prefix.into())?;
         let db_path = PathBuf::from(prefix);
+        crate::substrate::validate_object_lease_wal_key_capacity(&db_path)?;
         if let ContentReclamationMode::QualifiedObjectStore(qualification) =
             &options.content_reclamation
         {

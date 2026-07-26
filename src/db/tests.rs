@@ -18,7 +18,7 @@ use super::{
 use crate::{
     bucket::DEFAULT_BUCKET_NAME,
     object_store::{
-        ETag, ObjectClient, ObjectFuture, ObjectMeta, Precondition, PutIf,
+        ETag, ObjectClient, ObjectFuture, ObjectListPage, ObjectMeta, Precondition, PutIf,
         verify_object_client_contract,
     },
     options::{BucketOptions, DbOptions, DurabilityMode, ObjectClientTrustMode},
@@ -69,8 +69,14 @@ impl ObjectClient for UnsafePutIfObjectStore {
         self.inner.get(key)
     }
 
-    fn get_range<'op>(&'op self, key: &str, offset: u64, len: u64) -> ObjectFuture<'op, Arc<[u8]>> {
-        self.inner.get_range(key, offset, len)
+    fn get_range<'op>(
+        &'op self,
+        key: &str,
+        offset: u64,
+        len: u64,
+        expected_etag: &ETag,
+    ) -> ObjectFuture<'op, Arc<[u8]>> {
+        self.inner.get_range(key, offset, len, expected_etag)
     }
 
     fn put<'op>(&'op self, key: &str, bytes: Arc<[u8]>) -> ObjectFuture<'op, ETag> {
@@ -83,6 +89,15 @@ impl ObjectClient for UnsafePutIfObjectStore {
 
     fn list<'op>(&'op self, prefix: &str) -> ObjectFuture<'op, Vec<ObjectMeta>> {
         self.inner.list(prefix)
+    }
+
+    fn list_page<'op>(
+        &'op self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> ObjectFuture<'op, ObjectListPage> {
+        self.inner.list_page(prefix, after, limit)
     }
 
     fn head<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<ObjectMeta>> {

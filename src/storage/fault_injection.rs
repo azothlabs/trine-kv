@@ -15,9 +15,11 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StorageFaultPoint {
     WalAppend,
+    WalAppendPartial,
     WalPersist,
     ObjectPublish,
     ManifestPublish,
+    ManifestDirectorySync,
     WalRewritePublish,
     DirectorySync,
     ObjectDelete,

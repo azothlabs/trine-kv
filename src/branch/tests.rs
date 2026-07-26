@@ -219,7 +219,10 @@ fn durable_branch_write_commits_data_and_registry_together() {
     assert!(dev.put("data", b"k", b"v".to_vec()).is_err());
     assert_eq!(fault.calls(), 1);
     drop(fault);
+    drop(dev);
+    drop(db);
 
+    let db = Db::open_sync(&dir).expect("reopen after uncertain WAL outcome");
     let registry = db.read_registry("dev").expect("registry").expect("entry");
     assert!(registry.written_buckets.is_empty());
     assert_eq!(
@@ -230,10 +233,15 @@ fn durable_branch_write_commits_data_and_registry_together() {
         None
     );
 
-    dev.put("data", b"k", b"v".to_vec())
-        .expect("same handle retries");
-    drop(dev);
-    let reopened = db.open_branch("dev").expect("branch reopens");
+    drop(db);
+
+    // An append error is fail-stop because the OS may have written a partial
+    // frame. Reopen performs recovery before admitting any later write.
+    let db = Db::open_sync(&dir).expect("database reopens after WAL failure");
+    let mut reopened = db.open_branch("dev").expect("branch reopens");
+    reopened
+        .put("data", b"k", b"v".to_vec())
+        .expect("write succeeds after recovery");
     assert_eq!(
         reopened.get("data", b"k").expect("read"),
         Some(b"v".to_vec())

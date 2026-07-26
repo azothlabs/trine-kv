@@ -28,6 +28,7 @@
 use std::{
     collections::BTreeMap,
     future::Future,
+    ops::Bound,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
@@ -43,9 +44,9 @@ use crate::error::{Error, Result};
 use crate::options::DurabilityMode;
 use crate::storage::{
     StorageCapabilities, StorageFuture, StorageObjectDeleteBackend, StorageObjectId,
-    StorageObjectListBackend, StorageObjectListRequest, StorageObjectReadBackend,
-    StorageObjectWriteBackend, StorageReadBackend, StorageReadFuture, StorageReadObject,
-    ensure_whole_object_read_len,
+    StorageObjectKind, StorageObjectListBackend, StorageObjectListPage as StorageListPage,
+    StorageObjectListRequest, StorageObjectReadBackend, StorageObjectWriteBackend,
+    StorageReadBackend, StorageReadFuture, StorageReadObject, ensure_whole_object_read_len,
 };
 
 pub(crate) fn canonical_object_prefix(value: &str) -> Result<String> {
@@ -54,7 +55,6 @@ pub(crate) fn canonical_object_prefix(value: &str) -> Result<String> {
             "object-store prefix cannot contain a NUL byte",
         ));
     }
-    let absolute = value.starts_with(['/', '\\']);
     let mut components = Vec::new();
     for component in value.split(['/', '\\']) {
         match component {
@@ -67,14 +67,11 @@ pub(crate) fn canonical_object_prefix(value: &str) -> Result<String> {
             component => components.push(component),
         }
     }
-    let joined = components.join("/");
-    if absolute && !joined.is_empty() {
-        Ok(format!("/{joined}"))
-    } else if absolute {
-        Ok("/".to_owned())
-    } else {
-        Ok(joined)
-    }
+    // Object-provider paths are always relative to the configured bucket.
+    // Keeping a leading separator here is unstable: object_store::Path strips
+    // it on requests and listings then return the stripped key, which makes our
+    // canonical-key equality checks disagree with the key we wrote.
+    Ok(components.join("/"))
 }
 
 pub(crate) fn canonical_object_key(path: &Path) -> Result<String> {
@@ -317,6 +314,73 @@ pub struct ObjectMeta {
     pub version: Option<ObjectVersion>,
 }
 
+/// One bounded page of a prefix listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectListPage {
+    /// Objects in key order.
+    pub objects: Vec<ObjectMeta>,
+    /// Exclusive key offset for the next page, or `None` at end of listing.
+    pub next_after: Option<String>,
+}
+
+fn validate_object_list_page(
+    prefix: &str,
+    after: Option<&str>,
+    limit: usize,
+    page: &ObjectListPage,
+) -> Result<()> {
+    if limit == 0 {
+        return Err(Error::invalid_options(
+            "object listing page limit must be non-zero",
+        ));
+    }
+    if page.objects.len() > limit {
+        return Err(Error::Corruption {
+            message: format!(
+                "object listing returned {} entries for page limit {limit}",
+                page.objects.len()
+            ),
+        });
+    }
+    let mut previous = after;
+    for meta in &page.objects {
+        if !meta.key.starts_with(prefix) {
+            return Err(Error::Corruption {
+                message: format!(
+                    "object listing key {:?} does not start with prefix {prefix:?}",
+                    meta.key
+                ),
+            });
+        }
+        if previous.is_some_and(|previous| meta.key.as_str() <= previous) {
+            return Err(Error::Corruption {
+                message: format!(
+                    "object listing key {:?} does not advance exclusive cursor {:?}",
+                    meta.key, previous
+                ),
+            });
+        }
+        previous = Some(&meta.key);
+    }
+    if let Some(next_after) = &page.next_after {
+        let Some(last) = page.objects.last() else {
+            return Err(Error::Corruption {
+                message: "object listing returned an empty page with a continuation cursor"
+                    .to_owned(),
+            });
+        };
+        if next_after != &last.key {
+            return Err(Error::Corruption {
+                message: format!(
+                    "object listing continuation {:?} does not equal last key {:?}",
+                    next_after, last.key
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// A flat key/value object store: keys are strings, values are immutable byte
 /// blobs with an `ETag`. All methods are async (real providers are network I/O);
 /// the in-memory fake completes synchronously.
@@ -324,7 +388,7 @@ pub struct ObjectMeta {
 /// Contract the backend relies on:
 /// - `put` always stores and returns a fresh `ETag` (overwrites bump the `ETag`).
 /// - `get` returns `None` for an absent key; `get_range` errors for an absent
-///   key or an out-of-bounds range.
+///   key, an out-of-bounds range, or an `ETag` mismatch.
 /// - After `put`, or after a `put_if` returns [`PutIf::Stored`], later `get` and
 ///   `head` calls for the same key observe that object version or a newer one.
 /// - `delete` is idempotent (deleting an absent key succeeds).
@@ -369,9 +433,16 @@ pub trait ObjectClient: Send + Sync {
     /// Reads the whole object, or `None` when the key is absent.
     fn get<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<Arc<[u8]>>>;
 
-    /// Reads `len` bytes starting at `offset`; errors for an absent key or an
-    /// out-of-bounds range.
-    fn get_range<'op>(&'op self, key: &str, offset: u64, len: u64) -> ObjectFuture<'op, Arc<[u8]>>;
+    /// Reads `len` bytes starting at `offset` only when the stored object still
+    /// has `expected_etag`. This prevents separate range requests from silently
+    /// splicing bytes from different object versions.
+    fn get_range<'op>(
+        &'op self,
+        key: &str,
+        offset: u64,
+        len: u64,
+        expected_etag: &ETag,
+    ) -> ObjectFuture<'op, Arc<[u8]>>;
 
     /// Stores the object unconditionally, returning its new `ETag`.
     fn put<'op>(&'op self, key: &str, bytes: Arc<[u8]>) -> ObjectFuture<'op, ETag>;
@@ -381,6 +452,20 @@ pub trait ObjectClient: Send + Sync {
 
     /// Lists objects whose key starts with `prefix`, in key order.
     fn list<'op>(&'op self, prefix: &str) -> ObjectFuture<'op, Vec<ObjectMeta>>;
+
+    /// Lists at most `limit` objects after the exclusive `after` key.
+    ///
+    /// Implementations must retain only bounded page state even when an
+    /// underlying provider exposes listing as a stream rather than a page API.
+    /// Pages contain no more than `limit` objects, keys are strictly increasing
+    /// and start with `prefix`, and `next_after` is either `None` or the last
+    /// returned key.
+    fn list_page<'op>(
+        &'op self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> ObjectFuture<'op, ObjectListPage>;
 
     /// Returns the object's metadata (size + `ETag`) without its bytes, or `None`
     /// when the key is absent (like S3 `HEAD`).
@@ -634,6 +719,16 @@ async fn verify_unversioned_object(
             ),
         });
     }
+    let ranged = client
+        .get_range(key, 0, expected.len() as u64, expected_etag)
+        .await?;
+    if ranged.as_ref() != expected.as_ref() {
+        return Err(Error::Corruption {
+            message: format!(
+                "object client contract probe for {key} observed stale range bytes after {operation}"
+            ),
+        });
+    }
     let list_prefix = key.rsplit_once('/').map_or("", |(parent, _)| parent);
     let listed = client.list(list_prefix).await?;
     let mut exact = listed.iter().filter(|meta| meta.key == key);
@@ -641,6 +736,15 @@ async fn verify_unversioned_object(
         return Err(Error::Corruption {
             message: format!(
                 "object reclamation probe for {key} observed inconsistent listing after {operation}: {listed:?}"
+            ),
+        });
+    }
+    let page = client.list_page(key, None, 1).await?;
+    validate_object_list_page(key, None, 1, &page)?;
+    if page.objects.len() != 1 || page.objects[0].key != key {
+        return Err(Error::Corruption {
+            message: format!(
+                "object client contract probe for {key} observed inconsistent bounded listing after {operation}: {page:?}"
             ),
         });
     }
@@ -752,6 +856,17 @@ async fn verify_object_client_contract_at_key(
             ),
         });
     }
+    if client
+        .get_range(key, 0, second.len() as u64, &first_etag)
+        .await
+        .is_ok()
+    {
+        return Err(Error::Corruption {
+            message: format!(
+                "object client contract probe for {key} accepted a stale ETag for a range read"
+            ),
+        });
+    }
     verify_object_client_observed_bytes(client, key, &second, &second_etag, "put_if").await
 }
 
@@ -843,11 +958,22 @@ impl InMemoryObjectStore {
             .map(|object| Arc::clone(&object.bytes)))
     }
 
-    fn get_range_inner(&self, key: &str, offset: u64, len: u64) -> Result<Arc<[u8]>> {
+    fn get_range_inner(
+        &self,
+        key: &str,
+        offset: u64,
+        len: u64,
+        expected_etag: &ETag,
+    ) -> Result<Arc<[u8]>> {
         let objects = self.lock()?;
         let object = objects.get(key).ok_or_else(|| Error::Corruption {
             message: format!("object {key} not found for range read"),
         })?;
+        if &object.etag != expected_etag {
+            return Err(Error::Corruption {
+                message: format!("object {key} changed during immutable range reads"),
+            });
+        }
         let offset = usize::try_from(offset)
             .map_err(|_| Error::invalid_options("object range offset overflow"))?;
         let len = usize::try_from(len)
@@ -938,9 +1064,16 @@ impl ObjectClient for InMemoryObjectStore {
         Box::pin(async move { self.get_inner(&key) })
     }
 
-    fn get_range<'op>(&'op self, key: &str, offset: u64, len: u64) -> ObjectFuture<'op, Arc<[u8]>> {
+    fn get_range<'op>(
+        &'op self,
+        key: &str,
+        offset: u64,
+        len: u64,
+        expected_etag: &ETag,
+    ) -> ObjectFuture<'op, Arc<[u8]>> {
         let key = key.to_owned();
-        Box::pin(async move { self.get_range_inner(&key, offset, len) })
+        let expected_etag = expected_etag.clone();
+        Box::pin(async move { self.get_range_inner(&key, offset, len, &expected_etag) })
     }
 
     fn put<'op>(&'op self, key: &str, bytes: Arc<[u8]>) -> ObjectFuture<'op, ETag> {
@@ -956,6 +1089,49 @@ impl ObjectClient for InMemoryObjectStore {
     fn list<'op>(&'op self, prefix: &str) -> ObjectFuture<'op, Vec<ObjectMeta>> {
         let prefix = prefix.to_owned();
         Box::pin(async move { self.list_inner(&prefix) })
+    }
+
+    fn list_page<'op>(
+        &'op self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> ObjectFuture<'op, ObjectListPage> {
+        let prefix = prefix.to_owned();
+        let after = after.map(str::to_owned);
+        Box::pin(async move {
+            if limit == 0 {
+                return Err(Error::invalid_options(
+                    "object listing page limit must be non-zero",
+                ));
+            }
+            let take = limit
+                .checked_add(1)
+                .ok_or_else(|| Error::invalid_options("object listing page limit overflow"))?;
+            let objects = self.lock()?;
+            let start = after.map_or_else(|| Bound::Included(prefix.clone()), Bound::Excluded);
+            let mut page = objects
+                .range((start, Bound::Unbounded))
+                .take_while(|(key, _)| key.starts_with(&prefix))
+                .take(take)
+                .map(|(key, object)| ObjectMeta {
+                    key: key.clone(),
+                    size: object.bytes.len() as u64,
+                    etag: object.etag.clone(),
+                    version: None,
+                })
+                .collect::<Vec<_>>();
+            let has_more = page.len() > limit;
+            if has_more {
+                page.pop();
+            }
+            let next_after =
+                has_more.then(|| page.last().expect("non-empty bounded page").key.clone());
+            Ok(ObjectListPage {
+                objects: page,
+                next_after,
+            })
+        })
     }
 
     fn head<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<ObjectMeta>> {
@@ -982,8 +1158,14 @@ impl<C: ObjectClient + ?Sized> ObjectClient for Arc<C> {
         (**self).get(key)
     }
 
-    fn get_range<'op>(&'op self, key: &str, offset: u64, len: u64) -> ObjectFuture<'op, Arc<[u8]>> {
-        (**self).get_range(key, offset, len)
+    fn get_range<'op>(
+        &'op self,
+        key: &str,
+        offset: u64,
+        len: u64,
+        expected_etag: &ETag,
+    ) -> ObjectFuture<'op, Arc<[u8]>> {
+        (**self).get_range(key, offset, len, expected_etag)
     }
 
     fn put<'op>(&'op self, key: &str, bytes: Arc<[u8]>) -> ObjectFuture<'op, ETag> {
@@ -996,6 +1178,15 @@ impl<C: ObjectClient + ?Sized> ObjectClient for Arc<C> {
 
     fn list<'op>(&'op self, prefix: &str) -> ObjectFuture<'op, Vec<ObjectMeta>> {
         (**self).list(prefix)
+    }
+
+    fn list_page<'op>(
+        &'op self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> ObjectFuture<'op, ObjectListPage> {
+        (**self).list_page(prefix, after, limit)
     }
 
     fn head<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<ObjectMeta>> {
@@ -1068,30 +1259,53 @@ impl ObjectStoreBackend {
         }
         verify_object_store_reclamation_absent(&self.client, &key).await
     }
+
+    pub(crate) async fn read_object_versioned(
+        &self,
+        object: &StorageObjectId,
+    ) -> Result<Option<(Arc<[u8]>, ETag)>> {
+        let key = Self::object_key(object)?;
+        let Some(meta) = self.client.head(&key).await? else {
+            return Ok(None);
+        };
+        let bytes = read_object_bytes_by_meta(self.client.as_ref(), &key, object, &meta).await?;
+        Ok(Some((bytes, meta.etag)))
+    }
+
+    pub(crate) async fn put_object_if(
+        &self,
+        object: &StorageObjectId,
+        bytes: Arc<[u8]>,
+        precondition: Precondition,
+    ) -> Result<PutIf> {
+        let key = Self::object_key(object)?;
+        self.client.put_if(&key, bytes, precondition).await
+    }
 }
 
-/// A whole-object read handle: the bytes are fetched eagerly on `open_read`
-/// (object stores favour whole-object GETs) and random-access reads are served
-/// from the in-memory buffer — mirroring `MemoryStorageObject`.
-#[derive(Debug, Clone)]
+/// A bounded random-access object handle.
+///
+/// Opening performs only `HEAD`; table/blob sections are fetched with range
+/// requests on demand. This keeps database open memory proportional to metadata
+/// rather than to the sum of every referenced immutable object.
+#[derive(Clone)]
 pub(crate) struct ObjectStoreReadObject {
     object: StorageObjectId,
-    bytes: Arc<[u8]>,
+    client: Arc<dyn ObjectClient>,
+    key: String,
+    len: u64,
+    etag: ETag,
 }
 
-impl ObjectStoreReadObject {
-    fn read_exact_at_offset(&self, offset: usize, out: &mut [u8]) -> Result<()> {
-        let end = offset
-            .checked_add(out.len())
-            .ok_or_else(|| Error::invalid_options("object read offset overflow"))?;
-        let source = self
-            .bytes
-            .get(offset..end)
-            .ok_or_else(|| Error::Corruption {
-                message: format!("object {} short read", self.object.path().display()),
-            })?;
-        out.copy_from_slice(source);
-        Ok(())
+impl std::fmt::Debug for ObjectStoreReadObject {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ObjectStoreReadObject")
+            .field("object", &self.object)
+            .field("key", &self.key)
+            .field("len", &self.len)
+            .field("etag", &self.etag)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1101,10 +1315,8 @@ impl StorageReadObject for ObjectStoreReadObject {
     }
 
     fn len(&self) -> StorageReadFuture<'_, u64> {
-        let len = self.bytes.len();
-        Box::pin(async move {
-            u64::try_from(len).map_err(|_| Error::invalid_options("object length overflow"))
-        })
+        let len = self.len;
+        Box::pin(async move { Ok(len) })
     }
 
     fn read_exact_at<'op>(
@@ -1112,7 +1324,39 @@ impl StorageReadObject for ObjectStoreReadObject {
         offset: usize,
         bytes: &'op mut [u8],
     ) -> StorageReadFuture<'op, ()> {
-        Box::pin(async move { self.read_exact_at_offset(offset, bytes) })
+        Box::pin(async move {
+            let offset = u64::try_from(offset)
+                .map_err(|_| Error::invalid_options("object read offset overflow"))?;
+            let len = u64::try_from(bytes.len())
+                .map_err(|_| Error::invalid_options("object read length overflow"))?;
+            let end = offset
+                .checked_add(len)
+                .ok_or_else(|| Error::invalid_options("object read range overflow"))?;
+            if end > self.len {
+                return Err(Error::Corruption {
+                    message: format!("object {} short read", self.object.path().display()),
+                });
+            }
+            if bytes.is_empty() {
+                return Ok(());
+            }
+            let read = self
+                .client
+                .get_range(&self.key, offset, len, &self.etag)
+                .await?;
+            if read.len() != bytes.len() {
+                return Err(Error::Corruption {
+                    message: format!(
+                        "object {} range read returned {} bytes for requested length {}",
+                        self.object.path().display(),
+                        read.len(),
+                        bytes.len()
+                    ),
+                });
+            }
+            bytes.copy_from_slice(&read);
+            Ok(())
+        })
     }
 }
 
@@ -1133,9 +1377,14 @@ impl StorageReadBackend for ObjectStoreBackend {
                 .ok_or_else(|| Error::Corruption {
                     message: format!("referenced object {key} cannot be opened"),
                 })?;
-            let bytes =
-                read_object_bytes_by_meta(self.client.as_ref(), &key, &object, &meta).await?;
-            Ok(ObjectStoreReadObject { object, bytes })
+            ensure_object_meta_read_len(&object, &meta)?;
+            Ok(ObjectStoreReadObject {
+                object,
+                client: Arc::clone(&self.client),
+                key,
+                len: meta.size,
+                etag: meta.etag,
+            })
         })
     }
 }
@@ -1165,8 +1414,41 @@ impl StorageObjectWriteBackend for ObjectStoreBackend {
         // not apply (there is no separate flush/fsync step).
         Box::pin(async move {
             let key = Self::object_key(&object)?;
-            self.client.put(&key, bytes).await?;
-            Ok(())
+            if matches!(
+                object.kind(),
+                StorageObjectKind::Table
+                    | StorageObjectKind::Blob
+                    | StorageObjectKind::ContentAccessBarrier
+                    | StorageObjectKind::ContentChunk
+                    | StorageObjectKind::ContentDescriptor
+            ) {
+                let intended = Arc::clone(&bytes);
+                return match self
+                    .client
+                    .put_if(&key, bytes, Precondition::IfNoneMatch)
+                    .await
+                {
+                    Ok(PutIf::Stored { .. }) => Ok(()),
+                    Ok(PutIf::PreconditionFailed { .. }) => match self.client.get(&key).await? {
+                        Some(current) if current == intended => Ok(()),
+                        _ => Err(Error::Corruption {
+                            message: format!(
+                                "immutable object {key} already exists with different bytes"
+                            ),
+                        }),
+                    },
+                    Err(error) => match self.client.get(&key).await {
+                        Ok(Some(current)) if current == intended => Ok(()),
+                        Ok(Some(_)) => Err(Error::Corruption {
+                            message: format!(
+                                "immutable object {key} appeared with different bytes after an uncertain create"
+                            ),
+                        }),
+                        Ok(None) | Err(_) => Err(error),
+                    },
+                };
+            }
+            self.client.put(&key, bytes).await.map(|_| ())
         })
     }
 }
@@ -1174,6 +1456,14 @@ impl StorageObjectWriteBackend for ObjectStoreBackend {
 impl StorageObjectDeleteBackend for ObjectStoreBackend {
     fn delete_object(&self, object: StorageObjectId) -> StorageFuture<'_, ()> {
         Box::pin(async move {
+            if matches!(
+                object.kind(),
+                StorageObjectKind::Table | StorageObjectKind::Blob
+            ) {
+                return Err(Error::unsupported_backend(
+                    "immutable object-store table/blob deletion requires a durable reader-retirement protocol",
+                ));
+            }
             let key = Self::object_key(&object)?;
             self.client.delete(&key).await
         })
@@ -1186,16 +1476,47 @@ impl StorageObjectListBackend for ObjectStoreBackend {
         request: StorageObjectListRequest,
     ) -> StorageFuture<'_, Vec<StorageObjectId>> {
         Box::pin(async move {
+            let mut objects = Vec::new();
+            let mut after = None;
+            loop {
+                let page = self
+                    .list_objects_page(request.clone(), after.as_deref(), 1_024)
+                    .await?;
+                objects.extend(page.objects);
+                let Some(next_after) = page.next_after else {
+                    break;
+                };
+                after = Some(next_after);
+            }
+            objects.sort_unstable();
+            Ok(objects)
+        })
+    }
+
+    fn list_objects_page(
+        &self,
+        request: StorageObjectListRequest,
+        after: Option<&str>,
+        limit: usize,
+    ) -> StorageFuture<'_, StorageListPage> {
+        let after = after.map(str::to_owned);
+        Box::pin(async move {
             let kind = request.kind();
             let extension = request.file_extension();
-            // Prefix-list under the database root, then keep only the direct
-            // children matching the requested extension — mirroring the
-            // filesystem backend's non-recursive, extension-filtered listing.
             let prefix = canonical_object_key(request.root())?;
             let root = PathBuf::from(&prefix);
-            let listed = self.client.list(&prefix).await?;
+            let listing_prefix = if prefix.is_empty() {
+                prefix.clone()
+            } else {
+                format!("{prefix}/")
+            };
+            let page = self
+                .client
+                .list_page(&listing_prefix, after.as_deref(), limit)
+                .await?;
+            validate_object_list_page(&listing_prefix, after.as_deref(), limit, &page)?;
             let mut objects = Vec::new();
-            for meta in listed {
+            for meta in page.objects {
                 let canonical = canonical_object_prefix(&meta.key)?;
                 if canonical != meta.key {
                     return Err(Error::Corruption {
@@ -1209,7 +1530,10 @@ impl StorageObjectListBackend for ObjectStoreBackend {
                 }
             }
             objects.sort_unstable();
-            Ok(objects)
+            Ok(StorageListPage {
+                objects,
+                next_after: page.next_after,
+            })
         })
     }
 }
@@ -1240,9 +1564,20 @@ async fn read_object_bytes_by_meta(
         message: format!("object {} length exceeds usize", object.path().display()),
     })?;
     if expected_len == 0 {
+        let current = client.head(key).await?.ok_or_else(|| Error::Corruption {
+            message: format!("object {} disappeared after HEAD", object.path().display()),
+        })?;
+        if current.size != 0 || current.etag != meta.etag {
+            return Err(Error::Corruption {
+                message: format!(
+                    "object {} changed after metadata was read",
+                    object.path().display()
+                ),
+            });
+        }
         return Ok(Arc::from([]));
     }
-    let bytes = client.get_range(key, 0, meta.size).await?;
+    let bytes = client.get_range(key, 0, meta.size, &meta.etag).await?;
     if bytes.len() != expected_len {
         return Err(Error::Corruption {
             message: format!(
@@ -1265,10 +1600,10 @@ mod tests {
     };
 
     use super::{
-        ETag, InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta, ObjectStoreBackend,
-        ObjectStoreReclamationAttestation, ObjectStoreReclamationEvidenceDigest, ObjectVersion,
-        Precondition, PutIf, canonical_object_key, canonical_object_prefix,
-        qualify_object_store_reclamation,
+        ETag, InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectListPage, ObjectMeta,
+        ObjectStoreBackend, ObjectStoreReclamationAttestation,
+        ObjectStoreReclamationEvidenceDigest, ObjectVersion, Precondition, PutIf,
+        canonical_object_key, canonical_object_prefix, qualify_object_store_reclamation,
     };
     use crate::error::{Error, Result};
     use crate::options::DurabilityMode;
@@ -1289,12 +1624,12 @@ mod tests {
         );
         assert_eq!(
             canonical_object_prefix("/tenant/db/tables").expect("Unix separators normalize"),
-            "/tenant/db/tables"
+            "tenant/db/tables"
         );
         assert_eq!(
             canonical_object_key(Path::new(r"\tenant\db\MANIFEST"))
                 .expect("absolute Windows-style key normalizes"),
-            "/tenant/db/MANIFEST"
+            "tenant/db/MANIFEST"
         );
         assert!(matches!(
             canonical_object_prefix("tenant/../other"),
@@ -1343,6 +1678,7 @@ mod tests {
             _key: &str,
             _offset: u64,
             _len: u64,
+            _expected_etag: &ETag,
         ) -> ObjectFuture<'op, Arc<[u8]>> {
             Box::pin(async move { Err(Error::invalid_options("unexpected range read")) })
         }
@@ -1357,6 +1693,15 @@ mod tests {
 
         fn list<'op>(&'op self, _prefix: &str) -> ObjectFuture<'op, Vec<ObjectMeta>> {
             Box::pin(async move { Err(Error::invalid_options("unexpected list")) })
+        }
+
+        fn list_page<'op>(
+            &'op self,
+            _prefix: &str,
+            _after: Option<&str>,
+            _limit: usize,
+        ) -> ObjectFuture<'op, ObjectListPage> {
+            Box::pin(async move { Err(Error::invalid_options("unexpected list page")) })
         }
 
         fn head<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<ObjectMeta>> {
@@ -1384,6 +1729,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct ShortRangeClient {
         get_calls: AtomicU64,
+        range_calls: AtomicU64,
     }
 
     impl ObjectClient for ShortRangeClient {
@@ -1399,8 +1745,12 @@ mod tests {
             _key: &str,
             _offset: u64,
             _len: u64,
+            _expected_etag: &ETag,
         ) -> ObjectFuture<'op, Arc<[u8]>> {
-            Box::pin(async move { Ok(bytes(b"abc")) })
+            Box::pin(async move {
+                self.range_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(bytes(b"abc"))
+            })
         }
 
         fn put<'op>(&'op self, _key: &str, _bytes: Arc<[u8]>) -> ObjectFuture<'op, ETag> {
@@ -1413,6 +1763,15 @@ mod tests {
 
         fn list<'op>(&'op self, _prefix: &str) -> ObjectFuture<'op, Vec<ObjectMeta>> {
             Box::pin(async move { Err(Error::invalid_options("unexpected list")) })
+        }
+
+        fn list_page<'op>(
+            &'op self,
+            _prefix: &str,
+            _after: Option<&str>,
+            _limit: usize,
+        ) -> ObjectFuture<'op, ObjectListPage> {
+            Box::pin(async move { Err(Error::invalid_options("unexpected list page")) })
         }
 
         fn head<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<ObjectMeta>> {
@@ -1473,8 +1832,9 @@ mod tests {
             key: &str,
             offset: u64,
             len: u64,
+            expected_etag: &ETag,
         ) -> ObjectFuture<'op, Arc<[u8]>> {
-            self.inner.get_range(key, offset, len)
+            self.inner.get_range(key, offset, len, expected_etag)
         }
 
         fn put<'op>(&'op self, key: &str, bytes: Arc<[u8]>) -> ObjectFuture<'op, ETag> {
@@ -1498,6 +1858,29 @@ mod tests {
                         .map(|meta| self.decorate_meta(meta))
                         .collect()
                 })
+            })
+        }
+
+        fn list_page<'op>(
+            &'op self,
+            prefix: &str,
+            after: Option<&str>,
+            limit: usize,
+        ) -> ObjectFuture<'op, ObjectListPage> {
+            let prefix = prefix.to_owned();
+            let after = after.map(str::to_owned);
+            Box::pin(async move {
+                self.inner
+                    .list_page(&prefix, after.as_deref(), limit)
+                    .await
+                    .map(|mut page| {
+                        page.objects = page
+                            .objects
+                            .into_iter()
+                            .map(|meta| self.decorate_meta(meta))
+                            .collect();
+                        page
+                    })
             })
         }
 
@@ -1612,14 +1995,22 @@ mod tests {
     fn get_absent_is_none_and_range_reads_a_window() {
         let store = InMemoryObjectStore::new();
         assert!(block_on(store.get("missing")).unwrap().is_none());
-        block_on(store.put("k", bytes(b"abcdef"))).unwrap();
+        let etag = block_on(store.put("k", bytes(b"abcdef"))).unwrap();
         assert_eq!(
-            block_on(store.get_range("k", 2, 3)).unwrap().as_ref(),
+            block_on(store.get_range("k", 2, 3, &etag))
+                .unwrap()
+                .as_ref(),
             b"cde"
         );
         // Absent key and out-of-bounds range are both errors.
-        assert!(block_on(store.get_range("missing", 0, 1)).is_err());
-        assert!(block_on(store.get_range("k", 4, 10)).is_err());
+        assert!(block_on(store.get_range("missing", 0, 1, &etag)).is_err());
+        assert!(block_on(store.get_range("k", 4, 10, &etag)).is_err());
+
+        block_on(store.put("k", bytes(b"replacement"))).expect("overwrite changes ETag");
+        assert!(
+            block_on(store.get_range("k", 0, 3, &etag)).is_err(),
+            "a range read may not splice bytes from a newer object version"
+        );
     }
 
     #[test]
@@ -1643,6 +2034,33 @@ mod tests {
         assert_eq!(keys, ["wal/1", "wal/2"], "prefix-filtered, key-ordered");
         assert_eq!(listed[0].size, 2);
         assert_eq!(listed[1].size, 1);
+    }
+
+    #[test]
+    fn list_page_uses_exclusive_continuation_without_duplicates() {
+        let store = InMemoryObjectStore::new();
+        for key in ["wal/1", "wal/2", "wal/3"] {
+            block_on(store.put(key, bytes(key.as_bytes()))).unwrap();
+        }
+        let first = block_on(store.list_page("wal/", None, 2)).unwrap();
+        assert_eq!(
+            first
+                .objects
+                .iter()
+                .map(|meta| meta.key.as_str())
+                .collect::<Vec<_>>(),
+            ["wal/1", "wal/2"]
+        );
+        let second = block_on(store.list_page("wal/", first.next_after.as_deref(), 2)).unwrap();
+        assert_eq!(
+            second
+                .objects
+                .iter()
+                .map(|meta| meta.key.as_str())
+                .collect::<Vec<_>>(),
+            ["wal/3"]
+        );
+        assert!(second.next_after.is_none());
     }
 
     #[test]
@@ -1718,7 +2136,7 @@ mod tests {
         use crate::storage::StorageObjectKind;
 
         let backend = ObjectStoreBackend::new(Arc::new(InMemoryObjectStore::new()));
-        let id = StorageObjectId::native_file(StorageObjectKind::Table, "/db/0001.trinet");
+        let id = StorageObjectId::native_file(StorageObjectKind::ContentChunk, "/db/0001.trinec");
 
         block_on(backend.write_object(id.clone(), bytes(b"hello world"), DurabilityMode::Flush))
             .unwrap();
@@ -1731,7 +2149,7 @@ mod tests {
             Some(b"hello world".as_slice())
         );
 
-        // Random-access read via the eager read handle.
+        // Random-access read via the ranged read handle.
         let object = block_on(backend.open_read(id.clone())).unwrap();
         assert_eq!(block_on(StorageReadObject::len(&object)).unwrap(), 11);
         let mut window = [0_u8; 5];
@@ -1741,6 +2159,50 @@ mod tests {
         // Delete, then it is gone.
         block_on(backend.delete_object(id.clone())).unwrap();
         assert!(block_on(backend.read_object_bytes(id)).unwrap().is_none());
+    }
+
+    #[test]
+    fn immutable_table_object_cannot_be_overwritten_or_deleted() {
+        use crate::storage::StorageObjectKind;
+
+        let client = Arc::new(InMemoryObjectStore::new());
+        let backend = ObjectStoreBackend::new(client.clone());
+        let id = StorageObjectId::native_file(StorageObjectKind::Table, "/db/0001.trinet");
+
+        block_on(backend.write_object(id.clone(), bytes(b"first"), DurabilityMode::Flush))
+            .expect("initial immutable write");
+        block_on(backend.write_object(id.clone(), bytes(b"first"), DurabilityMode::Flush))
+            .expect("identical retry is idempotent");
+        let error =
+            block_on(backend.write_object(id.clone(), bytes(b"different"), DurabilityMode::Flush))
+                .expect_err("different bytes cannot replace immutable object");
+        assert!(matches!(error, Error::Corruption { .. }));
+        assert!(
+            block_on(backend.delete_object(id.clone())).is_err(),
+            "table deletion requires a reader-retirement protocol"
+        );
+        assert_eq!(
+            block_on(client.get("db/0001.trinet")).unwrap().as_deref(),
+            Some(b"first".as_slice())
+        );
+    }
+
+    #[test]
+    fn immutable_content_chunk_rejects_conflicting_retry() {
+        let backend = ObjectStoreBackend::new(Arc::new(InMemoryObjectStore::new()));
+        let id = StorageObjectId::native_file(
+            crate::storage::StorageObjectKind::ContentChunk,
+            "/db/content/upload/partial-0001-0007.trinec",
+        );
+
+        block_on(backend.write_object(id.clone(), bytes(b"first"), DurabilityMode::Flush))
+            .expect("initial immutable chunk write");
+        block_on(backend.write_object(id.clone(), bytes(b"first"), DurabilityMode::Flush))
+            .expect("identical chunk retry is idempotent");
+        assert!(matches!(
+            block_on(backend.write_object(id, bytes(b"stale"), DurabilityMode::Flush)),
+            Err(Error::Corruption { .. })
+        ));
     }
 
     #[test]
@@ -1784,6 +2246,19 @@ mod tests {
             0,
             "bounded range reads should not fall back to whole-object GET"
         );
+
+        let id = StorageObjectId::native_file(StorageObjectKind::Table, "/db/short.trinet");
+        let object = block_on(backend.open_read(id)).expect("HEAD-only open succeeds");
+        assert_eq!(
+            client.range_calls.load(Ordering::Relaxed),
+            1,
+            "open itself performs no additional range request"
+        );
+        let mut out = [0_u8; 5];
+        let error = block_on(StorageReadObject::read_exact_at(&object, 0, &mut out))
+            .expect_err("short ranged handle read fails");
+        assert!(error.to_string().contains("requested length"));
+        assert_eq!(client.range_calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -1817,7 +2292,7 @@ mod tests {
             .collect();
         assert_eq!(
             paths,
-            ["/db/0001.trinet", "/db/0002.trinet"],
+            ["db/0001.trinet", "db/0002.trinet"],
             "only direct .trinet children, in key order"
         );
     }

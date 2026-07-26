@@ -18,6 +18,7 @@ use super::{LsmVersion, delta::DeltaShardSet};
 
 #[derive(Debug)]
 pub(crate) struct LsmTree {
+    pub(crate) generation: u64,
     pub(crate) options: BucketOptions,
     pub(crate) active_memtable: RwLock<Arc<Memtable>>,
     pub(crate) range_tombstones: RwLock<Vec<RangeTombstone>>,
@@ -33,8 +34,17 @@ pub(crate) struct LsmTree {
 
 impl LsmTree {
     pub(crate) fn new(options: BucketOptions, tables: Vec<Arc<Table>>) -> Result<Self> {
+        Self::new_with_generation(options, tables, 0)
+    }
+
+    pub(crate) fn new_with_generation(
+        options: BucketOptions,
+        tables: Vec<Arc<Table>>,
+        generation: u64,
+    ) -> Result<Self> {
         let current_version = Arc::new(LsmVersion::new(tables)?);
         Ok(Self {
+            generation,
             options,
             active_memtable: RwLock::new(Arc::new(Memtable::default())),
             range_tombstones: RwLock::new(Vec::new()),
@@ -152,7 +162,11 @@ impl Drop for LsmWriteAdmission {
             let Ok(mut lifecycle) = self.tree.lifecycle.lock() else {
                 return;
             };
-            lifecycle.active_writes = lifecycle.active_writes.saturating_sub(1);
+            if lifecycle.active_writes == 0 {
+                debug_assert!(false, "LSM write admission count underflow");
+                return;
+            }
+            lifecycle.active_writes -= 1;
             if lifecycle.active_writes == 0 {
                 self.tree.lifecycle_idle.notify_all();
                 std::mem::take(&mut lifecycle.drain_wakers)

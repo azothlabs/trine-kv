@@ -184,6 +184,7 @@ struct WalLaneWaiter {
 #[derive(Debug)]
 struct WalLaneCompletion {
     result: Mutex<Option<Result<()>>>,
+    completed: AtomicBool,
     #[cfg(not(target_os = "wasi"))]
     ready: Condvar,
     #[cfg(not(target_os = "wasi"))]
@@ -199,6 +200,7 @@ impl WalLaneCompletion {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             result: Mutex::new(None),
+            completed: AtomicBool::new(false),
             #[cfg(not(target_os = "wasi"))]
             ready: Condvar::new(),
             #[cfg(not(target_os = "wasi"))]
@@ -217,6 +219,9 @@ impl WalLaneCompletion {
     }
 
     fn complete(&self, result: Result<()>) {
+        if self.completed.swap(true, Ordering::AcqRel) {
+            return;
+        }
         #[cfg(target_os = "wasi")]
         {
             let mut slot = match self.result.lock() {
@@ -256,8 +261,7 @@ impl WalLaneReply {
 }
 
 impl WalLaneCommand {
-    #[cfg(not(target_os = "wasi"))]
-    fn panic_reply(&self) -> WalLaneReply {
+    fn reply(&self) -> WalLaneReply {
         match self {
             Self::Append { reply, .. }
             | Self::Persist { reply, .. }
@@ -555,7 +559,7 @@ impl WalFrontDoor {
         let lane = self.lane(shard_index)?;
         let frame = encode_batch_frame(sequence, operations)?;
         let frame_len = usize_to_u64_saturating(frame.len());
-        let waiter = enqueue_wal_lane_command(lane, |reply| WalLaneCommand::Append {
+        let waiter = try_enqueue_wal_lane_command(lane, |reply| WalLaneCommand::Append {
             sequence,
             frame,
             durability,
@@ -580,8 +584,11 @@ impl WalFrontDoor {
     #[cfg(not(target_os = "wasi"))]
     pub(crate) async fn persist_async(&self, durability: DurabilityMode) -> Result<()> {
         for lane in &self.lanes {
-            enqueue_wal_lane_command(lane, |reply| WalLaneCommand::Persist { durability, reply })?
-                .await?;
+            try_enqueue_wal_lane_command(lane, |reply| WalLaneCommand::Persist {
+                durability,
+                reply,
+            })?
+            .await?;
         }
         Ok(())
     }
@@ -617,7 +624,7 @@ impl WalFrontDoor {
         replay_floor: Sequence,
     ) -> Result<()> {
         for lane in &self.lanes {
-            enqueue_wal_lane_command(lane, |reply| WalLaneCommand::Rewrite {
+            try_enqueue_wal_lane_command(lane, |reply| WalLaneCommand::Rewrite {
                 replay_floor,
                 reply,
             })?
@@ -854,9 +861,9 @@ mod recovery;
 
 pub(crate) use codec::*;
 #[cfg(not(target_os = "wasi"))]
-use lane::enqueue_wal_lane_command;
-#[cfg(not(target_os = "wasi"))]
 use lane::run_wal_lane_worker;
+#[cfg(not(target_os = "wasi"))]
+use lane::try_enqueue_wal_lane_command;
 use lane::{
     send_wal_lane_command, validate_wal_stream_order, wal_front_door_completion_poisoned,
     wal_shard_index_from_file_name, wal_shard_index_from_final_file_name,

@@ -1135,7 +1135,7 @@ fn lazy_value(
         ValueRef::Inline(bytes) => Ok(LazyValue {
             inner: LazyValueInner::Inline(bytes),
         }),
-        ValueRef::BlobIndex(_) | ValueRef::Blob { .. } => {
+        ValueRef::BlobIndex(_) => {
             let db_path = db_path.ok_or_else(|| Error::Corruption {
                 message: "in-memory database cannot read blob value references".to_owned(),
             })?;

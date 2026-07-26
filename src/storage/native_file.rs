@@ -13,11 +13,12 @@ use super::{
     StorageDirectoryCreateBackend, StorageDirectoryFile, StorageDirectoryId,
     StorageDirectoryListBackend, StorageDirectorySyncBackend, StorageFuture,
     StorageManifestPublishBackend, StorageManifestReadBackend, StorageObjectDeleteBackend,
-    StorageObjectId, StorageObjectKind, StorageObjectListBackend, StorageObjectListRequest,
-    StorageObjectReadBackend, StorageObjectWriteBackend, StorageOperation, StorageReadBackend,
-    StorageReadBuffer, StorageReadFuture, StorageReadObject, StorageWalRewriteBackend,
-    StorageWriterLeaseBackend, SystemTime, UNIX_EPOCH, Write, allocate_read_buffer,
-    ensure_whole_object_read_len, fs, io, record_timed_storage_future, record_timed_storage_result,
+    StorageObjectId, StorageObjectKind, StorageObjectListBackend, StorageObjectListPage,
+    StorageObjectListRequest, StorageObjectReadBackend, StorageObjectWriteBackend,
+    StorageOperation, StorageReadBackend, StorageReadBuffer, StorageReadFuture, StorageReadObject,
+    StorageWalRewriteBackend, StorageWriterLeaseBackend, SystemTime, UNIX_EPOCH, Write,
+    allocate_read_buffer, ensure_whole_object_read_len, fs, io, paginate_storage_objects,
+    record_timed_storage_future, record_timed_storage_result,
     requires_parent_dir_sync_after_rename, sync_dir_after_renames, sync_parent_dir_after_rename,
     u64_to_usize, usize_to_u64,
 };
@@ -70,11 +71,11 @@ mod browser_persistent_storage {
         StorageCapabilities, StorageCapability, StorageDirectoryCreateBackend,
         StorageDirectoryFile, StorageDirectoryId, StorageDirectoryListBackend, StorageFuture,
         StorageManifestPublishBackend, StorageManifestReadBackend, StorageObjectDeleteBackend,
-        StorageObjectId, StorageObjectKind, StorageObjectListBackend, StorageObjectListRequest,
-        StorageObjectReadBackend, StorageObjectWriteBackend, StorageReadBackend, StorageReadFuture,
-        StorageReadObject, StorageWalRewriteBackend, StorageWriterLeaseBackend,
-        allocate_read_buffer, ensure_whole_object_read_len, native_file_objects_from_paths,
-        usize_to_u64,
+        StorageObjectId, StorageObjectKind, StorageObjectListBackend, StorageObjectListPage,
+        StorageObjectListRequest, StorageObjectReadBackend, StorageObjectWriteBackend,
+        StorageReadBackend, StorageReadFuture, StorageReadObject, StorageWalRewriteBackend,
+        StorageWriterLeaseBackend, allocate_read_buffer, ensure_whole_object_read_len,
+        native_file_objects_from_paths, paginate_storage_objects, usize_to_u64,
     };
 
     #[derive(Debug, Clone)]
@@ -582,6 +583,18 @@ mod browser_persistent_storage {
                     }
                 }
                 Ok(native_file_objects_from_paths(&request, paths))
+            })
+        }
+
+        fn list_objects_page(
+            &self,
+            request: StorageObjectListRequest,
+            after: Option<&str>,
+            limit: usize,
+        ) -> StorageFuture<'_, StorageObjectListPage> {
+            let after = after.map(str::to_owned);
+            Box::pin(async move {
+                paginate_storage_objects(self.list_objects(request).await?, after.as_deref(), limit)
             })
         }
     }

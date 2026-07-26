@@ -87,6 +87,7 @@ impl Db {
         }
 
         self.persist_bucket_creation(name.as_str(), &options)?;
+        let generation = self.durable_bucket_generation(name.as_str())?;
 
         let durable_bucket_creation = self.inner.manifest.is_some();
         let installed_bucket = (|| -> Result<_> {
@@ -105,7 +106,11 @@ impl Db {
                 Ok((state.options.clone(), Arc::clone(state)))
             } else {
                 let bucket_options = options.clone();
-                let state = Arc::new(LsmTree::new(options, Vec::new())?);
+                let state = Arc::new(LsmTree::new_with_generation(
+                    options,
+                    Vec::new(),
+                    generation,
+                )?);
                 buckets.insert(name.as_str().to_owned(), Arc::clone(&state));
                 Ok((bucket_options, state))
             }
@@ -122,9 +127,9 @@ impl Db {
     }
 
     /// Drops a named bucket, removing it from the database and reclaiming its
-    /// storage. Existing [`Bucket`] handles or snapshots that still reference the
-    /// bucket's tables keep working until dropped (file deletion is deferred while
-    /// any reference remains), but no new handle can open it.
+    /// storage. Existing [`Bucket`] handles become stale immediately; deferred
+    /// file retirement keeps any read that was already admitted before the drop
+    /// memory-safe.
     ///
     /// Supported on in-memory and native filesystem databases. Object-store and
     /// other host backends return [`Error::UnsupportedBackend`] (their remote file
@@ -207,10 +212,13 @@ impl Db {
             .collect();
         let sequence = self.last_committed_sequence();
         if let Some(manifest) = &self.inner.manifest {
-            manifest
+            let result = manifest
                 .lock()
                 .map_err(|_| lock_poisoned("manifest store"))?
-                .drop_bucket(name.as_str(), blob_ids, sequence)?;
+                .drop_bucket(name.as_str(), blob_ids, sequence);
+            result.map_err(|error| {
+                self.close_after_manifest_durability_failure("bucket deletion", error)
+            })?;
         }
         remove_bucket_state(&self.inner.buckets, name.as_str(), &tree)?;
         drop_guard.commit();
@@ -221,11 +229,12 @@ impl Db {
         Ok(())
     }
 
-    /// Drops a named bucket, reclaiming its storage — the async form that also
+    /// Drops a named bucket logically — the async form that also
     /// supports object-store databases. In-memory and native databases delegate
     /// to [`Db::drop_bucket_sync`]; an object-store database removes the bucket
-    /// from the manifest (a CAS publish) so its table and blob objects become
-    /// orphans, then reclaims them with snapshot-safe orphan GC.
+    /// from the manifest with a CAS publish. Remote immutable objects are
+    /// retained until a durable reader-retirement protocol can prove physical
+    /// deletion safe.
     ///
     /// # Errors
     ///
@@ -268,8 +277,8 @@ impl Db {
             self.install_object_manifest_after_durable_publish("bucket drop", object)?;
             remove_bucket_state(&self.inner.buckets, name.as_str(), &tree)?;
             drop_guard.commit();
-            // Reclaim the now-orphaned objects (best effort: the bucket is already
-            // logically dropped; periodic orphan GC also collects them).
+            // Keep the now-unreferenced immutable objects: another process may
+            // still hold an older readable manifest.
             let _ = self.cleanup_object_store_orphans_async().await;
             return Ok(());
         }
@@ -315,7 +324,9 @@ impl Db {
                         .prepare_drop_bucket_publish(name.as_str(), blob_ids, sequence)?
                 };
                 if let Some(prepared) = prepared {
-                    prepared.publish_async().await?;
+                    prepared.publish_async().await.map_err(|error| {
+                        self.close_after_manifest_durability_failure("bucket deletion", error)
+                    })?;
                     self.install_prepared_manifest_after_durable_publish(
                         "bucket drop",
                         manifest,
@@ -384,6 +395,7 @@ impl Db {
             .create_bucket(name.as_str().to_owned(), options.clone())
             .await?;
         self.install_object_manifest_after_durable_publish("bucket creation", object)?;
+        let generation = self.durable_bucket_generation(name.as_str())?;
 
         let (bucket_options, state) = (|| -> Result<_> {
             let mut buckets = self
@@ -400,7 +412,11 @@ impl Db {
                 Ok((state.options.clone(), Arc::clone(state)))
             } else {
                 let bucket_options = options.clone();
-                let state = Arc::new(LsmTree::new(options, Vec::new())?);
+                let state = Arc::new(LsmTree::new_with_generation(
+                    options,
+                    Vec::new(),
+                    generation,
+                )?);
                 buckets.insert(name.as_str().to_owned(), Arc::clone(&state));
                 Ok((bucket_options, state))
             }
@@ -466,16 +482,19 @@ impl Db {
             let manifest = manifest
                 .lock()
                 .map_err(|_| lock_poisoned("manifest store"))?;
-            manifest.prepare_create_bucket_publish(name.as_str().to_owned(), options.clone())?
+            manifest.prepare_create_bucket_publish(name.as_str(), options.clone())?
         };
         if let Some(prepared_publish) = prepared_publish {
-            prepared_publish.publish_async().await?;
+            prepared_publish.publish_async().await.map_err(|error| {
+                self.close_after_manifest_durability_failure("bucket creation", error)
+            })?;
             self.install_prepared_manifest_after_durable_publish(
                 "bucket creation",
                 manifest,
                 prepared_publish,
             )?;
         }
+        let generation = self.durable_bucket_generation(name.as_str())?;
 
         let (bucket_options, state) = (|| -> Result<_> {
             let mut buckets = self
@@ -493,7 +512,11 @@ impl Db {
                 Ok((state.options.clone(), Arc::clone(state)))
             } else {
                 let bucket_options = options.clone();
-                let state = Arc::new(LsmTree::new(options, Vec::new())?);
+                let state = Arc::new(LsmTree::new_with_generation(
+                    options,
+                    Vec::new(),
+                    generation,
+                )?);
                 buckets.insert(name.as_str().to_owned(), Arc::clone(&state));
                 Ok((bucket_options, state))
             }
@@ -590,7 +613,7 @@ impl Db {
         self.get_at_with_pin_state(
             DEFAULT_BUCKET_NAME,
             key,
-            snapshot.read_sequence(),
+            self.snapshot_sequence(snapshot)?,
             snapshot.is_pinned(),
         )
     }
@@ -738,7 +761,7 @@ impl Db {
         self.range_at_sequence(
             DEFAULT_BUCKET_NAME,
             range,
-            snapshot.read_sequence(),
+            self.snapshot_sequence(snapshot)?,
             Direction::Forward,
         )
     }
@@ -748,7 +771,7 @@ impl Db {
         self.range_lazy_at_sequence(
             DEFAULT_BUCKET_NAME,
             range,
-            snapshot.read_sequence(),
+            self.snapshot_sequence(snapshot)?,
             Direction::Forward,
         )
     }
@@ -779,7 +802,7 @@ impl Db {
         self.range_at_sequence(
             DEFAULT_BUCKET_NAME,
             range,
-            snapshot.read_sequence(),
+            self.snapshot_sequence(snapshot)?,
             Direction::Reverse,
         )
     }
@@ -793,7 +816,7 @@ impl Db {
         self.range_lazy_at_sequence(
             DEFAULT_BUCKET_NAME,
             range,
-            snapshot.read_sequence(),
+            self.snapshot_sequence(snapshot)?,
             Direction::Reverse,
         )
     }
@@ -835,7 +858,7 @@ impl Db {
         self.prefix_at_sequence(
             DEFAULT_BUCKET_NAME,
             &prefix,
-            snapshot.read_sequence(),
+            self.snapshot_sequence(snapshot)?,
             Direction::Forward,
         )
     }
@@ -851,7 +874,7 @@ impl Db {
         self.prefix_lazy_at_sequence(
             DEFAULT_BUCKET_NAME,
             &prefix,
-            snapshot.read_sequence(),
+            self.snapshot_sequence(snapshot)?,
             Direction::Forward,
         )
     }
@@ -890,7 +913,7 @@ impl Db {
         self.prefix_at_sequence(
             DEFAULT_BUCKET_NAME,
             &prefix,
-            snapshot.read_sequence(),
+            self.snapshot_sequence(snapshot)?,
             Direction::Reverse,
         )
     }
@@ -906,7 +929,7 @@ impl Db {
         self.prefix_lazy_at_sequence(
             DEFAULT_BUCKET_NAME,
             &prefix,
-            snapshot.read_sequence(),
+            self.snapshot_sequence(snapshot)?,
             Direction::Reverse,
         )
     }

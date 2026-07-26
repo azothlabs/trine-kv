@@ -2,6 +2,7 @@ use super::*;
 use crate::filter::PointKeyFilter;
 use crate::options::BucketOptions;
 use crate::storage::StorageReadBuffer;
+use crate::table::format::decode_table;
 use crate::table::format::put_u32;
 use crate::table::format::read_checked_block;
 use crate::table::format::read_first_block_in_section;
@@ -163,6 +164,15 @@ fn table_file_bytes(payload: &[u8]) -> Vec<u8> {
     bytes.extend_from_slice(&payload_checksum.to_le_bytes());
     bytes.extend_from_slice(payload);
     bytes
+}
+
+#[test]
+fn table_decode_rejects_the_previous_incompatible_layout_version() {
+    let mut bytes = table_file_bytes(&[]);
+    bytes[4..6].copy_from_slice(&6_u16.to_le_bytes());
+
+    let error = decode_table(&bytes).expect_err("previous table layout must be rejected");
+    assert!(matches!(error, Error::UnsupportedFormat { .. }));
 }
 
 fn poll_ready<T>(future: impl std::future::Future<Output = Result<T>>) -> Result<T> {

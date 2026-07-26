@@ -50,7 +50,6 @@ const OBJECT_LEASE_TTL: Duration = Duration::from_secs(30);
 const OBJECT_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(10);
 const OBJECT_LEASE_MAGIC: u32 = 0x5452_4c53;
 const OBJECT_LEASE_VERSION: u16 = 3;
-const OBJECT_LEASE_V2_HEADER_LEN: usize = 34;
 const OBJECT_LEASE_V3_HEADER_LEN: usize = 50;
 const OBJECT_LEASE_MAX_BYTES: u64 = 64 * 1024;
 const OBJECT_WAL_SEGMENT_MAGIC: &[u8; 8] = b"TRNOWAL1";
@@ -59,6 +58,24 @@ const OBJECT_WAL_MAX_SEGMENT_BYTES: usize = 128 * 1024 * 1024;
 const OBJECT_WAL_MAX_GROUP_FRAME_BYTES: usize = OBJECT_WAL_MAX_SEGMENT_BYTES - 64 * 1024;
 const OBJECT_WAL_MAX_CHAIN_SEGMENTS: usize = 16_384;
 const OBJECT_WAL_MAX_REPLAY_BYTES: usize = 1024 * 1024 * 1024;
+
+pub(crate) fn validate_object_lease_wal_key_capacity(db_path: &std::path::Path) -> Result<()> {
+    let longest_key = canonical_object_key(&wal::object_wal_commit_path(
+        db_path,
+        u64::MAX,
+        Sequence::new(u64::MAX),
+        &"f".repeat(64),
+    ))?;
+    let encoded_len = OBJECT_LEASE_V3_HEADER_LEN
+        .checked_add(longest_key.len())
+        .ok_or_else(|| Error::invalid_options("object writer lease length overflow"))?;
+    if u64::try_from(encoded_len).map_or(true, |encoded_len| encoded_len > OBJECT_LEASE_MAX_BYTES) {
+        return Err(Error::invalid_options(format!(
+            "object-store prefix produces writer lease length {encoded_len}, exceeding maximum {OBJECT_LEASE_MAX_BYTES}"
+        )));
+    }
+    Ok(())
+}
 
 /// Backend-specific runtime durability operations (WAL lifecycle + writer
 /// lease) that the commit / flush / close paths drive.
@@ -128,8 +145,35 @@ impl DurabilitySubstrate {
                     .await
             }
             Self::ObjectStore(substrate) => {
-                substrate.accept_commit(sequence, operations, durability)
+                substrate
+                    .enqueue_commit(sequence, operations, durability)?
+                    .wait()
+                    .await
             }
+        }
+    }
+
+    #[cfg(not(target_os = "wasi"))]
+    pub(crate) fn enqueue_object_commit(
+        &self,
+        sequence: Sequence,
+        operations: &[BatchOperation],
+        durability: DurabilityMode,
+    ) -> Result<ObjectWalWaiter> {
+        match self {
+            Self::ObjectStore(substrate) => {
+                substrate.enqueue_commit(sequence, operations, durability)
+            }
+            Self::Filesystem(_) => Err(Error::unsupported_backend(
+                "object WAL enqueue requires object-store persistence",
+            )),
+        }
+    }
+
+    pub(crate) async fn fence_object_mutation_async(&self) -> Result<()> {
+        match self {
+            Self::Filesystem(_) => Ok(()),
+            Self::ObjectStore(substrate) => substrate.wal_lane.enqueue_persist()?.wait().await,
         }
     }
 
@@ -359,6 +403,69 @@ impl ObjectStoreSubstrate {
         }
     }
 
+    #[cfg(not(target_os = "wasi"))]
+    fn enqueue_commit(
+        &self,
+        sequence: Sequence,
+        operations: &[BatchOperation],
+        durability: DurabilityMode,
+    ) -> Result<ObjectWalWaiter> {
+        let commit_sequence = sequence;
+        let frame = wal::encode_batch_frame(sequence, operations)?;
+        let bytes_accepted = frame.len() as u64;
+        let mut buffered = self
+            .buffered
+            .lock()
+            .map_err(|_| lock_poisoned_error("object WAL buffered commits"))?;
+        buffered.push((sequence, frame.into()));
+        if durability == DurabilityMode::Buffered {
+            self.records_accepted
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.bytes_accepted
+                .fetch_add(bytes_accepted, std::sync::atomic::Ordering::Relaxed);
+            return Ok(ObjectWalWaiter::ready());
+        }
+
+        buffered.sort_by_key(|(sequence, _)| *sequence);
+        if buffered
+            .last()
+            .is_none_or(|(sequence, _)| *sequence != commit_sequence)
+        {
+            buffered.retain(|(sequence, _)| *sequence != commit_sequence);
+            return Err(Error::Corruption {
+                message:
+                    "object WAL buffered sequence order would admit the current commit before an older commit"
+                        .to_owned(),
+            });
+        }
+        let mut completions = Vec::with_capacity(buffered.len());
+        let mut enqueued = 0;
+        for (sequence, frame) in buffered.iter() {
+            match self.wal_lane.enqueue_commit(*sequence, Arc::clone(frame)) {
+                Ok(completion) => {
+                    completions.push(completion);
+                    enqueued += 1;
+                }
+                Err(error) => {
+                    buffered.drain(..enqueued);
+                    if let Some(index) = buffered
+                        .iter()
+                        .position(|(buffered_sequence, _)| *buffered_sequence == commit_sequence)
+                    {
+                        buffered.remove(index);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        buffered.clear();
+        self.records_accepted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.bytes_accepted
+            .fetch_add(bytes_accepted, std::sync::atomic::Ordering::Relaxed);
+        Ok(ObjectWalWaiter { completions })
+    }
+
     fn persist_wal(&self, durability: DurabilityMode) -> Result<()> {
         if durability == DurabilityMode::Buffered {
             return Ok(());
@@ -435,21 +542,40 @@ impl ObjectWalLane {
     }
 
     fn accept_commit(&self, sequence: Sequence, frame: Arc<[u8]>) -> Result<()> {
+        let completion = self.enqueue_commit(sequence, frame)?;
+        completion.wait()
+    }
+
+    fn enqueue_commit(
+        &self,
+        sequence: Sequence,
+        frame: Arc<[u8]>,
+    ) -> Result<Arc<ObjectWalCompletion>> {
         let completion = Arc::new(ObjectWalCompletion::new());
-        self.send(ObjectWalCommand::Accept(ObjectWalAccept {
+        self.try_send(ObjectWalCommand::Accept(ObjectWalAccept {
             sequence,
             frame,
             completion: Arc::clone(&completion),
         }))?;
-        completion.wait()
+        Ok(completion)
     }
 
     fn persist(&self) -> Result<()> {
-        let completion = Arc::new(ObjectWalCompletion::new());
-        self.send(ObjectWalCommand::Persist {
-            completion: Arc::clone(&completion),
+        let mut waiter = self.enqueue_persist()?;
+        let completion = waiter.completions.pop().ok_or_else(|| Error::Corruption {
+            message: "object WAL persist waiter has no completion".to_owned(),
         })?;
         completion.wait()
+    }
+
+    fn enqueue_persist(&self) -> Result<ObjectWalWaiter> {
+        let completion = Arc::new(ObjectWalCompletion::new());
+        self.try_send(ObjectWalCommand::Persist {
+            completion: Arc::clone(&completion),
+        })?;
+        Ok(ObjectWalWaiter {
+            completions: vec![completion],
+        })
     }
 
     fn rewrite_after_replay_floor(&self, replay_floor: Sequence) -> Result<()> {
@@ -478,6 +604,20 @@ impl ObjectWalLane {
             return Err(Error::Closed);
         };
         sender.send(command).map_err(|_| Error::Closed)
+    }
+
+    fn try_send(&self, command: ObjectWalCommand) -> Result<()> {
+        let sender = self
+            .sender
+            .lock()
+            .map_err(|_| lock_poisoned_error("object WAL sender"))?;
+        let Some(sender) = sender.as_ref() else {
+            return Err(Error::Closed);
+        };
+        sender.try_send(command).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => Error::runtime_busy("object WAL queue is full"),
+            mpsc::TrySendError::Disconnected(_) => Error::Closed,
+        })
     }
 }
 
@@ -516,21 +656,36 @@ struct ObjectWalAccept {
 
 struct ObjectWalCompletion {
     result: Mutex<Option<Result<()>>>,
+    completed: std::sync::atomic::AtomicBool,
     ready: Condvar,
+    waker: Mutex<Option<std::task::Waker>>,
 }
 
 impl ObjectWalCompletion {
     fn new() -> Self {
         Self {
             result: Mutex::new(None),
+            completed: std::sync::atomic::AtomicBool::new(false),
             ready: Condvar::new(),
+            waker: Mutex::new(None),
         }
     }
 
     fn complete(&self, result: Result<()>) {
+        if self
+            .completed
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
         if let Ok(mut slot) = self.result.lock() {
             *slot = Some(result);
             self.ready.notify_all();
+        }
+        if let Ok(mut waker) = self.waker.lock()
+            && let Some(waker) = waker.take()
+        {
+            waker.wake();
         }
     }
 
@@ -548,6 +703,51 @@ impl ObjectWalCompletion {
                 .wait(slot)
                 .map_err(|_| lock_poisoned_error("object WAL completion"))?;
         }
+    }
+
+    fn poll_result(&self, context: &mut std::task::Context<'_>) -> std::task::Poll<Result<()>> {
+        let Ok(mut slot) = self.result.lock() else {
+            return std::task::Poll::Ready(Err(lock_poisoned_error("object WAL completion")));
+        };
+        if let Some(result) = slot.take() {
+            return std::task::Poll::Ready(result);
+        }
+        drop(slot);
+        match self.waker.lock() {
+            Ok(mut waker) => *waker = Some(context.waker().clone()),
+            Err(_) => {
+                return std::task::Poll::Ready(Err(lock_poisoned_error(
+                    "object WAL completion waker",
+                )));
+            }
+        }
+        let Ok(mut slot) = self.result.lock() else {
+            return std::task::Poll::Ready(Err(lock_poisoned_error("object WAL completion")));
+        };
+        match slot.take() {
+            Some(result) => std::task::Poll::Ready(result),
+            None => std::task::Poll::Pending,
+        }
+    }
+}
+
+pub(crate) struct ObjectWalWaiter {
+    completions: Vec<Arc<ObjectWalCompletion>>,
+}
+
+impl ObjectWalWaiter {
+    #[cfg(not(target_os = "wasi"))]
+    fn ready() -> Self {
+        Self {
+            completions: Vec::new(),
+        }
+    }
+
+    pub(crate) async fn wait(self) -> Result<()> {
+        for completion in self.completions {
+            std::future::poll_fn(|context| completion.poll_result(context)).await?;
+        }
+        Ok(())
     }
 }
 
@@ -640,14 +840,27 @@ fn run_object_wal_command(
                 .iter()
                 .map(|accept| Arc::clone(&accept.completion))
                 .collect::<Vec<_>>();
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                complete_object_wal_accepts(lease, db_path, future_driver, accepts);
-            }))
-            .is_err()
-            {
-                complete_object_wal_worker_panic(completions);
-                fail_object_wal_after_panic(receiver, deferred.take());
-                return true;
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                complete_object_wal_accepts(lease, db_path, future_driver, accepts)
+            })) {
+                Ok(false) => {}
+                Ok(true) => {
+                    fail_object_wal_terminal(
+                        receiver,
+                        deferred.take(),
+                        "object WAL entered a terminal failed state",
+                    );
+                    return true;
+                }
+                Err(_) => {
+                    complete_object_wal_worker_panic(completions);
+                    fail_object_wal_terminal(
+                        receiver,
+                        deferred.take(),
+                        "object WAL worker panicked after durable mutation may have started",
+                    );
+                    return true;
+                }
             }
         }
         ObjectWalCommand::Persist { completion } => {
@@ -656,10 +869,23 @@ fn run_object_wal_command(
             }));
             let Ok(result) = result else {
                 complete_object_wal_worker_panic(vec![completion]);
-                fail_object_wal_after_panic(receiver, deferred.take());
+                fail_object_wal_terminal(
+                    receiver,
+                    deferred.take(),
+                    "object WAL worker panicked while renewing its lease",
+                );
                 return true;
             };
+            let failed = result.is_err();
             completion.complete(result);
+            if failed {
+                fail_object_wal_terminal(
+                    receiver,
+                    deferred.take(),
+                    "object WAL lease renewal failed and ownership is no longer trusted",
+                );
+                return true;
+            }
         }
         ObjectWalCommand::Rewrite {
             replay_floor,
@@ -670,10 +896,23 @@ fn run_object_wal_command(
             }));
             let Ok(result) = result else {
                 complete_object_wal_worker_panic(vec![completion]);
-                fail_object_wal_after_panic(receiver, deferred.take());
+                fail_object_wal_terminal(
+                    receiver,
+                    deferred.take(),
+                    "object WAL worker panicked while rewriting the WAL",
+                );
                 return true;
             };
+            let failed = result.is_err();
             completion.complete(result);
+            if failed {
+                fail_object_wal_terminal(
+                    receiver,
+                    deferred.take(),
+                    "object WAL rewrite failed after storage mutation may have started",
+                );
+                return true;
+            }
         }
         ObjectWalCommand::Release { completion } => {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -681,10 +920,15 @@ fn run_object_wal_command(
             }));
             let Ok(result) = result else {
                 complete_object_wal_worker_panic(vec![completion]);
-                fail_object_wal_after_panic(receiver, deferred.take());
+                fail_object_wal_terminal(
+                    receiver,
+                    deferred.take(),
+                    "object WAL worker panicked while releasing its lease",
+                );
                 return true;
             };
             completion.complete(result);
+            fail_object_wal_terminal(receiver, deferred.take(), "object WAL lane was released");
             return true;
         }
     }
@@ -760,34 +1004,41 @@ fn rewrite_object_wal(
 
 fn complete_object_wal_worker_panic(completions: Vec<Arc<ObjectWalCompletion>>) {
     for completion in completions {
-        completion.complete(Err(Error::runtime_busy("object WAL worker task panicked")));
+        completion.complete(Err(Error::Corruption {
+            message:
+                "object WAL worker panicked after durable mutation may have started; reopen the database"
+                    .to_owned(),
+        }));
     }
 }
 
-fn fail_object_wal_after_panic(
+fn fail_object_wal_terminal(
     receiver: &mpsc::Receiver<ObjectWalCommand>,
     deferred: Option<ObjectWalCommand>,
+    message: &str,
 ) {
     if let Some(command) = deferred {
-        complete_object_wal_command_after_panic(command);
+        complete_object_wal_command_terminal(command, message);
     }
     // Stay alive in a terminal failed state until every sender is gone. That
     // closes the race where a sender successfully enqueues after a one-shot
     // drain but before the receiver is dropped, which would otherwise strand
     // its waiter forever.
     while let Ok(command) = receiver.recv() {
-        complete_object_wal_command_after_panic(command);
+        complete_object_wal_command_terminal(command, message);
     }
 }
 
-fn complete_object_wal_command_after_panic(command: ObjectWalCommand) {
+fn complete_object_wal_command_terminal(command: ObjectWalCommand, message: &str) {
     let completion = match command {
         ObjectWalCommand::Accept(accept) => accept.completion,
         ObjectWalCommand::Persist { completion }
         | ObjectWalCommand::Rewrite { completion, .. }
         | ObjectWalCommand::Release { completion } => completion,
     };
-    complete_object_wal_worker_panic(vec![completion]);
+    completion.complete(Err(Error::Corruption {
+        message: message.to_owned(),
+    }));
 }
 
 fn complete_object_wal_accepts(
@@ -795,7 +1046,7 @@ fn complete_object_wal_accepts(
     db_path: &std::path::Path,
     future_driver: &ObjectWalFutureDriver,
     mut accepts: Vec<ObjectWalAccept>,
-) {
+) -> bool {
     accepts.sort_by_key(|accept| accept.sequence);
     if let Err(error) = future_driver.block_on(lease.refresh_current()) {
         let message = error.to_string();
@@ -808,7 +1059,7 @@ fn complete_object_wal_accepts(
                 "object WAL refresh failed before grouped commit: {message}"
             ))));
         }
-        return;
+        return true;
     }
     let mut previous = lease.state.committed_sequence;
     for accept in &accepts {
@@ -823,7 +1074,7 @@ fn complete_object_wal_accepts(
                     message: message.clone(),
                 }));
             }
-            return;
+            return true;
         }
         previous = accept.sequence;
     }
@@ -833,11 +1084,13 @@ fn complete_object_wal_accepts(
             for accept in accepts {
                 accept.completion.complete(Ok(()));
             }
+            false
         }
         Err(error) if accepts.len() == 1 => {
             if let Some(accept) = accepts.pop() {
                 accept.completion.complete(Err(error));
             }
+            true
         }
         Err(error) => {
             let message = format!("object WAL group commit failed: {error}");
@@ -846,6 +1099,7 @@ fn complete_object_wal_accepts(
                     .completion
                     .complete(Err(Error::Io(io::Error::other(message.clone()))));
             }
+            true
         }
     }
 }
@@ -857,6 +1111,65 @@ fn complete_object_wal_accepts(
 /// expiry has passed; while the owner is alive, the WAL worker extends the
 /// expiry with CAS writes. A previous holder is fenced out when its lower epoch
 /// is rejected before publishing a durable WAL commit or manifest edit.
+fn object_wal_group_frame_bytes(
+    committed_sequence: Sequence,
+    accepts: &[ObjectWalAccept],
+) -> Result<usize> {
+    let empty_frame_bytes = wal::encode_batch_frame(Sequence::ZERO, &[])?.len();
+    let mut expected_sequence =
+        committed_sequence
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| Error::Corruption {
+                message: "object WAL cannot advance past u64::MAX".to_owned(),
+            })?;
+    let mut total_bytes = 0usize;
+    for (index, accept) in accepts.iter().enumerate() {
+        let gap = accept
+            .sequence
+            .get()
+            .checked_sub(expected_sequence)
+            .ok_or_else(|| Error::Corruption {
+                message: format!(
+                    "object WAL expected sequence at least {expected_sequence}, got {}",
+                    accept.sequence.get()
+                ),
+            })?;
+        let gap = usize::try_from(gap).map_err(|_| Error::Corruption {
+            message: "object WAL skipped sequence count exceeds usize".to_owned(),
+        })?;
+        let gap_bytes = gap
+            .checked_mul(empty_frame_bytes)
+            .ok_or_else(|| Error::Corruption {
+                message: "object WAL skipped frame size overflow".to_owned(),
+            })?;
+        total_bytes = total_bytes
+            .checked_add(gap_bytes)
+            .and_then(|total| total.checked_add(accept.frame.len()))
+            .ok_or_else(|| Error::Corruption {
+                message: "object WAL group size overflow".to_owned(),
+            })?;
+        if total_bytes > OBJECT_WAL_MAX_GROUP_FRAME_BYTES {
+            return Err(Error::Corruption {
+                message: format!(
+                    "object WAL group frame length {total_bytes} exceeds maximum {OBJECT_WAL_MAX_GROUP_FRAME_BYTES}"
+                ),
+            });
+        }
+        if index + 1 != accepts.len() {
+            expected_sequence =
+                accept
+                    .sequence
+                    .get()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Corruption {
+                        message: "object WAL group sequence overflow".to_owned(),
+                    })?;
+        }
+    }
+    Ok(total_bytes)
+}
+
 pub(crate) struct ObjectWriterLease {
     client: Arc<dyn ObjectClient>,
     key: String,
@@ -1011,12 +1324,7 @@ impl ObjectWriterLease {
         let Some(last) = accepts.last() else {
             return Ok(());
         };
-        let total_bytes = accepts
-            .iter()
-            .try_fold(0usize, |total, accept| {
-                total.checked_add(accept.frame.len())
-            })
-            .ok_or_else(|| Error::invalid_options("object WAL group size overflow"))?;
+        let total_bytes = object_wal_group_frame_bytes(self.state.committed_sequence, accepts)?;
         let mut frames = Vec::with_capacity(total_bytes);
         let mut expected = self
             .state

@@ -378,8 +378,17 @@ pub(super) fn validate_blob_record_order(records: &[BlobRecord]) -> Result<()> {
 }
 
 pub(super) fn decode_records(file_id: u64, bytes: &[u8]) -> Result<Vec<BlobFileRecord>> {
+    decode_records_with_budget(file_id, bytes, limits::MAX_WHOLE_BLOB_DECODE_BYTES)
+}
+
+pub(super) fn decode_records_with_budget(
+    file_id: u64,
+    bytes: &[u8],
+    max_decoded_value_bytes: usize,
+) -> Result<Vec<BlobFileRecord>> {
     let mut cursor = Cursor::new(bytes);
     let mut records = Vec::new();
+    let mut decoded_value_bytes = 0_usize;
     while cursor.remaining_len() != 0 {
         if cursor.remaining_len() < MIN_BLOB_RECORD_FRAME_BYTES {
             return Err(invalid_blob("short blob record frame"));
@@ -396,7 +405,21 @@ pub(super) fn decode_records(file_id: u64, bytes: &[u8]) -> Result<Vec<BlobFileR
                 message: "blob record checksum mismatch".to_owned(),
             });
         }
-        records.push(decode_record_body(file_id, offset, record_checksum, body)?);
+        let remaining_budget = max_decoded_value_bytes
+            .checked_sub(decoded_value_bytes)
+            .ok_or_else(|| invalid_blob("aggregate decoded blob value budget underflow"))?;
+        let record = decode_record_body_with_budget(
+            file_id,
+            offset,
+            record_checksum,
+            body,
+            remaining_budget,
+            max_decoded_value_bytes,
+        )?;
+        decoded_value_bytes = decoded_value_bytes
+            .checked_add(record.record.value.len())
+            .ok_or_else(|| invalid_blob("aggregate decoded blob value length overflow"))?;
+        records.push(record);
     }
 
     for pair in records.windows(2) {
@@ -415,12 +438,38 @@ pub(super) fn decode_record_body(
     record_checksum: u32,
     body: &[u8],
 ) -> Result<BlobFileRecord> {
+    decode_record_body_with_budget(
+        file_id,
+        offset,
+        record_checksum,
+        body,
+        limits::MAX_DECODED_BLOCK_BYTES,
+        limits::MAX_DECODED_BLOCK_BYTES,
+    )
+}
+
+fn decode_record_body_with_budget(
+    file_id: u64,
+    offset: u64,
+    record_checksum: u32,
+    body: &[u8],
+    remaining_decoded_budget: usize,
+    max_decoded_value_bytes: usize,
+) -> Result<BlobFileRecord> {
     let mut cursor = Cursor::new(body);
     let internal_key = cursor.read_internal_key()?;
     if internal_key.kind() != ValueKind::Put {
         return Err(invalid_blob("blob record internal key is not a put"));
     }
     let value_len = cursor.read_u64()?;
+    let decoded_value_len = checked_blob_read_len(value_len)?;
+    if decoded_value_len > remaining_decoded_budget {
+        return Err(Error::InvalidFormat {
+            message: format!(
+                "aggregate decoded blob values exceed maximum {max_decoded_value_bytes}"
+            ),
+        });
+    }
     let encoded_len = cursor.read_u64()?;
     let compression = cursor.read_codec()?;
     let value_checksum = cursor.read_u32()?;
@@ -429,14 +478,12 @@ pub(super) fn decode_record_body(
         return Err(invalid_blob("blob record has trailing bytes"));
     }
 
-    let value = codec::decode_block(
-        compression,
-        encoded_value,
-        checked_blob_read_len(value_len)?,
-    )
-    .map_err(|error| Error::Corruption {
-        message: format!("blob value cannot be decoded: {error}"),
-    })?;
+    let value =
+        codec::decode_block(compression, encoded_value, decoded_value_len).map_err(|error| {
+            Error::Corruption {
+                message: format!("blob value cannot be decoded: {error}"),
+            }
+        })?;
     if checksum(&value) != value_checksum {
         return Err(Error::Corruption {
             message: "blob value checksum mismatch".to_owned(),

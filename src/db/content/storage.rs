@@ -2,8 +2,10 @@ use super::{
     Arc, ContentAccessBarrierRecord, ContentId, Db, DurabilityMode, Error, HostStorageBackend,
     MutexGuard, PathBuf, Result, StorageDomainId, StorageMode, StorageObjectDeleteBackend,
     StorageObjectId, StorageObjectKind, StorageObjectReadBackend, StorageObjectWriteBackend,
-    UploadId, UploadSessionState, content_lock_shard_index,
+    UploadId, UploadIdRetirement, UploadSessionState, UploadSessionStatus,
+    content_lock_shard_index, decode_upload_id_tombstone, encode_upload_id_tombstone,
 };
+use crate::object_store::{Precondition, PutIf};
 use crate::storage::{StorageObjectListBackend, StorageObjectListRequest};
 
 impl Db {
@@ -17,6 +19,17 @@ impl Db {
         self.write_content_object(object, bytes).await
     }
 
+    pub(crate) async fn write_content_partial_chunk(
+        &self,
+        upload_id: UploadId,
+        index: u64,
+        revision: u64,
+        bytes: Arc<[u8]>,
+    ) -> Result<()> {
+        let object = self.content_partial_chunk_object(upload_id, index, revision)?;
+        self.write_content_object(object, bytes).await
+    }
+
     pub(crate) async fn read_content_chunk(
         &self,
         upload_id: UploadId,
@@ -26,8 +39,28 @@ impl Db {
         self.read_content_object(object).await
     }
 
+    pub(crate) async fn read_content_partial_chunk(
+        &self,
+        upload_id: UploadId,
+        index: u64,
+        revision: u64,
+    ) -> Result<Option<Arc<[u8]>>> {
+        let object = self.content_partial_chunk_object(upload_id, index, revision)?;
+        self.read_content_object(object).await
+    }
+
     pub(crate) async fn delete_content_chunk(&self, upload_id: UploadId, index: u64) -> Result<()> {
         let object = self.content_chunk_object(upload_id, index)?;
+        self.delete_content_object(object).await
+    }
+
+    pub(crate) async fn delete_content_partial_chunk(
+        &self,
+        upload_id: UploadId,
+        index: u64,
+        revision: u64,
+    ) -> Result<()> {
+        let object = self.content_partial_chunk_object(upload_id, index, revision)?;
         self.delete_content_object(object).await
     }
 
@@ -91,7 +124,13 @@ impl Db {
     pub(crate) async fn write_upload_state(&self, state: &UploadSessionState) -> Result<()> {
         let object = self.content_upload_state_object(state.upload_id())?;
         let state = state.with_updated_at_unix_ms(crate::content::current_epoch_millis()?);
-        self.write_content_object(object, state.encode()?).await
+        let bytes = state.encode()?;
+        if self.inner.options.storage_mode.is_object_store_persistent() {
+            return self
+                .write_upload_state_object_store_cas(object, &state, bytes)
+                .await;
+        }
+        self.write_content_object(object, bytes).await
     }
 
     pub(crate) async fn require_upload_state(
@@ -104,12 +143,30 @@ impl Db {
                 upload_id: upload_id.to_string(),
             }
         })?;
+        if let Some(retirement) = decode_upload_id_tombstone(&bytes, upload_id)? {
+            return Err(upload_retirement_error(upload_id, retirement));
+        }
         UploadSessionState::decode(&bytes, upload_id)
     }
 
-    pub(super) async fn delete_upload_state(&self, upload_id: UploadId) -> Result<()> {
+    pub(super) async fn retire_upload_id(
+        &self,
+        upload_id: UploadId,
+        retirement: UploadIdRetirement,
+    ) -> Result<()> {
         let object = self.content_upload_state_object(upload_id)?;
-        self.delete_content_object(object).await
+        let bytes = encode_upload_id_tombstone(upload_id, retirement);
+        if self.inner.options.storage_mode.is_object_store_persistent() {
+            return self
+                .retire_upload_id_object_store_cas(object, upload_id, retirement, bytes)
+                .await;
+        }
+        self.write_content_object(object, bytes).await
+    }
+
+    pub(super) async fn delete_upload_state(&self, upload_id: UploadId) -> Result<()> {
+        self.retire_upload_id(upload_id, UploadIdRetirement::Aborted)
+            .await
     }
 
     pub(crate) async fn lock_content_upload(&self, upload_id: UploadId) -> MutexGuard<'_, ()> {
@@ -171,6 +228,68 @@ impl Db {
         ))
     }
 
+    fn content_partial_chunk_object(
+        &self,
+        upload_id: UploadId,
+        index: u64,
+        revision: u64,
+    ) -> Result<StorageObjectId> {
+        let path = self
+            .content_root()?
+            .join("chunks")
+            .join(upload_id.to_string())
+            .join(format!("partial-{index:020}-{revision:020}.trinec"));
+        Ok(StorageObjectId::native_file(
+            StorageObjectKind::ContentChunk,
+            path,
+        ))
+    }
+
+    pub(super) async fn list_content_upload_chunk_objects(
+        &self,
+        upload_id: UploadId,
+    ) -> Result<Vec<StorageObjectId>> {
+        let root = self
+            .content_root()?
+            .join("chunks")
+            .join(upload_id.to_string());
+        let request = StorageObjectListRequest::native_file(StorageObjectKind::ContentChunk, root)
+            .with_file_extension("trinec");
+        match &self.inner.options.storage_mode {
+            StorageMode::InMemory => self.inner.content_memory.list_objects(request).await,
+            StorageMode::Persistent { .. }
+            | StorageMode::HostPersistent {
+                backend: HostStorageBackend::Wasi { .. },
+            } => self.inner.native_storage.list_objects(request).await,
+            StorageMode::HostPersistent {
+                backend: HostStorageBackend::ObjectStore,
+            } => self.object_storage()?.list_objects(request).await,
+            StorageMode::HostPersistent {
+                backend: HostStorageBackend::Browser { .. },
+            } => {
+                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+                {
+                    self.browser_storage()?.list_objects(request).await
+                }
+                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+                {
+                    Err(Error::unsupported_backend(
+                        "browser content objects require wasm32-unknown-unknown",
+                    ))
+                }
+            }
+        }
+    }
+
+    pub(super) async fn delete_content_chunk_object(&self, object: StorageObjectId) -> Result<()> {
+        if object.kind() != StorageObjectKind::ContentChunk {
+            return Err(Error::Corruption {
+                message: "content chunk cleanup received a non-chunk object".to_owned(),
+            });
+        }
+        self.delete_content_object(object).await
+    }
+
     fn content_descriptor_object(
         &self,
         storage_domain_id: StorageDomainId,
@@ -220,47 +339,76 @@ impl Db {
     }
 
     pub(super) async fn list_upload_states(&self) -> Result<Vec<UploadSessionState>> {
+        let objects = self.list_upload_state_objects().await?;
+        let mut states = Vec::with_capacity(objects.len());
+        for object in objects {
+            let upload_id = upload_id_from_state_object(&object)?;
+            let Some(bytes) = self.read_content_object(object).await? else {
+                // A concurrent maintenance pass can change the listing between
+                // requests. Absence is not corruption; a later listing will
+                // simply omit that entry.
+                continue;
+            };
+            if decode_upload_id_tombstone(&bytes, upload_id)?.is_some() {
+                continue;
+            }
+            states.push(UploadSessionState::decode(&bytes, upload_id)?);
+        }
+        states.sort_unstable_by_key(|state| state.upload_id());
+        Ok(states)
+    }
+
+    pub(super) async fn cleanup_retired_upload_chunks(&self) -> Result<()> {
+        for state_object in self.list_upload_state_objects().await? {
+            let upload_id = upload_id_from_state_object(&state_object)?;
+            let Some(bytes) = self.read_content_object(state_object).await? else {
+                continue;
+            };
+            let Some(retirement) = decode_upload_id_tombstone(&bytes, upload_id)? else {
+                continue;
+            };
+            for chunk in self.list_content_upload_chunk_objects(upload_id).await? {
+                let is_partial = chunk
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("partial-"));
+                if retirement == UploadIdRetirement::Aborted || is_partial {
+                    self.delete_content_chunk_object(chunk).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn list_upload_state_objects(&self) -> Result<Vec<StorageObjectId>> {
         let root = self.content_root()?.join("uploads");
         let request = StorageObjectListRequest::native_file(StorageObjectKind::ContentUpload, root)
             .with_file_extension("trineu");
-        let objects = match &self.inner.options.storage_mode {
-            StorageMode::InMemory => self.inner.content_memory.list_objects(request).await?,
+        match &self.inner.options.storage_mode {
+            StorageMode::InMemory => self.inner.content_memory.list_objects(request).await,
             StorageMode::Persistent { .. }
             | StorageMode::HostPersistent {
                 backend: HostStorageBackend::Wasi { .. },
-            } => self.inner.native_storage.list_objects(request).await?,
+            } => self.inner.native_storage.list_objects(request).await,
             StorageMode::HostPersistent {
                 backend: HostStorageBackend::ObjectStore,
-            } => self.object_storage()?.list_objects(request).await?,
+            } => self.object_storage()?.list_objects(request).await,
             StorageMode::HostPersistent {
                 backend: HostStorageBackend::Browser { .. },
             } => {
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
                 {
-                    self.browser_storage()?.list_objects(request).await?
+                    self.browser_storage()?.list_objects(request).await
                 }
                 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
                 {
-                    return Err(Error::unsupported_backend(
+                    Err(Error::unsupported_backend(
                         "browser content objects require wasm32-unknown-unknown",
-                    ));
+                    ))
                 }
             }
-        };
-
-        let mut states = Vec::with_capacity(objects.len());
-        for object in objects {
-            let upload_id = upload_id_from_state_object(&object)?;
-            let Some(bytes) = self.read_content_object(object).await? else {
-                // A concurrent abort or maintenance pass can remove a state
-                // after listing. Absence is not corruption; a later listing
-                // will simply omit the completed cleanup.
-                continue;
-            };
-            states.push(UploadSessionState::decode(&bytes, upload_id)?);
         }
-        states.sort_unstable_by_key(|state| state.upload_id());
-        Ok(states)
     }
 
     async fn write_content_object(&self, object: StorageObjectId, bytes: Arc<[u8]>) -> Result<()> {
@@ -288,9 +436,15 @@ impl Db {
             StorageMode::HostPersistent {
                 backend: HostStorageBackend::ObjectStore,
             } => {
-                self.object_storage()?
+                self.fence_object_mutation_or_close("before content-object write")
+                    .await?;
+                let result = self
+                    .object_storage()?
                     .write_object(object, bytes, durability)
-                    .await
+                    .await;
+                self.fence_object_mutation_or_close("after content-object write")
+                    .await?;
+                result
             }
             StorageMode::HostPersistent {
                 backend: HostStorageBackend::Browser { .. },
@@ -309,6 +463,199 @@ impl Db {
                 }
             }
         }
+    }
+
+    async fn write_upload_state_object_store_cas(
+        &self,
+        object: StorageObjectId,
+        intended: &UploadSessionState,
+        bytes: Arc<[u8]>,
+    ) -> Result<()> {
+        self.fence_object_mutation_or_close("before upload-state CAS")
+            .await?;
+        let backend = self.object_storage()?;
+        let observed = backend.read_object_versioned(&object).await?;
+        let precondition = match observed {
+            None if intended.revision() == 0 => Precondition::IfNoneMatch,
+            None => {
+                return Err(Error::ContentUploadConflict {
+                    upload_id: intended.upload_id().to_string(),
+                    expected_revision: intended.revision(),
+                    actual_revision: 0,
+                });
+            }
+            Some((current_bytes, etag)) => {
+                if let Some(retirement) =
+                    decode_upload_id_tombstone(&current_bytes, intended.upload_id())?
+                {
+                    return Err(upload_retirement_error(intended.upload_id(), retirement));
+                }
+                let current = UploadSessionState::decode(&current_bytes, intended.upload_id())?;
+                if current.logically_eq_ignoring_updated_at(intended) {
+                    self.fence_object_mutation_or_close("after idempotent upload-state CAS")
+                        .await?;
+                    return Ok(());
+                }
+                let expected_revision =
+                    current
+                        .revision()
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Corruption {
+                            message: "content upload revision overflow".to_owned(),
+                        })?;
+                if intended.revision() != expected_revision {
+                    return Err(Error::ContentUploadConflict {
+                        upload_id: intended.upload_id().to_string(),
+                        expected_revision: intended.revision(),
+                        actual_revision: current.revision(),
+                    });
+                }
+                Precondition::IfMatch(etag)
+            }
+        };
+
+        let publish = backend
+            .put_object_if(&object, Arc::clone(&bytes), precondition)
+            .await;
+        let result = match publish {
+            Ok(PutIf::Stored { .. }) => Ok(()),
+            Ok(PutIf::PreconditionFailed { .. }) => {
+                self.reconcile_upload_state_cas(&backend, &object, intended)
+                    .await
+            }
+            Err(error) => match self
+                .reconcile_upload_state_cas(&backend, &object, intended)
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(_) => Err(error),
+            },
+        };
+        self.fence_object_mutation_or_close("after upload-state CAS")
+            .await?;
+        result
+    }
+
+    async fn reconcile_upload_state_cas(
+        &self,
+        backend: &crate::object_store::ObjectStoreBackend,
+        object: &StorageObjectId,
+        intended: &UploadSessionState,
+    ) -> Result<()> {
+        let Some((current_bytes, _)) = backend.read_object_versioned(object).await? else {
+            return Err(Error::ContentUploadConflict {
+                upload_id: intended.upload_id().to_string(),
+                expected_revision: intended.revision(),
+                actual_revision: 0,
+            });
+        };
+        if let Some(retirement) = decode_upload_id_tombstone(&current_bytes, intended.upload_id())?
+        {
+            return Err(upload_retirement_error(intended.upload_id(), retirement));
+        }
+        let current = UploadSessionState::decode(&current_bytes, intended.upload_id())?;
+        if current.logically_eq_ignoring_updated_at(intended) {
+            Ok(())
+        } else {
+            Err(Error::ContentUploadConflict {
+                upload_id: intended.upload_id().to_string(),
+                expected_revision: intended.revision(),
+                actual_revision: current.revision(),
+            })
+        }
+    }
+
+    async fn retire_upload_id_object_store_cas(
+        &self,
+        object: StorageObjectId,
+        upload_id: UploadId,
+        retirement: UploadIdRetirement,
+        bytes: Arc<[u8]>,
+    ) -> Result<()> {
+        self.fence_object_mutation_or_close("before upload-id retirement")
+            .await?;
+        let backend = self.object_storage()?;
+        let Some((current_bytes, etag)) = backend.read_object_versioned(&object).await? else {
+            return Err(Error::ContentUploadNotFound {
+                upload_id: upload_id.to_string(),
+            });
+        };
+        if let Some(current) = decode_upload_id_tombstone(&current_bytes, upload_id)? {
+            let result = if current == retirement {
+                Ok(())
+            } else {
+                Err(upload_retirement_error(upload_id, current))
+            };
+            self.fence_object_mutation_or_close("after idempotent upload-id retirement")
+                .await?;
+            return result;
+        }
+        let current = UploadSessionState::decode(&current_bytes, upload_id)?;
+        let allowed = matches!(
+            (retirement, current.status()),
+            (UploadIdRetirement::Aborted, UploadSessionStatus::Aborting)
+                | (UploadIdRetirement::Sealed, UploadSessionStatus::Sealed(_))
+        );
+        if !allowed {
+            return Err(Error::ContentUploadConflict {
+                upload_id: upload_id.to_string(),
+                expected_revision: current.revision(),
+                actual_revision: current.revision(),
+            });
+        }
+        let publish = backend
+            .put_object_if(&object, bytes, Precondition::IfMatch(etag))
+            .await;
+        let result: Result<()> = match publish {
+            Ok(PutIf::Stored { .. }) => Ok(()),
+            Ok(PutIf::PreconditionFailed { .. }) | Err(_) => {
+                match backend.read_object_versioned(&object).await {
+                    Ok(Some((current_bytes, _))) => {
+                        match decode_upload_id_tombstone(&current_bytes, upload_id) {
+                            Ok(Some(current)) if current == retirement => Ok(()),
+                            Ok(Some(current)) => Err(upload_retirement_error(upload_id, current)),
+                            Ok(None) => {
+                                match UploadSessionState::decode(&current_bytes, upload_id) {
+                                    Ok(current_state) => Err(Error::ContentUploadConflict {
+                                        upload_id: upload_id.to_string(),
+                                        expected_revision: current.revision(),
+                                        actual_revision: current_state.revision(),
+                                    }),
+                                    Err(error) => Err(error),
+                                }
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Ok(None) => Err(Error::ContentUploadNotFound {
+                        upload_id: upload_id.to_string(),
+                    }),
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        self.fence_object_mutation_or_close("after upload-id retirement")
+            .await?;
+        result
+    }
+
+    async fn fence_object_mutation_or_close(&self, stage: &'static str) -> Result<()> {
+        self.inner
+            .substrate
+            .fence_object_mutation_async()
+            .await
+            .map_err(|error| {
+                let message =
+                    format!("object mutation lease fence failed {stage}: {error}; database closed");
+                self.inner
+                    .closed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                self.inner.maintenance.record_error(Error::Corruption {
+                    message: message.clone(),
+                });
+                self.inner.maintenance.shutdown();
+                Error::Corruption { message }
+            })
     }
 
     pub(super) async fn read_content_object(
@@ -358,9 +705,15 @@ impl Db {
             StorageMode::HostPersistent {
                 backend: HostStorageBackend::ObjectStore,
             } => {
-                self.object_storage()?
+                self.fence_object_mutation_or_close("before content-object deletion")
+                    .await?;
+                let result = self
+                    .object_storage()?
                     .delete_unversioned_object_verified(object)
-                    .await
+                    .await;
+                self.fence_object_mutation_or_close("after content-object deletion")
+                    .await?;
+                result
             }
             StorageMode::HostPersistent {
                 backend: HostStorageBackend::Browser { .. },
@@ -390,6 +743,17 @@ impl Db {
                     | HostStorageBackend::ObjectStore,
             } => DurabilityMode::Flush,
         }
+    }
+}
+
+fn upload_retirement_error(upload_id: UploadId, retirement: UploadIdRetirement) -> Error {
+    match retirement {
+        UploadIdRetirement::Aborted => Error::ContentUploadNotFound {
+            upload_id: upload_id.to_string(),
+        },
+        UploadIdRetirement::Sealed => Error::ContentUploadSealed {
+            upload_id: upload_id.to_string(),
+        },
     }
 }
 

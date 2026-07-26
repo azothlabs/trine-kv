@@ -1,11 +1,11 @@
 use super::{
-    BTreeMap, BlobFileHeader, BlobRecord, CodecId, DurabilityMode, Entry, Error, InternalKey,
-    NativeFileBackend, NativeFileObject, Path, Result, Sequence, StorageObjectWriteBackend,
-    StorageReadBackend, ValueRef, blob_object_len, blob_storage_backend, checked_blob_read_len,
-    checksum, open_blob_read_object_with_backend, open_blob_read_object_with_backend_async,
-    read_blob_exact_at, read_blob_exact_at_async, read_indexed_blob_record,
-    read_indexed_value_with_backend, read_indexed_value_with_backend_async, usize_to_u64,
-    validate_indexed_blob_header, write_blob_file_with_backend_async,
+    BlobFileHeader, BlobRecord, CodecId, DurabilityMode, Error, InternalKey, NativeFileBackend,
+    NativeFileObject, Path, Result, Sequence, StorageObjectWriteBackend, StorageReadBackend,
+    ValueRef, blob_object_len, blob_object_len_async, blob_storage_backend,
+    open_blob_read_object_with_backend, open_blob_read_object_with_backend_async,
+    read_indexed_blob_record, read_indexed_blob_record_async, read_indexed_value_with_backend,
+    read_indexed_value_with_backend_async, usize_to_u64, validate_indexed_blob_header,
+    validate_indexed_blob_header_async, write_blob_file_with_backend_async,
     write_blob_file_with_backend_with_durability,
 };
 
@@ -196,17 +196,17 @@ pub(crate) fn inline_blob_values_with_backend(
     records: &[(InternalKey, Option<ValueRef>)],
 ) -> Result<Vec<(InternalKey, Option<ValueRef>)>> {
     let mut rewritten = Vec::with_capacity(records.len());
-    let mut blob_files = BTreeMap::new();
+    let mut blob_file = None;
     for (internal_key, value) in records {
         let value = match value {
             Some(ValueRef::Inline(bytes)) => Some(ValueRef::Inline(bytes.clone())),
-            Some(value @ (ValueRef::BlobIndex(_) | ValueRef::Blob { .. })) => {
+            Some(value @ ValueRef::BlobIndex(_)) => {
                 Some(ValueRef::Inline(read_value_for_internal_key_cached(
                     backend,
                     db_path,
                     value,
                     Some(internal_key),
-                    &mut blob_files,
+                    &mut blob_file,
                 )?))
             }
             None => None,
@@ -226,12 +226,12 @@ pub(super) fn read_value_for_internal_key_cached(
     db_path: &Path,
     value: &ValueRef,
     expected_internal_key: Option<&InternalKey>,
-    blob_files: &mut BTreeMap<u64, CachedBlobFile>,
+    blob_file: &mut Option<(u64, CachedBlobFile)>,
 ) -> Result<Vec<u8>> {
     match value {
         ValueRef::Inline(bytes) => Ok(bytes.clone()),
         ValueRef::BlobIndex(index) => {
-            let blob_file = cached_blob_file(backend, db_path, index.file_id, blob_files)?;
+            let blob_file = cached_blob_file(backend, db_path, index.file_id, blob_file)?;
             let record = read_indexed_blob_record(&blob_file.object, blob_file.len, index)?;
             if record.index != *index {
                 return Err(Error::Corruption {
@@ -246,28 +246,6 @@ pub(super) fn read_value_for_internal_key_cached(
             }
             Ok(record.record.value)
         }
-        ValueRef::Blob {
-            file_id,
-            offset,
-            len,
-            checksum: expected_checksum,
-        } => {
-            let len = checked_blob_read_len(*len)?;
-            let blob_file = cached_blob_file(backend, db_path, *file_id, blob_files)?;
-            let mut bytes = vec![0_u8; len];
-            read_blob_exact_at(
-                &blob_file.object,
-                *offset,
-                &mut bytes,
-                "referenced blob bytes cannot be read",
-            )?;
-            if checksum(&bytes) != *expected_checksum {
-                return Err(Error::Corruption {
-                    message: "blob checksum mismatch".to_owned(),
-                });
-            }
-            Ok(bytes)
-        }
     }
 }
 
@@ -275,17 +253,23 @@ pub(super) fn cached_blob_file<'files>(
     backend: &NativeFileBackend,
     db_path: &Path,
     file_id: u64,
-    blob_files: &'files mut BTreeMap<u64, CachedBlobFile>,
+    blob_file: &'files mut Option<(u64, CachedBlobFile)>,
 ) -> Result<&'files CachedBlobFile> {
-    match blob_files.entry(file_id) {
-        Entry::Occupied(entry) => Ok(entry.into_mut()),
-        Entry::Vacant(entry) => {
-            let object = open_blob_read_object_with_backend(backend, db_path, file_id)?;
-            let len = blob_object_len(&object, "referenced blob file metadata cannot be read")?;
-            validate_indexed_blob_header(&object, file_id)?;
-            Ok(entry.insert(CachedBlobFile { object, len }))
-        }
+    if blob_file
+        .as_ref()
+        .is_none_or(|(cached_file_id, _)| *cached_file_id != file_id)
+    {
+        let object = open_blob_read_object_with_backend(backend, db_path, file_id)?;
+        let len = blob_object_len(&object, "referenced blob file metadata cannot be read")?;
+        validate_indexed_blob_header(&object, file_id)?;
+        *blob_file = Some((file_id, CachedBlobFile { object, len }));
     }
+    blob_file
+        .as_ref()
+        .map(|(_, file)| file)
+        .ok_or_else(|| Error::Corruption {
+            message: "blob handle cache lost an inserted file".to_owned(),
+        })
 }
 pub(crate) async fn inline_blob_values_with_backend_async<B>(
     backend: &B,
@@ -296,25 +280,82 @@ where
     B: StorageReadBackend,
 {
     let mut rewritten = Vec::with_capacity(records.len());
+    let mut blob_file = None;
     for (internal_key, value) in records {
         let value = match value {
             Some(ValueRef::Inline(bytes)) => Some(ValueRef::Inline(bytes.clone())),
-            Some(value @ (ValueRef::BlobIndex(_) | ValueRef::Blob { .. })) => {
-                Some(ValueRef::Inline(
-                    read_value_for_internal_key_with_backend_async(
-                        backend,
-                        db_path,
-                        value,
-                        Some(internal_key),
-                    )
-                    .await?,
-                ))
-            }
+            Some(value @ ValueRef::BlobIndex(_)) => Some(ValueRef::Inline(
+                read_value_for_internal_key_cached_async(
+                    backend,
+                    db_path,
+                    value,
+                    Some(internal_key),
+                    &mut blob_file,
+                )
+                .await?,
+            )),
             None => None,
         };
         rewritten.push((internal_key.clone(), value));
     }
     Ok(rewritten)
+}
+
+struct AsyncCachedBlobFile<O> {
+    object: O,
+    len: u64,
+}
+
+async fn read_value_for_internal_key_cached_async<B>(
+    backend: &B,
+    db_path: &Path,
+    value: &ValueRef,
+    expected_internal_key: Option<&InternalKey>,
+    blob_file: &mut Option<(u64, AsyncCachedBlobFile<B::ReadObject>)>,
+) -> Result<Vec<u8>>
+where
+    B: StorageReadBackend,
+{
+    let file_id = match value {
+        ValueRef::Inline(bytes) => return Ok(bytes.clone()),
+        ValueRef::BlobIndex(index) => index.file_id,
+    };
+    if blob_file
+        .as_ref()
+        .is_none_or(|(cached_file_id, _)| *cached_file_id != file_id)
+    {
+        let object = open_blob_read_object_with_backend_async(backend, db_path, file_id).await?;
+        let len =
+            blob_object_len_async(&object, "referenced blob file metadata cannot be read").await?;
+        validate_indexed_blob_header_async(&object, file_id).await?;
+        *blob_file = Some((file_id, AsyncCachedBlobFile { object, len }));
+    }
+    let blob_file = blob_file
+        .as_ref()
+        .map(|(_, file)| file)
+        .ok_or_else(|| Error::Corruption {
+            message: "async blob handle cache lost an inserted file".to_owned(),
+        })?;
+
+    match value {
+        ValueRef::Inline(_) => unreachable!("inline value returned before opening a blob"),
+        ValueRef::BlobIndex(index) => {
+            let record =
+                read_indexed_blob_record_async(&blob_file.object, blob_file.len, index).await?;
+            if record.index != *index {
+                return Err(Error::Corruption {
+                    message: "blob index metadata mismatch".to_owned(),
+                });
+            }
+            if expected_internal_key.is_some_and(|expected| record.record.internal_key != *expected)
+            {
+                return Err(Error::Corruption {
+                    message: "blob record internal key mismatch".to_owned(),
+                });
+            }
+            Ok(record.record.value)
+        }
+    }
 }
 
 pub(crate) fn read_value_for_internal_key(
@@ -337,28 +378,6 @@ pub(crate) fn read_value_for_internal_key_with_backend(
         ValueRef::BlobIndex(index) => {
             read_indexed_value_with_backend(backend, db_path, index, expected_internal_key)
         }
-        ValueRef::Blob {
-            file_id,
-            offset,
-            len,
-            checksum: expected_checksum,
-        } => {
-            let len = checked_blob_read_len(*len)?;
-            let mut bytes = vec![0_u8; len];
-            let object = open_blob_read_object_with_backend(backend, db_path, *file_id)?;
-            read_blob_exact_at(
-                &object,
-                *offset,
-                &mut bytes,
-                "referenced blob bytes cannot be read",
-            )?;
-            if checksum(&bytes) != *expected_checksum {
-                return Err(Error::Corruption {
-                    message: "blob checksum mismatch".to_owned(),
-                });
-            }
-            Ok(bytes)
-        }
     }
 }
 pub(crate) async fn read_value_for_internal_key_with_backend_async<B>(
@@ -375,30 +394,6 @@ where
         ValueRef::BlobIndex(index) => {
             read_indexed_value_with_backend_async(backend, db_path, index, expected_internal_key)
                 .await
-        }
-        ValueRef::Blob {
-            file_id,
-            offset,
-            len,
-            checksum: expected_checksum,
-        } => {
-            let object =
-                open_blob_read_object_with_backend_async(backend, db_path, *file_id).await?;
-            let len = checked_blob_read_len(*len)?;
-            let mut bytes = vec![0_u8; len];
-            read_blob_exact_at_async(
-                &object,
-                *offset,
-                &mut bytes,
-                "referenced blob bytes cannot be read",
-            )
-            .await?;
-            if checksum(&bytes) != *expected_checksum {
-                return Err(Error::Corruption {
-                    message: "blob checksum mismatch".to_owned(),
-                });
-            }
-            Ok(bytes)
         }
     }
 }

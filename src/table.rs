@@ -44,7 +44,9 @@ use crate::{
 
 pub const TABLE_FILE_EXTENSION: &str = "trinet";
 const TABLE_MAGIC: u32 = 0x5452_5442;
-const TABLE_VERSION: u16 = 6;
+// Version 7 removes raw blob references; every external value is bound to its
+// blob header, full record metadata and internal key through `BlobIndex`.
+const TABLE_VERSION: u16 = 7;
 const HEADER_LEN: usize = 14;
 const FOOTER_MAGIC: u32 = 0x5452_5446;
 const FOOTER_LEN: usize = 90;
@@ -59,7 +61,6 @@ const VALUE_KIND_RANGE_DELETE: u8 = 3;
 
 const VALUE_NONE: u8 = 0;
 const VALUE_INLINE: u8 = 1;
-const VALUE_BLOB: u8 = 2;
 const VALUE_BLOB_INDEX: u8 = 3;
 
 const BOUND_UNBOUNDED: u8 = 0;
@@ -105,14 +106,6 @@ impl TableId {
     #[must_use]
     pub const fn get(self) -> u64 {
         self.0
-    }
-
-    #[must_use]
-    pub const fn next(self) -> Option<Self> {
-        match self.0.checked_add(1) {
-            Some(value) => Some(Self(value)),
-            None => None,
-        }
     }
 }
 
@@ -489,17 +482,8 @@ impl DataBlockRecordHeader {
 
 #[derive(Debug, Clone, Copy)]
 enum ValueRefHeader {
-    Inline {
-        offset: u32,
-        len: u32,
-    },
+    Inline { offset: u32, len: u32 },
     BlobIndex(BlobIndex),
-    Blob {
-        file_id: u64,
-        offset: u64,
-        len: u64,
-        checksum: u32,
-    },
 }
 
 impl ValueRefHeader {
@@ -516,17 +500,6 @@ impl ValueRefHeader {
                 Ok(ValueRefView::Inline(bytes))
             }
             Self::BlobIndex(index) => Ok(ValueRefView::BlobIndex(index)),
-            Self::Blob {
-                file_id,
-                offset,
-                len,
-                checksum,
-            } => Ok(ValueRefView::Blob {
-                file_id,
-                offset,
-                len,
-                checksum,
-            }),
         }
     }
 }
@@ -569,12 +542,6 @@ impl DataBlockRecordView<'_> {
 enum ValueRefView<'block> {
     Inline(&'block [u8]),
     BlobIndex(BlobIndex),
-    Blob {
-        file_id: u64,
-        offset: u64,
-        len: u64,
-        checksum: u32,
-    },
 }
 
 impl ValueRefView<'_> {
@@ -582,17 +549,6 @@ impl ValueRefView<'_> {
         match self {
             Self::Inline(bytes) => ValueRef::Inline(bytes.to_vec()),
             Self::BlobIndex(index) => ValueRef::BlobIndex(index),
-            Self::Blob {
-                file_id,
-                offset,
-                len,
-                checksum,
-            } => ValueRef::Blob {
-                file_id,
-                offset,
-                len,
-                checksum,
-            },
         }
     }
 }

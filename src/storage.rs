@@ -190,6 +190,14 @@ pub(crate) struct StorageObjectListRequest {
     file_extension: Option<&'static str>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageObjectListPage {
+    pub(crate) objects: Vec<StorageObjectId>,
+    pub(crate) next_after: Option<String>,
+}
+
+pub(crate) const OBJECT_LIST_PAGE_SIZE: usize = 1_024;
+
 impl StorageObjectListRequest {
     pub(crate) fn native_file(kind: StorageObjectKind, root: impl Into<PathBuf>) -> Self {
         Self {
@@ -719,6 +727,47 @@ pub(crate) trait StorageObjectListBackend: StorageReadBackend {
         &self,
         request: StorageObjectListRequest,
     ) -> StorageFuture<'_, Vec<StorageObjectId>>;
+
+    fn list_objects_page(
+        &self,
+        request: StorageObjectListRequest,
+        after: Option<&str>,
+        limit: usize,
+    ) -> StorageFuture<'_, StorageObjectListPage>;
+}
+
+fn paginate_storage_objects(
+    objects: Vec<StorageObjectId>,
+    after: Option<&str>,
+    limit: usize,
+) -> Result<StorageObjectListPage> {
+    if limit == 0 {
+        return Err(Error::invalid_options(
+            "storage object listing page limit must be non-zero",
+        ));
+    }
+    let start = match after {
+        Some(after) => objects
+            .iter()
+            .position(|object| object.path().to_string_lossy().as_ref() > after)
+            .unwrap_or(objects.len()),
+        None => 0,
+    };
+    let mut eligible = objects.into_iter().skip(start);
+    let page_objects = eligible.by_ref().take(limit).collect::<Vec<_>>();
+    let has_more = eligible.next().is_some();
+    let next_after = has_more.then(|| {
+        page_objects
+            .last()
+            .expect("a page with more objects cannot be empty")
+            .path()
+            .to_string_lossy()
+            .into_owned()
+    });
+    Ok(StorageObjectListPage {
+        objects: page_objects,
+        next_after,
+    })
 }
 
 pub(crate) trait BlockingStorageObjectListBackend: StorageObjectListBackend {
@@ -849,6 +898,18 @@ impl StorageObjectListBackend for MemoryStorageBackend {
                 .collect::<Vec<_>>();
             listed.sort_unstable();
             Ok(listed)
+        })
+    }
+
+    fn list_objects_page(
+        &self,
+        request: StorageObjectListRequest,
+        after: Option<&str>,
+        limit: usize,
+    ) -> StorageFuture<'_, StorageObjectListPage> {
+        let after = after.map(str::to_owned);
+        Box::pin(async move {
+            paginate_storage_objects(self.list_objects(request).await?, after.as_deref(), limit)
         })
     }
 }

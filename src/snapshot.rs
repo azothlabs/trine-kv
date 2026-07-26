@@ -13,6 +13,7 @@ use crate::{
 #[derive(Debug, Default)]
 pub(crate) struct SnapshotTracker {
     active: Mutex<BTreeMap<Sequence, usize>>,
+    compaction_floors: Mutex<BTreeMap<Sequence, usize>>,
 }
 
 impl SnapshotTracker {
@@ -32,6 +33,16 @@ impl SnapshotTracker {
         latest_sequence: Sequence,
         retained_floor: Sequence,
     ) -> Result<Snapshot> {
+        let compaction_floors = self
+            .compaction_floors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let compaction_floor = compaction_floors.keys().next_back().copied();
+        if compaction_floor.is_some_and(|floor| read_sequence < floor) {
+            return Err(Error::runtime_busy(
+                "requested snapshot is older than an admitted compaction; retry after maintenance",
+            ));
+        }
         let mut active = self
             .active
             .lock()
@@ -57,6 +68,8 @@ impl SnapshotTracker {
         }
 
         *active.entry(read_sequence).or_default() += 1;
+        drop(active);
+        drop(compaction_floors);
         Ok(Snapshot {
             read_sequence,
             pin: Some(SnapshotPin {
@@ -83,6 +96,38 @@ impl SnapshotTracker {
             .sum()
     }
 
+    pub(crate) fn begin_compaction(
+        self: &Arc<Self>,
+        retained_floor_without_snapshots: Sequence,
+    ) -> (Sequence, CompactionSnapshotGuard) {
+        let mut floors = self
+            .compaction_floors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Snapshot admission holds the floor lock until it has inserted into
+        // `active`; taking the locks in the same order makes admission atomic.
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let floor = active
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or(retained_floor_without_snapshots)
+            .min(retained_floor_without_snapshots);
+        *floors.entry(floor).or_default() += 1;
+        drop(active);
+        drop(floors);
+        (
+            floor,
+            CompactionSnapshotGuard {
+                tracker: Arc::clone(self),
+                floor,
+            },
+        )
+    }
+
     fn pin(&self, read_sequence: Sequence) {
         let mut active = self
             .active
@@ -100,6 +145,29 @@ impl SnapshotTracker {
             *count -= 1;
             if *count == 0 {
                 active.remove(&read_sequence);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CompactionSnapshotGuard {
+    tracker: Arc<SnapshotTracker>,
+    floor: Sequence,
+}
+
+impl Drop for CompactionSnapshotGuard {
+    fn drop(&mut self) {
+        let mut floors = self
+            .tracker
+            .compaction_floors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = floors.get_mut(&self.floor) {
+            if *count <= 1 {
+                floors.remove(&self.floor);
+            } else {
+                *count -= 1;
             }
         }
     }
@@ -126,9 +194,18 @@ impl Snapshot {
         }
     }
 
-    #[must_use]
-    pub(crate) const fn read_sequence(&self) -> Sequence {
-        self.read_sequence
+    pub(crate) fn read_sequence_for(
+        &self,
+        expected_tracker: &Arc<SnapshotTracker>,
+    ) -> Result<Sequence> {
+        let belongs_to_database = self
+            .pin
+            .as_ref()
+            .is_some_and(|pin| Arc::ptr_eq(&pin.tracker, expected_tracker));
+        if !belongs_to_database {
+            return Err(Error::SnapshotDatabaseMismatch);
+        }
+        Ok(self.read_sequence)
     }
 
     /// Returns the public read version visible through this snapshot.
@@ -289,3 +366,34 @@ impl PartialEq for Snapshot {
 }
 
 impl Eq for Snapshot {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admitted_compaction_blocks_new_older_snapshot_until_install_finishes() {
+        let tracker = Arc::new(SnapshotTracker::default());
+        let (floor, guard) = tracker.begin_compaction(Sequence::new(10));
+        assert_eq!(floor, Sequence::new(10));
+
+        let error = tracker
+            .pinned_retained_snapshot(Sequence::new(5), Sequence::new(20), Sequence::new(0))
+            .expect_err("older snapshot cannot enter an admitted compaction");
+        assert!(matches!(error, Error::RuntimeBusy { .. }));
+
+        drop(guard);
+        tracker
+            .pinned_retained_snapshot(Sequence::new(5), Sequence::new(20), Sequence::new(0))
+            .expect("snapshot admission resumes after compaction guard drops");
+    }
+
+    #[test]
+    fn already_pinned_snapshot_lowers_new_compaction_floor() {
+        let tracker = Arc::new(SnapshotTracker::default());
+        let snapshot = tracker.pinned_snapshot(Sequence::new(4));
+        let (floor, _guard) = tracker.begin_compaction(Sequence::new(10));
+        assert_eq!(floor, Sequence::new(4));
+        drop(snapshot);
+    }
+}

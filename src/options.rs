@@ -376,7 +376,7 @@ pub struct DbOptions {
     /// Maximum user key length accepted by write APIs, in bytes.
     ///
     /// The same limit applies to delete keys and range-delete bounds. The value
-    /// must be non-zero and may not exceed [`DbOptions::MAX_WRITE_FIELD_BYTES`].
+    /// must be non-zero and may not exceed [`DbOptions::MAX_KEY_BYTES`].
     /// Lower this limit for multi-tenant or untrusted workloads to cap WAL,
     /// memtable, table-index, and comparison work caused by oversized keys.
     pub max_key_bytes: usize,
@@ -421,16 +421,19 @@ impl DbOptions {
     /// Default target size for table files.
     pub const DEFAULT_TARGET_TABLE_BYTES: usize = 64 * 1024 * 1024;
     /// Default maximum user key length accepted by write APIs.
-    pub const DEFAULT_MAX_KEY_BYTES: usize = limits::MAX_DECODED_BLOCK_BYTES;
+    pub const DEFAULT_MAX_KEY_BYTES: usize = limits::MAX_USER_KEY_BYTES;
     /// Default maximum user value length accepted by write APIs.
-    pub const DEFAULT_MAX_VALUE_BYTES: usize = limits::MAX_DECODED_BLOCK_BYTES;
+    pub const DEFAULT_MAX_VALUE_BYTES: usize = limits::MAX_USER_VALUE_BYTES;
     /// Maximum configurable limit for a single write byte field.
     ///
     /// This is tied to Trine's internal decoded-block safety bound. Keeping
     /// public write limits at or below this value prevents accepted records from
     /// later creating table, WAL, or blob decode paths that exceed the engine's
     /// allocation guardrails.
-    pub const MAX_WRITE_FIELD_BYTES: usize = limits::MAX_DECODED_BLOCK_BYTES;
+    pub const MAX_WRITE_FIELD_BYTES: usize = limits::MAX_USER_VALUE_BYTES;
+    /// Maximum key length that every WAL, table, blob-properties and manifest
+    /// representation can encode.
+    pub const MAX_KEY_BYTES: usize = limits::MAX_USER_KEY_BYTES;
     /// Default block-cache byte budget.
     pub const DEFAULT_BLOCK_CACHE_BYTES: usize = 256 * 1024 * 1024;
     /// Default minimum blob file size for garbage collection.
@@ -682,7 +685,7 @@ impl DbOptions {
     ///
     /// This applies to put keys, delete keys, and both bounds of range deletes.
     /// The unit is bytes after the caller has encoded the key. `0` is invalid,
-    /// and values above [`DbOptions::MAX_WRITE_FIELD_BYTES`] are rejected when
+    /// and values above [`DbOptions::MAX_KEY_BYTES`] are rejected when
     /// the database opens.
     #[must_use]
     pub const fn with_max_key_bytes(mut self, max_key_bytes: usize) -> Self {

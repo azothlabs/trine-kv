@@ -364,7 +364,11 @@ impl Db {
         state: &Arc<LsmTree>,
         snapshot: &'snapshot Snapshot,
     ) -> Result<BucketReader<'snapshot>> {
-        self.reader_for_state_at_sequence(state, snapshot.read_sequence(), snapshot.is_pinned())
+        self.reader_for_state_at_sequence(
+            state,
+            self.snapshot_sequence(snapshot)?,
+            snapshot.is_pinned(),
+        )
     }
 
     pub(crate) fn reader_for_state_at_sequence<'snapshot>(
@@ -407,6 +411,202 @@ impl Db {
             read_sequence,
             read_pin,
         ))
+    }
+
+    fn scan_sources_for_state_at_sequence(
+        &self,
+        state: &Arc<LsmTree>,
+        selector: &ScanSelector,
+        read_sequence: Sequence,
+        direction: Direction,
+    ) -> Result<ScanSourceInput> {
+        self.ensure_open()?;
+        let read_pin = self.inner.snapshots.pinned_snapshot(read_sequence);
+        let scan = state.scan(
+            selector,
+            direction,
+            read_sequence,
+            Some(&self.inner.block_cache),
+        )?;
+        let db_path = self.persistent_path().map(Path::to_path_buf);
+        let native_storage = db_path.as_ref().map(|_| self.inner.native_storage.clone());
+        Ok(ScanSourceInput {
+            read_sequence,
+            read_pin,
+            db_path,
+            native_storage,
+            blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
+            scan_waste: Some(Arc::clone(&self.inner.scan_waste)),
+            range_tombstones: scan.range_tombstones,
+            sources: scan.sources,
+        })
+    }
+
+    async fn scan_sources_for_state_at_sequence_async(
+        &self,
+        state: &Arc<LsmTree>,
+        selector: &ScanSelector,
+        read_sequence: Sequence,
+        direction: Direction,
+    ) -> Result<ScanSourceInput> {
+        self.ensure_open()?;
+        let read_pin = self.inner.snapshots.pinned_snapshot(read_sequence);
+        let scan = state
+            .scan_async(
+                selector,
+                direction,
+                read_sequence,
+                Some(&self.inner.block_cache),
+            )
+            .await?;
+        let db_path = self.persistent_path().map(Path::to_path_buf);
+        let native_storage = db_path.as_ref().map(|_| self.inner.native_storage.clone());
+        Ok(ScanSourceInput {
+            read_sequence,
+            read_pin,
+            db_path,
+            native_storage,
+            blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
+            scan_waste: Some(Arc::clone(&self.inner.scan_waste)),
+            range_tombstones: scan.range_tombstones,
+            sources: scan.sources,
+        })
+    }
+
+    pub(crate) fn range_at_state_sequence(
+        &self,
+        state: &Arc<LsmTree>,
+        range: &KeyRange,
+        read_sequence: Sequence,
+        direction: Direction,
+    ) -> Result<Iter> {
+        let input = self.scan_sources_for_state_at_sequence(
+            state,
+            &ScanSelector::Range(range.clone()),
+            read_sequence,
+            direction,
+        )?;
+        Ok(Iter::from_sources(direction, input))
+    }
+
+    pub(crate) async fn range_at_state_sequence_async(
+        &self,
+        state: &Arc<LsmTree>,
+        range: &KeyRange,
+        read_sequence: Sequence,
+        direction: Direction,
+    ) -> Result<Iter> {
+        let input = self
+            .scan_sources_for_state_at_sequence_async(
+                state,
+                &ScanSelector::Range(range.clone()),
+                read_sequence,
+                direction,
+            )
+            .await?;
+        Ok(Iter::from_sources(direction, input))
+    }
+
+    pub(crate) fn range_lazy_at_state_sequence(
+        &self,
+        state: &Arc<LsmTree>,
+        range: &KeyRange,
+        read_sequence: Sequence,
+        direction: Direction,
+    ) -> Result<LazyIter> {
+        let input = self.scan_sources_for_state_at_sequence(
+            state,
+            &ScanSelector::Range(range.clone()),
+            read_sequence,
+            direction,
+        )?;
+        Ok(LazyIter::from_sources(direction, input))
+    }
+
+    pub(crate) async fn range_lazy_at_state_sequence_async(
+        &self,
+        state: &Arc<LsmTree>,
+        range: &KeyRange,
+        read_sequence: Sequence,
+        direction: Direction,
+    ) -> Result<LazyIter> {
+        let input = self
+            .scan_sources_for_state_at_sequence_async(
+                state,
+                &ScanSelector::Range(range.clone()),
+                read_sequence,
+                direction,
+            )
+            .await?;
+        Ok(LazyIter::from_sources(direction, input))
+    }
+
+    pub(crate) fn prefix_at_state_sequence(
+        &self,
+        state: &Arc<LsmTree>,
+        prefix: &[u8],
+        read_sequence: Sequence,
+        direction: Direction,
+    ) -> Result<Iter> {
+        let input = self.scan_sources_for_state_at_sequence(
+            state,
+            &ScanSelector::Prefix(prefix.to_vec()),
+            read_sequence,
+            direction,
+        )?;
+        Ok(Iter::from_sources(direction, input))
+    }
+
+    pub(crate) async fn prefix_at_state_sequence_async(
+        &self,
+        state: &Arc<LsmTree>,
+        prefix: &[u8],
+        read_sequence: Sequence,
+        direction: Direction,
+    ) -> Result<Iter> {
+        let input = self
+            .scan_sources_for_state_at_sequence_async(
+                state,
+                &ScanSelector::Prefix(prefix.to_vec()),
+                read_sequence,
+                direction,
+            )
+            .await?;
+        Ok(Iter::from_sources(direction, input))
+    }
+
+    pub(crate) fn prefix_lazy_at_state_sequence(
+        &self,
+        state: &Arc<LsmTree>,
+        prefix: &[u8],
+        read_sequence: Sequence,
+        direction: Direction,
+    ) -> Result<LazyIter> {
+        let input = self.scan_sources_for_state_at_sequence(
+            state,
+            &ScanSelector::Prefix(prefix.to_vec()),
+            read_sequence,
+            direction,
+        )?;
+        Ok(LazyIter::from_sources(direction, input))
+    }
+
+    pub(crate) async fn prefix_lazy_at_state_sequence_async(
+        &self,
+        state: &Arc<LsmTree>,
+        prefix: &[u8],
+        read_sequence: Sequence,
+        direction: Direction,
+    ) -> Result<LazyIter> {
+        let input = self
+            .scan_sources_for_state_at_sequence_async(
+                state,
+                &ScanSelector::Prefix(prefix.to_vec()),
+                read_sequence,
+                direction,
+            )
+            .await?;
+        Ok(LazyIter::from_sources(direction, input))
     }
 
     pub(crate) fn range_at_sequence(

@@ -109,6 +109,7 @@ impl Db {
     /// }
     /// ```
     pub async fn refresh_object_store(&self) -> Result<ReadVersion> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         if !self.inner.options.storage_mode.is_object_store_persistent()
             || !self.inner.options.read_only
@@ -219,6 +220,7 @@ impl Db {
         name: impl Into<BucketName>,
         options: BucketOptions,
     ) -> Result<Bucket> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         let name = name.into();
         validate_user_named_bucket(name.as_str())?;
         if self.inner.options.storage_mode.is_object_store_persistent() {
@@ -236,6 +238,7 @@ impl Db {
     }
 
     pub(crate) async fn internal_bucket(&self, name: impl Into<BucketName>) -> Result<Bucket> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         let name = name.into();
         require_internal_bucket(name.as_str())?;
         if self.inner.options.storage_mode.is_object_store_persistent() {
@@ -272,6 +275,7 @@ impl Db {
     /// [`Error::InvalidOptions`] for an invalid or reserved name, or
     /// [`Error::CheckpointAlreadyExists`] if `name` already exists.
     pub async fn create_checkpoint(&self, name: &str) -> Result<ReadVersion> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         validate_checkpoint_name(name)?;
         if self.inner.options.read_only {
@@ -307,6 +311,7 @@ impl Db {
     /// [`Error::InvalidOptions`] for an invalid or reserved name, or
     /// [`Error::CheckpointNotFound`] if `name` does not exist.
     pub async fn delete_checkpoint(&self, name: &str) -> Result<()> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         validate_checkpoint_name(name)?;
         if self.inner.options.read_only {
@@ -328,6 +333,7 @@ impl Db {
     }
 
     pub(crate) async fn delete_internal_checkpoint(&self, name: &str) -> Result<()> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         require_internal_checkpoint_name(name)?;
         if self.inner.options.read_only {
@@ -414,7 +420,7 @@ impl Db {
         self.get_at_with_pin_state_async(
             DEFAULT_BUCKET_NAME,
             key,
-            snapshot.read_sequence(),
+            self.snapshot_sequence(snapshot)?,
             snapshot.is_pinned(),
         )
         .await
@@ -527,7 +533,7 @@ impl Db {
         self.range_at_sequence_async(
             DEFAULT_BUCKET_NAME,
             range,
-            snapshot.read_sequence(),
+            self.snapshot_sequence(snapshot)?,
             Direction::Forward,
         )
         .await
@@ -538,7 +544,7 @@ impl Db {
         self.range_lazy_at_sequence_async(
             DEFAULT_BUCKET_NAME,
             range,
-            snapshot.read_sequence(),
+            self.snapshot_sequence(snapshot)?,
             Direction::Forward,
         )
         .await
@@ -571,7 +577,7 @@ impl Db {
         self.range_at_sequence_async(
             DEFAULT_BUCKET_NAME,
             range,
-            snapshot.read_sequence(),
+            self.snapshot_sequence(snapshot)?,
             Direction::Reverse,
         )
         .await
@@ -586,7 +592,7 @@ impl Db {
         self.range_lazy_at_sequence_async(
             DEFAULT_BUCKET_NAME,
             range,
-            snapshot.read_sequence(),
+            self.snapshot_sequence(snapshot)?,
             Direction::Reverse,
         )
         .await
@@ -622,7 +628,7 @@ impl Db {
         self.prefix_at_sequence_async(
             DEFAULT_BUCKET_NAME,
             &prefix,
-            snapshot.read_sequence(),
+            self.snapshot_sequence(snapshot)?,
             Direction::Forward,
         )
         .await
@@ -638,7 +644,7 @@ impl Db {
         self.prefix_lazy_at_sequence_async(
             DEFAULT_BUCKET_NAME,
             &prefix,
-            snapshot.read_sequence(),
+            self.snapshot_sequence(snapshot)?,
             Direction::Forward,
         )
         .await
@@ -678,7 +684,7 @@ impl Db {
         self.prefix_at_sequence_async(
             DEFAULT_BUCKET_NAME,
             &prefix,
-            snapshot.read_sequence(),
+            self.snapshot_sequence(snapshot)?,
             Direction::Reverse,
         )
         .await
@@ -694,7 +700,7 @@ impl Db {
         self.prefix_lazy_at_sequence_async(
             DEFAULT_BUCKET_NAME,
             &prefix,
-            snapshot.read_sequence(),
+            self.snapshot_sequence(snapshot)?,
             Direction::Reverse,
         )
         .await
@@ -715,6 +721,8 @@ impl Db {
     ///
     /// - `mode`: durability level to request for pending WAL bytes.
     pub async fn persist(&self, mode: DurabilityMode) -> Result<()> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
+        self.ensure_open()?;
         if self.inner.options.storage_mode.is_object_store_persistent() {
             if matches!(
                 mode,
@@ -754,6 +762,8 @@ impl Db {
     /// does not cancel the flush; the task finishes or reports its result to
     /// the waiting future.
     pub async fn flush(&self) -> Result<()> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
+        self.ensure_open()?;
         if self.inner.options.storage_mode.is_object_store_persistent() {
             return self.flush_object_store_async().await;
         }
@@ -783,8 +793,9 @@ impl Db {
     /// point does not cancel the compaction, because partially abandoned table
     /// publish work would make startup recovery more expensive.
     pub async fn compact_range(&self, range: KeyRange) -> Result<()> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
+        self.ensure_open()?;
         if self.inner.options.storage_mode.is_object_store_persistent() {
-            self.ensure_open()?;
             if self.inner.options.read_only {
                 return Err(Error::ReadOnly);
             }
@@ -843,8 +854,9 @@ impl Db {
         range: KeyRange,
         budget: MaintenanceBudget,
     ) -> Result<MaintenanceOutcome> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
+        self.ensure_open()?;
         if self.inner.options.storage_mode.is_object_store_persistent() {
-            self.ensure_open()?;
             if self.inner.options.read_only {
                 return Err(Error::ReadOnly);
             }
@@ -904,8 +916,9 @@ impl Db {
         &self,
         budget: MaintenanceBudget,
     ) -> Result<MaintenanceOutcome> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
+        self.ensure_open()?;
         if self.inner.options.storage_mode.is_object_store_persistent() {
-            self.ensure_open()?;
             if self.inner.options.read_only {
                 return Err(Error::ReadOnly);
             }

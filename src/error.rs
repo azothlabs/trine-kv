@@ -148,6 +148,13 @@ impl ContentReclaimBlocker {
 pub enum Error {
     /// Underlying I/O error from the selected storage backend.
     Io(io::Error),
+    /// The manifest namespace was atomically replaced, but the subsequent
+    /// durability confirmation failed. The new manifest must be treated as
+    /// published even though its crash durability is uncertain.
+    ManifestPublishedDurabilityUnknown {
+        /// The durability confirmation failure.
+        source: io::Error,
+    },
     /// Durable data failed an integrity or consistency check.
     Corruption {
         /// Human-readable corruption detail.
@@ -198,6 +205,14 @@ pub enum Error {
         /// Oldest read version Trine promises to answer when the request was
         /// checked.
         oldest_retained: ReadVersion,
+    },
+    /// A snapshot created by a different database handle lineage was supplied.
+    SnapshotDatabaseMismatch,
+    /// A bucket handle refers to a generation that has since been dropped or
+    /// replaced by a newly created bucket with the same name.
+    BucketStale {
+        /// Name of the dropped or replaced bucket.
+        name: String,
     },
     /// A checkpoint with the requested name already exists.
     CheckpointAlreadyExists {
@@ -385,12 +400,24 @@ impl Error {
             message: message.into(),
         }
     }
+
+    /// Returns whether the manifest namespace already changed even though its
+    /// final durability confirmation failed.
+    #[must_use]
+    pub(crate) const fn manifest_was_published(&self) -> bool {
+        matches!(self, Self::ManifestPublishedDurabilityUnknown { .. })
+    }
 }
 
 impl fmt::Display for Error {
+    #[allow(clippy::too_many_lines)] // exhaustive public error text remains centralized
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "io error: {error}"),
+            Self::ManifestPublishedDurabilityUnknown { source } => write!(
+                formatter,
+                "manifest namespace was published but durability confirmation failed: {source}"
+            ),
             Self::Corruption { message } => write!(formatter, "corruption: {message}"),
             Self::InvalidFormat { message } => write!(formatter, "invalid format: {message}"),
             Self::UnsupportedFormat { message } => fmt_unsupported_format(formatter, message),
@@ -407,6 +434,15 @@ impl fmt::Display for Error {
                 requested,
                 oldest_retained,
             } => fmt_read_version_expired(formatter, *requested, *oldest_retained),
+            Self::SnapshotDatabaseMismatch => {
+                formatter.write_str("snapshot belongs to a different database lineage")
+            }
+            Self::BucketStale { name } => {
+                write!(
+                    formatter,
+                    "bucket handle is stale after drop or replacement: {name}"
+                )
+            }
             Self::CheckpointAlreadyExists { name } => {
                 write!(formatter, "checkpoint already exists: {name}")
             }
@@ -489,6 +525,7 @@ impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
+            Self::ManifestPublishedDurabilityUnknown { source } => Some(source),
             _ => None,
         }
     }

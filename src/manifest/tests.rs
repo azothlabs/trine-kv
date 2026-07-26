@@ -6,8 +6,16 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use super::{ManifestStore, decode_manifest, decode_state, manifest_path};
+use super::{
+    ManifestState, ManifestStore, decode_manifest, decode_state, encode_manifest_bytes,
+    manifest_path,
+};
+use crate::storage::{
+    StorageObjectKind,
+    fault_injection::{StorageFaultGuard, StorageFaultPoint},
+};
 use crate::{
+    codec::CodecId,
     limits,
     options::{
         BlobLevelMergePolicy, BucketOptions, CompressionProfile, FilterDepthCurve, FilterPolicy,
@@ -15,10 +23,13 @@ use crate::{
     },
     prefix::PrefixExtractor,
     storage::NativeFileBackend,
+    table::{TableId, TableLevel, TableProperties},
+    types::Sequence,
 };
 
 struct AppliedManifestThenError {
     inner: std::sync::Arc<dyn crate::object_store::ObjectClient>,
+    fail_before_once: std::sync::atomic::AtomicBool,
     fail_once: std::sync::atomic::AtomicBool,
 }
 
@@ -35,8 +46,9 @@ impl crate::object_store::ObjectClient for AppliedManifestThenError {
         key: &str,
         offset: u64,
         len: u64,
+        expected_etag: &crate::object_store::ETag,
     ) -> crate::object_store::ObjectFuture<'op, std::sync::Arc<[u8]>> {
-        self.inner.get_range(key, offset, len)
+        self.inner.get_range(key, offset, len, expected_etag)
     }
 
     fn put<'op>(
@@ -58,6 +70,15 @@ impl crate::object_store::ObjectClient for AppliedManifestThenError {
         self.inner.list(prefix)
     }
 
+    fn list_page<'op>(
+        &'op self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> crate::object_store::ObjectFuture<'op, crate::object_store::ObjectListPage> {
+        self.inner.list_page(prefix, after, limit)
+    }
+
     fn head<'op>(
         &'op self,
         key: &str,
@@ -71,6 +92,16 @@ impl crate::object_store::ObjectClient for AppliedManifestThenError {
         bytes: std::sync::Arc<[u8]>,
         precondition: crate::object_store::Precondition,
     ) -> crate::object_store::ObjectFuture<'op, crate::object_store::PutIf> {
+        if self
+            .fail_before_once
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Box::pin(async {
+                Err(crate::Error::Io(std::io::Error::other(
+                    "injected manifest CAS transport failure",
+                )))
+            });
+        }
         let future = self.inner.put_if(key, bytes, precondition);
         let fail = self
             .fail_once
@@ -120,6 +151,17 @@ fn manifest_decode_rejects_payload_len_before_large_allocation() {
     assert!(error.to_string().contains("manifest payload length"));
 }
 
+#[test]
+fn manifest_decode_rejects_the_previous_incompatible_layout_version() {
+    let mut bytes = encode_manifest_bytes(&ManifestState::empty())
+        .expect("current manifest encodes")
+        .to_vec();
+    bytes[4..6].copy_from_slice(&1_u16.to_le_bytes());
+
+    let error = decode_manifest(&bytes).expect_err("previous layout version must be rejected");
+    assert!(matches!(error, crate::Error::UnsupportedFormat { .. }));
+}
+
 fn put_bucket_options_header(payload: &mut Vec<u8>) {
     super::put_u64(payload, 0);
     super::put_u32(payload, 1);
@@ -142,10 +184,15 @@ fn manifest_round_trips_custom_filter_depth_curve() {
     let mut payload = Vec::new();
     put_bucket_options_header(&mut payload);
     super::put_filter_depth_curve(&mut payload, FilterDepthCurve::Custom { step: 3, floor: 6 });
-    super::put_u32(&mut payload, 0); // tables
+    super::put_u64(&mut payload, 1); // bucket generation
+    super::put_u32(&mut payload, 1); // table buckets
+    super::put_bytes(&mut payload, b"users").expect("table bucket encodes");
+    super::put_u32(&mut payload, 0); // tables in users
     super::put_u32(&mut payload, 0); // pending blob deletions
     super::put_u32(&mut payload, 0); // checkpoints
     super::put_u64(&mut payload, 0); // writer_epoch
+    super::put_u64(&mut payload, 1); // next_file_id
+    super::put_u64(&mut payload, 2); // next_bucket_generation
 
     let state = decode_state(&payload).expect("manifest decodes");
     let options = state.buckets().get("users").expect("bucket options exist");
@@ -164,10 +211,15 @@ fn manifest_round_trips_cost_weighted_filter_depth_curve() {
         &mut payload,
         FilterDepthCurve::CostWeighted { step: 4, ceil: 24 },
     );
-    super::put_u32(&mut payload, 0); // tables
+    super::put_u64(&mut payload, 1); // bucket generation
+    super::put_u32(&mut payload, 1); // table buckets
+    super::put_bytes(&mut payload, b"users").expect("table bucket encodes");
+    super::put_u32(&mut payload, 0); // tables in users
     super::put_u32(&mut payload, 0); // pending blob deletions
     super::put_u32(&mut payload, 0); // checkpoints
     super::put_u64(&mut payload, 0); // writer_epoch
+    super::put_u64(&mut payload, 1); // next_file_id
+    super::put_u64(&mut payload, 2); // next_bucket_generation
 
     let state = decode_state(&payload).expect("manifest decodes");
     let options = state.buckets().get("users").expect("bucket options exist");
@@ -186,7 +238,7 @@ fn manifest_state_stays_put_when_publish_fails() {
 
     fs::remove_dir_all(&dir).expect("remove manifest parent to force publish failure");
     let error = store
-        .create_bucket("users".to_owned(), BucketOptions::default())
+        .create_bucket("users", BucketOptions::default())
         .expect_err("publish should fail");
     assert!(
         error.to_string().contains("io error"),
@@ -196,6 +248,148 @@ fn manifest_state_stays_put_when_publish_fails() {
         !store.state().buckets().contains_key("users"),
         "failed publish must not advance in-memory manifest state"
     );
+}
+
+#[test]
+fn durable_file_id_reservation_survives_reopen_and_never_reuses_gaps() {
+    let dir = temp_manifest_dir("file-id-reservation");
+    fs::create_dir_all(&dir).expect("create manifest dir");
+    let path = manifest_path(&dir);
+    let mut store = ManifestStore::open_or_create(&path, true).expect("open manifest");
+
+    let mut first = store.reserve_file_ids(2).expect("reserve first range");
+    assert_eq!(first.next_file_id().expect("first id"), 1);
+    assert_eq!(first.next_file_id().expect("second id"), 2);
+    drop(store);
+
+    let mut reopened = ManifestStore::open_or_create(path, false).expect("reopen manifest");
+    let mut second = reopened.reserve_file_ids(1).expect("reserve after reopen");
+    assert_eq!(
+        second.next_file_id().expect("next durable id"),
+        3,
+        "reserved identifiers remain consumed even when no object was written"
+    );
+
+    fs::remove_dir_all(dir).expect("cleanup manifest dir");
+}
+
+#[test]
+fn manifest_rejects_duplicate_bucket_generations_and_file_identifiers() {
+    let mut duplicate_generation = super::ManifestState::empty();
+    duplicate_generation
+        .insert_new_bucket("a".to_owned(), BucketOptions::default())
+        .expect("insert a");
+    duplicate_generation
+        .insert_new_bucket("b".to_owned(), BucketOptions::default())
+        .expect("insert b");
+    let generation_a = duplicate_generation
+        .bucket_generation("a")
+        .expect("a generation");
+    duplicate_generation
+        .bucket_generations
+        .insert("b".to_owned(), generation_a);
+    assert!(
+        super::encode_state(&duplicate_generation).is_err(),
+        "logical bucket incarnations must be globally unique"
+    );
+
+    let mut duplicate_file = super::ManifestState::empty();
+    duplicate_file
+        .insert_new_bucket("data".to_owned(), BucketOptions::default())
+        .expect("insert data");
+    duplicate_file.tables.insert(
+        "data".to_owned(),
+        vec![
+            TableProperties {
+                id: TableId(1),
+                level: TableLevel::ZERO,
+                smallest_user_key: b"a".to_vec(),
+                largest_user_key: b"m".to_vec(),
+                smallest_sequence: Sequence::new(1),
+                largest_sequence: Sequence::new(1),
+                codec: CodecId::None,
+                blob_file_ids: Vec::new(),
+                blob_references: Vec::new(),
+            },
+            TableProperties {
+                id: TableId(1),
+                level: TableLevel::ZERO,
+                smallest_user_key: b"n".to_vec(),
+                largest_user_key: b"z".to_vec(),
+                smallest_sequence: Sequence::new(1),
+                largest_sequence: Sequence::new(1),
+                codec: CodecId::None,
+                blob_file_ids: Vec::new(),
+                blob_references: Vec::new(),
+            },
+        ],
+    );
+    duplicate_file.next_file_id = 2;
+    assert!(
+        super::encode_state(&duplicate_file).is_err(),
+        "table identifiers must be unique within their object namespace"
+    );
+}
+
+#[test]
+fn manifest_allows_one_blob_file_to_be_referenced_by_multiple_tables() {
+    let mut state = super::ManifestState::empty();
+    state
+        .insert_new_bucket("data".to_owned(), BucketOptions::default())
+        .expect("insert data");
+    let table = |id, smallest, largest| TableProperties {
+        id: TableId(id),
+        level: TableLevel::ZERO,
+        smallest_user_key: vec![smallest],
+        largest_user_key: vec![largest],
+        smallest_sequence: Sequence::new(1),
+        largest_sequence: Sequence::new(1),
+        codec: CodecId::None,
+        blob_file_ids: vec![1],
+        blob_references: Vec::new(),
+    };
+    state.tables.insert(
+        "data".to_owned(),
+        vec![table(1, b'a', b'm'), table(2, b'n', b'z')],
+    );
+    state.next_file_id = 3;
+    state.pending_blob_deletions.insert(1, Sequence::new(2));
+
+    super::encode_state(&state).expect(
+        "shared live blob references and a conflicting pending-deletion marker must remain readable",
+    );
+}
+
+#[test]
+fn post_rename_manifest_sync_failure_keeps_published_state_and_reports_phase() {
+    let dir = temp_manifest_dir("post-rename-sync");
+    fs::create_dir_all(&dir).expect("create manifest dir");
+    let path = manifest_path(&dir);
+    let mut store = ManifestStore::open_or_create(&path, true).expect("open manifest");
+    let _fault = StorageFaultGuard::install(
+        &dir,
+        StorageFaultPoint::ManifestDirectorySync,
+        Some(StorageObjectKind::Manifest),
+        1,
+    );
+
+    let error = store
+        .reserve_file_ids(1)
+        .expect_err("directory sync failure is returned");
+    assert!(matches!(
+        error,
+        crate::Error::ManifestPublishedDurabilityUnknown { .. }
+    ));
+    assert_eq!(
+        store.state().next_file_id,
+        2,
+        "in-memory state follows the namespace that already changed"
+    );
+    drop(store);
+
+    let reopened = ManifestStore::open_or_create(&path, false).expect("reopen published manifest");
+    assert_eq!(reopened.state().next_file_id, 2);
+    fs::remove_dir_all(dir).expect("cleanup manifest dir");
 }
 
 #[test]
@@ -321,6 +515,7 @@ fn object_manifest_reconciles_applied_then_errored_cas() {
     let inner: std::sync::Arc<dyn ObjectClient> = std::sync::Arc::new(InMemoryObjectStore::new());
     let client = std::sync::Arc::new(AppliedManifestThenError {
         inner,
+        fail_before_once: std::sync::atomic::AtomicBool::new(false),
         fail_once: std::sync::atomic::AtomicBool::new(true),
     });
     let mut manifest =
@@ -334,6 +529,31 @@ fn object_manifest_reconciles_applied_then_errored_cas() {
     assert_eq!(
         manifest.state().wal_replay_floor(),
         crate::types::Sequence::new(5)
+    );
+}
+
+#[test]
+fn object_manifest_preserves_unapplied_transport_error_category() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let inner: std::sync::Arc<dyn ObjectClient> = std::sync::Arc::new(InMemoryObjectStore::new());
+    let client = std::sync::Arc::new(AppliedManifestThenError {
+        inner,
+        fail_before_once: std::sync::atomic::AtomicBool::new(true),
+        fail_once: std::sync::atomic::AtomicBool::new(false),
+    });
+    let mut manifest =
+        poll_ready(super::ObjectManifestStore::open(client, "MANIFEST", 1)).expect("open");
+
+    let error = poll_ready(manifest.try_publish(object_manifest_state(5)))
+        .expect_err("unapplied transport error must be returned");
+    assert!(
+        matches!(error, crate::Error::Io(_)),
+        "unapplied I/O must not be converted into a CAS conflict: {error:?}"
+    );
+    assert_eq!(
+        manifest.state().wal_replay_floor(),
+        crate::types::Sequence::ZERO
     );
 }
 
@@ -367,6 +587,9 @@ fn object_manifest_reports_conflict_then_rebases() {
     match poll_ready(writer_b.try_publish(object_manifest_state(7))).expect("B conflicts") {
         super::PublishOutcome::Conflict { current } => {
             assert_eq!(current.wal_replay_floor(), crate::types::Sequence::new(5));
+        }
+        super::PublishOutcome::PublishedDurabilityUnknown { .. } => {
+            panic!("object-store CAS does not use filesystem directory durability")
         }
         super::PublishOutcome::Published => panic!("B must lose the create race"),
     }
@@ -505,7 +728,7 @@ fn object_store_manifest_rejects_sync_publish() {
     .expect("open");
     // The sync API is unsupported for object storage (it cannot await a CAS).
     let error = manifest
-        .create_bucket("alpha".to_owned(), BucketOptions::default())
+        .create_bucket("alpha", BucketOptions::default())
         .expect_err("sync create must be rejected");
     assert!(
         error.to_string().contains("async API"),

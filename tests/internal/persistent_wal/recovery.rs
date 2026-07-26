@@ -672,6 +672,9 @@ fn persistent_recovery_cleans_manifest_pending_blob_deletion() {
     let mut manifest_store =
         manifest::ManifestStore::open_or_create(manifest::manifest_path(&path), false)
             .expect("manifest opens");
+    let _reserved = manifest_store
+        .reserve_file_ids(999)
+        .expect("advance durable file-id high-water mark");
     manifest_store
         .replace_tables_batch_and_mark_blob_deletions(Vec::new(), vec![999], Sequence::new(7))
         .expect("pending blob deletion is published");

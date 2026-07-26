@@ -18,7 +18,7 @@ use crate::storage::{
 
 use super::{
     CONTENT_CONTROL_BUCKET, CONTENT_LEASE_BUCKET, CONTENT_PHYSICAL_HOLD_BUCKET,
-    CONTENT_TOKEN_INDEX_BUCKET, ContentAccessBarrierRecord, ContentLeaseRecord,
+    CONTENT_TOKEN_INDEX_BUCKET, ContentAccessBarrierRecord, ContentLeaseRecord, UploadSessionState,
     content_control_key, content_lease_key, content_physical_hold_key, content_quarantine_key,
     content_reader_drain_attestation_key, content_reclaim_grace_key, content_reclaim_sweep_key,
     content_token_index_key,
@@ -34,10 +34,10 @@ use crate::{
     ContentReclaimClockEvidenceDigest, ContentReclaimGraceStage, ContentReclaimIntentStage,
     ContentReclaimProofToken, ContentReclaimSweepStage, ContentReclamationMode,
     ContentUploadOptions, ContentUploadResume, ContentUploadState, Db, DbOptions, ETag, Error,
-    HostStorageBackend, InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectMeta,
-    ObjectStoreReclamationAttestation, ObjectStoreReclamationEvidenceDigest, ObjectVersion,
-    OwnerScopeId, Precondition, PutIf, ReadVersion, SealedContent, StorageDomainId, StorageMode,
-    TransactionOptions, UploadId, UploadToken, qualify_object_store_reclamation,
+    HostStorageBackend, InMemoryObjectStore, ObjectClient, ObjectFuture, ObjectListPage,
+    ObjectMeta, ObjectStoreReclamationAttestation, ObjectStoreReclamationEvidenceDigest,
+    ObjectVersion, OwnerScopeId, Precondition, PutIf, ReadVersion, SealedContent, StorageDomainId,
+    StorageMode, TransactionOptions, UploadId, UploadToken, qualify_object_store_reclamation,
 };
 
 const TEST_CHUNK_BYTES: usize = 64 * 1024;
@@ -196,6 +196,7 @@ fn caller_supplied_upload_id_binds_options_and_recovers_exact_state() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // one end-to-end lifecycle assertion is clearer than split setup
 fn upload_maintenance_reclaims_orphans_and_prunes_only_sealed_idempotency_state() {
     block_on(async {
         let db = Db::open(DbOptions::memory()).await.expect("open database");
@@ -254,6 +255,14 @@ fn upload_maintenance_reclaims_orphans_and_prunes_only_sealed_idempotency_state(
             db.resume_content_upload(abandoned_id).await,
             Err(Error::ContentUploadNotFound { .. })
         ));
+        assert!(matches!(
+            db.begin_content_upload_with_id(
+                abandoned_id,
+                test_upload_options().with_expected_length(1)
+            )
+            .await,
+            Err(Error::ContentUploadNotFound { .. })
+        ));
 
         let sealed_id = UploadId::new().expect("sealed upload identity");
         let ContentUploadResume::Open(mut upload) = db
@@ -272,7 +281,15 @@ fn upload_maintenance_reclaims_orphans_and_prunes_only_sealed_idempotency_state(
         assert_eq!(pruned.pruned_sealed(), 1);
         assert!(matches!(
             db.resume_content_upload(sealed_id).await,
-            Err(Error::ContentUploadNotFound { .. })
+            Err(Error::ContentUploadSealed { .. })
+        ));
+        assert!(matches!(
+            db.begin_content_upload_with_id(
+                sealed_id,
+                test_upload_options().with_expected_length(4)
+            )
+            .await,
+            Err(Error::ContentUploadSealed { .. })
         ));
         let content = db
             .open_content(domain, sealed.content_id())
@@ -285,6 +302,148 @@ fn upload_maintenance_reclaims_orphans_and_prunes_only_sealed_idempotency_state(
                 .expect("content reads")
                 .as_ref(),
             b"xyz"
+        );
+    });
+}
+
+#[test]
+fn upload_maintenance_revisits_tombstones_to_remove_late_visible_chunks() {
+    block_on(async {
+        let db = Db::open(DbOptions::memory()).await.expect("open database");
+
+        let aborted_id = UploadId::new().expect("aborted upload identity");
+        let ContentUploadResume::Open(upload) = db
+            .begin_content_upload_with_id(aborted_id, test_upload_options())
+            .await
+            .expect("aborted upload begins")
+        else {
+            panic!("new upload is open");
+        };
+        upload.abort().await.expect("upload aborts");
+        db.write_content_partial_chunk(aborted_id, 0, 99, Arc::from(b"late".as_slice()))
+            .await
+            .expect("plant late-visible aborted chunk");
+
+        db.reap_inactive_content_uploads(u64::MAX)
+            .await
+            .expect("aborted tombstone cleanup");
+        assert!(
+            db.read_content_partial_chunk(aborted_id, 0, 99)
+                .await
+                .expect("read aborted orphan")
+                .is_none()
+        );
+
+        let sealed_id = UploadId::new().expect("sealed upload identity");
+        let domain = test_scope().storage_domain_id();
+        let ContentUploadResume::Open(mut upload) = db
+            .begin_content_upload_with_id(sealed_id, test_upload_options().with_expected_length(3))
+            .await
+            .expect("sealed upload begins")
+        else {
+            panic!("new upload is open");
+        };
+        upload.write(b"xyz").await.expect("sealed bytes write");
+        let sealed = upload.seal().await.expect("upload seals");
+        db.prune_sealed_content_uploads(u64::MAX)
+            .await
+            .expect("sealed state retires");
+        db.write_content_partial_chunk(sealed_id, 0, 100, Arc::from(b"late".as_slice()))
+            .await
+            .expect("plant late-visible sealed partial");
+
+        db.prune_sealed_content_uploads(u64::MAX)
+            .await
+            .expect("sealed tombstone cleanup");
+        assert!(
+            db.read_content_partial_chunk(sealed_id, 0, 100)
+                .await
+                .expect("read sealed orphan")
+                .is_none()
+        );
+        let content = db
+            .open_content(domain, sealed.content_id())
+            .await
+            .expect("canonical sealed content survives");
+        assert_eq!(
+            content
+                .read_range(0, 3)
+                .await
+                .expect("content reads")
+                .as_ref(),
+            b"xyz"
+        );
+    });
+}
+
+#[test]
+fn object_store_upload_state_rejects_a_stale_revision_transition() {
+    block_on(async {
+        let client = Arc::new(InMemoryObjectStore::new());
+        let db = Db::open_object_store(client, DbOptions::object_store())
+            .await
+            .expect("open object store");
+        let upload_id = UploadId::new().expect("upload identity");
+        let ContentUploadResume::Open(mut upload) = db
+            .begin_content_upload_with_id(upload_id, test_upload_options().with_expected_length(1))
+            .await
+            .expect("begin upload")
+        else {
+            panic!("new upload is open");
+        };
+        let stale: UploadSessionState = db
+            .require_upload_state(upload_id)
+            .await
+            .expect("read initial state");
+        upload.write(b"x").await.expect("advance durable revision");
+
+        let stale_transition = stale.into_aborting().expect("build stale transition");
+        assert!(matches!(
+            db.write_upload_state(&stale_transition).await,
+            Err(Error::ContentUploadConflict { .. })
+        ));
+        assert_eq!(
+            db.require_upload_state(upload_id)
+                .await
+                .expect("current state remains")
+                .revision(),
+            1
+        );
+    });
+}
+
+#[test]
+fn object_store_upload_can_durably_extend_the_same_partial_chunk() {
+    block_on(async {
+        let client = Arc::new(InMemoryObjectStore::new());
+        let db = Db::open_object_store(client, DbOptions::object_store())
+            .await
+            .expect("open object store");
+        let mut upload = db
+            .begin_content_upload(test_upload_options().with_expected_length(2))
+            .await
+            .expect("begin upload");
+
+        upload
+            .write(b"a")
+            .await
+            .expect("write first partial prefix");
+        upload
+            .write(b"b")
+            .await
+            .expect("extend the same staging chunk");
+        let sealed = upload.seal().await.expect("seal extended upload");
+        let content = db
+            .open_content(sealed.storage_domain_id(), sealed.content_id())
+            .await
+            .expect("open sealed content");
+        assert_eq!(
+            content
+                .read_range(0, 2)
+                .await
+                .expect("read content")
+                .as_ref(),
+            b"ab"
         );
     });
 }
@@ -3856,6 +4015,7 @@ fn native_content_exceeds_ordinary_value_limit_and_reopens() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // one end-to-end request-count and failure-ordering scenario
 fn object_store_counts_requests_detects_tampering_and_hides_failed_seal() {
     block_on(async {
         let client = Arc::new(MeasuredClient::new());
@@ -3874,12 +4034,12 @@ fn object_store_counts_requests_detects_tampering_and_hides_failed_seal() {
         let sealed = upload.seal().await.expect("object upload seals");
         let after_seal = client.counts();
         assert_eq!(
-            after_seal.put, 8,
-            "content state, chunks, descriptor, and upload state use ordinary immutable writes"
+            after_seal.put, 0,
+            "published upload objects are create-only"
         );
         assert_eq!(
-            after_seal.put_if, 12,
-            "six database commits each create one immutable WAL segment and CAS the durable head"
+            after_seal.put_if, 41,
+            "database commits, object-mutation lease fences, chunks, and descriptors use conditional writes"
         );
 
         let handle = db
@@ -3902,7 +4062,11 @@ fn object_store_counts_requests_detects_tampering_and_hides_failed_seal() {
         let after_range = client.counts();
         assert_eq!(after_range.head - after_open.head, 2);
         assert_eq!(after_range.get_range - after_open.get_range, 2);
-        assert_eq!(after_range.get, 0, "content reads avoid whole-object GET");
+        assert_eq!(
+            after_range.get - after_open.get,
+            0,
+            "content reads avoid whole-object GET"
+        );
 
         let chunk = client
             .inner
@@ -3954,6 +4118,7 @@ fn object_store_counts_requests_detects_tampering_and_hides_failed_seal() {
             .write(b"not published")
             .await
             .expect("failed upload chunk buffers");
+        let failed_upload_id = failed_upload.upload_id();
         assert!(failed_upload.seal().await.is_err());
         assert!(matches!(
             failed_db
@@ -3961,12 +4126,28 @@ fn object_store_counts_requests_detects_tampering_and_hides_failed_seal() {
                 .await,
             Err(Error::ContentNotFound { .. })
         ));
+        assert!(matches!(
+            failed_db.abort_content_upload(failed_upload_id).await,
+            Err(Error::ContentUploadSealed { .. })
+        ));
+        failed_client
+            .fail_descriptors
+            .store(false, Ordering::Release);
+        let repaired = failed_db
+            .seal_content_upload(failed_upload_id)
+            .await
+            .expect("sealing marker publishes missing descriptor on retry");
+        assert_eq!(repaired.content_id(), expected);
+        failed_db
+            .open_content(test_scope().storage_domain_id(), expected)
+            .await
+            .expect("retried descriptor opens");
         drop(failed_db);
     });
 }
 
 #[test]
-fn seal_retry_repairs_descriptor_session_crash_window() {
+fn sealing_state_failure_keeps_descriptor_hidden_and_retry_completes() {
     block_on(async {
         let client = Arc::new(MeasuredClient::new());
         let db = Db::open_object_store_at(
@@ -3989,9 +4170,11 @@ fn seal_retry_repairs_descriptor_session_crash_window() {
             .fail_sealing_upload_states
             .store(true, Ordering::Release);
         assert!(upload.seal().await.is_err());
-        db.open_content(test_scope().storage_domain_id(), content_id)
-            .await
-            .expect("published descriptor is visible");
+        assert!(matches!(
+            db.open_content(test_scope().storage_domain_id(), content_id)
+                .await,
+            Err(Error::ContentNotFound { .. })
+        ));
 
         client
             .fail_sealing_upload_states
@@ -4102,7 +4285,7 @@ fn resume_ignores_chunk_bytes_not_confirmed_by_session_revision() {
         resumed
             .write(&bytes)
             .await
-            .expect("unconfirmed chunks are overwritten");
+            .expect("identical immutable chunk retries are idempotent");
         let sealed = resumed.seal().await.expect("retried upload seals");
         assert_eq!(sealed.content_id(), ContentId::for_bytes(&bytes));
         db.open_content(test_scope().storage_domain_id(), sealed.content_id())
@@ -4187,9 +4370,15 @@ impl ObjectClient for MeasuredClient {
         self.inner.get(key)
     }
 
-    fn get_range<'op>(&'op self, key: &str, offset: u64, len: u64) -> ObjectFuture<'op, Arc<[u8]>> {
+    fn get_range<'op>(
+        &'op self,
+        key: &str,
+        offset: u64,
+        len: u64,
+        expected_etag: &ETag,
+    ) -> ObjectFuture<'op, Arc<[u8]>> {
         self.get_range.fetch_add(1, Ordering::Relaxed);
-        self.inner.get_range(key, offset, len)
+        self.inner.get_range(key, offset, len, expected_etag)
     }
 
     fn put<'op>(&'op self, key: &str, bytes: Arc<[u8]>) -> ObjectFuture<'op, ETag> {
@@ -4259,6 +4448,15 @@ impl ObjectClient for MeasuredClient {
         self.inner.list(prefix)
     }
 
+    fn list_page<'op>(
+        &'op self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> ObjectFuture<'op, ObjectListPage> {
+        self.inner.list_page(prefix, after, limit)
+    }
+
     fn head<'op>(&'op self, key: &str) -> ObjectFuture<'op, Option<ObjectMeta>> {
         self.head.fetch_add(1, Ordering::Relaxed);
         let key = key.to_owned();
@@ -4281,6 +4479,43 @@ impl ObjectClient for MeasuredClient {
         precondition: Precondition,
     ) -> ObjectFuture<'op, PutIf> {
         self.put_if.fetch_add(1, Ordering::Relaxed);
+        if self.fail_descriptors.load(Ordering::Acquire) && key.contains("/descriptors/") {
+            return Box::pin(async move {
+                Err(Error::Io(io::Error::other(
+                    "injected content descriptor publish failure",
+                )))
+            });
+        }
+        if self.fail_sealing_upload_states.load(Ordering::Acquire)
+            && key.contains("/uploads/")
+            && bytes.get(8) == Some(&1)
+        {
+            return Box::pin(async move {
+                Err(Error::Io(io::Error::other(
+                    "injected sealing upload state failure",
+                )))
+            });
+        }
+        if self.fail_sealed_upload_states.load(Ordering::Acquire)
+            && key.contains("/uploads/")
+            && bytes.get(8) == Some(&2)
+        {
+            return Box::pin(async move {
+                Err(Error::Io(io::Error::other(
+                    "injected sealed upload state failure",
+                )))
+            });
+        }
+        if self.fail_open_upload_states.load(Ordering::Acquire)
+            && key.contains("/uploads/")
+            && bytes.get(8) == Some(&0)
+        {
+            return Box::pin(async move {
+                Err(Error::Io(io::Error::other(
+                    "injected open upload state failure",
+                )))
+            });
+        }
         self.inner.put_if(key, bytes, precondition)
     }
 }

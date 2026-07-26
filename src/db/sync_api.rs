@@ -8,9 +8,8 @@ use super::open_helpers::{
     ensure_default_bucket_in_manifest_async, ensure_default_bucket_loaded,
     is_level_layout_compaction_error, list_persistent_directory_files,
     list_persistent_directory_files_async, lock_poisoned, object_store_committed_wal_batches,
-    persistent_path_from_options, referenced_blob_file_ids_from_manifest,
-    referenced_table_file_ids, remove_storage_files, remove_storage_files_async,
-    repair_safe_temporary_files_for_open,
+    persistent_path_from_options, referenced_blob_file_ids_from_manifest, remove_storage_files,
+    remove_storage_files_async, repair_safe_temporary_files_for_open,
     repair_safe_temporary_files_for_open_from_directory_files_async,
     require_internal_checkpoint_name, run_persistent_recovery_checks,
     run_persistent_recovery_checks_from_directory_files_async,
@@ -39,10 +38,9 @@ use super::{
     ObjectStoreBackend, ObjectStoreSubstrate, ObjectWriterLease, Ordering, Path, PathBuf,
     PendingCompactionOutputs, PersistentOpenParts, PointValue, PublishBarrier, ReadVersion, Result,
     Runtime, RwLock, ScanSelector, ScanSourceInput, ScanWasteMetrics, Sequence, Snapshot,
-    SnapshotTracker, StorageMode, StorageObjectDeleteBackend, StorageObjectId, StorageObjectKind,
-    Table, Transaction, TransactionOptions, Value, ValueRef, WalFrontDoor, WriteOptions,
-    WritePressure, blob, cache, manifest, recovery, runtime, shutdown_background_workers, table,
-    verify_object_client_contract_for_open, wal,
+    SnapshotTracker, StorageMode, StorageObjectKind, Table, Transaction, TransactionOptions, Value,
+    ValueRef, WalFrontDoor, WriteOptions, WritePressure, blob, cache, manifest, recovery, runtime,
+    shutdown_background_workers, table, verify_object_client_contract_for_open, wal,
 };
 
 mod blob_cleanup;

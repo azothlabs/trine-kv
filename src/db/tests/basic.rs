@@ -1,7 +1,58 @@
 use super::*;
+
+#[test]
+fn snapshot_is_rejected_by_a_different_database_lineage() {
+    let first = Db::open_sync(DbOptions::memory()).expect("open first db");
+    let second = Db::open_sync(DbOptions::memory()).expect("open second db");
+    first.put_sync(b"key", b"first").expect("write first db");
+    second.put_sync(b"key", b"second").expect("write second db");
+    let foreign = first.snapshot();
+
+    assert!(matches!(
+        second.get_at_sync(&foreign, b"key"),
+        Err(Error::SnapshotDatabaseMismatch)
+    ));
+    let bucket = second.default_bucket_sync().expect("default bucket");
+    assert!(matches!(
+        bucket.range_at_sync(&foreign, &KeyRange::all()),
+        Err(Error::SnapshotDatabaseMismatch)
+    ));
+}
 use crate::{TransactionOptions, WriteBatch};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
+
+#[test]
+fn open_rejects_configuration_that_storage_formats_cannot_encode() {
+    assert!(matches!(
+        Db::open_sync(
+            DbOptions::memory().with_max_key_bytes(
+                DbOptions::MAX_KEY_BYTES
+                    .checked_add(1)
+                    .expect("test key bound increments"),
+            )
+        ),
+        Err(Error::InvalidOptions { .. })
+    ));
+    assert!(matches!(
+        Db::open_sync(
+            DbOptions::memory().with_max_value_bytes(
+                DbOptions::MAX_WRITE_FIELD_BYTES
+                    .checked_add(1)
+                    .expect("test value bound increments"),
+            )
+        ),
+        Err(Error::InvalidOptions { .. })
+    ));
+    let oversized_block = BucketOptions {
+        block_bytes: crate::limits::MAX_DECODED_BLOCK_BYTES + 1,
+        ..BucketOptions::default()
+    };
+    assert!(matches!(
+        Db::open_sync(DbOptions::memory().with_default_bucket_options(oversized_block)),
+        Err(Error::InvalidOptions { .. })
+    ));
+}
 
 #[test]
 fn public_bucket_apis_reject_the_internal_namespace() {
@@ -46,6 +97,36 @@ fn public_bucket_apis_reject_the_internal_namespace() {
         branch.put(reserved.as_str(), b"k", b"v".to_vec()),
         Err(Error::InvalidOptions { .. })
     ));
+}
+
+#[test]
+fn dropped_bucket_handle_cannot_cross_into_recreated_generation() {
+    let db = Db::open_sync(DbOptions::memory()).expect("open db");
+    let stale = db.bucket_sync("scratch").expect("create first generation");
+    stale
+        .put_sync(b"old", b"value")
+        .expect("write first generation");
+    db.drop_bucket_sync("scratch")
+        .expect("drop first generation");
+    let current = db.bucket_sync("scratch").expect("create second generation");
+    current
+        .put_sync(b"new", b"value")
+        .expect("write second generation");
+
+    assert!(matches!(
+        stale.get_sync(b"new"),
+        Err(Error::BucketStale { .. })
+    ));
+    assert!(matches!(
+        stale.put_sync(b"cross-generation", b"blocked"),
+        Err(Error::BucketStale { .. })
+    ));
+    assert_eq!(
+        current
+            .get_sync(b"cross-generation")
+            .expect("read current generation"),
+        None
+    );
 }
 
 #[test]
@@ -95,6 +176,19 @@ fn object_store_prefix_isolates_databases_in_one_bucket() {
         b.get_sync(b"k").expect("get b").as_deref(),
         Some(b"from-b".as_slice())
     );
+}
+
+#[test]
+fn object_store_prefix_must_fit_every_durable_lease_record() {
+    let client = Arc::new(crate::InMemoryObjectStore::new());
+    let prefix = "x".repeat(70 * 1024);
+    let error = block_on_test_future(Db::open_object_store_at(
+        client,
+        prefix,
+        DbOptions::object_store(),
+    ))
+    .expect_err("oversized prefix must fail before writing a lease");
+    assert!(matches!(error, Error::InvalidOptions { .. }));
 }
 
 #[test]
@@ -670,6 +764,43 @@ fn object_store_refresh_updates_existing_named_bucket_handles() {
 }
 
 #[test]
+fn object_store_refresh_rejects_handle_from_dropped_bucket_generation() {
+    use crate::object_store::{InMemoryObjectStore, ObjectClient};
+
+    let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
+    let writer = block_on_test_future(Db::open_object_store(
+        Arc::clone(&client),
+        DbOptions::object_store(),
+    ))
+    .expect("open writer");
+    let first = block_on_test_future(writer.bucket("scratch")).expect("create first generation");
+    first
+        .put_sync(b"old", b"value")
+        .expect("write first generation");
+    block_on_test_future(writer.flush()).expect("flush first generation");
+
+    let reader = block_on_test_future(Db::open_object_store(
+        Arc::clone(&client),
+        DbOptions::object_store().read_only(),
+    ))
+    .expect("open reader");
+    let retained = block_on_test_future(reader.bucket("scratch")).expect("retain first generation");
+
+    block_on_test_future(writer.drop_bucket("scratch")).expect("drop first generation");
+    let second = block_on_test_future(writer.bucket("scratch")).expect("create second generation");
+    second
+        .put_sync(b"new", b"value")
+        .expect("write second generation");
+    block_on_test_future(writer.flush()).expect("flush second generation");
+    block_on_test_future(reader.refresh_object_store()).expect("refresh reader");
+
+    assert!(matches!(
+        block_on_test_future(retained.get(b"new")),
+        Err(Error::BucketStale { .. })
+    ));
+}
+
+#[test]
 fn object_store_refresh_requires_read_only_object_store_handle() {
     use crate::object_store::{InMemoryObjectStore, ObjectClient};
 
@@ -689,7 +820,7 @@ fn object_store_refresh_requires_read_only_object_store_handle() {
 }
 
 #[test]
-fn object_store_orphan_objects_are_collected() {
+fn object_store_orphans_are_retained_without_reader_retirement_proof() {
     use crate::object_store::{InMemoryObjectStore, ObjectClient};
 
     let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
@@ -716,15 +847,15 @@ fn object_store_orphan_objects_are_collected() {
     );
 
     let deleted = block_on_test_future(db.cleanup_object_store_orphans_async()).expect("gc");
-    assert_eq!(deleted, 1, "only the unreferenced orphan object is removed");
+    assert_eq!(deleted, 0, "unsafe remote reclamation remains disabled");
     assert!(
         block_on_test_future(client.head(&orphan_key))
             .unwrap()
-            .is_none(),
-        "orphan object removed"
+            .is_some(),
+        "orphan is retained while remote reader lifetime is unknowable"
     );
 
-    // The referenced table object survived GC: reopen and read it back.
+    // The referenced table object survives: reopen and read it back.
     drop(db);
     let db = block_on_test_future(Db::open_object_store(client, DbOptions::object_store()))
         .expect("reopen");
@@ -735,7 +866,7 @@ fn object_store_orphan_objects_are_collected() {
 }
 
 #[test]
-fn drop_bucket_reclaims_objects_on_object_store() {
+fn drop_bucket_is_logical_and_retains_remote_objects_safely() {
     use crate::object_store::{InMemoryObjectStore, ObjectClient};
 
     let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
@@ -756,12 +887,12 @@ fn drop_bucket_reclaims_objects_on_object_store() {
 
     block_on_test_future(db.drop_bucket("scratch")).expect("drop scratch");
 
-    // drop_bucket already reclaimed scratch's now-orphaned objects, so a
-    // follow-up orphan GC finds nothing.
+    // Logical deletion is immediate, while physical immutable objects remain
+    // until a durable reader-retirement protocol can prove deletion safe.
     assert_eq!(
         block_on_test_future(db.cleanup_object_store_orphans_async()).expect("gc"),
         0,
-        "drop_bucket collected the dropped bucket's objects"
+        "remote reclamation is intentionally conservative"
     );
 
     // scratch reopens empty; keep survives, including across a reopen.
@@ -795,7 +926,7 @@ fn drop_bucket_reclaims_objects_on_object_store() {
 }
 
 #[test]
-fn object_store_compaction_merges_tables_and_reclaims_objects() {
+fn object_store_compaction_merges_tables_and_retains_old_objects_safely() {
     use crate::object_store::{InMemoryObjectStore, ObjectClient};
 
     let client: Arc<dyn ObjectClient> = Arc::new(InMemoryObjectStore::new());
@@ -813,7 +944,7 @@ fn object_store_compaction_merges_tables_and_reclaims_objects() {
     db.put_sync(b"a", b"1b").expect("overwrite a");
     block_on_test_future(db.flush()).expect("flush 3");
 
-    // Compact, then reclaim the now-obsolete input table objects.
+    // Compact; obsolete immutable inputs remain safe for older readers.
     block_on_test_future(db.compact_range(KeyRange::all())).expect("compact");
     assert_eq!(
         db.get_sync(b"a").expect("get a").as_deref(),
@@ -825,7 +956,7 @@ fn object_store_compaction_merges_tables_and_reclaims_objects() {
         Some(b"2".as_slice())
     );
     block_on_test_future(db.run_maintenance_with_budget(MaintenanceBudget::unbounded()))
-        .expect("maintenance reclaims obsolete objects");
+        .expect("maintenance completes with conservative retention");
 
     // Reopen: the compacted tables are durable and reads are still correct.
     drop(db);

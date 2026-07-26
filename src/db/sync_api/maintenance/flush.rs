@@ -21,10 +21,7 @@ impl Db {
             })
     }
 
-    pub(in crate::db) fn bucket_state_if_exists(
-        &self,
-        bucket: &str,
-    ) -> Result<Option<Arc<LsmTree>>> {
+    pub(crate) fn bucket_state_if_exists(&self, bucket: &str) -> Result<Option<Arc<LsmTree>>> {
         let buckets = self
             .inner
             .buckets
@@ -47,10 +44,13 @@ impl Db {
             // Manifest I/O happens outside the bucket registry lock. Two
             // racing creators are serialized by the manifest lock, and the
             // second identical request becomes a no-op.
-            manifest
+            let result = manifest
                 .lock()
                 .map_err(|_| lock_poisoned("manifest store"))?
-                .create_bucket(name.to_owned(), options.clone())?;
+                .create_bucket(name, options.clone());
+            result.map_err(|error| {
+                self.close_after_manifest_durability_failure("bucket creation", error)
+            })?;
         }
 
         Ok(())
@@ -59,6 +59,7 @@ impl Db {
     pub(in crate::db) fn resolve_batch_buckets(
         &self,
         operations: &[BatchOperation],
+        expected_bucket: Option<&crate::db::commit::ExpectedBucketState>,
     ) -> Result<Vec<Arc<LsmTree>>> {
         let buckets = self
             .inner
@@ -66,6 +67,22 @@ impl Db {
             .read()
             .map_err(|_| lock_poisoned("bucket registry"))?;
         let mut states = Vec::with_capacity(operations.len());
+
+        if let Some(expected) = expected_bucket {
+            let current = buckets.get(&expected.name);
+            let same_generation = current.is_some_and(|current| {
+                if expected.state.generation == 0 {
+                    Arc::ptr_eq(current, &expected.state)
+                } else {
+                    current.generation == expected.state.generation
+                }
+            });
+            if !same_generation {
+                return Err(Error::BucketStale {
+                    name: expected.name.clone(),
+                });
+            }
+        }
 
         for operation in operations {
             let state =
@@ -365,21 +382,18 @@ impl Db {
         if flush_inputs.is_empty() {
             return Ok(false);
         }
-        let flush_sequence = flush_inputs
-            .iter()
-            .map(|input| input.input.freeze_sequence)
-            .max()
-            .expect("non-empty flush input list has a max sequence");
+        let mut file_ids = self.reserve_file_ids(flush_inputs.len())?;
 
         let mut written_tables = Vec::with_capacity(flush_inputs.len());
         let mut written_table_ids = Vec::with_capacity(flush_inputs.len());
         for input in flush_inputs {
-            let table_path = table::table_path(db_path, input.input.table_id);
-            written_table_ids.push(input.input.table_id);
+            let table_id = file_ids.next_table_id()?;
+            let table_path = table::table_path(db_path, table_id);
+            written_table_ids.push(table_id);
             let table = match table::write_table_with_backend_with_durability(
                 &self.inner.native_storage,
                 &table_path,
-                input.input.table_id,
+                table_id,
                 input.input.table_level,
                 &input.input.table_options,
                 &input.input.point_records,
@@ -405,15 +419,27 @@ impl Db {
         }
 
         {
+            let _memtable_publish = self
+                .inner
+                .memtable_publish_lock
+                .lock()
+                .map_err(|_| lock_poisoned("memtable publish lock"))?;
             let _publish = self.inner.publish_barrier.enter()?;
-            if let Err(error) = self.publish_flushed_tables(&written_tables, flush_sequence) {
-                let _ =
-                    remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
+            let replay_floor = self.replay_floor_after_flush(flush_inputs)?;
+            if let Err(error) = self.publish_flushed_tables(&written_tables, replay_floor) {
+                let error = self.close_after_manifest_durability_failure("flush", error);
+                if !self.closed_after_durable_publish_error() {
+                    let _ = remove_storage_files(
+                        &self.inner.native_storage,
+                        db_path,
+                        &written_table_ids,
+                    );
+                }
                 return Err(error);
             }
             Self::install_flushed_tables(flush_inputs, written_tables)
                 .map_err(|error| self.close_after_durable_publish_error("flush", &error))?;
-            self.rewrite_wal_after_replay_floor(flush_sequence)?;
+            self.rewrite_wal_after_replay_floor(replay_floor)?;
         }
         self.l0_pressure_exceeded()
     }
@@ -462,12 +488,8 @@ impl Db {
         if flush_inputs.is_empty() {
             return Ok(false);
         }
+        let mut file_ids = self.reserve_file_ids_host_async(flush_inputs.len()).await?;
 
-        let flush_sequence = flush_inputs
-            .iter()
-            .map(|input| input.input.freeze_sequence)
-            .max()
-            .expect("non-empty flush input list has a max sequence");
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let storage = self.inner.native_storage.clone();
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -480,12 +502,13 @@ impl Db {
         let mut written_table_ids = Vec::with_capacity(flush_inputs.len());
 
         for input in flush_inputs {
-            let table_path = table::table_path(db_path, input.input.table_id);
-            written_table_ids.push(input.input.table_id);
+            let table_id = file_ids.next_table_id()?;
+            let table_path = table::table_path(db_path, table_id);
+            written_table_ids.push(table_id);
             let table = match table::write_table_with_backend_async(
                 &storage,
                 &table_path,
-                input.input.table_id,
+                table_id,
                 input.input.table_level,
                 &input.input.table_options,
                 &input.input.point_records,
@@ -519,16 +542,18 @@ impl Db {
                 return Err(error);
             }
         };
+        let replay_floor = self.replay_floor_after_flush_serialized(flush_inputs)?;
 
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let publish_result = self
-            .publish_flushed_tables_native_async(&written_tables, flush_sequence)
+            .publish_flushed_tables_native_async(&written_tables, replay_floor)
             .await;
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         let publish_result = self
-            .publish_flushed_tables_browser_async(&written_tables, flush_sequence)
+            .publish_flushed_tables_browser_async(&written_tables, replay_floor)
             .await;
         if let Err(error) = publish_result {
+            let error = self.close_after_manifest_durability_failure("flush", error);
             if !self.closed_after_durable_publish_error() {
                 let _ = remove_storage_files_async(&storage, db_path, &written_table_ids).await;
             }
@@ -538,12 +563,51 @@ impl Db {
         Self::install_flushed_tables(flush_inputs, written_tables)
             .map_err(|error| self.close_after_durable_publish_error("flush", &error))?;
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        self.rewrite_wal_after_replay_floor_async(flush_sequence)
+        self.rewrite_wal_after_replay_floor_async(replay_floor)
             .await?;
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-        self.rewrite_wal_after_replay_floor_browser_async(db_path, flush_sequence)
+        self.rewrite_wal_after_replay_floor_browser_async(db_path, replay_floor)
             .await?;
         self.l0_pressure_exceeded()
+    }
+
+    pub(in crate::db) fn replay_floor_after_flush_serialized(
+        &self,
+        flush_inputs: &[NamedFlushInput],
+    ) -> Result<Sequence> {
+        let _memtable_publish = self
+            .inner
+            .memtable_publish_lock
+            .lock()
+            .map_err(|_| lock_poisoned("memtable publish lock"))?;
+        self.replay_floor_after_flush(flush_inputs)
+    }
+
+    fn replay_floor_after_flush(&self, flush_inputs: &[NamedFlushInput]) -> Result<Sequence> {
+        let buckets = self
+            .inner
+            .buckets
+            .read()
+            .map_err(|_| lock_poisoned("bucket registry"))?;
+        let mut oldest_unflushed = None;
+
+        for state in buckets.values() {
+            let flushed_memtables = flush_inputs
+                .iter()
+                .filter(|input| Arc::ptr_eq(&input.tree, state))
+                .map(|input| Arc::clone(&input.input.memtable))
+                .collect::<Vec<_>>();
+            if let Some(sequence) = state.oldest_unflushed_sequence_excluding(&flushed_memtables)? {
+                oldest_unflushed = Some(
+                    oldest_unflushed.map_or(sequence, |current: Sequence| current.min(sequence)),
+                );
+            }
+        }
+
+        Ok(oldest_unflushed.map_or_else(
+            || self.last_committed_sequence(),
+            |sequence| Sequence::new(sequence.get().saturating_sub(1)),
+        ))
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -556,21 +620,9 @@ impl Db {
             .iter()
             .map(|(bucket, table)| (bucket.clone(), table.properties().clone()))
             .collect::<Vec<_>>();
-        let manifest = self
-            .inner
-            .manifest
-            .as_ref()
-            .ok_or_else(|| Error::Corruption {
-                message: "persistent database is missing manifest store".to_owned(),
-            })?;
-        let prepared = {
-            let manifest = manifest
-                .lock()
-                .map_err(|_| lock_poisoned("manifest store"))?;
-            manifest.prepare_add_tables_publish(edits, flush_sequence)?
-        };
-        prepared.publish_async().await?;
-        self.install_prepared_manifest_after_durable_publish("flush", manifest, prepared)
+        self.edit_host_manifest_async(move |manifest| manifest.add_tables(edits, flush_sequence))
+            .await
+            .map_err(|error| self.close_after_manifest_durability_failure("flush", error))
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -594,25 +646,17 @@ impl Db {
                 )
             })
             .collect::<Vec<_>>();
-        let manifest = self
-            .inner
-            .manifest
-            .as_ref()
-            .ok_or_else(|| Error::Corruption {
-                message: "persistent database is missing manifest store".to_owned(),
-            })?;
-        let prepared = {
-            let manifest = manifest
-                .lock()
-                .map_err(|_| lock_poisoned("manifest store"))?;
-            manifest.prepare_replace_tables_batch_publish(
+        let obsolete_blob_ids = obsolete_blob_ids.to_vec();
+        let pending_deletion_sequence = self.last_committed_sequence();
+        self.edit_host_manifest_async(move |manifest| {
+            manifest.replace_tables_batch_and_mark_blob_deletions(
                 edits,
-                obsolete_blob_ids.to_vec(),
-                self.last_committed_sequence(),
-            )?
-        };
-        prepared.publish_async().await?;
-        self.install_prepared_manifest_after_durable_publish("compaction", manifest, prepared)
+                obsolete_blob_ids,
+                pending_deletion_sequence,
+            )
+        })
+        .await
+        .map_err(|error| self.close_after_manifest_durability_failure("compaction", error))
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -639,7 +683,10 @@ impl Db {
                 .map_err(|_| lock_poisoned("manifest store"))?;
             manifest.prepare_add_tables_publish(edits, flush_sequence)?
         };
-        prepared.publish_async().await?;
+        prepared
+            .publish_async()
+            .await
+            .map_err(|error| self.close_after_manifest_durability_failure("flush", error))?;
         self.install_prepared_manifest_after_durable_publish("flush", manifest, prepared)
     }
 
@@ -662,7 +709,6 @@ impl Db {
         budget: MaintenanceBudget,
     ) -> Result<(Vec<NamedFlushInput>, bool)> {
         let max_immutable_memtables = self.inner.options.max_immutable_memtables;
-        let mut next_table_id = self.next_table_id()?;
         let buckets = self
             .inner
             .buckets
@@ -676,7 +722,7 @@ impl Db {
             if state.immutable_memtable_count() < max_immutable_memtables {
                 continue;
             }
-            for input in state.prepare_flush_inputs(&mut next_table_id)? {
+            for input in state.prepare_flush_inputs()? {
                 if inputs.len() >= limit {
                     budget_exhausted = true;
                     break;
@@ -699,7 +745,6 @@ impl Db {
         &self,
         budget: MaintenanceBudget,
     ) -> Result<(Vec<NamedFlushInput>, bool)> {
-        let mut next_table_id = self.next_table_id()?;
         let buckets = self
             .inner
             .buckets
@@ -710,7 +755,7 @@ impl Db {
         let mut budget_exhausted = false;
 
         for (name, state) in buckets.iter() {
-            for input in state.prepare_flush_inputs(&mut next_table_id)? {
+            for input in state.prepare_flush_inputs()? {
                 if inputs.len() >= limit {
                     budget_exhausted = true;
                     break;

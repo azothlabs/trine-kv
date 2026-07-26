@@ -26,6 +26,7 @@ impl Db {
         &self,
         storage_domain_id: StorageDomainId,
     ) -> Result<ContentAccessMode> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         match self
             .read_content_access_barrier_record(storage_domain_id)
@@ -87,6 +88,7 @@ impl Db {
         storage_domain_id: StorageDomainId,
         requested_id: ContentAccessBarrierId,
     ) -> Result<ContentAccessBarrier> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
@@ -216,6 +218,7 @@ impl Db {
         attestation_id: ContentReaderDrainAttestationId,
         options: ContentReaderDrainAttestationOptions,
     ) -> Result<ContentReaderDrainAttestation> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
@@ -313,6 +316,7 @@ impl Db {
         &self,
         storage_domain_id: StorageDomainId,
     ) -> Result<Option<ContentReaderDrainAttestation>> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         if matches!(
             self.content_access_mode(storage_domain_id).await?,
@@ -343,6 +347,7 @@ impl Db {
         storage_domain_id: StorageDomainId,
         content_id: ContentId,
     ) -> Result<Option<ContentQuarantine>> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         let mut transaction = self.transaction(TransactionOptions::default());
         let key = content_quarantine_key(storage_domain_id, content_id);
@@ -373,6 +378,7 @@ impl Db {
         storage_domain_id: StorageDomainId,
         content_id: ContentId,
     ) -> Result<Option<ContentReclaimGrace>> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         let mut transaction = self.transaction(TransactionOptions::default());
         let grace_key = content_reclaim_grace_key(storage_domain_id, content_id);
@@ -410,6 +416,7 @@ impl Db {
         storage_domain_id: StorageDomainId,
         content_id: ContentId,
     ) -> Result<Option<ContentReclaimSweep>> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         let mut transaction = self.transaction(TransactionOptions::default());
         let key = content_reclaim_sweep_key(storage_domain_id, content_id);
@@ -446,6 +453,7 @@ impl Db {
         storage_domain_id: StorageDomainId,
         content_id: ContentId,
     ) -> Result<ContentReclaimSweep> {
+        let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
