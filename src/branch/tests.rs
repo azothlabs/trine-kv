@@ -342,7 +342,9 @@ fn durable_branch_write_commits_data_and_registry_together() {
     drop(db);
 
     let db = Db::open_sync(&dir).expect("reopen after uncertain WAL outcome");
-    let registry = db.read_registry("dev").expect("registry").expect("entry");
+    let registry = futures::executor::block_on(db.read_registry("dev"))
+        .expect("registry")
+        .expect("entry");
     assert!(registry.written_buckets.is_empty());
     assert_eq!(
         db.internal_bucket_sync(data_bucket("dev", "data"))
@@ -381,7 +383,9 @@ fn deleting_marker_hides_branch_and_delete_resumes() {
         .put_sync("data", b"k", b"v".to_vec())
         .expect("branch data");
 
-    let mut entry = db.read_registry("dev").expect("registry").expect("entry");
+    let mut entry = futures::executor::block_on(db.read_registry("dev"))
+        .expect("registry")
+        .expect("entry");
     entry.lifecycle = BranchLifecycle::Deleting;
     let encoded = entry.encode().expect("encode interrupted delete marker");
     db.internal_bucket_sync(registry_bucket())
@@ -398,7 +402,11 @@ fn deleting_marker_hides_branch_and_delete_resumes() {
     db.delete_branch_sync("dev").expect("delete resumes");
     db.delete_branch_sync("dev")
         .expect("completed delete is idempotent");
-    assert!(db.read_registry("dev").expect("registry").is_none());
+    assert!(
+        futures::executor::block_on(db.read_registry("dev"))
+            .expect("registry")
+            .is_none()
+    );
 }
 
 #[test]
@@ -734,8 +742,10 @@ fn branch_info_exposes_fork_and_parent_without_opening_data() {
 fn orphan_fork_checkpoint_is_reconciled_to_the_registry_intent() {
     let db = Db::open_sync(DbOptions::memory().with_keep_last_read_versions(64)).expect("open");
     let old_fork = db.latest_read_version();
-    db.create_internal_checkpoint_at_sync(&fork_checkpoint("dev"), old_fork)
-        .expect("orphan checkpoint creates");
+    futures::executor::block_on(
+        db.create_internal_checkpoint_at(&fork_checkpoint("dev"), old_fork),
+    )
+    .expect("orphan checkpoint creates");
     db.delete_branch_sync("dev")
         .expect("absent branch delete is idempotent");
     assert_eq!(

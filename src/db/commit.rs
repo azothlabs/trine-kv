@@ -15,6 +15,8 @@ use std::{
 ))]
 use std::{pin::Pin, thread};
 
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use crate::db::DatabaseStorageRef;
 use crate::{
     error::{Error, Result},
     lsm::LsmTree,
@@ -744,7 +746,10 @@ impl Db {
         self.inner.substrate.wal_is_present() || {
             #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
             {
-                self.inner.storage.browser_wal().is_some()
+                matches!(
+                    self.inner.storage.resources(),
+                    DatabaseStorageRef::Browser(resources) if resources.wal.is_some()
+                )
             }
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             {
@@ -853,12 +858,13 @@ impl Db {
         operations: &[BatchOperation],
         durability: DurabilityMode,
     ) -> Result<()> {
-        if let Some(wal) = self.inner.storage.browser_wal() {
-            let storage = self.inner.storage.browser_files()?;
+        if let DatabaseStorageRef::Browser(resources) = self.inner.storage.resources()
+            && let Some(wal) = resources.wal
+        {
             let accepted = wal
                 .accept_commit(
-                    &storage,
-                    self.browser_db_path()?,
+                    resources.files,
+                    resources.root,
                     sequence,
                     operations,
                     durability,

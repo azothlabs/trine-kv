@@ -90,7 +90,7 @@ impl Db {
                 &backend,
                 key,
                 read_sequence,
-                self.storage_read_path()?,
+                self.storage_read_path(),
                 Some(self.inner.block_cache.as_ref()),
                 Some(self.inner.blob_reads.as_ref()),
             )
@@ -173,7 +173,7 @@ impl Db {
                 read_sequence,
                 AsyncPointReadIo::new(
                     &backend,
-                    self.storage_read_path()?,
+                    self.storage_read_path(),
                     Some(self.inner.block_cache.as_ref()),
                     Some(self.inner.blob_reads.as_ref()),
                 ),
@@ -207,7 +207,7 @@ impl Db {
                 read_sequence,
                 AsyncPointReadIo::new(
                     &backend,
-                    self.storage_read_path()?,
+                    self.storage_read_path(),
                     Some(self.inner.block_cache.as_ref()),
                     Some(self.inner.blob_reads.as_ref()),
                 ),
@@ -284,7 +284,7 @@ impl Db {
             read_sequence,
             Some(&self.inner.block_cache),
         )?;
-        let db_path = self.storage_read_path()?.map(Path::to_path_buf);
+        let db_path = self.storage_read_path().map(Path::to_path_buf);
         let read_backend = db_path.as_ref().map(|_| self.inner.storage.read_backend());
         Ok(ScanSourceInput {
             read_sequence,
@@ -315,7 +315,7 @@ impl Db {
                 Some(&self.inner.block_cache),
             )
             .await?;
-        let db_path = self.storage_read_path()?.map(Path::to_path_buf);
+        let db_path = self.storage_read_path().map(Path::to_path_buf);
         let read_backend = db_path.as_ref().map(|_| self.inner.storage.read_backend());
         Ok(ScanSourceInput {
             read_sequence,
@@ -483,7 +483,7 @@ impl Db {
             read_sequence,
             Some(&self.inner.block_cache),
         )?;
-        let db_path = self.storage_read_path()?.map(Path::to_path_buf);
+        let db_path = self.storage_read_path().map(Path::to_path_buf);
         let read_backend = db_path.as_ref().map(|_| self.inner.storage.read_backend());
 
         Ok(Iter::from_sources(
@@ -521,7 +521,7 @@ impl Db {
                 Some(&self.inner.block_cache),
             )
             .await?;
-        let db_path = self.storage_read_path()?.map(Path::to_path_buf);
+        let db_path = self.storage_read_path().map(Path::to_path_buf);
         let read_backend = db_path.as_ref().map(|_| self.inner.storage.read_backend());
 
         Ok(Iter::from_sources(
@@ -557,7 +557,7 @@ impl Db {
             read_sequence,
             Some(&self.inner.block_cache),
         )?;
-        let db_path = self.storage_read_path()?.map(Path::to_path_buf);
+        let db_path = self.storage_read_path().map(Path::to_path_buf);
         let read_backend = db_path.as_ref().map(|_| self.inner.storage.read_backend());
 
         Ok(LazyIter::from_sources(
@@ -595,7 +595,7 @@ impl Db {
                 Some(&self.inner.block_cache),
             )
             .await?;
-        let db_path = self.storage_read_path()?.map(Path::to_path_buf);
+        let db_path = self.storage_read_path().map(Path::to_path_buf);
         let read_backend = db_path.as_ref().map(|_| self.inner.storage.read_backend());
 
         Ok(LazyIter::from_sources(
@@ -631,7 +631,7 @@ impl Db {
             read_sequence,
             Some(&self.inner.block_cache),
         )?;
-        let db_path = self.storage_read_path()?.map(Path::to_path_buf);
+        let db_path = self.storage_read_path().map(Path::to_path_buf);
         let read_backend = db_path.as_ref().map(|_| self.inner.storage.read_backend());
 
         Ok(Iter::from_sources(
@@ -669,7 +669,7 @@ impl Db {
                 Some(&self.inner.block_cache),
             )
             .await?;
-        let db_path = self.storage_read_path()?.map(Path::to_path_buf);
+        let db_path = self.storage_read_path().map(Path::to_path_buf);
         let read_backend = db_path.as_ref().map(|_| self.inner.storage.read_backend());
 
         Ok(Iter::from_sources(
@@ -705,7 +705,7 @@ impl Db {
             read_sequence,
             Some(&self.inner.block_cache),
         )?;
-        let db_path = self.storage_read_path()?.map(Path::to_path_buf);
+        let db_path = self.storage_read_path().map(Path::to_path_buf);
         let read_backend = db_path.as_ref().map(|_| self.inner.storage.read_backend());
 
         Ok(LazyIter::from_sources(
@@ -743,7 +743,7 @@ impl Db {
                 Some(&self.inner.block_cache),
             )
             .await?;
-        let db_path = self.storage_read_path()?.map(Path::to_path_buf);
+        let db_path = self.storage_read_path().map(Path::to_path_buf);
         let read_backend = db_path.as_ref().map(|_| self.inner.storage.read_backend());
 
         Ok(LazyIter::from_sources(

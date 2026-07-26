@@ -16,6 +16,19 @@ All public crate releases use Semantic Versioning.
 - Split database opening, platform I/O, browser storage, lease state, content
   transaction extensions, and large test suites into responsibility-named
   modules, with executable architecture-boundary checks.
+- Split branch implementation by registry encoding, owned state, handle I/O,
+  range merge, durable transition, and public API responsibilities. Sync APIs
+  now drive the same async orchestration and range merge instead of maintaining
+  a second lifecycle execution path.
+- Split content transaction extensions by token/activity, reclaim intent,
+  quarantine, grace, sweep, and protected guard responsibilities, with explicit
+  dependency imports for every module.
+- Move storage-independent transaction state into a private responsibility
+  module without adding a separately released crate.
+- Group object-store and browser resources into backend-owned capability
+  bundles, remove wrong-backend runtime accessors, and replace broad
+  source-text and file-tree architecture assertions with compile-checked public
+  contracts.
 
 ## 0.6.0 - 2026-07-25
 

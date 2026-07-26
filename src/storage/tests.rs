@@ -84,6 +84,22 @@ fn temp_storage_root(prefix: &str) -> std::path::PathBuf {
     ))
 }
 
+#[test]
+fn backend_capability_sets_are_checked_by_the_compiler() {
+    fn reads<T: StorageReadBackend>() {}
+    fn appends<T: StorageAppendBackend>() {}
+    fn publishes_manifests<T: StorageManifestPublishBackend>() {}
+    fn writes_objects<T: StorageObjectWriteBackend>() {}
+
+    reads::<MemoryStorageBackend>();
+    writes_objects::<MemoryStorageBackend>();
+
+    reads::<NativeFileBackend>();
+    appends::<NativeFileBackend>();
+    publishes_manifests::<NativeFileBackend>();
+    writes_objects::<NativeFileBackend>();
+}
+
 mod memory_capabilities;
 mod native_mutations;
 mod native_objects;

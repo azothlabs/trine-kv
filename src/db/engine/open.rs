@@ -54,6 +54,25 @@ struct ObjectStoreInnerParts {
     prefix: PathBuf,
 }
 
+#[derive(Debug)]
+struct NativeInnerParts {
+    manifest: ManifestStore,
+    storage: NativeFileBackend,
+    root: PathBuf,
+    wal: Option<WalFrontDoor>,
+    process_lock: Option<recovery::ProcessLock>,
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[derive(Debug)]
+struct BrowserInnerParts {
+    manifest: ManifestStore,
+    storage: BrowserStorageBackend,
+    root: PathBuf,
+    writer_lease: Option<BrowserWriterLease>,
+    wal: Option<BrowserWalFrontDoor>,
+}
+
 impl DbInnerParts {
     fn base(
         options: DbOptions,
@@ -91,18 +110,18 @@ impl DbInnerParts {
     fn native(
         options: DbOptions,
         buckets: BTreeMap<String, Arc<LsmTree>>,
-        manifest: ManifestStore,
-        native_storage: NativeFileBackend,
-        wal: Option<WalFrontDoor>,
-        process_lock: Option<recovery::ProcessLock>,
+        backend: NativeInnerParts,
         runtime: Runtime,
     ) -> Self {
         Self::base(
             options,
             buckets,
-            Some(manifest),
-            DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(wal, process_lock)),
-            DatabaseStorage::filesystem(native_storage),
+            Some(backend.manifest),
+            DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(
+                backend.wal,
+                backend.process_lock,
+            )),
+            DatabaseStorage::filesystem(backend.storage, backend.root),
             runtime,
         )
     }
@@ -128,18 +147,20 @@ impl DbInnerParts {
     fn browser(
         options: DbOptions,
         buckets: BTreeMap<String, Arc<LsmTree>>,
-        manifest: ManifestStore,
-        storage: BrowserStorageBackend,
-        writer_lease: Option<BrowserWriterLease>,
-        wal: Option<BrowserWalFrontDoor>,
+        backend: BrowserInnerParts,
         runtime: Runtime,
     ) -> Self {
         Self::base(
             options,
             buckets,
-            Some(manifest),
+            Some(backend.manifest),
             DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(None, None)),
-            DatabaseStorage::browser(storage, writer_lease, wal),
+            DatabaseStorage::browser(
+                backend.storage,
+                backend.root,
+                backend.writer_lease,
+                backend.wal,
+            ),
             runtime,
         )
     }
@@ -468,10 +489,13 @@ impl Db {
         let db = Self::from_inner_parts(DbInnerParts::browser(
             options,
             buckets,
-            manifest,
-            storage,
-            writer_lease,
-            browser_wal,
+            BrowserInnerParts {
+                manifest,
+                storage,
+                root: db_path,
+                writer_lease,
+                wal: browser_wal,
+            },
             runtime,
         ));
         db.replay_wal_batches(batches, replay_floor)?;
@@ -1076,10 +1100,13 @@ impl Db {
         let db = Self::from_inner_parts(DbInnerParts::native(
             options,
             buckets,
-            manifest,
-            native_storage,
-            wal,
-            process_lock,
+            NativeInnerParts {
+                manifest,
+                storage: native_storage,
+                root: db_path_for_cleanup.clone(),
+                wal,
+                process_lock,
+            },
             runtime,
         ));
         db.replay_wal_batches(batches, replay_floor)?;

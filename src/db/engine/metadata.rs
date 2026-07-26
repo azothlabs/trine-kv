@@ -4,6 +4,7 @@ use super::{
     add_obsolete_blob_stats, lock_poisoned, require_internal_checkpoint_name,
     shutdown_background_workers, table, table_file_bytes, validate_checkpoint_name,
 };
+use crate::db::DatabaseStorageRef;
 
 impl Db {
     pub(crate) fn snapshot_sequence(&self, snapshot: &Snapshot) -> Result<Sequence> {
@@ -118,15 +119,6 @@ impl Db {
     /// latest committed version or older than the retained-history floor.
     pub fn create_checkpoint_at_sync(&self, name: &str, version: ReadVersion) -> Result<()> {
         validate_checkpoint_name(name)?;
-        self.create_checkpoint_at_sync_unchecked(name, version)
-    }
-
-    pub(crate) fn create_internal_checkpoint_at_sync(
-        &self,
-        name: &str,
-        version: ReadVersion,
-    ) -> Result<()> {
-        require_internal_checkpoint_name(name)?;
         self.create_checkpoint_at_sync_unchecked(name, version)
     }
 
@@ -347,14 +339,22 @@ impl Db {
         let cache_stats = self.inner.block_cache.stats();
         stats.block_cache_hits = cache_stats.hits;
         stats.block_cache_misses = cache_stats.misses;
+        self.add_table_stats(&mut stats);
 
-        let persistent_path = self.persistent_path();
+        stats
+    }
+
+    fn add_table_stats(&self, stats: &mut DbStats) {
+        let filesystem = match self.inner.storage.resources() {
+            DatabaseStorageRef::Filesystem(resources) => Some(resources),
+            _ => None,
+        };
         let mut level_stats = BTreeMap::<u32, LevelStats>::new();
         let mut level_filter_stats = BTreeMap::<u32, LevelFilterStats>::new();
         let mut live_blob_bytes_by_file = BTreeMap::<u64, u64>::new();
 
         let Ok(buckets) = self.inner.buckets.read() else {
-            return stats;
+            return;
         };
         stats.live_buckets = buckets.len();
 
@@ -381,12 +381,9 @@ impl Db {
                 });
                 for table in tables {
                     let properties = table.properties();
-                    let table_bytes = match (
-                        persistent_path,
-                        self.inner.storage.filesystem_files_if_present(),
-                    ) {
-                        (Some(db_path), Some(files)) => {
-                            table_file_bytes(files, db_path, properties.id)
+                    let table_bytes = match filesystem {
+                        Some(resources) => {
+                            table_file_bytes(resources.files, resources.root, properties.id)
                         }
                         _ => table.estimated_file_bytes(),
                     };
@@ -433,14 +430,14 @@ impl Db {
         stats.level_filters = level_filter_stats.into_values().collect();
         stats.live_blob_files = live_blob_bytes_by_file.len();
         stats.live_blob_bytes = live_blob_bytes_by_file.values().copied().sum();
-        if let (Some(db_path), Some(files)) = (
-            persistent_path,
-            self.inner.storage.filesystem_files_if_present(),
-        ) {
-            add_obsolete_blob_stats(files, db_path, &live_blob_bytes_by_file, &mut stats);
+        if let Some(resources) = filesystem {
+            add_obsolete_blob_stats(
+                resources.files,
+                resources.root,
+                &live_blob_bytes_by_file,
+                stats,
+            );
         }
-
-        stats
     }
 
     pub(in crate::db) fn base_stats(&self) -> DbStats {
@@ -518,7 +515,9 @@ impl Db {
             stats.wal_bytes_accepted = wal_stats.bytes_accepted;
         }
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-        if let Some(wal) = self.inner.storage.browser_wal() {
+        if let DatabaseStorageRef::Browser(resources) = self.inner.storage.resources()
+            && let Some(wal) = resources.wal
+        {
             let wal_stats = wal.stats();
             stats.wal_shards = wal_stats.shards;
             stats.wal_open_shards = wal_stats.open_shards;
@@ -529,10 +528,10 @@ impl Db {
     }
 
     pub(in crate::db) fn add_storage_runtime_stats(&self, stats: &mut DbStats) {
-        let Some(files) = self.inner.storage.filesystem_files_if_present() else {
+        let DatabaseStorageRef::Filesystem(resources) = self.inner.storage.resources() else {
             return;
         };
-        let storage_stats = files.stats();
+        let storage_stats = resources.files.stats();
         stats.storage_uses_sync_adapter = storage_stats.uses_blocking_adapter;
         stats.storage_uses_platform_io_driver = storage_stats.uses_platform_io_driver;
         stats.storage_uses_platform_async_io = storage_stats.uses_platform_async_io;

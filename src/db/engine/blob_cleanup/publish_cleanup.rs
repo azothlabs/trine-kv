@@ -8,6 +8,7 @@ use super::{
     deletable_pending_blob_file_ids, delete_pending_obsolete_blob_files, lock_poisoned, table,
     take_deletable_obsolete_tables, usize_to_u64_saturating,
 };
+use crate::db::DatabaseStorageRef;
 use crate::manifest::FileIdReservation;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::manifest::PreparedManifestPublish;
@@ -390,8 +391,13 @@ impl Db {
     }
 
     pub(in crate::db) fn cleanup_pending_obsolete_blob_files(&self, db_path: &Path) -> Result<()> {
+        let DatabaseStorageRef::Filesystem(resources) = self.inner.storage.resources() else {
+            return Err(Error::unsupported_backend(
+                "obsolete blob cleanup requires filesystem storage",
+            ));
+        };
         cleanup_pending_obsolete_blob_files(
-            self.inner.storage.filesystem_files()?,
+            resources.files,
             Some(db_path),
             &self.inner.snapshots,
             self.inner.manifest.as_ref(),
@@ -399,8 +405,13 @@ impl Db {
     }
 
     pub(in crate::db) fn delete_pending_obsolete_blob_files(&self, db_path: &Path) -> Result<()> {
+        let DatabaseStorageRef::Filesystem(resources) = self.inner.storage.resources() else {
+            return Err(Error::unsupported_backend(
+                "obsolete blob deletion requires filesystem storage",
+            ));
+        };
         let _ = delete_pending_obsolete_blob_files(
-            self.inner.storage.filesystem_files()?,
+            resources.files,
             Some(db_path),
             &self.inner.snapshots,
             self.inner.manifest.as_ref(),
@@ -464,7 +475,14 @@ impl Db {
             return Ok((manifest, Vec::new()));
         }
 
-        let storage = self.inner.storage.filesystem_files_cloned()?;
+        let storage = match self.inner.storage.resources() {
+            DatabaseStorageRef::Filesystem(resources) => resources.files.clone(),
+            _ => {
+                return Err(Error::unsupported_backend(
+                    "native blob deletion requires filesystem storage",
+                ));
+            }
+        };
         for file_id in &pending_file_ids {
             delete_storage_object_async(
                 &storage,
@@ -543,7 +561,14 @@ impl Db {
             return Ok((manifest, Vec::new()));
         }
 
-        let storage = self.browser_storage()?;
+        let storage = match self.inner.storage.resources() {
+            DatabaseStorageRef::Browser(resources) => resources.files.clone(),
+            _ => {
+                return Err(Error::unsupported_backend(
+                    "browser blob deletion requires browser storage",
+                ));
+            }
+        };
         for file_id in &pending_file_ids {
             storage
                 .delete_object(StorageObjectId::native_file(
@@ -667,8 +692,13 @@ impl Db {
     }
 
     pub(in crate::db) fn cleanup_pending_obsolete_table_files(&self, db_path: &Path) -> Result<()> {
+        let DatabaseStorageRef::Filesystem(resources) = self.inner.storage.resources() else {
+            return Err(Error::unsupported_backend(
+                "obsolete table cleanup requires filesystem storage",
+            ));
+        };
         cleanup_pending_obsolete_table_files(
-            self.inner.storage.filesystem_files()?,
+            resources.files,
             Some(db_path),
             &self.inner.pending_obsolete_tables,
         )
@@ -684,7 +714,14 @@ impl Db {
             return Ok(());
         }
 
-        let storage = self.inner.storage.filesystem_files_cloned()?;
+        let storage = match self.inner.storage.resources() {
+            DatabaseStorageRef::Filesystem(resources) => resources.files.clone(),
+            _ => {
+                return Err(Error::unsupported_backend(
+                    "native table cleanup requires filesystem storage",
+                ));
+            }
+        };
         let mut result = Ok(());
         let mut remaining = Vec::new();
         for table in deletable {
@@ -720,7 +757,14 @@ impl Db {
             return Ok(());
         }
 
-        let storage = self.browser_storage()?;
+        let storage = match self.inner.storage.resources() {
+            DatabaseStorageRef::Browser(resources) => resources.files.clone(),
+            _ => {
+                return Err(Error::unsupported_backend(
+                    "browser table cleanup requires browser storage",
+                ));
+            }
+        };
         let mut result = Ok(());
         let mut remaining = Vec::new();
         for table in deletable {

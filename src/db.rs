@@ -77,8 +77,8 @@ mod storage_backend;
 
 use open_helpers::{
     cleanup_pending_obsolete_blob_files, cleanup_pending_obsolete_table_files, lock_poisoned,
-    persistent_path_from_options,
 };
+use storage_backend::DatabaseStorageRef;
 
 #[cfg(test)]
 mod tests;
@@ -1075,15 +1075,15 @@ impl Drop for DbInner {
             &self.runtime_shutdown,
             &self.background_workers,
         );
-        if let Some(files) = self.storage.filesystem_files_if_present() {
+        if let DatabaseStorageRef::Filesystem(resources) = self.storage.resources() {
             let _ = cleanup_pending_obsolete_table_files(
-                files,
-                persistent_path_from_options(&self.options),
+                resources.files,
+                Some(resources.root),
                 &self.pending_obsolete_tables,
             );
             let _ = cleanup_pending_obsolete_blob_files(
-                files,
-                persistent_path_from_options(&self.options),
+                resources.files,
+                Some(resources.root),
                 &self.snapshots,
                 self.manifest.as_ref(),
             );

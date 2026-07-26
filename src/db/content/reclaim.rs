@@ -10,6 +10,7 @@ use super::{
     content_control_key, content_quarantine_key, content_reader_drain_attestation_key,
     content_reclaim_grace_key, content_reclaim_sweep_key,
 };
+use crate::db::DatabaseStorageRef;
 
 impl Db {
     /// Returns the persisted content-access mode for one storage domain.
@@ -586,12 +587,18 @@ impl Db {
                     backend: HostStorageBackend::ObjectStore,
                 },
             ) => {
-                if !qualification.matches_prefix(self.object_store_db_path()?) {
+                let DatabaseStorageRef::ObjectStore(resources) = self.inner.storage.resources()
+                else {
+                    return Err(Error::unsupported_backend(
+                        "object-store reclamation requires object-store resources",
+                    ));
+                };
+                if !qualification.matches_prefix(resources.prefix) {
                     return Err(Error::unsupported_backend(
                         "object-store reclamation qualification names a different database prefix",
                     ));
                 }
-                let client = self.object_storage()?.client();
+                let client = resources.objects.client();
                 if !qualification.matches_client(&client) {
                     return Err(Error::unsupported_backend(
                         "object-store reclamation qualification belongs to a different client instance",

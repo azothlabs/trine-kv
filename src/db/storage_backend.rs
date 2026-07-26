@@ -1,7 +1,8 @@
 use std::path::Path;
 
+#[cfg(feature = "platform-io")]
+use crate::error::Result;
 use crate::{
-    error::{Error, Result},
     object_store::ObjectStoreBackend,
     storage::{MemoryStorageBackend, NativeFileBackend},
     storage_read::ReadBackend,
@@ -28,6 +29,7 @@ pub(in crate::db) enum DatabaseStorage {
     },
     Filesystem {
         files: NativeFileBackend,
+        root: std::path::PathBuf,
     },
     ObjectStore {
         objects: ObjectStoreBackend,
@@ -37,9 +39,45 @@ pub(in crate::db) enum DatabaseStorage {
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     Browser {
         files: BrowserStorageBackend,
+        root: std::path::PathBuf,
         writer_lease: Mutex<Option<BrowserWriterLease>>,
         wal: Option<BrowserWalFrontDoor>,
     },
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::db) struct MemoryResources<'storage> {
+    pub(in crate::db) content: &'storage MemoryStorageBackend,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::db) struct FilesystemResources<'storage> {
+    pub(in crate::db) files: &'storage NativeFileBackend,
+    pub(in crate::db) root: &'storage Path,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::db) struct ObjectStoreResources<'storage> {
+    pub(in crate::db) objects: &'storage ObjectStoreBackend,
+    pub(in crate::db) wal_objects: &'storage ObjectStoreBackend,
+    pub(in crate::db) prefix: &'storage Path,
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[derive(Clone, Copy)]
+pub(in crate::db) struct BrowserResources<'storage> {
+    pub(in crate::db) files: &'storage BrowserStorageBackend,
+    pub(in crate::db) root: &'storage Path,
+    pub(in crate::db) wal: Option<&'storage BrowserWalFrontDoor>,
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::db) enum DatabaseStorageRef<'storage> {
+    Memory(MemoryResources<'storage>),
+    Filesystem(FilesystemResources<'storage>),
+    ObjectStore(ObjectStoreResources<'storage>),
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    Browser(BrowserResources<'storage>),
 }
 
 impl DatabaseStorage {
@@ -49,8 +87,11 @@ impl DatabaseStorage {
         }
     }
 
-    pub(in crate::db) const fn filesystem(files: NativeFileBackend) -> Self {
-        Self::Filesystem { files }
+    pub(in crate::db) const fn filesystem(
+        files: NativeFileBackend,
+        root: std::path::PathBuf,
+    ) -> Self {
+        Self::Filesystem { files, root }
     }
 
     pub(in crate::db) fn object_store(
@@ -68,97 +109,55 @@ impl DatabaseStorage {
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     pub(in crate::db) fn browser(
         files: BrowserStorageBackend,
+        root: std::path::PathBuf,
         writer_lease: Option<BrowserWriterLease>,
         wal: Option<BrowserWalFrontDoor>,
     ) -> Self {
         Self::Browser {
             files,
+            root,
             writer_lease: Mutex::new(writer_lease),
             wal,
         }
     }
 
-    pub(in crate::db) fn memory_content(&self) -> Result<MemoryStorageBackend> {
+    pub(in crate::db) fn resources(&self) -> DatabaseStorageRef<'_> {
         match self {
-            Self::Memory { content } => Ok(content.clone()),
-            _ => Err(Error::Corruption {
-                message: "in-memory database is missing its content backend".to_owned(),
+            Self::Memory { content } => DatabaseStorageRef::Memory(MemoryResources { content }),
+            Self::Filesystem { files, root } => {
+                DatabaseStorageRef::Filesystem(FilesystemResources { files, root })
+            }
+            Self::ObjectStore {
+                objects,
+                wal_objects,
+                prefix,
+            } => DatabaseStorageRef::ObjectStore(ObjectStoreResources {
+                objects,
+                wal_objects,
+                prefix,
+            }),
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            Self::Browser {
+                files, root, wal, ..
+            } => DatabaseStorageRef::Browser(BrowserResources {
+                files,
+                root,
+                wal: wal.as_ref(),
             }),
         }
     }
 
     pub(in crate::db) fn read_backend(&self) -> ReadBackend {
-        match self {
-            Self::Memory { content } => ReadBackend::Memory(content.clone()),
-            Self::Filesystem { files } => ReadBackend::Filesystem(files.clone()),
-            Self::ObjectStore { objects, .. } => ReadBackend::ObjectStore(objects.clone()),
+        match self.resources() {
+            DatabaseStorageRef::Memory(resources) => ReadBackend::Memory(resources.content.clone()),
+            DatabaseStorageRef::Filesystem(resources) => {
+                ReadBackend::Filesystem(resources.files.clone())
+            }
+            DatabaseStorageRef::ObjectStore(resources) => {
+                ReadBackend::ObjectStore(resources.objects.clone())
+            }
             #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-            Self::Browser { files, .. } => ReadBackend::Browser(files.clone()),
-        }
-    }
-
-    pub(in crate::db) fn filesystem_files(&self) -> Result<&NativeFileBackend> {
-        match self {
-            Self::Filesystem { files } => Ok(files),
-            _ => Err(Error::Corruption {
-                message: "filesystem database is missing its native storage backend".to_owned(),
-            }),
-        }
-    }
-
-    pub(in crate::db) const fn filesystem_files_if_present(&self) -> Option<&NativeFileBackend> {
-        match self {
-            Self::Filesystem { files } => Some(files),
-            _ => None,
-        }
-    }
-
-    pub(in crate::db) fn filesystem_files_cloned(&self) -> Result<NativeFileBackend> {
-        self.filesystem_files().cloned()
-    }
-
-    pub(in crate::db) fn object_store_objects(&self) -> Result<ObjectStoreBackend> {
-        match self {
-            Self::ObjectStore { objects, .. } => Ok(objects.clone()),
-            _ => Err(Error::Corruption {
-                message: "object-store database is missing its data backend".to_owned(),
-            }),
-        }
-    }
-
-    pub(in crate::db) fn object_store_wal_objects(&self) -> Result<ObjectStoreBackend> {
-        match self {
-            Self::ObjectStore { wal_objects, .. } => Ok(wal_objects.clone()),
-            _ => Err(Error::Corruption {
-                message: "object-store database is missing its WAL backend".to_owned(),
-            }),
-        }
-    }
-
-    pub(in crate::db) fn object_store_prefix(&self) -> Result<&Path> {
-        match self {
-            Self::ObjectStore { prefix, .. } => Ok(prefix),
-            _ => Err(Error::Corruption {
-                message: "object-store database is missing its key prefix".to_owned(),
-            }),
-        }
-    }
-
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    pub(in crate::db) fn browser_files(&self) -> Result<BrowserStorageBackend> {
-        match self {
-            Self::Browser { files, .. } => Ok(files.clone()),
-            _ => Err(Error::Corruption {
-                message: "browser database is missing its OPFS backend".to_owned(),
-            }),
-        }
-    }
-
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    pub(in crate::db) fn browser_wal(&self) -> Option<&BrowserWalFrontDoor> {
-        match self {
-            Self::Browser { wal, .. } => wal.as_ref(),
-            _ => None,
+            DatabaseStorageRef::Browser(resources) => ReadBackend::Browser(resources.files.clone()),
         }
     }
 
@@ -175,10 +174,24 @@ impl DatabaseStorage {
     #[cfg(feature = "platform-io")]
     pub(in crate::db) fn close_platform_io(&self) -> Result<()> {
         match self {
-            Self::Filesystem { files } => files.close_platform_io(),
+            Self::Filesystem { files, .. } => files.close_platform_io(),
             Self::Memory { .. } | Self::ObjectStore { .. } => Ok(()),
             #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
             Self::Browser { .. } => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{super::DbInner, DatabaseStorage};
+
+    #[test]
+    fn db_inner_storage_field_has_one_exhaustive_backend_type() {
+        fn storage_of(inner: &DbInner) -> &DatabaseStorage {
+            &inner.storage
+        }
+
+        let _ = storage_of;
     }
 }

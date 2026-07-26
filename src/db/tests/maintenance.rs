@@ -206,12 +206,10 @@ fn persistent_open_attaches_runtime_enabled_native_storage_backend() {
     options.default_bucket_options = options.default_bucket_options.with_blob_threshold_bytes(4);
     let db = Db::open_sync(options).expect("persistent db opens");
 
-    let capabilities = db
-        .inner
-        .storage
-        .filesystem_files()
-        .expect("persistent database owns filesystem storage")
-        .capabilities();
+    let crate::db::DatabaseStorageRef::Filesystem(resources) = db.inner.storage.resources() else {
+        panic!("persistent database owns filesystem storage");
+    };
+    let capabilities = resources.files.capabilities();
     assert!(capabilities.supports(StorageCapability::AsyncTasks));
     assert!(capabilities.supports(StorageCapability::BlockingAdapter));
     assert!(capabilities.supports(StorageCapability::BackgroundThreads));

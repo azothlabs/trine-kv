@@ -3,10 +3,11 @@ use super::open_helpers::{
     object_store_committed_wal_batches, require_internal_checkpoint_name, validate_checkpoint_name,
 };
 use super::{
-    Arc, Bucket, BucketName, BucketOptions, CommitInfo, DEFAULT_BUCKET_NAME, Db, Direction,
-    DurabilityMode, Error, HostStorageBackend, IntoOpenOptions, Iter, KeyRange, LazyIter,
-    MaintenanceBudget, MaintenanceOutcome, ManifestStore, ObjectLeaseState, ObjectWriterLease,
-    ReadVersion, Result, Snapshot, StorageMode, Value, WriteOptions, commit, manifest, recovery,
+    Arc, Bucket, BucketName, BucketOptions, CommitInfo, DEFAULT_BUCKET_NAME, DatabaseStorageRef,
+    Db, Direction, DurabilityMode, Error, HostStorageBackend, IntoOpenOptions, Iter, KeyRange,
+    LazyIter, MaintenanceBudget, MaintenanceOutcome, ManifestStore, ObjectLeaseState,
+    ObjectWriterLease, ReadVersion, Result, Snapshot, StorageMode, Value, WriteOptions, commit,
+    manifest, recovery,
 };
 use crate::{
     bucket::{require_internal_bucket, validate_user_named_bucket},
@@ -129,11 +130,16 @@ impl Db {
         }
 
         let _refresh = self.inner.object_manifest_async_lock.lock().await;
-        let backend = self.object_storage()?;
+        let DatabaseStorageRef::ObjectStore(resources) = self.inner.storage.resources() else {
+            return Err(Error::invalid_options(
+                "refresh_object_store requires an object-store database",
+            ));
+        };
+        let backend = resources.objects.clone();
         let storage_client = backend.client();
-        let wal_backend = self.object_wal_storage()?;
+        let wal_backend = resources.wal_objects.clone();
         let wal_client = wal_backend.client();
-        let db_path = self.object_store_db_path()?.to_path_buf();
+        let db_path = resources.prefix.to_path_buf();
         let manifest_key = canonical_object_key(&manifest::manifest_path(&db_path))?;
         let lease_key = canonical_object_key(&db_path.join(recovery::PROCESS_LOCK_FILE_NAME))?;
 
@@ -232,7 +238,10 @@ impl Db {
         let _activity = self.inner.publish_barrier.begin_activity()?;
         let name = name.into();
         validate_user_named_bucket(name.as_str())?;
-        if self.inner.options.storage_mode.is_object_store_persistent() {
+        if matches!(
+            self.inner.storage.resources(),
+            DatabaseStorageRef::ObjectStore(_)
+        ) {
             return self
                 .bucket_with_options_object_store_async(name, options)
                 .await;
@@ -250,7 +259,10 @@ impl Db {
         let _activity = self.inner.publish_barrier.begin_activity()?;
         let name = name.into();
         require_internal_bucket(name.as_str())?;
-        if self.inner.options.storage_mode.is_object_store_persistent() {
+        if matches!(
+            self.inner.storage.resources(),
+            DatabaseStorageRef::ObjectStore(_)
+        ) {
             return self
                 .bucket_with_options_object_store_async(name, BucketOptions::default())
                 .await;
@@ -804,13 +816,14 @@ impl Db {
     pub async fn compact_range(&self, range: KeyRange) -> Result<()> {
         let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
-        if self.inner.options.storage_mode.is_object_store_persistent() {
+        if let DatabaseStorageRef::ObjectStore(resources) = self.inner.storage.resources() {
             if self.inner.options.read_only {
                 return Err(Error::ReadOnly);
             }
             let outcome = self
                 .run_compaction_once_object_store_async(
-                    self.object_store_db_path()?,
+                    resources.objects,
+                    resources.prefix,
                     &range,
                     false,
                     MaintenanceBudget::unbounded(),
@@ -865,13 +878,14 @@ impl Db {
     ) -> Result<MaintenanceOutcome> {
         let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
-        if self.inner.options.storage_mode.is_object_store_persistent() {
+        if let DatabaseStorageRef::ObjectStore(resources) = self.inner.storage.resources() {
             if self.inner.options.read_only {
                 return Err(Error::ReadOnly);
             }
             return self
                 .run_compaction_once_object_store_async(
-                    self.object_store_db_path()?,
+                    resources.objects,
+                    resources.prefix,
                     &range,
                     false,
                     budget,
@@ -927,7 +941,7 @@ impl Db {
     ) -> Result<MaintenanceOutcome> {
         let _activity = self.inner.publish_barrier.begin_activity()?;
         self.ensure_open()?;
-        if self.inner.options.storage_mode.is_object_store_persistent() {
+        if let DatabaseStorageRef::ObjectStore(resources) = self.inner.storage.resources() {
             if self.inner.options.read_only {
                 return Err(Error::ReadOnly);
             }
@@ -941,7 +955,8 @@ impl Db {
             if flush_permits_compaction {
                 let compaction = self
                     .run_compaction_once_object_store_async(
-                        self.object_store_db_path()?,
+                        resources.objects,
+                        resources.prefix,
                         &KeyRange::all(),
                         false,
                         budget,

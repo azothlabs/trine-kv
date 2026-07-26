@@ -26,6 +26,70 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-07-26: typed plans and responsibility-level module boundaries
+
+### Observation
+
+- Branch behavior remained correct after the first architecture correction,
+  but one file still owned registry encoding, handle I/O, range merging,
+  lifecycle decisions, and public orchestration. Sync and async code still had
+  separate execution loops.
+- Content transaction extensions were correctly outside the generic
+  transaction core but still combined token/activity and every reclaim phase in
+  one file.
+- Object-store data, WAL, and prefix resources could be requested
+  independently even though one backend variant owns them together.
+- Architecture tests used broad source-string and file-tree assertions for
+  rules that Rust can check through types and module declarations.
+
+### Interpretation
+
+- File splitting alone would not prevent semantic drift. The async Branch
+  implementation must be the single execution path, with sync APIs adapting
+  that future instead of repeating storage calls.
+- Backend resources that are valid only together should cross the engine
+  boundary together. Public API and capability contracts should compile as
+  ordinary Rust rather than infer types from source text.
+- Transaction state needs a private responsibility boundary, but not a second
+  Cargo package: it has no independent consumer, version, or release lifecycle.
+
+### Verification
+
+- The crate package identity remains `0.6.0`; architecture work does not
+  advance the release version.
+- The branch implementation is divided into registry, state, handle, range,
+  transition, and API modules. Sync methods drive the same async orchestration;
+  `BranchRange` drives the same `AsyncBranchRange` merge implementation.
+- Content transaction extensions are divided into token, intent, quarantine,
+  grace, sweep, and guard modules with strict explicit-import linting.
+- Transaction state lives in private `transaction::core`; no workspace or path
+  dependency was added.
+- `DatabaseStorageRef` exhaustively exposes complete memory, filesystem,
+  object-store, or browser resource bundles. All incompatible runtime accessors
+  and their false `Result` paths were removed.
+- Architecture integration tests now compile-check public Branch and
+  Transaction contracts. No `include_str!` or file-tree architecture assertion
+  remains.
+- `cargo test -q --all-features` passed 606 tests with 4 intentionally ignored,
+  all integration targets, all 52 acceptance scenarios and 352 steps, and all
+  6 durable-branch scenarios and 55 steps.
+- Focused branch tests passed 24/24. Strict native and browser Clippy, native
+  and browser all-feature checks, Rustdoc with warnings denied, and 31 doctests
+  passed.
+
+### Remaining Blockers
+
+- No local architecture blocker remains for this refinement.
+- Because transaction core remains inside the main crate, Rust does not provide
+  a negative dependency rule that forbids a future internal import. That
+  limitation is recorded explicitly instead of introducing a fake package
+  boundary or a source-text test.
+
+### Recommended Next Action
+
+- Retain these contracts as required regression coverage and run the hosted
+  release gates against the final change set.
+
 ## 2026-07-26: backend ownership and async-first architecture remediation
 
 ### Observation

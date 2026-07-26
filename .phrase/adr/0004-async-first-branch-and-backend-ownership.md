@@ -37,13 +37,22 @@ handle. Its variants contain only the resources valid for that backend:
 - browser owns OPFS storage, its writer lease, and its WAL front door.
 
 `DbInner` must not keep backend-specific `Option` fields or an unused native
-backend for non-filesystem databases. Backend access goes through typed
-accessors on `DatabaseStorage`; asking for an incompatible capability fails as
-corruption inside the engine rather than silently using a placeholder.
+backend for non-filesystem databases. Callers exhaustively match a
+`DatabaseStorageRef`, whose variants expose only the resources valid for that
+backend. Object-store and browser callers receive one resource bundle
+containing every jointly owned client and coordinate. There is no
+wrong-backend accessor and therefore no incompatible capability request that
+can become a runtime corruption error.
 
 Capability-specific storage traits remain the operation boundary. This ADR does
 not introduce one large trait that pretends every backend supports every
 operation.
+
+The backend set is intentionally closed inside the crate because an
+implementation participates in WAL, manifest publication, writer fencing,
+recovery, and durability contracts together. Supporting third-party backends
+would require a separately versioned public protocol and qualification suite;
+it must not be introduced by merely making the internal traits public.
 
 ### Branch execution
 
@@ -55,22 +64,35 @@ storage path. The public branch API follows the crate-wide rule:
 - async-only backends have a complete create, open, list, read, write, scan, and
   delete path.
 
-The synchronous adapter may use synchronous storage mechanics, but it must
-apply the same typed branch transition and identity checks as the async path.
-Duplicated legality decisions are not allowed.
+The async implementation is the only branch orchestration and range-merge
+implementation. Synchronous methods first reject async-only persistent
+backends, then drive that same future to completion. `BranchRange` likewise
+adapts `AsyncBranchRange`; it does not own a second merge algorithm.
+
+Branch registry encoding, owned handle state, range merging, durable
+transitions, and public orchestration live in separate modules.
+`BranchCreateRequest`, `BranchDeleteScan`, and `BranchDeletePlan` own lifecycle
+decisions inside the single execution path.
 
 ### Transaction ownership
 
-The generic transaction module owns snapshot reads, staged writes, conflict
-tracking, and commit. Immutable-content lifecycle extensions live under the
-content module even when their methods are implemented on `Transaction`.
+The private `transaction::core` module owns snapshot coordinates, staged
+writes, conflict tracking, and extension claims. `Transaction` owns database
+I/O and commit orchestration. This boundary remains inside the main crate:
+transaction state has no independent reuse, version, or release lifecycle that
+would justify a second Cargo package. Immutable-content lifecycle extensions
+live under the content module even when their methods are implemented on
+`Transaction`.
+Token/activity, intent, quarantine, grace, sweep, and their protected guards
+remain separate content-owned modules.
 
 ## Compatibility
 
-Correcting the branch method names is a pre-1.0 breaking public API change.
-Trine therefore increments the minor crate version. Storage formats, WAL,
-manifest, table encoding, MVCC visibility, and durable branch registry encoding
-do not change.
+This architecture phase does not own the release-version decision. The crate
+package identity remains `0.6.0`; a future release process may choose a new
+version only as an explicit release action. Storage formats, WAL, manifest,
+table encoding, MVCC visibility, and durable branch registry encoding do not
+change.
 
 ## Verification
 
@@ -78,7 +100,9 @@ do not change.
   outcomes;
 - async branch handles can read, write, delete, and scan on object storage;
 - synchronous branch tests use only explicit `*_sync` methods;
-- compile-time and source-boundary checks reject backend-specific fields on
-  `DbInner` and content lifecycle implementations in `transaction.rs`;
+- exhaustive storage enums make invalid resource combinations
+  unrepresentable;
+- integration tests compile-check the async/sync branch and transaction public
+  contracts, while Rust visibility keeps transaction state private;
 - all-feature tests, strict Clippy, Rustdoc, doctests, formatting, and diff
   hygiene pass.

@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-use crate::error::Error;
 use crate::{
     DurabilityMode,
     error::Result,
@@ -12,6 +10,8 @@ use crate::{
         StorageObjectWriteBackend,
     },
 };
+
+use crate::db::DatabaseStorageRef;
 
 use super::Db;
 
@@ -30,30 +30,15 @@ pub(super) enum ContentObjectBackend {
 }
 
 impl ContentObjectBackend {
-    pub(super) fn for_db(db: &Db) -> Result<Self> {
-        match &db.inner.options.storage_mode {
-            crate::StorageMode::InMemory => Ok(Self::Memory(db.inner.storage.memory_content()?)),
-            crate::StorageMode::Persistent { .. }
-            | crate::StorageMode::HostPersistent {
-                backend: crate::HostStorageBackend::Wasi { .. },
-            } => Ok(Self::Native(db.inner.storage.filesystem_files_cloned()?)),
-            crate::StorageMode::HostPersistent {
-                backend: crate::HostStorageBackend::ObjectStore,
-            } => Ok(Self::ObjectStore(db.object_storage()?)),
-            crate::StorageMode::HostPersistent {
-                backend: crate::HostStorageBackend::Browser { .. },
-            } => {
-                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                {
-                    Ok(Self::Browser(db.browser_storage()?))
-                }
-                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-                {
-                    Err(Error::unsupported_backend(
-                        "browser content objects require wasm32-unknown-unknown",
-                    ))
-                }
+    pub(super) fn for_db(db: &Db) -> Self {
+        match db.inner.storage.resources() {
+            DatabaseStorageRef::Memory(resources) => Self::Memory(resources.content.clone()),
+            DatabaseStorageRef::Filesystem(resources) => Self::Native(resources.files.clone()),
+            DatabaseStorageRef::ObjectStore(resources) => {
+                Self::ObjectStore(resources.objects.clone())
             }
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            DatabaseStorageRef::Browser(resources) => Self::Browser(resources.files.clone()),
         }
     }
 

@@ -8,6 +8,7 @@ use super::{
 };
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::DurabilityMode;
+use crate::db::DatabaseStorageRef;
 
 struct PreparedCompactionRun {
     oldest_active_snapshot: Sequence,
@@ -128,6 +129,12 @@ impl Db {
         local_l0_compaction: bool,
         budget: MaintenanceBudget,
     ) -> Result<MaintenanceOutcome> {
+        let DatabaseStorageRef::Filesystem(resources) = self.inner.storage.resources() else {
+            return Err(Error::unsupported_backend(
+                "synchronous compaction requires filesystem storage",
+            ));
+        };
+        let storage = resources.files;
         let PreparedCompactionRun {
             oldest_active_snapshot,
             inputs: compaction_inputs,
@@ -142,7 +149,12 @@ impl Db {
         let PendingCompactionOutputs {
             outputs: written_tables,
             written_table_ids,
-        } = self.build_compaction_outputs(db_path, oldest_active_snapshot, &compaction_inputs)?;
+        } = self.build_compaction_outputs(
+            storage,
+            db_path,
+            oldest_active_snapshot,
+            &compaction_inputs,
+        )?;
 
         let input_tables_for_stats = compaction_inputs
             .iter()
@@ -159,21 +171,13 @@ impl Db {
         if !written_table_ids.is_empty()
             && let Err(error) = self.sync_filesystem_directory_after_renames(db_path)
         {
-            let _ = remove_storage_files(
-                self.inner.storage.filesystem_files()?,
-                db_path,
-                &written_table_ids,
-            );
+            let _ = remove_storage_files(storage, db_path, &written_table_ids);
             return Err(error);
         }
 
         let _publish = self.inner.publish_barrier.enter()?;
         if let Err(error) = self.validate_compacted_tables(&written_tables) {
-            let _ = remove_storage_files(
-                self.inner.storage.filesystem_files()?,
-                db_path,
-                &written_table_ids,
-            );
+            let _ = remove_storage_files(storage, db_path, &written_table_ids);
             if is_level_layout_compaction_error(&error) {
                 return Ok(MaintenanceOutcome::default());
             }
@@ -182,11 +186,7 @@ impl Db {
         if let Err(error) = self.publish_compacted_tables(&written_tables, &obsolete_blob_ids) {
             let error = self.close_after_manifest_durability_failure("compaction", error);
             if !self.closed_after_durable_publish_error() {
-                let _ = remove_storage_files(
-                    self.inner.storage.filesystem_files()?,
-                    db_path,
-                    &written_table_ids,
-                );
+                let _ = remove_storage_files(storage, db_path, &written_table_ids);
             }
             return Err(error);
         }
@@ -442,9 +442,23 @@ impl Db {
         table_ids: &[table::TableId],
     ) -> Result<()> {
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        let storage = self.inner.storage.filesystem_files_cloned()?;
+        let storage = match self.inner.storage.resources() {
+            DatabaseStorageRef::Filesystem(resources) => resources.files.clone(),
+            _ => {
+                return Err(Error::unsupported_backend(
+                    "native cleanup requires filesystem storage",
+                ));
+            }
+        };
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-        let storage = self.browser_storage()?;
+        let storage = match self.inner.storage.resources() {
+            DatabaseStorageRef::Browser(resources) => resources.files.clone(),
+            _ => {
+                return Err(Error::unsupported_backend(
+                    "browser cleanup requires browser storage",
+                ));
+            }
+        };
         remove_storage_files_async(&storage, db_path, table_ids).await
     }
 
@@ -510,6 +524,7 @@ impl Db {
 
     pub(in crate::db) fn build_compaction_outputs(
         &self,
+        storage: &crate::storage::NativeFileBackend,
         db_path: &Path,
         oldest_active_snapshot: Sequence,
         compaction_inputs: &[NamedCompactionInput],
@@ -549,7 +564,7 @@ impl Db {
                 let table_path = table::table_path(db_path, table_id);
                 written_table_ids.push(table_id);
                 let table = match table::write_table_with_backend_with_durability(
-                    self.inner.storage.filesystem_files()?,
+                    storage,
                     &table_path,
                     table_id,
                     input.input.table_level,
@@ -560,11 +575,7 @@ impl Db {
                 ) {
                     Ok(table) => table,
                     Err(error) => {
-                        let _ = remove_storage_files(
-                            self.inner.storage.filesystem_files()?,
-                            db_path,
-                            &written_table_ids,
-                        );
+                        let _ = remove_storage_files(storage, db_path, &written_table_ids);
                         return Err(error);
                     }
                 };
@@ -593,7 +604,14 @@ impl Db {
         oldest_active_snapshot: Sequence,
         compaction_inputs: &[NamedCompactionInput],
     ) -> Result<PendingCompactionOutputs> {
-        let storage = self.inner.storage.filesystem_files_cloned()?;
+        let storage = match self.inner.storage.resources() {
+            DatabaseStorageRef::Filesystem(resources) => resources.files.clone(),
+            _ => {
+                return Err(Error::unsupported_backend(
+                    "native compaction requires filesystem storage",
+                ));
+            }
+        };
         let rewrites =
             self.prepare_compaction_rewrites(oldest_active_snapshot, compaction_inputs)?;
         let output_table_count = rewrites
@@ -672,7 +690,14 @@ impl Db {
         oldest_active_snapshot: Sequence,
         compaction_inputs: &[NamedCompactionInput],
     ) -> Result<PendingCompactionOutputs> {
-        let storage = self.browser_storage()?;
+        let storage = match self.inner.storage.resources() {
+            DatabaseStorageRef::Browser(resources) => resources.files.clone(),
+            _ => {
+                return Err(Error::unsupported_backend(
+                    "browser compaction requires browser storage",
+                ));
+            }
+        };
         let rewrites =
             self.prepare_compaction_rewrites(oldest_active_snapshot, compaction_inputs)?;
         let output_table_count = rewrites

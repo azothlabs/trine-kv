@@ -1,11 +1,12 @@
 use super::{
-    Arc, ContentAccessBarrierRecord, ContentId, Db, DurabilityMode, Error, HostStorageBackend,
-    MutexGuard, PathBuf, Result, StorageDomainId, StorageMode, StorageObjectId, StorageObjectKind,
-    UploadId, UploadIdRetirement, UploadSessionState, backend::ContentObjectBackend,
-    content_lock_shard_index, decode_upload_id_tombstone, encode_upload_id_tombstone,
+    Arc, ContentAccessBarrierRecord, ContentId, Db, DurabilityMode, Error, MutexGuard, PathBuf,
+    Result, StorageDomainId, StorageObjectId, StorageObjectKind, UploadId, UploadIdRetirement,
+    UploadSessionState, backend::ContentObjectBackend, content_lock_shard_index,
+    decode_upload_id_tombstone, encode_upload_id_tombstone,
 };
 use crate::content::UploadStatePublish;
-use crate::object_store::{Precondition, PutIf};
+use crate::db::DatabaseStorageRef;
+use crate::object_store::{ObjectStoreBackend, Precondition, PutIf};
 use crate::storage::StorageObjectListRequest;
 
 impl Db {
@@ -15,7 +16,7 @@ impl Db {
         index: u64,
         bytes: Arc<[u8]>,
     ) -> Result<()> {
-        let object = self.content_chunk_object(upload_id, index)?;
+        let object = self.content_chunk_object(upload_id, index);
         self.write_content_object(object, bytes).await
     }
 
@@ -26,7 +27,7 @@ impl Db {
         revision: u64,
         bytes: Arc<[u8]>,
     ) -> Result<()> {
-        let object = self.content_partial_chunk_object(upload_id, index, revision)?;
+        let object = self.content_partial_chunk_object(upload_id, index, revision);
         self.write_content_object(object, bytes).await
     }
 
@@ -35,7 +36,7 @@ impl Db {
         upload_id: UploadId,
         index: u64,
     ) -> Result<Option<Arc<[u8]>>> {
-        let object = self.content_chunk_object(upload_id, index)?;
+        let object = self.content_chunk_object(upload_id, index);
         self.read_content_object(object).await
     }
 
@@ -45,12 +46,12 @@ impl Db {
         index: u64,
         revision: u64,
     ) -> Result<Option<Arc<[u8]>>> {
-        let object = self.content_partial_chunk_object(upload_id, index, revision)?;
+        let object = self.content_partial_chunk_object(upload_id, index, revision);
         self.read_content_object(object).await
     }
 
     pub(crate) async fn delete_content_chunk(&self, upload_id: UploadId, index: u64) -> Result<()> {
-        let object = self.content_chunk_object(upload_id, index)?;
+        let object = self.content_chunk_object(upload_id, index);
         self.delete_content_object(object).await
     }
 
@@ -60,7 +61,7 @@ impl Db {
         index: u64,
         revision: u64,
     ) -> Result<()> {
-        let object = self.content_partial_chunk_object(upload_id, index, revision)?;
+        let object = self.content_partial_chunk_object(upload_id, index, revision);
         self.delete_content_object(object).await
     }
 
@@ -70,7 +71,7 @@ impl Db {
         content_id: ContentId,
         bytes: Arc<[u8]>,
     ) -> Result<()> {
-        let object = self.content_descriptor_object(storage_domain_id, content_id)?;
+        let object = self.content_descriptor_object(storage_domain_id, content_id);
         self.write_content_object(object, bytes).await
     }
 
@@ -79,7 +80,7 @@ impl Db {
         storage_domain_id: StorageDomainId,
         content_id: ContentId,
     ) -> Result<Option<Arc<[u8]>>> {
-        let object = self.content_descriptor_object(storage_domain_id, content_id)?;
+        let object = self.content_descriptor_object(storage_domain_id, content_id);
         self.read_content_object(object).await
     }
 
@@ -88,7 +89,7 @@ impl Db {
         storage_domain_id: StorageDomainId,
         content_id: ContentId,
     ) -> Result<()> {
-        let object = self.content_descriptor_object(storage_domain_id, content_id)?;
+        let object = self.content_descriptor_object(storage_domain_id, content_id);
         self.delete_content_object(object).await
     }
 
@@ -96,7 +97,7 @@ impl Db {
         &self,
         storage_domain_id: StorageDomainId,
     ) -> Result<Option<ContentAccessBarrierRecord>> {
-        let object = self.content_access_barrier_object(storage_domain_id)?;
+        let object = self.content_access_barrier_object(storage_domain_id);
         self.read_content_object(object)
             .await?
             .map(|bytes| ContentAccessBarrierRecord::decode(&bytes, storage_domain_id))
@@ -109,7 +110,7 @@ impl Db {
         storage_domain_id: StorageDomainId,
         bytes: Arc<[u8]>,
     ) -> Result<()> {
-        let object = self.content_access_barrier_object(storage_domain_id)?;
+        let object = self.content_access_barrier_object(storage_domain_id);
         self.write_content_object(object, bytes).await
     }
 
@@ -117,17 +118,17 @@ impl Db {
         &self,
         record: ContentAccessBarrierRecord,
     ) -> Result<()> {
-        let object = self.content_access_barrier_object(record.storage_domain_id)?;
+        let object = self.content_access_barrier_object(record.storage_domain_id);
         self.write_content_object(object, record.encode()).await
     }
 
     pub(crate) async fn write_upload_state(&self, state: &UploadSessionState) -> Result<()> {
-        let object = self.content_upload_state_object(state.upload_id())?;
+        let object = self.content_upload_state_object(state.upload_id());
         let state = state.with_updated_at_unix_ms(crate::content::current_epoch_millis()?);
         let bytes = state.encode()?;
-        if self.inner.options.storage_mode.is_object_store_persistent() {
+        if let DatabaseStorageRef::ObjectStore(resources) = self.inner.storage.resources() {
             return self
-                .write_upload_state_object_store_cas(object, &state, bytes)
+                .write_upload_state_object_store_cas(resources.objects, object, &state, bytes)
                 .await;
         }
         self.write_content_object(object, bytes).await
@@ -137,7 +138,7 @@ impl Db {
         &self,
         upload_id: UploadId,
     ) -> Result<UploadSessionState> {
-        let object = self.content_upload_state_object(upload_id)?;
+        let object = self.content_upload_state_object(upload_id);
         let bytes = self.read_content_object(object).await?.ok_or_else(|| {
             Error::ContentUploadNotFound {
                 upload_id: upload_id.to_string(),
@@ -154,11 +155,17 @@ impl Db {
         upload_id: UploadId,
         retirement: UploadIdRetirement,
     ) -> Result<()> {
-        let object = self.content_upload_state_object(upload_id)?;
+        let object = self.content_upload_state_object(upload_id);
         let bytes = encode_upload_id_tombstone(upload_id, retirement);
-        if self.inner.options.storage_mode.is_object_store_persistent() {
+        if let DatabaseStorageRef::ObjectStore(resources) = self.inner.storage.resources() {
             return self
-                .retire_upload_id_object_store_cas(object, upload_id, retirement, bytes)
+                .retire_upload_id_object_store_cas(
+                    resources.objects,
+                    object,
+                    upload_id,
+                    retirement,
+                    bytes,
+                )
                 .await;
         }
         self.write_content_object(object, bytes).await
@@ -194,38 +201,23 @@ impl Db {
         self.inner.content_quota_locks[shard].lock().await
     }
 
-    fn content_root(&self) -> Result<PathBuf> {
-        let root = match &self.inner.options.storage_mode {
-            StorageMode::InMemory => PathBuf::from("__trine_content_v1"),
-            StorageMode::Persistent { .. }
-            | StorageMode::HostPersistent {
-                backend: HostStorageBackend::Wasi { .. },
-            } => self
-                .persistent_path()
-                .ok_or_else(|| Error::Corruption {
-                    message: "persistent content backend has no database path".to_owned(),
-                })?
-                .join(".trine-content-v1"),
-            StorageMode::HostPersistent {
-                backend: HostStorageBackend::ObjectStore,
-            } => self.object_store_db_path()?.join("content-v1"),
-            StorageMode::HostPersistent {
-                backend: HostStorageBackend::Browser { path },
-            } => path.join(".trine-content-v1"),
-        };
-        Ok(root)
+    fn content_root(&self) -> PathBuf {
+        match self.inner.storage.resources() {
+            DatabaseStorageRef::Memory(_) => PathBuf::from("__trine_content_v1"),
+            DatabaseStorageRef::Filesystem(resources) => resources.root.join(".trine-content-v1"),
+            DatabaseStorageRef::ObjectStore(resources) => resources.prefix.join("content-v1"),
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            DatabaseStorageRef::Browser(resources) => resources.root.join(".trine-content-v1"),
+        }
     }
 
-    fn content_chunk_object(&self, upload_id: UploadId, index: u64) -> Result<StorageObjectId> {
+    fn content_chunk_object(&self, upload_id: UploadId, index: u64) -> StorageObjectId {
         let path = self
-            .content_root()?
+            .content_root()
             .join("chunks")
             .join(upload_id.to_string())
             .join(format!("{index:020}.trinec"));
-        Ok(StorageObjectId::native_file(
-            StorageObjectKind::ContentChunk,
-            path,
-        ))
+        StorageObjectId::native_file(StorageObjectKind::ContentChunk, path)
     }
 
     fn content_partial_chunk_object(
@@ -233,16 +225,13 @@ impl Db {
         upload_id: UploadId,
         index: u64,
         revision: u64,
-    ) -> Result<StorageObjectId> {
+    ) -> StorageObjectId {
         let path = self
-            .content_root()?
+            .content_root()
             .join("chunks")
             .join(upload_id.to_string())
             .join(format!("partial-{index:020}-{revision:020}.trinec"));
-        Ok(StorageObjectId::native_file(
-            StorageObjectKind::ContentChunk,
-            path,
-        ))
+        StorageObjectId::native_file(StorageObjectKind::ContentChunk, path)
     }
 
     pub(super) async fn list_content_upload_chunk_objects(
@@ -250,12 +239,12 @@ impl Db {
         upload_id: UploadId,
     ) -> Result<Vec<StorageObjectId>> {
         let root = self
-            .content_root()?
+            .content_root()
             .join("chunks")
             .join(upload_id.to_string());
         let request = StorageObjectListRequest::native_file(StorageObjectKind::ContentChunk, root)
             .with_file_extension("trinec");
-        ContentObjectBackend::for_db(self)?.list(request).await
+        ContentObjectBackend::for_db(self).list(request).await
     }
 
     pub(super) async fn delete_content_chunk_object(&self, object: StorageObjectId) -> Result<()> {
@@ -271,48 +260,33 @@ impl Db {
         &self,
         storage_domain_id: StorageDomainId,
         content_id: ContentId,
-    ) -> Result<StorageObjectId> {
+    ) -> StorageObjectId {
         let path = self
-            .content_root()?
+            .content_root()
             .join("domains")
             .join(hex_identifier(storage_domain_id.to_bytes()))
             .join("descriptors")
             .join("sha256")
             .join(format!("{}.trined", hex_identifier(content_id.digest())));
-        Ok(StorageObjectId::native_file(
-            StorageObjectKind::ContentDescriptor,
-            path,
-        ))
+        StorageObjectId::native_file(StorageObjectKind::ContentDescriptor, path)
     }
 
-    fn content_access_barrier_object(
-        &self,
-        storage_domain_id: StorageDomainId,
-    ) -> Result<StorageObjectId> {
+    fn content_access_barrier_object(&self, storage_domain_id: StorageDomainId) -> StorageObjectId {
         let path = self
-            .content_root()?
+            .content_root()
             .join("domains")
             .join(hex_identifier(storage_domain_id.to_bytes()))
             .join("access")
             .join("leased-only.trinebarrier");
-        Ok(StorageObjectId::native_file(
-            StorageObjectKind::ContentAccessBarrier,
-            path,
-        ))
+        StorageObjectId::native_file(StorageObjectKind::ContentAccessBarrier, path)
     }
 
-    pub(super) fn content_upload_state_object(
-        &self,
-        upload_id: UploadId,
-    ) -> Result<StorageObjectId> {
+    pub(super) fn content_upload_state_object(&self, upload_id: UploadId) -> StorageObjectId {
         let path = self
-            .content_root()?
+            .content_root()
             .join("uploads")
             .join(format!("{upload_id}.trineu"));
-        Ok(StorageObjectId::native_file(
-            StorageObjectKind::ContentUpload,
-            path,
-        ))
+        StorageObjectId::native_file(StorageObjectKind::ContentUpload, path)
     }
 
     pub(super) async fn list_upload_states(&self) -> Result<Vec<UploadSessionState>> {
@@ -359,10 +333,10 @@ impl Db {
     }
 
     async fn list_upload_state_objects(&self) -> Result<Vec<StorageObjectId>> {
-        let root = self.content_root()?.join("uploads");
+        let root = self.content_root().join("uploads");
         let request = StorageObjectListRequest::native_file(StorageObjectKind::ContentUpload, root)
             .with_file_extension("trineu");
-        ContentObjectBackend::for_db(self)?.list(request).await
+        ContentObjectBackend::for_db(self).list(request).await
     }
 
     async fn write_content_object(&self, object: StorageObjectId, bytes: Arc<[u8]>) -> Result<()> {
@@ -371,7 +345,7 @@ impl Db {
             return Err(Error::ReadOnly);
         }
         let durability = self.content_durability();
-        let backend = ContentObjectBackend::for_db(self)?;
+        let backend = ContentObjectBackend::for_db(self);
         if backend.requires_lease_fence() {
             self.fence_object_mutation_or_close("before content-object write")
                 .await?;
@@ -386,13 +360,13 @@ impl Db {
 
     async fn write_upload_state_object_store_cas(
         &self,
+        backend: &ObjectStoreBackend,
         object: StorageObjectId,
         intended: &UploadSessionState,
         bytes: Arc<[u8]>,
     ) -> Result<()> {
         self.fence_object_mutation_or_close("before upload-state CAS")
             .await?;
-        let backend = self.object_storage()?;
         let observed = backend.read_object_versioned(&object).await?;
         let precondition = match observed {
             None => match intended.plan_publish_against(None)? {
@@ -432,11 +406,11 @@ impl Db {
         let result = match publish {
             Ok(PutIf::Stored { .. }) => Ok(()),
             Ok(PutIf::PreconditionFailed { .. }) => {
-                self.reconcile_upload_state_cas(&backend, &object, intended)
+                self.reconcile_upload_state_cas(backend, &object, intended)
                     .await
             }
             Err(error) => match self
-                .reconcile_upload_state_cas(&backend, &object, intended)
+                .reconcile_upload_state_cas(backend, &object, intended)
                 .await
             {
                 Ok(()) => Ok(()),
@@ -479,6 +453,7 @@ impl Db {
 
     async fn retire_upload_id_object_store_cas(
         &self,
+        backend: &ObjectStoreBackend,
         object: StorageObjectId,
         upload_id: UploadId,
         retirement: UploadIdRetirement,
@@ -486,7 +461,6 @@ impl Db {
     ) -> Result<()> {
         self.fence_object_mutation_or_close("before upload-id retirement")
             .await?;
-        let backend = self.object_storage()?;
         let Some((current_bytes, etag)) = backend.read_object_versioned(&object).await? else {
             return Err(Error::ContentUploadNotFound {
                 upload_id: upload_id.to_string(),
@@ -563,12 +537,12 @@ impl Db {
         object: StorageObjectId,
     ) -> Result<Option<Arc<[u8]>>> {
         self.ensure_open()?;
-        ContentObjectBackend::for_db(self)?.read(object).await
+        ContentObjectBackend::for_db(self).read(object).await
     }
 
     async fn delete_content_object(&self, object: StorageObjectId) -> Result<()> {
         self.ensure_open()?;
-        let backend = ContentObjectBackend::for_db(self)?;
+        let backend = ContentObjectBackend::for_db(self);
         if backend.requires_lease_fence() {
             self.fence_object_mutation_or_close("before content-object deletion")
                 .await?;
@@ -582,15 +556,13 @@ impl Db {
     }
 
     pub(super) fn content_durability(&self) -> DurabilityMode {
-        match &self.inner.options.storage_mode {
-            StorageMode::Persistent { .. } => self.filesystem_publish_durability(),
-            StorageMode::InMemory
-            | StorageMode::HostPersistent {
-                backend:
-                    HostStorageBackend::Wasi { .. }
-                    | HostStorageBackend::Browser { .. }
-                    | HostStorageBackend::ObjectStore,
-            } => DurabilityMode::Flush,
+        match self.inner.storage.resources() {
+            DatabaseStorageRef::Filesystem(_) => self.filesystem_publish_durability(),
+            DatabaseStorageRef::Memory(_) | DatabaseStorageRef::ObjectStore(_) => {
+                DurabilityMode::Flush
+            }
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            DatabaseStorageRef::Browser(_) => DurabilityMode::Flush,
         }
     }
 }

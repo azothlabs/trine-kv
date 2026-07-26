@@ -7,6 +7,7 @@ use super::{
 };
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::DurabilityMode;
+use crate::db::DatabaseStorageRef;
 
 impl Db {
     pub(in crate::db) fn apply_write_backpressure(&self) -> Result<()> {
@@ -293,6 +294,12 @@ impl Db {
         if flush_inputs.is_empty() {
             return Ok(false);
         }
+        let DatabaseStorageRef::Filesystem(resources) = self.inner.storage.resources() else {
+            return Err(Error::unsupported_backend(
+                "synchronous flush requires filesystem storage",
+            ));
+        };
+        let storage = resources.files;
         let mut file_ids = self.reserve_file_ids(flush_inputs.len())?;
 
         let mut written_tables = Vec::with_capacity(flush_inputs.len());
@@ -302,7 +309,7 @@ impl Db {
             let table_path = table::table_path(db_path, table_id);
             written_table_ids.push(table_id);
             let table = match table::write_table_with_backend_with_durability(
-                self.inner.storage.filesystem_files()?,
+                storage,
                 &table_path,
                 table_id,
                 input.input.table_level,
@@ -313,11 +320,7 @@ impl Db {
             ) {
                 Ok(table) => table,
                 Err(error) => {
-                    let _ = remove_storage_files(
-                        self.inner.storage.filesystem_files()?,
-                        db_path,
-                        &written_table_ids,
-                    );
+                    let _ = remove_storage_files(storage, db_path, &written_table_ids);
                     return Err(error);
                 }
             };
@@ -325,11 +328,7 @@ impl Db {
         }
 
         if let Err(error) = self.sync_filesystem_directory_after_renames(db_path) {
-            let _ = remove_storage_files(
-                self.inner.storage.filesystem_files()?,
-                db_path,
-                &written_table_ids,
-            );
+            let _ = remove_storage_files(storage, db_path, &written_table_ids);
             return Err(error);
         }
 
@@ -344,11 +343,7 @@ impl Db {
             if let Err(error) = self.publish_flushed_tables(&written_tables, replay_floor) {
                 let error = self.close_after_manifest_durability_failure("flush", error);
                 if !self.closed_after_durable_publish_error() {
-                    let _ = remove_storage_files(
-                        self.inner.storage.filesystem_files()?,
-                        db_path,
-                        &written_table_ids,
-                    );
+                    let _ = remove_storage_files(storage, db_path, &written_table_ids);
                 }
                 return Err(error);
             }
@@ -406,9 +401,23 @@ impl Db {
         let mut file_ids = self.reserve_file_ids_host_async(flush_inputs.len()).await?;
 
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        let storage = self.inner.storage.filesystem_files_cloned()?;
+        let storage = match self.inner.storage.resources() {
+            DatabaseStorageRef::Filesystem(resources) => resources.files.clone(),
+            _ => {
+                return Err(Error::unsupported_backend(
+                    "native async flush requires filesystem storage",
+                ));
+            }
+        };
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-        let storage = self.browser_storage()?;
+        let storage = match self.inner.storage.resources() {
+            DatabaseStorageRef::Browser(resources) => resources.files.clone(),
+            _ => {
+                return Err(Error::unsupported_backend(
+                    "browser flush requires browser storage",
+                ));
+            }
+        };
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let durability = self.filesystem_publish_durability();
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -611,11 +620,15 @@ impl Db {
         db_path: &Path,
         replay_floor: Sequence,
     ) -> Result<()> {
-        let Some(wal) = self.inner.storage.browser_wal() else {
+        let DatabaseStorageRef::Browser(resources) = self.inner.storage.resources() else {
+            return Err(Error::unsupported_backend(
+                "browser WAL rewrite requires browser storage",
+            ));
+        };
+        let Some(wal) = resources.wal else {
             return Ok(());
         };
-        let storage = self.browser_storage()?;
-        wal.rewrite_after_replay_floor(&storage, db_path, replay_floor)
+        wal.rewrite_after_replay_floor(resources.files, db_path, replay_floor)
             .await
     }
 

@@ -7,6 +7,7 @@ use super::{
 };
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::DurabilityMode;
+use crate::db::DatabaseStorageRef;
 
 struct BlobGcRunMetadata {
     input_bytes: u64,
@@ -42,6 +43,12 @@ fn blob_gc_run_metadata(plan: &BlobGcRewritePlan) -> BlobGcRunMetadata {
 
 impl Db {
     pub(in crate::db) fn run_blob_gc_once_locked(&self, db_path: &Path) -> Result<()> {
+        let DatabaseStorageRef::Filesystem(resources) = self.inner.storage.resources() else {
+            return Err(Error::unsupported_backend(
+                "synchronous blob GC requires filesystem storage",
+            ));
+        };
+        let storage = resources.files;
         let Some(plan) = self.build_blob_gc_rewrite_plan(db_path)? else {
             return Ok(());
         };
@@ -68,7 +75,7 @@ impl Db {
         let blob_records = blob_gc_blob_records(&plan.records);
 
         let indexes = match blob::write_blob_file_with_backend_with_durability(
-            self.inner.storage.filesystem_files()?,
+            storage,
             db_path,
             plan.new_blob_file_id,
             header,
@@ -77,11 +84,7 @@ impl Db {
         ) {
             Ok(indexes) => indexes,
             Err(error) => {
-                let _ = remove_storage_files(
-                    self.inner.storage.filesystem_files()?,
-                    db_path,
-                    &written_table_ids,
-                );
+                let _ = remove_storage_files(storage, db_path, &written_table_ids);
                 return Err(error);
             }
         };
@@ -90,48 +93,32 @@ impl Db {
         let output_bytes = match apply_blob_gc_indexes(&mut tables, plan.records, indexes) {
             Ok(output_bytes) => output_bytes,
             Err(error) => {
-                let _ = remove_storage_files(
-                    self.inner.storage.filesystem_files()?,
-                    db_path,
-                    &written_table_ids,
-                );
+                let _ = remove_storage_files(storage, db_path, &written_table_ids);
                 return Err(error);
             }
         };
         let outputs = match write_blob_gc_replacement_tables(
-            self.inner.storage.filesystem_files()?,
+            storage,
             db_path,
             tables,
             self.filesystem_publish_durability(),
         ) {
             Ok(outputs) => outputs,
             Err(error) => {
-                let _ = remove_storage_files(
-                    self.inner.storage.filesystem_files()?,
-                    db_path,
-                    &written_table_ids,
-                );
+                let _ = remove_storage_files(storage, db_path, &written_table_ids);
                 return Err(error);
             }
         };
 
         if let Err(error) = self.sync_filesystem_directory_after_renames(db_path) {
-            let _ = remove_storage_files(
-                self.inner.storage.filesystem_files()?,
-                db_path,
-                &written_table_ids,
-            );
+            let _ = remove_storage_files(storage, db_path, &written_table_ids);
             return Err(error);
         }
 
         if let Err(error) = self.publish_compacted_tables(&outputs, &obsolete_blob_ids) {
             let error = self.close_after_manifest_durability_failure("blob GC", error);
             if !self.closed_after_durable_publish_error() {
-                let _ = remove_storage_files(
-                    self.inner.storage.filesystem_files()?,
-                    db_path,
-                    &written_table_ids,
-                );
+                let _ = remove_storage_files(storage, db_path, &written_table_ids);
             }
             return Err(error);
         }
@@ -169,10 +156,7 @@ impl Db {
             crate::codec::CodecId::None,
         );
         let blob_records = blob_gc_blob_records(&plan.records);
-        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        let storage = self.inner.storage.filesystem_files_cloned()?;
-        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-        let storage = self.browser_storage()?;
+        let storage = self.host_blob_gc_storage()?;
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let durability = self.filesystem_publish_durability();
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -274,6 +258,26 @@ impl Db {
             .await;
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn host_blob_gc_storage(&self) -> Result<crate::storage::NativeFileBackend> {
+        let DatabaseStorageRef::Filesystem(resources) = self.inner.storage.resources() else {
+            return Err(Error::unsupported_backend(
+                "native blob GC requires filesystem storage",
+            ));
+        };
+        Ok(resources.files.clone())
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    fn host_blob_gc_storage(&self) -> Result<crate::storage::BrowserStorageBackend> {
+        let DatabaseStorageRef::Browser(resources) = self.inner.storage.resources() else {
+            return Err(Error::unsupported_backend(
+                "browser blob GC requires browser storage",
+            ));
+        };
+        Ok(resources.files.clone())
+    }
+
     fn record_blob_gc_stats(&self, input_bytes: u64, output_bytes: u64, discarded_bytes: u64) {
         self.inner.blob_gc_runs.fetch_add(1, Ordering::AcqRel);
         self.inner
@@ -291,6 +295,12 @@ impl Db {
         &self,
         db_path: &Path,
     ) -> Result<Option<BlobGcRewritePlan>> {
+        let DatabaseStorageRef::Filesystem(resources) = self.inner.storage.resources() else {
+            return Err(Error::unsupported_backend(
+                "blob GC planning requires filesystem storage",
+            ));
+        };
+        let storage = resources.files;
         let candidates = self.choose_blob_gc_candidates(db_path)?;
         if candidates.is_empty() {
             return Ok(None);
@@ -338,7 +348,7 @@ impl Db {
                         continue;
                     }
                     let blob_record = blob::read_record_for_index_with_backend(
-                        self.inner.storage.filesystem_files()?,
+                        storage,
                         db_path,
                         index,
                         Some(&point_record.internal_key),
@@ -454,7 +464,14 @@ impl Db {
             .map(|candidate| candidate.file_id)
             .collect::<BTreeSet<_>>();
 
-        let storage = self.inner.storage.filesystem_files_cloned()?;
+        let storage = match self.inner.storage.resources() {
+            DatabaseStorageRef::Filesystem(resources) => resources.files.clone(),
+            _ => {
+                return Err(Error::unsupported_backend(
+                    "native blob GC planning requires filesystem storage",
+                ));
+            }
+        };
         let rewrite_table_count = self.count_blob_gc_rewrite_tables(&candidate_file_ids)?;
         let reservation_count =
             rewrite_table_count
@@ -561,7 +578,7 @@ impl Db {
             .map(|candidate| candidate.file_id)
             .collect::<BTreeSet<_>>();
 
-        let storage = self.browser_storage()?;
+        let storage = self.host_blob_gc_storage()?;
         let rewrite_table_count = self.count_blob_gc_rewrite_tables(&candidate_file_ids)?;
         let reservation_count =
             rewrite_table_count
@@ -656,15 +673,17 @@ impl Db {
         &self,
         db_path: &Path,
     ) -> Result<Vec<BlobGcCandidate>> {
+        let DatabaseStorageRef::Filesystem(resources) = self.inner.storage.resources() else {
+            return Err(Error::unsupported_backend(
+                "blob GC candidate selection requires filesystem storage",
+            ));
+        };
         let live_bytes_by_file = self.live_blob_bytes_by_file()?;
         let mut candidates = Vec::new();
 
         for (file_id, live_bytes) in live_bytes_by_file {
-            let properties = blob::read_blob_file_properties_with_backend(
-                self.inner.storage.filesystem_files()?,
-                db_path,
-                file_id,
-            )?;
+            let properties =
+                blob::read_blob_file_properties_with_backend(resources.files, db_path, file_id)?;
             let total_bytes = properties.encoded_bytes;
             if total_bytes < self.inner.options.blob_gc_min_file_bytes {
                 continue;
@@ -701,7 +720,14 @@ impl Db {
         db_path: &Path,
     ) -> Result<Vec<BlobGcCandidate>> {
         let live_bytes_by_file = self.live_blob_bytes_by_file()?;
-        let storage = self.inner.storage.filesystem_files_cloned()?;
+        let storage = match self.inner.storage.resources() {
+            DatabaseStorageRef::Filesystem(resources) => resources.files.clone(),
+            _ => {
+                return Err(Error::unsupported_backend(
+                    "native blob candidate selection requires filesystem storage",
+                ));
+            }
+        };
         let mut candidates = Vec::new();
 
         for (file_id, live_bytes) in live_bytes_by_file {
@@ -744,7 +770,14 @@ impl Db {
         db_path: &Path,
     ) -> Result<Vec<BlobGcCandidate>> {
         let live_bytes_by_file = self.live_blob_bytes_by_file()?;
-        let storage = self.browser_storage()?;
+        let storage = match self.inner.storage.resources() {
+            DatabaseStorageRef::Browser(resources) => resources.files.clone(),
+            _ => {
+                return Err(Error::unsupported_backend(
+                    "browser blob candidate selection requires browser storage",
+                ));
+            }
+        };
         let mut candidates = Vec::new();
 
         for (file_id, live_bytes) in live_bytes_by_file {
@@ -787,7 +820,14 @@ impl Db {
         db_path: &Path,
         tables: Vec<BlobGcRewriteTable>,
     ) -> Result<Vec<NamedCompactionOutput>> {
-        let storage = self.inner.storage.filesystem_files_cloned()?;
+        let storage = match self.inner.storage.resources() {
+            DatabaseStorageRef::Filesystem(resources) => resources.files.clone(),
+            _ => {
+                return Err(Error::unsupported_backend(
+                    "native blob table rewrite requires filesystem storage",
+                ));
+            }
+        };
         let mut outputs = Vec::with_capacity(tables.len());
         for rewrite_table in tables {
             let table_path = table::table_path(db_path, rewrite_table.output_table_id);
@@ -829,7 +869,14 @@ impl Db {
         db_path: &Path,
         tables: Vec<BlobGcRewriteTable>,
     ) -> Result<Vec<NamedCompactionOutput>> {
-        let storage = self.browser_storage()?;
+        let storage = match self.inner.storage.resources() {
+            DatabaseStorageRef::Browser(resources) => resources.files.clone(),
+            _ => {
+                return Err(Error::unsupported_backend(
+                    "browser blob table rewrite requires browser storage",
+                ));
+            }
+        };
         let mut outputs = Vec::with_capacity(tables.len());
         for rewrite_table in tables {
             let table_path = table::table_path(db_path, rewrite_table.output_table_id);

@@ -26,14 +26,23 @@
   module.
 - Split open, durability-substrate, and platform-I/O files at responsibility
   boundaries without changing storage formats or durability semantics.
-- Add source-boundary checks and object-store branch acceptance before closing
-  the slice.
+- Add compile-checked architecture contracts and object-store branch
+  acceptance before closing the slice.
 
 The slice is complete. The engine now owns exactly one `DatabaseStorage`
 variant, branch APIs are async-first with explicitly named native sync
 adapters, and immutable-content transaction behavior lives outside the generic
 transaction core. Responsibility-focused modules and executable architecture
 checks prevent the retired mixed boundaries from returning.
+
+The follow-up refinement is also complete locally. Branch registry, state,
+handle I/O, range merge, transitions, and API orchestration now have separate
+modules. Sync Branch APIs drive the same async orchestration and range merge,
+so there is only one lifecycle execution path. Content transaction extensions
+are divided by lifecycle capability. Transaction state has its own private
+module without inventing a separately published crate. Backend-specific
+clients and coordinates are exposed only through exhaustive typed resource
+bundles.
 
 ### Evidence collected
 
@@ -76,15 +85,16 @@ checks prevent the retired mixed boundaries from returning.
     Local macOS evidence observed more than one native future in flight; both
     native and managed full library suites, the all-feature suite, strict
     Clippy, Rustdoc, and doctests passed.
-14. The architecture remediation slice passed a clean-build all-feature run:
-    604 core tests passed with 4 intentionally ignored, the 10-feature
+14. The architecture remediation slice passed a clean-build all-feature run.
+    Its refinement passed 606 core tests with 4 intentionally ignored, the 10-feature
     acceptance corpus passed all 52 scenarios and 352 steps, the durable branch
     profile passed all 6 scenarios and 55 steps, and all 31 doctests passed.
-15. Five architecture checks enforce singular backend ownership,
-    content-neutral generic transactions, a genuinely asynchronous branch
-    range path, narrow storage capabilities, and the new responsibility-based
-    file tree. Strict native/browser Clippy and the warning-denied WASI library
-    check also passed.
+15. Exhaustive storage types enforce singular backend ownership and prevent
+    wrong-backend capability access. Integration contracts compile-check the
+    public async/sync branch and transaction APIs. Rust module declarations make
+    every responsibility module a compile dependency; no source-text or
+    file-tree architecture assertions remain. Strict native/browser Clippy and
+    the warning-denied WASI library check also passed.
 
 ### Residual scope
 

@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use crate::{
     bucket::{DEFAULT_BUCKET_NAME, require_internal_bucket, validate_user_named_bucket},
     db::Db,
@@ -7,8 +5,14 @@ use crate::{
     iterator::Iter,
     options::WriteOptions,
     types::{CommitInfo, KeyRange, ReadVersion, Sequence, Value},
-    write_batch::WriteBatch,
 };
+
+mod core;
+
+#[cfg(test)]
+pub(crate) use core::ReadKey;
+use core::TransactionCore;
+pub(crate) use core::TransactionReadSet;
 
 /// Options used by optimistic transactions.
 ///
@@ -27,7 +31,7 @@ pub struct TransactionOptions {
 /// Methods ending in `_bucket` operate on optional named buckets.
 ///
 /// Reads are performed at the transaction's `read_sequence` and recorded in a
-/// read set. Writes are staged in memory through a [`WriteBatch`]. Commit checks
+/// read set. Writes are staged in memory through a [`crate::WriteBatch`]. Commit checks
 /// whether any later committed point write, point delete, or range delete
 /// conflicts with the recorded reads; if so, commit returns
 /// [`crate::Error::Conflict`] and none of the staged writes are accepted.
@@ -54,30 +58,7 @@ pub struct TransactionOptions {
 #[derive(Debug, Clone)]
 pub struct Transaction {
     db: Db,
-    read_sequence: Sequence,
-    options: TransactionOptions,
-    writes: WriteBatch,
-    point_reads: Vec<ReadKey>,
-    range_reads: Vec<ReadRange>,
-    extension_claims: BTreeMap<Vec<u8>, [u8; 16]>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReadKey {
-    pub(crate) bucket: String,
-    pub(crate) key: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReadRange {
-    pub(crate) bucket: String,
-    pub(crate) range: KeyRange,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct TransactionReadSet {
-    pub(crate) point_reads: Vec<ReadKey>,
-    pub(crate) range_reads: Vec<ReadRange>,
+    core: TransactionCore,
 }
 
 impl Transaction {
@@ -85,12 +66,7 @@ impl Transaction {
     pub(crate) fn new(db: Db, read_sequence: Sequence, options: TransactionOptions) -> Self {
         Self {
             db,
-            read_sequence,
-            options,
-            writes: WriteBatch::new(),
-            point_reads: Vec::new(),
-            range_reads: Vec::new(),
-            extension_claims: BTreeMap::new(),
+            core: TransactionCore::new(read_sequence, options),
         }
     }
 
@@ -101,25 +77,29 @@ impl Transaction {
     /// commit before the transaction commits.
     #[must_use]
     pub const fn read_version(&self) -> ReadVersion {
-        ReadVersion::from_sequence(self.read_sequence)
+        ReadVersion::from_sequence(self.core.read_sequence())
     }
 
     /// Returns this transaction's options.
     #[must_use]
     pub const fn options(&self) -> TransactionOptions {
-        self.options
+        self.core.options()
     }
 
     pub(crate) const fn database(&self) -> &Db {
         &self.db
     }
 
+    const fn read_sequence(&self) -> Sequence {
+        self.core.read_sequence()
+    }
+
     pub(crate) fn extension_claim(&self, key: &[u8]) -> Option<[u8; 16]> {
-        self.extension_claims.get(key).copied()
+        self.core.extension_claim(key)
     }
 
     pub(crate) fn record_extension_claim(&mut self, key: Vec<u8>, claim: [u8; 16]) {
-        self.extension_claims.insert(key, claim);
+        self.core.record_extension_claim(key, claim);
     }
 
     /// Reads a default-bucket key and tracks it for commit conflict checks.
@@ -162,14 +142,13 @@ impl Transaction {
     }
 
     fn get_bucket_sync_unchecked(&mut self, bucket: String, key: &[u8]) -> Result<Option<Value>> {
-        let value = self.db.get_at_sequence(&bucket, key, self.read_sequence)?;
+        let value = self
+            .db
+            .get_at_sequence(&bucket, key, self.read_sequence())?;
         // Record the exact user key read at the transaction's read sequence.
         // Commit validation rejects the transaction if a later committed point
         // write, point delete, or covering range delete touched it.
-        self.point_reads.push(ReadKey {
-            bucket,
-            key: key.to_vec(),
-        });
+        self.core.record_point_read(bucket, key.to_vec());
 
         Ok(value)
     }
@@ -202,7 +181,7 @@ impl Transaction {
         let iter = self.db.range_at_sequence(
             &bucket,
             &range,
-            self.read_sequence,
+            self.read_sequence(),
             crate::Direction::Forward,
         )?;
         // The transaction API records a range that was actually read at the
@@ -213,7 +192,7 @@ impl Transaction {
         }
         // Range reads conflict with any later committed point mutation inside
         // the range, plus any later range tombstone that overlaps it.
-        self.range_reads.push(ReadRange { bucket, range });
+        self.core.record_range_read(bucket, range);
 
         Ok(())
     }
@@ -244,25 +223,15 @@ impl Transaction {
         self.range_bucket_sync_unchecked(bucket, range)
     }
 
-    pub(crate) fn range_internal_bucket_sync(
-        &mut self,
-        bucket: impl Into<String>,
-        range: KeyRange,
-    ) -> Result<Iter> {
-        let bucket = bucket.into();
-        require_internal_bucket(&bucket)?;
-        self.range_bucket_sync_unchecked(bucket, range)
-    }
-
     fn range_bucket_sync_unchecked(&mut self, bucket: String, range: KeyRange) -> Result<Iter> {
         self.db.ensure_open()?;
         let iter = self.db.range_at_sequence(
             &bucket,
             &range,
-            self.read_sequence,
+            self.read_sequence(),
             crate::Direction::Forward,
         )?;
-        self.range_reads.push(ReadRange { bucket, range });
+        self.core.record_range_read(bucket, range);
 
         Ok(iter)
     }
@@ -272,7 +241,7 @@ impl Transaction {
     /// Staging only mutates the in-memory transaction batch. The write is not
     /// visible and does not reserve a commit sequence until commit succeeds.
     pub fn put(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Value>) {
-        self.writes.put(key, value);
+        self.core.writes_mut().put(key, value);
     }
 
     /// Stages one key/value write for a named bucket.
@@ -282,7 +251,7 @@ impl Transaction {
         key: impl Into<Vec<u8>>,
         value: impl Into<Value>,
     ) -> Result<()> {
-        self.writes.put_bucket(bucket, key, value)
+        self.core.writes_mut().put_bucket(bucket, key, value)
     }
 
     pub(crate) fn put_internal_bucket(
@@ -291,7 +260,9 @@ impl Transaction {
         key: impl Into<Vec<u8>>,
         value: impl Into<Value>,
     ) -> Result<()> {
-        self.writes.put_internal_bucket(bucket, key, value)
+        self.core
+            .writes_mut()
+            .put_internal_bucket(bucket, key, value)
     }
 
     /// Stages a named-bucket value containing this transaction's final commit
@@ -357,7 +328,8 @@ impl Transaction {
         prefix: &[u8],
         suffix: &[u8],
     ) -> Result<()> {
-        self.writes
+        self.core
+            .writes_mut()
             .put_bucket_with_commit_sequence(bucket, key, prefix, suffix)
     }
 
@@ -368,13 +340,14 @@ impl Transaction {
         prefix: &[u8],
         suffix: &[u8],
     ) -> Result<()> {
-        self.writes
+        self.core
+            .writes_mut()
             .put_internal_bucket_with_commit_sequence(bucket, key, prefix, suffix)
     }
 
     /// Stages a point delete for the default bucket.
     pub fn delete(&mut self, key: impl Into<Vec<u8>>) {
-        self.writes.delete(key);
+        self.core.writes_mut().delete(key);
     }
 
     /// Stages a point delete for a named bucket.
@@ -383,7 +356,7 @@ impl Transaction {
         bucket: impl Into<String>,
         key: impl Into<Vec<u8>>,
     ) -> Result<()> {
-        self.writes.delete_bucket(bucket, key)
+        self.core.writes_mut().delete_bucket(bucket, key)
     }
 
     pub(crate) fn delete_internal_bucket(
@@ -391,12 +364,12 @@ impl Transaction {
         bucket: impl Into<String>,
         key: impl Into<Vec<u8>>,
     ) -> Result<()> {
-        self.writes.delete_internal_bucket(bucket, key)
+        self.core.writes_mut().delete_internal_bucket(bucket, key)
     }
 
     /// Stages a range delete for the default bucket.
     pub fn delete_range(&mut self, range: KeyRange) {
-        self.writes.delete_range(range);
+        self.core.writes_mut().delete_range(range);
     }
 
     /// Stages a range delete for a named bucket.
@@ -405,7 +378,7 @@ impl Transaction {
         bucket: impl Into<String>,
         range: KeyRange,
     ) -> Result<()> {
-        self.writes.delete_range_bucket(bucket, range)
+        self.core.writes_mut().delete_range_bucket(bucket, range)
     }
 
     /// Commits the staged writes synchronously after conflict checks.
@@ -425,17 +398,9 @@ impl Transaction {
     /// the same write errors as [`crate::Db::write_sync`] for storage,
     /// durability, or closed/read-only handle failures.
     pub fn commit_sync(self) -> Result<CommitInfo> {
-        let read_set = TransactionReadSet {
-            point_reads: self.point_reads,
-            range_reads: self.range_reads,
-        };
-
-        self.db.commit_transaction(
-            self.read_sequence,
-            read_set,
-            self.writes,
-            self.options.write_options,
-        )
+        let (read_sequence, read_set, writes, options) = self.core.into_commit_parts();
+        self.db
+            .commit_transaction(read_sequence, read_set, writes, options.write_options)
     }
 }
 
@@ -473,12 +438,9 @@ impl Transaction {
     async fn get_bucket_unchecked(&mut self, bucket: String, key: &[u8]) -> Result<Option<Value>> {
         let value = self
             .db
-            .get_at_sequence_async(&bucket, key, self.read_sequence)
+            .get_at_sequence_async(&bucket, key, self.read_sequence())
             .await?;
-        self.point_reads.push(ReadKey {
-            bucket,
-            key: key.to_vec(),
-        });
+        self.core.record_point_read(bucket, key.to_vec());
 
         Ok(value)
     }
@@ -507,12 +469,12 @@ impl Transaction {
             .range_at_sequence_async(
                 &bucket,
                 &range,
-                self.read_sequence,
+                self.read_sequence(),
                 crate::Direction::Forward,
             )
             .await?;
         while iter.next().await?.is_some() {}
-        self.range_reads.push(ReadRange { bucket, range });
+        self.core.record_range_read(bucket, range);
 
         Ok(())
     }
@@ -554,29 +516,20 @@ impl Transaction {
             .range_at_sequence_async(
                 &bucket,
                 &range,
-                self.read_sequence,
+                self.read_sequence(),
                 crate::Direction::Forward,
             )
             .await?;
-        self.range_reads.push(ReadRange { bucket, range });
+        self.core.record_range_read(bucket, range);
 
         Ok(iter)
     }
 
     /// Commits the staged writes asynchronously after conflict checks.
     pub async fn commit(self) -> Result<CommitInfo> {
-        let read_set = TransactionReadSet {
-            point_reads: self.point_reads,
-            range_reads: self.range_reads,
-        };
-
+        let (read_sequence, read_set, writes, options) = self.core.into_commit_parts();
         self.db
-            .commit_transaction_async(
-                self.read_sequence,
-                read_set,
-                self.writes,
-                self.options.write_options,
-            )
+            .commit_transaction_async(read_sequence, read_set, writes, options.write_options)
             .await
     }
 }

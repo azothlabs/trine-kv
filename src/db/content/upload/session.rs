@@ -157,7 +157,7 @@ impl Db {
         }
         let options = options.validate()?;
         let upload_guard = self.lock_content_upload(upload_id).await;
-        let object = self.content_upload_state_object(upload_id)?;
+        let object = self.content_upload_state_object(upload_id);
         if let Some(bytes) = self.read_content_object(object).await? {
             if let Some(retirement) = decode_upload_id_tombstone(&bytes, upload_id)? {
                 return Err(match retirement {

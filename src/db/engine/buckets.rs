@@ -4,6 +4,8 @@ use super::{
     WriteOptions, lock_poisoned, validate_bucket_options,
 };
 use crate::bucket::{require_internal_bucket, validate_user_named_bucket};
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use crate::db::DatabaseStorageRef;
 
 impl Db {
     /// Returns a handle for the built-in default bucket.
@@ -144,12 +146,6 @@ impl Db {
     pub fn drop_bucket_sync(&self, name: impl Into<BucketName>) -> Result<()> {
         let name = name.into();
         validate_user_named_bucket(name.as_str())?;
-        self.drop_bucket_sync_unchecked(&name)
-    }
-
-    pub(crate) fn drop_internal_bucket_sync(&self, name: impl Into<BucketName>) -> Result<()> {
-        let name = name.into();
-        require_internal_bucket(name.as_str())?;
         self.drop_bucket_sync_unchecked(&name)
     }
 
@@ -337,7 +333,12 @@ impl Db {
             remove_bucket_state(&self.inner.buckets, name.as_str(), &tree)?;
             drop_guard.commit();
             drop(tree);
-            let db_path = self.browser_db_path()?;
+            let DatabaseStorageRef::Browser(resources) = self.inner.storage.resources() else {
+                return Err(Error::unsupported_backend(
+                    "browser bucket deletion requires browser storage",
+                ));
+            };
+            let db_path = resources.root;
             self.retire_obsolete_table_files_browser_async(db_path, tables)
                 .await?;
             self.cleanup_pending_obsolete_blob_files_browser_async(db_path)

@@ -8,19 +8,32 @@ use super::{
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use super::{Ordering, shutdown_background_workers, sync_storage_directory_after_renames_async};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-use crate::{ReadVersion, storage::BrowserStorageBackend};
+use crate::ReadVersion;
+use crate::db::DatabaseStorageRef;
+use std::future::Future;
 
 impl Db {
-    pub(in crate::db) fn storage_read_path(&self) -> Result<Option<&Path>> {
-        match &self.inner.options.storage_mode {
-            StorageMode::InMemory => Ok(None),
-            StorageMode::Persistent { path }
-            | StorageMode::HostPersistent {
-                backend: HostStorageBackend::Wasi { path } | HostStorageBackend::Browser { path },
-            } => Ok(Some(path)),
-            StorageMode::HostPersistent {
-                backend: HostStorageBackend::ObjectStore,
-            } => self.object_store_db_path().map(Some),
+    pub(crate) fn block_on_sync_api<T>(
+        &self,
+        future: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        if self.inner.options.storage_mode.is_object_store_persistent()
+            || self.inner.options.storage_mode.is_browser_persistent()
+        {
+            return Err(Error::unsupported_backend(
+                "selected storage backend requires the async API",
+            ));
+        }
+        futures::executor::block_on(future)
+    }
+
+    pub(in crate::db) fn storage_read_path(&self) -> Option<&Path> {
+        match self.inner.storage.resources() {
+            DatabaseStorageRef::Memory(_) => None,
+            DatabaseStorageRef::Filesystem(resources) => Some(resources.root),
+            DatabaseStorageRef::ObjectStore(resources) => Some(resources.prefix),
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            DatabaseStorageRef::Browser(resources) => Some(resources.root),
         }
     }
 
@@ -77,36 +90,6 @@ impl Db {
         }
     }
 
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    pub(in crate::db) fn browser_storage(&self) -> Result<BrowserStorageBackend> {
-        self.inner.storage.browser_files()
-    }
-
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    pub(in crate::db) fn browser_db_path(&self) -> Result<&Path> {
-        self.inner
-            .options
-            .storage_mode
-            .browser_path()
-            .ok_or_else(|| Error::Corruption {
-                message: "browser persistent database is missing namespace path".to_owned(),
-            })
-    }
-
-    pub(in crate::db) fn object_storage(&self) -> Result<ObjectStoreBackend> {
-        self.inner.storage.object_store_objects()
-    }
-
-    pub(in crate::db) fn object_wal_storage(&self) -> Result<ObjectStoreBackend> {
-        self.inner.storage.object_store_wal_objects()
-    }
-
-    /// The key prefix (as a `db_path`) under which this object-store database's
-    /// keys live; empty for a bucket-root database.
-    pub(in crate::db) fn object_store_db_path(&self) -> Result<&Path> {
-        self.inner.storage.object_store_prefix()
-    }
-
     /// Flush all immutable memtables to objects, publish them via the manifest
     /// CAS, then clean remote WAL objects covered by the new replay floor.
     ///
@@ -119,12 +102,17 @@ impl Db {
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
-        let db_path = self.object_store_db_path()?;
+        let DatabaseStorageRef::ObjectStore(resources) = self.inner.storage.resources() else {
+            return Err(Error::unsupported_backend(
+                "object-store flush requires an object-store database",
+            ));
+        };
         let target_sequence = self.freeze_public_flush_target()?;
         while self.has_immutable_memtables_at_or_below(target_sequence)? {
             let outcome = self
                 .run_flush_once_with_budget_object_store_async(
-                    db_path,
+                    resources.objects,
+                    resources.prefix,
                     MaintenanceBudget::unbounded(),
                 )
                 .await?;
@@ -146,12 +134,20 @@ impl Db {
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
-        let db_path = self.object_store_db_path()?;
+        let DatabaseStorageRef::ObjectStore(resources) = self.inner.storage.resources() else {
+            return Err(Error::unsupported_backend(
+                "object-store flush requires an object-store database",
+            ));
+        };
         if !self.has_immutable_memtables()? {
             return Ok(MaintenanceOutcome::default());
         }
-        self.run_flush_once_with_budget_object_store_async(db_path, budget)
-            .await
+        self.run_flush_once_with_budget_object_store_async(
+            resources.objects,
+            resources.prefix,
+            budget,
+        )
+        .await
     }
 
     pub(in crate::db) fn filesystem_publish_durability(&self) -> DurabilityMode {
@@ -169,7 +165,12 @@ impl Db {
         if self.inner.options.storage_mode.is_wasi_persistent() {
             Ok(())
         } else {
-            sync_storage_directory_after_renames(self.inner.storage.filesystem_files()?, db_path)
+            let DatabaseStorageRef::Filesystem(resources) = self.inner.storage.resources() else {
+                return Err(Error::unsupported_backend(
+                    "directory synchronization requires filesystem storage",
+                ));
+            };
+            sync_storage_directory_after_renames(resources.files, db_path)
         }
     }
 
@@ -181,16 +182,18 @@ impl Db {
         if self.inner.options.storage_mode.is_wasi_persistent() {
             Ok(())
         } else {
-            sync_storage_directory_after_renames_async(
-                self.inner.storage.filesystem_files()?,
-                db_path,
-            )
-            .await
+            let DatabaseStorageRef::Filesystem(resources) = self.inner.storage.resources() else {
+                return Err(Error::unsupported_backend(
+                    "directory synchronization requires filesystem storage",
+                ));
+            };
+            sync_storage_directory_after_renames_async(resources.files, db_path).await
         }
     }
 
     pub(in crate::db) async fn run_flush_once_with_budget_object_store_async(
         &self,
+        backend: &ObjectStoreBackend,
         db_path: &Path,
         budget: MaintenanceBudget,
     ) -> Result<MaintenanceOutcome> {
@@ -200,7 +203,7 @@ impl Db {
 
         let (flush_inputs, budget_exhausted) = self.collect_flush_inputs_with_budget(budget)?;
         let flush_count = flush_inputs.len();
-        self.write_flush_inputs_object_store_async(db_path, &flush_inputs)
+        self.write_flush_inputs_object_store_async(backend, db_path, &flush_inputs)
             .await?;
         let outcome = MaintenanceOutcome {
             flushes: flush_count,
@@ -215,6 +218,7 @@ impl Db {
 
     pub(in crate::db) async fn write_flush_inputs_object_store_async(
         &self,
+        backend: &ObjectStoreBackend,
         db_path: &Path,
         flush_inputs: &[NamedFlushInput],
     ) -> Result<()> {
@@ -224,7 +228,6 @@ impl Db {
         let mut file_ids = self
             .reserve_file_ids_object_store_async(flush_inputs.len())
             .await?;
-        let backend = self.object_storage()?;
         let mut written_tables = Vec::with_capacity(flush_inputs.len());
         for input in flush_inputs {
             let table_id = file_ids.next_table_id()?;
@@ -233,7 +236,7 @@ impl Db {
             // unreferenced. It remains a safe permanent gap until remote reader
             // retirement is represented durably.
             let table = table::write_table_with_backend_async(
-                &backend,
+                backend,
                 &table_path,
                 table_id,
                 input.input.table_level,
@@ -462,6 +465,7 @@ impl Db {
     #[allow(clippy::too_many_lines)] // faithful mirror of the browser compaction orchestration
     pub(in crate::db) async fn run_compaction_once_object_store_async(
         &self,
+        backend: &ObjectStoreBackend,
         db_path: &Path,
         range: &KeyRange,
         local_l0_compaction: bool,
@@ -510,6 +514,7 @@ impl Db {
             written_table_ids: _,
         } = self
             .build_compaction_outputs_object_store_async(
+                backend,
                 db_path,
                 oldest_active_snapshot,
                 &compaction_inputs,
@@ -587,11 +592,11 @@ impl Db {
     /// browser version except for conservative remote retention.
     pub(in crate::db) async fn build_compaction_outputs_object_store_async(
         &self,
+        backend: &ObjectStoreBackend,
         db_path: &Path,
         oldest_active_snapshot: Sequence,
         compaction_inputs: &[NamedCompactionInput],
     ) -> Result<PendingCompactionOutputs> {
-        let backend = self.object_storage()?;
         let rewrites =
             self.prepare_compaction_rewrites(oldest_active_snapshot, compaction_inputs)?;
         let output_table_count = rewrites
@@ -628,7 +633,7 @@ impl Db {
                 let table_path = table::table_path(db_path, table_id);
                 written_table_ids.push(table_id);
                 let table = table::write_table_with_backend_async(
-                    &backend,
+                    backend,
                     &table_path,
                     table_id,
                     input.input.table_level,
@@ -682,11 +687,15 @@ impl Db {
         ) {
             return Err(Error::unsupported_durability(mode));
         }
-        let Some(wal) = self.inner.storage.browser_wal() else {
+        let DatabaseStorageRef::Browser(resources) = self.inner.storage.resources() else {
+            return Err(Error::unsupported_backend(
+                "browser WAL persistence requires browser storage",
+            ));
+        };
+        let Some(wal) = resources.wal else {
             return Ok(());
         };
-        let storage = self.browser_storage()?;
-        wal.persist(&storage, self.browser_db_path()?, mode).await
+        wal.persist(resources.files, resources.root, mode).await
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -1038,7 +1047,12 @@ impl Db {
         }
         self.take_background_maintenance_error()?;
 
-        let db_path = self.browser_db_path()?;
+        let DatabaseStorageRef::Browser(resources) = self.inner.storage.resources() else {
+            return Err(Error::unsupported_backend(
+                "browser flush requires browser storage",
+            ));
+        };
+        let db_path = resources.root;
         let target_sequence = self.freeze_public_flush_target()?;
         let mut should_compact = false;
 
@@ -1097,9 +1111,14 @@ impl Db {
             return Err(Error::ReadOnly);
         }
 
+        let DatabaseStorageRef::Browser(resources) = self.inner.storage.resources() else {
+            return Err(Error::unsupported_backend(
+                "browser compaction requires browser storage",
+            ));
+        };
         let outcome = self
             .run_compaction_once_with_budget_host_async(
-                self.browser_db_path()?,
+                resources.root,
                 &range,
                 false,
                 MaintenanceBudget::unbounded(),
@@ -1125,13 +1144,13 @@ impl Db {
             return Err(Error::ReadOnly);
         }
 
-        self.run_compaction_once_with_budget_host_async(
-            self.browser_db_path()?,
-            &range,
-            false,
-            budget,
-        )
-        .await
+        let DatabaseStorageRef::Browser(resources) = self.inner.storage.resources() else {
+            return Err(Error::unsupported_backend(
+                "browser compaction requires browser storage",
+            ));
+        };
+        self.run_compaction_once_with_budget_host_async(resources.root, &range, false, budget)
+            .await
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -1145,7 +1164,12 @@ impl Db {
             return Err(Error::ReadOnly);
         }
 
-        let db_path = self.browser_db_path()?;
+        let DatabaseStorageRef::Browser(resources) = self.inner.storage.resources() else {
+            return Err(Error::unsupported_backend(
+                "browser maintenance requires browser storage",
+            ));
+        };
+        let db_path = resources.root;
         let mut outcome = MaintenanceOutcome::default();
         let mut should_compact = self.l0_pressure_exceeded()?;
 
