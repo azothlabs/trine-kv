@@ -17188,3 +17188,49 @@ Negative check:
 - Cargo audit scanned 368 locked dependencies against 1,169 advisories and
   reported no vulnerability. Seven script tests, documentation drift, workflow
   YAML parsing, formatting, and diff hygiene passed.
+
+## 2026-07-26: WASI release-gate dependency correction
+
+### Observation
+
+- The hosted WASI persistence command failed before running Trine tests because
+  unconditional `proptest` defaults selected `rusty-fork` and
+  `wait-timeout`. `wait-timeout 0.2.1` defines its implementation only for
+  Unix and Windows, so its WASI build had no `imp` module.
+- Once that compile blocker was removed, two WASI writer-lock tests still
+  expected the pre-0.6 `Corruption` category instead of the accepted
+  `LeaseUnavailable` writer-ownership contract.
+
+### Implementation
+
+- `cucumber`, `loom`, and `proptest` are now dev-dependencies only on non-WASM
+  targets. Their tests require host processes, threads, or native acceptance
+  runners and do not belong in browser or WASI target builds.
+- The WASI lock tests now verify `LeaseUnavailable`, preservation of the lock
+  file, and continued usability of the original writer.
+- CI runs native, WASI, and browser verification as independent jobs. The
+  documentation drift check enforces those job boundaries. A result-only
+  `Verify` job preserves the aggregate required check without serializing the
+  target work.
+
+### Verification
+
+- From a new target directory, the exact hosted WASI command compiled without
+  the host-only test dependency chain and passed all seven persistence tests.
+- Native all-target/all-feature tests and strict Clippy passed. The native
+  suite included 599 passing library tests, 52 backend-neutral Gherkin
+  scenarios, and 6 durable-native branch scenarios.
+- WASI warning-denied check, browser Clippy, documentation drift, script tests,
+  workflow YAML parsing, formatting, and diff hygiene passed.
+- Forced-exit recovery, nine destructive tests, and a 10,000-operation
+  concurrent mixed-load reopen run passed.
+
+### Remaining release evidence
+
+- The corrected changes are not committed, so `cargo package --locked` and
+  hosted checks for the exact corrected commit cannot yet pass.
+- Local browser test binaries compiled, but Safari WebDriver was killed before
+  executing them. The independent hosted Chrome job must pass after the
+  corrected commit is pushed.
+- Linux/macOS/Windows production-evidence jobs and a publishing dry run must
+  pass for the exact release commit before publishing 0.6.0.

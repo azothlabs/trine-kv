@@ -173,6 +173,36 @@ def check_release_contract() -> list[str]:
         "crate package contains repository-only files",
     )
     errors = check_checkout_action_versions()
+    ci_text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    ci_job_boundaries = (
+        ("native-verify", "wasi-verify"),
+        ("wasi-verify", "browser-verify"),
+        ("browser-verify", "verify"),
+        ("verify", "windows-platform-io"),
+    )
+    ci_job_requirements = {
+        "native-verify": "cargo test --all-targets --all-features",
+        "wasi-verify": "cargo test --target wasm32-wasip1 --lib wasi_persistent",
+        "browser-verify": (
+            "cargo test --target wasm32-unknown-unknown "
+            "--test browser_persistent_wasm"
+        ),
+        "verify": "Require every primary target gate",
+    }
+    for job, next_job in ci_job_boundaries:
+        marker = f"  {job}:"
+        next_marker = f"  {next_job}:"
+        if ci_text.count(marker) != 1 or ci_text.count(next_marker) != 1:
+            errors.append(
+                ".github/workflows/ci.yml: native, WASI, and browser verification "
+                "must remain separate jobs"
+            )
+            break
+        job_text = ci_text.partition(marker)[2].partition(next_marker)[0]
+        if ci_job_requirements[job] not in job_text:
+            errors.append(
+                f".github/workflows/ci.yml: {job} is missing its target-specific gate"
+            )
 
     for path in (".github/workflows/ci.yml", ".github/workflows/publish.yml"):
         errors.extend(require_snippets(path, common_gate))

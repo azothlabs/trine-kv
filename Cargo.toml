@@ -41,7 +41,10 @@ lz4_flex = { version = "0.13.1", default-features = false, features = [
 ] }
 sha2 = "0.10.9"
 
-[dev-dependencies]
+# These harnesses exercise host processes, threads, or native acceptance
+# runners. Keeping them off WASM targets prevents host-only transitive crates
+# from entering browser and WASI test builds.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 cucumber = "0.23.0"
 loom = "0.7.2"
 proptest = "1.11.0"

@@ -379,7 +379,7 @@ fn wasi_persistent_write_rejects_strict_sync_durability() {
 
 #[cfg(target_os = "wasi")]
 #[test]
-fn wasi_persistent_safe_temp_repair_does_not_remove_leftover_lock() {
+fn wasi_persistent_safe_temp_repair_preserves_unavailable_lock() {
     let path = temp_db_path("wasi-persistent-stale-lock");
     let db = Db::open_sync(DbOptions::wasi_persistent(&path)).expect("WASI db opens");
     db.put_sync(b"key", b"value").expect("WASI write succeeds");
@@ -391,15 +391,21 @@ fn wasi_persistent_safe_temp_repair_does_not_remove_leftover_lock() {
     .expect("stale lock marker writes");
 
     let error = Db::open_sync(DbOptions::wasi_persistent(&path))
-        .expect_err("stale WASI lock requires explicit repair");
-    assert!(matches!(error, Error::Corruption { .. }));
+        .expect_err("existing WASI lock keeps the writer lease unavailable");
+    assert!(
+        matches!(error, Error::LeaseUnavailable { .. }),
+        "expected LeaseUnavailable, got {error:?}"
+    );
     assert!(error.to_string().contains("LOCK"));
 
     let mut options = DbOptions::wasi_persistent(&path);
     options.fail_on_corruption = FailOnCorruptionPolicy::RepairSafeTemporaryFiles;
     let error = Db::open_sync(options)
         .expect_err("safe temporary repair must not delete a WASI lock marker");
-    assert!(matches!(error, Error::Corruption { .. }));
+    assert!(
+        matches!(error, Error::LeaseUnavailable { .. }),
+        "expected LeaseUnavailable, got {error:?}"
+    );
     assert!(error.to_string().contains("LOCK"));
     assert!(path.join(recovery::PROCESS_LOCK_FILE_NAME).exists());
 
@@ -408,14 +414,17 @@ fn wasi_persistent_safe_temp_repair_does_not_remove_leftover_lock() {
 
 #[cfg(target_os = "wasi")]
 #[test]
-fn wasi_persistent_repair_policy_does_not_remove_active_lock() {
+fn wasi_persistent_repair_policy_reports_active_lock_as_lease_unavailable() {
     let path = temp_db_path("wasi-persistent-active-lock");
     let db = Db::open_sync(DbOptions::wasi_persistent(&path)).expect("WASI db opens");
 
     let mut options = DbOptions::wasi_persistent(&path);
     options.fail_on_corruption = FailOnCorruptionPolicy::RepairSafeTemporaryFiles;
     let error = Db::open_sync(options).expect_err("active WASI writer keeps its lock");
-    assert!(matches!(error, Error::Corruption { .. }));
+    assert!(
+        matches!(error, Error::LeaseUnavailable { .. }),
+        "expected LeaseUnavailable, got {error:?}"
+    );
     assert!(error.to_string().contains("LOCK"));
     assert!(path.join(recovery::PROCESS_LOCK_FILE_NAME).exists());
 

@@ -30,6 +30,9 @@ to 1.95, which starts a new pre-`1.0` minor line.
 
 ### Changed
 
+- CI now runs native, WASI, and browser verification as independent jobs. This
+  keeps target failures attributable and allows the three release gates to run
+  in parallel.
 - The crate, repository toolchain, CI, publishing, production-evidence
   workflows, documentation, and examples now use Rust 1.95 and the `0.6`
   release line consistently.
@@ -49,6 +52,9 @@ to 1.95, which starts a new pre-`1.0` minor line.
 
 ### Fixed
 
+- Host-only test harness dependencies are now excluded from browser and WASI
+  target builds. In particular, WASI persistence tests no longer compile
+  `proptest`'s Unix/Windows-only process-timeout dependency chain.
 - Platform-I/O flush verification now attributes bounded-adapter work to
   explicit manifest transitions or storage fallbacks instead of assuming a
   fixed task count. This keeps whole-operation fallback detectable while

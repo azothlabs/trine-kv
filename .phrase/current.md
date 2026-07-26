@@ -2,7 +2,7 @@
 
 ## Architecture clarity and layered assurance
 
-**Status:** Complete after requirements-first acceptance expansion.
+**Status:** In progress: hosted release gates pending.
 
 ### Goal
 
@@ -36,12 +36,24 @@
 8. Upload-maintenance mutation analysis initially exposed two missing
    distinctions. The expanded Feature and explicit lifecycle decision table
    now reject every viable focused mutation.
+9. The hosted WASI test exposed that unconditional native test harness
+   dependencies pulled `proptest`'s Unix/Windows-only process-timeout chain
+   into a WASI build.
+10. The host-only harnesses are now target-scoped. From a new target directory,
+    the exact WASI CI command compiled without that dependency chain and all
+    seven persistence tests passed.
+11. Native, WASI, and browser CI checks are independent jobs. The documentation
+    drift guard rejects collapsing them back into one failure domain, while a
+    result-only `Verify` job preserves the aggregate required check.
 
 ### Residual scope
 
 - Real R2 is qualified for the acceptance and request-measurement suites. Other
   live providers, real browser/WASI hosts, kernel/filesystem/controller
   failures, and hardware power loss remain deployment evidence.
+- Local browser test binaries compile, but this macOS host's Safari WebDriver
+  was killed before execution. The hosted Chrome job remains the browser
+  release evidence for the corrected commit.
 - The native 17-boundary catalog covers every represented atomic hook, not
   hidden syscalls inside dependencies or remote provider internals.
 - The guarantee layers reduce residual risk and make it observable; they do not
@@ -74,6 +86,8 @@
   changes silently.
 - Architecture documentation identifies the trusted core and adapter
   assumptions.
+- The exact WASI persistence command passes without compiling host-only test
+  harness dependencies.
 
 ### Out of scope
 

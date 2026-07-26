@@ -97,7 +97,11 @@ The package list should not include `.github/`, `.phrase/`, `.rust-skills/`,
 ## CI Verification
 
 `.github/workflows/ci.yml` runs the release verification gate on pushes to
-`main`, pull requests, and manual dispatch:
+`main`, pull requests, and manual dispatch. Native, WASI, and browser checks
+run as independent jobs so a target-specific failure is reported directly and
+does not prevent the other target jobs from executing. A lightweight `Verify`
+job preserves one aggregate required check and passes only when all three
+primary target jobs pass:
 
 - `cargo fmt --check`
 - `python3 scripts/check_docs_drift.py`
