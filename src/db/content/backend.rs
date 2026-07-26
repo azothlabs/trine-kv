@@ -32,11 +32,11 @@ pub(super) enum ContentObjectBackend {
 impl ContentObjectBackend {
     pub(super) fn for_db(db: &Db) -> Result<Self> {
         match &db.inner.options.storage_mode {
-            crate::StorageMode::InMemory => Ok(Self::Memory(db.inner.content_memory.clone())),
+            crate::StorageMode::InMemory => Ok(Self::Memory(db.inner.storage.memory_content()?)),
             crate::StorageMode::Persistent { .. }
             | crate::StorageMode::HostPersistent {
                 backend: crate::HostStorageBackend::Wasi { .. },
-            } => Ok(Self::Native(db.inner.native_storage.clone())),
+            } => Ok(Self::Native(db.inner.storage.filesystem_files_cloned()?)),
             crate::StorageMode::HostPersistent {
                 backend: crate::HostStorageBackend::ObjectStore,
             } => Ok(Self::ObjectStore(db.object_storage()?)),

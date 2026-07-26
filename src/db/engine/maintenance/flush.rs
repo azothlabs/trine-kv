@@ -302,7 +302,7 @@ impl Db {
             let table_path = table::table_path(db_path, table_id);
             written_table_ids.push(table_id);
             let table = match table::write_table_with_backend_with_durability(
-                &self.inner.native_storage,
+                self.inner.storage.filesystem_files()?,
                 &table_path,
                 table_id,
                 input.input.table_level,
@@ -314,7 +314,7 @@ impl Db {
                 Ok(table) => table,
                 Err(error) => {
                     let _ = remove_storage_files(
-                        &self.inner.native_storage,
+                        self.inner.storage.filesystem_files()?,
                         db_path,
                         &written_table_ids,
                     );
@@ -325,7 +325,11 @@ impl Db {
         }
 
         if let Err(error) = self.sync_filesystem_directory_after_renames(db_path) {
-            let _ = remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
+            let _ = remove_storage_files(
+                self.inner.storage.filesystem_files()?,
+                db_path,
+                &written_table_ids,
+            );
             return Err(error);
         }
 
@@ -341,7 +345,7 @@ impl Db {
                 let error = self.close_after_manifest_durability_failure("flush", error);
                 if !self.closed_after_durable_publish_error() {
                     let _ = remove_storage_files(
-                        &self.inner.native_storage,
+                        self.inner.storage.filesystem_files()?,
                         db_path,
                         &written_table_ids,
                     );
@@ -402,7 +406,7 @@ impl Db {
         let mut file_ids = self.reserve_file_ids_host_async(flush_inputs.len()).await?;
 
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        let storage = self.inner.native_storage.clone();
+        let storage = self.inner.storage.filesystem_files_cloned()?;
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         let storage = self.browser_storage()?;
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -607,7 +611,7 @@ impl Db {
         db_path: &Path,
         replay_floor: Sequence,
     ) -> Result<()> {
-        let Some(wal) = &self.inner.browser_wal else {
+        let Some(wal) = self.inner.storage.browser_wal() else {
             return Ok(());
         };
         let storage = self.browser_storage()?;

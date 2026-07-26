@@ -76,6 +76,7 @@ mod codec;
 mod identity;
 mod lease_hold;
 mod reclaim;
+mod transaction;
 mod upload;
 
 pub(crate) use codec::*;

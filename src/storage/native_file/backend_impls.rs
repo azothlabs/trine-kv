@@ -28,7 +28,7 @@ use super::{
     require_native_file_append, require_native_file_directory_create,
     require_native_file_directory_listing, require_native_file_directory_sync,
     require_native_file_manifest_read, require_native_file_object_delete,
-    require_native_file_object_listing, wait_for_platform_io,
+    require_native_file_object_listing, require_native_file_object_read, wait_for_platform_io,
 };
 #[cfg(all(
     feature = "platform-io",
@@ -36,8 +36,7 @@ use super::{
     not(all(target_arch = "wasm32", target_os = "unknown"))
 ))]
 use super::{
-    prepare_native_file_wal_rewrite, require_native_file_object_read,
-    require_native_file_writer_lease, writer_lease_owner_text,
+    prepare_native_file_wal_rewrite, require_native_file_writer_lease, writer_lease_owner_text,
 };
 
 impl StorageReadBackend for NativeFileBackend {

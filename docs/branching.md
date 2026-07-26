@@ -1,16 +1,13 @@
 # Branching & Time Travel
 
-Status: **Slices 1–3 implemented** in `src/branch.rs` (no feature gate):
-ephemeral instant clones + time travel (1); durable, writable named branches
-whose divergent writes persist in their own buckets (2); and branch-aware
-retention — a durable branch pins its fork with a checkpoint so the parent keeps
-its fork history across restarts and aggressive GC, with `delete_branch`
-releasing the pin (3); and branch-of-branch — the git-style DAG, where a branch
-reads through its whole ancestor chain (4). `delete_branch` drops a branch's
-divergent data buckets (via the new `Db::drop_bucket` / `drop_bucket_sync`,
-which reclaim storage on every backend — in-memory, native, WASI, object store,
-and browser), and `range` is a lazy merging iterator. This document specifies
-copy-on-write
+Status: **Slices 1–4 implemented** in `src/branch.rs` (no feature gate):
+ephemeral instant clones, durable writable branches, branch-aware retention,
+nested branches, and lifecycle cleanup. The primary API is async-first:
+`create_branch`, `create_branch_from`, `open_branch`, `list_branches`,
+`branch_info`, and `delete_branch` use backend-native asynchronous storage.
+Native callers use the explicit `*_sync` adapters. `Branch::range` returns an
+`AsyncBranchRange`; `Branch::range_sync` returns the synchronous `BranchRange`.
+This document specifies copy-on-write
 **branches** (Neon-/git-style: an O(1) fork off a version point, history shared
 with the parent, divergent writes isolated) and read-only **time travel** (`AS
 OF` a past version) for trine-kv.
@@ -133,13 +130,8 @@ without a parent write; reads check the branch bucket, decode present/tombstone,
 else fall through to the pinned parent snapshot. `Db::create_branch` /
 `open_branch` / `list_branches` manage them.
 
-Known limit (closed by slice 3): a durable branch pins its fork only while a
-handle is open. Across a restart with no configured retention, the parent's fork
-history may have been GC'd, so the fall-through read fails until the fork is
-re-pinned — today the caller must keep enough retention
-(`with_keep_last_read_versions`) to cover live forks. Deferred to later slices:
-`delete_branch` (needs a bucket-drop primitive) and a branch of a branch (the
-registry already carries the fork; the read path would walk the ancestor chain).
+This slice's original restart-retention limit is closed by slice 3. Durable
+branches now retain their fork independently of open handles.
 
 ### Slice 3 — branch-aware retention (done)
 
@@ -163,7 +155,7 @@ without a bespoke GC pass: each live branch contributes one checkpoint, and the
 floor is already their minimum. Per-branch compaction is automatic because each
 branch's data is its own buckets (slice 2).
 
-### Slice 4 — nesting (done) & lifecycle completion (partial)
+### Slice 4 — nesting and lifecycle completion (done)
 
 **Branch of a branch (done):** the registry entry records a `parent` (None = the
 root lineage), and `Db::create_branch_from(name, parent)` forks an existing
@@ -199,8 +191,10 @@ the WASI and browser paths are compile-checked on `wasm32-wasip1` and
 outright (it falls back to clearing only where a sync drop is unavailable, e.g.
 the object-store backend, which needs the async drop).
 
-**`range` is lazy (done):** a [`BranchRange`] k-way-merges the chain's sorted
-scans on the fly instead of materializing a map.
+**Range reads are lazy (done):** `AsyncBranchRange` pulls each source with
+`Iter::next().await`, preserving asynchronous table and large-value reads on
+object and browser storage. `BranchRange` provides the corresponding synchronous
+merge for `range_sync`.
 
 **Remaining:** merge/reset semantics stay at the
 application layer (trinedb decides merge policy; the KV exposes the version

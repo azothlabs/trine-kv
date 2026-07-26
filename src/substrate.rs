@@ -80,9 +80,8 @@ pub(crate) fn validate_object_lease_wal_key_capacity(db_path: &std::path::Path) 
 /// Backend-specific runtime durability operations (WAL lifecycle + writer
 /// lease) that the commit / flush / close paths drive.
 ///
-/// Dispatch is an enum rather than `dyn` to match the house style of
-/// [`crate::storage::StorageBackend`] and `ManifestStoreBackend` — no vtable, no
-/// viral type parameter on `DbInner`.
+/// Dispatch is an enum rather than `dyn` so the database owns one explicit
+/// durability state without adding a backend type parameter to `DbInner`.
 #[derive(Debug)]
 pub(crate) enum DurabilitySubstrate {
     /// Native filesystem: appendable WAL files + a `LOCK` writer lease.
@@ -1176,115 +1175,6 @@ pub(crate) struct ObjectWriterLease {
     state: ObjectLeaseState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ObjectLeaseState {
-    pub(crate) epoch: u64,
-    pub(crate) owner_id: [u8; 16],
-    pub(crate) committed_sequence: Sequence,
-    pub(crate) current_wal_key: Option<String>,
-    pub(crate) lease_expires_at_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum LeaseStatePublish {
-    Publish(ObjectLeaseState),
-    AlreadyApplied,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LeaseOwnerObservation {
-    CurrentOwner,
-    Fenced { current_epoch: u64 },
-    EpochRegression { current_epoch: u64 },
-}
-
-impl ObjectLeaseState {
-    pub(crate) fn empty() -> Self {
-        Self {
-            epoch: 0,
-            owner_id: [0; 16],
-            committed_sequence: Sequence::ZERO,
-            current_wal_key: None,
-            lease_expires_at_ms: 0,
-        }
-    }
-
-    fn is_expired_at(&self, now_ms: u64) -> bool {
-        self.lease_expires_at_ms <= now_ms
-    }
-
-    fn observe_owner(&self, current: &Self) -> LeaseOwnerObservation {
-        match current.epoch.cmp(&self.epoch) {
-            std::cmp::Ordering::Greater => LeaseOwnerObservation::Fenced {
-                current_epoch: current.epoch,
-            },
-            std::cmp::Ordering::Less => LeaseOwnerObservation::EpochRegression {
-                current_epoch: current.epoch,
-            },
-            std::cmp::Ordering::Equal if current.owner_id != self.owner_id => {
-                LeaseOwnerObservation::Fenced {
-                    current_epoch: current.epoch,
-                }
-            }
-            std::cmp::Ordering::Equal => LeaseOwnerObservation::CurrentOwner,
-        }
-    }
-
-    fn plan_renew(&self, lease_expires_at_ms: u64) -> Self {
-        Self {
-            lease_expires_at_ms,
-            ..self.clone()
-        }
-    }
-
-    fn plan_release(&self) -> Self {
-        Self {
-            lease_expires_at_ms: 0,
-            ..self.clone()
-        }
-    }
-
-    fn plan_commit_head(
-        &self,
-        sequence: Sequence,
-        wal_key: &str,
-        lease_expires_at_ms: u64,
-    ) -> Result<LeaseStatePublish> {
-        match self.committed_sequence.cmp(&sequence) {
-            std::cmp::Ordering::Greater => Err(Error::Corruption {
-                message: format!(
-                    "object WAL head advanced to sequence {} while publishing older sequence {}",
-                    self.committed_sequence.get(),
-                    sequence.get()
-                ),
-            }),
-            std::cmp::Ordering::Equal if self.current_wal_key.as_deref() == Some(wal_key) => {
-                Ok(LeaseStatePublish::AlreadyApplied)
-            }
-            std::cmp::Ordering::Equal => Err(Error::Corruption {
-                message: format!(
-                    "object WAL sequence {} names conflicting immutable segment heads",
-                    sequence.get()
-                ),
-            }),
-            std::cmp::Ordering::Less => Ok(LeaseStatePublish::Publish(Self {
-                committed_sequence: sequence,
-                current_wal_key: Some(wal_key.to_owned()),
-                lease_expires_at_ms,
-                ..self.clone()
-            })),
-        }
-    }
-
-    fn plan_rewrite_head(&self, current_wal_key: Option<String>, lease_expires_at_ms: u64) -> Self {
-        Self {
-            current_wal_key,
-            lease_expires_at_ms,
-            ..self.clone()
-        }
-    }
-}
-
 impl std::fmt::Debug for ObjectWriterLease {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1977,17 +1867,13 @@ pub(crate) async fn object_store_wal_batches_after_replay_floor(
         .map(|(batches, _)| batches)
 }
 
-struct ObservedLeaseState {
-    etag: ETag,
-    state: ObjectLeaseState,
-}
-
 mod lease_state;
+pub(crate) use lease_state::ObjectLeaseState;
 #[cfg(not(all(feature = "s3", not(target_family = "wasm"))))]
 use lease_state::block_on_substrate_future;
 use lease_state::{
-    current_epoch_millis, encode_lease_state, lock_poisoned_error, object_lease_deadline_ms,
-    read_lease_state,
+    LeaseOwnerObservation, LeaseStatePublish, ObservedLeaseState, current_epoch_millis,
+    encode_lease_state, lock_poisoned_error, object_lease_deadline_ms, read_lease_state,
 };
 
 #[cfg(feature = "fuzzing")]

@@ -381,12 +381,15 @@ impl Db {
                 });
                 for table in tables {
                     let properties = table.properties();
-                    let table_bytes = persistent_path.map_or_else(
-                        || table.estimated_file_bytes(),
-                        |db_path| {
-                            table_file_bytes(&self.inner.native_storage, db_path, properties.id)
-                        },
-                    );
+                    let table_bytes = match (
+                        persistent_path,
+                        self.inner.storage.filesystem_files_if_present(),
+                    ) {
+                        (Some(db_path), Some(files)) => {
+                            table_file_bytes(files, db_path, properties.id)
+                        }
+                        _ => table.estimated_file_bytes(),
+                    };
                     let table_filters = table.filter_stats();
                     stats.filters.saturating_add_assign(table_filters);
                     let level_filter_entry =
@@ -430,13 +433,11 @@ impl Db {
         stats.level_filters = level_filter_stats.into_values().collect();
         stats.live_blob_files = live_blob_bytes_by_file.len();
         stats.live_blob_bytes = live_blob_bytes_by_file.values().copied().sum();
-        if let Some(db_path) = persistent_path {
-            add_obsolete_blob_stats(
-                &self.inner.native_storage,
-                db_path,
-                &live_blob_bytes_by_file,
-                &mut stats,
-            );
+        if let (Some(db_path), Some(files)) = (
+            persistent_path,
+            self.inner.storage.filesystem_files_if_present(),
+        ) {
+            add_obsolete_blob_stats(files, db_path, &live_blob_bytes_by_file, &mut stats);
         }
 
         stats
@@ -517,7 +518,7 @@ impl Db {
             stats.wal_bytes_accepted = wal_stats.bytes_accepted;
         }
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-        if let Some(wal) = &self.inner.browser_wal {
+        if let Some(wal) = self.inner.storage.browser_wal() {
             let wal_stats = wal.stats();
             stats.wal_shards = wal_stats.shards;
             stats.wal_open_shards = wal_stats.open_shards;
@@ -528,7 +529,10 @@ impl Db {
     }
 
     pub(in crate::db) fn add_storage_runtime_stats(&self, stats: &mut DbStats) {
-        let storage_stats = self.inner.native_storage.stats();
+        let Some(files) = self.inner.storage.filesystem_files_if_present() else {
+            return;
+        };
+        let storage_stats = files.stats();
         stats.storage_uses_sync_adapter = storage_stats.uses_blocking_adapter;
         stats.storage_uses_platform_io_driver = storage_stats.uses_platform_io_driver;
         stats.storage_uses_platform_async_io = storage_stats.uses_platform_async_io;
@@ -647,7 +651,7 @@ impl Db {
         super::super::release_browser_writer_lease(&self.inner);
         self.inner.substrate.release_writer_lease();
         #[cfg(feature = "platform-io")]
-        let _ = self.inner.native_storage.close_platform_io();
+        let _ = self.inner.storage.close_platform_io();
     }
 
     pub(crate) fn ensure_open(&self) -> Result<()> {

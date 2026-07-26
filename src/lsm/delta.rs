@@ -614,7 +614,7 @@ mod tests {
                 read_sequence: Sequence::new(1),
                 read_pin: Snapshot::new(Sequence::new(1)),
                 db_path: None,
-                native_storage: None,
+                read_backend: None,
                 blob_reads: None,
                 scan_waste: None,
                 range_tombstones: scan.range_tombstones,

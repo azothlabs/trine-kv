@@ -586,7 +586,7 @@ impl Db {
                     backend: HostStorageBackend::ObjectStore,
                 },
             ) => {
-                if !qualification.matches_prefix(self.object_store_db_path()) {
+                if !qualification.matches_prefix(self.object_store_db_path()?) {
                     return Err(Error::unsupported_backend(
                         "object-store reclamation qualification names a different database prefix",
                     ));

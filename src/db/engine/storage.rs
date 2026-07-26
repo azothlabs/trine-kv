@@ -11,6 +11,19 @@ use super::{Ordering, shutdown_background_workers, sync_storage_directory_after_
 use crate::{ReadVersion, storage::BrowserStorageBackend};
 
 impl Db {
+    pub(in crate::db) fn storage_read_path(&self) -> Result<Option<&Path>> {
+        match &self.inner.options.storage_mode {
+            StorageMode::InMemory => Ok(None),
+            StorageMode::Persistent { path }
+            | StorageMode::HostPersistent {
+                backend: HostStorageBackend::Wasi { path } | HostStorageBackend::Browser { path },
+            } => Ok(Some(path)),
+            StorageMode::HostPersistent {
+                backend: HostStorageBackend::ObjectStore,
+            } => self.object_store_db_path().map(Some),
+        }
+    }
+
     /// Persists pending WAL bytes according to `mode`.
     ///
     /// This function does not flush memtables into table files. It asks the WAL
@@ -66,12 +79,7 @@ impl Db {
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     pub(in crate::db) fn browser_storage(&self) -> Result<BrowserStorageBackend> {
-        self.inner
-            .browser_storage
-            .clone()
-            .ok_or_else(|| Error::Corruption {
-                message: "browser persistent database is missing storage backend".to_owned(),
-            })
+        self.inner.storage.browser_files()
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -86,27 +94,17 @@ impl Db {
     }
 
     pub(in crate::db) fn object_storage(&self) -> Result<ObjectStoreBackend> {
-        self.inner
-            .object_storage
-            .clone()
-            .ok_or_else(|| Error::Corruption {
-                message: "object-store database is missing storage backend".to_owned(),
-            })
+        self.inner.storage.object_store_objects()
     }
 
     pub(in crate::db) fn object_wal_storage(&self) -> Result<ObjectStoreBackend> {
-        self.inner
-            .object_wal_storage
-            .clone()
-            .ok_or_else(|| Error::Corruption {
-                message: "object-store database is missing WAL backend".to_owned(),
-            })
+        self.inner.storage.object_store_wal_objects()
     }
 
     /// The key prefix (as a `db_path`) under which this object-store database's
     /// keys live; empty for a bucket-root database.
-    pub(in crate::db) fn object_store_db_path(&self) -> &Path {
-        &self.inner.object_storage_prefix
+    pub(in crate::db) fn object_store_db_path(&self) -> Result<&Path> {
+        self.inner.storage.object_store_prefix()
     }
 
     /// Flush all immutable memtables to objects, publish them via the manifest
@@ -121,7 +119,7 @@ impl Db {
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
-        let db_path = self.object_store_db_path();
+        let db_path = self.object_store_db_path()?;
         let target_sequence = self.freeze_public_flush_target()?;
         while self.has_immutable_memtables_at_or_below(target_sequence)? {
             let outcome = self
@@ -148,7 +146,7 @@ impl Db {
         if self.inner.options.read_only {
             return Err(Error::ReadOnly);
         }
-        let db_path = self.object_store_db_path();
+        let db_path = self.object_store_db_path()?;
         if !self.has_immutable_memtables()? {
             return Ok(MaintenanceOutcome::default());
         }
@@ -171,7 +169,7 @@ impl Db {
         if self.inner.options.storage_mode.is_wasi_persistent() {
             Ok(())
         } else {
-            sync_storage_directory_after_renames(&self.inner.native_storage, db_path)
+            sync_storage_directory_after_renames(self.inner.storage.filesystem_files()?, db_path)
         }
     }
 
@@ -183,7 +181,11 @@ impl Db {
         if self.inner.options.storage_mode.is_wasi_persistent() {
             Ok(())
         } else {
-            sync_storage_directory_after_renames_async(&self.inner.native_storage, db_path).await
+            sync_storage_directory_after_renames_async(
+                self.inner.storage.filesystem_files()?,
+                db_path,
+            )
+            .await
         }
     }
 
@@ -680,7 +682,7 @@ impl Db {
         ) {
             return Err(Error::unsupported_durability(mode));
         }
-        let Some(wal) = &self.inner.browser_wal else {
+        let Some(wal) = self.inner.storage.browser_wal() else {
             return Ok(());
         };
         let storage = self.browser_storage()?;
@@ -851,7 +853,7 @@ impl Db {
         super::super::release_browser_writer_lease(&self.inner);
         self.inner.substrate.release_writer_lease();
         #[cfg(feature = "platform-io")]
-        self.inner.native_storage.close_platform_io()?;
+        self.inner.storage.close_platform_io()?;
         Ok(())
     }
 

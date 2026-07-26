@@ -208,7 +208,7 @@ impl Db {
                 .join(".trine-content-v1"),
             StorageMode::HostPersistent {
                 backend: HostStorageBackend::ObjectStore,
-            } => self.object_store_db_path().join("content-v1"),
+            } => self.object_store_db_path()?.join("content-v1"),
             StorageMode::HostPersistent {
                 backend: HostStorageBackend::Browser { path },
             } => path.join(".trine-content-v1"),

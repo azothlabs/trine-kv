@@ -24,7 +24,6 @@ use crate::{
         IoDriverInfo, IoReadObject,
     },
     limits,
-    object_store::{ObjectStoreBackend, ObjectStoreReadObject},
     options::DurabilityMode,
     runtime::Runtime,
     stats::{PlatformIoOperationStats, StorageOperationMetric, StorageOperationStats},
@@ -1129,19 +1128,19 @@ impl Default for NativeFileBackend {
     }
 }
 
-mod backend;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[allow(dead_code)]
+mod browser;
 #[cfg(test)]
 pub(crate) mod fault_injection;
 mod metrics;
 mod native_file;
 
-#[allow(unused_imports)]
-pub(crate) use backend::*;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub(crate) use browser::{BrowserStorageBackend, BrowserStorageObject, BrowserWriterLease};
 pub(crate) use metrics::{NativeFileStorageMetrics, NativeFileStorageStats};
 use metrics::{StorageOperation, record_timed_storage_future, record_timed_storage_result};
 pub(crate) use native_file::*;
-#[cfg(test)]
-mod backend_tests;
 fn poll_ready_storage_future<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
     let waker = Waker::noop();
     let mut context = Context::from_waker(waker);

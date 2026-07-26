@@ -68,7 +68,7 @@ impl Db {
         let blob_records = blob_gc_blob_records(&plan.records);
 
         let indexes = match blob::write_blob_file_with_backend_with_durability(
-            &self.inner.native_storage,
+            self.inner.storage.filesystem_files()?,
             db_path,
             plan.new_blob_file_id,
             header,
@@ -77,8 +77,11 @@ impl Db {
         ) {
             Ok(indexes) => indexes,
             Err(error) => {
-                let _ =
-                    remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
+                let _ = remove_storage_files(
+                    self.inner.storage.filesystem_files()?,
+                    db_path,
+                    &written_table_ids,
+                );
                 return Err(error);
             }
         };
@@ -87,35 +90,48 @@ impl Db {
         let output_bytes = match apply_blob_gc_indexes(&mut tables, plan.records, indexes) {
             Ok(output_bytes) => output_bytes,
             Err(error) => {
-                let _ =
-                    remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
+                let _ = remove_storage_files(
+                    self.inner.storage.filesystem_files()?,
+                    db_path,
+                    &written_table_ids,
+                );
                 return Err(error);
             }
         };
         let outputs = match write_blob_gc_replacement_tables(
-            &self.inner.native_storage,
+            self.inner.storage.filesystem_files()?,
             db_path,
             tables,
             self.filesystem_publish_durability(),
         ) {
             Ok(outputs) => outputs,
             Err(error) => {
-                let _ =
-                    remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
+                let _ = remove_storage_files(
+                    self.inner.storage.filesystem_files()?,
+                    db_path,
+                    &written_table_ids,
+                );
                 return Err(error);
             }
         };
 
         if let Err(error) = self.sync_filesystem_directory_after_renames(db_path) {
-            let _ = remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
+            let _ = remove_storage_files(
+                self.inner.storage.filesystem_files()?,
+                db_path,
+                &written_table_ids,
+            );
             return Err(error);
         }
 
         if let Err(error) = self.publish_compacted_tables(&outputs, &obsolete_blob_ids) {
             let error = self.close_after_manifest_durability_failure("blob GC", error);
             if !self.closed_after_durable_publish_error() {
-                let _ =
-                    remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
+                let _ = remove_storage_files(
+                    self.inner.storage.filesystem_files()?,
+                    db_path,
+                    &written_table_ids,
+                );
             }
             return Err(error);
         }
@@ -154,7 +170,7 @@ impl Db {
         );
         let blob_records = blob_gc_blob_records(&plan.records);
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        let storage = self.inner.native_storage.clone();
+        let storage = self.inner.storage.filesystem_files_cloned()?;
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         let storage = self.browser_storage()?;
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -322,7 +338,7 @@ impl Db {
                         continue;
                     }
                     let blob_record = blob::read_record_for_index_with_backend(
-                        &self.inner.native_storage,
+                        self.inner.storage.filesystem_files()?,
                         db_path,
                         index,
                         Some(&point_record.internal_key),
@@ -438,7 +454,7 @@ impl Db {
             .map(|candidate| candidate.file_id)
             .collect::<BTreeSet<_>>();
 
-        let storage = self.inner.native_storage.clone();
+        let storage = self.inner.storage.filesystem_files_cloned()?;
         let rewrite_table_count = self.count_blob_gc_rewrite_tables(&candidate_file_ids)?;
         let reservation_count =
             rewrite_table_count
@@ -645,7 +661,7 @@ impl Db {
 
         for (file_id, live_bytes) in live_bytes_by_file {
             let properties = blob::read_blob_file_properties_with_backend(
-                &self.inner.native_storage,
+                self.inner.storage.filesystem_files()?,
                 db_path,
                 file_id,
             )?;
@@ -685,7 +701,7 @@ impl Db {
         db_path: &Path,
     ) -> Result<Vec<BlobGcCandidate>> {
         let live_bytes_by_file = self.live_blob_bytes_by_file()?;
-        let storage = self.inner.native_storage.clone();
+        let storage = self.inner.storage.filesystem_files_cloned()?;
         let mut candidates = Vec::new();
 
         for (file_id, live_bytes) in live_bytes_by_file {
@@ -771,7 +787,7 @@ impl Db {
         db_path: &Path,
         tables: Vec<BlobGcRewriteTable>,
     ) -> Result<Vec<NamedCompactionOutput>> {
-        let storage = self.inner.native_storage.clone();
+        let storage = self.inner.storage.filesystem_files_cloned()?;
         let mut outputs = Vec::with_capacity(tables.len());
         for rewrite_table in tables {
             let table_path = table::table_path(db_path, rewrite_table.output_table_id);

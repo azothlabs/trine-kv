@@ -7,6 +7,12 @@ use std::{
 
 use crate::runtime::{Runtime, RuntimeOptions};
 
+#[cfg(feature = "platform-io")]
+use super::platform::*;
+#[cfg(feature = "platform-io")]
+use super::platform::{
+    driver::reserve_platform_io_queue_slot, scheduler::platform_io_resources_conflict,
+};
 use super::*;
 
 fn poll_ready_io<T>(future: impl Future<Output = Result<T>>) -> Result<T> {

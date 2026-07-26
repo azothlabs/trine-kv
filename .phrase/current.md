@@ -14,6 +14,27 @@
 - Add complete Gherkin acceptance coverage and repeatable deep-verification
   gates.
 
+### Architecture remediation slice (complete locally)
+
+- Replace backend-specific optional fields on `DbInner` with one owned
+  `DatabaseStorage` state as accepted in ADR 0004.
+- Make the complete durable branch lifecycle async-first and retain only
+  explicit `*_sync` native adapters.
+- Keep branch legality and generation decisions shared between both execution
+  paths.
+- Move immutable-content lifecycle extensions out of the generic transaction
+  module.
+- Split open, durability-substrate, and platform-I/O files at responsibility
+  boundaries without changing storage formats or durability semantics.
+- Add source-boundary checks and object-store branch acceptance before closing
+  the slice.
+
+The slice is complete. The engine now owns exactly one `DatabaseStorage`
+variant, branch APIs are async-first with explicitly named native sync
+adapters, and immutable-content transaction behavior lives outside the generic
+transaction core. Responsibility-focused modules and executable architecture
+checks prevent the retired mixed boundaries from returning.
+
 ### Evidence collected
 
 1. Native all-target/all-feature suite: every executed target passed; provider
@@ -55,6 +76,15 @@
     Local macOS evidence observed more than one native future in flight; both
     native and managed full library suites, the all-feature suite, strict
     Clippy, Rustdoc, and doctests passed.
+14. The architecture remediation slice passed a clean-build all-feature run:
+    604 core tests passed with 4 intentionally ignored, the 10-feature
+    acceptance corpus passed all 52 scenarios and 352 steps, the durable branch
+    profile passed all 6 scenarios and 55 steps, and all 31 doctests passed.
+15. Five architecture checks enforce singular backend ownership,
+    content-neutral generic transactions, a genuinely asynchronous branch
+    range path, narrow storage capabilities, and the new responsibility-based
+    file tree. Strict native/browser Clippy and the warning-denied WASI library
+    check also passed.
 
 ### Residual scope
 

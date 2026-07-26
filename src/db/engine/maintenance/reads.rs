@@ -84,12 +84,13 @@ impl Db {
             Some(self.inner.snapshots.pinned_snapshot(read_sequence))
         };
 
+        let backend = self.inner.storage.read_backend();
         state
             .read_visible_point_async(
-                &self.inner.native_storage,
+                &backend,
                 key,
                 read_sequence,
-                self.persistent_path(),
+                self.storage_read_path()?,
                 Some(self.inner.block_cache.as_ref()),
                 Some(self.inner.blob_reads.as_ref()),
             )
@@ -164,14 +165,15 @@ impl Db {
             Some(self.inner.snapshots.pinned_snapshot(read_sequence))
         };
 
+        let backend = self.inner.storage.read_backend();
         state
             .read_visible_point_value_in_snapshot_async(
                 read_snapshot,
                 key,
                 read_sequence,
                 AsyncPointReadIo::new(
-                    &self.inner.native_storage,
-                    self.persistent_path(),
+                    &backend,
+                    self.storage_read_path()?,
                     Some(self.inner.block_cache.as_ref()),
                     Some(self.inner.blob_reads.as_ref()),
                 ),
@@ -197,14 +199,15 @@ impl Db {
             Some(self.inner.snapshots.pinned_snapshot(read_sequence))
         };
 
+        let backend = self.inner.storage.read_backend();
         state
             .read_visible_point_values_in_snapshot_async(
                 read_snapshot,
                 keys,
                 read_sequence,
                 AsyncPointReadIo::new(
-                    &self.inner.native_storage,
-                    self.persistent_path(),
+                    &backend,
+                    self.storage_read_path()?,
                     Some(self.inner.block_cache.as_ref()),
                     Some(self.inner.blob_reads.as_ref()),
                 ),
@@ -281,13 +284,13 @@ impl Db {
             read_sequence,
             Some(&self.inner.block_cache),
         )?;
-        let db_path = self.persistent_path().map(Path::to_path_buf);
-        let native_storage = db_path.as_ref().map(|_| self.inner.native_storage.clone());
+        let db_path = self.storage_read_path()?.map(Path::to_path_buf);
+        let read_backend = db_path.as_ref().map(|_| self.inner.storage.read_backend());
         Ok(ScanSourceInput {
             read_sequence,
             read_pin,
             db_path,
-            native_storage,
+            read_backend,
             blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
             scan_waste: Some(Arc::clone(&self.inner.scan_waste)),
             range_tombstones: scan.range_tombstones,
@@ -312,13 +315,13 @@ impl Db {
                 Some(&self.inner.block_cache),
             )
             .await?;
-        let db_path = self.persistent_path().map(Path::to_path_buf);
-        let native_storage = db_path.as_ref().map(|_| self.inner.native_storage.clone());
+        let db_path = self.storage_read_path()?.map(Path::to_path_buf);
+        let read_backend = db_path.as_ref().map(|_| self.inner.storage.read_backend());
         Ok(ScanSourceInput {
             read_sequence,
             read_pin,
             db_path,
-            native_storage,
+            read_backend,
             blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
             scan_waste: Some(Arc::clone(&self.inner.scan_waste)),
             range_tombstones: scan.range_tombstones,
@@ -480,8 +483,8 @@ impl Db {
             read_sequence,
             Some(&self.inner.block_cache),
         )?;
-        let db_path = self.persistent_path().map(Path::to_path_buf);
-        let native_storage = db_path.as_ref().map(|_| self.inner.native_storage.clone());
+        let db_path = self.storage_read_path()?.map(Path::to_path_buf);
+        let read_backend = db_path.as_ref().map(|_| self.inner.storage.read_backend());
 
         Ok(Iter::from_sources(
             direction,
@@ -489,7 +492,7 @@ impl Db {
                 read_sequence,
                 read_pin,
                 db_path,
-                native_storage,
+                read_backend,
                 blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
                 scan_waste: Some(Arc::clone(&self.inner.scan_waste)),
                 range_tombstones: scan.range_tombstones,
@@ -518,8 +521,8 @@ impl Db {
                 Some(&self.inner.block_cache),
             )
             .await?;
-        let db_path = self.persistent_path().map(Path::to_path_buf);
-        let native_storage = db_path.as_ref().map(|_| self.inner.native_storage.clone());
+        let db_path = self.storage_read_path()?.map(Path::to_path_buf);
+        let read_backend = db_path.as_ref().map(|_| self.inner.storage.read_backend());
 
         Ok(Iter::from_sources(
             direction,
@@ -527,7 +530,7 @@ impl Db {
                 read_sequence,
                 read_pin,
                 db_path,
-                native_storage,
+                read_backend,
                 blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
                 scan_waste: Some(Arc::clone(&self.inner.scan_waste)),
                 range_tombstones: scan.range_tombstones,
@@ -554,8 +557,8 @@ impl Db {
             read_sequence,
             Some(&self.inner.block_cache),
         )?;
-        let db_path = self.persistent_path().map(Path::to_path_buf);
-        let native_storage = db_path.as_ref().map(|_| self.inner.native_storage.clone());
+        let db_path = self.storage_read_path()?.map(Path::to_path_buf);
+        let read_backend = db_path.as_ref().map(|_| self.inner.storage.read_backend());
 
         Ok(LazyIter::from_sources(
             direction,
@@ -563,7 +566,7 @@ impl Db {
                 read_sequence,
                 read_pin,
                 db_path,
-                native_storage,
+                read_backend,
                 blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
                 scan_waste: Some(Arc::clone(&self.inner.scan_waste)),
                 range_tombstones: scan.range_tombstones,
@@ -592,8 +595,8 @@ impl Db {
                 Some(&self.inner.block_cache),
             )
             .await?;
-        let db_path = self.persistent_path().map(Path::to_path_buf);
-        let native_storage = db_path.as_ref().map(|_| self.inner.native_storage.clone());
+        let db_path = self.storage_read_path()?.map(Path::to_path_buf);
+        let read_backend = db_path.as_ref().map(|_| self.inner.storage.read_backend());
 
         Ok(LazyIter::from_sources(
             direction,
@@ -601,7 +604,7 @@ impl Db {
                 read_sequence,
                 read_pin,
                 db_path,
-                native_storage,
+                read_backend,
                 blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
                 scan_waste: Some(Arc::clone(&self.inner.scan_waste)),
                 range_tombstones: scan.range_tombstones,
@@ -628,8 +631,8 @@ impl Db {
             read_sequence,
             Some(&self.inner.block_cache),
         )?;
-        let db_path = self.persistent_path().map(Path::to_path_buf);
-        let native_storage = db_path.as_ref().map(|_| self.inner.native_storage.clone());
+        let db_path = self.storage_read_path()?.map(Path::to_path_buf);
+        let read_backend = db_path.as_ref().map(|_| self.inner.storage.read_backend());
 
         Ok(Iter::from_sources(
             direction,
@@ -637,7 +640,7 @@ impl Db {
                 read_sequence,
                 read_pin,
                 db_path,
-                native_storage,
+                read_backend,
                 blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
                 scan_waste: Some(Arc::clone(&self.inner.scan_waste)),
                 range_tombstones: scan.range_tombstones,
@@ -666,8 +669,8 @@ impl Db {
                 Some(&self.inner.block_cache),
             )
             .await?;
-        let db_path = self.persistent_path().map(Path::to_path_buf);
-        let native_storage = db_path.as_ref().map(|_| self.inner.native_storage.clone());
+        let db_path = self.storage_read_path()?.map(Path::to_path_buf);
+        let read_backend = db_path.as_ref().map(|_| self.inner.storage.read_backend());
 
         Ok(Iter::from_sources(
             direction,
@@ -675,7 +678,7 @@ impl Db {
                 read_sequence,
                 read_pin,
                 db_path,
-                native_storage,
+                read_backend,
                 blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
                 scan_waste: Some(Arc::clone(&self.inner.scan_waste)),
                 range_tombstones: scan.range_tombstones,
@@ -702,8 +705,8 @@ impl Db {
             read_sequence,
             Some(&self.inner.block_cache),
         )?;
-        let db_path = self.persistent_path().map(Path::to_path_buf);
-        let native_storage = db_path.as_ref().map(|_| self.inner.native_storage.clone());
+        let db_path = self.storage_read_path()?.map(Path::to_path_buf);
+        let read_backend = db_path.as_ref().map(|_| self.inner.storage.read_backend());
 
         Ok(LazyIter::from_sources(
             direction,
@@ -711,7 +714,7 @@ impl Db {
                 read_sequence,
                 read_pin,
                 db_path,
-                native_storage,
+                read_backend,
                 blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
                 scan_waste: Some(Arc::clone(&self.inner.scan_waste)),
                 range_tombstones: scan.range_tombstones,
@@ -740,8 +743,8 @@ impl Db {
                 Some(&self.inner.block_cache),
             )
             .await?;
-        let db_path = self.persistent_path().map(Path::to_path_buf);
-        let native_storage = db_path.as_ref().map(|_| self.inner.native_storage.clone());
+        let db_path = self.storage_read_path()?.map(Path::to_path_buf);
+        let read_backend = db_path.as_ref().map(|_| self.inner.storage.read_backend());
 
         Ok(LazyIter::from_sources(
             direction,
@@ -749,7 +752,7 @@ impl Db {
                 read_sequence,
                 read_pin,
                 db_path,
-                native_storage,
+                read_backend,
                 blob_reads: Some(Arc::clone(&self.inner.blob_reads)),
                 scan_waste: Some(Arc::clone(&self.inner.scan_waste)),
                 range_tombstones: scan.range_tombstones,

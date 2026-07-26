@@ -148,6 +148,7 @@ mod state_transition;
 /// Live database statistics exposed to callers.
 pub mod stats;
 mod storage;
+mod storage_read;
 mod substrate;
 mod table;
 /// Optimistic transaction API.
@@ -158,7 +159,7 @@ mod wal;
 /// Atomic write batch types.
 pub mod write_batch;
 
-pub use branch::{Branch, BranchInfo, BranchRange};
+pub use branch::{AsyncBranchRange, Branch, BranchInfo, BranchRange};
 pub use bucket::{Bucket, BucketName, BucketReader};
 pub use content::{
     ContentAccessBarrier, ContentAccessBarrierId, ContentAccessMode, ContentAttachment,

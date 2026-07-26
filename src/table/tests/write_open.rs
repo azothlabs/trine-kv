@@ -55,7 +55,7 @@ fn async_table_write_returns_loaded_table_without_readback() {
         table_time_suffix()
     ));
     std::fs::create_dir_all(&root).expect("test dir creates");
-    let backend = crate::storage::StorageBackend::Native(NativeFileBackend::new());
+    let backend = NativeFileBackend::new();
     let path = root.join("table-1.trinet");
     let options = test_table_options(CodecId::None, false);
     let records = vec![

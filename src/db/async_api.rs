@@ -133,7 +133,7 @@ impl Db {
         let storage_client = backend.client();
         let wal_backend = self.object_wal_storage()?;
         let wal_client = wal_backend.client();
-        let db_path = self.object_store_db_path().to_path_buf();
+        let db_path = self.object_store_db_path()?.to_path_buf();
         let manifest_key = canonical_object_key(&manifest::manifest_path(&db_path))?;
         let lease_key = canonical_object_key(&db_path.join(recovery::PROCESS_LOCK_FILE_NAME))?;
 
@@ -810,7 +810,7 @@ impl Db {
             }
             let outcome = self
                 .run_compaction_once_object_store_async(
-                    self.object_store_db_path(),
+                    self.object_store_db_path()?,
                     &range,
                     false,
                     MaintenanceBudget::unbounded(),
@@ -871,7 +871,7 @@ impl Db {
             }
             return self
                 .run_compaction_once_object_store_async(
-                    self.object_store_db_path(),
+                    self.object_store_db_path()?,
                     &range,
                     false,
                     budget,
@@ -941,7 +941,7 @@ impl Db {
             if flush_permits_compaction {
                 let compaction = self
                     .run_compaction_once_object_store_async(
-                        self.object_store_db_path(),
+                        self.object_store_db_path()?,
                         &KeyRange::all(),
                         false,
                         budget,

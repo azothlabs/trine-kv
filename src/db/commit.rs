@@ -744,7 +744,7 @@ impl Db {
         self.inner.substrate.wal_is_present() || {
             #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
             {
-                self.inner.browser_wal.is_some()
+                self.inner.storage.browser_wal().is_some()
             }
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             {
@@ -853,17 +853,11 @@ impl Db {
         operations: &[BatchOperation],
         durability: DurabilityMode,
     ) -> Result<()> {
-        if let Some(wal) = &self.inner.browser_wal {
-            let storage = self
-                .inner
-                .browser_storage
-                .as_ref()
-                .ok_or_else(|| Error::Corruption {
-                    message: "browser persistent database is missing storage backend".to_owned(),
-                })?;
+        if let Some(wal) = self.inner.storage.browser_wal() {
+            let storage = self.inner.storage.browser_files()?;
             let accepted = wal
                 .accept_commit(
-                    storage,
+                    &storage,
                     self.browser_db_path()?,
                     sequence,
                     operations,

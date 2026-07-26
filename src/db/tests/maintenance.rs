@@ -206,7 +206,12 @@ fn persistent_open_attaches_runtime_enabled_native_storage_backend() {
     options.default_bucket_options = options.default_bucket_options.with_blob_threshold_bytes(4);
     let db = Db::open_sync(options).expect("persistent db opens");
 
-    let capabilities = db.inner.native_storage.capabilities();
+    let capabilities = db
+        .inner
+        .storage
+        .filesystem_files()
+        .expect("persistent database owns filesystem storage")
+        .capabilities();
     assert!(capabilities.supports(StorageCapability::AsyncTasks));
     assert!(capabilities.supports(StorageCapability::BlockingAdapter));
     assert!(capabilities.supports(StorageCapability::BackgroundThreads));

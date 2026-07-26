@@ -26,6 +26,54 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-07-26: backend ownership and async-first architecture remediation
+
+### Observation
+
+- `DbInner` previously allowed several backend fields to coexist, so the type
+  system did not express which storage implementation owned one database.
+- Branch lifecycle methods mixed sync and async conventions, and the async
+  range path wrapped a synchronous iterator even for remote storage.
+- The generic transaction module contained immutable-content lifecycle policy,
+  while open/recovery, platform I/O, and engine operations lived in files whose
+  names and boundaries did not match their responsibilities.
+- A broad storage trait required every implementation to pretend to support
+  unrelated capabilities.
+
+### Interpretation
+
+- These were ownership and dependency-direction defects, not naming-only
+  cleanup. Fixing individual call sites would have preserved invalid states and
+  allowed the same coupling to recur.
+- ADR 0004 therefore makes one storage variant, async-first branch APIs,
+  capability-focused read interfaces, and a content-neutral transaction core
+  durable architecture decisions.
+
+### Verification
+
+- A clean-build `cargo test -q --all-features` passed: 604 core tests, with 4
+  intentionally ignored; all integration targets; 10 acceptance features, 52
+  scenarios, and 352 steps; 6 durable-branch scenarios and 55 steps; and 31
+  doctests.
+- An object-store branch test writes a value larger than one MiB, closes and
+  reopens the database, then verifies point and asynchronous range reads.
+- Five architecture tests enforce the new ownership, dependency, async-read,
+  capability, and file-tree boundaries.
+- Strict all-target/all-feature native Clippy, strict browser Clippy, and the
+  warning-denied WASI library check passed.
+
+### Remaining Blockers
+
+- No local blocker remains for this architecture slice.
+- Live-provider qualification, hosted browser/WASI execution, operating-system
+  coverage, and power-loss evidence remain deployment gates already tracked by
+  the current phase; they do not justify weakening the local architecture.
+
+### Recommended Next Action
+
+- Run the hosted release gates against this exact change set and retain the
+  architecture checks as required regression coverage.
+
 ## 2026-07-19: portable ContentId catalog encoding
 
 ### Observation

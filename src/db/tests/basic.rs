@@ -114,7 +114,7 @@ fn public_bucket_apis_reject_the_internal_namespace() {
 
     let mut branch = db.branch_from_latest().expect("ephemeral branch opens");
     assert!(matches!(
-        branch.put(reserved.as_str(), b"k", b"v".to_vec()),
+        branch.put_sync(reserved.as_str(), b"k", b"v".to_vec()),
         Err(Error::InvalidOptions { .. })
     ));
 }

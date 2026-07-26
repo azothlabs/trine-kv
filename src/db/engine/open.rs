@@ -23,9 +23,9 @@ use std::sync::atomic::AtomicU8;
 use crate::db::FatalWriteStopReason;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::db::open_helpers::run_persistent_recovery_checks_async;
+use crate::db::storage_backend::DatabaseStorage;
 use crate::object_store::{canonical_object_key, canonical_object_prefix};
 use crate::options::ContentReclamationMode;
-use crate::storage::MemoryStorageBackend;
 use crate::substrate::object_store_wal_batches_after_replay_floor;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::{
@@ -42,16 +42,7 @@ struct DbInnerParts {
     buckets: BTreeMap<String, Arc<LsmTree>>,
     manifest: Option<ManifestStore>,
     substrate: DurabilitySubstrate,
-    native_storage: NativeFileBackend,
-    object_storage: Option<ObjectStoreBackend>,
-    object_wal_storage: Option<ObjectStoreBackend>,
-    object_storage_prefix: PathBuf,
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    browser_storage: Option<BrowserStorageBackend>,
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    browser_writer_lease: Option<BrowserWriterLease>,
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    browser_wal: Option<BrowserWalFrontDoor>,
+    storage: DatabaseStorage,
     runtime: Runtime,
 }
 
@@ -69,7 +60,7 @@ impl DbInnerParts {
         buckets: BTreeMap<String, Arc<LsmTree>>,
         manifest: Option<ManifestStore>,
         substrate: DurabilitySubstrate,
-        native_storage: NativeFileBackend,
+        storage: DatabaseStorage,
         runtime: Runtime,
     ) -> Self {
         Self {
@@ -77,16 +68,7 @@ impl DbInnerParts {
             buckets,
             manifest,
             substrate,
-            native_storage,
-            object_storage: None,
-            object_wal_storage: None,
-            object_storage_prefix: PathBuf::new(),
-            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-            browser_storage: None,
-            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-            browser_writer_lease: None,
-            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-            browser_wal: None,
+            storage,
             runtime,
         }
     }
@@ -101,7 +83,7 @@ impl DbInnerParts {
             buckets,
             None,
             DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(None, None)),
-            NativeFileBackend::new(),
+            DatabaseStorage::memory(),
             runtime,
         )
     }
@@ -120,7 +102,7 @@ impl DbInnerParts {
             buckets,
             Some(manifest),
             DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(wal, process_lock)),
-            native_storage,
+            DatabaseStorage::filesystem(native_storage),
             runtime,
         )
     }
@@ -132,19 +114,14 @@ impl DbInnerParts {
         backend: ObjectStoreInnerParts,
         runtime: Runtime,
     ) -> Self {
-        Self {
-            object_storage: Some(backend.storage),
-            object_wal_storage: Some(backend.wal_storage),
-            object_storage_prefix: backend.prefix,
-            ..Self::base(
-                options,
-                buckets,
-                Some(manifest),
-                backend.substrate,
-                NativeFileBackend::new(),
-                runtime,
-            )
-        }
+        Self::base(
+            options,
+            buckets,
+            Some(manifest),
+            backend.substrate,
+            DatabaseStorage::object_store(backend.storage, backend.wal_storage, backend.prefix),
+            runtime,
+        )
     }
 
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -157,19 +134,14 @@ impl DbInnerParts {
         wal: Option<BrowserWalFrontDoor>,
         runtime: Runtime,
     ) -> Self {
-        Self {
-            browser_storage: Some(storage),
-            browser_writer_lease: writer_lease,
-            browser_wal: wal,
-            ..Self::base(
-                options,
-                buckets,
-                Some(manifest),
-                DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(None, None)),
-                NativeFileBackend::new(),
-                runtime,
-            )
-        }
+        Self::base(
+            options,
+            buckets,
+            Some(manifest),
+            DurabilitySubstrate::Filesystem(FilesystemSubstrate::new(None, None)),
+            DatabaseStorage::browser(storage, writer_lease, wal),
+            runtime,
+        )
     }
 }
 
@@ -184,16 +156,7 @@ impl Db {
             buckets,
             manifest,
             substrate,
-            native_storage,
-            object_storage,
-            object_wal_storage,
-            object_storage_prefix,
-            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-            browser_storage,
-            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-            browser_writer_lease,
-            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-            browser_wal,
+            storage,
             runtime,
         } = parts;
         let block_cache_bytes = options.block_cache_bytes;
@@ -232,23 +195,13 @@ impl Db {
                 maintenance_cooperative_yields: AtomicU64::new(0),
                 maintenance_budget_exhaustions: AtomicU64::new(0),
                 manifest_sync_adapter_tasks: AtomicU64::new(0),
-                native_storage,
-                content_memory: MemoryStorageBackend::new(),
+                storage,
                 content_seal_lock: futures::lock::Mutex::new(()),
                 content_access_lock: futures::lock::Mutex::new(()),
                 content_lock_hasher: RandomState::new(),
                 content_quota_locks: std::array::from_fn(|_| futures::lock::Mutex::new(())),
                 content_upload_locks: std::array::from_fn(|_| futures::lock::Mutex::new(())),
-                object_storage,
-                object_wal_storage,
-                object_storage_prefix,
                 object_manifest_async_lock: futures::lock::Mutex::new(()),
-                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                browser_storage,
-                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                browser_writer_lease: Mutex::new(browser_writer_lease),
-                #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-                browser_wal,
                 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
                 browser_manifest_async_lock: futures::lock::Mutex::new(()),
                 runtime,

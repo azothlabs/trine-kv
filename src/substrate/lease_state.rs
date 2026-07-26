@@ -1,10 +1,128 @@
 use super::{
     Arc, Error, OBJECT_LEASE_MAGIC, OBJECT_LEASE_MAX_BYTES, OBJECT_LEASE_TTL,
-    OBJECT_LEASE_V3_HEADER_LEN, OBJECT_LEASE_VERSION, ObjectClient, ObjectLeaseState,
-    ObservedLeaseState, Result, Sequence,
+    OBJECT_LEASE_V3_HEADER_LEN, OBJECT_LEASE_VERSION, ObjectClient, Result, Sequence,
 };
 #[cfg(not(all(feature = "s3", not(target_family = "wasm"))))]
 use super::{Context, Future, Poll, Wake, Waker, thread};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObjectLeaseState {
+    pub(crate) epoch: u64,
+    pub(crate) owner_id: [u8; 16],
+    pub(crate) committed_sequence: Sequence,
+    pub(crate) current_wal_key: Option<String>,
+    pub(crate) lease_expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum LeaseStatePublish {
+    Publish(ObjectLeaseState),
+    AlreadyApplied,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LeaseOwnerObservation {
+    CurrentOwner,
+    Fenced { current_epoch: u64 },
+    EpochRegression { current_epoch: u64 },
+}
+
+impl ObjectLeaseState {
+    pub(crate) fn empty() -> Self {
+        Self {
+            epoch: 0,
+            owner_id: [0; 16],
+            committed_sequence: Sequence::ZERO,
+            current_wal_key: None,
+            lease_expires_at_ms: 0,
+        }
+    }
+
+    pub(super) fn is_expired_at(&self, now_ms: u64) -> bool {
+        self.lease_expires_at_ms <= now_ms
+    }
+
+    pub(super) fn observe_owner(&self, current: &Self) -> LeaseOwnerObservation {
+        match current.epoch.cmp(&self.epoch) {
+            std::cmp::Ordering::Greater => LeaseOwnerObservation::Fenced {
+                current_epoch: current.epoch,
+            },
+            std::cmp::Ordering::Less => LeaseOwnerObservation::EpochRegression {
+                current_epoch: current.epoch,
+            },
+            std::cmp::Ordering::Equal if current.owner_id != self.owner_id => {
+                LeaseOwnerObservation::Fenced {
+                    current_epoch: current.epoch,
+                }
+            }
+            std::cmp::Ordering::Equal => LeaseOwnerObservation::CurrentOwner,
+        }
+    }
+
+    pub(super) fn plan_renew(&self, lease_expires_at_ms: u64) -> Self {
+        Self {
+            lease_expires_at_ms,
+            ..self.clone()
+        }
+    }
+
+    pub(super) fn plan_release(&self) -> Self {
+        Self {
+            lease_expires_at_ms: 0,
+            ..self.clone()
+        }
+    }
+
+    pub(super) fn plan_commit_head(
+        &self,
+        sequence: Sequence,
+        wal_key: &str,
+        lease_expires_at_ms: u64,
+    ) -> Result<LeaseStatePublish> {
+        match self.committed_sequence.cmp(&sequence) {
+            std::cmp::Ordering::Greater => Err(Error::Corruption {
+                message: format!(
+                    "object WAL head advanced to sequence {} while publishing older sequence {}",
+                    self.committed_sequence.get(),
+                    sequence.get()
+                ),
+            }),
+            std::cmp::Ordering::Equal if self.current_wal_key.as_deref() == Some(wal_key) => {
+                Ok(LeaseStatePublish::AlreadyApplied)
+            }
+            std::cmp::Ordering::Equal => Err(Error::Corruption {
+                message: format!(
+                    "object WAL sequence {} names conflicting immutable segment heads",
+                    sequence.get()
+                ),
+            }),
+            std::cmp::Ordering::Less => Ok(LeaseStatePublish::Publish(Self {
+                committed_sequence: sequence,
+                current_wal_key: Some(wal_key.to_owned()),
+                lease_expires_at_ms,
+                ..self.clone()
+            })),
+        }
+    }
+
+    pub(super) fn plan_rewrite_head(
+        &self,
+        current_wal_key: Option<String>,
+        lease_expires_at_ms: u64,
+    ) -> Self {
+        Self {
+            current_wal_key,
+            lease_expires_at_ms,
+            ..self.clone()
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct ObservedLeaseState {
+    pub(super) etag: super::ETag,
+    pub(super) state: ObjectLeaseState,
+}
 
 const OBJECT_LEASE_READ_MAX_ATTEMPTS: usize = 16;
 

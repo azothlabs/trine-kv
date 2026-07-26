@@ -159,13 +159,21 @@ impl Db {
         if !written_table_ids.is_empty()
             && let Err(error) = self.sync_filesystem_directory_after_renames(db_path)
         {
-            let _ = remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
+            let _ = remove_storage_files(
+                self.inner.storage.filesystem_files()?,
+                db_path,
+                &written_table_ids,
+            );
             return Err(error);
         }
 
         let _publish = self.inner.publish_barrier.enter()?;
         if let Err(error) = self.validate_compacted_tables(&written_tables) {
-            let _ = remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
+            let _ = remove_storage_files(
+                self.inner.storage.filesystem_files()?,
+                db_path,
+                &written_table_ids,
+            );
             if is_level_layout_compaction_error(&error) {
                 return Ok(MaintenanceOutcome::default());
             }
@@ -174,8 +182,11 @@ impl Db {
         if let Err(error) = self.publish_compacted_tables(&written_tables, &obsolete_blob_ids) {
             let error = self.close_after_manifest_durability_failure("compaction", error);
             if !self.closed_after_durable_publish_error() {
-                let _ =
-                    remove_storage_files(&self.inner.native_storage, db_path, &written_table_ids);
+                let _ = remove_storage_files(
+                    self.inner.storage.filesystem_files()?,
+                    db_path,
+                    &written_table_ids,
+                );
             }
             return Err(error);
         }
@@ -431,7 +442,7 @@ impl Db {
         table_ids: &[table::TableId],
     ) -> Result<()> {
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        let storage = self.inner.native_storage.clone();
+        let storage = self.inner.storage.filesystem_files_cloned()?;
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         let storage = self.browser_storage()?;
         remove_storage_files_async(&storage, db_path, table_ids).await
@@ -538,7 +549,7 @@ impl Db {
                 let table_path = table::table_path(db_path, table_id);
                 written_table_ids.push(table_id);
                 let table = match table::write_table_with_backend_with_durability(
-                    &self.inner.native_storage,
+                    self.inner.storage.filesystem_files()?,
                     &table_path,
                     table_id,
                     input.input.table_level,
@@ -550,7 +561,7 @@ impl Db {
                     Ok(table) => table,
                     Err(error) => {
                         let _ = remove_storage_files(
-                            &self.inner.native_storage,
+                            self.inner.storage.filesystem_files()?,
                             db_path,
                             &written_table_ids,
                         );
@@ -582,7 +593,7 @@ impl Db {
         oldest_active_snapshot: Sequence,
         compaction_inputs: &[NamedCompactionInput],
     ) -> Result<PendingCompactionOutputs> {
-        let storage = self.inner.native_storage.clone();
+        let storage = self.inner.storage.filesystem_files_cloned()?;
         let rewrites =
             self.prepare_compaction_rewrites(oldest_active_snapshot, compaction_inputs)?;
         let output_table_count = rewrites

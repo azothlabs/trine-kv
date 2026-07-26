@@ -4,7 +4,18 @@ All public crate releases use Semantic Versioning.
 
 ## Unreleased
 
-No unreleased changes.
+- Made durable branches async-first end to end. The primary create, open,
+  list, read, write, scan, lineage, and delete methods now use async storage;
+  native synchronous adapters use explicit `*_sync` names.
+- Added `AsyncBranchRange`; asynchronous branch scans no longer erase their
+  storage iterators behind the synchronous `Iterator` interface.
+- Replaced independently optional backend fields on `DbInner` with one owned
+  backend state and a narrow random-read capability.
+- Removed the unused all-capabilities storage dispatcher that was exercised
+  only by tests.
+- Split database opening, platform I/O, browser storage, lease state, content
+  transaction extensions, and large test suites into responsibility-named
+  modules, with executable architecture-boundary checks.
 
 ## 0.6.0 - 2026-07-25
 

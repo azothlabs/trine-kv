@@ -391,7 +391,7 @@ impl Db {
 
     pub(in crate::db) fn cleanup_pending_obsolete_blob_files(&self, db_path: &Path) -> Result<()> {
         cleanup_pending_obsolete_blob_files(
-            &self.inner.native_storage,
+            self.inner.storage.filesystem_files()?,
             Some(db_path),
             &self.inner.snapshots,
             self.inner.manifest.as_ref(),
@@ -400,7 +400,7 @@ impl Db {
 
     pub(in crate::db) fn delete_pending_obsolete_blob_files(&self, db_path: &Path) -> Result<()> {
         let _ = delete_pending_obsolete_blob_files(
-            &self.inner.native_storage,
+            self.inner.storage.filesystem_files()?,
             Some(db_path),
             &self.inner.snapshots,
             self.inner.manifest.as_ref(),
@@ -464,7 +464,7 @@ impl Db {
             return Ok((manifest, Vec::new()));
         }
 
-        let storage = self.inner.native_storage.clone();
+        let storage = self.inner.storage.filesystem_files_cloned()?;
         for file_id in &pending_file_ids {
             delete_storage_object_async(
                 &storage,
@@ -668,7 +668,7 @@ impl Db {
 
     pub(in crate::db) fn cleanup_pending_obsolete_table_files(&self, db_path: &Path) -> Result<()> {
         cleanup_pending_obsolete_table_files(
-            &self.inner.native_storage,
+            self.inner.storage.filesystem_files()?,
             Some(db_path),
             &self.inner.pending_obsolete_tables,
         )
@@ -684,7 +684,7 @@ impl Db {
             return Ok(());
         }
 
-        let storage = self.inner.native_storage.clone();
+        let storage = self.inner.storage.filesystem_files_cloned()?;
         let mut result = Ok(());
         let mut remaining = Vec::new();
         for table in deletable {

@@ -36,36 +36,42 @@ async fn named_bucket_contains_keys(
 }
 
 #[given(expr = "I create durable branch {string}")]
-fn create_durable_branch(world: &mut TrineWorld, name: String) {
-    create_branch(world, &name);
+async fn create_durable_branch(world: &mut TrineWorld, name: String) {
+    create_branch(world, &name).await;
 }
 
 #[when(expr = "I create durable branch {string}")]
-fn create_durable_branch_after_action(world: &mut TrineWorld, name: String) {
-    create_branch(world, &name);
+async fn create_durable_branch_after_action(world: &mut TrineWorld, name: String) {
+    create_branch(world, &name).await;
 }
 
-fn create_branch(world: &TrineWorld, name: &str) {
+async fn create_branch(world: &TrineWorld, name: &str) {
     world
         .db()
         .create_branch(name, world.db().latest_read_version())
+        .await
         .expect("durable branch creates");
 }
 
 #[given(expr = "I create durable branch {string} from branch {string}")]
-fn create_durable_child_branch(world: &mut TrineWorld, name: String, parent: String) {
-    create_child_branch(world, &name, &parent);
+async fn create_durable_child_branch(world: &mut TrineWorld, name: String, parent: String) {
+    create_child_branch(world, &name, &parent).await;
 }
 
 #[when(expr = "I create durable branch {string} from branch {string}")]
-fn create_durable_child_branch_after_action(world: &mut TrineWorld, name: String, parent: String) {
-    create_child_branch(world, &name, &parent);
+async fn create_durable_child_branch_after_action(
+    world: &mut TrineWorld,
+    name: String,
+    parent: String,
+) {
+    create_child_branch(world, &name, &parent).await;
 }
 
-fn create_child_branch(world: &TrineWorld, name: &str, parent: &str) {
+async fn create_child_branch(world: &TrineWorld, name: &str, parent: &str) {
     world
         .db()
         .create_branch_from(name, parent)
+        .await
         .expect("durable child branch creates");
 }
 
@@ -87,57 +93,71 @@ async fn named_bucket_writes(
 }
 
 #[when(expr = "branch {string} writes named bucket {string} key {string} as {string}")]
-fn branch_writes(
+async fn branch_writes(
     world: &mut TrineWorld,
     branch_name: String,
     bucket_name: String,
     key: String,
     value: String,
 ) {
-    world
+    let mut branch = world
         .db()
         .open_branch(&branch_name)
-        .expect("durable branch opens")
+        .await
+        .expect("durable branch opens");
+    branch
         .put(bucket_name, key.into_bytes(), value.into_bytes())
+        .await
         .expect("durable branch write commits");
 }
 
 #[when(expr = "branch {string} deletes named bucket {string} key {string}")]
-fn branch_deletes(world: &mut TrineWorld, branch_name: String, bucket_name: String, key: String) {
-    world
+async fn branch_deletes(
+    world: &mut TrineWorld,
+    branch_name: String,
+    bucket_name: String,
+    key: String,
+) {
+    let mut branch = world
         .db()
         .open_branch(&branch_name)
-        .expect("durable branch opens")
+        .await
+        .expect("durable branch opens");
+    branch
         .delete(bucket_name, key.into_bytes())
+        .await
         .expect("durable branch deletion commits");
 }
 
 #[when(expr = "I scan named bucket {string} on branch {string}")]
-fn scan_branch(world: &mut TrineWorld, bucket_name: String, branch_name: String) {
-    world.branch_rows = world
+async fn scan_branch(world: &mut TrineWorld, bucket_name: String, branch_name: String) {
+    let branch = world
         .db()
         .open_branch(&branch_name)
-        .expect("durable branch opens")
+        .await
+        .expect("durable branch opens");
+    let mut rows = branch
         .range(bucket_name, &KeyRange::all())
-        .expect("branch range opens")
-        .map(|row| {
-            let row = row.expect("branch row reads");
-            (row.key, row.value)
-        })
-        .collect();
+        .await
+        .expect("branch range opens");
+    world.branch_rows.clear();
+    while let Some(row) = rows.next().await.expect("branch row reads") {
+        world.branch_rows.push((row.key, row.value));
+    }
 }
 
 #[when(expr = "I delete durable branch {string}")]
-fn delete_durable_branch(world: &mut TrineWorld, name: String) {
+async fn delete_durable_branch(world: &mut TrineWorld, name: String) {
     world
         .db()
         .delete_branch(&name)
+        .await
         .expect("durable branch deletes");
 }
 
 #[when(expr = "I try to delete durable branch {string}")]
-fn try_delete_durable_branch(world: &mut TrineWorld, name: String) {
-    let result = world.db().delete_branch(&name);
+async fn try_delete_durable_branch(world: &mut TrineWorld, name: String) {
+    let result = world.db().delete_branch(&name).await;
     world.record_error(result);
 }
 
@@ -173,19 +193,22 @@ async fn advance_root_values(
 }
 
 #[then(expr = "branch {string} key {string} in named bucket {string} contains {string}")]
-fn branch_key_contains(
+async fn branch_key_contains(
     world: &mut TrineWorld,
     branch_name: String,
     key: String,
     bucket_name: String,
     expected: String,
 ) {
+    let branch = world
+        .db()
+        .open_branch(&branch_name)
+        .await
+        .expect("durable branch opens");
     assert_eq!(
-        world
-            .db()
-            .open_branch(&branch_name)
-            .expect("durable branch opens")
+        branch
             .get(bucket_name, key.as_bytes())
+            .await
             .expect("branch key reads")
             .as_deref(),
         Some(expected.as_bytes())
@@ -193,20 +216,23 @@ fn branch_key_contains(
 }
 
 #[then(expr = "branch {string} key {string} in named bucket {string} is absent")]
-fn branch_key_is_absent(
+async fn branch_key_is_absent(
     world: &mut TrineWorld,
     branch_name: String,
     key: String,
     bucket_name: String,
 ) {
+    let branch = world
+        .db()
+        .open_branch(&branch_name)
+        .await
+        .expect("durable branch opens");
     assert_eq!(
-        world
-            .db()
-            .open_branch(&branch_name)
-            .expect("durable branch opens")
+        branch
             .get(bucket_name, key.as_bytes())
+            .await
             .expect("branch key reads"),
-        None
+        None,
     );
 }
 
@@ -216,10 +242,11 @@ fn branch_rows_are(world: &mut TrineWorld, expected: String) {
 }
 
 #[then(expr = "branch {string} reports parent {string}")]
-fn branch_reports_parent(world: &mut TrineWorld, branch_name: String, expected: String) {
+async fn branch_reports_parent(world: &mut TrineWorld, branch_name: String, expected: String) {
     let info = world
         .db()
         .branch_info(&branch_name)
+        .await
         .expect("branch lineage reads")
         .expect("branch is active");
     assert_eq!(info.parent(), Some(expected.as_str()));
@@ -235,11 +262,12 @@ fn branch_with_child_is_not_deleted(world: &mut TrineWorld) {
 }
 
 #[then("no durable branches are listed")]
-fn no_durable_branches_are_listed(world: &mut TrineWorld) {
+async fn no_durable_branches_are_listed(world: &mut TrineWorld) {
     assert!(
         world
             .db()
             .list_branches()
+            .await
             .expect("durable branch list reads")
             .is_empty()
     );

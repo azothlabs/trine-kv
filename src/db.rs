@@ -1,9 +1,11 @@
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use std::sync::Weak;
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::RandomState},
     io,
     path::{Path, PathBuf},
     sync::{
-        Arc, Condvar, Mutex, MutexGuard, RwLock, Weak,
+        Arc, Condvar, Mutex, MutexGuard, RwLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -49,11 +51,11 @@ use crate::{
     storage::{
         BlockingStorageDirectoryCreateBackend, BlockingStorageDirectoryListBackend,
         BlockingStorageDirectorySyncBackend, BlockingStorageObjectDeleteBackend,
-        BlockingStorageReadBackend, BlockingStorageReadObject, MemoryStorageBackend,
-        NativeFileBackend, StorageCapability, StorageDirectoryCreateBackend, StorageDirectoryFile,
-        StorageDirectoryId, StorageDirectoryListBackend, StorageDirectorySyncBackend,
-        StorageManifestReadBackend, StorageObjectDeleteBackend, StorageObjectId, StorageObjectKind,
-        StorageObjectListBackend, StorageObjectReadBackend, StorageReadBackend,
+        BlockingStorageReadBackend, BlockingStorageReadObject, NativeFileBackend,
+        StorageCapability, StorageDirectoryCreateBackend, StorageDirectoryFile, StorageDirectoryId,
+        StorageDirectoryListBackend, StorageDirectorySyncBackend, StorageManifestReadBackend,
+        StorageObjectDeleteBackend, StorageObjectId, StorageObjectKind, StorageObjectListBackend,
+        StorageObjectReadBackend, StorageReadBackend,
     },
     substrate::{
         DurabilitySubstrate, FilesystemSubstrate, ObjectLeaseState, ObjectStoreSubstrate,
@@ -66,17 +68,12 @@ use crate::{
     write_batch::BatchOperation,
 };
 
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-use crate::{
-    storage::{BrowserStorageBackend, BrowserWriterLease},
-    wal::BrowserWalFrontDoor,
-};
-
 mod async_api;
 mod commit;
 mod content;
+mod engine;
 mod open_helpers;
-mod sync_api;
+mod storage_backend;
 
 use open_helpers::{
     cleanup_pending_obsolete_blob_files, cleanup_pending_obsolete_table_files, lock_poisoned,
@@ -289,10 +286,8 @@ pub(crate) struct DbInner {
     /// This is separate from native-storage fallback accounting so diagnostics
     /// can prove that an async operation did not adapt the whole operation.
     manifest_sync_adapter_tasks: AtomicU64,
-    native_storage: NativeFileBackend,
-    /// Private object registry used only by `ContentObject` chunks and
-    /// descriptors in an in-memory database.
-    content_memory: MemoryStorageBackend,
+    /// The one valid storage state selected when this database was opened.
+    storage: storage_backend::DatabaseStorage,
     /// Serializes descriptor publication and same-ContentId deduplication.
     content_seal_lock: futures::lock::Mutex<()>,
     /// Serializes the irreversible leased-only barrier transition in one writer.
@@ -304,31 +299,10 @@ pub(crate) struct DbInner {
     /// Bounded lock shards serialize state transitions for one `UploadId` without
     /// retaining a lock object for every historical upload.
     content_upload_locks: [futures::lock::Mutex<()>; 256],
-    /// Object-storage byte backend for object-store databases (async-only),
-    /// mirroring `browser_storage`. `None` for every other backend; when set,
-    /// `native_storage` is an unused default and `substrate` is `ObjectStore`.
-    object_storage: Option<ObjectStoreBackend>,
-    /// Optional low-latency object backend for the object-store writer lease and
-    /// remote WAL. Defaults to `object_storage` when callers do not provide a
-    /// separate WAL tier.
-    object_wal_storage: Option<ObjectStoreBackend>,
-    /// Key prefix for an object-store database, used as the `db_path` for all of
-    /// its object keys. For split-tier opens the same prefix is used in both
-    /// clients: storage-tier keys include `<prefix>/MANIFEST` and tables, while
-    /// WAL-tier keys include `<prefix>/LOCK` and remote WAL objects. Empty
-    /// (bucket root) for the default open and for every other backend.
-    object_storage_prefix: PathBuf,
     /// Serializes object-store manifest publishes so the CAS clone -> commit ->
     /// write-back stays atomic without holding the (std) manifest mutex across
     /// the await. Mirrors `browser_manifest_async_lock`; unused by other backends.
     object_manifest_async_lock: futures::lock::Mutex<()>,
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    browser_storage: Option<BrowserStorageBackend>,
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    #[allow(dead_code)]
-    browser_writer_lease: Mutex<Option<BrowserWriterLease>>,
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    browser_wal: Option<BrowserWalFrontDoor>,
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     browser_manifest_async_lock: futures::lock::Mutex<()>,
     runtime: Runtime,
@@ -1088,12 +1062,7 @@ fn shutdown_background_workers(
 
 fn release_browser_writer_lease(inner: &DbInner) {
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    {
-        let Ok(mut lease) = inner.browser_writer_lease.lock() else {
-            return;
-        };
-        let _ = lease.take();
-    }
+    inner.storage.release_writer_lease();
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     let _ = inner;
 }
@@ -1106,20 +1075,22 @@ impl Drop for DbInner {
             &self.runtime_shutdown,
             &self.background_workers,
         );
-        let _ = cleanup_pending_obsolete_table_files(
-            &self.native_storage,
-            persistent_path_from_options(&self.options),
-            &self.pending_obsolete_tables,
-        );
-        let _ = cleanup_pending_obsolete_blob_files(
-            &self.native_storage,
-            persistent_path_from_options(&self.options),
-            &self.snapshots,
-            self.manifest.as_ref(),
-        );
+        if let Some(files) = self.storage.filesystem_files_if_present() {
+            let _ = cleanup_pending_obsolete_table_files(
+                files,
+                persistent_path_from_options(&self.options),
+                &self.pending_obsolete_tables,
+            );
+            let _ = cleanup_pending_obsolete_blob_files(
+                files,
+                persistent_path_from_options(&self.options),
+                &self.snapshots,
+                self.manifest.as_ref(),
+            );
+        }
         release_browser_writer_lease(self);
         #[cfg(feature = "platform-io")]
-        let _ = self.native_storage.close_platform_io();
+        let _ = self.storage.close_platform_io();
     }
 }
 
@@ -1151,7 +1122,7 @@ impl Drop for Db {
             release_browser_writer_lease(&self.inner);
             self.inner.substrate.release_writer_lease();
             #[cfg(feature = "platform-io")]
-            let _ = self.inner.native_storage.close_platform_io();
+            let _ = self.inner.storage.close_platform_io();
         }
     }
 }

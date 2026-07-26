@@ -3,10 +3,115 @@ use crate::storage::{
     StorageObjectKind,
     fault_injection::{StorageFaultGuard, StorageFaultPoint},
 };
-use crate::{Db, DbOptions, Error, KeyRange};
+use crate::{Db, DbOptions, Error, InMemoryObjectStore, KeyRange};
 
 fn memory_db() -> Db {
     Db::open_sync(DbOptions::memory()).expect("open in-memory db")
+}
+
+#[test]
+fn object_store_branch_has_a_complete_async_lifecycle() {
+    futures::executor::block_on(async {
+        let client = std::sync::Arc::new(InMemoryObjectStore::new());
+        let db = Db::open_object_store(client.clone(), DbOptions::object_store())
+            .await
+            .expect("object-store database opens");
+        let data = db.bucket("data").await.expect("data bucket opens");
+        data.put(b"base", b"root")
+            .await
+            .expect("root write commits");
+        let fork = db.latest_read_version();
+        let branch_blob = vec![7_u8; crate::BucketOptions::DEFAULT_BLOB_THRESHOLD_BYTES + 1];
+
+        db.create_branch("dev", fork).await.expect("branch creates");
+        let mut branch = db.open_branch("dev").await.expect("branch opens");
+        branch
+            .put("data", b"base", b"branch")
+            .await
+            .expect("branch override commits");
+        branch
+            .put("data", b"private", branch_blob.clone())
+            .await
+            .expect("branch insert commits");
+        assert_eq!(
+            branch.get("data", b"base").await.expect("branch reads"),
+            Some(b"branch".to_vec()),
+        );
+        let mut range = branch
+            .range("data", &KeyRange::all())
+            .await
+            .expect("branch range opens");
+        let mut rows = Vec::new();
+        while let Some(row) = range.next().await.expect("branch row reads") {
+            rows.push(row);
+        }
+        assert_eq!(
+            rows.into_iter()
+                .map(|row| (row.key, row.value))
+                .collect::<Vec<_>>(),
+            vec![
+                (b"base".to_vec(), b"branch".to_vec()),
+                (b"private".to_vec(), branch_blob.clone()),
+            ],
+        );
+        drop(branch);
+        assert_eq!(
+            db.list_branches().await.expect("branches list"),
+            vec!["dev".to_owned()],
+        );
+        assert_eq!(
+            db.branch_info("dev")
+                .await
+                .expect("branch info reads")
+                .expect("branch is active")
+                .fork(),
+            fork,
+        );
+        db.close().await.expect("database closes");
+        drop(db);
+
+        let reopened = Db::open_object_store(client, DbOptions::object_store())
+            .await
+            .expect("object-store database reopens");
+        let branch = reopened.open_branch("dev").await.expect("branch reopens");
+        assert_eq!(
+            branch
+                .get("data", b"private")
+                .await
+                .expect("reopened branch reads"),
+            Some(branch_blob.clone()),
+        );
+        let mut rows = branch
+            .range("data", &KeyRange::all())
+            .await
+            .expect("reopened branch range opens");
+        assert_eq!(
+            rows.next()
+                .await
+                .expect("first branch row reads")
+                .expect("first branch row exists")
+                .value,
+            b"branch",
+        );
+        assert_eq!(
+            rows.next()
+                .await
+                .expect("blob branch row reads")
+                .expect("blob branch row exists")
+                .value,
+            branch_blob,
+        );
+        drop(branch);
+        reopened.delete_branch("dev").await.expect("branch deletes");
+        assert!(
+            reopened
+                .list_branches()
+                .await
+                .expect("branches list")
+                .is_empty(),
+        );
+        reopened.close().await.expect("reopened database closes");
+    });
 }
 
 #[test]
@@ -26,19 +131,19 @@ fn branch_reads_parent_then_shadows_with_local_writes() {
 
     let mut branch = db.branch_from_latest().expect("branch");
     assert_eq!(
-        branch.get("data", b"k1").expect("get"),
+        branch.get_sync("data", b"k1").expect("get"),
         Some(b"v1".to_vec())
     );
 
     branch
-        .put("data", b"k1", b"v1-branch".to_vec())
+        .put_sync("data", b"k1", b"v1-branch".to_vec())
         .expect("put");
-    branch.delete("data", b"k2").expect("delete");
+    branch.delete_sync("data", b"k2").expect("delete");
     assert_eq!(
-        branch.get("data", b"k1").expect("get"),
+        branch.get_sync("data", b"k1").expect("get"),
         Some(b"v1-branch".to_vec())
     );
-    assert_eq!(branch.get("data", b"k2").expect("get"), None);
+    assert_eq!(branch.get_sync("data", b"k2").expect("get"), None);
 
     // The parent is untouched.
     assert_eq!(bucket.get_sync(b"k1").expect("get"), Some(b"v1".to_vec()));
@@ -55,7 +160,7 @@ fn branch_pins_its_fork_while_the_parent_diverges() {
     bucket.put_sync(b"k".to_vec(), b"v2".to_vec()).expect("p2");
 
     assert_eq!(
-        branch.get("data", b"k").expect("get"),
+        branch.get_sync("data", b"k").expect("get"),
         Some(b"v1".to_vec()),
         "the branch stays frozen at its fork while the parent diverges"
     );
@@ -72,9 +177,15 @@ fn branch_at_a_retained_past_version_time_travels() {
     bucket.put_sync(b"k".to_vec(), b"v2".to_vec()).expect("p2");
 
     let old = db.branch_at(v1).expect("branch at v1");
-    assert_eq!(old.get("data", b"k").expect("get"), Some(b"v1".to_vec()));
+    assert_eq!(
+        old.get_sync("data", b"k").expect("get"),
+        Some(b"v1".to_vec())
+    );
     let now = db.branch_from_latest().expect("branch now");
-    assert_eq!(now.get("data", b"k").expect("get"), Some(b"v2".to_vec()));
+    assert_eq!(
+        now.get_sync("data", b"k").expect("get"),
+        Some(b"v2".to_vec())
+    );
 }
 
 #[test]
@@ -87,12 +198,12 @@ fn ephemeral_branch_range_merges_overlay_over_parent() {
 
     let mut branch = db.branch_from_latest().expect("branch");
     branch
-        .put("data", b"b", b"2-branch".to_vec())
+        .put_sync("data", b"b", b"2-branch".to_vec())
         .expect("override b");
-    branch.delete("data", b"c").expect("delete c");
-    branch.put("data", b"d", b"4".to_vec()).expect("add d");
+    branch.delete_sync("data", b"c").expect("delete c");
+    branch.put_sync("data", b"d", b"4".to_vec()).expect("add d");
 
-    let rows = branch.range("data", &KeyRange::all()).expect("range");
+    let rows = branch.range_sync("data", &KeyRange::all()).expect("range");
     let got: Vec<(Vec<u8>, Vec<u8>)> = rows
         .map(|kv| {
             let kv = kv.expect("row");
@@ -120,24 +231,27 @@ fn durable_branch_persists_writes_and_shadows_parent() {
         .put_sync(b"k2".to_vec(), b"parent".to_vec())
         .expect("p2");
 
-    db.create_branch("dev", db.latest_read_version())
+    db.create_branch_sync("dev", db.latest_read_version())
         .expect("create");
     {
-        let mut dev = db.open_branch("dev").expect("open");
-        dev.put("data", b"k1", b"dev".to_vec()).expect("put");
-        dev.delete("data", b"k2").expect("delete");
+        let mut dev = db.open_branch_sync("dev").expect("open");
+        dev.put_sync("data", b"k1", b"dev".to_vec()).expect("put");
+        dev.delete_sync("data", b"k2").expect("delete");
     }
 
     // A freshly opened handle sees the persisted branch writes; the parent is
     // untouched.
-    let dev = db.open_branch("dev").expect("reopen");
-    assert_eq!(dev.get("data", b"k1").expect("get"), Some(b"dev".to_vec()));
+    let dev = db.open_branch_sync("dev").expect("reopen");
     assert_eq!(
-        dev.get("data", b"k2").expect("get"),
+        dev.get_sync("data", b"k1").expect("get"),
+        Some(b"dev".to_vec())
+    );
+    assert_eq!(
+        dev.get_sync("data", b"k2").expect("get"),
         None,
         "branch tombstone hides parent"
     );
-    assert_eq!(dev.get("data", b"k3").expect("get"), None);
+    assert_eq!(dev.get_sync("data", b"k3").expect("get"), None);
     assert_eq!(
         bucket.get_sync(b"k1").expect("get"),
         Some(b"parent".to_vec())
@@ -147,7 +261,10 @@ fn durable_branch_persists_writes_and_shadows_parent() {
         Some(b"parent".to_vec())
     );
 
-    assert_eq!(db.list_branches().expect("list"), vec!["dev".to_string()]);
+    assert_eq!(
+        db.list_branches_sync().expect("list"),
+        vec!["dev".to_string()]
+    );
     assert!(dev.is_durable());
 }
 
@@ -159,41 +276,43 @@ fn durable_branch_storage_names_cannot_collide_at_component_boundaries() {
     db.bucket_sync(first_bucket).expect("first parent bucket");
     db.bucket_sync("c").expect("second parent bucket");
     let fork = db.latest_read_version();
-    db.create_branch("a", fork).expect("first branch");
-    db.create_branch(second_branch, fork)
+    db.create_branch_sync("a", fork).expect("first branch");
+    db.create_branch_sync(second_branch, fork)
         .expect("second branch");
 
-    let mut first = db.open_branch("a").expect("open first branch");
+    let mut first = db.open_branch_sync("a").expect("open first branch");
     first
-        .put(first_bucket, b"k", b"first".to_vec())
+        .put_sync(first_bucket, b"k", b"first".to_vec())
         .expect("write first branch");
-    let mut second = db.open_branch(second_branch).expect("open second branch");
+    let mut second = db
+        .open_branch_sync(second_branch)
+        .expect("open second branch");
     second
-        .put("c", b"k", b"second".to_vec())
+        .put_sync("c", b"k", b"second".to_vec())
         .expect("write second branch");
 
     drop(first);
     drop(second);
     assert_eq!(
-        db.open_branch("a")
+        db.open_branch_sync("a")
             .expect("reopen first")
-            .get(first_bucket, b"k")
+            .get_sync(first_bucket, b"k")
             .expect("read first"),
         Some(b"first".to_vec())
     );
     assert_eq!(
-        db.open_branch(second_branch)
+        db.open_branch_sync(second_branch)
             .expect("reopen second")
-            .get("c", b"k")
+            .get_sync("c", b"k")
             .expect("read second"),
         Some(b"second".to_vec())
     );
 
-    db.delete_branch("a").expect("delete first branch");
+    db.delete_branch_sync("a").expect("delete first branch");
     assert_eq!(
-        db.open_branch(second_branch)
+        db.open_branch_sync(second_branch)
             .expect("second survives first deletion")
-            .get("c", b"k")
+            .get_sync("c", b"k")
             .expect("read surviving branch"),
         Some(b"second".to_vec())
     );
@@ -206,9 +325,9 @@ fn durable_branch_write_commits_data_and_registry_together() {
     let _ = std::fs::remove_dir_all(&dir);
     let db = Db::open_sync(&dir).expect("open");
     db.bucket_sync("data").expect("bucket");
-    db.create_branch("dev", db.latest_read_version())
+    db.create_branch_sync("dev", db.latest_read_version())
         .expect("create");
-    let mut dev = db.open_branch("dev").expect("open");
+    let mut dev = db.open_branch_sync("dev").expect("open");
 
     let fault = StorageFaultGuard::install(
         &dir,
@@ -216,7 +335,7 @@ fn durable_branch_write_commits_data_and_registry_together() {
         Some(StorageObjectKind::Wal),
         1,
     );
-    assert!(dev.put("data", b"k", b"v".to_vec()).is_err());
+    assert!(dev.put_sync("data", b"k", b"v".to_vec()).is_err());
     assert_eq!(fault.calls(), 1);
     drop(fault);
     drop(dev);
@@ -238,12 +357,12 @@ fn durable_branch_write_commits_data_and_registry_together() {
     // An append error is fail-stop because the OS may have written a partial
     // frame. Reopen performs recovery before admitting any later write.
     let db = Db::open_sync(&dir).expect("database reopens after WAL failure");
-    let mut reopened = db.open_branch("dev").expect("branch reopens");
+    let mut reopened = db.open_branch_sync("dev").expect("branch reopens");
     reopened
-        .put("data", b"k", b"v".to_vec())
+        .put_sync("data", b"k", b"v".to_vec())
         .expect("write succeeds after recovery");
     assert_eq!(
-        reopened.get("data", b"k").expect("read"),
+        reopened.get_sync("data", b"k").expect("read"),
         Some(b"v".to_vec())
     );
     drop(reopened);
@@ -255,10 +374,12 @@ fn durable_branch_write_commits_data_and_registry_together() {
 fn deleting_marker_hides_branch_and_delete_resumes() {
     let db = memory_db();
     db.bucket_sync("data").expect("bucket");
-    db.create_branch("dev", db.latest_read_version())
+    db.create_branch_sync("dev", db.latest_read_version())
         .expect("create");
-    let mut stale = db.open_branch("dev").expect("open");
-    stale.put("data", b"k", b"v".to_vec()).expect("branch data");
+    let mut stale = db.open_branch_sync("dev").expect("open");
+    stale
+        .put_sync("data", b"k", b"v".to_vec())
+        .expect("branch data");
 
     let mut entry = db.read_registry("dev").expect("registry").expect("entry");
     entry.lifecycle = BranchLifecycle::Deleting;
@@ -268,14 +389,14 @@ fn deleting_marker_hides_branch_and_delete_resumes() {
         .put_sync(b"dev".to_vec(), encoded)
         .expect("persist interrupted delete marker");
 
-    assert!(db.list_branches().expect("list").is_empty());
-    assert!(db.branch_info("dev").expect("info").is_none());
-    assert!(db.open_branch("dev").is_err());
-    assert!(stale.get("data", b"k").is_err());
-    assert!(stale.put("data", b"k2", b"v2".to_vec()).is_err());
+    assert!(db.list_branches_sync().expect("list").is_empty());
+    assert!(db.branch_info_sync("dev").expect("info").is_none());
+    assert!(db.open_branch_sync("dev").is_err());
+    assert!(stale.get_sync("data", b"k").is_err());
+    assert!(stale.put_sync("data", b"k2", b"v2".to_vec()).is_err());
 
-    db.delete_branch("dev").expect("delete resumes");
-    db.delete_branch("dev")
+    db.delete_branch_sync("dev").expect("delete resumes");
+    db.delete_branch_sync("dev")
         .expect("completed delete is idempotent");
     assert!(db.read_registry("dev").expect("registry").is_none());
 }
@@ -285,19 +406,19 @@ fn stale_handle_cannot_write_recreated_branch_generation() {
     let db = memory_db();
     db.bucket_sync("data").expect("bucket");
     let fork = db.latest_read_version();
-    db.create_branch("dev", fork).expect("create");
-    let mut stale = db.open_branch("dev").expect("open old generation");
-    db.delete_branch("dev").expect("delete old generation");
-    db.create_branch("dev", fork).expect("recreate");
+    db.create_branch_sync("dev", fork).expect("create");
+    let mut stale = db.open_branch_sync("dev").expect("open old generation");
+    db.delete_branch_sync("dev").expect("delete old generation");
+    db.create_branch_sync("dev", fork).expect("recreate");
 
     assert!(
-        stale.put("data", b"stale", b"value".to_vec()).is_err(),
+        stale.put_sync("data", b"stale", b"value".to_vec()).is_err(),
         "an old handle must not mutate a replacement with the same name and fork"
     );
     assert_eq!(
-        db.open_branch("dev")
+        db.open_branch_sync("dev")
             .expect("open replacement")
-            .get("data", b"stale")
+            .get_sync("data", b"stale")
             .expect("read replacement"),
         None
     );
@@ -316,17 +437,23 @@ fn durable_branch_survives_reopen_with_default_retention() {
         bucket
             .put_sync(b"k".to_vec(), b"parent".to_vec())
             .expect("seed");
-        db.create_branch("dev", db.latest_read_version())
+        db.create_branch_sync("dev", db.latest_read_version())
             .expect("create");
-        let mut dev = db.open_branch("dev").expect("open");
-        dev.put("data", b"k", b"dev".to_vec()).expect("put");
+        let mut dev = db.open_branch_sync("dev").expect("open");
+        dev.put_sync("data", b"k", b"dev".to_vec()).expect("put");
         db.flush_sync().expect("flush");
     }
     // Reopen: the durable branch, its fork, and its writes all survive.
     let db = Db::open_sync(&dir).expect("reopen");
-    assert_eq!(db.list_branches().expect("list"), vec!["dev".to_string()]);
-    let dev = db.open_branch("dev").expect("open after reopen");
-    assert_eq!(dev.get("data", b"k").expect("get"), Some(b"dev".to_vec()));
+    assert_eq!(
+        db.list_branches_sync().expect("list"),
+        vec!["dev".to_string()]
+    );
+    let dev = db.open_branch_sync("dev").expect("open after reopen");
+    assert_eq!(
+        dev.get_sync("data", b"k").expect("get"),
+        Some(b"dev".to_vec())
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -339,7 +466,7 @@ fn durable_branch_fork_is_pinned_against_aggressive_gc() {
     bucket
         .put_sync(b"k".to_vec(), b"forked".to_vec())
         .expect("seed");
-    db.create_branch("dev", db.latest_read_version())
+    db.create_branch_sync("dev", db.latest_read_version())
         .expect("create");
 
     // Hammer the parent well past the fork; the fork checkpoint keeps that
@@ -350,9 +477,9 @@ fn durable_branch_fork_is_pinned_against_aggressive_gc() {
             .expect("churn");
     }
 
-    let dev = db.open_branch("dev").expect("fork still openable");
+    let dev = db.open_branch_sync("dev").expect("fork still openable");
     assert_eq!(
-        dev.get("data", b"k").expect("get"),
+        dev.get_sync("data", b"k").expect("get"),
         Some(b"forked".to_vec()),
         "the branch still reads its fork value despite aggressive parent GC"
     );
@@ -366,7 +493,7 @@ fn delete_branch_releases_the_fork_pin() {
         .put_sync(b"k".to_vec(), b"forked".to_vec())
         .expect("seed");
     let fork = db.latest_read_version();
-    db.create_branch("dev", fork).expect("create");
+    db.create_branch_sync("dev", fork).expect("create");
 
     // While the branch lives, the fork stays pinned even past parent writes.
     bucket
@@ -377,9 +504,9 @@ fn delete_branch_releases_the_fork_pin() {
         "fork pinned while branch exists"
     );
 
-    db.delete_branch("dev").expect("delete");
+    db.delete_branch_sync("dev").expect("delete");
     assert!(
-        db.open_branch("dev").is_err(),
+        db.open_branch_sync("dev").is_err(),
         "deleted branch cannot be opened"
     );
     // The pin is released: with only the latest retained, a further write
@@ -400,14 +527,15 @@ fn durable_branch_range_merges_over_parent() {
     for (k, v) in [(b"a", b"1"), (b"b", b"2"), (b"c", b"3")] {
         bucket.put_sync(k.to_vec(), v.to_vec()).expect("seed");
     }
-    db.create_branch("dev", db.latest_read_version())
+    db.create_branch_sync("dev", db.latest_read_version())
         .expect("create");
-    let mut dev = db.open_branch("dev").expect("open");
-    dev.put("data", b"b", b"2-dev".to_vec()).expect("override");
-    dev.delete("data", b"c").expect("delete");
-    dev.put("data", b"d", b"4".to_vec()).expect("add");
+    let mut dev = db.open_branch_sync("dev").expect("open");
+    dev.put_sync("data", b"b", b"2-dev".to_vec())
+        .expect("override");
+    dev.delete_sync("data", b"c").expect("delete");
+    dev.put_sync("data", b"d", b"4".to_vec()).expect("add");
 
-    let rows = dev.range("data", &KeyRange::all()).expect("range");
+    let rows = dev.range_sync("data", &KeyRange::all()).expect("range");
     let got: Vec<(Vec<u8>, Vec<u8>)> = rows
         .map(|kv| {
             let kv = kv.expect("row");
@@ -436,37 +564,46 @@ fn branch_of_branch_reads_through_the_whole_chain() {
         .expect("seed");
 
     // a forks root and overrides `shared`, adds `a-only`.
-    db.create_branch("a", db.latest_read_version())
+    db.create_branch_sync("a", db.latest_read_version())
         .expect("create a");
     {
-        let mut a = db.open_branch("a").expect("open a");
-        a.put("data", b"shared", b"a".to_vec()).expect("a override");
-        a.put("data", b"a-only", b"a".to_vec()).expect("a add");
+        let mut a = db.open_branch_sync("a").expect("open a");
+        a.put_sync("data", b"shared", b"a".to_vec())
+            .expect("a override");
+        a.put_sync("data", b"a-only", b"a".to_vec()).expect("a add");
     }
 
     // b forks a, overrides `shared` again, adds `b-only`, deletes `a-only`.
-    db.create_branch_from("b", "a").expect("create b from a");
-    let mut b = db.open_branch("b").expect("open b");
-    b.put("data", b"shared", b"b".to_vec()).expect("b override");
-    b.put("data", b"b-only", b"b".to_vec()).expect("b add");
-    b.delete("data", b"a-only").expect("b delete a-only");
+    db.create_branch_from_sync("b", "a")
+        .expect("create b from a");
+    let mut b = db.open_branch_sync("b").expect("open b");
+    b.put_sync("data", b"shared", b"b".to_vec())
+        .expect("b override");
+    b.put_sync("data", b"b-only", b"b".to_vec()).expect("b add");
+    b.delete_sync("data", b"a-only").expect("b delete a-only");
 
     // b sees: its own writes, then a's, then root's, in that precedence.
-    assert_eq!(b.get("data", b"shared").expect("get"), Some(b"b".to_vec()));
-    assert_eq!(b.get("data", b"b-only").expect("get"), Some(b"b".to_vec()));
     assert_eq!(
-        b.get("data", b"a-only").expect("get"),
+        b.get_sync("data", b"shared").expect("get"),
+        Some(b"b".to_vec())
+    );
+    assert_eq!(
+        b.get_sync("data", b"b-only").expect("get"),
+        Some(b"b".to_vec())
+    );
+    assert_eq!(
+        b.get_sync("data", b"a-only").expect("get"),
         None,
         "b deleted a's key"
     );
     assert_eq!(
-        b.get("data", b"base").expect("get"),
+        b.get_sync("data", b"base").expect("get"),
         Some(b"root".to_vec()),
         "falls through a (untouched) to the root"
     );
 
     // The range view merges the whole chain.
-    let rows = b.range("data", &KeyRange::all()).expect("range");
+    let rows = b.range_sync("data", &KeyRange::all()).expect("range");
     let got: Vec<(Vec<u8>, Vec<u8>)> = rows
         .map(|kv| {
             let kv = kv.expect("row");
@@ -483,51 +620,58 @@ fn branch_of_branch_reads_through_the_whole_chain() {
     );
 
     // a is unaffected by b.
-    let a = db.open_branch("a").expect("reopen a");
-    assert_eq!(a.get("data", b"shared").expect("get"), Some(b"a".to_vec()));
-    assert_eq!(a.get("data", b"a-only").expect("get"), Some(b"a".to_vec()));
-    assert_eq!(a.get("data", b"b-only").expect("get"), None);
+    let a = db.open_branch_sync("a").expect("reopen a");
+    assert_eq!(
+        a.get_sync("data", b"shared").expect("get"),
+        Some(b"a".to_vec())
+    );
+    assert_eq!(
+        a.get_sync("data", b"a-only").expect("get"),
+        Some(b"a".to_vec())
+    );
+    assert_eq!(a.get_sync("data", b"b-only").expect("get"), None);
 }
 
 #[test]
 fn branch_of_branch_is_frozen_when_its_parent_advances() {
     let db = Db::open_sync(DbOptions::memory().with_keep_last_read_versions(64)).expect("open");
     db.bucket_sync("data").expect("bucket");
-    db.create_branch("a", db.latest_read_version())
+    db.create_branch_sync("a", db.latest_read_version())
         .expect("create a");
     {
-        let mut a = db.open_branch("a").expect("open a");
-        a.put("data", b"k", b"a1".to_vec()).expect("a write");
+        let mut a = db.open_branch_sync("a").expect("open a");
+        a.put_sync("data", b"k", b"a1".to_vec()).expect("a write");
     }
     // b forks a at this point.
-    db.create_branch_from("b", "a").expect("create b");
+    db.create_branch_from_sync("b", "a").expect("create b");
     // a keeps writing after the fork.
     {
-        let mut a = db.open_branch("a").expect("reopen a");
-        a.put("data", b"k", b"a2".to_vec()).expect("a write later");
+        let mut a = db.open_branch_sync("a").expect("reopen a");
+        a.put_sync("data", b"k", b"a2".to_vec())
+            .expect("a write later");
     }
     // b sees a's value as of the fork, not a's later write.
-    let b = db.open_branch("b").expect("open b");
-    assert_eq!(b.get("data", b"k").expect("get"), Some(b"a1".to_vec()));
+    let b = db.open_branch_sync("b").expect("open b");
+    assert_eq!(b.get_sync("data", b"k").expect("get"), Some(b"a1".to_vec()));
 }
 
 #[test]
 fn cannot_delete_branch_with_children() {
     let db = Db::open_sync(DbOptions::memory().with_keep_last_read_versions(64)).expect("open");
     db.bucket_sync("data").expect("bucket");
-    db.create_branch("a", db.latest_read_version())
+    db.create_branch_sync("a", db.latest_read_version())
         .expect("create a");
-    db.create_branch_from("b", "a").expect("create b");
+    db.create_branch_from_sync("b", "a").expect("create b");
 
     assert!(
-        db.delete_branch("a").is_err(),
+        db.delete_branch_sync("a").is_err(),
         "a still has child b, so it cannot be deleted"
     );
     // Delete the child first, then the parent.
-    db.delete_branch("b").expect("delete child");
-    db.delete_branch("a")
+    db.delete_branch_sync("b").expect("delete child");
+    db.delete_branch_sync("a")
         .expect("delete parent after child gone");
-    assert!(db.list_branches().expect("list").is_empty());
+    assert!(db.list_branches_sync().expect("list").is_empty());
 }
 
 #[test]
@@ -538,25 +682,29 @@ fn recreated_branch_does_not_inherit_deleted_branch_data() {
         .put_sync(b"k".to_vec(), b"parent".to_vec())
         .expect("seed");
 
-    db.create_branch("dev", db.latest_read_version())
+    db.create_branch_sync("dev", db.latest_read_version())
         .expect("create");
     {
-        let mut dev = db.open_branch("dev").expect("open");
-        dev.put("data", b"k", b"old".to_vec()).expect("write");
-        dev.put("data", b"only-old", b"x".to_vec()).expect("write2");
+        let mut dev = db.open_branch_sync("dev").expect("open");
+        dev.put_sync("data", b"k", b"old".to_vec()).expect("write");
+        dev.put_sync("data", b"only-old", b"x".to_vec())
+            .expect("write2");
     }
-    db.delete_branch("dev")
+    db.delete_branch_sync("dev")
         .expect("delete (clears the data bucket)");
 
     // Recreate the same name and write to the same bucket. The branch must
     // start from the parent, not inherit the deleted branch's rows.
-    db.create_branch("dev", db.latest_read_version())
+    db.create_branch_sync("dev", db.latest_read_version())
         .expect("recreate");
-    let mut dev = db.open_branch("dev").expect("reopen");
-    dev.put("data", b"k", b"new".to_vec()).expect("write");
-    assert_eq!(dev.get("data", b"k").expect("get"), Some(b"new".to_vec()));
+    let mut dev = db.open_branch_sync("dev").expect("reopen");
+    dev.put_sync("data", b"k", b"new".to_vec()).expect("write");
     assert_eq!(
-        dev.get("data", b"only-old").expect("get"),
+        dev.get_sync("data", b"k").expect("get"),
+        Some(b"new".to_vec())
+    );
+    assert_eq!(
+        dev.get_sync("data", b"only-old").expect("get"),
         None,
         "the deleted branch's data was cleared, not inherited"
     );
@@ -567,18 +715,18 @@ fn branch_info_exposes_fork_and_parent_without_opening_data() {
     let db = Db::open_sync(DbOptions::memory().with_keep_last_read_versions(64)).expect("open");
     db.bucket_sync("data").expect("bucket");
     assert!(
-        db.branch_info("missing").expect("info").is_none(),
+        db.branch_info_sync("missing").expect("info").is_none(),
         "an unknown branch has no lineage"
     );
 
     let fork = db.latest_read_version();
-    db.create_branch("a", fork).expect("create a");
-    let a = db.branch_info("a").expect("info").expect("a present");
+    db.create_branch_sync("a", fork).expect("create a");
+    let a = db.branch_info_sync("a").expect("info").expect("a present");
     assert_eq!(a.fork(), fork, "exposes the fork version for fall-through");
     assert_eq!(a.parent(), None, "a forked the root lineage");
 
-    db.create_branch_from("b", "a").expect("create b");
-    let b = db.branch_info("b").expect("info").expect("b present");
+    db.create_branch_from_sync("b", "a").expect("create b");
+    let b = db.branch_info_sync("b").expect("info").expect("b present");
     assert_eq!(b.parent(), Some("a"), "exposes the parent for nesting");
 }
 
@@ -588,7 +736,7 @@ fn orphan_fork_checkpoint_is_reconciled_to_the_registry_intent() {
     let old_fork = db.latest_read_version();
     db.create_internal_checkpoint_at_sync(&fork_checkpoint("dev"), old_fork)
         .expect("orphan checkpoint creates");
-    db.delete_branch("dev")
+    db.delete_branch_sync("dev")
         .expect("absent branch delete is idempotent");
     assert_eq!(
         db.internal_checkpoint_read_version_sync(&fork_checkpoint("dev"))
@@ -602,10 +750,10 @@ fn orphan_fork_checkpoint_is_reconciled_to_the_registry_intent() {
     let new_fork = db.latest_read_version();
     assert_ne!(old_fork, new_fork);
 
-    db.create_branch("dev", new_fork)
+    db.create_branch_sync("dev", new_fork)
         .expect("stale orphan is removed before activating the new intent");
     assert_eq!(
-        db.branch_info("dev")
+        db.branch_info_sync("dev")
             .expect("registry reads")
             .expect("branch publishes")
             .fork(),
@@ -636,7 +784,7 @@ fn open_branch_rejects_a_corrupt_lineage_cycle() {
             .expect("install corrupt lineage");
     }
 
-    let Err(error) = db.open_branch("a") else {
+    let Err(error) = db.open_branch_sync("a") else {
         panic!("lineage cycle must fail closed");
     };
     assert!(

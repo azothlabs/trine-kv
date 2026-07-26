@@ -12,7 +12,7 @@ use crate::{
     range_tombstone::{RangeTombstoneIndex, RangeTombstoneLike},
     snapshot::Snapshot,
     stats::{BlobReadMetrics, ScanGroupOutcome, ScanWasteMetrics},
-    storage::NativeFileBackend,
+    storage_read::ReadBackend,
     table::TablePointCursor,
     types::{KeyRange, KeyValue, Sequence, Value},
 };
@@ -61,7 +61,7 @@ enum LazyValueInner {
     Inline(Vec<u8>),
     Blob {
         db_path: PathBuf,
-        native_storage: Option<NativeFileBackend>,
+        read_backend: Option<ReadBackend>,
         internal_key: InternalKey,
         value: ValueRef,
         blob_reads: Option<Arc<BlobReadMetrics>>,
@@ -80,7 +80,7 @@ pub(crate) struct ScanSourceInput {
     pub(crate) read_sequence: Sequence,
     pub(crate) read_pin: Snapshot,
     pub(crate) db_path: Option<PathBuf>,
-    pub(crate) native_storage: Option<NativeFileBackend>,
+    pub(crate) read_backend: Option<ReadBackend>,
     pub(crate) blob_reads: Option<Arc<BlobReadMetrics>>,
     pub(crate) scan_waste: Option<Arc<ScanWasteMetrics>>,
     pub(crate) range_tombstones: Vec<ScanRangeTombstone>,
@@ -115,7 +115,7 @@ impl Iter {
                 read_sequence: input.read_sequence,
                 read_pin: Arc::new(input.read_pin),
                 db_path: input.db_path,
-                native_storage: input.native_storage,
+                read_backend: input.read_backend,
                 blob_reads: input.blob_reads,
                 scan_waste: input.scan_waste,
                 range_tombstones: RangeTombstoneIndex::new(input.range_tombstones),
@@ -142,7 +142,7 @@ impl LazyIter {
                 read_sequence: input.read_sequence,
                 read_pin: Arc::new(input.read_pin),
                 db_path: input.db_path,
-                native_storage: input.native_storage,
+                read_backend: input.read_backend,
                 blob_reads: input.blob_reads,
                 scan_waste: input.scan_waste,
                 range_tombstones: RangeTombstoneIndex::new(input.range_tombstones),
@@ -186,14 +186,24 @@ impl LazyValue {
             LazyValueInner::Inline(bytes) => Ok(bytes.clone()),
             LazyValueInner::Blob {
                 db_path,
-                native_storage: _,
+                read_backend,
                 internal_key,
                 value,
                 blob_reads,
                 _read_pin: _,
             } => {
-                let bytes =
-                    crate::blob::read_value_for_internal_key(db_path, value, Some(internal_key))?;
+                let backend = read_backend
+                    .as_ref()
+                    .and_then(ReadBackend::filesystem)
+                    .ok_or_else(|| {
+                        Error::unsupported_backend("synchronous blob reads on this storage backend")
+                    })?;
+                let bytes = crate::blob::read_value_for_internal_key_with_backend(
+                    backend,
+                    db_path,
+                    value,
+                    Some(internal_key),
+                )?;
                 if let Some(blob_reads) = blob_reads {
                     blob_reads.record(bytes.len() as u64);
                 }
@@ -208,13 +218,20 @@ impl LazyValue {
             LazyValueInner::Inline(bytes) => Ok(bytes),
             LazyValueInner::Blob {
                 db_path,
-                native_storage: _,
+                read_backend,
                 internal_key,
                 value,
                 blob_reads,
                 _read_pin: _,
             } => {
-                let bytes = crate::blob::read_value_for_internal_key(
+                let backend = read_backend
+                    .as_ref()
+                    .and_then(ReadBackend::filesystem)
+                    .ok_or_else(|| {
+                        Error::unsupported_backend("synchronous blob reads on this storage backend")
+                    })?;
+                let bytes = crate::blob::read_value_for_internal_key_with_backend(
+                    backend,
                     &db_path,
                     &value,
                     Some(&internal_key),
@@ -233,14 +250,14 @@ impl LazyValue {
             LazyValueInner::Inline(bytes) => Ok(bytes.clone()),
             LazyValueInner::Blob {
                 db_path,
-                native_storage: Some(native_storage),
+                read_backend: Some(read_backend),
                 internal_key,
                 value,
                 blob_reads,
                 _read_pin: _,
             } => {
                 let bytes = crate::blob::read_value_for_internal_key_with_backend_async(
-                    native_storage,
+                    read_backend,
                     db_path,
                     value,
                     Some(internal_key),
@@ -252,9 +269,10 @@ impl LazyValue {
                 Ok(bytes)
             }
             LazyValueInner::Blob {
-                native_storage: None,
-                ..
-            } => self.read_sync(),
+                read_backend: None, ..
+            } => Err(Error::Corruption {
+                message: "persistent blob value is missing its read backend".to_owned(),
+            }),
         }
     }
 
@@ -264,14 +282,14 @@ impl LazyValue {
             LazyValueInner::Inline(bytes) => Ok(bytes),
             LazyValueInner::Blob {
                 db_path,
-                native_storage: Some(native_storage),
+                read_backend: Some(read_backend),
                 internal_key,
                 value,
                 blob_reads,
                 _read_pin: _,
             } => {
                 let bytes = crate::blob::read_value_for_internal_key_with_backend_async(
-                    &native_storage,
+                    &read_backend,
                     &db_path,
                     &value,
                     Some(&internal_key),
@@ -283,23 +301,10 @@ impl LazyValue {
                 Ok(bytes)
             }
             LazyValueInner::Blob {
-                db_path,
-                native_storage: None,
-                internal_key,
-                value,
-                blob_reads,
-                _read_pin: _,
-            } => {
-                let bytes = crate::blob::read_value_for_internal_key(
-                    &db_path,
-                    &value,
-                    Some(&internal_key),
-                )?;
-                if let Some(blob_reads) = blob_reads {
-                    blob_reads.record(bytes.len() as u64);
-                }
-                Ok(bytes)
-            }
+                read_backend: None, ..
+            } => Err(Error::Corruption {
+                message: "persistent blob value is missing its read backend".to_owned(),
+            }),
         }
     }
 }
@@ -356,7 +361,7 @@ struct LazyScan {
     read_sequence: Sequence,
     read_pin: Arc<Snapshot>,
     db_path: Option<PathBuf>,
-    native_storage: Option<NativeFileBackend>,
+    read_backend: Option<ReadBackend>,
     blob_reads: Option<Arc<BlobReadMetrics>>,
     scan_waste: Option<Arc<ScanWasteMetrics>>,
     range_tombstones: RangeTombstoneIndex<ScanRangeTombstone>,
@@ -556,7 +561,7 @@ impl LazyScan {
                         value,
                         internal_key,
                         self.db_path.as_deref(),
-                        self.native_storage.clone(),
+                        self.read_backend.clone(),
                         self.blob_reads.clone(),
                         Arc::clone(&self.read_pin),
                     )?;
@@ -1123,7 +1128,7 @@ fn lazy_value(
     value: Option<ValueRef>,
     internal_key: InternalKey,
     db_path: Option<&std::path::Path>,
-    native_storage: Option<NativeFileBackend>,
+    read_backend: Option<ReadBackend>,
     blob_reads: Option<Arc<BlobReadMetrics>>,
     read_pin: Arc<Snapshot>,
 ) -> Result<LazyValue> {
@@ -1142,7 +1147,7 @@ fn lazy_value(
             Ok(LazyValue {
                 inner: LazyValueInner::Blob {
                     db_path: db_path.to_path_buf(),
-                    native_storage,
+                    read_backend,
                     internal_key,
                     value,
                     blob_reads,

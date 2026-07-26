@@ -86,18 +86,18 @@ fn apply_root(db: &Db, mutations: &[Mutation], model: &mut BTreeMap<Vec<u8>, Vec
 }
 
 fn apply_branch(db: &Db, mutations: &[Mutation], model: &mut BTreeMap<Vec<u8>, Vec<u8>>) {
-    let mut branch = db.open_branch("candidate").expect("branch opens");
+    let mut branch = db.open_branch_sync("candidate").expect("branch opens");
     for mutation in mutations {
         match mutation {
             Mutation::Put(_, value) => branch
-                .put(
+                .put_sync(
                     "data",
                     mutation.key(),
                     format!("value-{value:02}").into_bytes(),
                 )
                 .expect("branch put commits"),
             Mutation::Delete(_) => branch
-                .delete("data", mutation.key())
+                .delete_sync("data", mutation.key())
                 .expect("branch delete commits"),
         }
         mutation.apply_to_model(model);
@@ -105,9 +105,9 @@ fn apply_branch(db: &Db, mutations: &[Mutation], model: &mut BTreeMap<Vec<u8>, V
 }
 
 fn read_branch(db: &Db) -> Vec<(Vec<u8>, Vec<u8>)> {
-    db.open_branch("candidate")
+    db.open_branch_sync("candidate")
         .expect("branch opens")
-        .range("data", &KeyRange::all())
+        .range_sync("data", &KeyRange::all())
         .expect("branch range opens")
         .map(|row| {
             let row = row.expect("branch row reads");
@@ -152,7 +152,7 @@ proptest! {
             .expect("persistent database opens");
             apply_root(&db, &seed, &mut root_model);
             branch_model = root_model.clone();
-            db.create_branch("candidate", db.latest_read_version())
+            db.create_branch_sync("candidate", db.latest_read_version())
                 .expect("durable branch creates");
 
             apply_root(&db, &root_after_fork, &mut root_model);
