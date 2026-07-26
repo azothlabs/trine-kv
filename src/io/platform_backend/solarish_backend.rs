@@ -3,7 +3,7 @@ use crate::io::{PlatformIoBackendKind, PlatformIoBackendMatrix, PlatformIoTaskCl
 pub(super) const fn matrix() -> PlatformIoBackendMatrix {
     use PlatformIoTaskClass::{PlatformNativeAsyncButPartial, ThreadPoolManagedAsync};
 
-    // compio-driver 0.7.1 enables libc AIO for Solaris-family read/write/sync
+    // The selected compio-driver 0.12 family enables libc AIO for Solaris-family read/write/sync
     // primitives. Complete Trine operations stay partial when they also need
     // blocking open, metadata, rename, delete, directory, or lease steps.
     PlatformIoBackendMatrix {

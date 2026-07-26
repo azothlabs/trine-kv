@@ -23,9 +23,9 @@ use super::{
 };
 #[cfg(feature = "platform-io")]
 use super::{
-    PlatformIoOperation, max_whole_object_read_bytes, native_file_objects_from_paths,
+    PlatformIoPublishPlan, max_whole_object_read_bytes, native_file_objects_from_paths,
     prepare_native_file_manifest_publish, prepare_native_file_object_write,
-    record_platform_io_task, require_native_file_append, require_native_file_directory_create,
+    require_native_file_append, require_native_file_directory_create,
     require_native_file_directory_listing, require_native_file_directory_sync,
     require_native_file_manifest_read, require_native_file_object_delete,
     require_native_file_object_listing, wait_for_platform_io,
@@ -111,7 +111,6 @@ impl StorageObjectReadBackend for NativeFileBackend {
         ))]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
-            let task_metrics = Arc::clone(&metrics);
             return record_timed_storage_future(
                 metrics,
                 StorageOperation::ReadObjectBytes,
@@ -120,11 +119,6 @@ impl StorageObjectReadBackend for NativeFileBackend {
                     let max_bytes = max_whole_object_read_bytes(object.kind());
                     let completion =
                         driver.submit_read_optional_path(object.path().to_path_buf(), max_bytes)?;
-                    record_platform_io_task(
-                        task_metrics.as_ref(),
-                        &driver,
-                        PlatformIoOperation::OptionalWholeObjectRead,
-                    );
                     completion.await
                 }),
             );
@@ -138,6 +132,22 @@ impl StorageObjectReadBackend for NativeFileBackend {
 
 impl BlockingStorageObjectReadBackend for NativeFileBackend {
     fn read_object_bytes_blocking(&self, object: StorageObjectId) -> Result<Option<Arc<[u8]>>> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = &self.platform_io {
+            return record_timed_storage_result(
+                self.metrics.as_ref(),
+                StorageOperation::ReadObjectBytes,
+                || {
+                    require_native_file_object_read()?;
+                    let completion = driver.submit_read_optional_path(
+                        object.path().to_path_buf(),
+                        max_whole_object_read_bytes(object.kind()),
+                    )?;
+                    wait_for_platform_io(completion)
+                },
+            );
+        }
+
         record_timed_storage_result(
             self.metrics.as_ref(),
             StorageOperation::ReadObjectBytes,
@@ -162,17 +172,14 @@ impl StorageAppendBackend for NativeFileBackend {
                 StorageOperation::OpenAppend,
                 Box::pin(async move {
                     require_native_file_append(&object)?;
-                    let completion = driver.submit_open_append_path(object.path().to_path_buf())?;
-                    record_platform_io_task(
-                        task_metrics.as_ref(),
-                        &driver,
-                        PlatformIoOperation::AppendObjectOpen,
-                    );
-                    completion.await?;
+                    let append_session = driver
+                        .submit_open_append(object.path().to_path_buf())?
+                        .await?;
                     Ok(NativeFileAppendObject::open_platform(
                         object,
                         runtime,
                         platform_io,
+                        append_session,
                         task_metrics,
                     ))
                 }),
@@ -194,6 +201,27 @@ impl StorageAppendBackend for NativeFileBackend {
 impl BlockingStorageAppendBackend for NativeFileBackend {
     fn open_append_blocking(&self, object: StorageObjectId) -> Result<Self::AppendObject> {
         let metrics = Arc::clone(&self.metrics);
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = self.platform_io.clone() {
+            return record_timed_storage_result(
+                self.metrics.as_ref(),
+                StorageOperation::OpenAppend,
+                || {
+                    require_native_file_append(&object)?;
+                    let append_session = wait_for_platform_io(
+                        driver.submit_open_append(object.path().to_path_buf())?,
+                    )?;
+                    Ok(NativeFileAppendObject::open_platform(
+                        object,
+                        self.runtime.clone(),
+                        Some(driver),
+                        append_session,
+                        metrics,
+                    ))
+                },
+            );
+        }
+
         record_timed_storage_result(self.metrics.as_ref(), StorageOperation::OpenAppend, || {
             NativeFileAppendObject::open(
                 &object,
@@ -221,21 +249,15 @@ impl StorageWalRewriteBackend for NativeFileBackend {
         ))]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
-            let task_metrics = Arc::clone(&metrics);
             return record_timed_storage_future(
                 metrics,
                 StorageOperation::RewriteWal,
                 Box::pin(async move {
                     let (path, tmp_path) =
                         prepare_native_file_wal_rewrite(&object, &temporary_object, durability)?;
-                    let completion = driver.submit_write_temp_rename_path(
-                        path, tmp_path, bytes, durability, true, true,
-                    )?;
-                    record_platform_io_task(
-                        task_metrics.as_ref(),
-                        &driver,
-                        PlatformIoOperation::WalRewrite,
-                    );
+                    let completion = driver.submit_publish(PlatformIoPublishPlan::wal_rewrite(
+                        path, tmp_path, bytes, durability,
+                    ))?;
                     completion.await
                 }),
             );
@@ -255,6 +277,30 @@ impl BlockingStorageWalRewriteBackend for NativeFileBackend {
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
     ) -> Result<()> {
+        #[cfg(all(
+            feature = "platform-io",
+            any(unix, windows),
+            not(all(target_arch = "wasm32", target_os = "unknown"))
+        ))]
+        if let Some(driver) = &self.platform_io {
+            return record_timed_storage_result(
+                self.metrics.as_ref(),
+                StorageOperation::RewriteWal,
+                || {
+                    let (path, temporary_path) =
+                        prepare_native_file_wal_rewrite(&object, &temporary_object, durability)?;
+                    wait_for_platform_io(driver.submit_publish(
+                        PlatformIoPublishPlan::wal_rewrite(
+                            path,
+                            temporary_path,
+                            Arc::clone(&bytes),
+                            durability,
+                        ),
+                    )?)
+                },
+            );
+        }
+
         record_timed_storage_result(self.metrics.as_ref(), StorageOperation::RewriteWal, || {
             rewrite_native_file_wal(&object, &temporary_object, &bytes, durability)
         })
@@ -275,7 +321,6 @@ impl StorageWriterLeaseBackend for NativeFileBackend {
         ))]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
-            let task_metrics = Arc::clone(&metrics);
             return record_timed_storage_future(
                 metrics,
                 StorageOperation::AcquireWriterLease,
@@ -286,11 +331,6 @@ impl StorageWriterLeaseBackend for NativeFileBackend {
                         object.path().to_path_buf(),
                         Arc::from(owner.as_bytes()),
                     )?;
-                    record_platform_io_task(
-                        task_metrics.as_ref(),
-                        &driver,
-                        PlatformIoOperation::WriterLeaseAcquire,
-                    );
                     let file = completion.await?;
                     Ok(NativeFileWriterLease::from_locked_file(object, owner, file))
                 }),
@@ -321,11 +361,6 @@ impl BlockingStorageWriterLeaseBackend for NativeFileBackend {
                         object.path().to_path_buf(),
                         Arc::from(owner.as_bytes()),
                     )?;
-                    record_platform_io_task(
-                        self.metrics.as_ref(),
-                        &driver,
-                        PlatformIoOperation::WriterLeaseAcquire,
-                    );
                     let file = wait_for_platform_io(completion)?;
                     Ok(NativeFileWriterLease::from_locked_file(object, owner, file))
                 },
@@ -345,7 +380,6 @@ impl StorageDirectoryCreateBackend for NativeFileBackend {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
-            let task_metrics = Arc::clone(&metrics);
             return record_timed_storage_future(
                 metrics,
                 StorageOperation::CreateDirectoryAll,
@@ -353,11 +387,6 @@ impl StorageDirectoryCreateBackend for NativeFileBackend {
                     require_native_file_directory_create()?;
                     let completion =
                         driver.submit_create_dir_all_path(directory.path().to_path_buf())?;
-                    record_platform_io_task(
-                        task_metrics.as_ref(),
-                        &driver,
-                        PlatformIoOperation::DirectoryCreate,
-                    );
                     completion.await
                 }),
             );
@@ -371,6 +400,20 @@ impl StorageDirectoryCreateBackend for NativeFileBackend {
 
 impl BlockingStorageDirectoryCreateBackend for NativeFileBackend {
     fn create_directory_all_blocking(&self, directory: StorageDirectoryId) -> Result<()> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = &self.platform_io {
+            return record_timed_storage_result(
+                self.metrics.as_ref(),
+                StorageOperation::CreateDirectoryAll,
+                || {
+                    require_native_file_directory_create()?;
+                    wait_for_platform_io(
+                        driver.submit_create_dir_all_path(directory.path().to_path_buf())?,
+                    )
+                },
+            );
+        }
+
         record_timed_storage_result(
             self.metrics.as_ref(),
             StorageOperation::CreateDirectoryAll,
@@ -387,7 +430,6 @@ impl StorageDirectoryListBackend for NativeFileBackend {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
-            let task_metrics = Arc::clone(&metrics);
             return record_timed_storage_future(
                 metrics,
                 StorageOperation::ListDirectoryFiles,
@@ -395,11 +437,6 @@ impl StorageDirectoryListBackend for NativeFileBackend {
                     require_native_file_directory_listing()?;
                     let completion =
                         driver.submit_list_file_paths_path(directory.path().to_path_buf())?;
-                    record_platform_io_task(
-                        task_metrics.as_ref(),
-                        &driver,
-                        PlatformIoOperation::DirectoryListing,
-                    );
                     let paths = completion.await?;
                     Ok(paths
                         .into_iter()
@@ -429,11 +466,6 @@ impl BlockingStorageDirectoryListBackend for NativeFileBackend {
                     require_native_file_directory_listing()?;
                     let completion =
                         driver.submit_list_file_paths_path(directory.path().to_path_buf())?;
-                    record_platform_io_task(
-                        self.metrics.as_ref(),
-                        &driver,
-                        PlatformIoOperation::DirectoryListing,
-                    );
                     let paths = wait_for_platform_io(completion)?;
                     Ok(paths
                         .into_iter()
@@ -456,18 +488,12 @@ impl StorageDirectorySyncBackend for NativeFileBackend {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
-            let task_metrics = Arc::clone(&metrics);
             return record_timed_storage_future(
                 metrics,
                 StorageOperation::SyncDirectoryAfterRenames,
                 Box::pin(async move {
                     require_native_file_directory_sync()?;
                     let completion = driver.submit_sync_dir_path(directory.path().to_path_buf())?;
-                    record_platform_io_task(
-                        task_metrics.as_ref(),
-                        &driver,
-                        PlatformIoOperation::DirectorySync,
-                    );
                     completion.await
                 }),
             );
@@ -481,6 +507,20 @@ impl StorageDirectorySyncBackend for NativeFileBackend {
 
 impl BlockingStorageDirectorySyncBackend for NativeFileBackend {
     fn sync_directory_after_renames_blocking(&self, directory: StorageDirectoryId) -> Result<()> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = &self.platform_io {
+            return record_timed_storage_result(
+                self.metrics.as_ref(),
+                StorageOperation::SyncDirectoryAfterRenames,
+                || {
+                    require_native_file_directory_sync()?;
+                    wait_for_platform_io(
+                        driver.submit_sync_dir_path(directory.path().to_path_buf())?,
+                    )
+                },
+            );
+        }
+
         record_timed_storage_result(
             self.metrics.as_ref(),
             StorageOperation::SyncDirectoryAfterRenames,
@@ -497,7 +537,6 @@ impl StorageManifestReadBackend for NativeFileBackend {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
-            let task_metrics = Arc::clone(&metrics);
             return record_timed_storage_future(
                 metrics,
                 StorageOperation::ReadCurrentManifest,
@@ -506,11 +545,6 @@ impl StorageManifestReadBackend for NativeFileBackend {
                     let max_bytes = max_whole_object_read_bytes(object.kind());
                     let completion =
                         driver.submit_read_optional_path(object.path().to_path_buf(), max_bytes)?;
-                    record_platform_io_task(
-                        task_metrics.as_ref(),
-                        &driver,
-                        PlatformIoOperation::OptionalWholeObjectRead,
-                    );
                     completion.await
                 }),
             );
@@ -524,6 +558,21 @@ impl StorageManifestReadBackend for NativeFileBackend {
 
 impl BlockingStorageManifestReadBackend for NativeFileBackend {
     fn read_current_manifest_blocking(&self, object: StorageObjectId) -> Result<Option<Arc<[u8]>>> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = &self.platform_io {
+            return record_timed_storage_result(
+                self.metrics.as_ref(),
+                StorageOperation::ReadCurrentManifest,
+                || {
+                    require_native_file_manifest_read(&object)?;
+                    wait_for_platform_io(driver.submit_read_optional_path(
+                        object.path().to_path_buf(),
+                        max_whole_object_read_bytes(object.kind()),
+                    )?)
+                },
+            );
+        }
+
         record_timed_storage_result(
             self.metrics.as_ref(),
             StorageOperation::ReadCurrentManifest,
@@ -542,21 +591,15 @@ impl StorageManifestPublishBackend for NativeFileBackend {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
-            let task_metrics = Arc::clone(&metrics);
             return record_timed_storage_future(
                 metrics,
                 StorageOperation::PublishManifest,
                 Box::pin(async move {
                     let (path, tmp_path) =
                         prepare_native_file_manifest_publish(&object, durability)?;
-                    let completion = driver.submit_write_temp_rename_path(
-                        path, tmp_path, bytes, durability, false, true,
-                    )?;
-                    record_platform_io_task(
-                        task_metrics.as_ref(),
-                        &driver,
-                        PlatformIoOperation::TempWriteRenamePublish,
-                    );
+                    let completion = driver.submit_publish(PlatformIoPublishPlan::manifest(
+                        path, tmp_path, bytes, durability,
+                    ))?;
                     completion.await
                 }),
             );
@@ -575,6 +618,24 @@ impl BlockingStorageManifestPublishBackend for NativeFileBackend {
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
     ) -> Result<()> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = &self.platform_io {
+            return record_timed_storage_result(
+                self.metrics.as_ref(),
+                StorageOperation::PublishManifest,
+                || {
+                    let (path, temporary_path) =
+                        prepare_native_file_manifest_publish(&object, durability)?;
+                    wait_for_platform_io(driver.submit_publish(PlatformIoPublishPlan::manifest(
+                        path,
+                        temporary_path,
+                        Arc::clone(&bytes),
+                        durability,
+                    ))?)
+                },
+            );
+        }
+
         record_timed_storage_result(
             self.metrics.as_ref(),
             StorageOperation::PublishManifest,
@@ -593,20 +654,14 @@ impl StorageObjectWriteBackend for NativeFileBackend {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
-            let task_metrics = Arc::clone(&metrics);
             return record_timed_storage_future(
                 metrics,
                 StorageOperation::WriteObject,
                 Box::pin(async move {
                     let (path, tmp_path) = prepare_native_file_object_write(&object, durability)?;
-                    let completion = driver.submit_write_temp_rename_path(
-                        path, tmp_path, bytes, durability, true, true,
-                    )?;
-                    record_platform_io_task(
-                        task_metrics.as_ref(),
-                        &driver,
-                        PlatformIoOperation::TempWriteRenamePublish,
-                    );
+                    let completion = driver.submit_publish(PlatformIoPublishPlan::object(
+                        path, tmp_path, bytes, durability,
+                    ))?;
                     completion.await
                 }),
             );
@@ -625,6 +680,24 @@ impl BlockingStorageObjectWriteBackend for NativeFileBackend {
         bytes: Arc<[u8]>,
         durability: DurabilityMode,
     ) -> Result<()> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = &self.platform_io {
+            return record_timed_storage_result(
+                self.metrics.as_ref(),
+                StorageOperation::WriteObject,
+                || {
+                    let (path, temporary_path) =
+                        prepare_native_file_object_write(&object, durability)?;
+                    wait_for_platform_io(driver.submit_publish(PlatformIoPublishPlan::object(
+                        path,
+                        temporary_path,
+                        Arc::clone(&bytes),
+                        durability,
+                    ))?)
+                },
+            );
+        }
+
         record_timed_storage_result(self.metrics.as_ref(), StorageOperation::WriteObject, || {
             write_native_file_object(&object, &bytes, durability)
         })
@@ -636,18 +709,12 @@ impl StorageObjectDeleteBackend for NativeFileBackend {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
-            let task_metrics = Arc::clone(&metrics);
             return record_timed_storage_future(
                 metrics,
                 StorageOperation::DeleteObject,
                 Box::pin(async move {
                     require_native_file_object_delete(&object)?;
                     let completion = driver.submit_delete_path(object.path().to_path_buf())?;
-                    record_platform_io_task(
-                        task_metrics.as_ref(),
-                        &driver,
-                        PlatformIoOperation::ObjectDelete,
-                    );
                     completion.await
                 }),
             );
@@ -661,6 +728,18 @@ impl StorageObjectDeleteBackend for NativeFileBackend {
 
 impl BlockingStorageObjectDeleteBackend for NativeFileBackend {
     fn delete_object_blocking(&self, object: StorageObjectId) -> Result<()> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = &self.platform_io {
+            return record_timed_storage_result(
+                self.metrics.as_ref(),
+                StorageOperation::DeleteObject,
+                || {
+                    require_native_file_object_delete(&object)?;
+                    wait_for_platform_io(driver.submit_delete_path(object.path().to_path_buf())?)
+                },
+            );
+        }
+
         record_timed_storage_result(
             self.metrics.as_ref(),
             StorageOperation::DeleteObject,
@@ -678,6 +757,14 @@ impl NativeFileBackend {
         let path = object.path().to_path_buf();
         self.delete_object(object).await?;
         if requires_parent_dir_sync_after_rename(durability) {
+            #[cfg(feature = "platform-io")]
+            if self.platform_io.is_some()
+                && let Some(parent) = path.parent()
+            {
+                self.sync_directory_after_renames(StorageDirectoryId::native_file(parent))
+                    .await?;
+                return Ok(());
+            }
             self.run_owned_storage_task(StorageOperation::SyncDirectoryAfterRenames, move || {
                 sync_native_file_parent_directory_after_rename(&path)
             })
@@ -695,7 +782,6 @@ impl StorageObjectListBackend for NativeFileBackend {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = self.platform_io.clone() {
             let metrics = Arc::clone(&self.metrics);
-            let task_metrics = Arc::clone(&metrics);
             return record_timed_storage_future(
                 metrics,
                 StorageOperation::ListObjects,
@@ -703,11 +789,6 @@ impl StorageObjectListBackend for NativeFileBackend {
                     require_native_file_object_listing()?;
                     let completion =
                         driver.submit_list_file_paths_path(request.root().to_path_buf())?;
-                    record_platform_io_task(
-                        task_metrics.as_ref(),
-                        &driver,
-                        PlatformIoOperation::DirectoryListing,
-                    );
                     let paths = completion.await?;
                     Ok(native_file_objects_from_paths(&request, paths))
                 }),
@@ -746,11 +827,6 @@ impl BlockingStorageObjectListBackend for NativeFileBackend {
                     require_native_file_object_listing()?;
                     let completion =
                         driver.submit_list_file_paths_path(request.root().to_path_buf())?;
-                    record_platform_io_task(
-                        self.metrics.as_ref(),
-                        &driver,
-                        PlatformIoOperation::DirectoryListing,
-                    );
                     let paths = wait_for_platform_io(completion)?;
                     Ok(native_file_objects_from_paths(&request, paths))
                 },

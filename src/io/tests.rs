@@ -86,7 +86,9 @@ fn blocking_adapter_driver_runs_submitted_operation() {
 #[cfg(feature = "platform-io")]
 #[test]
 fn platform_backend_matrix_matches_target_family() {
-    let matrix = PlatformIoDriver::backend_matrix();
+    let driver = PlatformIoDriver::new(Arc::new(NativeFileStorageMetrics::default()))
+        .expect("platform I/O driver starts");
+    let matrix = driver.backend_matrix();
 
     #[cfg(not(feature = "platform-io-native"))]
     {
@@ -185,6 +187,229 @@ fn assert_all_platform_rows(matrix: &PlatformIoBackendMatrix, class: PlatformIoT
     for operation in ALL_PLATFORM_OPERATIONS {
         assert_eq!(matrix.class_for(operation), class, "{operation:?}");
     }
+}
+
+#[cfg(feature = "platform-io")]
+#[test]
+fn platform_scheduler_queue_has_a_hard_admission_bound() {
+    let metrics = PlatformIoSchedulerMetrics::default();
+    for _ in 0..PLATFORM_IO_SCHEDULER_QUEUE_DEPTH {
+        assert!(reserve_platform_io_queue_slot(&metrics));
+    }
+    assert!(!reserve_platform_io_queue_slot(&metrics));
+    assert_eq!(
+        metrics.queued.load(std::sync::atomic::Ordering::Acquire),
+        PLATFORM_IO_SCHEDULER_QUEUE_DEPTH
+    );
+}
+
+#[cfg(feature = "platform-io")]
+#[test]
+fn platform_scheduler_orders_one_resource_without_serializing_unrelated_resources() {
+    let path_a = std::path::PathBuf::from("/trine-test/a.wal");
+    let path_b = std::path::PathBuf::from("/trine-test/b.wal");
+    let read_a = PlatformIoTask::Len {
+        path: path_a.clone(),
+        completion: IoCompletion::new(),
+    }
+    .resources();
+    let second_read_a = PlatformIoTask::ReadExactAtOwned {
+        path: path_a.clone(),
+        offset: 0,
+        len: 1,
+        completion: IoCompletion::new(),
+    }
+    .resources();
+    let append_a = PlatformIoTask::Append {
+        session: PlatformIoAppendSession::opened(path_a),
+        bytes: Arc::from(&b"a"[..]),
+        durability: DurabilityMode::Buffered,
+        completion: IoCompletion::new(),
+    }
+    .resources();
+    let append_b = PlatformIoTask::Append {
+        session: PlatformIoAppendSession::opened(path_b),
+        bytes: Arc::from(&b"b"[..]),
+        durability: DurabilityMode::Buffered,
+        completion: IoCompletion::new(),
+    }
+    .resources();
+
+    let mut resources = PlatformIoResourceTable::default();
+    resources.acquire(&read_a);
+    assert!(resources.can_acquire(&second_read_a));
+    assert!(!resources.can_acquire(&append_a));
+    assert!(resources.can_acquire(&append_b));
+    assert!(platform_io_resources_conflict(&append_a, &second_read_a));
+    assert!(!platform_io_resources_conflict(&append_a, &append_b));
+    resources.release(&read_a);
+    assert!(resources.can_acquire(&append_a));
+}
+
+#[cfg(feature = "platform-io")]
+#[test]
+fn platform_driver_close_drains_accepted_work_and_rejects_new_work() {
+    let root = platform_io_test_directory("close-drain");
+    std::fs::create_dir_all(&root).expect("test directory creates");
+    let path = root.join("published");
+    let temporary = root.join("published.tmp");
+    let metrics = Arc::new(NativeFileStorageMetrics::default());
+    let driver = PlatformIoDriver::new(metrics).expect("platform I/O driver starts");
+    let completion = driver
+        .submit_publish(PlatformIoPublishPlan::manifest(
+            path.clone(),
+            temporary,
+            Arc::from(&b"accepted-before-close"[..]),
+            DurabilityMode::Buffered,
+        ))
+        .expect("write is accepted");
+
+    driver.close().expect("driver drains and joins");
+    wait_for_io(completion).expect("accepted write reaches completion");
+    assert_eq!(
+        std::fs::read(&path).expect("published bytes read"),
+        b"accepted-before-close"
+    );
+    let stats = driver.stats();
+    assert_eq!(stats.submitted, 1);
+    assert_eq!(stats.completed, 1);
+    assert_eq!(stats.queued, 0);
+    assert_eq!(stats.in_flight, 0);
+
+    let error = driver
+        .submit_len_path(path)
+        .expect_err("closed driver rejects new work");
+    assert!(matches!(error, Error::Closed));
+    assert_eq!(driver.stats().rejected, 1);
+    std::fs::remove_dir_all(root).expect("test directory removes");
+}
+
+#[cfg(feature = "platform-io")]
+#[test]
+fn abandoned_executor_task_completes_waiter_and_releases_resources() {
+    let metrics = Arc::new(NativeFileStorageMetrics::default());
+    let completion =
+        IoCompletion::new_platform(Arc::clone(&metrics), PlatformIoOperation::LengthLookup);
+    let waiter = completion.clone();
+    let task = PlatformIoTask::Len {
+        path: std::path::PathBuf::from("/trine-test/abandoned"),
+        completion,
+    };
+    let resources = task.resources();
+    let (completed, released) = crossbeam_channel::unbounded();
+    let state = Arc::new(std::sync::atomic::AtomicU8::new(PLATFORM_IO_RUNNING));
+    let scheduled = ScheduledPlatformIoTask {
+        abandon_completion: Some(task.failure_completion()),
+        task: Some(task),
+        class: PlatformIoTaskClass::ThreadPoolManagedAsync,
+        #[cfg(all(feature = "platform-io-native", any(unix, windows)))]
+        control_metrics: Arc::new(PlatformIoSchedulerMetrics::default()),
+        resources: Some(resources.clone()),
+        completed,
+        state: Arc::clone(&state),
+        finished: false,
+    };
+
+    drop(scheduled);
+    let error = wait_for_io(waiter).expect_err("abandoned waiter completes with an error");
+    assert!(error.to_string().contains("stopped before task completion"));
+    assert_eq!(released.recv().expect("resources release"), resources);
+    assert_eq!(
+        state.load(std::sync::atomic::Ordering::Acquire),
+        PLATFORM_IO_FAILED
+    );
+    assert_eq!(
+        metrics.recorded_platform_io_tasks(),
+        0,
+        "a task abandoned before an executor starts it must not claim an execution class"
+    );
+}
+
+#[cfg(feature = "platform-io")]
+#[test]
+fn platform_async_capability_comes_from_the_selected_backend_matrix() {
+    let unsupported = PlatformIoBackendMatrix {
+        kind: PlatformIoBackendKind::UnsupportedFallback,
+        length_lookup: PlatformIoTaskClass::Unsupported,
+        owned_random_read: PlatformIoTaskClass::Unsupported,
+        optional_whole_object_read: PlatformIoTaskClass::Unsupported,
+        temp_write_rename_publish: PlatformIoTaskClass::Unsupported,
+        append_object_open: PlatformIoTaskClass::Unsupported,
+        append: PlatformIoTaskClass::Unsupported,
+        persist: PlatformIoTaskClass::Unsupported,
+        wal_rewrite: PlatformIoTaskClass::Unsupported,
+        object_delete: PlatformIoTaskClass::Unsupported,
+        directory_create: PlatformIoTaskClass::Unsupported,
+        directory_sync: PlatformIoTaskClass::Unsupported,
+        directory_listing: PlatformIoTaskClass::Unsupported,
+        writer_lease_acquire: PlatformIoTaskClass::Unsupported,
+    };
+    assert!(!unsupported.supports_platform_async_io());
+
+    let mut managed = unsupported;
+    managed.kind = PlatformIoBackendKind::ThreadPoolManaged;
+    managed.owned_random_read = PlatformIoTaskClass::ThreadPoolManagedAsync;
+    assert!(managed.supports_platform_async_io());
+}
+
+#[cfg(all(
+    feature = "platform-io-native",
+    any(target_os = "linux", target_os = "macos")
+))]
+#[test]
+fn native_platform_runtime_has_multiple_futures_in_flight() {
+    let root = platform_io_test_directory("native-concurrency");
+    std::fs::create_dir_all(&root).expect("test directory creates");
+    let metrics = Arc::new(NativeFileStorageMetrics::default());
+    let driver = PlatformIoDriver::new(metrics).expect("platform I/O driver starts");
+    if matches!(
+        driver.backend_matrix().kind,
+        PlatformIoBackendKind::ThreadPoolManaged
+    ) {
+        driver.close().expect("fallback driver closes");
+        std::fs::remove_dir_all(root).expect("test directory removes");
+        return;
+    }
+
+    let bytes: Arc<[u8]> = Arc::from(vec![0x5a; 1024 * 1024]);
+    let mut completions = Vec::new();
+    for index in 0..16 {
+        let session = wait_for_io(
+            driver
+                .submit_open_append(root.join(format!("lane-{index}.wal")))
+                .expect("append open submits"),
+        )
+        .expect("append session opens");
+        completions.push(
+            driver
+                .submit_append(&session, Arc::clone(&bytes), DurabilityMode::Buffered)
+                .expect("append submits"),
+        );
+    }
+    for completion in completions {
+        wait_for_io(completion).expect("append completes");
+    }
+
+    let stats = driver.stats();
+    assert!(
+        stats.native_max_in_flight > 1,
+        "native runtime stayed serial: {stats:?}"
+    );
+    assert_eq!(stats.submitted, stats.completed);
+    driver.close().expect("driver closes");
+    std::fs::remove_dir_all(root).expect("test directory removes");
+}
+
+#[cfg(feature = "platform-io")]
+fn platform_io_test_directory(label: &str) -> std::path::PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time follows epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "trine-kv-io-{label}-{}-{nonce}",
+        std::process::id()
+    ))
 }
 
 #[cfg(feature = "platform-io")]

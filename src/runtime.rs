@@ -227,12 +227,14 @@ impl RuntimeCapabilities {
         self.has(TASK_JOIN)
     }
 
-    /// Returns whether at least one Trine storage operation uses platform async I/O.
+    /// Returns whether this runtime configuration is eligible for platform async I/O.
     ///
-    /// This is a coarse runtime capability. Use [`crate::DbStats`] platform I/O
-    /// operation counters to see which storage operations completed through
-    /// true platform async, partial native async, thread-pool managed async,
-    /// blocking fallback, or unsupported classes.
+    /// This configuration-level value is based on the target and enabled Cargo
+    /// features; it cannot observe executor startup. A successfully opened
+    /// database reports its actual selected storage capability through
+    /// [`crate::DbStats::storage_uses_platform_async_io`]. Use the same stats
+    /// snapshot's platform I/O operation counters to see which executor
+    /// actually started each operation.
     #[must_use]
     pub const fn platform_async_io(self) -> bool {
         self.has(PLATFORM_ASYNC_IO)

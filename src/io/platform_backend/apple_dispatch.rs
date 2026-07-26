@@ -7,7 +7,6 @@ use std::{
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     ptr::NonNull,
-    sync::mpsc,
 };
 
 use block2::{Block, RcBlock};
@@ -15,6 +14,7 @@ use dispatch2::{
     DispatchData, DispatchIO, DispatchIOCloseFlags, DispatchIOStreamType, DispatchQueue,
     DispatchQueueAttr, dispatch_io_handler_t,
 };
+use futures::{StreamExt, channel::mpsc};
 
 use crate::{
     error::{Error, Result},
@@ -29,7 +29,7 @@ enum ReadEvent {
 
 type DispatchIoHandler = Block<dyn Fn(bool, *mut DispatchData, libc::c_int)>;
 
-pub(super) fn read_exact_at_owned(
+pub(super) async fn read_exact_at_owned(
     path: &Path,
     offset: usize,
     len: usize,
@@ -38,7 +38,7 @@ pub(super) fn read_exact_at_owned(
         return Ok(StorageReadBuffer::from_vec(offset, Vec::new()));
     }
 
-    let bytes = read_dispatch(path, platform_offset(offset)?, len)?;
+    let bytes = read_dispatch(path, platform_offset(offset)?, len).await?;
     if bytes.len() != len {
         return Err(Error::Io(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -48,7 +48,11 @@ pub(super) fn read_exact_at_owned(
     Ok(StorageReadBuffer::from_vec(offset, bytes))
 }
 
-pub(super) fn write_truncate(path: &Path, bytes: &[u8], durability: DurabilityMode) -> Result<()> {
+pub(super) async fn write_truncate(
+    path: &Path,
+    bytes: &[u8],
+    durability: DurabilityMode,
+) -> Result<()> {
     write_dispatch(
         path,
         bytes,
@@ -56,9 +60,10 @@ pub(super) fn write_truncate(path: &Path, bytes: &[u8], durability: DurabilityMo
         libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
         durability,
     )
+    .await
 }
 
-pub(super) fn write_existing_or_create(
+pub(super) async fn write_existing_or_create(
     path: &Path,
     bytes: &[u8],
     offset: u64,
@@ -71,9 +76,10 @@ pub(super) fn write_existing_or_create(
         libc::O_WRONLY | libc::O_CREAT,
         durability,
     )
+    .await
 }
 
-pub(super) fn sync_path(path: &Path, durability: DurabilityMode) -> Result<()> {
+pub(super) async fn sync_path(path: &Path, durability: DurabilityMode) -> Result<()> {
     if !requires_sync(durability) {
         return Ok(());
     }
@@ -84,15 +90,18 @@ pub(super) fn sync_path(path: &Path, durability: DurabilityMode) -> Result<()> {
     let path_ptr = NonNull::new(dispatch_path.as_ptr().cast_mut())
         .ok_or_else(|| Error::invalid_options("macOS DispatchIO path is empty"))?;
     let channel = unsafe_channel_with_path(path_ptr, libc::O_RDONLY, 0, &queue, &cleanup);
-    let synced = barrier_sync(&channel, durability)?;
+    let synced = barrier_sync(&channel, durability).await?;
     channel.close(DispatchIOCloseFlags(0));
     if !synced {
-        sync_path_blocking(path, durability)?;
+        let path = path.to_path_buf();
+        compio::runtime::spawn_blocking(move || sync_path_blocking(&path, durability))
+            .await
+            .map_err(|_| Error::runtime_busy("macOS sync fallback panicked"))??;
     }
     Ok(())
 }
 
-fn read_dispatch(path: &Path, offset: libc::off_t, len: usize) -> Result<Vec<u8>> {
+async fn read_dispatch(path: &Path, offset: libc::off_t, len: usize) -> Result<Vec<u8>> {
     let queue = new_queue();
     let cleanup = RcBlock::new(|_error: libc::c_int| {});
     let path = dispatch_path(path)?;
@@ -101,7 +110,7 @@ fn read_dispatch(path: &Path, offset: libc::off_t, len: usize) -> Result<Vec<u8>
     let channel = unsafe_channel_with_path(path_ptr, libc::O_RDONLY, 0, &queue, &cleanup);
     channel.set_high_water(len.clamp(1, 1024 * 1024));
 
-    let (tx, rx) = mpsc::channel();
+    let (tx, mut rx) = mpsc::unbounded();
     let handler: RcBlock<dyn Fn(u8, *mut DispatchData, libc::c_int)> = RcBlock::new(
         move |done: u8, data: *mut DispatchData, error: libc::c_int| {
             if !data.is_null() {
@@ -109,7 +118,7 @@ fn read_dispatch(path: &Path, offset: libc::off_t, len: usize) -> Result<Vec<u8>
                 // only for the duration of this callback. We immediately copy
                 // the bytes into an owned `Vec` and do not retain the pointer.
                 let data = unsafe { &*data };
-                let _ = tx.send(ReadEvent::Chunk(data.to_vec()));
+                let _ = tx.unbounded_send(ReadEvent::Chunk(data.to_vec()));
             }
             if done != 0 {
                 let result = if error == 0 {
@@ -117,7 +126,7 @@ fn read_dispatch(path: &Path, offset: libc::off_t, len: usize) -> Result<Vec<u8>
                 } else {
                     Err(io::Error::from_raw_os_error(error))
                 };
-                let _ = tx.send(ReadEvent::Done(result));
+                let _ = tx.unbounded_send(ReadEvent::Done(result));
             }
         },
     );
@@ -132,14 +141,14 @@ fn read_dispatch(path: &Path, offset: libc::off_t, len: usize) -> Result<Vec<u8>
 
     let mut bytes = Vec::new();
     loop {
-        match rx.recv() {
-            Ok(ReadEvent::Chunk(chunk)) => bytes.extend_from_slice(&chunk),
-            Ok(ReadEvent::Done(Ok(()))) => break,
-            Ok(ReadEvent::Done(Err(error))) => {
+        match rx.next().await {
+            Some(ReadEvent::Chunk(chunk)) => bytes.extend_from_slice(&chunk),
+            Some(ReadEvent::Done(Ok(()))) => break,
+            Some(ReadEvent::Done(Err(error))) => {
                 channel.close(DispatchIOCloseFlags::DISPATCH_IO_STOP);
                 return Err(Error::Io(error));
             }
-            Err(_) => {
+            None => {
                 channel.close(DispatchIOCloseFlags::DISPATCH_IO_STOP);
                 return Err(Error::runtime_busy("macOS DispatchIO read channel closed"));
             }
@@ -150,7 +159,7 @@ fn read_dispatch(path: &Path, offset: libc::off_t, len: usize) -> Result<Vec<u8>
     Ok(bytes)
 }
 
-fn write_dispatch(
+async fn write_dispatch(
     path: &Path,
     bytes: &[u8],
     offset: u64,
@@ -174,7 +183,7 @@ fn write_dispatch(
         Some(data) => data,
         None => DispatchData::empty(),
     };
-    let (tx, rx) = mpsc::channel();
+    let (tx, mut rx) = mpsc::unbounded();
     let handler: RcBlock<dyn Fn(u8, *mut DispatchData, libc::c_int)> = RcBlock::new(
         move |done: u8, _data: *mut DispatchData, error: libc::c_int| {
             if done != 0 {
@@ -183,7 +192,7 @@ fn write_dispatch(
                 } else {
                     Err(io::Error::from_raw_os_error(error))
                 };
-                let _ = tx.send(result);
+                let _ = tx.unbounded_send(result);
             }
         },
     );
@@ -198,33 +207,52 @@ fn write_dispatch(
         channel.write(offset, data, &queue, handler_ptr);
     }
 
-    match rx.recv() {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
+    match rx.next().await {
+        Some(Ok(())) => {}
+        Some(Err(error)) => {
             channel.close(DispatchIOCloseFlags::DISPATCH_IO_STOP);
             if should_retry_with_blocking_write(&error, flags) {
-                return write_path_blocking(path, bytes, offset, flags, durability);
+                let path = path.to_path_buf();
+                let bytes = bytes.to_vec();
+                return compio::runtime::spawn_blocking(move || {
+                    write_path_blocking(&path, &bytes, offset, flags, durability)
+                })
+                .await
+                .map_err(|_| Error::runtime_busy("macOS write fallback panicked"))?;
             }
             return Err(Error::Io(error));
         }
-        Err(_) => {
+        None => {
             channel.close(DispatchIOCloseFlags::DISPATCH_IO_STOP);
             return Err(Error::runtime_busy("macOS DispatchIO write channel closed"));
         }
     }
 
-    let synced = barrier_sync(&channel, durability)?;
+    let synced = barrier_sync(&channel, durability).await?;
     channel.close(DispatchIOCloseFlags(0));
-    if flags & libc::O_CREAT != 0 && !path.exists() {
-        return write_path_blocking(path, bytes, offset, flags, durability);
+    if flags & libc::O_CREAT != 0 {
+        let path = path.to_path_buf();
+        let bytes = bytes.to_vec();
+        compio::runtime::spawn_blocking(move || {
+            if path.exists() {
+                Ok(())
+            } else {
+                write_path_blocking(&path, &bytes, offset, flags, durability)
+            }
+        })
+        .await
+        .map_err(|_| Error::runtime_busy("macOS create verification fallback panicked"))??;
     }
     if !synced {
-        sync_path_blocking(path, durability)?;
+        let path = path.to_path_buf();
+        compio::runtime::spawn_blocking(move || sync_path_blocking(&path, durability))
+            .await
+            .map_err(|_| Error::runtime_busy("macOS sync fallback panicked"))??;
     }
     Ok(())
 }
 
-fn barrier_sync(channel: &DispatchIO, durability: DurabilityMode) -> Result<bool> {
+async fn barrier_sync(channel: &DispatchIO, durability: DurabilityMode) -> Result<bool> {
     if !requires_sync(durability) {
         return Ok(true);
     }
@@ -234,13 +262,13 @@ fn barrier_sync(channel: &DispatchIO, durability: DurabilityMode) -> Result<bool
         return Ok(false);
     }
 
-    let (tx, rx) = mpsc::channel();
+    let (tx, mut rx) = mpsc::unbounded();
     let block: RcBlock<dyn Fn()> = RcBlock::new(move || {
         // Strict modes flush the drive cache with F_FULLFSYNC; non-strict modes
         // use a plain fsync. The single source of truth for that decision lives
         // in `crate::durability` (see `sync_file_for_durability`).
         let result = crate::durability::sync_fd_for_durability(fd, durability);
-        let _ = tx.send(result);
+        let _ = tx.unbounded_send(result);
     });
     let block_ptr = RcBlock::as_ptr(&block);
     // SAFETY: `block` stays alive until the barrier sends its completion.
@@ -248,10 +276,10 @@ fn barrier_sync(channel: &DispatchIO, durability: DurabilityMode) -> Result<bool
         channel.barrier(block_ptr);
     }
 
-    match rx.recv() {
-        Ok(Ok(())) => Ok(true),
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err(Error::runtime_busy(
+    match rx.next().await {
+        Some(Ok(())) => Ok(true),
+        Some(Err(error)) => Err(error),
+        None => Err(Error::runtime_busy(
             "macOS DispatchIO barrier channel closed",
         )),
     }

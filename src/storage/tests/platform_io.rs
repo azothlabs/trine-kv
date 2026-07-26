@@ -15,7 +15,7 @@ fn platform_io_native_file_read_and_append_use_platform_driver() {
     std::fs::write(table.path(), b"abcdef").expect("table file writes");
 
     let runtime = Runtime::new(RuntimeOptions::platform_io());
-    let backend = NativeFileBackend::with_runtime(runtime);
+    let backend = NativeFileBackend::with_runtime(runtime).expect("platform I/O backend starts");
     let capabilities = backend.capabilities();
     assert!(capabilities.supports(StorageCapability::PlatformAsyncIo));
 
@@ -50,37 +50,41 @@ fn platform_io_native_file_read_and_append_use_platform_driver() {
 
     let stats = backend.stats();
     assert_platform_task_accounting(&stats, 5, 0);
-    assert!(
-        stats
-            .platform_io_operations
-            .length_lookup
-            .true_platform_async
-            > 0,
-        "Linux platform length lookup should report true platform async"
-    );
-    assert!(
-        stats.platform_io_operations.random_read.true_platform_async > 0,
-        "Linux platform random reads should report true platform async"
-    );
-    assert!(
-        stats.platform_io_operations.append_open.true_platform_async > 0,
-        "Linux platform append open should report true platform async"
-    );
-    assert!(
-        stats.platform_io_operations.append.true_platform_async > 0,
-        "Linux platform append should report true platform async"
-    );
-    assert!(
-        stats.platform_io_operations.persist.true_platform_async > 0,
-        "Linux platform persist should report true platform async"
-    );
-    assert!(
-        stats
-            .platform_io_operations
-            .total()
-            .uses_true_platform_async(),
-        "Linux platform diagnostics should aggregate true platform async work"
-    );
+    if stats.platform_async_io_tasks > 0 {
+        assert!(
+            stats
+                .platform_io_operations
+                .length_lookup
+                .true_platform_async
+                > 0,
+            "io_uring length lookup should report true platform async"
+        );
+        assert!(
+            stats.platform_io_operations.random_read.true_platform_async > 0,
+            "io_uring random reads should report true platform async"
+        );
+        assert!(
+            stats.platform_io_operations.append_open.true_platform_async > 0,
+            "io_uring append open should report true platform async"
+        );
+        assert!(
+            stats.platform_io_operations.append.true_platform_async > 0,
+            "io_uring append should report true platform async"
+        );
+        assert!(
+            stats.platform_io_operations.persist.true_platform_async > 0,
+            "io_uring persist should report true platform async"
+        );
+    } else {
+        assert!(
+            stats
+                .platform_io_operations
+                .total()
+                .thread_pool_managed_async
+                >= 5,
+            "Linux without io_uring must report the selected managed executor"
+        );
+    }
 
     std::fs::remove_dir_all(root).expect("test dir removes");
 }
@@ -153,8 +157,8 @@ fn assert_platform_task_accounting(
     );
 
     assert!(
-        stats.platform_async_io_tasks > 0,
-        "Linux platform backend should account true async work"
+        stats.platform_async_io_tasks > 0 || stats.platform_thread_pool_managed_async_tasks > 0,
+        "Linux platform backend should report its actual selected executor"
     );
 }
 
@@ -167,7 +171,7 @@ fn assert_platform_task_accounting(
 fn platform_io_native_file_management_ops_use_platform_driver() {
     let root = temp_storage_root("trine-kv-platform-io-management");
     let runtime = Runtime::new(RuntimeOptions::platform_io());
-    let backend = NativeFileBackend::with_runtime(runtime);
+    let backend = NativeFileBackend::with_runtime(runtime).expect("platform I/O backend starts");
     let directory = StorageDirectoryId::native_file(&root);
 
     block_on_test_future(backend.create_directory_all(directory.clone()))
@@ -261,6 +265,17 @@ fn platform_io_native_file_management_ops_use_platform_driver() {
     target_os = "linux"
 ))]
 fn assert_linux_platform_management_counters(stats: &NativeFileStorageStats) {
+    if stats.platform_async_io_tasks == 0 {
+        assert!(
+            stats
+                .platform_io_operations
+                .total()
+                .thread_pool_managed_async
+                >= 11,
+            "Linux without io_uring must report managed execution for storage operations"
+        );
+        return;
+    }
     assert!(
         stats
             .platform_io_operations
@@ -345,7 +360,7 @@ fn platform_io_partial_native_storage_ops_use_platform_driver() {
     std::fs::write(table.path(), b"abcdef").expect("table file writes");
 
     let runtime = Runtime::new(RuntimeOptions::platform_io());
-    let backend = NativeFileBackend::with_runtime(runtime);
+    let backend = NativeFileBackend::with_runtime(runtime).expect("platform I/O backend starts");
     let capabilities = backend.capabilities();
     assert!(capabilities.supports(StorageCapability::PlatformAsyncIo));
     assert!(capabilities.supports(StorageCapability::BlockingAdapter));
@@ -406,7 +421,7 @@ fn platform_io_threadpool_storage_ops_use_platform_driver() {
     std::fs::write(table.path(), b"abcdef").expect("table file writes");
 
     let runtime = Runtime::new(RuntimeOptions::platform_io());
-    let backend = NativeFileBackend::with_runtime(runtime);
+    let backend = NativeFileBackend::with_runtime(runtime).expect("platform I/O backend starts");
     let capabilities = backend.capabilities();
     assert!(capabilities.supports(StorageCapability::PlatformAsyncIo));
     assert!(capabilities.supports(StorageCapability::BlockingAdapter));

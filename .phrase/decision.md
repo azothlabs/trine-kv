@@ -121,6 +121,12 @@ Evidence notes should separate:
   writer lease. Each row must report whether the complete operation is true
   platform async, partial native async, thread-pool managed async, blocking
   fallback, or unsupported on the selected platform.
+- Platform-io scheduling and lifecycle follow
+  `.phrase/adr/0003-resource-aware-platform-io-scheduler.md`: bounded
+  admission, bounded in-flight work, one ordering domain across native and
+  fallback executors, shared/exclusive object and directory access, typed
+  append sessions and publish plans, eager native-runtime qualification, and
+  drain-plus-join close.
 - Persistent storage behavior is governed by backend capabilities, including
   writer lease, manifest publish, durability strength, and background-work
   support.

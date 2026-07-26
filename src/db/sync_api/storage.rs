@@ -850,6 +850,8 @@ impl Db {
         }
         super::super::release_browser_writer_lease(&self.inner);
         self.inner.substrate.release_writer_lease();
+        #[cfg(feature = "platform-io")]
+        self.inner.native_storage.close_platform_io()?;
         Ok(())
     }
 

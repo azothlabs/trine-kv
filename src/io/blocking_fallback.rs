@@ -13,7 +13,10 @@ use crate::{
     storage::StorageReadBuffer,
 };
 
-use super::{PlatformIoBackendKind, PlatformIoBackendMatrix, PlatformIoTask, PlatformIoTaskClass};
+use super::{
+    PLATFORM_IO_FAILED, PlatformIoBackendKind, PlatformIoBackendMatrix, PlatformIoParentCreation,
+    PlatformIoPublishPlan, PlatformIoTaskClass, ScheduledPlatformIoTask,
+};
 
 #[cfg_attr(feature = "platform-io-native", allow(dead_code))]
 pub(super) fn matrix() -> PlatformIoBackendMatrix {
@@ -68,12 +71,25 @@ pub(super) fn matrix() -> PlatformIoBackendMatrix {
     }
 }
 
-pub(super) fn run_worker(receiver: crossbeam_channel::Receiver<PlatformIoTask>) {
-    for task in receiver {
-        let completion = task.panic_completion();
+pub(super) fn run_worker(receiver: crossbeam_channel::Receiver<ScheduledPlatformIoTask>) {
+    for mut scheduled in receiver {
+        let task = scheduled.take_task();
+        let completion = task.failure_completion();
+        if task.mark_execution_class(scheduled.class).is_err() {
+            completion.complete();
+            scheduled
+                .state
+                .store(PLATFORM_IO_FAILED, std::sync::atomic::Ordering::Release);
+            scheduled.finish();
+            continue;
+        }
         if panic::catch_unwind(AssertUnwindSafe(|| task.run_thread_pool())).is_err() {
             completion.complete();
+            scheduled
+                .state
+                .store(PLATFORM_IO_FAILED, std::sync::atomic::Ordering::Release);
         }
+        scheduled.finish();
     }
 }
 
@@ -127,27 +143,22 @@ pub(super) fn read_optional(path: &Path, max_bytes: usize) -> Result<Option<Arc<
     Ok(Some(Arc::from(bytes)))
 }
 
-pub(super) fn write_temp_rename(
-    path: &Path,
-    tmp_path: &Path,
-    bytes: &[u8],
-    durability: DurabilityMode,
-    create_parent: bool,
-    sync_parent_after_rename: bool,
-) -> Result<()> {
-    if create_parent && let Some(parent) = tmp_path.parent() {
+pub(super) fn publish(plan: &PlatformIoPublishPlan) -> Result<()> {
+    if plan.create_parent == PlatformIoParentCreation::CreateAll
+        && let Some(parent) = plan.temporary_path.parent()
+    {
         fs::create_dir_all(parent)?;
     }
 
     {
-        let mut file = File::create(tmp_path)?;
-        file.write_all(bytes)?;
-        persist_file(&file, durability)?;
+        let mut file = File::create(&plan.temporary_path)?;
+        file.write_all(&plan.bytes)?;
+        persist_file(&file, plan.durability)?;
     }
 
-    fs::rename(tmp_path, path)?;
-    if sync_parent_after_rename && requires_parent_dir_sync_after_rename(durability) {
-        sync_parent_directory(path)?;
+    fs::rename(&plan.temporary_path, &plan.path)?;
+    if requires_parent_dir_sync_after_rename(plan.durability) {
+        sync_parent_directory(&plan.path)?;
     }
     Ok(())
 }

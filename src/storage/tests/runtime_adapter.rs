@@ -128,7 +128,7 @@ fn runtime_enabled_native_file_object_mutations_use_blocking_adapter() {
     let path = root.join("table-00000000000000000011.trinet");
     let object = StorageObjectId::native_file(StorageObjectKind::Table, &path);
     let runtime = Runtime::with_blocking_limits(RuntimeOptions::native_threads(), 1, 8);
-    let backend = NativeFileBackend::with_runtime(runtime.clone());
+    let backend = NativeFileBackend::with_runtime(runtime.clone()).expect("runtime backend starts");
 
     complete_after_blocking_worker_release(
         &runtime,
@@ -175,7 +175,7 @@ fn runtime_enabled_native_file_object_mutations_use_blocking_adapter() {
 fn runtime_enabled_native_file_directory_and_lease_ops_use_blocking_adapter() {
     let root = temp_storage_root("trine-kv-runtime-directory-storage");
     let runtime = Runtime::with_blocking_limits(RuntimeOptions::native_threads(), 1, 8);
-    let backend = NativeFileBackend::with_runtime(runtime.clone());
+    let backend = NativeFileBackend::with_runtime(runtime.clone()).expect("runtime backend starts");
     let directory = StorageDirectoryId::native_file(&root);
 
     complete_after_blocking_worker_release(
@@ -242,7 +242,7 @@ fn runtime_enabled_native_file_manifest_wal_and_listing_use_blocking_adapter() {
     let root = temp_storage_root("trine-kv-runtime-metadata-storage");
     std::fs::create_dir_all(&root).expect("test dir creates");
     let runtime = Runtime::with_blocking_limits(RuntimeOptions::native_threads(), 1, 8);
-    let backend = NativeFileBackend::with_runtime(runtime.clone());
+    let backend = NativeFileBackend::with_runtime(runtime.clone()).expect("runtime backend starts");
 
     let manifest = StorageObjectId::native_file(StorageObjectKind::Manifest, root.join("MANIFEST"));
     complete_after_blocking_worker_release(
@@ -311,7 +311,7 @@ fn runtime_enabled_native_file_append_operations_use_blocking_adapter() {
     let root = temp_storage_root("trine-kv-runtime-append-storage");
     let object = StorageObjectId::native_file(StorageObjectKind::Wal, root.join("trine.wal"));
     let runtime = Runtime::with_blocking_limits(RuntimeOptions::native_threads(), 1, 8);
-    let backend = NativeFileBackend::with_runtime(runtime.clone());
+    let backend = NativeFileBackend::with_runtime(runtime.clone()).expect("runtime backend starts");
 
     let mut append = complete_after_blocking_worker_release(
         &runtime,

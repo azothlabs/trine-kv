@@ -32,7 +32,10 @@ use crate::{
 use bytes::Bytes;
 
 #[cfg(feature = "platform-io")]
-use crate::io::{PlatformIoDriver, PlatformIoOperation, PlatformIoTaskClass};
+use crate::io::{
+    PlatformIoAppendSession, PlatformIoDriver, PlatformIoOperation, PlatformIoPublishPlan,
+    PlatformIoTaskClass,
+};
 #[cfg(feature = "platform-io")]
 use crate::stats::PlatformIoClassCounters;
 
@@ -992,18 +995,28 @@ impl NativeFileBackend {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn with_runtime(runtime: Runtime) -> Self {
+    pub(crate) fn with_runtime(runtime: Runtime) -> Result<Self> {
+        let metrics = Arc::new(NativeFileStorageMetrics::default());
         #[cfg(feature = "platform-io")]
         let platform_io = runtime
             .capabilities()
             .platform_io_driver()
-            .then(PlatformIoDriver::new);
-        Self {
+            .then(|| PlatformIoDriver::new(Arc::clone(&metrics)))
+            .transpose()?;
+        Ok(Self {
             runtime: Some(runtime),
             #[cfg(feature = "platform-io")]
             platform_io,
-            metrics: Arc::new(NativeFileStorageMetrics::default()),
+            metrics,
+        })
+    }
+
+    #[cfg(feature = "platform-io")]
+    pub(crate) fn close_platform_io(&self) -> Result<()> {
+        if let Some(driver) = &self.platform_io {
+            driver.close()?;
         }
+        Ok(())
     }
 
     pub(crate) fn stats(&self) -> NativeFileStorageStats {
@@ -1070,11 +1083,16 @@ impl NativeFileBackend {
     }
 
     fn supports_platform_async_io(&self) -> bool {
-        self.uses_platform_io_driver()
-            && self
-                .runtime
+        #[cfg(feature = "platform-io")]
+        {
+            self.platform_io
                 .as_ref()
-                .is_some_and(|runtime| runtime.capabilities().platform_async_io())
+                .is_some_and(PlatformIoDriver::supports_platform_async_io)
+        }
+        #[cfg(not(feature = "platform-io"))]
+        {
+            false
+        }
     }
 
     fn run_owned_storage_task<T>(
@@ -1119,13 +1137,8 @@ mod native_file;
 
 #[allow(unused_imports)]
 pub(crate) use backend::*;
-pub(crate) use metrics::NativeFileStorageStats;
-#[cfg(feature = "platform-io")]
-use metrics::record_platform_io_task;
-use metrics::{
-    NativeFileStorageMetrics, StorageOperation, record_timed_storage_future,
-    record_timed_storage_result,
-};
+pub(crate) use metrics::{NativeFileStorageMetrics, NativeFileStorageStats};
+use metrics::{StorageOperation, record_timed_storage_future, record_timed_storage_result};
 pub(crate) use native_file::*;
 #[cfg(test)]
 mod backend_tests;

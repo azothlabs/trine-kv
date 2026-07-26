@@ -1118,6 +1118,8 @@ impl Drop for DbInner {
             self.manifest.as_ref(),
         );
         release_browser_writer_lease(self);
+        #[cfg(feature = "platform-io")]
+        let _ = self.native_storage.close_platform_io();
     }
 }
 
@@ -1148,6 +1150,8 @@ impl Drop for Db {
             let _ = self.inner.publish_barrier.close();
             release_browser_writer_lease(&self.inner);
             self.inner.substrate.release_writer_lease();
+            #[cfg(feature = "platform-io")]
+            let _ = self.inner.native_storage.close_platform_io();
         }
     }
 }

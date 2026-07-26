@@ -848,7 +848,7 @@ impl Db {
     pub(in crate::db) fn open_persistent_with_options(options: DbOptions) -> Result<Self> {
         validate_options(&options)?;
         let runtime = Runtime::new(options.runtime);
-        let native_storage = NativeFileBackend::with_runtime(runtime.clone());
+        let native_storage = NativeFileBackend::with_runtime(runtime.clone())?;
         let Some(path) = persistent_path_from_options(&options) else {
             return Err(Error::invalid_options("persistent open requires a path"));
         };
@@ -941,7 +941,7 @@ impl Db {
         }
 
         let runtime = Runtime::new(options.runtime);
-        let native_storage = NativeFileBackend::with_runtime(runtime.clone());
+        let native_storage = NativeFileBackend::with_runtime(runtime.clone())?;
         let Some(path) = persistent_path_from_options(&options) else {
             return Err(Error::invalid_options("persistent open requires a path"));
         };

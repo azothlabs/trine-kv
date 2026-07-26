@@ -17263,3 +17263,149 @@ Negative check:
 - Google Chrome 150.0.7871.186 with ChromeDriver 150.0.7871.124 passed four
   DedicatedWorker tests, fifteen browser persistence tests, and one
   SharedWorker test.
+
+## 2026-07-26: Resource-aware platform I/O scheduler
+
+### Observation
+
+- The native worker previously owned one completion runtime but called
+  `block_on` once for each received task. The database therefore had at most
+  one native operation in flight.
+- The unbounded native ingress queue had no admission backpressure.
+- The global serialization accidentally prevented two same-file appends from
+  racing their end-offset lookup. Removing serialization without replacing that
+  guarantee would corrupt a WAL.
+- Native and managed fallback work had separate queues and no common
+  object/directory ordering domain.
+- Driver workers were detached; close did not drain accepted I/O or join them.
+- macOS DispatchIO callbacks sent to a blocking receiver on the completion
+  runtime thread, preventing the runtime from polling another callback future.
+- Platform operation counters were incremented at submission even though their
+  public contract describes terminal completions.
+
+### Interpretation
+
+- The missing component was not another Compio call. Trine needed a
+  database-owned scheduler above every executor.
+- Correct concurrency is resource-dependent: shared reads may overlap;
+  append/persist and namespace mutations require exclusive access; unrelated
+  WAL lanes and objects should overlap.
+- Ordering must cover both async and sync entry points and both native and
+  managed executors.
+
+### Implementation
+
+- Added ADR 0003 and one bounded scheduler with a 1,024-task admission limit,
+  a 256-task executor-admission limit, shared/exclusive object and directory
+  grants, and one ordering domain across native and managed executors.
+- The native runtime starts and qualifies eagerly. Runtime startup failure
+  selects the managed matrix instead of failing the first database operation.
+- One Compio runtime now polls a set of operation futures concurrently.
+- Added typed append sessions and explicit manifest/object/WAL publish plans.
+- Added `Running`, `Closing`, `Closed`, and `Failed` states. Close rejects new
+  work, drains accepted work, then joins scheduler and executor threads.
+  Executor RAII also joins startup-failure paths.
+- Added an abandonment guard so an executor/runtime failure completes the
+  waiter, releases its resources, and marks the driver failed.
+- Routed platform-selected blocking storage entry points through the same
+  scheduler and replaced timer polling with a thread waker.
+- Converted macOS DispatchIO read/write/barrier callbacks into wakeable futures;
+  rare blocking recovery work uses the runtime blocking facility.
+- Platform operation counters are attached to completion state and recorded
+  before the waiter is woken.
+- Updated ADR 0002 rows to match the implementation and corrected stale
+  Compio-driver family comments.
+
+### Verification
+
+- Resource rules: shared reads overlap, a same-object append waits, and an
+  unrelated append is admitted.
+- Backpressure: the scheduler admission counter accepts exactly 1,024 queued
+  tasks and rejects the next reservation.
+- Native concurrency: sixteen different WAL paths produced
+  `native_max_in_flight > 1` on the local macOS native runtime.
+- Lifecycle: accepted publish work completed across close, all queue/in-flight
+  counters returned to zero, a post-close submission returned `Closed`, and an
+  abandoned executor task completed its waiter and released its resources.
+- `cargo test -q --features platform-io-native --lib`: 598 passed.
+- `cargo test -q --features platform-io --lib`: 597 passed.
+- `cargo test -q --all-features`: 604 library tests passed, four intentional
+  ignores, all executed integration/acceptance targets passed, and 31 doctests
+  passed.
+- `cargo clippy -q --all-features --all-targets -- -D warnings` passed.
+- `cargo rustdoc -q --all-features -- -D warnings` passed.
+- Default, `platform-io`, and `platform-io-native` checks, formatting, and diff
+  hygiene passed.
+
+### Remaining evidence
+
+- Native runtime initialization and multi-in-flight behavior are locally proven
+  on macOS. Linux, Windows, FreeBSD, and Solaris-family matrix claims still
+  require their target CI/production evidence.
+- Queue-depth and throughput defaults are correctness-safe. Device-specific
+  tuning still requires benchmark evidence on the deployment filesystem and
+  controller; the architecture no longer prevents that measurement.
+
+## 2026-07-26: Platform I/O boundary truthfulness audit
+
+### Observation
+
+- The first scheduler implementation attached the matrix class while creating
+  a completion. A task lost before an executor started it could therefore
+  claim a native or managed execution class.
+- Native-file capability reporting still consulted the configuration-level
+  runtime flags after the driver had already selected an actual backend matrix.
+- Compio runtime construction alone did not prove that Linux selected io_uring
+  rather than its polling driver.
+- The macOS DispatchIO write compatibility check performed a blocking path
+  existence check, and one recovery branch could write directly on the Compio
+  runtime thread.
+- Executor ownership was correct but named generically enough to obscure the
+  intended native-completion versus blocking-fallback boundary.
+
+### Interpretation
+
+- Terminal timing alone is insufficient for truthful operation statistics; the
+  execution class must be assigned by the executor that actually starts work.
+- Runtime-option eligibility and a constructed storage backend's actual
+  capability are different facts.
+- A callback-driven backend is not non-blocking if a recovery branch still
+  performs filesystem work on its completion-runtime thread.
+
+### Implementation
+
+- Execution classes are now assigned immediately after
+  `NativeCompletionExecutor` or `BlockingFallbackExecutor` takes ownership of a
+  task. Pre-execution loss completes the waiter but records no backend class;
+  unsupported dispatch remains explicitly counted.
+- `NativeFileBackend` derives `PlatformAsyncIo` from the selected driver's
+  actual matrix. `RuntimeOptions::capabilities` documents that it reports
+  configuration eligibility rather than executor startup.
+- Native startup now additionally requires Compio's actual Linux driver to be
+  io_uring and its actual Windows driver to be IOCP. Otherwise Trine selects
+  the bounded fallback matrix and reports that route.
+- The macOS create verification and recovery branch now runs entirely through
+  Compio's blocking facility. DispatchIO read, write, and barrier waiting
+  remains future-driven through callback-woken channels.
+- Executor types now expose the intended ownership directly:
+  `PlatformIoScheduler` owns `NativeCompletionExecutor` and
+  `BlockingFallbackExecutor`; their RAII shutdown closes ingress before joining
+  their worker threads.
+- Append open now returns `PlatformIoAppendSession` only after the selected
+  executor succeeds; append and persist carry that session through the
+  scheduler. Typed publish plans likewise remain intact through executor
+  dispatch instead of degrading into boolean arguments.
+
+### Verification
+
+- The abandoned-task test now additionally proves that pre-execution loss does
+  not increment platform execution counters.
+- A matrix test proves that an all-unsupported backend does not advertise
+  platform async capability and that a selected managed async row does.
+- The focused platform suite passed 10/10 tests, including native
+  multi-in-flight execution on local macOS.
+- `cargo test -q --features platform-io --lib` passed 598/598 tests.
+- `cargo test -q --all-features` passed 605 library tests with four intentional
+  ignores, every executed integration and acceptance target, and 31 doctests.
+- Strict all-feature/all-target Clippy, warning-denied Rustdoc, default/native
+  checks, formatting, and diff hygiene passed.

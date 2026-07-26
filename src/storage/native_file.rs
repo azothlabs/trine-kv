@@ -24,7 +24,7 @@ use super::{
 };
 #[cfg(feature = "platform-io")]
 use super::{
-    PlatformIoDriver, PlatformIoOperation, max_whole_object_read_bytes, record_platform_io_task,
+    PlatformIoAppendSession, PlatformIoDriver, PlatformIoPublishPlan, max_whole_object_read_bytes,
 };
 
 mod backend_impls;

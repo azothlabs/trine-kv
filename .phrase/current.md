@@ -51,12 +51,19 @@
     assert that cross-backend contract. Local Chrome 150 with its matching
     ChromeDriver passed all 20 DedicatedWorker, persistent, and SharedWorker
     tests after the correction.
+13. Platform I/O now uses the resource-aware scheduler accepted in ADR 0003.
+    Local macOS evidence observed more than one native future in flight; both
+    native and managed full library suites, the all-feature suite, strict
+    Clippy, Rustdoc, and doctests passed.
 
 ### Residual scope
 
 - Real R2 is qualified for the acceptance and request-measurement suites. Other
   live providers, real browser/WASI hosts, kernel/filesystem/controller
   failures, and hardware power loss remain deployment evidence.
+- Linux, Windows, FreeBSD, and Solaris-family platform-I/O qualification plus
+  device-specific queue-depth benchmarks remain target evidence; the scheduler
+  no longer globally serializes them.
 - Local Chrome 150 passes all 20 browser tests. The hosted Chrome job remains
   the browser release evidence for the exact corrected commit.
 - The native 17-boundary catalog covers every represented atomic hook, not
@@ -81,6 +88,35 @@
 - Verification gate: focused transition/property tests, Gherkin acceptance,
   systematic fault matrix, all-feature tests, strict Clippy, Rustdoc/doctests,
   supported WASM checks, and deep scheduled tools.
+
+### Platform I/O root-correction slice
+
+- Observation: one native worker executed one `block_on` per task, globally
+  serializing unrelated database I/O. The same accidental serialization also
+  hid unsafe same-file append offsets. Native startup, bounded admission,
+  cross-executor ordering, and driver shutdown were not owned by one boundary.
+- Trine operations: random/whole-object read, typed append session
+  open/append/persist, explicit manifest/object/WAL publish plan, delete,
+  directory create/list/sync, and writer lease.
+- Owned interface: `PlatformIoDriver` is the native-file facade;
+  `PlatformIoScheduler` owns bounded admission, resource ordering,
+  native-versus-managed routing, terminal accounting, failure state, drain, and
+  join. Storage traits keep database semantics; platform executors only execute
+  admitted plans.
+- Chosen backends: `NativeCompletionExecutor` owns one concurrently polled
+  Compio runtime where eager startup succeeds; `BlockingFallbackExecutor` owns
+  the bounded managed thread pool for fallback matrix rows. The scheduler owns
+  both executor lifecycles.
+- Known limits: the operation matrix remains target-specific; directory
+  listing and writer lease are managed on targets without a qualified native
+  operation. Hardware queue-depth benefit still requires benchmark evidence.
+- Leak-check scope: accepted completions, scheduler queue entries, resource
+  grants, native futures, managed tasks, worker threads, temporary publish
+  files, append sessions, and close-time references.
+- Verification gate: resource-order test, hard queue-bound test, native
+  multi-in-flight test, close/drain/reject test, WAL append regressions, default
+  and feature builds, strict Clippy, Rustdoc/doctests, formatting, and diff
+  hygiene.
 
 ### Acceptance gate
 

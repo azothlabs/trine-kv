@@ -3,10 +3,10 @@ use super::{
     StorageOperationMetric, StorageOperationStats,
 };
 #[cfg(feature = "platform-io")]
-use super::{PlatformIoClassCounters, PlatformIoDriver, PlatformIoOperation, PlatformIoTaskClass};
+use super::{PlatformIoClassCounters, PlatformIoOperation, PlatformIoTaskClass};
 
 #[derive(Debug, Default)]
-pub(super) struct NativeFileStorageMetrics {
+pub(crate) struct NativeFileStorageMetrics {
     blocking_adapter: AtomicU64,
     platform_async_io: AtomicU64,
     platform_thread_pool_managed_async: AtomicU64,
@@ -92,7 +92,7 @@ impl NativeFileStorageMetrics {
     }
 
     #[cfg(feature = "platform-io")]
-    pub(super) fn record_platform_io_operation(
+    pub(crate) fn record_platform_io_operation(
         &self,
         operation: PlatformIoOperation,
         class: PlatformIoTaskClass,
@@ -148,6 +148,11 @@ impl NativeFileStorageMetrics {
             let _ = self.inline_tasks();
             PlatformIoOperationStats::default()
         }
+    }
+
+    #[cfg(all(test, feature = "platform-io"))]
+    pub(crate) fn recorded_platform_io_tasks(&self) -> u64 {
+        self.platform_io_operations.snapshot().total().total()
     }
 }
 
@@ -321,15 +326,6 @@ impl NativeFileStorageOperationMetric {
             total_latency_micros: self.total_latency_micros.load(Ordering::Acquire),
         }
     }
-}
-
-#[cfg(feature = "platform-io")]
-pub(super) fn record_platform_io_task(
-    metrics: &NativeFileStorageMetrics,
-    _driver: &PlatformIoDriver,
-    operation: PlatformIoOperation,
-) {
-    metrics.record_platform_io_operation(operation, PlatformIoDriver::task_class(operation));
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

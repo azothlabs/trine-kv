@@ -227,11 +227,14 @@ pub struct StorageOperationStats {
 
 /// Platform I/O capability-class counters for one Trine storage operation.
 ///
-/// Each field is a task count. A single operation request increments exactly one
-/// field when it goes through the `platform-io` driver. Operations that use the
-/// normal bounded sync adapter or inline native file path do not increment this
-/// structure. A zero value usually means the operation has not run through the
-/// platform driver during the stats interval, not that the target lacks support.
+/// Each field is a terminal task count. A request increments exactly one field
+/// only after the scheduler assigns the execution route that actually starts
+/// it, or identifies the operation as unsupported. Admission rejection and
+/// executor loss before execution starts do not claim a backend class.
+/// Operations that use the normal bounded sync adapter or inline native file
+/// path do not increment this structure. A zero value usually means the
+/// operation has not started through the platform driver during the stats
+/// interval, not that the target lacks support.
 ///
 /// Use [`Self::total`] to count all platform-driver completions for the
 /// operation, and [`Self::non_true_platform_async_total`] to count completions

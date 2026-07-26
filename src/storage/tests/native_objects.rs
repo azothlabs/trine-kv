@@ -4,7 +4,7 @@ use super::*;
 fn inline_runtime_native_file_mutations_remain_ready() {
     let root = temp_storage_root("trine-kv-inline-runtime-mutations");
     let runtime = Runtime::new(RuntimeOptions::inline());
-    let backend = NativeFileBackend::with_runtime(runtime);
+    let backend = NativeFileBackend::with_runtime(runtime).expect("runtime backend starts");
     let table = StorageObjectId::native_file(
         StorageObjectKind::Table,
         root.join("table-00000000000000000031.trinet"),
@@ -58,7 +58,7 @@ fn runtime_enabled_native_file_owned_read_uses_blocking_adapter() {
 
     let runtime = Runtime::with_blocking_limits(RuntimeOptions::native_threads(), 1, 2);
     let release = hold_runtime_blocking_worker(&runtime);
-    let backend = NativeFileBackend::with_runtime(runtime);
+    let backend = NativeFileBackend::with_runtime(runtime).expect("runtime backend starts");
     let capabilities = backend.capabilities();
     assert!(capabilities.supports(StorageCapability::AsyncTasks));
     assert!(capabilities.supports(StorageCapability::BlockingAdapter));
@@ -97,7 +97,7 @@ fn runtime_enabled_borrowed_read_never_performs_file_io_in_poll() {
 
     let runtime = Runtime::with_blocking_limits(RuntimeOptions::native_threads(), 1, 2);
     let release = hold_runtime_blocking_worker(&runtime);
-    let backend = NativeFileBackend::with_runtime(runtime);
+    let backend = NativeFileBackend::with_runtime(runtime).expect("runtime backend starts");
     let object_id = StorageObjectId::native_file(StorageObjectKind::Table, &path);
     let object = poll_ready_storage_future(backend.open_read(object_id))
         .expect("runtime-backed object opens");
@@ -130,7 +130,7 @@ fn runtime_enabled_native_file_object_read_uses_blocking_adapter() {
 
     let runtime = Runtime::with_blocking_limits(RuntimeOptions::native_threads(), 1, 2);
     let release = hold_runtime_blocking_worker(&runtime);
-    let backend = NativeFileBackend::with_runtime(runtime);
+    let backend = NativeFileBackend::with_runtime(runtime).expect("runtime backend starts");
     let object_id = StorageObjectId::native_file(StorageObjectKind::Table, &path);
 
     let mut read = backend.read_object_bytes(object_id);
@@ -178,7 +178,7 @@ fn inline_runtime_native_file_owned_read_remains_ready() {
     std::fs::write(&path, b"abcdef").expect("test file writes");
 
     let runtime = Runtime::new(RuntimeOptions::inline());
-    let backend = NativeFileBackend::with_runtime(runtime);
+    let backend = NativeFileBackend::with_runtime(runtime).expect("runtime backend starts");
     let capabilities = backend.capabilities();
     assert!(!capabilities.supports(StorageCapability::AsyncTasks));
     assert!(!capabilities.supports(StorageCapability::BlockingAdapter));

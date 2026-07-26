@@ -14,7 +14,9 @@ use super::{
     write_native_file_writer_lease_owner, writer_lease_owner_text,
 };
 #[cfg(feature = "platform-io")]
-use super::{PlatformIoDriver, PlatformIoOperation, record_platform_io_task};
+use super::{PlatformIoAppendSession, PlatformIoDriver};
+#[cfg(feature = "platform-io")]
+use std::{sync::Arc as StdArc, task::Wake, thread};
 
 #[derive(Debug)]
 pub(crate) struct NativeFileObject {
@@ -54,12 +56,7 @@ impl NativeFileObject {
         len: usize,
     ) -> StorageReadFuture<'_, StorageReadBuffer> {
         #[cfg(feature = "platform-io")]
-        if let Some(driver) = &self.platform_io {
-            record_platform_io_task(
-                self.metrics.as_ref(),
-                driver,
-                PlatformIoOperation::OwnedRandomRead,
-            );
+        if self.platform_io.is_some() {
             return Box::pin(async move { self.read_exact_at_owned_io(offset, len)?.await });
         }
 
@@ -121,15 +118,6 @@ impl StorageReadObject for NativeFileObject {
     }
 
     fn len(&self) -> StorageReadFuture<'_, u64> {
-        #[cfg(feature = "platform-io")]
-        if let Some(driver) = &self.platform_io {
-            record_platform_io_task(
-                self.metrics.as_ref(),
-                driver,
-                PlatformIoOperation::LengthLookup,
-            );
-        }
-
         record_timed_storage_future(
             Arc::clone(&self.metrics),
             StorageOperation::Len,
@@ -170,12 +158,38 @@ impl StorageReadObject for NativeFileObject {
 
 impl BlockingStorageReadObject for NativeFileObject {
     fn len_blocking(&self) -> Result<u64> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = &self.platform_io {
+            return record_timed_storage_result(
+                self.metrics.as_ref(),
+                StorageOperation::Len,
+                || wait_for_platform_io(driver.submit_len_path(self.object.path().to_path_buf())?),
+            );
+        }
+
         record_timed_storage_result(self.metrics.as_ref(), StorageOperation::Len, || {
             len_native_file_handle(self.file.as_ref(), &self.object)
         })
     }
 
     fn read_exact_at_blocking(&self, offset: usize, bytes: &mut [u8]) -> Result<()> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = &self.platform_io {
+            return record_timed_storage_result(
+                self.metrics.as_ref(),
+                StorageOperation::ReadExactAt,
+                || {
+                    let buffer = wait_for_platform_io(driver.submit_read_exact_at_owned_path(
+                        self.object.path().to_path_buf(),
+                        offset,
+                        bytes.len(),
+                    )?)?;
+                    bytes.copy_from_slice(buffer.as_slice());
+                    Ok(())
+                },
+            );
+        }
+
         record_timed_storage_result(self.metrics.as_ref(), StorageOperation::ReadExactAt, || {
             let buffer = self.read_exact_at_offset_owned(offset, bytes.len())?;
             bytes.copy_from_slice(buffer.as_slice());
@@ -184,6 +198,21 @@ impl BlockingStorageReadObject for NativeFileObject {
     }
 
     fn read_exact_at_owned_blocking(&self, offset: usize, len: usize) -> Result<StorageReadBuffer> {
+        #[cfg(feature = "platform-io")]
+        if let Some(driver) = &self.platform_io {
+            return record_timed_storage_result(
+                self.metrics.as_ref(),
+                StorageOperation::ReadExactAtOwned,
+                || {
+                    wait_for_platform_io(driver.submit_read_exact_at_owned_path(
+                        self.object.path().to_path_buf(),
+                        offset,
+                        len,
+                    )?)
+                },
+            );
+        }
+
         record_timed_storage_result(
             self.metrics.as_ref(),
             StorageOperation::ReadExactAtOwned,
@@ -199,6 +228,8 @@ pub(crate) struct NativeFileAppendObject {
     runtime: Option<Runtime>,
     #[cfg(feature = "platform-io")]
     platform_io: Option<PlatformIoDriver>,
+    #[cfg(feature = "platform-io")]
+    append_session: Option<PlatformIoAppendSession>,
     metrics: Arc<NativeFileStorageMetrics>,
 }
 
@@ -216,6 +247,8 @@ impl NativeFileAppendObject {
             runtime,
             #[cfg(feature = "platform-io")]
             platform_io,
+            #[cfg(feature = "platform-io")]
+            append_session: None,
             metrics,
         })
     }
@@ -225,6 +258,7 @@ impl NativeFileAppendObject {
         object: StorageObjectId,
         runtime: Option<Runtime>,
         platform_io: Option<PlatformIoDriver>,
+        append_session: PlatformIoAppendSession,
         metrics: Arc<NativeFileStorageMetrics>,
     ) -> Self {
         Self {
@@ -232,6 +266,7 @@ impl NativeFileAppendObject {
             file: None,
             runtime,
             platform_io,
+            append_session: Some(append_session),
             metrics,
         }
     }
@@ -274,7 +309,10 @@ impl IoAppendObject for NativeFileAppendObject {
     fn append_io(&self, bytes: Arc<[u8]>, durability: DurabilityMode) -> Result<IoCompletion<()>> {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = &self.platform_io {
-            return driver.submit_append_path(self.object.path().to_path_buf(), bytes, durability);
+            let session = self.append_session.as_ref().ok_or_else(|| {
+                Error::runtime_busy("platform append object has no append session")
+            })?;
+            return driver.submit_append(session, bytes, durability);
         }
 
         let object = self.object.clone();
@@ -288,7 +326,10 @@ impl IoAppendObject for NativeFileAppendObject {
     fn persist_io(&self, durability: DurabilityMode) -> Result<IoCompletion<()>> {
         #[cfg(feature = "platform-io")]
         if let Some(driver) = &self.platform_io {
-            return driver.submit_persist_path(self.object.path().to_path_buf(), durability);
+            let session = self.append_session.as_ref().ok_or_else(|| {
+                Error::runtime_busy("platform append object has no append session")
+            })?;
+            return driver.submit_persist(session, durability);
         }
 
         let object = self.object.clone();
@@ -308,8 +349,7 @@ impl StorageAppendObject for NativeFileAppendObject {
     ) -> StorageFuture<'op, ()> {
         let bytes: Arc<[u8]> = Arc::from(bytes);
         #[cfg(feature = "platform-io")]
-        if let Some(driver) = &self.platform_io {
-            record_platform_io_task(self.metrics.as_ref(), driver, PlatformIoOperation::Append);
+        if self.platform_io.is_some() {
             return record_timed_storage_future(
                 Arc::clone(&self.metrics),
                 StorageOperation::Append,
@@ -355,8 +395,7 @@ impl StorageAppendObject for NativeFileAppendObject {
 
     fn persist(&mut self, durability: DurabilityMode) -> StorageFuture<'_, ()> {
         #[cfg(feature = "platform-io")]
-        if let Some(driver) = &self.platform_io {
-            record_platform_io_task(self.metrics.as_ref(), driver, PlatformIoOperation::Persist);
+        if self.platform_io.is_some() {
             return record_timed_storage_future(
                 Arc::clone(&self.metrics),
                 StorageOperation::Persist,
@@ -399,6 +438,14 @@ impl StorageAppendObject for NativeFileAppendObject {
 impl BlockingStorageAppendObject for NativeFileAppendObject {
     fn append_blocking(&mut self, bytes: &[u8], durability: DurabilityMode) -> Result<()> {
         let started = Instant::now();
+        #[cfg(feature = "platform-io")]
+        let result = if self.platform_io.is_some() {
+            self.append_io(Arc::from(bytes), durability)
+                .and_then(wait_for_platform_io)
+        } else {
+            self.append_to_file(bytes, durability)
+        };
+        #[cfg(not(feature = "platform-io"))]
         let result = self.append_to_file(bytes, durability);
         self.metrics
             .record_operation(StorageOperation::Append, started.elapsed());
@@ -407,6 +454,13 @@ impl BlockingStorageAppendObject for NativeFileAppendObject {
 
     fn persist_blocking(&mut self, durability: DurabilityMode) -> Result<()> {
         let started = Instant::now();
+        #[cfg(feature = "platform-io")]
+        let result = if self.platform_io.is_some() {
+            self.persist_io(durability).and_then(wait_for_platform_io)
+        } else {
+            self.persist_file(durability)
+        };
+        #[cfg(not(feature = "platform-io"))]
         let result = self.persist_file(durability);
         self.metrics
             .record_operation(StorageOperation::Persist, started.elapsed());
@@ -473,14 +527,32 @@ impl Drop for NativeFileWriterLease {
 }
 
 #[cfg(feature = "platform-io")]
+struct PlatformIoThreadWake {
+    thread: thread::Thread,
+}
+
+#[cfg(feature = "platform-io")]
+impl Wake for PlatformIoThreadWake {
+    fn wake(self: StdArc<Self>) {
+        self.thread.unpark();
+    }
+
+    fn wake_by_ref(self: &StdArc<Self>) {
+        self.thread.unpark();
+    }
+}
+
+#[cfg(feature = "platform-io")]
 pub(in crate::storage) fn wait_for_platform_io<T>(completion: IoCompletion<T>) -> Result<T> {
-    let waker = Waker::noop();
-    let mut context = Context::from_waker(waker);
+    let waker = Waker::from(StdArc::new(PlatformIoThreadWake {
+        thread: thread::current(),
+    }));
+    let mut context = Context::from_waker(&waker);
     let mut completion = std::pin::pin!(completion);
     loop {
         match completion.as_mut().poll(&mut context) {
             Poll::Ready(result) => return result,
-            Poll::Pending => std::thread::sleep(std::time::Duration::from_millis(1)),
+            Poll::Pending => thread::park(),
         }
     }
 }
