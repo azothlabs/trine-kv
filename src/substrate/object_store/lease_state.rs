@@ -1,9 +1,21 @@
+use std::sync::Arc;
+
+use crate::{
+    error::{Error, Result},
+    object_store::{ETag, ObjectClient},
+    types::Sequence,
+};
+
 use super::{
-    Arc, Error, OBJECT_LEASE_MAGIC, OBJECT_LEASE_MAX_BYTES, OBJECT_LEASE_TTL,
-    OBJECT_LEASE_V3_HEADER_LEN, OBJECT_LEASE_VERSION, ObjectClient, Result, Sequence,
+    OBJECT_LEASE_MAGIC, OBJECT_LEASE_MAX_BYTES, OBJECT_LEASE_TTL, OBJECT_LEASE_V3_HEADER_LEN,
+    OBJECT_LEASE_VERSION,
 };
 #[cfg(not(all(feature = "s3", not(target_family = "wasm"))))]
-use super::{Context, Future, Poll, Wake, Waker, thread};
+use std::{
+    future::Future,
+    task::{Context, Poll, Wake, Waker},
+    thread,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ObjectLeaseState {
@@ -120,7 +132,7 @@ impl ObjectLeaseState {
 
 #[derive(Debug)]
 pub(super) struct ObservedLeaseState {
-    pub(super) etag: super::ETag,
+    pub(super) etag: ETag,
     pub(super) state: ObjectLeaseState,
 }
 

@@ -26,6 +26,54 @@ Record only evidence that can change planning or durable decisions.
 
 - What the next phase or task should do.
 
+## 2026-07-26: responsibility-boundary audit closure
+
+### Observation
+
+- Several already-correct subsystems still concentrated unrelated owners in
+  one source file: durability dispatch and object WAL internals; storage
+  contracts and implementations; database state, maintenance, lifecycle, open,
+  persistence, and async entry points; content identities, upload state and
+  format, and reclaim lifecycle records.
+- The remaining longest files are predominantly cohesive algorithms, one
+  backend adapter, or tests. File length alone does not justify fragmenting
+  them.
+
+### Interpretation
+
+- The unresolved cost was navigational and dependency ambiguity, not another
+  behavior bug. Façades should expose stable APIs while child modules own one
+  capability, lifecycle stage, or resource owner.
+- Moving a Rust item down one module level changes the meaning of
+  `pub(super)`. Preserving the old boundary requires explicit restricted
+  visibility such as `pub(in crate::content)`, not broader crate visibility.
+
+### Verification
+
+- Durability, storage, database open/storage/async orchestration, content
+  identity, upload, public reclaim values, and reclaim record codecs now use
+  responsibility-named child modules behind stable façades.
+- Public API, storage constants and record encodings, WAL behavior, manifest
+  behavior, durability rules, and release version remain unchanged.
+- `cargo test -q --all-features` passed 606 library tests with 4 intentional
+  ignores, all executed integration targets, 52 acceptance scenarios with 352
+  steps, 6 durable-branch scenarios with 55 steps, and 31 doctests.
+- Strict all-target native Clippy, strict browser Clippy, warning-denied WASI
+  library check, 7 WASI persistence tests, Rustdoc, documentation drift,
+  formatting, and diff hygiene passed.
+
+### Remaining Blockers
+
+- No local architecture blocker remains in this audit scope.
+- Live-provider, hosted browser/WASI, operating-system, filesystem/controller,
+  and power-loss qualification remain deployment evidence, not reasons to
+  change the module design.
+
+### Recommended Next Action
+
+- Commit the verified responsibility split, then run hosted release gates
+  against the exact commit before publishing 0.6.0.
+
 ## 2026-07-26: first supported manifest format starts at version 1
 
 ### Observation

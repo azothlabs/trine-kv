@@ -29,13 +29,30 @@ drift into two versions of an invariant.
 
 ## Orchestration boundaries
 
-- `db/commit.rs` owns commit admission, WAL publication, and visibility order.
-- `db/sync_api/maintenance/coordinator.rs` schedules maintenance;
+- `db/commit.rs` owns commit admission, WAL publication, and visibility order;
+  `db/commit_tracker.rs` owns commit visibility and publish barriers.
+- `db/engine/maintenance/coordinator.rs` schedules maintenance;
   `registry.rs`, `reads.rs`, `flush.rs`, and `compaction.rs` own distinct work.
+- `db/async_api/` separates open/refresh, bucket/checkpoint, default-bucket
+  data access, and maintenance entry points. Explicit sync methods adapt the
+  same engine rules.
+- `branch/` separates registry format, owned state, handle I/O, range merge,
+  lifecycle transitions, and public orchestration. Sync operations drive the
+  async implementation rather than owning a second branch algorithm.
+- `transaction/core.rs` owns generic transaction state. Immutable-content
+  extensions live in `content/transaction/`, divided by lifecycle capability.
 - `db/content/upload/` separates session, seal, abort, quota, and operator
   maintenance flows.
 - `db/content/backend.rs` is the common content-object adapter selected once at
   the storage boundary.
+- `content/identity/`, `content/upload/`, and `content/reclaim/` separate
+  public values, live upload behavior, lifecycle states, and durable record
+  codecs. Reclaim records are divided by the transition that owns them.
+- `db/engine/open/` owns backend-specific construction. `db/engine/storage/`
+  owns persistence, flush, compaction, and browser maintenance mechanics.
+- `storage/` separates object identities, read contracts, capability traits,
+  and backend implementations. `substrate/` separates filesystem durability
+  from object-store WAL lanes, leases, and chain encoding.
 - `object_store/contract.rs` verifies provider semantics,
   `memory.rs` supplies the deterministic implementation, and `backend.rs`
   translates storage traits into object operations.

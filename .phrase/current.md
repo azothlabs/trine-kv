@@ -44,6 +44,18 @@ module without inventing a separately published crate. Backend-specific
 clients and coordinates are exposed only through exhaustive typed resource
 bundles.
 
+The final responsibility audit is complete locally. The durability substrate
+is divided into filesystem ownership and object-store lane, lease, lease-state,
+and WAL-chain modules. Storage contracts, object identities, capability traits,
+and implementations are separate. Database shared state, commit visibility,
+maintenance coordination, handle lifecycle, backend-specific open, persistence,
+flush, compaction, and async public entry points each have named owners.
+Immutable-content identity, live upload behavior, upload-state encoding,
+descriptor/chunk encoding, public reclaim coordinates, and every durable
+reclaim record stage are likewise separate. Remaining long files were reviewed
+as cohesive algorithms, backend adapters, or test collections rather than
+split mechanically.
+
 ### Evidence collected
 
 1. Native all-target/all-feature suite: every executed target passed; provider
@@ -95,6 +107,12 @@ bundles.
     every responsibility module a compile dependency; no source-text or
     file-tree architecture assertions remain. Strict native/browser Clippy and
     the warning-denied WASI library check also passed.
+16. The final responsibility split passed 606 all-feature library tests with 4
+    intentional ignores, all executed integration targets, 52 backend-neutral
+    acceptance scenarios with 352 steps, 6 durable-branch scenarios with 55
+    steps, 31 doctests, and 7 WASI persistence tests. Strict native and browser
+    Clippy, warning-denied WASI check, Rustdoc, documentation drift, formatting,
+    and diff hygiene passed.
 
 ### Residual scope
 
